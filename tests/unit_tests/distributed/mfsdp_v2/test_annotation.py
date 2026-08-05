@@ -202,7 +202,8 @@ def test_tied_child_parameters_complete_backward_once_per_cycle(distributed_setu
     _setup_nvtx_recording(monkeypatch, events)
     model = TiedLM()
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     token_ids = torch.arange(8, device=distributed_setup.device).reshape(2, 4)
     for _ in range(2):

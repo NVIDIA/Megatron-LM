@@ -379,7 +379,8 @@ def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
     """Tied registrations should allocate one DBuffer entry and optimizer parameter."""
     model = TiedLM()
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     (parameter_group,) = model.parameter_groups
     (parameter,) = parameter_group.fsdp_parameters
@@ -911,7 +912,8 @@ def test_meta_parameters_shard_to_mesh_device(distributed_setup):
         nn.Linear(4, 4, bias=False, device="meta", dtype=torch.bfloat16),
     )
 
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     with torch.no_grad():
         model[0].weight.fill_(2.0)
