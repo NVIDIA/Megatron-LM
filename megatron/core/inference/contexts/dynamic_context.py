@@ -1,11 +1,11 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -53,6 +53,9 @@ from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
+
+# These callbacks are currently consumed only by the Dynamo frontend.
+KVEventListener = Callable[[str, dict[str, Any]], None]
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -226,6 +229,69 @@ def get_mem_size_str(n_bytes: int) -> str:
     raise Exception(f"something went wrong, n_bytes={n_bytes}.")
 
 
+class DynamoHelper:
+    """Manage KV-cache lifecycle events consumed by the Dynamo frontend."""
+
+    def __init__(self) -> None:
+        self._kv_event_listeners: list[KVEventListener] = []
+        self._pending_kv_stored_events: list[dict[str, Any]] = []
+
+    @property
+    def has_kv_event_listeners(self) -> bool:
+        """Return whether any KV-event listeners are registered."""
+        return bool(self._kv_event_listeners)
+
+    def add_kv_event_listener(self, listener: KVEventListener) -> None:
+        """Register a KV-cache lifecycle listener.
+
+        Args:
+            listener: Callback invoked with the event kind and payload.
+        """
+        self._kv_event_listeners.append(listener)
+
+    def queue_kv_stored_event(self, payload: dict[str, Any]) -> None:
+        """Queue a stored event for publication after a successful forward pass.
+
+        Args:
+            payload: Stored-event payload.
+        """
+        self._pending_kv_stored_events.append(payload)
+
+    def publish_pending_kv_stored_events(self) -> None:
+        """Publish blocks whose KV contents were produced by a successful forward pass."""
+        pending, self._pending_kv_stored_events = self._pending_kv_stored_events, []
+        for payload in pending:
+            self._emit_kv_event("stored", payload)
+
+    def discard_pending_kv_stored_events(self) -> None:
+        """Discard registrations left by an interrupted or failed forward pass."""
+        self._pending_kv_stored_events.clear()
+
+    def on_kv_blocks_deregistered(self, _block_ids: list[int], hashes: set[int]) -> None:
+        """Publish removal events for deregistered KV blocks.
+
+        Args:
+            _block_ids: Deregistered block IDs, unused by Dynamo.
+            hashes: Hashes of the deregistered blocks.
+        """
+        if hashes:
+            self._emit_kv_event("removed", {"block_hashes": list(hashes)})
+
+    def notify_kv_cache_cleared(self) -> None:
+        """Notify listeners that no previously advertised block is routable."""
+        self.discard_pending_kv_stored_events()
+        if self._kv_event_listeners:
+            self._emit_kv_event("cleared", {})
+
+    def _emit_kv_event(self, kind: str, payload: dict[str, Any]) -> None:
+        """Notify Dynamo listeners without allowing frontend failures to stop inference."""
+        for listener in tuple(self._kv_event_listeners):
+            try:
+                listener(kind, payload)
+            except Exception:  # pylint: disable=broad-exception-caught
+                logging.exception("KV-event listener failed while handling %r", kind)
+
+
 @internal_api
 # pylint: disable=line-too-long
 class DynamicInferenceContext(BaseInferenceContext):
@@ -315,11 +381,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.num_attention_heads_per_partition = 1
 
+        self.batch_invariant_mode = model_config.batch_invariant_mode
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         assert self.num_speculative_tokens < inference_config.block_size_tokens, (
             f"num_speculative_tokens ({self.num_speculative_tokens}) must be < "
             f"block_size_tokens ({inference_config.block_size_tokens})"
         )
+        self._async_sched_token_offsets = None
 
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
@@ -355,6 +423,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
             self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
+
+            if self.batch_invariant_mode:
+                assert not self.enable_prefix_caching, (
+                    "batch_invariant_mode does not support Mamba prefix caching; "
+                    "set enable_prefix_caching=False."
+                )
+                assert self.num_speculative_tokens == 0, (
+                    "batch_invariant_mode for Mamba dynamic inference only supports "
+                    "one-token decode; set num_speculative_tokens=0."
+                )
+                assert self.mamba_ssm_states_dtype == torch.float32, (
+                    "batch_invariant_mode requires FP32 Mamba SSM states so state-passing "
+                    "boundaries are not rounded between decode chunks."
+                )
 
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
@@ -393,7 +475,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 model_config, vp_stage=None, pp_rank=pp_rank
             )
             self.num_mamba_layers = 0
-            (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
+            self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
         if self.num_attention_layers == 0:
@@ -499,7 +581,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - mamba_memory_ratio))
 
             block_count = buffer_size_bytes // self.block_size_bytes
-            block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
+            block_count = max(2, block_count)  # need >= 1 usable block + 1 dummy block
             paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
         elif self.is_hybrid_model and inference_config.max_requests is not None:
             # Auto-derive mamba/KV split from max_requests. Allocate exactly enough
@@ -513,19 +595,19 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             mamba_max_requests = inference_config.max_requests
 
-            # Subtract mamba memory proportionally from active and paused buffers.
+            # Subtract Mamba memory proportionally from both configured buffer inputs.
             mamba_memory_ratio = mamba_memory_needed / total_memory
             buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
             paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - mamba_memory_ratio))
 
             block_count = buffer_size_bytes // self.block_size_bytes
-            block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
+            block_count = max(2, block_count)  # need >= 1 usable block + 1 dummy block
             paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
         else:
             block_count = buffer_size_bytes // (
                 self.block_size_bytes + mamba_states_memory_per_request
             )
-            block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
+            block_count = max(2, block_count)  # need >= 1 usable block + 1 dummy block
             paused_block_count = paused_buffer_size_bytes // (
                 self.block_size_bytes + mamba_states_memory_per_request
             )
@@ -550,12 +632,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.kv_block_allocator = KVBlockAllocator(
             context=self,
-            total_count=(
+            pool_size=(
                 block_count if self.unified_memory_level == 0 else block_count + paused_block_count
             ),
-            paused_count=paused_block_count,
+            paused_limit=paused_block_count,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
+        )
+        self.dynamo_helper = DynamoHelper()
+        self.kv_block_allocator.add_blocks_deregistered_observer(
+            self.dynamo_helper.on_kv_blocks_deregistered
         )
 
         # Track request metadata.
@@ -580,7 +666,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Set max_requests, max_tokens.
         if inference_config.max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.
-            self.max_requests = self.kv_block_allocator.total_count - 1  # -1 for dummy block
+            self.max_requests = self.kv_block_allocator.pool_size - 1  # -1 for dummy block
 
             # Adjust max_requests for Mamba memory constraints if necessary
             if self.is_hybrid_model and mamba_max_requests < self.max_requests:
@@ -619,7 +705,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.non_graph_attn_metadata = {}
 
         self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
-            block_count_total=self.kv_block_allocator.total_count,
+            block_count_total=self.kv_block_allocator.pool_size,
             max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
@@ -627,7 +713,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         self.non_graph_attn_metadata["mha_metadata"] = NonGraphedMHAMetadata(
-            block_count_total=self.kv_block_allocator.total_count,
+            block_count_total=self.kv_block_allocator.pool_size,
             max_kv_block_count=self.max_kv_block_count,
             max_requests=self.max_requests,
             block_size_tokens=self.block_size_tokens,
@@ -721,6 +807,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
+        if self.batch_invariant_mode and self.is_hybrid_model and self.enable_chunked_prefill:
+            # A chunk plus its final token must fit in one step; otherwise a prompt
+            # of that length can never advance without an invalid one-token tail.
+            assert self.max_tokens > self.mamba_chunk_size, (
+                "batch-invariant Mamba chunked prefill requires max_tokens > "
+                f"mamba_chunk_size ({self.mamba_chunk_size})."
+            )
 
         # FlashInfer.
         if inference_config.use_flashinfer_fused_rope is True:
@@ -748,12 +841,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
-        active_blocks = self.kv_block_allocator.active_count
-        total_blocks = self.kv_block_allocator.total_count
-        paused_blocks = self.kv_block_allocator.paused_count
-        active_kv_bytes = active_blocks * self.block_size_bytes
-        total_kv_bytes = total_blocks * self.block_size_bytes
-        paused_kv_bytes = paused_blocks * self.block_size_bytes
+        pool_size = self.kv_block_allocator.pool_size
+        usable_blocks = pool_size - 1
+        paused_limit = self.kv_block_allocator.paused_limit
+        pool_size_bytes = pool_size * self.block_size_bytes
+        usable_bytes = usable_blocks * self.block_size_bytes
+        paused_limit_bytes = paused_limit * self.block_size_bytes
 
         log_lines = [
             "DynamicInferenceContext: configuration summary",
@@ -764,9 +857,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"  max_kv_blocks_per_req:   {self.max_kv_block_count}",
             f"  KV cache:",
             f"    block_size_bytes:      {get_mem_size_str(self.block_size_bytes)}",
-            f"    active_blocks:         {active_blocks} ({get_mem_size_str(active_kv_bytes)})",
-            f"    paused_blocks:         {paused_blocks} ({get_mem_size_str(paused_kv_bytes)})",
-            f"    total_blocks:          {total_blocks} ({get_mem_size_str(total_kv_bytes)})",
+            f"    pool_size:             {pool_size} ({get_mem_size_str(pool_size_bytes)})",
+            f"    usable_blocks:         {usable_blocks} ({get_mem_size_str(usable_bytes)})",
+            f"    paused_limit:          {paused_limit} "
+            f"({get_mem_size_str(paused_limit_bytes)})",
         ]
 
         if self.is_hybrid_model:
@@ -837,7 +931,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.memory_buffer = torch.empty(
                 (
                     self.num_attention_layers,
-                    self.kv_block_allocator.total_count,
+                    self.kv_block_allocator.pool_size,
                     self.block_size_tokens,
                     self.kv_reduced_dim,
                 ),
@@ -849,7 +943,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (
                     2,  # key and value
                     self.num_attention_layers,
-                    self.kv_block_allocator.total_count,
+                    self.kv_block_allocator.pool_size,
                     self.block_size_tokens,
                     self.num_attention_heads_per_partition,
                     self.hidden_size_per_attention_head,
@@ -876,6 +970,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_intermediate_count=self.max_mamba_intermediate_states_per_step,
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
+                decode_indices_dtype=self._mamba_decode_indices_dtype,
             )
             # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
             # fields ride along with the single coalesced H2D in
@@ -1006,6 +1101,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             device='cpu',
             pin_memory=True,
         )
+        self._async_sched_token_offsets = torch.arange(
+            self.num_speculative_tokens + 1, device='cpu'
+        )
 
         # Track request metadata. Backed by pinned CPU memory: bookkeeping is
         # CPU-resident; GPU consumers read from the active-slice mirror in
@@ -1077,12 +1175,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         # Mamba section (hybrid models only). Must match the MambaMetadata
         # shapes (mirrors the layout documented in ContextGPUView).
-        # batch_indices_decode is int64; all other fields are int32.
+        # batch_indices_decode is int32 in batch-invariant mode and int64 otherwise;
+        # all other fields are int32.
         if self.is_hybrid_model:
-            # mamba_batch_indices_decode is int64; pad to 8-byte alignment.
-            _mamba_align_pad = (8 - _pre_mamba_bytes % 8) % 8
+            self._mamba_decode_indices_dtype = (
+                torch.int32 if self.batch_invariant_mode else torch.int64
+            )
+            _decode_index_bytes = 4 if self.batch_invariant_mode else 8
+            _mamba_align_pad = (
+                _decode_index_bytes - _pre_mamba_bytes % _decode_index_bytes
+            ) % _decode_index_bytes
             self._max_mamba_chunks = self.max_tokens // self.mamba_chunk_size + self.max_requests
-            _mamba_batch_indices_decode_bytes = self.max_requests * 8
+            _mamba_batch_indices_decode_bytes = self.max_requests * _decode_index_bytes
             _mamba_batch_indices_prefill_bytes = self.max_requests * 4
             _mamba_seq_idx_bytes = self.max_tokens * 4
             _mamba_cu_seqlens_bytes = (self.max_requests + 1) * 4
@@ -1246,7 +1350,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             _off += _mamba_align_pad
             self._cpu_mamba_batch_indices_decode = self._cpu_bookkeeping_buf[
                 _off : _off + _mamba_batch_indices_decode_bytes
-            ].view(torch.int64)
+            ].view(self._mamba_decode_indices_dtype)
             _off += _mamba_batch_indices_decode_bytes
             self._cpu_mamba_batch_indices_prefill = self._cpu_bookkeeping_buf[
                 _off : _off + _mamba_batch_indices_prefill_bytes
@@ -1293,6 +1397,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_kv_blocks=self.max_kv_block_count,
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
+            mamba_decode_indices_dtype=(
+                self._mamba_decode_indices_dtype if self.is_hybrid_model else torch.int64
+            ),
         )
         self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
@@ -2363,10 +2470,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._cpu_mha_cu_kv_seq_lengths[real_bs]
             )
 
-        # Block table: [0:real_bs] real, [real_bs:padded_bs] = -1 sentinel.
+        # Block table: [0:real_bs] real, [real_bs:padded_bs] = dummy block.
         self._cpu_mha_block_table[:real_bs] = request_to_kv_block_ids_view[:real_bs]
         if real_bs < padded_bs:
-            self._cpu_mha_block_table[real_bs:padded_bs] = -1
+            self._cpu_mha_block_table[real_bs:padded_bs] = self.kv_block_allocator.dummy_block_idx
 
         # Max sequence lengths (Python scalars; consumed as kernel launch args).
         if not self.using_cuda_graph_this_step() and real_bs > 0:
@@ -2575,8 +2682,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return done_event
 
-    def copy_async_sched_sample_to_forward(self, sampled_tokens_cuda: Tensor) -> None:
-        """Populate GPU input token IDs from sampled CUDA tokens for async scheduled decode.
+    def copy_async_sched_sample_to_forward(
+        self, sampled_tokens_cuda: Tensor, sampled_mtp_tokens_cuda: Optional[Tensor] = None
+    ) -> None:
+        """Populate GPU input token IDs from sampled CUDA tokens for async scheduling.
 
         Async scheduling keeps sampled tokens GPU-resident for the next decode
         forward. CPU bookkeeping is prepared independently and published later;
@@ -2586,16 +2695,33 @@ class DynamicInferenceContext(BaseInferenceContext):
         Args:
             sampled_tokens_cuda (Tensor): 1D CUDA tensor containing one sampled
                 token per active decode request.
+            sampled_mtp_tokens_cuda (Optional[Tensor]): MTP draft tokens with shape
+                ``[num_speculative_tokens, active_request_count]``.
         """
         active_request_count = self.total_request_count - self.paused_request_count
 
-        self.gpu_view.token_to_input_ids[:active_request_count].copy_(
-            sampled_tokens_cuda, non_blocking=True
+        if self.num_speculative_tokens > 0:
+            expected_shape = (self.num_speculative_tokens, active_request_count)
+            if sampled_mtp_tokens_cuda is None or tuple(sampled_mtp_tokens_cuda.shape) != (
+                expected_shape
+            ):
+                actual_shape = (
+                    None if sampled_mtp_tokens_cuda is None else sampled_mtp_tokens_cuda.shape
+                )
+                raise RuntimeError(
+                    f"Expected MTP draft token shape {expected_shape}, got {actual_shape}."
+                )
+
+        tokens_per_request = self.num_speculative_tokens + 1
+        token_count = active_request_count * tokens_per_request
+        grouped_tokens = self.gpu_view.token_to_input_ids[:token_count].view(
+            active_request_count, tokens_per_request
         )
-        if active_request_count < self.padded_active_token_count:
-            self.gpu_view.token_to_input_ids[
-                active_request_count : self.padded_active_token_count
-            ].zero_()
+        grouped_tokens[:, 0].copy_(sampled_tokens_cuda, non_blocking=True)
+        if sampled_mtp_tokens_cuda is not None:
+            grouped_tokens[:, 1:].copy_(sampled_mtp_tokens_cuda.transpose(0, 1), non_blocking=True)
+        if token_count < self.padded_active_token_count:
+            self.gpu_view.token_to_input_ids[token_count : self.padded_active_token_count].zero_()
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
@@ -2623,7 +2749,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx.fill_(-1)
         self.token_to_local_position_within_kv_block.fill_(0)
 
-    def reset_metadata(self, preserve_prefix_cache: bool = False) -> None:
+    def reset_metadata(
+        self, preserve_prefix_cache: bool = False, *, preserve_counters: bool = False
+    ) -> None:
         """Reset all bookkeeping state: counters, block allocator, attention/mamba state.
 
         This must be called after ``initialize_all_tensors()`` and after any
@@ -2636,17 +2764,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                 step state -- wiping the allocator there would destroy cross-request prefix
                 reuse for any subsequent request (the engine idles between requests at low
                 concurrency, especially with EP > 1).
+            preserve_counters: When True, keep engine-step, prefix-cache clock,
+                prefill-token, and async-scheduling counters intact.
         """
-        # No cache to preserve when prefix caching is off: fall back to a full
-        # reset so the disabled path is byte-identical to the original behavior.
+        # There is no prefix-cache state to preserve when caching is disabled.
         preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
 
         # Reset request/token counts.
         self.total_request_count = 0
         self.active_token_count = 0
-        self.lifetime_prefill_token_count = 0
-        self.async_sched_step_count = 0
-        self.async_sched_compaction_step_count = 0
+        if not preserve_counters:
+            self.lifetime_prefill_token_count = 0
+            self.async_sched_step_count = 0
+            self.async_sched_compaction_step_count = 0
         self.paused_request_count = 0
         self.batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
@@ -2675,7 +2805,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
 
-    def reset(self, preserve_prefix_cache: bool = False) -> None:
+    def reset(
+        self, preserve_prefix_cache: bool = False, *, preserve_counters: bool = False
+    ) -> None:
         """Reset entire context.
 
         This method does:
@@ -2689,28 +2821,29 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Args:
             preserve_prefix_cache: When True, keep the KV and Mamba prefix-cache
-                state (hash indices, cached blocks/slots, LRU clock) intact. Used by
+                state (hash indices and cached blocks/slots) intact. Used by
                 the idle ``dummy_forward`` path so an idle step between requests does
                 not destroy cross-request prefix reuse.
+            preserve_counters: When True, keep engine-step, prefix-cache clock,
+                prefill-token, and async-scheduling counters intact.
         """
-        # No cache to preserve when prefix caching is off: fall back to a full
-        # reset so the disabled path is byte-identical to the original behavior.
+        # There is no prefix-cache state to preserve when caching is disabled.
         preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
+        self.dynamo_helper.discard_pending_kv_stored_events()
         self.reset_tensors()
-        self.reset_metadata(preserve_prefix_cache=preserve_prefix_cache)
+        self.reset_metadata(
+            preserve_prefix_cache=preserve_prefix_cache, preserve_counters=preserve_counters
+        )
 
-        # Reset lifetime counters (not reset in reset_metadata, which is also
-        # called during suspend/resume where these must persist).
-        if not preserve_prefix_cache:
+        if not preserve_counters:
             self.step_count = 0
             self.prefix_cache_lru_clock = 0
 
-            # Reset Mamba cache state
-            if self.mamba_slot_allocator is not None:
-                self.mamba_slot_allocator.reset()
-        # When preserving prefix cache (idle dummy_forward), keep step_count
-        # monotonic so the engine's periodic logging cadence
-        # (step_count % logging_step_interval) still fires for short requests.
+        # Reset Mamba cache state.
+        if not preserve_prefix_cache and self.mamba_slot_allocator is not None:
+            self.mamba_slot_allocator.reset()
+        if not preserve_prefix_cache:
+            self.dynamo_helper.notify_kv_cache_cleared()
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
@@ -2937,7 +3070,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
 
-        (matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
+        matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
             self._compute_prefix_match(req, req.remaining_prompt_length)
         )
 
@@ -3193,6 +3326,20 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.kv_block_allocator.register_kv_block_hashes(
                     block_ids_to_hash, block_hashes_slice, parent_hashes_slice
                 )
+                if self.dynamo_helper.has_kv_event_listeners:
+                    token_start = start * self.block_size_tokens
+                    token_end = end * self.block_size_tokens
+                    token_ids = req.prompt_tokens[token_start:token_end].tolist()
+                    self.dynamo_helper.queue_kv_stored_event(
+                        {
+                            "block_hashes": list(block_hashes_slice),
+                            "token_ids": token_ids,
+                            "num_block_tokens": [self.block_size_tokens] * (end - start),
+                            "parent_hash": (
+                                int(req.precomputed_block_hashes[start - 1]) if start > 0 else None
+                            ),
+                        }
+                    )
 
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))
@@ -3356,53 +3503,117 @@ class DynamicInferenceContext(BaseInferenceContext):
             sa._intermediate_block_ids_cpu[request_indexes] = -1
             sa._eos_cache_block_id_cpu[request_indexes] = -1
 
+    def _get_paused_request_count_within_block_budget(self) -> int:
+        """Count the left-most paused requests whose blocks fit the paused budget."""
+        block_budget = self.kv_block_allocator.paused_limit
+        if self.paused_request_count == 0 or block_budget == 0:
+            return 0
+
+        if not self.enable_prefix_caching:
+            paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
+            cumulative_block_counts = paused_block_counts.cumsum(dim=0)
+            return int(torch.count_nonzero(cumulative_block_counts <= block_budget).item())
+
+        seen_block_ids: set[int] = set()
+        retained_request_count = 0
+        for request_idx in range(self.paused_request_count):
+            block_ids = self.request_to_kv_block_ids[request_idx]
+            seen_block_ids.update(block_ids[block_ids >= 0].tolist())
+            if len(seen_block_ids) > block_budget:
+                break
+            retained_request_count += 1
+        return retained_request_count
+
+    def _get_releasable_block_counts(
+        self, request_start_idx: int, request_end_idx: int
+    ) -> list[int]:
+        """Count blocks made allocatable by each right-most request suffix.
+
+        The returned list has one entry for every possible suffix length, including
+        zero. For prefix caching, a shared block is credited only once all selected
+        request references account for its current allocator reference count.
+        """
+        suffix_request_count = request_end_idx - request_start_idx
+        releasable_counts = [0] * (suffix_request_count + 1)
+        if suffix_request_count == 0:
+            return releasable_counts
+
+        if not self.enable_prefix_caching:
+            suffix_block_counts = (
+                self.request_kv_block_counts[request_start_idx:request_end_idx]
+                .flip(dims=[0])
+                .cumsum(dim=0)
+            )
+            return [0, *suffix_block_counts.tolist()]
+
+        block_rows = self.request_to_kv_block_ids[request_start_idx:request_end_idx]
+        request_offsets, block_offsets = torch.where(block_rows >= 0)
+        if request_offsets.numel() == 0:
+            return releasable_counts
+
+        block_ids = block_rows[request_offsets, block_offsets].long()
+        unique_block_ids, inverse, selected_reference_counts = torch.unique(
+            block_ids, return_inverse=True, return_counts=True
+        )
+        current_reference_counts = self.kv_block_allocator.block_ref_counts[unique_block_ids]
+        assert torch.all(
+            selected_reference_counts <= current_reference_counts
+        ), "selected more KV block references than the allocator owns"
+
+        # A fully selected block becomes releasable when the suffix reaches its
+        # left-most reference.
+        suffix_depths = suffix_request_count - request_offsets
+        release_suffix_depths = torch.zeros_like(unique_block_ids)
+        release_suffix_depths.scatter_reduce_(
+            0, inverse, suffix_depths, reduce="amax", include_self=True
+        )
+        fully_selected = selected_reference_counts == current_reference_counts
+        releases_by_suffix = torch.bincount(
+            release_suffix_depths[fully_selected], minlength=suffix_request_count + 1
+        )
+        return releases_by_suffix.cumsum(dim=0).tolist()
+
     def resume_paused_requests(
-        self, active_request_count: int, newly_paused_request_ids: torch.Tensor
-    ) -> tuple[int, torch.Tensor]:
-        """Resume as many paused requests as we have space for in the active buffer.
+        self, active_request_count: int, newly_paused_request_ids: Optional[torch.Tensor]
+    ) -> tuple[int, Optional[torch.Tensor]]:
+        """Resume as many paused requests as compute and KV capacity permit.
 
         Args:
             active_request_count (int): Number of active requests.
-            newly_paused_request_ids (torch.Tensor): List of newly paused request ids.
-            next_tokens (torch.Tensor): Sampled tokens.
+            newly_paused_request_ids (Optional[torch.Tensor]): Newly paused request ids.
 
         Returns:
-            (tuple[int, torch.Tensor]) active_request_count, newly_paused_request_ids.
+            (tuple[int, Optional[torch.Tensor]]) Updated active count and newly paused ids.
         """
 
         # Assign released blocks to paused requests.
         # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
         resume_request_count = 0
         if self.paused_request_count > 0:
-            active_block_count_avail = self.kv_block_allocator.get_active_avail()
-            # Clone not needed: flip() makes a copy.
-            paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
-            # Flip counts before cumsum, since paused requests are resumed from
-            # the right-most index, so we must count resumed blocks starting from
-            # the right side.
-            paused_block_counts = paused_block_counts.flip(dims=[0])
-
-            # Check which paused requests will actually need a new block upon resuming
+            # Check which paused requests will actually need a new block upon
+            # resuming. Flip before cumsum because requests resume from the right.
             offsets = self.request_last_kv_block_offset[: self.paused_request_count]
             needs_new_block = (
                 offsets >= self.block_size_tokens - 1 - self.num_speculative_tokens
-            ).to(paused_block_counts.dtype)
+            ).to(self.request_kv_block_counts.dtype)
             needs_new_block = needs_new_block.flip(dims=[0])
-
-            # Add +1 ONLY to the block counts of requests that finished their previous memory block
-            paused_block_counts += needs_new_block
-            paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-            resume_request_count = min(
-                torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel(),
-                self.kv_block_allocator.total_avail,
-            )
 
             # Constrain resumptions by the maximum allowed active requests and tokens
             max_allowed_active = min(
                 self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
             )
             allowed_to_resume = max(0, max_allowed_active - active_request_count)
-            resume_request_count = min(resume_request_count, allowed_to_resume)
+            candidate_count = min(self.paused_request_count, allowed_to_resume)
+
+            if candidate_count > 0:
+                new_block_counts_cumsum = needs_new_block[:candidate_count].cumsum(dim=0)
+                max_new_block_count = int(new_block_counts_cumsum[-1].item())
+                block_count_avail = self.kv_block_allocator.pool_avail
+                if max_new_block_count > block_count_avail:
+                    block_count_avail = self.kv_block_allocator.get_allocatable_count()
+                resume_request_count = int(
+                    torch.count_nonzero(new_block_counts_cumsum <= block_count_avail).item()
+                )
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
@@ -3418,8 +3629,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_new_blocks = needs_new_block.sum().item()
 
             if num_new_blocks > 0:
-                assert num_new_blocks <= self.kv_block_allocator.total_avail
                 block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
+                assert (
+                    block_ids is not None and block_ids.numel() == num_new_blocks
+                ), f"failed to allocate {num_new_blocks} blocks for resumed requests"
 
                 # Apply updates only to the requests that required a new block
                 relative_row_idx = torch.nonzero(needs_new_block).squeeze(1)
@@ -3445,53 +3658,65 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count: int,
         next_tokens: torch.Tensor,
         new_speculative_tokens: Optional[torch.Tensor] = None,
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        """Evict requests that overflow the paused buffer.
+    ) -> Optional[torch.Tensor]:
+        """Evict requests that overflow the paused-block retention budget.
 
         Args:
             active_request_count (int): Number of active requests.
             next_tokens (torch.Tensor): Sampled tokens.
+            new_speculative_tokens (Optional[torch.Tensor]): Speculative tokens.
 
         Returns:
-            (torch.Tensor) Evicted request ids.
+            (Optional[torch.Tensor]) Evicted request ids.
         """
 
-        # Overflow paused block count.
-        overflow_paused_block_count = (
-            self.kv_block_allocator.get_paused_used() - self.kv_block_allocator.paused_count
-        )
-
-        # Nothing to evict?
-        if overflow_paused_block_count <= 0:
-            return None
-
-        # Overflow paused block count.
-        paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
-        paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-        valid_paused_request_count = torch.nonzero(
-            paused_block_counts_cumsum <= self.kv_block_allocator.paused_count
-        ).numel()
-        overflow_paused_request_count = self.paused_request_count - valid_paused_request_count
-
-        # Nothing to evict? (Similar to checking overflow_paused_block_count
-        # above, but here we allow up to one paused request to overflow into the
-        # active buffer.
+        # Keep the largest left-most paused prefix that fits the configured
+        # paused-block retention budget. Requests to its right must either resume
+        # or be evicted.
+        retained_paused_request_count = self._get_paused_request_count_within_block_budget()
+        overflow_paused_request_count = self.paused_request_count - retained_paused_request_count
         if overflow_paused_request_count == 0:
             return None
 
-        # Evict request count. (Flip paused_block_counts because evictions are
-        # counted from the right-most paused requests.
-        paused_block_counts = paused_block_counts[-overflow_paused_request_count:].flip(dims=[0])
-        paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-        remaining_paused_request_counts = torch.arange(
-            overflow_paused_request_count - 1,
-            -1,
-            -1,
-            dtype=paused_block_counts_cumsum.dtype,
-            device='cpu',
+        max_allowed_active = min(
+            self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
         )
-        net_block_counts = paused_block_counts_cumsum - remaining_paused_request_counts
-        evict_request_count = torch.nonzero(net_block_counts >= 0)[0].item() + 1
+        allowed_to_resume = max(0, max_allowed_active - active_request_count)
+
+        needs_new_block = (
+            self.request_last_kv_block_offset[: self.paused_request_count]
+            >= self.block_size_tokens - 1 - self.num_speculative_tokens
+        )
+        overflow_needs_new_block = needs_new_block[
+            retained_paused_request_count : self.paused_request_count
+        ]
+        releasable_block_counts = self._get_releasable_block_counts(
+            retained_paused_request_count, self.paused_request_count
+        )
+        new_block_counts_by_survivor_count = overflow_needs_new_block.cumsum(dim=0)
+        new_block_counts_by_survivor_count = torch.cat(
+            (new_block_counts_by_survivor_count.new_zeros(1), new_block_counts_by_survivor_count)
+        )
+        block_count_avail = self.kv_block_allocator.get_allocatable_count()
+
+        # Preserve current ordering: evict the smallest right-most suffix whose
+        # physical releases let every remaining overflow request resume.
+        evict_request_count = None
+        for candidate_evict_count in range(overflow_paused_request_count + 1):
+            survivor_count = overflow_paused_request_count - candidate_evict_count
+            if survivor_count > allowed_to_resume:
+                continue
+            survivor_new_block_count = int(
+                new_block_counts_by_survivor_count[survivor_count].item()
+            )
+            candidate_avail = block_count_avail + releasable_block_counts[candidate_evict_count]
+            if survivor_new_block_count <= candidate_avail:
+                evict_request_count = candidate_evict_count
+                break
+
+        assert evict_request_count is not None
+        if evict_request_count == 0:
+            return None
 
         # Eviction index range.
         evict_start_idx = self.paused_request_count - evict_request_count
@@ -3553,17 +3778,42 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
+    def _get_async_sched_rows_requiring_new_block(self) -> Tensor:
+        """Return active request rows that need a block during the next prepare.
+
+        Returns:
+            Tensor: Boolean mask over active request rows.
+        """
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        tokens_per_request = self.num_speculative_tokens + 1
+        return (
+            self.request_last_kv_block_offset[active_slice] + tokens_per_request
+            >= self.block_size_tokens
+        )
+
+    def can_prepare_requests(self) -> bool:
+        """Return whether requests can be prepared without lifecycle changes.
+
+        Returns:
+            bool: Whether all requests are active decode requests and the shared
+                KV-block pool can satisfy the exact next-step allocation demand.
+        """
+        if self.num_prefill_requests != 0 or self.paused_request_count != 0:
+            return False
+
+        rows_requiring_new_block = self._get_async_sched_rows_requiring_new_block()
+        num_new_blocks = int(rows_requiring_new_block.sum().item())
+        return num_new_blocks <= self.kv_block_allocator.get_allocatable_count()
+
     def prepare_requests(self) -> None:
         """Speculatively prepare active decode requests for the next forward pass.
 
         Async scheduling only supports decode-only steps with no pause,
-        evict, or resume lifecycle changes. If preparing the next token would
-        require one of those lifecycle changes, this method raises and the caller
-        should treat async scheduling as unsupported for that workload.
+        evict, or resume lifecycle changes. If preparation cannot allocate the
+        required KV blocks without a lifecycle change, this method raises. The
+        prepared decode layout establishes the active token count.
         """
         active_request_count = self.total_request_count - self.paused_request_count
-        if self.num_speculative_tokens != 0:
-            raise RuntimeError("Async scheduling does not support speculative tokens.")
         if self.num_prefill_requests != 0:
             raise RuntimeError("Async scheduling only supports decode-only steps.")
         if self.paused_request_count != 0:
@@ -3574,58 +3824,85 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         active_slice = slice(0, active_request_count)
-        rows_requiring_new_block = (
-            self.request_last_kv_block_offset[active_slice] >= self.block_size_tokens - 1
-        )
-        num_new_blocks = rows_requiring_new_block.sum().item()
+        tokens_per_request = self.num_speculative_tokens + 1
+        last_block_offsets = self.request_last_kv_block_offset[active_slice]
+        token_offsets = self._async_sched_token_offsets
+        rows_requiring_new_block = self._get_async_sched_rows_requiring_new_block()
+        num_new_blocks = int(rows_requiring_new_block.sum().item())
+
+        block_ids = None
         if num_new_blocks > 0:
-            active_block_count_avail = self.kv_block_allocator.get_active_avail()
-            if num_new_blocks > active_block_count_avail:
+            if num_new_blocks > self.kv_block_allocator.get_allocatable_count():
                 raise RuntimeError("Async scheduling cannot pause requests to allocate new blocks.")
 
             block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
             if block_ids is None:
                 raise RuntimeError("Async scheduling cannot evict requests to allocate new blocks.")
 
+        self.active_token_count = active_request_count * tokens_per_request
+        active_token_slice = slice(0, self.active_token_count)
+        grouped_token_block_ids = self.token_to_block_idx[active_token_slice].view(
+            active_request_count, tokens_per_request
+        )
+        grouped_token_block_ids.copy_(self.request_last_kv_block_id[active_slice, None])
+
+        if block_ids is not None:
             row_idx = torch.nonzero(rows_requiring_new_block, as_tuple=True)[0]
             col_idx = self.request_kv_block_counts[row_idx]
             self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
             self.request_kv_block_counts[row_idx] += 1
             self.request_last_kv_block_id[row_idx] = block_ids
+            grouped_token_block_ids[row_idx] = torch.where(
+                last_block_offsets[row_idx, None] + 1 + token_offsets[None, :]
+                >= self.block_size_tokens,
+                block_ids[:, None],
+                grouped_token_block_ids[row_idx],
+            )
 
         self.request_kv_length_offsets[active_slice].add_(self.request_query_lengths[active_slice])
-        self.request_query_lengths[active_slice].fill_(1)
-
+        self.request_query_lengths[active_slice].fill_(tokens_per_request)
         self.request_last_kv_block_offset[active_slice] = (
-            self.request_last_kv_block_offset[active_slice] + 1
+            last_block_offsets + tokens_per_request
         ) % self.block_size_tokens
 
-        self.active_token_count = active_request_count
-        self.token_to_pos_ids[:active_request_count] = self.request_kv_length_offsets[active_slice]
-        self.token_to_request_idx[:active_request_count] = torch.arange(
-            active_request_count, device='cpu'
+        token_positions = (
+            self.request_kv_length_offsets[active_slice, None] + token_offsets[None, :]
         )
-        self.token_to_position_in_request[:active_request_count] = self.token_to_pos_ids[
-            :active_request_count
+        token_request_idxs = torch.arange(active_request_count, device='cpu').repeat_interleave(
+            tokens_per_request
+        )
+        self.token_to_pos_ids[active_token_slice] = token_positions.flatten()
+        self.token_to_request_idx[active_token_slice] = token_request_idxs
+        self.token_to_position_in_request[active_token_slice] = self.token_to_pos_ids[
+            active_token_slice
         ]
-        self.token_to_local_position_within_kv_block[:active_request_count] = (
-            self.token_to_pos_ids[:active_request_count] % self.block_size_tokens
+        self.token_to_local_position_within_kv_block[active_token_slice] = (
+            self.token_to_pos_ids[active_token_slice] % self.block_size_tokens
         )
-        self.token_to_block_idx[:active_request_count] = self.request_last_kv_block_id[active_slice]
 
-    def commit_sampled_tokens(self, sampled_tokens_cpu: Tensor) -> None:
+    def commit_sampled_tokens(
+        self, sampled_tokens_cpu: Tensor, sampled_mtp_tokens_cpu: Optional[Tensor] = None
+    ) -> None:
         """Commit sampled CPU token IDs to the prepared request state.
 
-        This updates the CPU source of truth used by resolution. Async
+        This establishes the post-resolution active token count and populates
+        the CPU input-ID staging rows in survivor order. Overlapped async
         scheduling has already copied the same samples into the live GPU input
         view for the speculative forward.
 
         Args:
             sampled_tokens_cpu (Tensor): Sampled CPU token for each active request.
+            sampled_mtp_tokens_cpu (Optional[Tensor]): MTP draft tokens with shape
+                ``[num_speculative_tokens, active_request_count]``.
         """
         assert sampled_tokens_cpu.device == torch.device(
             'cpu'
         ), "Sampled tokens must be on the CPU before they are committed."
+
+        if sampled_mtp_tokens_cpu is not None:
+            assert sampled_mtp_tokens_cpu.device == torch.device(
+                'cpu'
+            ), "MTP draft tokens must be on the CPU before they are committed."
 
         active_request_count = self.total_request_count - self.paused_request_count
         if sampled_tokens_cpu.numel() != active_request_count:
@@ -3633,28 +3910,52 @@ class DynamicInferenceContext(BaseInferenceContext):
                 f"Expected {active_request_count} new tokens, got {sampled_tokens_cpu.numel()}."
             )
 
-        self.token_to_input_ids[:active_request_count] = sampled_tokens_cpu
+        expected_mtp_shape = (self.num_speculative_tokens, active_request_count)
+        if self.num_speculative_tokens == 0:
+            if sampled_mtp_tokens_cpu is not None and sampled_mtp_tokens_cpu.numel() != 0:
+                raise RuntimeError(
+                    "Received MTP draft tokens when speculative decoding is disabled."
+                )
+        else:
+            if sampled_mtp_tokens_cpu is None or tuple(sampled_mtp_tokens_cpu.shape) != (
+                expected_mtp_shape
+            ):
+                actual_shape = (
+                    None if sampled_mtp_tokens_cpu is None else sampled_mtp_tokens_cpu.shape
+                )
+                raise RuntimeError(
+                    f"Expected MTP draft token shape {expected_mtp_shape}, got {actual_shape}."
+                )
 
-    def resolve_requests(self, active_requests_mask: Tensor) -> Tensor:
+        tokens_per_request = self.num_speculative_tokens + 1
+        active_token_count = active_request_count * tokens_per_request
+        self.active_token_count = active_token_count
+        grouped_tokens = self.token_to_input_ids[:active_token_count].view(
+            active_request_count, tokens_per_request
+        )
+        grouped_tokens[:, 0] = sampled_tokens_cpu
+        if sampled_mtp_tokens_cpu is not None:
+            grouped_tokens[:, 1:] = sampled_mtp_tokens_cpu.transpose(0, 1)
+
+    def resolve_requests(self, active_requests_mask: Tensor) -> Tuple[Tensor, Tensor]:
         """Resolve finished requests after an async scheduling forward pass.
 
-        Async scheduling supports only request completion. The active request rows
-        and current decode-token rows are compacted in survivor order so any
-        following legacy or async scheduling step sees a consistent context.
+        Prefill requests transition to decode during resolution. Request rows use
+        the same hole-filling order as ``update_requests`` so seeded sampling stays
+        consistent with legacy scheduling. Token tensors and the active token
+        count are left untouched; prepare rebuilds derived token metadata and the
+        controller commits sampled input IDs after resolution.
 
         Args:
             active_requests_mask (Tensor): 1D mask marking requests that remain active.
 
         Returns:
-            Tensor: Request IDs for requests that finished during resolution.
+            Tuple[Tensor, Tensor]: Request IDs that finished and source row indices
+                for surviving requests in their resolved destination order.
         """
         if active_requests_mask.is_cuda:
             active_requests_mask = active_requests_mask.cpu()
 
-        if self.num_speculative_tokens != 0:
-            raise RuntimeError("Async scheduling does not support speculative tokens.")
-        if self.num_prefill_requests != 0:
-            raise RuntimeError("Async scheduling only supports decode-only steps.")
         if self.paused_request_count != 0:
             raise RuntimeError("Async scheduling does not support paused requests.")
 
@@ -3665,29 +3966,38 @@ class DynamicInferenceContext(BaseInferenceContext):
                 f"got {active_requests_mask.numel()}."
             )
 
-        survivor_idxs = torch.nonzero(active_requests_mask == 1, as_tuple=True)[0]
+        self.num_prefill_requests = 0
+        self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0
+
         finished_idxs = torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
         finished_request_ids = self.request_ids[finished_idxs].clone()
+
+        active_request_count = int(active_requests_mask.sum().item())
+        survivor_idxs = torch.arange(active_request_count, device='cpu')
+        finished_idxs_on_left = torch.nonzero(
+            active_requests_mask[:active_request_count] == 0, as_tuple=True
+        )[0]
+        active_idxs_on_right = (
+            torch.nonzero(active_requests_mask[active_request_count:] == 1, as_tuple=True)[0]
+            + active_request_count
+        )
+        assert finished_idxs_on_left.numel() == active_idxs_on_right.numel()
+        survivor_idxs[finished_idxs_on_left] = active_idxs_on_right
 
         self.reset_attention_state()
 
         if finished_idxs.numel() > 0:
             self.release_memory_blocks_from_request_indexes(finished_idxs)
 
-        active_request_count = survivor_idxs.numel()
         if active_request_count == 0:
             self.request_to_kv_block_ids.fill_(-1)
             self.total_request_count = 0
-            self.active_token_count = 0
             self.reset_mamba_state()
-            return finished_request_ids
+            return finished_request_ids, survivor_idxs
 
         dst_idxs = torch.arange(active_request_count, device='cpu')
         if not torch.equal(survivor_idxs, dst_idxs):
             self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[survivor_idxs]
-            self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
-                survivor_idxs
-            ]
             self.request_query_lengths[dst_idxs] = self.request_query_lengths[survivor_idxs]
             self.request_output_lengths[dst_idxs] = self.request_output_lengths[survivor_idxs]
             self.request_ids[dst_idxs] = self.request_ids[survivor_idxs]
@@ -3697,25 +4007,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[
                 survivor_idxs
             ]
+            if self.is_hybrid_model:
+                self.mamba_metadata.request_to_mamba_state_idx[dst_idxs] = (
+                    self.mamba_metadata.request_to_mamba_state_idx[survivor_idxs]
+                )
             for metadata_tensor in self.request_metadata.values():
                 metadata_tensor[dst_idxs] = metadata_tensor[survivor_idxs]
-
-            self.token_to_input_ids[dst_idxs] = self.token_to_input_ids[survivor_idxs]
-            self.token_to_pos_ids[dst_idxs] = self.token_to_pos_ids[survivor_idxs]
-            self.token_to_block_idx[dst_idxs] = self.token_to_block_idx[survivor_idxs]
-            self.token_to_local_position_within_kv_block[dst_idxs] = (
-                self.token_to_local_position_within_kv_block[survivor_idxs]
-            )
-            self.token_to_position_in_request[dst_idxs] = self.token_to_position_in_request[
-                survivor_idxs
-            ]
-
-        self.token_to_request_idx[:active_request_count] = dst_idxs
         stale_slice = slice(active_request_count, old_active_request_count)
         self.request_to_kv_block_ids[stale_slice] = -1
+        if self.is_hybrid_model:
+            self.mamba_metadata.request_to_mamba_state_idx[stale_slice] = -1
         self.total_request_count = active_request_count
-        self.active_token_count = active_request_count
-        return finished_request_ids
+        return finished_request_ids, survivor_idxs
 
     def update_requests(
         self,
@@ -3965,7 +4268,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_request_count, newly_paused_request_ids
         )
 
-        # 6.b. Evict requests that overflow the paused buffer.
+        # 6.b. Evict requests that overflow the paused-block retention budget.
         evict_request_ids = self.evict_overflow_paused_requests(
             active_request_count, next_tokens, new_speculative_tokens
         )
@@ -3975,8 +4278,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_request_count, newly_paused_request_ids
         )
 
-        assert active_request_count > 0 or self.chunked_prefill_request_id != -1, (
-            "active_request_count == %d with no hidden chunked prefill." % active_request_count
+        assert (
+            active_request_count > 0
+            or self.total_request_count == 0
+            or self.chunked_prefill_request_id != -1
+        ), "active_request_count == %d with %d paused requests and no hidden chunked prefill." % (
+            active_request_count,
+            self.paused_request_count,
         )
 
         # 6.d. Swap the chunked prefill request to the end of the active requests
@@ -4180,25 +4488,83 @@ class DynamicInferenceContext(BaseInferenceContext):
         n_active: int,
         active_query_lengths: Optional[Tensor],
         sampling: Optional[Sampling],
+        row_to_request: Optional[Tensor] = None,
     ) -> Tensor:
-        """Sample the logprobs if desired."""
+        """Calculate raw or sampling-processed per-row log probabilities.
+
+        Args:
+            logits (Tensor): Raw logits with shape `[num_rows, vocab_size]`.
+            n_active (int): Number of active requests represented by the rows.
+            active_query_lengths (Optional[Tensor]): CPU token counts used to
+                map prefill rows to active requests, or `None` for decode.
+            sampling (Optional[Sampling]): Backend providing processed logprobs.
+            row_to_request (Optional[Tensor]): Explicit CPU mapping from each
+                logit row to an active request.
+
+        Returns:
+            Tensor: Per-row log probabilities over the vocabulary.
+        """
         if self.config.logprobs_mode == "raw_logprobs":
             return F.log_softmax(logits, dim=-1)
 
         assert sampling is not None, "processed_logprobs requires a sampling backend"
 
         # Map each logits row to its active request.
-        request_idx = torch.arange(n_active, device=logits.device)
-        row_to_request = (
-            request_idx
-            if active_query_lengths is None
-            else request_idx.repeat_interleave(active_query_lengths)
+        if row_to_request is None and active_query_lengths is not None:
+            row_to_request = torch.arange(n_active).repeat_interleave(active_query_lengths)
+        return sampling.log_probs_kernel(logits, self, token_to_request_index=row_to_request)
+
+    def calculate_log_probs_tensors(
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        only_last_token_logits: Optional[bool] = False,
+        sampling: Optional[Sampling] = None,
+        row_to_request: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Calculate selected-token and full-distribution log probabilities.
+
+        Args:
+            logits (Tensor): Raw model output logits with shape
+                `[1, sequence_length, vocab_size]`.
+            new_tokens (Tensor): Newly sampled tokens for active requests.
+            only_last_token_logits (Optional[bool]): Whether logits contain only
+                each request's final token row.
+            sampling (Optional[Sampling]): Sampling backend used for processed
+                log probabilities.
+            row_to_request (Optional[Tensor]): Explicit CPU mapping from each
+                logit row to an active request.
+
+        Returns:
+            Tuple[Tensor, Tensor]: Selected-token log probabilities flattened in
+                active-token order and the full per-row log-probability tensor.
+        """
+        logits_squeezed = logits.squeeze(0)
+        n_active = self.total_request_count - self.paused_request_count
+
+        if only_last_token_logits or self.is_decode_only():
+            seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
+            active_logits = logits_squeezed[: len(new_tokens)].float()
+            log_probs = self._processed_log_probs(
+                active_logits, n_active, None, sampling, row_to_request
+            )
+            return log_probs[seq_idx, new_tokens], log_probs
+
+        logits_squeezed = logits_squeezed.float()
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        active_query_lengths_cpu = self.request_query_lengths[active_slice]
+        active_query_lengths_gpu = self.gpu_view.request_query_lengths[:n_active]
+
+        # Shift away each request's first prompt token, then insert its sampled token.
+        active_token_ids = self.gpu_view.token_to_input_ids[: self.active_token_count].roll(-1, 0)
+        new_token_idx = active_query_lengths_gpu.cumsum(0) - 1
+        active_token_ids[new_token_idx] = new_tokens
+
+        log_probs = self._processed_log_probs(
+            logits_squeezed, n_active, active_query_lengths_cpu, sampling
         )
-        md = self.active_request_metadata
-        temperature = md["temperature"][:n_active].to(logits.device, torch.float32)[row_to_request]
-        top_k = md["top_k"][:n_active].to(logits.device, torch.long)[row_to_request]
-        top_p = md["top_p"][:n_active].to(logits.device, torch.float32)[row_to_request]
-        return sampling.log_probs_kernel(logits, temperature, top_k, top_p)
+        seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
+        return log_probs[seq_idx, active_token_ids], log_probs
 
     def calculate_log_probs(
         self,
@@ -4223,58 +4589,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             log_probs (Tensor): Used to compute top n logprobs later if required.
         """
 
-        # Calculate log_probs (sequence_length x vocab_size)
-        logits_squeezed = logits.squeeze(0).float()
-        n_active = self.total_request_count - self.paused_request_count
-
-        if only_last_token_logits or self.is_decode_only():
-            seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
-            log_probs = self._processed_log_probs(
-                logits_squeezed[seq_idx], n_active, None, sampling
-            )
-            selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.tolist()], log_probs
-
-        # Get the selected token ids for all tokens.
-        # We shift the active token window left by one to remove the first prompt token for
-        # prefill requests and then set the token ids explicitly for the newly generated tokens.
-        # This is necessary because we calculate the log probs *before* updating the request metadata.
-        #
-        # Example (decode & prefill mix):
-        #
-        #   active_query_lengths: [ 1 | 1 | 2 | 5 ]
-        #
-        #   new_tokens          : [ 52 | 12 | 3 | 86 ]
-        #
-        #   seq_idx             : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]
-        #
-        #   new_token_idx       : [ 0 | 1 | 3 | 8 ]
-        #
-        #   active_token_ids before left shift:
-        #                       : [ 31 | 75 | 45 16 | 90 12 72 24 88 ]
-        #
-        #   active_token_ids after shift:
-        #                       : [ XX | XX | 16 XX | 12 72 24 88 XX ]   (XX = undefined)
-        #
-        #   active_token_ids[new_token_idx] = new_tokens
-        #                       : [ 52 | 12 | 16  3 | 12 72 24 88 86 ]
-        active_token_ids = self.gpu_view.token_to_input_ids[: self.active_token_count].roll(-1, 0)
-        active_query_lengths = self.gpu_view.request_query_lengths[:n_active]
-
-        new_token_idx = active_query_lengths.cumsum(0) - 1
-        active_token_ids[new_token_idx] = new_tokens
-
-        # Compute (possibly processed) log-probs over all active-token rows.
-        log_probs = self._processed_log_probs(
-            logits_squeezed, n_active, active_query_lengths, sampling
+        selected_log_probs, log_probs = self.calculate_log_probs_tensors(
+            logits, new_tokens, only_last_token_logits=only_last_token_logits, sampling=sampling
         )
 
-        # Extract the log probs for only the selected tokens.
-        # (sequence_length x vocab_size) -> (sequence_length)
-        seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
-        selected_log_probs = log_probs[seq_idx, active_token_ids]
+        if only_last_token_logits or self.is_decode_only():
+            return [[lp] for lp in selected_log_probs.tolist()], log_probs
 
-        # Split the log probs across request boundaries
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        active_query_lengths = self.request_query_lengths[active_slice]
         selected_log_probs_list = selected_log_probs.cpu().split(
             active_query_lengths.tolist(), dim=0
         )
@@ -4302,11 +4625,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             }
         """
         # Total usable blocks exclude the reserved dummy block.
-        total_blocks = max(self.kv_block_allocator.total_count - 1, 1)
-        block_count_avail = int(self.kv_block_allocator.total_avail)
+        total_blocks = max(self.kv_block_allocator.pool_size - 1, 1)
+        block_count_avail = int(self.kv_block_allocator.pool_avail)
 
         # Overall allocated blocks in the buffer right now.
-        allocated_blocks = (self.kv_block_allocator.total_count - 1) - block_count_avail
+        allocated_blocks = (self.kv_block_allocator.pool_size - 1) - block_count_avail
         allocated_blocks = int(max(0, allocated_blocks))
 
         # Active unique blocks referenced by current active requests only.

@@ -24,7 +24,7 @@ from torch.distributed import DeviceMesh
 from ..mixed_precision import MixedPrecisionPolicy
 from .indexed_order import IndexedOrder
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
-from .placement import MeshAxis, Placements
+from .placement import Placements
 
 
 class FsdpContext:
@@ -85,7 +85,7 @@ class FsdpModule:
     _name: str | None
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext | None
-    _ready_grad_parameters: set[nn.Parameter]
+    _num_ready_grad_parameters: int
     _num_trainable_parameters: int
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
@@ -104,8 +104,7 @@ class FsdpModule:
         self._name = None
         self._unshard_event = None
         owned_parameters = _collect_owned_parameters(self)
-        axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
-        assert axis_indices == tuple(
+        assert tuple(placements.dp_axes) == tuple(
             range(mesh.ndim)
         ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
         parameter_groups = [
@@ -120,9 +119,9 @@ class FsdpModule:
             for group_parameters in _group_parameters(owned_parameters)
         ]
         self._parameter_groups = tuple(parameter_groups)
-        self._ready_grad_parameters = set()
+        self._num_ready_grad_parameters = 0
         self._num_trainable_parameters = sum(
-            len(group.sharded_parameters) for group in self._parameter_groups if group.requires_grad
+            len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
         self._register_hooks()
 
@@ -211,13 +210,13 @@ class FsdpModule:
         for group in self._parameter_groups:
             if not group.requires_grad:
                 continue
-            for parameter in group.unsharded_parameters:
-                parameter.register_post_accumulate_grad_hook(self._make_grad_hook(parameter))
+            for fsdp_parameter in group.fsdp_parameters:
+                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(self._make_grad_hook())
 
-    def _make_grad_hook(self, parameter: nn.Parameter) -> Callable[[nn.Parameter], None]:
+    def _make_grad_hook(self) -> Callable[[nn.Parameter], None]:
         def grad_hook(_parameter: nn.Parameter) -> None:
-            self._ready_grad_parameters.add(parameter)
-            if len(self._ready_grad_parameters) == self._num_trainable_parameters:
+            self._num_ready_grad_parameters += 1
+            if self._num_ready_grad_parameters == self._num_trainable_parameters:
                 self.post_backward()
 
         return grad_hook
@@ -230,7 +229,7 @@ class FsdpModule:
         """
         self._lazy_init_context()
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
-        self._ready_grad_parameters.clear()
+        self._num_ready_grad_parameters = 0
         context = self.context
         allgather_stream = context.allgather_stream
         current_stream = context.current_stream()
@@ -316,7 +315,6 @@ class FsdpModule:
         """Reduce gradients and return parameters to their sharded resting state."""
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
-        self._ready_grad_parameters.clear()
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
@@ -358,26 +356,11 @@ def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]
         _collect_backward_order(child, order)
 
 
-def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
-    if isinstance(axis, int):
-        axis_index = axis
-        if axis_index < 0:
-            axis_index += mesh.ndim
-        if axis_index < 0 or axis_index >= mesh.ndim:
-            raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
-        return axis_index
-
-    dim_names = mesh.mesh_dim_names
-    if dim_names is None or axis not in dim_names:
-        raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
-    return dim_names.index(axis)
-
-
 def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:
     parameters: dict[str, nn.Parameter] = {}
 
     def visit(submodule: nn.Module, submodule_fqn: str) -> None:
-        direct_parameters = list(submodule.named_parameters(recurse=False))
+        direct_parameters = submodule.named_parameters(recurse=False, remove_duplicate=False)
 
         for local_parameter_name, parameter in direct_parameters:
             parameter_fqn = (

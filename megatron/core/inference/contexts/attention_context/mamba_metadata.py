@@ -21,6 +21,7 @@ class MambaMetadata:
         max_intermediate_count: int,
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
+        decode_indices_dtype: torch.dtype = torch.int64,
     ):
         """
         Initializes the Mamba slot allocator.
@@ -36,12 +37,15 @@ class MambaMetadata:
             mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
             d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
+            decode_indices_dtype (torch.dtype): Dtype for decode state-slot indices.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
         self.mamba_chunk_size = mamba_chunk_size
         self.d_conv = d_conv
         self.device = torch.cuda.current_device()
+        assert decode_indices_dtype in (torch.int32, torch.int64)
+        self.decode_indices_dtype = decode_indices_dtype
 
         # Maximum possible chunks across all batch configurations
         self.max_chunks = max_tokens // mamba_chunk_size + max_requests
@@ -52,9 +56,10 @@ class MambaMetadata:
         )
 
         # Map from requests to slots in the static Mamba state buffer for active decode requests.
-        # int64 so selective_state_update can index directly without a per-layer upcast kernel;
+        # Non-BIK decode uses int64 for selective_state_update; BIK uses int32
+        # for the exact causal-conv1d update kernel.
         self._batch_indices_decode_buffer = torch.full(
-            (self.max_requests,), -1, dtype=torch.int64, device=self.device
+            (self.max_requests,), -1, dtype=self.decode_indices_dtype, device=self.device
         )
 
         # Map from requests to slots in the static Mamba state buffer for active prefill requests
