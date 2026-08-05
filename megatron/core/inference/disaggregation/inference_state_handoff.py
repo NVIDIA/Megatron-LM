@@ -69,26 +69,38 @@ class InferenceStateHandoffMixin:
         self.zmq_sockets.extend(self._handoff_completion_tracker.sockets)
 
     def _drain_handoff_completion_notifications(self) -> list[tuple[int, bool]]:
-        """Collect decisions that the existing MP schedule broadcast must distribute."""
+        """Collect decisions that the existing MP schedule broadcast must distribute.
+
+        Side: decode MP coordinator; pull and push transport paths.
+        """
 
         if self._handoff_completion_tracker is None:
             return []
         return self._handoff_completion_tracker.drain_completed()
 
     def _record_handoff_completion_notification(self, request_id: int, failed: bool) -> None:
-        """Record the coordinator's shared admission decision on every MP rank."""
+        """Record the coordinator's shared admission decision on every MP rank.
+
+        Side: decode engine; pull and push transport paths.
+        """
 
         self._handoff_completion_notifications[request_id] = failed
 
     @property
     def pending_kv_import_count(self) -> int:
-        """Number of decode requests waiting for capacity or transfer completion."""
+        """Number of decode requests waiting for capacity or transfer completion.
+
+        Side: decode engine; pull and push transport paths.
+        """
 
         return len(self._deferred_kv_handoffs) + len(self._pending_kv_imports)
 
     @property
     def pending_kv_push_count(self) -> int:
-        """Number of prefill sends waiting for transport completion."""
+        """Number of prefill sends waiting for transport completion.
+
+        Side: prefill engine; push transport path only.
+        """
 
         return len(self._pending_kv_pushes)
 
@@ -135,7 +147,10 @@ class InferenceStateHandoffMixin:
         self._handoff_completion_notifications.clear()
 
     def _release_handoff_import_owner(self, request_id: int) -> bool:
-        """Release blocks retained until a decode request enters the context."""
+        """Release blocks retained until a decode request enters the context.
+
+        Side: decode engine; pull and push transport paths.
+        """
 
         local_blocks = self._handoff_import_owners.pop(request_id, None)
         if not local_blocks:
@@ -150,7 +165,10 @@ class InferenceStateHandoffMixin:
         return True
 
     def schedule_waiting_requests(self) -> None:
-        """Release imported-block ownership after requests acquire context blocks."""
+        """Release imported-block ownership after requests acquire context blocks.
+
+        Side: the ownership-release behavior is decode-only and applies to pull and push paths.
+        """
 
         waiting_before = set(self.waiting_request_ids)
         owned_waiting = {
@@ -269,7 +287,10 @@ class InferenceStateHandoffMixin:
 
         The decode posted its matching receives when SUBMIT_REQUEST_WITH_KV
         arrived; the sends are reaped asynchronously and the pins stay until
-        the coordinator's RELEASE_KV."""
+        the coordinator's RELEASE_KV.
+
+        Side: prefill engine; push transport path only.
+        """
         block_ids = self._pinned_handoff_blocks.get(request_id)
         if not block_ids:
             logging.warning(
@@ -282,7 +303,10 @@ class InferenceStateHandoffMixin:
         logging.info("DISAGG_PREFILL_PUSH request_id=%d blocks=%d", request_id, len(block_ids))
 
     def _poll_pending_kv_pushes(self) -> int:
-        """Reap completed push sends; unfinished ones stay pending."""
+        """Reap completed push sends; unfinished ones stay pending.
+
+        Side: prefill engine; push transport path only.
+        """
         if not self._pending_kv_pushes:
             return 0
         remaining = []
@@ -298,7 +322,10 @@ class InferenceStateHandoffMixin:
     def _prepare_handoff_metadata_batch(
         self, requests_and_blocks: list[tuple["DynamicInferenceRequest", list[int]]]
     ) -> dict[int, _PreparedHandoffMetadata]:
-        """Assemble metadata for all handoffs completed by one engine step."""
+        """Assemble metadata for all handoffs completed by one engine step.
+
+        Side: prefill engine; pull and push transport paths.
+        """
 
         handoffs = [
             (request, list(block_ids))
@@ -355,7 +382,10 @@ class InferenceStateHandoffMixin:
         block_ids: list,
         prepared: _PreparedHandoffMetadata | None = None,
     ) -> None:
-        """Attach prepared transfer metadata and retain the request's blocks."""
+        """Attach prepared transfer metadata and retain the request's blocks.
+
+        Side: prefill engine; pull and push transport paths.
+        """
 
         rid = request.request_id
         if prepared is None:
@@ -385,7 +415,10 @@ class InferenceStateHandoffMixin:
         logging.info("DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d", rid, len(block_ids))
 
     def release_handoff_blocks(self, request_id: int) -> None:
-        """Release blocks pinned by a previous do_kv_handoff completion."""
+        """Release blocks pinned by a previous do_kv_handoff completion.
+
+        Side: prefill engine; pull and push transport paths.
+        """
         block_ids = self._pinned_handoff_blocks.pop(request_id, None)
         if not block_ids:
             return
@@ -395,7 +428,10 @@ class InferenceStateHandoffMixin:
         )
 
     def _release_pinned_handoff_blocks(self, block_ids: list) -> int:
-        """Release this request's ownership of its pinned handoff blocks."""
+        """Release this request's ownership of its pinned handoff blocks.
+
+        Side: prefill engine; pull and push transport paths.
+        """
         if not block_ids:
             return 0
         allocator = self.context.kv_block_allocator
@@ -410,7 +446,11 @@ class InferenceStateHandoffMixin:
         kv_meta: dict,
         src_block_ids: list,
     ) -> "asyncio.Future[DynamicInferenceRequest]":
-        """Start or capacity-queue a KV pull and return its completion future."""
+        """Start or capacity-queue a KV import and return its completion future.
+
+        Side: decode engine; pull and push transport paths. A pull backend starts
+        the read here, while a push backend posts the matching receive.
+        """
         allocator = self.context.kv_block_allocator
         if not allocator.enable_prefix_caching:
             raise RuntimeError(
@@ -446,7 +486,10 @@ class InferenceStateHandoffMixin:
         return future
 
     def _try_start_kv_handoff_import(self, handoff: DeferredKvHandoff) -> bool:
-        """Start one capacity-safe import, or return false without mutation."""
+        """Start one capacity-safe import, or return false without mutation.
+
+        Side: decode engine; pull and push transport paths.
+        """
 
         allocator = self.context.kv_block_allocator
         cached_blocks = []
@@ -509,7 +552,10 @@ class InferenceStateHandoffMixin:
         return True
 
     def _find_cached_handoff_prefix(self, hashes: list[int], num_blocks: int) -> list[int]:
-        """Find the contiguous handoff prefix already cached on decode."""
+        """Find the contiguous handoff prefix already cached on decode.
+
+        Side: decode engine; pull transport path only.
+        """
 
         allocator = self.context.kv_block_allocator
         cached_blocks = []
@@ -521,7 +567,10 @@ class InferenceStateHandoffMixin:
         return cached_blocks
 
     def _handoff_capacity_available(self, num_blocks: int, cached_blocks: list[int]) -> bool:
-        """Check capacity in the rank-local mirror of model-parallel allocator state."""
+        """Check capacity in the rank-local mirror of model-parallel allocator state.
+
+        Side: decode engine; pull and push transport paths.
+        """
 
         allocator = self.context.kv_block_allocator
         potential_matched_count = 0
@@ -535,7 +584,10 @@ class InferenceStateHandoffMixin:
         )
 
     def _drain_deferred_kv_handoffs(self) -> int:
-        """Start queued handoffs in FIFO order while the queue head fits."""
+        """Start queued handoffs in FIFO order while the queue head fits.
+
+        Side: decode engine; pull and push transport paths.
+        """
 
         started = 0
         while self._deferred_kv_handoffs:
@@ -548,9 +600,19 @@ class InferenceStateHandoffMixin:
 
     @staticmethod
     def _pending_transfer_handles(pending: PendingKvImport) -> list:
+        """Return this decode import's active transfer handles.
+
+        Side: decode engine; pull and push transport paths.
+        """
+
         return [pending.handle] if pending.handle is not None else []
 
     def _finalize_kv_handoff_import(self, pending: PendingKvImport) -> None:
+        """Register transferred blocks and admit the decode request.
+
+        Side: decode engine; pull and push transport paths.
+        """
+
         allocator = self.context.kv_block_allocator
         local_blocks = pending.local_blocks
         cached_prefix_block_count = pending.cached_prefix_block_count
@@ -617,6 +679,11 @@ class InferenceStateHandoffMixin:
         request_future.add_done_callback(_relay_result)
 
     def _release_pending_kv_import(self, pending: PendingKvImport) -> None:
+        """Release storage owned by an unadmitted decode import.
+
+        Side: decode engine; pull and push transport paths.
+        """
+
         owner_released = self._release_handoff_import_owner(pending.request_id)
         if pending.local_blocks and not owner_released:
             block_tensor = torch.tensor(pending.local_blocks, dtype=torch.int32, device="cpu")
@@ -641,7 +708,10 @@ class InferenceStateHandoffMixin:
         return safe_to_release
 
     def _report_completed_kv_imports(self) -> None:
-        """Report locally terminal imports without synchronizing the compute ranks."""
+        """Report locally terminal imports without synchronizing the compute ranks.
+
+        Side: decode engine; pull and push transport paths.
+        """
 
         for pending in self._pending_kv_imports:
             request_id = pending.request_id
@@ -670,6 +740,11 @@ class InferenceStateHandoffMixin:
             pending.terminal_state_reported = True
 
     def _poll_pending_kv_imports(self) -> int:
+        """Finalize decode imports after all model-parallel ranks report completion.
+
+        Side: decode engine; pull and push transport paths.
+        """
+
         self._drain_deferred_kv_handoffs()
         if not self._pending_kv_imports:
             return 0
