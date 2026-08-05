@@ -17,6 +17,7 @@ from typing import Callable, Dict, Optional, Set, Tuple, Union
 import torch
 
 from megatron.core.msc_utils import maybe_msc
+from megatron.core.perfetto_trace import trace_region
 
 from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
@@ -66,6 +67,7 @@ CkptShardedMetadata = Dict[str, Union[ShardedTensor, ShardedObject]]
 _CONTENT_METADATA_KEY = 'content_metadata'
 
 
+@trace_region("load")
 def load(
     sharded_state_dict: ShardedStateDict,
     checkpoint_dir: str,
@@ -140,7 +142,8 @@ def load(
     # Common (non-tensor) data is stored either as a single ShardedObject inside the
     # torch_dist checkpoint (current format) or in a legacy common.pt. Loading it up front
     # is also required to determine `async_strategy` for the sharded load below.
-    common_state_dict = load_common_state_dict(checkpoint_dir)
+    with trace_region("load_common"):
+        common_state_dict = load_common_state_dict(checkpoint_dir)
     merge(common_state_dict, nonpersistent_state_dict)
 
     # At this point we are only dealing with ShardedBase objects
@@ -151,25 +154,29 @@ def load(
     local_metadata, global_metadata = None, None
     strict = parse_strict_flag(strict)
     if StrictHandling.requires_explicit_ckpt_mismatch_check(strict):
-        ckpt_sharded_metadata = load_sharded_metadata(str(checkpoint_dir), sharded_strategy)
-        # common_state is an internal format key loaded separately by load_common_state_dict();
-        # exclude it so it doesn't surface as a spurious missing key during strict validation.
-        ckpt_sharded_metadata = {
-            k: v for k, v in ckpt_sharded_metadata.items() if v.key != 'common_state'
-        }
+        with trace_region("load_sharded_metadata"):
+            ckpt_sharded_metadata = load_sharded_metadata(str(checkpoint_dir), sharded_strategy)
+            # common_state is an internal format key loaded separately by
+            # load_common_state_dict(); exclude it so it doesn't surface as a
+            # spurious missing key during strict validation.
+            ckpt_sharded_metadata = {
+                k: v for k, v in ckpt_sharded_metadata.items() if v.key != 'common_state'
+            }
     if validate_access_integrity or StrictHandling.requires_global_app_metadata(strict):
-        local_metadata, global_metadata = determine_global_metadata(
-            sharded_state_dict, process_group=process_group
-        )
+        with trace_region("determine_global_metadata"):
+            local_metadata, global_metadata = determine_global_metadata(
+                sharded_state_dict, process_group=process_group
+            )
 
-    sharded_state_dict, missing_keys, unexpected_keys = validate_integrity_and_strict_load(
-        sharded_state_dict,
-        strict,
-        validate_access_integrity,
-        local_metadata,
-        global_metadata,
-        ckpt_sharded_metadata,
-    )
+    with trace_region("validate_integrity_and_strict_load"):
+        sharded_state_dict, missing_keys, unexpected_keys = validate_integrity_and_strict_load(
+            sharded_state_dict,
+            strict,
+            validate_access_integrity,
+            local_metadata,
+            global_metadata,
+            ckpt_sharded_metadata,
+        )
 
     ckpt_args = common_state_dict.get("args")
     async_strategy = (
@@ -177,7 +184,11 @@ def load(
         if getattr(ckpt_args, "async_save", False)
         else "mcore"
     )
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+
+    with trace_region("sharded_strategy.load"):
+        loaded_state_dict = sharded_strategy.load(
+            sharded_state_dict, checkpoint_dir, async_strategy
+        )
 
     merge(common_state_dict, loaded_state_dict)
 
@@ -424,17 +435,21 @@ def save(
     if content_metadata is not None:
         sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata
 
-    sharded_state_dict, state_dict = save_preprocess(
-        sharded_state_dict, validate_access_integrity, preprocess_common_before_consistancy_check
-    )
+    with trace_region("save_preprocess"):
+        sharded_state_dict, state_dict = save_preprocess(
+            sharded_state_dict,
+            validate_access_integrity,
+            preprocess_common_before_consistancy_check,
+        )
 
-    sharded_state_dict["common_state"] = ShardedObject(
-        key="common_state",
-        data=state_dict,
-        global_shape=(1,),
-        global_offset=(0,),
-        replica_id=torch.distributed.get_rank(),
-    )
+    with trace_region("save_common"):
+        sharded_state_dict["common_state"] = ShardedObject(
+            key="common_state",
+            data=state_dict,
+            global_shape=(1,),
+            global_offset=(0,),
+            replica_id=torch.distributed.get_rank(),
+        )
 
     def metadata_finalize_fn():
         if torch.distributed.get_rank() == 0:

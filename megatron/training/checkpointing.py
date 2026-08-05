@@ -6,6 +6,7 @@ import contextlib
 import inspect
 import multiprocessing
 import os
+import pickle
 import random
 import re
 import shutil
@@ -25,7 +26,8 @@ import torch
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
-from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
@@ -36,9 +38,16 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
+from megatron.core.dist_checkpointing.strategies.torch_dcp_load_trace import (
+    apply_torch_dcp_load_trace_patch,
+)
+from megatron.core.dist_checkpointing.strategies.torch_dcp_save_trace import (
+    apply_torch_dcp_save_trace_patch,
+)
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.perfetto_trace import trace_region
 from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
@@ -557,6 +566,7 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
     )
 
 
+@trace_region("save_checkpoint")
 def save_checkpoint(
     iteration,
     model,
@@ -654,20 +664,21 @@ def save_checkpoint(
     if tp_group is None and pp_group is None:
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
-    rng_state = get_rng_state(
-        args.ckpt_format,
-        tp_group,
-        pp_group,
-        dp_cp_group=dp_cp_group,
-        dp_group=dp_group,
-        key_prefix=rng_state_key_prefix,
-    )
+    with trace_region("collect_rng_and_rerun_state"):
+        rng_state = get_rng_state(
+            args.ckpt_format,
+            tp_group,
+            pp_group,
+            dp_cp_group=dp_cp_group,
+            dp_group=dp_group,
+            key_prefix=rng_state_key_prefix,
+        )
 
-    # Collect rerun state across all ranks
-    rerun_state_machine = get_rerun_state_machine()
-    rerun_state = rerun_state_machine.state_dict(
-        data_iterator=train_data_iterator, ckpt_format=args.ckpt_format
-    )
+        # Collect rerun state across all ranks
+        rerun_state_machine = get_rerun_state_machine()
+        rerun_state = rerun_state_machine.state_dict(
+            data_iterator=train_data_iterator, ckpt_format=args.ckpt_format
+        )
 
     # Checkpoint name.
     return_base_dir = ckpt_type != CheckpointType.LEGACY
@@ -761,17 +772,18 @@ def save_checkpoint(
                 )
         else:
             sharded_sd_metadata = None
-        state_dict = generate_state_dict(
-            args,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            rng_state,
-            iteration=iteration,
-            optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
-            model_sd_kwargs=dict(metadata=sharded_sd_metadata),
-            rerun_state=rerun_state,
-        )
+        with trace_region("generate_state_dict"):
+            state_dict = generate_state_dict(
+                args,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                rng_state,
+                iteration=iteration,
+                optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                model_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                rerun_state=rerun_state,
+            )
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
@@ -812,6 +824,32 @@ def save_checkpoint(
                             logger.debug(
                                 'Failed to plug in the read metadata from the load strategy...'
                             )
+                    # `--ckpt-metadata`: reuse a prepared, complete `.metadata`
+                    # file (container-local) for every SAVE, skipping the
+                    # save-side gathers (nvrx). The LOAD path is unaffected — it
+                    # always reads each checkpoint's own `.metadata`. Two modes,
+                    # mirroring the PG-tensors cache:
+                    #   * read (default): read the file now and reuse it from the
+                    #     first save.
+                    #   * create (`--ckpt-metadata-create`): the first save of
+                    #     this job runs the full collectives and *creates* the
+                    #     file; subsequent saves in this job reuse it.
+                    # Either way, every checkpoint dir still gets its own complete
+                    # `.metadata` (self-contained), so the metadata is stored both
+                    # per-checkpoint and at the `--ckpt-metadata` path.
+                    ckpt_metadata_path = getattr(args, 'ckpt_metadata', None)
+                    if ckpt_metadata_path:
+                        if getattr(args, 'ckpt_metadata_create', False):
+                            save_strategy.ckpt_metadata_create_path = ckpt_metadata_path
+                            logger.info(
+                                f"Will create prepared checkpoint metadata at {ckpt_metadata_path}"
+                            )
+                        else:
+                            with open(ckpt_metadata_path, 'rb') as f:
+                                save_strategy.prepared_metadata = pickle.load(f)
+                            logger.info(
+                                f"Using prepared checkpoint metadata from {ckpt_metadata_path}"
+                            )
 
                 if args.ckpt_fully_parallel_save:
                     if args.ckpt_fully_parallel_save_process_group == 'dp':
@@ -827,8 +865,20 @@ def save_checkpoint(
                             else mpu.get_expert_data_parallel_group()
                         )
                     save_strategy = FullyParallelSaveStrategyWrapper(
-                        save_strategy, process_group, args.ckpt_assume_constant_structure
+                        save_strategy,
+                        process_group,
+                        args.ckpt_assume_constant_structure,
+                        replicate_local_replicas=getattr(
+                            args, 'ckpt_fully_parallel_save_replicate_local', False
+                        ),
+                        pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+                        pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
                     )
+            # Allow opting out of save-side sharding validation entirely (even on
+            # the first save) via --no-ckpt-load-validate-sharding-integrity. This
+            # skips the world-wide determine_global_metadata all_gather_object.
+            if not args.ckpt_load_validate_sharding_integrity:
+                validate_sharding_integrity = False
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
@@ -855,8 +905,15 @@ def save_checkpoint(
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
             if ckpt_format == 'fsdp_dtensor':
-                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+                with trace_region("preprocess_fsdp_dtensor_state_dict"):
+                    state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
+            # Break the DCP save black box (planning / staging / write) into
+            # per-phase Perfetto regions by instrumenting the SavePlanner,
+            # StorageWriter and _DistWrapper collective methods. Covers both the
+            # async (save_state_dict_async_plan) and sync (checkpoint.save)
+            # paths. No-op unless CKPT_PERFETTO_TRACE=1.
+            apply_torch_dcp_save_trace_patch()
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
                 coordinator_rank = 0
@@ -877,29 +934,36 @@ def save_checkpoint(
                             'use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext '
                             'to use --async-ckpt-use-cpu-shm.'
                         )
-                fs_storage_writer = FileSystemWriterAsync(
-                    checkpoint_name,
-                    thread_count=args.dist_ckpt_workers,
-                    use_msc=args.enable_msc,
-                    **_writer_kwargs,
-                )
+                with trace_region("FileSystemWriterAsync"):
+                    fs_storage_writer = FileSystemWriterAsync(
+                        checkpoint_name,
+                        thread_count=args.dist_ckpt_workers,
+                        use_msc=args.enable_msc,
+                        **_writer_kwargs,
+                    )
 
-                save_state_dict_ret = save_state_dict_async_plan(
-                    state_dict,
-                    fs_storage_writer,
-                    None,
-                    coordinator_rank,
-                    planner=planner,
-                    enable_cache=args.ckpt_assume_constant_structure,
-                )
-                async_save_request = get_save_and_finalize_callbacks(
-                    fs_storage_writer, save_state_dict_ret, args.async_strategy
-                )
+                # Synchronous part of the async save: DCP planning + GPU->CPU/shm
+                # staging (prepare_write_data). The actual file write happens
+                # later in the background worker.
+                with trace_region("save_state_dict_async_plan"):
+                    save_state_dict_ret = save_state_dict_async_plan(
+                        state_dict,
+                        fs_storage_writer,
+                        None,
+                        coordinator_rank,
+                        planner=planner,
+                        enable_cache=args.ckpt_assume_constant_structure,
+                    )
+                with trace_region("get_save_and_finalize_callbacks"):
+                    async_save_request = get_save_and_finalize_callbacks(
+                        fs_storage_writer, save_state_dict_ret, args.async_strategy
+                    )
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
-                torch.distributed.checkpoint.save(
-                    state_dict=state_dict, storage_writer=fs_storage_writer
-                )
+                with trace_region("checkpoint.save"):
+                    torch.distributed.checkpoint.save(
+                        state_dict=state_dict, storage_writer=fs_storage_writer
+                    )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
             if ckpt_type == CheckpointType.LOCAL:
@@ -1157,10 +1221,11 @@ def save_checkpoint(
                 finalize_fns=logits_finalize_fns,
             )
 
-        if async_save_request is not None:
-            schedule_async_save(async_save_request)
-        if logits_saver is not None:
-            schedule_async_save(async_logits_request)
+        with trace_region("schedule_async_save"):
+            if async_save_request is not None:
+                schedule_async_save(async_save_request)
+            if logits_saver is not None:
+                schedule_async_save(async_logits_request)
         print_rank_0(
             f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] scheduled '
             f'an async checkpoint save at iteration {iteration:7d} to {save_dir}'
@@ -1414,7 +1479,96 @@ def generate_state_dict(
     if not args.no_save_rng and rng_state:
         state_dict['rng_state'] = rng_state
 
+    # Avoid persisting TE `_extra_state` artifacts that carry no irreplaceable
+    # state (see `_localize_redundant_extra_states`). Applied here so the SAME
+    # decision is used for both the save state dict and the load *request*
+    # (`generate_state_dict` is the shared chokepoint), which keeps the two
+    # symmetric and backward compatible.
+    if args.ckpt_format == "torch_dist" and not getattr(
+        args, "keep_redundant_extra_state", False
+    ):
+        _localize_redundant_extra_states(state_dict)
+
     return state_dict
+
+
+# Byte markers of the dict keys that TE `get_extra_state` writes ONLY under
+# `if recipe.delayed():` (see TransformerEngine `module/base.py`). Their presence
+# in the serialized payload is a robust, unpickle-free signal that the
+# `_extra_state` carries persistent delayed-scaling state (amax history + scale).
+_FP8_PERSISTENT_EXTRA_STATE_MARKERS = (b"amax_history_fwd", b"scale_fwd", b"scale_bwd")
+
+
+def _fp8_extra_state_is_persistent(data) -> bool:
+    """Whether a TE `_extra_state` payload must be checkpointed.
+
+    A `_extra_state` is worth persisting only when it carries state that cannot
+    be reconstructed from the run config at model-build time, i.e. the
+    delayed-scaling FP8 amax history + scale. Concretely:
+
+    * ``None`` / empty ``uint8`` tensor  -> FP8 disabled        -> NOT persistent
+    * non-empty, no delayed-scaling key  -> block/current scaling (NVFP4, MXFP8,
+      Float8CurrentScaling): recipe + scalars only, all config-derived
+                                                                  -> NOT persistent
+    * non-empty, has ``scale_fwd`` / ``amax_history_fwd`` / ``scale_bwd``
+                                          -> delayed scaling      -> persistent
+
+    The check operates on the raw serialized bytes (the uint8 tensor that
+    ``get_extra_state`` returns) so it needs no unpickling and no TE import.
+    Anything unrecognized defaults to persistent, so real state is never
+    silently dropped.
+    """
+    if data is None:
+        return False
+    if isinstance(data, torch.Tensor):
+        if data.numel() == 0:
+            return False
+        try:
+            raw = data.detach().cpu().contiguous().numpy().tobytes()
+        except Exception:
+            return True
+        return any(marker in raw for marker in _FP8_PERSISTENT_EXTRA_STATE_MARKERS)
+    # Unknown payload type: keep it persistent to be safe.
+    return True
+
+
+def _localize_redundant_extra_states(state_dict):
+    """Rewrite non-persistent TE `_extra_state` ShardedObjects as local objects.
+
+    For checkpoints with no FP8, or with block/current FP8 scaling (NVFP4,
+    MXFP8, Float8CurrentScaling), every `_extra_state` is either empty or a
+    recipe-only blob that the freshly-built model reproduces from config — see
+    `_fp8_extra_state_is_persistent`. Such artifacts are pure overhead: in a
+    large MoE model they account for the overwhelming majority of the
+    checkpoint's ShardedObjects (e.g. ~50k on the 55B hybrid-MoE run).
+
+    Wrapping them in ``LocalNonpersistentObject`` (instead of ``ShardedObject``)
+    means, via the dist-checkpointing pipeline:
+
+    * SAVE: ``save_preprocess`` drops them, so they are never written to disk.
+    * LOAD: ``load_preprocess`` unwraps them back into the loaded state dict with
+      the local (freshly-built) value, so the module's ``_extra_state`` key is
+      still present (strict ``load_state_dict`` stays happy) and
+      ``set_extra_state`` no-ops on the empty/recipe payload.
+
+    Because this runs in ``generate_state_dict`` (shared by save and the load
+    request), the decision is symmetric: dropped keys are never *requested*, so
+    loading an older checkpoint that still stores them simply does not read them
+    (they are neither "missing" nor "unexpected" in the request) — backward
+    compatible. Delayed-scaling `_extra_state` stays a ``ShardedObject`` and is
+    saved/loaded exactly as before.
+    """
+
+    def _maybe_localize(value):
+        if (
+            isinstance(value, ShardedObject)
+            and value.key.endswith("_extra_state")
+            and not _fp8_extra_state_is_persistent(value.data)
+        ):
+            return LocalNonpersistentObject(value.data)
+        return value
+
+    dict_list_map_inplace(_maybe_localize, state_dict)
 
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
@@ -1584,7 +1738,7 @@ def _load_non_persistent_base_checkpoint(
             f'Please use local or global non-persistent checkpoints (got: {args.non_persistent_ckpt_type})'
         )
 
-
+@trace_region("_load_global_dist_base_checkpoint")
 def _load_global_dist_base_checkpoint(
     load_dir,
     args,
@@ -1612,7 +1766,12 @@ def _load_global_dist_base_checkpoint(
         )
 
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
-    load_strategy = TorchDistLoadShardedStrategy(cache_metadata=args.ckpt_assume_constant_structure)
+    load_strategy = TorchDistLoadShardedStrategy(
+        cache_metadata=args.ckpt_assume_constant_structure,
+        replicate_local_replicas=getattr(
+            args, 'ckpt_fully_parallel_load_replicate_local', False
+        ),
+    )
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         if args.ckpt_fully_parallel_load_process_group == 'dp':
@@ -1631,7 +1790,11 @@ def _load_global_dist_base_checkpoint(
             )
 
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, process_group, exchange_algo=args.ckpt_fully_parallel_load_exchange_algo
+            load_strategy,
+            process_group,
+            exchange_algo=args.ckpt_fully_parallel_load_exchange_algo,
+            pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+            pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
@@ -1808,9 +1971,12 @@ def _load_base_checkpoint(
         )
         raw_model_state_dict = state_dict['model'].copy() if 'model' in state_dict else None
         model = state_dict.pop('_model')
-        state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
-        fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
-        state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
+        with trace_region("preprocess_fsdp_dtensor_state_dict"):
+            state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+        with trace_region("FileSystemReader"):
+            fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
+        with trace_region("read_metadata"):
+            state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
         if gpt_compat_layer_maps is not None:
             from megatron.core.dist_checkpointing.gpt_checkpoint_interop import (
                 retarget_fsdp_state_dict_to_gpt_checkpoint,
@@ -1833,16 +1999,23 @@ def _load_base_checkpoint(
         ckpt_type = CheckpointType.FSDP_DTENSOR
         allow_partial_load = not getattr(args, 'strict_fsdp_dtensor_load', False)
         if allow_partial_load:
-            rank = torch.distributed.get_rank()
-            import time as _time
+            with trace_region("diff_state_dicts"):
+                rank = torch.distributed.get_rank()
+                import time as _time
 
-            _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
-            print_diff_in_state_dicts(state_dict_metadata, state_dict)
+                _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
+                print_diff_in_state_dicts(state_dict_metadata, state_dict)
 
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
-        torch.distributed.checkpoint.load_state_dict(
-            state_dict=state_dict, storage_reader=fs_storage_reader, planner=planner
-        )
+        # Break the torch.distributed.checkpoint.load_state_dict black box into
+        # per-phase Perfetto regions (read_metadata / planning / read_data) by
+        # instrumenting the DCP storage-reader and planner methods that the
+        # underlying _load_state_dict drives. No-op unless CKPT_PERFETTO_TRACE=1.
+        apply_torch_dcp_load_trace_patch()
+        with trace_region("load_state_dict"):
+            torch.distributed.checkpoint.load_state_dict(
+                state_dict=state_dict, storage_reader=fs_storage_reader, planner=planner
+            )
 
         if raw_optimizer_state_dict is not None:
             state_dict['optimizer'] = raw_optimizer_state_dict
@@ -2100,6 +2273,7 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     return layer_maps, load_optim
 
 
+@trace_region("load_checkpoint")
 def load_checkpoint(
     ddp_model,
     optimizer,
@@ -2409,7 +2583,8 @@ def load_checkpoint(
     elif args.ckpt_format == 'fsdp_dtensor':
         reader = FileSystemReader(get_load_checkpoint_path_by_args(args))
         try:
-            state_dict_metadata = reader.read_metadata().state_dict_metadata
+            with trace_region("read_metadata"):
+                state_dict_metadata = reader.read_metadata().state_dict_metadata
         except FileNotFoundError:
             state_dict_metadata = {}
 
@@ -2458,32 +2633,34 @@ def load_checkpoint(
                     param_group['lr'] = 0.0
 
         try:
-            state_dict = generate_state_dict(
-                args,
-                model=model,
-                optimizer=gen_sd_optim,
-                opt_param_scheduler=gen_sd_opt_param_scheduler,
-                rng_state=gen_sd_rng_state,
-                optim_sd_kwargs=optim_sd_kwargs,
-                rerun_state=gen_sd_rerun_state,
-                iteration=1,
-            )
+            with trace_region("generate_state_dict"):
+                state_dict = generate_state_dict(
+                    args,
+                    model=model,
+                    optimizer=gen_sd_optim,
+                    opt_param_scheduler=gen_sd_opt_param_scheduler,
+                    rng_state=gen_sd_rng_state,
+                    optim_sd_kwargs=optim_sd_kwargs,
+                    rerun_state=gen_sd_rerun_state,
+                    iteration=1,
+                )
         finally:
             for param_group, lr in optimizer_lrs:
                 param_group['lr'] = lr
         state_dict['_model'] = model
         load_kwargs['sharded_state_dict'] = state_dict
 
-    state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-        load_dir,
-        args,
-        rank0=False,
-        checkpointing_context=checkpointing_context,
-        dp_cp_group=dp_cp_group,
-        expt_dp_group=expt_dp_group,
-        gpt_compat_layer_maps=gpt_compat_layer_maps,
-        **load_kwargs,
-    )
+    with trace_region("_load_base_checkpoint"):
+        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+            load_dir,
+            args,
+            rank0=False,
+            checkpointing_context=checkpointing_context,
+            dp_cp_group=dp_cp_group,
+            expt_dp_group=expt_dp_group,
+            gpt_compat_layer_maps=gpt_compat_layer_maps,
+            **load_kwargs,
+        )
 
     # Checkpoint not loaded.
     if state_dict is None:
@@ -2588,21 +2765,24 @@ def load_checkpoint(
         ckpt_format == 'fsdp_dtensor' and gpt_compat_layer_maps is not None
     )
 
-    # Model.
-    if not skip_load_to_model_and_opt and not gpt_fsdp_model_loaded_in_place:
-        if len(ddp_model) == 1:
-            load_model_state_dict(ddp_model[0], state_dict['model'], strict)
-        else:
-            for i in range(len(ddp_model)):
-                # If there is no corresponding model in the state_dict, it will be ignored.
-                # It means that this is an empty stage.
-                if 'model%d' % i not in state_dict:
-                    continue
-                load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
-    # Fix up query/key/value matrix ordering if needed.
-    checkpoint_version = get_checkpoint_version()
-    print_rank_0(f' checkpoint version {checkpoint_version}')
-    fix_query_key_value_ordering(model, checkpoint_version)
+    # Model. Copies the loaded tensors into the live model parameters (and runs
+    # any TransformerEngine `_extra_state` post-processing), which is a sizeable
+    # part of the post-`_load_base_checkpoint` tail.
+    with trace_region("load_state_dict_into_model"):
+        if not skip_load_to_model_and_opt and not gpt_fsdp_model_loaded_in_place:
+            if len(ddp_model) == 1:
+                load_model_state_dict(ddp_model[0], state_dict['model'], strict)
+            else:
+                for i in range(len(ddp_model)):
+                    # If there is no corresponding model in the state_dict, it will be ignored.
+                    # It means that this is an empty stage.
+                    if 'model%d' % i not in state_dict:
+                        continue
+                    load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
+        # Fix up query/key/value matrix ordering if needed.
+        checkpoint_version = get_checkpoint_version()
+        print_rank_0(f' checkpoint version {checkpoint_version}')
+        fix_query_key_value_ordering(model, checkpoint_version)
 
     # Optimizer.
     if not release and (not args.finetune or gpt_compat_load_optim) and not args.no_load_optim:
@@ -2623,7 +2803,8 @@ def load_checkpoint(
                 and optimizer is not None
                 and not optimizer.is_stub_optimizer
             ):
-                optimizer.load_state_dict(state_dict['optimizer'])
+                with trace_region("load_optimizer_state"):
+                    optimizer.load_state_dict(state_dict['optimizer'])
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
@@ -2745,9 +2926,11 @@ def load_checkpoint(
             )
             sys.exit()
 
-    # Some utilities want to load a checkpoint without distributed being initialized
+    # Some utilities want to load a checkpoint without distributed being initialized.
+    # This barrier also absorbs cross-rank load skew, so it can dominate the tail.
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        with trace_region("load_checkpoint_barrier"):
+            torch.distributed.barrier()
 
     _tp_r = get_pg_rank(tp_group) if tp_group is not None else mpu.get_tensor_model_parallel_rank()
     _tp_w = (
@@ -2777,7 +2960,8 @@ def load_checkpoint(
     if not torch.distributed.is_initialized() or is_last_rank():
         wandb_utils.on_load_checkpoint_success(checkpoint_name, load_dir)
 
-    torch.cuda.empty_cache()
+    with trace_region("empty_cache"):
+        torch.cuda.empty_cache()
 
     if iteration > 0:
         # Notify FT that a checkpoint was loaded.
