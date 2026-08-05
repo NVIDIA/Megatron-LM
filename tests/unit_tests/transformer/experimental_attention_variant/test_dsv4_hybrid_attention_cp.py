@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -17,6 +17,10 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexerLossAutoScaler,
+    DSAIndexerLossLoggingHelper,
+)
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
     _SEED,
@@ -268,7 +272,7 @@ def _make_dsv4_cp_config(
     context_parallel_size,
     dsa_indexer_loss_coeff=1.0,
     dsa_indexer_use_sparse_loss=True,
-    apply_dsa_kernel_fusion=True,
+    use_fused_kernels=True,
     apply_rope_fusion=True,
 ):
     """Build the DSv4 flash attention config used by CP tests."""
@@ -298,7 +302,7 @@ def _make_dsv4_cp_config(
         qk_layernorm=True,
         layernorm_zero_centered_gamma=False,
         expert_model_parallel_size=1,
-        apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+        dsa_kernel_backend="cudnn" if use_fused_kernels else "none",
         apply_rope_fusion=apply_rope_fusion,
     )
 
@@ -549,6 +553,171 @@ class TestDSv4HybridAttentionTHDCP:
         self._cp1_graph_time_cache[layer_number] = measured
         return measured
 
+    @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse", "dense"])
+    @pytest.mark.parametrize(
+        ("seg_lens", "padded_seg_lens"),
+        [((64,), None), ((5, 11, 17, 19), (8, 12, 20, 24))],
+        ids=["single", "ragged_padded"],
+    )
+    def test_cp2_unfused_indexer_loss_and_grad_matches_cp1(
+        self, sparse_loss, seg_lens, padded_seg_lens, request
+    ):
+        """CP2 unfused indexer loss and gradients must match the CP1 teacher."""
+        if self.cp_size != 2:
+            pytest.skip("The exact unfused indexer regression is a focused CP2 gate")
+
+        def cleanup_indexer_loss_state():
+            DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+            DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+            _clear_cuda_test_state()
+
+        request.addfinalizer(cleanup_indexer_loss_state)
+
+        packed = _make_thd_packed_seq_params(seg_lens, padded_seg_lens)
+        seq_len = sum(padded_seg_lens or seg_lens)
+        local_rows = seq_len // self.cp_size
+        local_idx = torch.arange(
+            self.cp_rank * local_rows, (self.cp_rank + 1) * local_rows, device='cuda'
+        )
+
+        common_config = dict(
+            num_layers=1,
+            csa_compress_ratios=[4],
+            csa_window_size=8,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=sparse_loss,
+            csa_dense_mode=False,
+            csa_compress_rotary_base=40000,
+            layernorm_epsilon=1e-6,
+            normalization="RMSNorm",
+            qk_layernorm=True,
+            layernorm_zero_centered_gamma=False,
+            expert_model_parallel_size=1,
+            dsa_kernel_backend="none",
+            apply_rope_fusion=False,
+        )
+        config_cp = _make_config(
+            **common_config,
+            context_parallel_size=self.cp_size,
+            cp_partition_mode="contiguous",
+            sequence_packing_scheduler="dp_balanced",
+        )
+        config_ref = _make_config(
+            **common_config,
+            context_parallel_size=1,
+            cp_partition_mode="zigzag",
+            sequence_packing_scheduler=None,
+        )
+
+        torch.manual_seed(_SEED + 5960)
+        model_parallel_cuda_manual_seed(_SEED + 5960)
+        cp_attn = _build_attention(config_cp, layer_number=1, pg_collection=self.pg).cuda()
+        ref_attn = _build_attention(config_ref, layer_number=1, pg_collection=self.ref_pg).cuda()
+        _copy_module_parameters(cp_attn, ref_attn)
+        cp_attn.train()
+        ref_attn.train()
+
+        full_hidden = torch.randn(
+            seq_len, 1, config_cp.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        local_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
+        ref_hidden = full_hidden.detach().clone().requires_grad_(True)
+
+        DSAIndexerLossAutoScaler.set_loss_scale(torch.ones((), device='cuda'))
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        local_out, _ = cp_attn(
+            hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        local_loss = DSAIndexerLossLoggingHelper.tracker["values"][0].detach().float().clone()
+
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        ref_out, _ = ref_attn(
+            hidden_states=ref_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        ref_loss = DSAIndexerLossLoggingHelper.tracker["values"][0].detach().float().clone()
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+
+        cp_loss = local_loss.clone()
+        dist.all_reduce(cp_loss, group=self.pg.cp)
+
+        # A zero upstream gradient isolates the indexer-loss backward injected
+        # by DSAIndexerLossAutoScaler from the main attention objective.
+        local_out.backward(torch.zeros_like(local_out))
+        ref_out.backward(torch.zeros_like(ref_out))
+
+        cp_params = dict(cp_attn.core_attention.indexer.named_parameters())
+        ref_params = dict(ref_attn.core_attention.indexer.named_parameters())
+        reduced_cp_grads = {}
+        missing_cp_grads = []
+        for name, param in sorted(cp_params.items()):
+            if param.grad is None:
+                missing_cp_grads.append(name)
+                grad = torch.zeros_like(param, dtype=torch.float32)
+            else:
+                grad = param.grad.detach().float().clone()
+            dist.all_reduce(grad, group=self.pg.cp)
+            reduced_cp_grads[name] = grad
+
+        # Complete every collective before evaluating failures so one rank
+        # cannot leave its peers blocked in an all-reduce.
+        errors = []
+        loss_diff = (cp_loss - ref_loss).abs()
+        if not torch.isfinite(cp_loss) or not torch.isfinite(ref_loss):
+            errors.append(f"non-finite loss: cp2={cp_loss.item()}, cp1={ref_loss.item()}")
+        elif cp_loss <= 0 or ref_loss <= 0:
+            errors.append(f"non-positive loss: cp2={cp_loss.item()}, cp1={ref_loss.item()}")
+        if loss_diff > 1e-4:
+            errors.append(
+                f"indexer loss diff={loss_diff.item():.10e} exceeds 1e-4 "
+                f"(cp2={cp_loss.item():.10f}, cp1={ref_loss.item():.10f})"
+            )
+
+        if set(cp_params) != set(ref_params):
+            errors.append(
+                f"indexer parameter names differ: cp2={sorted(cp_params)}, cp1={sorted(ref_params)}"
+            )
+        if missing_cp_grads:
+            errors.append(f"missing CP2 indexer gradients: {missing_cp_grads}")
+
+        nonzero_cp_grad = False
+        nonzero_ref_grad = False
+        grad_metrics = []
+        for name, cp_grad in reduced_cp_grads.items():
+            ref_param = ref_params.get(name)
+            if ref_param is None or ref_param.grad is None:
+                errors.append(f"missing CP1 indexer gradient: {name}")
+                continue
+            ref_grad = ref_param.grad.detach().float()
+            nonzero_cp_grad = nonzero_cp_grad or bool(torch.count_nonzero(cp_grad).item())
+            nonzero_ref_grad = nonzero_ref_grad or bool(torch.count_nonzero(ref_grad).item())
+            max_abs = (cp_grad - ref_grad).abs().max().item()
+            grad_metrics.append(
+                f"{name}:max_abs={max_abs:.10e},cp_norm={cp_grad.norm().item():.10e},"
+                f"cp1_norm={ref_grad.norm().item():.10e}"
+            )
+            if max_abs > 1e-4:
+                errors.append(f"indexer gradient {name} max_abs={max_abs:.10e}")
+        if not nonzero_cp_grad:
+            errors.append("all CP2 indexer gradients are zero")
+        if not nonzero_ref_grad:
+            errors.append("all CP1 indexer gradients are zero")
+
+        if self.cp_rank == 0:
+            print(
+                f"[CP2-INDEXER] sparse_loss={sparse_loss} seg_lens={seg_lens} "
+                f"padded_seg_lens={padded_seg_lens} cp2={cp_loss.item():.10f} "
+                f"cp1={ref_loss.item():.10f} loss_abs={loss_diff.item():.10e}; "
+                + "; ".join(grad_metrics),
+                flush=True,
+            )
+
+        failure_flag = torch.tensor(bool(errors), dtype=torch.int32, device='cuda')
+        dist.all_reduce(failure_flag, op=dist.ReduceOp.MAX, group=self.pg.cp)
+        if failure_flag.item():
+            pytest.fail("; ".join(errors) if errors else "peer rank reported an alignment failure")
+
+        del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out
+
     @pytest.mark.parametrize(
         ("layer_number", "sparse_loss"),
         [(1, True), (2, True), (2, False), (3, True)],
@@ -579,19 +748,19 @@ class TestDSv4HybridAttentionTHDCP:
 
         torch.manual_seed(_SEED + layer_number)
         model_parallel_cuda_manual_seed(_SEED + layer_number)
-        apply_dsa_kernel_fusion = self.fused_kernels_available
+        use_fused_kernels = self.fused_kernels_available
         config_cp = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=sparse_loss,
-            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            use_fused_kernels=use_fused_kernels,
             apply_rope_fusion=apply_rope_fusion,
         )
         config_ref = _make_dsv4_cp_config(
             context_parallel_size=1,
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=sparse_loss,
-            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            use_fused_kernels=use_fused_kernels,
             apply_rope_fusion=apply_rope_fusion,
         )
         cp_attn = _build_attention(
@@ -617,7 +786,7 @@ class TestDSv4HybridAttentionTHDCP:
         _assert_cp_tensor_match(
             local_out.detach(),
             ref_out.detach().index_select(0, local_idx),
-            f"layer={layer_number}:dsa={apply_dsa_kernel_fusion}:rope={apply_rope_fusion}:output",
+            f"layer={layer_number}:dsa={use_fused_kernels}:rope={apply_rope_fusion}:output",
         )
 
         grad = torch.randn_like(ref_out)
@@ -626,7 +795,7 @@ class TestDSv4HybridAttentionTHDCP:
         _assert_cp_tensor_match(
             local_hidden.grad.detach(),
             ref_hidden.grad.index_select(0, local_idx),
-            f"layer={layer_number}:dsa={apply_dsa_kernel_fusion}:rope={apply_rope_fusion}:hidden_grad",
+            f"layer={layer_number}:dsa={use_fused_kernels}:rope={apply_rope_fusion}:hidden_grad",
         )
 
         ref_params = dict(ref_attn.named_parameters())
@@ -639,7 +808,7 @@ class TestDSv4HybridAttentionTHDCP:
             _assert_cp_tensor_match(
                 grad_sum,
                 ref_grad,
-                f"layer={layer_number}:dsa={apply_dsa_kernel_fusion}:"
+                f"layer={layer_number}:dsa={use_fused_kernels}:"
                 f"rope={apply_rope_fusion}:param_grad:{name}",
             )
 
@@ -655,7 +824,7 @@ class TestDSv4HybridAttentionTHDCP:
         config = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=0.0,
-            apply_dsa_kernel_fusion=False,
+            use_fused_kernels=False,
             apply_rope_fusion=False,
         )
         attn = _build_attention(config, layer_number=2, pg_collection=self.pg).cuda()
@@ -689,13 +858,13 @@ class TestDSv4HybridAttentionTHDCP:
         eager_config = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=0.0,
-            apply_dsa_kernel_fusion=False,
+            use_fused_kernels=False,
             apply_rope_fusion=apply_rope_fusion,
         )
         recompute_config = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=0.0,
-            apply_dsa_kernel_fusion=False,
+            use_fused_kernels=False,
             apply_rope_fusion=apply_rope_fusion,
         )
         recompute_config.recompute_granularity = "selective"
@@ -741,12 +910,12 @@ class TestDSv4HybridAttentionTHDCP:
         model_parallel_cuda_manual_seed(_SEED + 1202)
         config_cp = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
-            apply_dsa_kernel_fusion=self.fused_kernels_available,
+            use_fused_kernels=self.fused_kernels_available,
             apply_rope_fusion=True,
         )
         config_ref = _make_dsv4_cp_config(
             context_parallel_size=1,
-            apply_dsa_kernel_fusion=self.fused_kernels_available,
+            use_fused_kernels=self.fused_kernels_available,
             apply_rope_fusion=False,
         )
         cp_attn = _build_attention(config_cp, layer_number=2, pg_collection=self.pg).cuda().eval()
@@ -811,7 +980,7 @@ class TestDSv4HybridAttentionTHDCP:
                 context_parallel_size=self.cp_size,
                 dsa_indexer_loss_coeff=1.0,
                 dsa_indexer_use_sparse_loss=True,
-                apply_dsa_kernel_fusion=dsa_fused,
+                use_fused_kernels=dsa_fused,
                 apply_rope_fusion=rope_fused,
             )
             graph_attn = _build_attention(
@@ -924,7 +1093,7 @@ class TestDSv4HybridAttentionTHDCP:
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
-            apply_dsa_kernel_fusion=True,
+            use_fused_kernels=True,
             apply_rope_fusion=True,
         )
         graph_attn = _build_attention(

@@ -118,13 +118,21 @@ class ModelParallelConfig:
     tensors are padded to a multiple of N.
     """
 
-    pad_packed_seq_by_appending_dummy_seq: bool = True
-    """Represent a THD packed-sequence padding tail by appending a dummy sequence.
+    thd_tail_padding_policy: Optional[Literal["append_dummy_seq", "extend_last"]] = None
+    """Policy for representing the THD packed-sequence padding tail.
 
-    When disabled, token-like tensors are still padded according to
-    pad_packed_seq_alignment, but cu_seqlens sequence boundaries are not extended
-    for the padding tail. CUDA Graph static-input padding may still pad the
-    cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
+    - append_dummy_seq: cover the post-pack padding tail with an ordinary
+      dummy sequence appended to the cu_seqlens metadata. Existing
+      valid/physical gaps between real sequences are preserved. This is the
+      default behavior.
+    - extend_last: keep valid cu_seqlens boundaries unchanged and extend the
+      final padded boundary so the tail is physical padding of the last
+      sequence. With context parallelism the extension is applied to the
+      global metadata before CP slicing.
+    - None (default): treated as append_dummy_seq.
+
+    When thd_max_packed_sequences is set, cu_seqlens tensors are padded to
+    that value + 1 entries in both eager and CUDA Graph modes.
     """
 
     expert_model_parallel_size: int = 1
@@ -513,6 +521,12 @@ class ModelParallelConfig:
                     f"min_dynamic_context_parallel_size must be >= 1, "
                     f"got {self.min_dynamic_context_parallel_size}"
                 )
+
+        if self.thd_tail_padding_policy not in (None, "append_dummy_seq", "extend_last"):
+            raise ValueError(
+                "thd_tail_padding_policy must be 'append_dummy_seq', 'extend_last', or None, "
+                f"got {self.thd_tail_padding_policy!r}."
+            )
 
         if self.pad_packed_seq_alignment is not None:
             self.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(

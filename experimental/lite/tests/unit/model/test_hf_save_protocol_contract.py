@@ -11,7 +11,6 @@ import pytest
 
 from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES
 
-pytestmark = pytest.mark.mlite
 
 LITE_ROOT = Path(__file__).resolve().parents[3]
 _REGISTERED_PROTOCOLS = sorted(TRAIN_RUNTIME_MODULES.items())
@@ -28,7 +27,9 @@ def test_registered_protocol_exposes_hf_save(
     protocol_path = LITE_ROOT / Path(*module_name.split(".")).with_suffix(".py")
     tree = ast.parse(protocol_path.read_text())
     functions = {
-        node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
     assert "save_hf_weights" in functions, (
@@ -41,8 +42,12 @@ def test_new_hf_save_protocols_delegate_all_arguments(
     model_name: str, monkeypatch: pytest.MonkeyPatch, transformer_engine_import_stub
 ) -> None:
     transformer_engine_import_stub()
-    protocol = importlib.import_module(f"megatron.lite.model.{model_name}.lite.protocol")
-    checkpoint = importlib.import_module(f"megatron.lite.model.{model_name}.lite.checkpoint")
+    protocol = importlib.import_module(
+        f"megatron.lite.model.{model_name}.lite.protocol"
+    )
+    checkpoint = importlib.import_module(
+        f"megatron.lite.model.{model_name}.lite.checkpoint"
+    )
     calls = []
     monkeypatch.setattr(
         checkpoint,

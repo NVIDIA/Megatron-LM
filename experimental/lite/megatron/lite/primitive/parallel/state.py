@@ -65,7 +65,8 @@ def init_parallel(config) -> ParallelState:
 
     world = dist.get_world_size()
     rank = dist.get_rank()
-    tp, ep, etp, cp, pp = config.tp, config.ep, config.etp, config.cp, config.pp
+    tp, ep, cp, pp = config.tp, config.ep, config.cp, config.pp
+    etp = 1 if config.etp is None else config.etp
 
     dense_dp = ensure_divisible(world, tp * cp * pp)
     expert_dp = ensure_divisible(world, etp * ep * pp)
