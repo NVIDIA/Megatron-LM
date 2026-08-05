@@ -12,6 +12,9 @@ from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
+from megatron.core.inference.disaggregation.handoff_completion_tracker import (
+    HandoffCompletionTracker,
+)
 from megatron.core.inference.disaggregation.pending_handoff_imports import (
     DeferredKvHandoff,
     PendingKvImport,
@@ -51,9 +54,31 @@ class InferenceStateHandoffMixin:
         self._pp_kv_peer_metas = None  # Each PP stage's set of TP KV descriptors.
         self._deferred_kv_handoffs = deque()
         self._pending_kv_imports = deque()
+        self._handoff_completion_tracker: HandoffCompletionTracker | None = None
+        self._handoff_completion_notifications: dict[int, bool] = {}  # Request ID -> failed.
         # Retain handoff blocks until the admitted request acquires its own references.
         self._handoff_import_owners: Dict[int, list[int]] = {}  # Request ID -> local KV blocks.
         self._pending_kv_pushes: list = []
+
+    def _setup_handoff_completion_tracking(self, hostname: str | None = None) -> None:
+        """Create the CPU path used to aggregate model-parallel transfer completion."""
+
+        self._handoff_completion_tracker = HandoffCompletionTracker(
+            self.zmq_context, self.pg_collection.mp, hostname
+        )
+        self.zmq_sockets.extend(self._handoff_completion_tracker.sockets)
+
+    def _drain_handoff_completion_notifications(self) -> list[tuple[int, bool]]:
+        """Collect decisions that the existing MP schedule broadcast must distribute."""
+
+        if self._handoff_completion_tracker is None:
+            return []
+        return self._handoff_completion_tracker.drain_completed()
+
+    def _record_handoff_completion_notification(self, request_id: int, failed: bool) -> None:
+        """Record the coordinator's shared admission decision on every MP rank."""
+
+        self._handoff_completion_notifications[request_id] = failed
 
     @property
     def pending_kv_import_count(self) -> int:
@@ -89,7 +114,10 @@ class InferenceStateHandoffMixin:
         unsafe = deque()
         while self._pending_kv_imports:
             pending = self._pending_kv_imports.popleft()
-            if self._wait_for_transfer_handles(*self._pending_transfer_handles(pending)):
+            safe_to_release = pending.destinations_safe and self._wait_for_transfer_handles(
+                *self._pending_transfer_handles(pending)
+            )
+            if safe_to_release:
                 self._release_pending_kv_import(pending)
                 if not pending.future.done():
                     pending.future.cancel()
@@ -104,6 +132,7 @@ class InferenceStateHandoffMixin:
             self._handoff_import_owners = {}
         for request_id in list(self._handoff_import_owners):
             self._release_handoff_import_owner(request_id)
+        self._handoff_completion_notifications.clear()
 
     def _release_handoff_import_owner(self, request_id: int) -> bool:
         """Release blocks retained until a decode request enters the context."""
@@ -438,7 +467,6 @@ class InferenceStateHandoffMixin:
             raise RuntimeError("KV allocator capacity changed during handoff admission")
         imported_blocks = [int(block) for block in local_blocks_tensor.tolist()]
         local_blocks = cached_blocks + imported_blocks
-        owned_blocks_tensor = torch.tensor(local_blocks, dtype=torch.int32, device="cpu")
 
         handle = None
         start_error = None
@@ -453,27 +481,6 @@ class InferenceStateHandoffMixin:
         except Exception as exc:
             start_error = exc
 
-        if not self._all_ranks_started_handoff(start_error is None):
-            # A peer may fail after this rank has posted a two-sided receive.
-            # Waiting here could block forever because its matching send may
-            # never be posted. Keep any potentially active destination blocks
-            # out of the allocator until the engine is restarted.
-            safe_to_release = handle is None and getattr(
-                start_error, "transfer_destinations_safe", True
-            )
-            if safe_to_release:
-                allocator.release_memory_blocks(owned_blocks_tensor)
-            else:
-                logging.error(
-                    "Quarantining KV blocks after a failed handoff submission: %s", local_blocks
-                )
-            error = start_error or RuntimeError(
-                "KV handoff submission failed on a model-parallel peer"
-            )
-            if not handoff.future.done():
-                handoff.future.set_exception(error)
-            raise error
-
         pending = PendingKvImport(
             request_id=handoff.request_id,
             prompt=handoff.prompt,
@@ -483,6 +490,10 @@ class InferenceStateHandoffMixin:
             cached_prefix_block_count=len(cached_blocks),
             handle=handle,
             future=handoff.future,
+            local_error=start_error,
+            destinations_safe=(
+                start_error is None or getattr(start_error, "transfer_destinations_safe", True)
+            ),
         )
         self._pending_kv_imports.append(pending)
         logging.debug(
@@ -522,24 +533,6 @@ class InferenceStateHandoffMixin:
         return allocator.is_memory_available(
             num_blocks, potential_matched_count=potential_matched_count
         )
-
-    def _all_ranks_started_handoff(self, local_started: bool) -> bool:
-        """Agree that every model-parallel rank submitted its local transfer."""
-
-        mp_group = self.pg_collection.mp
-        world_size = (
-            torch.distributed.get_world_size(mp_group)
-            if (mp_group is not None and torch.distributed.is_initialized())
-            else 1
-        )
-        if world_size == 1:
-            return local_started
-
-        started = torch.tensor(
-            int(local_started), dtype=torch.int32, device=self.context.memory_buffer.device
-        )
-        torch.distributed.all_reduce(started, op=torch.distributed.ReduceOp.MIN, group=mp_group)
-        return bool(started.item())
 
     def _drain_deferred_kv_handoffs(self) -> int:
         """Start queued handoffs in FIFO order while the queue head fits."""
@@ -647,64 +640,61 @@ class InferenceStateHandoffMixin:
                 pass
         return safe_to_release
 
-    def _admission_flags(self) -> list:
-        """Per-pending (done, failed, exception) tuples agreed across MP ranks.
+    def _report_completed_kv_imports(self) -> None:
+        """Report locally terminal imports without synchronizing the compute ranks."""
 
-        Pending order is identical across ranks because submissions arrive via
-        the TP broadcast in order. One SUM reduction establishes that all ranks
-        completed or that any rank failed, keeping admission and failure control
-        flow identical across the model-parallel group.
-        """
-        local = []
-        for p in self._pending_kv_imports:
-            try:
-                done = all(handle.poll() for handle in self._pending_transfer_handles(p))
-                local.append((done, False, None))
-            except Exception as exc:  # quarantined by the caller
-                local.append((False, True, exc))
-        mp_group = self.pg_collection.mp
-        world_size = (
-            torch.distributed.get_world_size(mp_group)
-            if (mp_group is not None and torch.distributed.is_initialized())
-            else 1
-        )
-        if world_size > 1:
-            # A failure contributes -world_size, so the reduced value stays
-            # negative even when every other rank reports completion.
-            flags = torch.tensor(
-                [-world_size if failed else int(done) for done, failed, _ in local],
-                dtype=torch.int32,
-                device=self.context.memory_buffer.device,
-            )
-            torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.SUM, group=mp_group)
-            local = [
-                (value == world_size, value < 0, exc)
-                for value, (_, _, exc) in zip(flags.tolist(), local)
-            ]
-        return local
+        for pending in self._pending_kv_imports:
+            request_id = pending.request_id
+            if pending.terminal_state_reported:
+                continue
+            failed = pending.local_error is not None
+            if not failed:
+                try:
+                    if not all(handle.poll() for handle in self._pending_transfer_handles(pending)):
+                        continue
+                except Exception as exc:
+                    pending.local_error = exc
+                    failed = True
+
+            if (
+                self._handoff_completion_tracker is None
+                or self._handoff_completion_tracker.world_size == 1
+            ):
+                if get_pg_size(self.pg_collection.mp) != 1:
+                    raise RuntimeError(
+                        "Model-parallel KV handoff requires coordinator completion tracking"
+                    )
+                self._handoff_completion_notifications[request_id] = failed
+            else:
+                self._handoff_completion_tracker.report(request_id, failed)
+            pending.terminal_state_reported = True
 
     def _poll_pending_kv_imports(self) -> int:
         self._drain_deferred_kv_handoffs()
         if not self._pending_kv_imports:
             return 0
-        admission = deque(self._admission_flags())
+        self._report_completed_kv_imports()
         ready = 0
         remaining = deque()
         while self._pending_kv_imports:
             pending = self._pending_kv_imports.popleft()
-            done, failed, poll_exc = admission.popleft()
+            failed = self._handoff_completion_notifications.pop(pending.request_id, None)
+            if failed is None:
+                remaining.append(pending)
+                continue
             try:
                 if failed:
-                    raise poll_exc or RuntimeError(
+                    raise pending.local_error or RuntimeError(
                         "KV handoff transfer failed on a model-parallel peer"
                     )
-                if done:
-                    self._finalize_kv_handoff_import(pending)
-                    ready += 1
-                else:
-                    remaining.append(pending)
+                self._finalize_kv_handoff_import(pending)
+                ready += 1
             except Exception as exc:
-                safe_to_release = self._wait_for_transfer_handles(
+                # A peer can fail before posting its half of a two-sided transfer.
+                # Do not wait on this rank's unmatched operation; quarantine its
+                # destination unless its own handle already reached a terminal state.
+                safe_to_release = pending.destinations_safe and pending.terminal_state_reported
+                safe_to_release = safe_to_release and self._wait_for_transfer_handles(
                     *self._pending_transfer_handles(pending)
                 )
                 if safe_to_release:
@@ -712,7 +702,7 @@ class InferenceStateHandoffMixin:
                 else:
                     remaining.append(pending)
                     logging.error(
-                        "Quarantining request %d cache storage after transfer timeout",
+                        "Quarantining request %d cache storage after an incomplete handoff",
                         pending.request_id,
                     )
                 if not pending.future.done():

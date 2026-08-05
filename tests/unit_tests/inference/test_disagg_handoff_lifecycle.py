@@ -10,6 +10,9 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core.inference.disaggregation.handoff_completion_tracker import (
+    HandoffCompletionTracker,
+)
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
@@ -138,6 +141,16 @@ def _pending_import(engine, request_id, block_id, block_hash):
     )
 
 
+def _completion_tracker(world_size=2):
+    tracker = object.__new__(HandoffCompletionTracker)
+    tracker.rank = 0
+    tracker.world_size = world_size
+    tracker.is_coordinator = True
+    tracker._reports = {}
+    tracker._socket = None
+    return tracker
+
+
 @pytest.fixture
 def handoff_loop():
     loop = asyncio.new_event_loop()
@@ -217,50 +230,46 @@ def test_reset_rejects_an_active_prefill_push(handoff_loop):
     assert engine._pending_kv_pushes == [(7, [handle])]
 
 
-def test_admission_collective_uses_cache_buffer_device(handoff_loop, monkeypatch):
+def test_reset_does_not_release_unsafe_import_destinations(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
-    pending = _pending_import(engine, 4, 10, 104)
-    pending.handle = _PendingHandle()
+    block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
+    pending = _pending_import(engine, 4, block_id, 104)
+    pending.destinations_safe = False
     engine._pending_kv_imports.append(pending)
-    engine.pg_collection.mp = object()
-    expected_device = engine.context.memory_buffer.device
-    observed_devices = []
-    torch_tensor = torch.tensor
 
-    def record_device(data, *args, device=None, **kwargs):
-        observed_devices.append(device)
-        return torch_tensor(data, *args, device="cpu", **kwargs)
+    with pytest.raises(RuntimeError, match="may still access cache storage"):
+        engine._reset_pending_kv_imports()
 
-    monkeypatch.setattr(torch, "tensor", record_device)
-    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
-    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
-
-    assert engine._admission_flags() == [(False, False, None)]
-    assert observed_devices == [expected_device]
+    assert engine.context.kv_block_allocator.releases == []
+    assert list(engine._pending_kv_imports) == [pending]
 
 
-def test_peer_poll_failure_fails_this_rank(handoff_loop, monkeypatch):
+def test_peer_failure_quarantines_an_unfinished_local_transfer(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
     pending = _pending_import(engine, 4, block_id, 104)
     pending.handle = _PendingHandle()
     engine._pending_kv_imports.append(pending)
-    engine.pg_collection.mp = object()
-
-    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
-
-    def report_peer_failure(flags, op, group):
-        flags.copy_(torch.tensor([-1], dtype=flags.dtype))
-
-    monkeypatch.setattr(torch.distributed, "all_reduce", report_peer_failure)
+    engine._record_handoff_completion_notification(4, failed=True)
 
     with pytest.raises(RuntimeError, match="failed on a model-parallel peer"):
         engine._poll_pending_kv_imports()
 
     assert isinstance(pending.future.exception(), RuntimeError)
-    assert engine.context.kv_block_allocator.releases == [[block_id]]
+    assert engine.context.kv_block_allocator.releases == []
+    assert list(engine._pending_kv_imports) == [pending]
+
+
+def test_handoff_completion_waits_for_all_ranks_but_failure_is_immediate():
+    tracker = _completion_tracker()
+    tracker._record(7, rank=0, failed=False)
+    assert tracker.drain_completed() == []
+
+    tracker._record(7, rank=1, failed=False)
+    assert tracker.drain_completed() == [(7, False)]
+
+    tracker._record(8, rank=1, failed=True)
+    assert tracker.drain_completed() == [(8, True)]
 
 
 def test_handoff_metadata_uses_mirrored_blocks_across_pipeline(monkeypatch):
@@ -400,11 +409,12 @@ def test_decode_handoff_defers_until_kv_capacity_is_available(handoff_loop):
     assert engine._kv_transfer_agent.calls == [({"request_id": 8}, [100, 101], [10, 11])]
 
 
-def test_handoff_submission_failure_is_agreed_across_model_parallel_ranks(
-    handoff_loop, monkeypatch
-):
+def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
-    engine.pg_collection.mp = object()
+    engine._kv_transfer_agent.begin_pull_blocks = mock.Mock(
+        side_effect=RuntimeError("local handoff submission failed")
+    )
+    engine._handoff_completion_tracker = mock.Mock(world_size=2)
     future = handoff_loop.create_future()
     handoff = DeferredKvHandoff(
         request_id=8,
@@ -417,22 +427,17 @@ def test_handoff_submission_failure_is_agreed_across_model_parallel_ranks(
         future=future,
     )
 
-    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    assert engine._try_start_kv_handoff_import(handoff)
+    _drain_loop(handoff_loop)
+    engine._poll_pending_kv_imports()
+    engine._handoff_completion_tracker.report.assert_called_once_with(8, True)
 
-    def report_peer_start_failure(value, op, group):
-        if value.numel() == 1:
-            value.zero_()
-
-    monkeypatch.setattr(torch.distributed, "all_reduce", report_peer_start_failure)
-
-    with pytest.raises(RuntimeError, match="submission failed on a model-parallel peer"):
-        engine._try_start_kv_handoff_import(handoff)
+    engine._record_handoff_completion_notification(8, failed=True)
+    with pytest.raises(RuntimeError, match="local handoff submission failed"):
+        engine._poll_pending_kv_imports()
 
     assert isinstance(future.exception(), RuntimeError)
-    # The local receive may still be active, so its destination blocks cannot
-    # return to the allocator until the engine is restarted.
-    assert engine.context.kv_block_allocator.releases == []
+    assert engine.context.kv_block_allocator.releases == [[10, 11]]
     assert not engine._pending_kv_imports
 
 

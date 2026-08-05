@@ -37,3 +37,6 @@ class PendingKvImport:
     cached_prefix_block_count: int
     handle: Any
     future: asyncio.Future
+    local_error: Exception | None = None  # Exact local error, if this rank failed.
+    destinations_safe: bool = True  # Whether allocated blocks may return to the pool.
+    terminal_state_reported: bool = False  # This rank sent its completion report.

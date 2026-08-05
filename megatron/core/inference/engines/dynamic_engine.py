@@ -356,6 +356,17 @@ class DynamicInferenceEngine(AbstractEngine):
     def _poll_pending_kv_imports(self) -> int:
         return 0
 
+    def _setup_handoff_completion_tracking(self, hostname: str | None = None) -> None:
+        """Hook overridden by the KV-handoff engine composition."""
+
+    def _drain_handoff_completion_notifications(self) -> list[tuple[int, bool]]:
+        """Hook overridden by the KV-handoff engine composition."""
+        return []
+
+    def _record_handoff_completion_notification(self, request_id: int, failed: bool) -> None:
+        """Hook overridden by the KV-handoff engine composition."""
+        self._raise_kv_handoff_not_enabled("KV handoff completion notification")
+
     def _prepare_handoff_metadata_batch(self, requests_and_blocks: list[tuple]) -> dict:
         """Hook overridden by the KV-handoff engine composition."""
         return {}
@@ -805,6 +816,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
         self.zmq_sockets += [self.model_parallel_subscriber_socket]
+
+        self._setup_handoff_completion_tracking(hostname)
 
         torch.distributed.barrier(mp_group)
 
@@ -2715,6 +2728,12 @@ class DynamicInferenceEngine(AbstractEngine):
         nvtx_range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
+            all_messages.extend(
+                msgpack.packb(
+                    [Headers.KV_HANDOFF_COMPLETE.value, request_id, failed], use_bin_type=True
+                )
+                for request_id, failed in self._drain_handoff_completion_notifications()
+            )
             while True:
                 try:
                     # Receive messages in a non-blocking way.
@@ -2759,6 +2778,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Push transport: send a pinned hand-off's KV to the decode
                 # instance the coordinator picked.
                 self.push_handoff_kv(int(data[1]), data[2])
+            elif header == Headers.KV_HANDOFF_COMPLETE:
+                self._record_handoff_completion_notification(int(data[1]), bool(data[2]))
             elif header == Headers.ABORT_REQUEST:
                 request_id = int(data[1])
                 entry = self.requests.get(request_id)

@@ -58,6 +58,7 @@ class Transport(IntEnum):
     """Low-level transport framing."""
 
     TP_BROADCAST = 80
+    KV_HANDOFF_COMPLETE = 81  # Internal MP-wide decode admission decision.
 
 
 # All header categories. To add a new class of headers, define a new IntEnum in

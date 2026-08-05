@@ -1953,6 +1953,8 @@ class TextGenerationController:
                 if valid:
                     finished_routing_block_ids[req_id] = valid
 
+        # Retain finished prefill blocks before request cleanup releases them;
+        # the handoff path owns this reference until the decode transfer completes.
         finished_handoff_block_ids = {}
         allocator = context.kv_block_allocator
         if allocator.enable_handoff_pinning and finished_idxs.numel() > 0:
