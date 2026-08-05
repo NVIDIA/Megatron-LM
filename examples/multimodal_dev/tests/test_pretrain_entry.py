@@ -7,8 +7,25 @@ from types import SimpleNamespace
 import pytest
 
 from examples.multimodal_dev.pretrain_multimodal import (
+    configure_vision_recompute,
     validate_entry_args,
 )
+
+
+@pytest.mark.parametrize(("whole_tower", "expected_num_layers"), [(False, 1), (True, 24)])
+def test_recompute_vision_block_size_is_opt_in(whole_tower, expected_num_layers):
+    """Whole-tower must stay opt-in: it trades every layer's saved input for a
+    backward that re-materializes all 24 layers at once, which only wins for
+    payloads like the 128K qualification's."""
+    vision_config = SimpleNamespace(
+        num_layers=24, recompute_granularity=None, recompute_method=None, recompute_num_layers=None
+    )
+    configure_vision_recompute(vision_config, whole_tower=whole_tower)
+    assert (
+        vision_config.recompute_granularity,
+        vision_config.recompute_method,
+        vision_config.recompute_num_layers,
+    ) == ("full", "uniform", expected_num_layers)
 
 
 def _entry_args(**overrides):
@@ -19,6 +36,8 @@ def _entry_args(**overrides):
         cuda_graph_impl="none",
         sequence_parallel=False,
         tensor_model_parallel_size=1,
+        recompute_vision=False,
+        recompute_vision_whole_tower=False,
         dataset_provider="mock_varlen",
         total_seq_length=None,
         seq_length=4096,
@@ -42,6 +61,9 @@ def _entry_args(**overrides):
         # forward_step keeps a runtime guard as defense in depth; this one
         # fails in seconds instead of after multi-node model construction.
         ({"cuda_graph_impl": "local"}, "cuda-graph-impl"),
+        # Block size without the feature is silently inert; for a long-window
+        # recipe that only shows up as an OOM at the allocation point.
+        ({"recompute_vision_whole_tower": True}, "does nothing on its own"),
         # The fixed-shape providers size samples from --total-seq-length while
         # the packer caps at --seq-length; the packer refuses to truncate, so
         # this always dies at step 1. Catch it before the run costs anything.

@@ -40,6 +40,32 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 
 
+def configure_vision_recompute(vision_config, *, whole_tower: bool = False) -> None:
+    """--recompute-vision: full activation recompute for the vision tower.
+
+    The block size is the whole trade-off, and it is payload-dependent, so it
+    stays opt-in rather than becoming a silent change of what --recompute-vision
+    has always meant:
+
+    - per-layer blocks (default): every layer's input is saved, and backward
+      re-materializes one layer at a time — a bounded spike.
+    - one whole-tower block (--recompute-vision-whole-tower): only the block
+      input (the patch-embed output) is saved, but backward re-materializes ALL
+      layers' internal activations simultaneously.
+
+    Recompute FLOPs are identical either way (any full recompute re-runs the
+    tower in backward). Whole-tower is the measured winner for this stack's
+    long-window envelope, where the per-layer saves
+    (raw_patches x vision_hidden x num_layers) dominate vision memory; it was
+    validated by the 128K qualification with allocation-point margin forensics.
+    A different model or a lighter payload can just as easily be dominated by
+    the backward spike instead, which is why the default is unchanged.
+    """
+    vision_config.recompute_granularity = "full"
+    vision_config.recompute_method = "uniform"
+    vision_config.recompute_num_layers = vision_config.num_layers if whole_tower else 1
+
+
 def model_provider(
     pre_process: bool = True,
     post_process: bool = True,
@@ -81,9 +107,9 @@ def model_provider(
     vision_config.apply_rope_fusion = language_config.apply_rope_fusion
 
     if getattr(args, "recompute_vision", False):
-        vision_config.recompute_granularity = "full"
-        vision_config.recompute_method = "uniform"
-        vision_config.recompute_num_layers = 1
+        configure_vision_recompute(
+            vision_config, whole_tower=getattr(args, "recompute_vision_whole_tower", False)
+        )
 
     # --- vision FLOPs metadata ---
     vision_flops_fn = registry.get("vision_flops_fn")
@@ -171,6 +197,16 @@ def validate_entry_args(args) -> None:
             "the deferred embedding scatter (scatter_embedding_sequence_parallel=False) "
             "leaves the decoder embedding unscattered while MTP consumes scattered "
             "hidden states. Run with --mtp-num-layers 0, or drop --sequence-parallel."
+        )
+    # Block-size without the feature is a no-op the operator cannot see: the
+    # run starts with NO vision recompute at all and, for a long-window recipe,
+    # only says so as an OOM at the GPU allocation point.
+    if getattr(args, "recompute_vision_whole_tower", False) and not getattr(
+        args, "recompute_vision", False
+    ):
+        raise ValueError(
+            "--recompute-vision-whole-tower selects the recompute BLOCK SIZE and "
+            "does nothing on its own; pass --recompute-vision as well, or drop it."
         )
     # The fixed-shape providers size their samples from --total-seq-length
     # while pack_or_pad_batch caps at --seq-length, so this combination always

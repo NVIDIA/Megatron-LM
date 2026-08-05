@@ -74,9 +74,24 @@ def add_multimodal_args(parser):
         action="store_true",
         default=False,
         help=(
-            "Enable full activation recomputation for vision encoder layers. "
-            "Uses uniform method and recomputes every layer. "
-            "Independent of the decoder --recompute-* flags."
+            "Enable full activation recomputation for vision encoder layers, "
+            "as per-layer uniform blocks. Independent of the decoder "
+            "--recompute-* flags. See --recompute-vision-whole-tower to trade "
+            "the saved per-layer inputs for a larger backward spike."
+        ),
+    )
+    group.add_argument(
+        "--recompute-vision-whole-tower",
+        action="store_true",
+        default=False,
+        help=(
+            "With --recompute-vision, configure the tower as ONE uniform block "
+            "spanning all layers: only the patch-embed output is saved, but "
+            "backward re-materializes every layer's activations at once. "
+            "Recompute FLOPs are unchanged. Wins when the per-layer saves "
+            "(raw_patches x vision_hidden x num_layers) dominate vision memory, "
+            "as in the 128K long-window qualification; off by default because a "
+            "lighter payload can instead be dominated by the backward spike."
         ),
     )
     group.add_argument(
