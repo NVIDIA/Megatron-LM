@@ -19,9 +19,8 @@ from megatron.core.utils import get_attr_wrapped_model
 
 logger = logging.getLogger(__name__)
 
-# One retry only. The retry replays at a budget grown to the peak the first attempt needed, so it
-# drops again only if the replay routes differently -- possible because the rerun does not restore
-# RNG state, so dropout (if any) shifts the routing.
+# One retry only, and it is enough: prepare_for_rerun clears the capacity factor (dropless, so no
+# receive budget to exceed) and disables paged stashing, so the retry cannot fail either way.
 _MAX_RERUN_ATTEMPTS = 2
 
 SCALE_INV_BLOCK_SIZE = 32
