@@ -132,6 +132,7 @@ class MultimodalModel(MegatronModule):
             post_process=True,
             parallel_output=parallel_output,
             share_embeddings_and_output_weights=(share_embeddings_and_output_weights),
+            scatter_embedding_sequence_parallel=False,
             position_embedding_type=position_embedding_type,
             rotary_percent=rotary_percent,
             rotary_base=rotary_base,
@@ -150,35 +151,22 @@ class MultimodalModel(MegatronModule):
     ) -> Tensor:
         """Replace image-token positions with vision embeddings.
 
-        Handles sequence parallelism (gather → scatter → re-scatter).
+        The text sequence must still be full here. Context parallelism is
+        applied after the replacement, followed by sequence parallelism.
 
         Args:
             input_ids: ``[B, S]`` token IDs.
-            text_embeddings: ``[S, B, D]`` (or ``[S/TP, B, D]`` with SP).
+            text_embeddings: Full, unsharded ``[S, B, D]`` embeddings.
             vision_embeddings: ``[num_visual_tokens, D]``.
 
         Returns:
-            Combined embeddings, same shape as *text_embeddings*.
+            Full combined embeddings with shape ``[S, B, D]``.
         """
-        sp = (
-            self.config.sequence_parallel
-            and parallel_state.get_tensor_model_parallel_world_size() > 1
-        )
-
-        if sp:
-            text_embeddings = tensor_parallel.gather_from_sequence_parallel_region(
-                text_embeddings, tensor_parallel_output_grad=False
-            )
-
         combined = text_embeddings.transpose(0, 1).contiguous()
         image_mask = input_ids == self.image_token_id
         mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
         combined = combined.masked_scatter(mask_expanded, vision_embeddings)
         combined = combined.transpose(0, 1).contiguous()
-
-        if sp:
-            combined = tensor_parallel.scatter_to_sequence_parallel_region(combined)
-
         return combined
 
     def compute_position_ids(
@@ -340,6 +328,7 @@ class MultimodalModel(MegatronModule):
         Returns:
             Loss tensor (post_process=True) or hidden states.
         """
+        scatter_decoder_input_to_sp = False
         if position_ids is None:
             position_ids = self.compute_position_ids(
                 input_ids=input_ids,
@@ -354,6 +343,10 @@ class MultimodalModel(MegatronModule):
         if decoder_input is None and self.language_model is not None:
             text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
 
+            scatter_decoder_input_to_sp = (
+                self.config.sequence_parallel
+                and parallel_state.get_tensor_model_parallel_world_size() > 1
+            )
             if vision_embeddings is not None:
                 decoder_input = self._scatter_vision_embeddings(
                     input_ids, text_embeddings, vision_embeddings
@@ -374,6 +367,9 @@ class MultimodalModel(MegatronModule):
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
         )
+
+        if scatter_decoder_input_to_sp:
+            decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(decoder_input)
 
         with self._thd_mrope_no_cp_override(packed_seq_params):
             return self.language_model(
