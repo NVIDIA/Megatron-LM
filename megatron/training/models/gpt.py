@@ -169,6 +169,7 @@ class GPTModelConfig(ModelConfig):
     ### GPT Model initialization ###
     seq_length: int = 1024
     fp16_lm_cross_entropy: bool = False
+    logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
     share_embeddings_and_output_weights: bool = False
     position_embedding_type: Literal["learned_absolute", "rope", "mrope", "yarn", "none"] = "learned_absolute"
@@ -316,6 +317,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             vocab_size=padded_vocab_size,
             max_sequence_length=self._model_config.seq_length,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
+            logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,
             share_embeddings_and_output_weights=self._model_config.share_embeddings_and_output_weights,
             position_embedding_type=self._model_config.position_embedding_type,
