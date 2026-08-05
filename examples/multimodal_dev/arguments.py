@@ -84,7 +84,7 @@ def add_multimodal_args(parser):
         action="store_true",
         default=False,
         help=(
-            "Pack variable-length sequences into THD format to eliminate "
+            "Pack variable-length sequences into THD format to reduce "
             "padding waste."
         ),
     )
