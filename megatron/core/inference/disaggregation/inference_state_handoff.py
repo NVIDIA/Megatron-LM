@@ -45,13 +45,14 @@ class InferenceStateHandoffMixin:
     def _initialize_disaggregation_state(self) -> None:
         """Initialize state without importing or constructing a transfer backend."""
 
-        self._pinned_handoff_blocks: Dict[int, list] = {}
+        self._pinned_handoff_blocks: Dict[int, list] = {}  # Request ID -> pinned KV block IDs.
         self._kv_transfer_agent = None
-        self._kv_peer_metas = None
-        self._pp_kv_peer_metas = None
+        self._kv_peer_metas = None  # KV descriptors for this PP stage's TP ranks.
+        self._pp_kv_peer_metas = None  # Each PP stage's set of TP KV descriptors.
         self._deferred_kv_handoffs = deque()
         self._pending_kv_imports = deque()
-        self._handoff_import_owners: Dict[int, list[int]] = {}
+        # Retain imported blocks until the admitted request acquires its own references.
+        self._handoff_import_owners: Dict[int, list[int]] = {}  # Request ID -> imported KV blocks.
         self._pending_kv_pushes: list = []
 
     @property
