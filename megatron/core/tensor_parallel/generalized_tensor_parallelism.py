@@ -366,9 +366,6 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     there are no per-layer runners, so that second wait is skipped. No-op when GTP is inactive.
     """
     wait_async_comms()
-    # End of iteration. The first-backward dump already logged the chains; this only catches
-    # one that gained links afterwards, which virtual pipelining can do by interleaving chunks.
-    GTPShardedParam.flush_link_tables()
     cur = torch.cuda.current_stream()
     # Join the async AG/RS side streams for both the eager and CUDA-graph capture paths.
     for s in _AG_STREAMS.values():
@@ -897,9 +894,7 @@ class GTPShardedParam(torch.nn.Parameter):
     # Recompute-forward prefetch cursor, keyed by chain_id; also cleared by reset_gtp_state().
     _recompute_chain_state: Dict[str, dict] = {}
 
-    # True while some chain holds links that have not been logged yet. Backward tests this on
-    # every all-gather, so it stays a plain bool instead of a scan over _chain_state.
-    _link_tables_dirty: bool = False
+    _link_tables_flushed: bool = False
 
     @classmethod
     def _get_chain_state(cls, chain_id: str) -> dict:
@@ -908,9 +903,6 @@ class GTPShardedParam(torch.nn.Parameter):
                 "last_weight": None,
                 "link_node_count": 0,
                 "link_table_buffer": [],
-                # How many buffered rows have been logged so far. A count rather than a
-                # done-flag, so a chain that gains links later is noticed and logged again.
-                "link_table_logged_len": 0,
             }
         return cls._chain_state[chain_id]
 
@@ -922,23 +914,15 @@ class GTPShardedParam(torch.nn.Parameter):
 
     @classmethod
     def flush_link_tables(cls) -> None:
-        """Log the prefetch-link table of every chain that has rows not yet logged.
+        """Log every chain's buffered prefetch-link table once, atomically.
 
-        _buffer_link_table_row buffers a row per link; emitting them together here keeps a
-        table from being interleaved with other log lines. A chain that gains links after it
-        was logged is logged again in full, rather than as a fragment.
-
-        Only call this where the chains are known to be complete. "This weight is already
-        linked" is not such a point: MTP consumes the same weight several times per forward,
-        so that condition is first met mid-forward, while later links are still being created.
+        Call only where the chains are complete -- NOT on "this weight is already linked", which
+        MTP hits mid-forward while later links are still being created.
         """
-        cls._link_tables_dirty = False
         for chain in cls._chain_state.values():
-            buf = chain["link_table_buffer"]
-            if len(buf) == chain["link_table_logged_len"]:
-                continue
-            chain["link_table_logged_len"] = len(buf)
-            log_single_rank(logger, logging.INFO, "\n".join(buf) + "\n")
+            if chain["link_table_buffer"]:
+                log_single_rank(logger, logging.INFO, "\n".join(chain["link_table_buffer"]) + "\n")
+        cls._link_tables_flushed = True
 
     @classmethod
     def _buffer_link_table_row(
@@ -979,7 +963,6 @@ class GTPShardedParam(torch.nn.Parameter):
                 return f"{type(q).__name__}/{raw_dt}"
             return str(getattr(param, "dtype", "-"))
 
-        cls._link_tables_dirty = True
         chain["link_node_count"] += 1
         if chain["link_node_count"] == 1:
             chain_id = getattr(curr, "chain_id", GTPChain.UNGRAPHED.value)
@@ -1414,7 +1397,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # Links are only created during forward, so every chain is complete by the first
         # backward all-gather. Logging here rather than at the end of the iteration means the
         # tables are still emitted if backward then fails, which is when they are most useful.
-        if type(self)._link_tables_dirty:
+        if not type(self)._link_tables_flushed:
             type(self).flush_link_tables()
 
         if GTP_CONFIG.weight_prefetch and self.next_w is not None:
@@ -2291,7 +2274,7 @@ def reset_gtp_state():
     """
     GTPShardedParam._chain_state.clear()
     GTPShardedParam._recompute_chain_state.clear()
-    GTPShardedParam._link_tables_dirty = False
+    GTPShardedParam._link_tables_flushed = False
     _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
 
 

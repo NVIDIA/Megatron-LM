@@ -536,6 +536,7 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 | **Fixed, single membership** — `chain_id` and graphed-vs-eager decided once | A weight whose CG scope or dense/expert context changes between steps | Unrepresentable in one linear slot |
 | **One consume per weight per step** — a linear list gives each weight one slot, and backward is assumed to walk it in exact reverse | A weight used at two points in one forward (MTP's shared embedding / output_layer, tied I/O embeddings) | Backward reaches the weight out of chain order, and its reduce-scatters overlap. Supported since §3.5 — anything else in this shape must be checked against it |
 | **Build-once, run-forever lifetime** — strong refs never released | Building/tearing down GTP models in-process (successive UTs, model re-init, multi-model drivers) | Leaks all GTP params/buffers; a new model's chain can cross-link onto a previous model's stale params |
+| **The prefetched weight is already updated** — the chain gathers a weight before the module that owns it runs | DDP's `overlap_param_gather`: `_make_forward_pre_hook` waits `finish_param_sync` only for the module about to execute, and GTP never calls it, so a prefetch reaching into a bucket whose all-gather has not landed is unordered against it | Gathers the pre-update weight. Widens with prefetch depth — one-block-ahead grouped chains reach furthest. `overlap_param_gather=False` removes it, at the cost of that overlap |
 
 **Mitigations.**
 
@@ -577,30 +578,36 @@ Three consequences:
 
 ### 3.5 GTP_remat + Multi-Token Prediction (MTP)
 
-MTP is the first feature to break the *one consume per weight per step* assumption in §3.4, and it breaks it in two independent ways:
+**The one thing to know:** MTP consumes `embedding` and `output_layer` **`1 + mtp_num_layers` times per forward**, not once. Everything below follows from that.
 
-- **Shared weights.** Each MTP layer re-embeds its shifted input with the main model's `embedding`, and every prediction head (main + one per MTP depth) runs the main model's `output_layer`. Those two weights are consumed **1 + `mtp_num_layers`** times per forward instead of once.
-- **A replayed layer.** With `--mtp-use-repeated-layer` a *single* MTP layer object is built and applied `mtp_num_layers` times (`MultiTokenPredictionBlock.forward` indexes `self.layers[0]` every iteration), so its weights — including grouped experts — are consumed once per depth.
+#### What MTP does to the chain
 
-The chain itself is unaffected: linking happens on a weight's **first** materialization, so a re-consumed weight is skipped rather than relinked, and the chain still encodes one clean forward order. In an L6 + 2-depth run it reads `embedding → decoder.0..5 → mtp.0.eh_proj → mtp.0 attn/shared-experts → mtp.1 … → output_layer`, with MTP's routed experts on the grouped `fc1`/`fc2` chains.
+Two independent violations of the *one consume per weight per step* assumption in §3.4:
 
-What breaks is everything downstream that assumed *one backward per weight, in reverse chain order*.
+- **Shared weights.** Each MTP layer re-embeds its shifted input with the main `embedding`, and every prediction head (main + one per depth) runs the main `output_layer`.
+- **A replayed layer.** With `--mtp-use-repeated-layer` a *single* MTP layer object is built and applied `mtp_num_layers` times (`MultiTokenPredictionBlock.forward` indexes `self.layers[0]` every iteration), so its weights — grouped experts included — are consumed once per depth.
 
-| Failure | Cause | Fix |
-|---|---|---|
-| `KeyError: None` in `wgrad_reduce_scatter` | Backward reaches a shared weight before its chain successor has reduce-scattered, so the deferred finalize read an unreserved ticket. | Finalize only when an RS was really pending. |
-| **Dropped gradient on `output_layer`, silently** | Its per-head reduce-scatters share one ticket and one handle, so only the last one survives. | Finalize a pending RS before starting the next for that weight. |
-| Truncated link table in the logs | The old flush trigger fired on a weight's second consume, which MTP hits mid-forward. | Flush from `flush_link_tables()` at the first backward AG. |
+**The forward chain is unaffected.** Linking happens on a weight's *first* materialization, so a re-consumed weight is skipped rather than relinked. An L6 + 2-depth chain reads `embedding → decoder.0..5 → mtp.0.eh_proj → mtp.0 attn/shared-experts → mtp.1 … → output_layer`, with MTP's routed experts on the grouped `fc1`/`fc2` chains.
 
-The first and third are loud; the second is not, which is why it is guarded numerically rather than by a smoke test — see `test_gtp_mtp.py` in §4.
+**The backward order is what breaks.** It follows the reverse of *consumption events*, not of chain nodes: a chain of `N` nodes yields `N + 2 × mtp_num_layers` backward events, because `embedding` and `output_layer` each contribute `mtp_num_layers` extra ones. A shared weight is therefore visited far from its chain position, and anything that assumed "one backward per weight, in reverse chain order" fails:
 
-**Configuration notes.**
+#### How the chain supports it
 
-- MTP layers are appended to `--hybrid-layer-pattern` after a `/` separator, **one segment per depth**, all segments identical: `MEM*EM/*E/*E` is a 6-layer decoder plus 2 MTP depths. `MEM*EM/*E*E` is *one* depth whose MTP layer is 4 layers deep — a different model.
-- The pattern is authoritative: `mtp_num_layers` is **silently overridden** to the number of `/`-separated segments (`arguments.py`, "conflicts with MTP depth count"). Check the arg dump rather than assuming the flag took.
-- `--mtp-use-repeated-layer` is generated from the `TransformerConfig` dataclass, so it does not appear as a literal string in `arguments.py`.
+The chain stays a plain linear list — one slot per weight, no branching. MTP is absorbed in the wgrad path instead, by two rules:
 
-> **Status.** The failure modes above are fixed and covered by unit tests at world=4. A55B-scale convergence with MTP is **still under investigation** — a GTP16 × EGTP2 MXFP8 run diverges from its no-MTP baseline from ~iter 900 with parameter-norm growth of +52% vs +7%. That run has no *MTP-without-GTP* control, so the divergence is **not yet attributed** to GTP_remat. Do not treat GTP_remat + MTP as production-validated.
+- **Per-consume gradients accumulate.** Every consume produces its own wgrad and its own reduce-scatter, and the weight's `main_grad` ends up holding their sum — which is its true gradient. A weight keeps only one reduce-scatter in flight at a time, so an outstanding one is completed and accumulated before the next begins.
+
+- **The deferred finalize is conditional.** Normally a weight finalizes its chain *successor's* reduce-scatter, hiding that latency behind the next backward. Once backward stops following chain order, the successor may not have started one yet, so the finalize runs only when something is actually in flight.
+
+Both apply only under `async_reduction`; with it off, every wgrad reduce-scatters and accumulates inline.
+
+Link tables are logged from the first backward all-gather — the earliest point at which every chain is complete, and one that is still reached if backward later fails.
+
+#### Configuration traps
+
+- **One `/` segment per depth, all identical.** `MEM*EM/*E/*E` = 6-layer decoder + 2 MTP depths. `MEM*EM/*E*E` = *one* depth whose MTP layer is 4 layers deep — a different model.
+- **The pattern silently overrides `--mtp-num-layers`** to the number of `/`-separated segments (`arguments.py`, warning `"conflicts with MTP depth count"`). If a run appears to execute fewer MTP layers than requested, this is almost always why — **trust the arg dump, not the flag**.
+- `--mtp-use-repeated-layer` is generated from the `TransformerConfig` dataclass, so it never appears as a literal string in `arguments.py`. At `mtp_num_layers=1` it is a no-op: the loop runs once either way and the parameter set is identical.
 
 ## 4. Testing
 

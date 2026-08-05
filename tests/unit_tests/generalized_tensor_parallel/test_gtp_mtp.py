@@ -243,7 +243,7 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
             ps.destroy_model_parallel()
             GTPShardedParam._chain_state = {}
             GTPShardedParam._recompute_chain_state = {}
-            GTPShardedParam._link_tables_dirty = False
+            GTPShardedParam._link_tables_flushed = False
     finally:
         GTP_CONFIG.async_reduction = saved_async
         GTP_CONFIG.pad_for_alignment = saved_pad
@@ -319,7 +319,7 @@ def _worker_runs_end_to_end(rank, world_size, port, repeated_layer=False, moe=Fa
         ps.destroy_model_parallel()
         GTPShardedParam._chain_state = {}
         GTPShardedParam._recompute_chain_state = {}
-        GTPShardedParam._link_tables_dirty = False
+        GTPShardedParam._link_tables_flushed = False
     finally:
         GTP_CONFIG.pad_for_alignment = saved_pad
 
