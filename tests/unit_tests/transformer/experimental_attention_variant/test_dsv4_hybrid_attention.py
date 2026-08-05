@@ -427,7 +427,12 @@ class TestDSv4HybridGroupedOutput:
 
         expected_in = (config.v_head_dim * config.num_attention_heads) // o_groups
         weight = attn._linear_o_group_proj_weight
-        assert weight.shape == (o_groups, o_lora_rank, expected_in)
+        expected_shape = (
+            (o_groups, o_lora_rank, expected_in)
+            if attn._uses_te_batched_linear
+            else (o_groups * o_lora_rank, expected_in)
+        )
+        assert weight.shape == expected_shape
         assert weight.requires_grad
 
     @pytest.mark.parametrize(
@@ -435,10 +440,11 @@ class TestDSv4HybridGroupedOutput:
     )
     def test_o_group_proj_legacy_checkpoint_compatibility(self, quantized_weight):
         """Legacy 2D checkpoints should load into BF16 and quantized weights."""
+        if not hasattr(te_pytorch, "BatchedLinear"):
+            pytest.skip("Transformer Engine BatchedLinear is not available")
+
         recipe = None
         if quantized_weight:
-            if not hasattr(te_pytorch, "BatchedLinear"):
-                pytest.skip("Transformer Engine BatchedLinear is not available")
             available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
             if not available:
                 pytest.skip(reason)
