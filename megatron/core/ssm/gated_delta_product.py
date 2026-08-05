@@ -22,12 +22,12 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_merge,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm._packed_seq_helpers import (
+from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
+from megatron.core.ssm.packed_seq_helpers import (
     build_packed_seq_idx,
     check_fla_sequence_packing_support,
     get_cu_seqlens,
 )
-from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
