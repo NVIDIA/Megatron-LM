@@ -510,39 +510,18 @@ class InferenceStateHandoffMixin:
         return cached_blocks
 
     def _handoff_capacity_available(self, num_blocks: int, cached_blocks: list[int]) -> bool:
-        """Agree on KV capacity before any model-parallel rank mutates its allocator."""
+        """Check capacity in the rank-local mirror of model-parallel allocator state."""
 
         allocator = self.context.kv_block_allocator
         potential_matched_count = 0
         if cached_blocks:
             block_tensor = torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
             potential_matched_count = int((allocator.block_ref_counts[block_tensor] == 0).sum())
-        local_available = allocator.is_memory_available(
+        # Model-parallel ranks process the same request and allocator operations
+        # in lockstep, so capacity must remain mirrored without a per-request collective.
+        return allocator.is_memory_available(
             num_blocks, potential_matched_count=potential_matched_count
         )
-
-        mp_group = self.pg_collection.mp
-        world_size = (
-            torch.distributed.get_world_size(mp_group)
-            if (mp_group is not None and torch.distributed.is_initialized())
-            else 1
-        )
-        if world_size == 1:
-            return local_available
-
-        agreement = torch.tensor(
-            [num_blocks, -num_blocks, int(local_available)],
-            dtype=torch.int32,
-            device=self.context.memory_buffer.device,
-        )
-        torch.distributed.all_reduce(agreement, op=torch.distributed.ReduceOp.MIN, group=mp_group)
-        min_blocks, neg_max_blocks, all_available = agreement.tolist()
-        if min_blocks != -neg_max_blocks:
-            raise RuntimeError(
-                "Model-parallel ranks computed different KV handoff block counts "
-                f"(min={min_blocks}, max={-neg_max_blocks})"
-            )
-        return bool(all_available)
 
     def _all_ranks_started_handoff(self, local_started: bool) -> bool:
         """Agree that every model-parallel rank submitted its local transfer."""
