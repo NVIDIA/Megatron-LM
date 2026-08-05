@@ -52,6 +52,7 @@ class FsdpContext:
         self.is_last_microbatch = True
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
+        # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
         with torch.cuda.device(device):
@@ -86,6 +87,7 @@ class FsdpContext:
         for root in reversed(roots):
             _collect_backward_order(cast(nn.Module, root), self.backward_order)
 
+        self._registered_modules.clear()
         self._is_finalized = True
 
     def ensure_finalized(self) -> None:
