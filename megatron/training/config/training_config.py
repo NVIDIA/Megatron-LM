@@ -573,24 +573,6 @@ class CheckpointConfig:
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
 
-    strict_fsdp_dtensor_model_load: Literal[
-        "assume_ok_unexpected",
-        "log_unexpected",
-        "log_all",
-        "raise_unexpected",
-        "raise_all",
-        "return_unexpected",
-        "return_all",
-        "ignore_all",
-    ] = "raise_unexpected"
-    """Determine handling of model weights an FSDP DTensor partial load cannot supply.
-    Check StrictHandling docs for flags meaning. Only applies when strict_fsdp_dtensor_load is
-    False, where the underlying load would otherwise skip such weights silently and leave them
-    at their initialized values. Unlike strict_fsdp_dtensor_load this covers only the model
-    sections, so optimizer and RNG state that is intentionally absent does not trip it. Weights
-    the checkpoint holds but this rank does not need are always fine, as expected under
-    pipeline, tensor and expert parallelism. Ignored when finetune is set."""
-
     dist_ckpt_strictness: Literal[
         "assume_ok_unexpected",
         "log_unexpected",
@@ -602,7 +584,10 @@ class CheckpointConfig:
         "ignore_all",
     ] = "assume_ok_unexpected"
     """Determine handling of key mismatch during checkpoint load. Check StrictHandling docs for flags meaning.
-    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model."""
+    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model.
+    For fsdp_dtensor checkpoints it covers model weights a partial load cannot supply, and
+    assume_ok_unexpected raises like raise_unexpected there because a partial load never raises
+    on its own. Use ignore_all to opt out."""
 
     dist_ckpt_save_pre_mcore_014: bool = False
     """Revert checkpointing simplifications introduced in Megatron-Core v0.14.

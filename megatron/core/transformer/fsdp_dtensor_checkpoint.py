@@ -51,6 +51,26 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_attr_wrapped_model
 
 
+def _strip_wrapper_prefixes(path):
+    """Strip DDP/FSDP wrapper prefixes (module., model.) from a module or state dict path."""
+    parts = path.split('.')
+    while parts and parts[0] in ('module', 'model'):
+        parts = parts[1:]
+    return '.'.join(parts)
+
+
+def _intersect_slice(s1, s2):
+    """Intersection of two step-1 slices, or an empty slice when they do not overlap."""
+    start = max(s1.start, s2.start)
+    stop = min(s1.stop, s2.stop)
+    return slice(0, 0) if start >= stop else slice(start, stop)
+
+
+def _shift_slice(s, offset):
+    """Move a step-1 slice by ``offset``, e.g. to rebase it onto a shard's local storage."""
+    return slice(s.start + offset, s.stop + offset)
+
+
 def get_ep_layer_offset(num_experts: int | None = None) -> int:
     """
     Get the expert layer offset for the current model.
@@ -217,21 +237,16 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     # layers have gated_linear_unit=False while language decoder layers
     # have gated_linear_unit=True.
     # ------------------------------------------------------------------
-    def _strip_wrappers(path):
-        """Strip DDP/FSDP wrapper prefixes (module., model.) from a path."""
-        parts = path.split('.')
-        while parts and parts[0] in ('module', 'model'):
-            parts = parts[1:]
-        return '.'.join(parts)
-
     _layer_glu = {}
     for name, module in model.named_modules():
         if isinstance(module, TransformerLayer):
-            _layer_glu[_strip_wrappers(name)] = getattr(module.config, 'gated_linear_unit', False)
+            _layer_glu[_strip_wrapper_prefixes(name)] = getattr(
+                module.config, 'gated_linear_unit', False
+            )
 
     def _key_in_glu_layer(key):
         """Return True if *key* belongs to a TransformerLayer with gated_linear_unit=True."""
-        norm_key = _strip_wrappers(key)
+        norm_key = _strip_wrapper_prefixes(key)
         best_glu, best_len = None, -1
         for layer_path, uses_glu in _layer_glu.items():
             if norm_key.startswith(layer_path + '.') and len(layer_path) > best_len:
@@ -239,17 +254,6 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         if best_glu is None:
             return True  # no TransformerLayer found — assume GLU for backward compat
         return best_glu
-
-    def intersection(s1, s2):
-        # Only works for step=1
-        start = max(s1.start, s2.start)
-        stop = min(s1.stop, s2.stop)
-        if start >= stop:
-            return slice(0, 0)  # Empty slice if no intersection
-        return slice(start, stop)
-
-    def offset_slice(s, offset):
-        return slice(s.start + offset, s.stop + offset)
 
     def is_swiglu_key(key):
         """
@@ -296,10 +300,10 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         view_shape[swiglu_shard_axis] = -1
         local_tensor = data.to_local()
         weight_w = local_tensor.view(-1)[
-            offset_slice(intersection(fsdp_slice, w_slice), -fsdp_slice.start)
+            _shift_slice(_intersect_slice(fsdp_slice, w_slice), -fsdp_slice.start)
         ]
         weight_v = local_tensor.view(-1)[
-            offset_slice(intersection(fsdp_slice, v_slice), -fsdp_slice.start)
+            _shift_slice(_intersect_slice(fsdp_slice, v_slice), -fsdp_slice.start)
         ]
         weight_w = weight_w.reshape(view_shape)
         weight_v = weight_v.reshape(view_shape)
@@ -414,13 +418,6 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
     GDN_IN_PROJ_NAMES = ["query", "key", "value", "z", "beta", "alpha"]
     GDN_CONV1D_NAMES = ["query", "key", "value"]
 
-    def _strip_wrappers(path):
-        """Strip DDP/FSDP wrapper prefixes (module., model.) from a path."""
-        parts = path.split('.')
-        while parts and parts[0] in ('module', 'model'):
-            parts = parts[1:]
-        return '.'.join(parts)
-
     # ------------------------------------------------------------------
     # Build per-GDN-module split-size map by walking the model tree.
     # GDN modules are identified by the presence of qk_dim / v_dim /
@@ -434,7 +431,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         qk = mod.qk_dim // tp
         v = mod.v_dim // tp
         nvh = mod.num_value_heads // tp
-        _gdn_info[_strip_wrappers(name)] = {
+        _gdn_info[_strip_wrapper_prefixes(name)] = {
             'in_proj_sizes': [qk, qk, v, v, nvh, nvh],
             'conv1d_sizes': [qk, qk, v],
         }
@@ -445,7 +442,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
     def _match_gdn_key(key):
         """Return (split_sizes, sub_names, split_dim) if *key* is a GDN fused
         parameter that needs splitting, else ``None``."""
-        norm = _strip_wrappers(key)
+        norm = _strip_wrapper_prefixes(key)
         for gdn_path, info in _gdn_info.items():
             if not norm.startswith(gdn_path + '.'):
                 continue
@@ -455,14 +452,6 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             if rel in ('conv1d.weight', 'conv1d.bias'):
                 return info['conv1d_sizes'], GDN_CONV1D_NAMES, 0
         return None
-
-    def intersection(s1, s2):
-        start = max(s1.start, s2.start)
-        stop = min(s1.stop, s2.stop)
-        return slice(0, 0) if start >= stop else slice(start, stop)
-
-    def offset_slice(s, offset):
-        return slice(s.start + offset, s.stop + offset)
 
     def split_gdn_fused(data, dist_param, split_sizes, split_dim):
         """Split a fused GDN projection DTensor into per-component DTensors."""
@@ -496,8 +485,8 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             comp_flat = s * elems_per_unit
             comp_slice = slice(flat_offset, flat_offset + comp_flat)
 
-            shard = intersection(fsdp_slice, comp_slice)
-            comp_data = local_tensor.view(-1)[offset_slice(shard, -fsdp_slice.start)]
+            shard = _intersect_slice(fsdp_slice, comp_slice)
+            comp_data = local_tensor.view(-1)[_shift_slice(shard, -fsdp_slice.start)]
 
             comp_view = list(view_shape)
             comp_view[split_dim] = -1
@@ -564,25 +553,6 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
             optimizer_state_dict["state"] = new_opt_state
 
     return model_state_dict, optimizer_state_dict
-
-
-def _strip_wrapper_prefixes(path):
-    """Strip DDP/FSDP wrapper prefixes (module., model.) from a module or state dict path."""
-    parts = path.split('.')
-    while parts and parts[0] in ('module', 'model'):
-        parts = parts[1:]
-    return '.'.join(parts)
-
-
-def _intersect_slice(s1, s2):
-    """Intersection of two step-1 slices, or an empty slice when they do not overlap."""
-    start = max(s1.start, s2.start)
-    stop = min(s1.stop, s2.stop)
-    return slice(0, 0) if start >= stop else slice(start, stop)
-
-
-def _shift_slice(s, offset):
-    return slice(s.start + offset, s.stop + offset)
 
 
 def split_fused_fsdp_param(data, dist_param, split_sizes, is_expert_param=False, split_dim=0):
@@ -982,6 +952,11 @@ def validate_fsdp_dtensor_model_load(
     ``*_ALL`` variants of ``strict`` behave like their ``*_UNEXPECTED`` counterparts;
     identifying genuinely "missing" keys would require exchanging key sets across ranks.
 
+    ``ASSUME_OK_UNEXPECTED`` is treated as ``RAISE_UNEXPECTED`` here. It means "rely on the
+    underlying strategy to raise", which a partial DCP load never does, and it exists to skip
+    the extra disk access an explicit check normally costs — but the caller already holds the
+    checkpoint metadata, so this check is free. Use ``IGNORE_ALL`` to actually skip it.
+
     Args:
         state_dict_metadata: ``state_dict_metadata`` from the checkpoint's DCP metadata.
         load_state_dict: state dict this rank is about to load into.
@@ -996,7 +971,7 @@ def validate_fsdp_dtensor_model_load(
         CheckpointingException: if ``strict`` is a ``RAISE_*`` value and keys are missing.
     """
     strict = parse_strict_flag(strict)
-    if strict in (StrictHandling.ASSUME_OK_UNEXPECTED, StrictHandling.IGNORE_ALL):
+    if strict is StrictHandling.IGNORE_ALL:
         return set()
 
     unexpected_keys = get_unexpected_model_keys(state_dict_metadata, load_state_dict)
@@ -1024,7 +999,11 @@ def validate_fsdp_dtensor_model_load(
         "preprocess_fsdp_dtensor_state_dict instead."
     )
 
-    if strict in (StrictHandling.RAISE_UNEXPECTED, StrictHandling.RAISE_ALL):
+    if strict in (
+        StrictHandling.ASSUME_OK_UNEXPECTED,
+        StrictHandling.RAISE_UNEXPECTED,
+        StrictHandling.RAISE_ALL,
+    ):
         raise CheckpointingException(message)
     logger.warning(message)
     return unexpected_keys
