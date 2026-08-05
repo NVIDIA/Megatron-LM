@@ -47,7 +47,7 @@ def per_segment_alignment(cp_size: int, tp_size: int, sequence_parallel: bool) -
     return tp_size if sequence_parallel else 1
 
 
-def __cp_local_target_multiple(cp_size: int, tp_size: int, sequence_parallel: bool) -> int:
+def _cp_local_target_multiple(cp_size: int, tp_size: int, sequence_parallel: bool) -> int:
     """Divisibility the CP-local packed target length must satisfy.
 
     Distinct from :func:`per_segment_alignment` (it drops the CP factor);
@@ -175,6 +175,7 @@ def broadcast_data_batch(data, device="cuda"):
 
     return result
 
+
 # -------------------------------------------------------------------
 # Pack-status handshake across TP ranks
 # -------------------------------------------------------------------
@@ -248,7 +249,6 @@ def _propagate_pack_status(is_src, error, device="cuda"):
     )
 
 
-
 # -------------------------------------------------------------------
 # THD (packed sequence) helpers
 # -------------------------------------------------------------------
@@ -294,11 +294,53 @@ def _build_packed_seq_params_from_cu_seqlens(
     )
 
 
+def _check_vision_patch_budget(
+    pixel_values: torch.Tensor, image_grid_thw: torch.Tensor, args
+) -> None:
+    """Fail fast when a microbatch's vision payload exceeds configured caps.
+
+    The vision tower consumes the whole microbatch payload in one packed
+    forward whose attention workspace scales stepwise with total raw patches;
+    exceeding the memory envelope otherwise surfaces as an opaque CUDA OOM
+    deep in backward. Checked identically on every TP rank on the broadcasted
+    batch, so all ranks fail fast together with the same rich error message
+    (source-side pack failures before the broadcast are covered separately by
+    :func:`_propagate_pack_status`).
+
+    Callers must invoke this AFTER the payload broadcast so every TP rank
+    evaluates the identical batch and raises the same rich error natively,
+    with no message re-encoding through the pack-status handshake.
+    """
+    max_total = getattr(args, "max_vision_patches_per_microbatch", None)
+    max_per_image = getattr(args, "max_vision_patches_per_image", None)
+    if max_total is None and max_per_image is None:
+        return
+    num_images = int(image_grid_thw.shape[0]) if image_grid_thw.dim() == 2 else 0
+    total_patches = int(pixel_values.shape[0])
+    if max_total is not None and total_patches > int(max_total):
+        raise ValueError(
+            f"Microbatch vision payload has {total_patches} raw patches across "
+            f"{num_images} image(s), exceeding --max-vision-patches-per-microbatch="
+            f"{int(max_total)}. Reduce the image count/size profile or the "
+            "per-sample vision budget."
+        )
+    if max_per_image is not None and num_images:
+        patches_per_image = image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]
+        worst = int(patches_per_image.max().item())
+        if worst > int(max_per_image):
+            worst_index = int(patches_per_image.argmax().item())
+            raise ValueError(
+                f"Image {worst_index} with grid {image_grid_thw[worst_index].tolist()} has "
+                f"{worst} raw patches, exceeding --max-vision-patches-per-image="
+                f"{int(max_per_image)}."
+            )
+
+
 def _segment_bounds(seq_lens: Optional[torch.Tensor], sample_len: int) -> list[tuple[int, int]]:
     """Per-segment (start, end) bounds of a sample's token axis.
 
     ``seq_lens`` is the optional per-sample segment-length vector emitted by
-    the packed_window dataset mode; ``None`` means one segment spanning the
+    the packed_document dataset; ``None`` means one segment spanning the
     whole sample.
     """
     if seq_lens is None:
@@ -344,9 +386,12 @@ def _pad_multimodal_thd_batch(
     """
     if not pad_by_appending_dummy_seq:
         raise ValueError(
-            "multimodal packed THD requires "
-            "--pad-packed-seq-by-appending-dummy-seq when "
-            "--pad-packed-seq-alignment is enabled"
+            "multimodal packed THD represents the physical tail as one dummy "
+            "THD sequence whenever --pad-packed-seq-alignment is enabled; this "
+            "is an implementation invariant of the packed path — disabling it "
+            "(e.g. via the auto-generated "
+            "--no-pad-packed-seq-by-appending-dummy-seq switch) is not "
+            "supported"
         )
 
     global_actual = int(packed_batch["input_ids"].shape[-1])
@@ -445,6 +490,12 @@ def pack_or_pad_batch(
     ``PackedSeqParams`` (``cu_seqlens``, ``cu_seqlens_padded``,
     ``max_seqlen``, ``total_tokens``) is broadcast alongside the data, so
     every rank can build an identical ``PackedSeqParams`` on its own.
+
+    Source-side pack/validation errors (e.g. a ``seq_lens`` sum mismatch or a
+    BSHD multi-segment/over-length reject) are propagated to every TP rank
+    via a status handshake (:func:`_propagate_pack_status`) before the
+    payload broadcast, so all ranks raise together instead of the peers
+    hanging in the collective.
     """
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
@@ -464,71 +515,86 @@ def pack_or_pad_batch(
     if use_packed_sequence:
         packed_batch: Dict[str, Any] = {}
 
+        pack_error: Optional[Exception] = None
         if is_src:
-            assert batch is not None, "source TP rank must provide a batch"
-            input_ids_list, labels_list, loss_mask_list = [], [], []
-            pixel_values_list, image_grid_thw_list = [], []
-            seqlens_list, seqlens_padded_list = [], []
+            try:
+                assert batch is not None, "source TP rank must provide a batch"
+                input_ids_list, labels_list, loss_mask_list = [], [], []
+                pixel_values_list, image_grid_thw_list = [], []
+                seqlens_list, seqlens_padded_list = [], []
 
-            for sample in batch:
-                sample_len = sample["input_ids"].shape[0]
-                assert (
-                    sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape
-                ), "labels, input_ids, and loss_mask must have the same shape"
-                # A sample may carry multiple document segments (packed_window
-                # mode). Each segment becomes its own logical sequence: it is
-                # spliced into cu_seqlens and padded independently to the
-                # CP/SP alignment, so the physical layout always matches
-                # cu_seqlens_padded. Vision payloads stay sample-level:
-                # placeholder order inside the tokens already matches the
-                # pixel row order.
-                bounds = _segment_bounds(sample.get("seq_lens"), sample_len)
-                for start, end in bounds:
-                    seqlen = end - start
-                    target_len = math.ceil(seqlen / divisible_by) * divisible_by
-                    input_ids_list.append(
-                        F.pad(sample["input_ids"][start:end], (0, target_len - seqlen), value=0)
-                    )
-                    labels_list.append(
-                        F.pad(sample["labels"][start:end], (0, target_len - seqlen), value=-100)
-                    )
-                    loss_mask_list.append(
-                        F.pad(sample["loss_mask"][start:end], (0, target_len - seqlen), value=0)
-                    )
-                    seqlens_list.append(seqlen)
-                    seqlens_padded_list.append(target_len)
-                pixel_values_list.append(sample["pixel_values"])
-                image_grid_thw_list.append(sample["image_grid_thw"])
+                for sample in batch:
+                    sample_len = sample["input_ids"].shape[0]
+                    assert (
+                        sample["labels"].shape
+                        == sample["input_ids"].shape
+                        == sample["loss_mask"].shape
+                    ), "labels, input_ids, and loss_mask must have the same shape"
+                    # A sample may carry multiple document segments (a packed
+                    # window). Each segment becomes its own logical sequence: it is
+                    # spliced into cu_seqlens and padded independently to the
+                    # CP/SP alignment, so the physical layout always matches
+                    # cu_seqlens_padded. Vision payloads stay sample-level:
+                    # placeholder order inside the tokens already matches the
+                    # pixel row order.
+                    bounds = _segment_bounds(sample.get("seq_lens"), sample_len)
+                    for start, end in bounds:
+                        seqlen = end - start
+                        target_len = math.ceil(seqlen / divisible_by) * divisible_by
+                        input_ids_list.append(
+                            F.pad(sample["input_ids"][start:end], (0, target_len - seqlen), value=0)
+                        )
+                        labels_list.append(
+                            F.pad(sample["labels"][start:end], (0, target_len - seqlen), value=-100)
+                        )
+                        loss_mask_list.append(
+                            F.pad(sample["loss_mask"][start:end], (0, target_len - seqlen), value=0)
+                        )
+                        seqlens_list.append(seqlen)
+                        seqlens_padded_list.append(target_len)
+                    pixel_values_list.append(sample["pixel_values"])
+                    image_grid_thw_list.append(sample["image_grid_thw"])
 
-            cu_seqlens = list(accumulate(seqlens_list, initial=0))
-            cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
+                cu_seqlens = list(accumulate(seqlens_list, initial=0))
+                cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
 
-            # padding_mask: True at collate-padded positions within each packed
-            # sample. Real tokens occupy [cu_seqlens_padded[i], +seqlens_list[i]);
-            # the tail up to cu_seqlens_padded[i+1] is padding. Consumed by MoE
-            # routing in megatron.core to exclude padded tokens from aux loss,
-            # z-loss, and expert-bias accumulation.
-            total_tokens_padded = cu_seqlens_padded[-1]
-            padding_mask_thd = torch.zeros(total_tokens_padded, dtype=torch.bool)
-            for i, real_seqlen in enumerate(seqlens_list):
-                pad_start = cu_seqlens_padded[i] + real_seqlen
-                pad_end = cu_seqlens_padded[i + 1]
-                if pad_end > pad_start:
-                    padding_mask_thd[pad_start:pad_end] = True
+                # padding_mask: True at collate-padded positions within each packed
+                # sample. Real tokens occupy [cu_seqlens_padded[i], +seqlens_list[i]);
+                # the tail up to cu_seqlens_padded[i+1] is padding. Consumed by MoE
+                # routing in megatron.core to exclude padded tokens from aux loss,
+                # z-loss, and expert-bias accumulation.
+                total_tokens_padded = cu_seqlens_padded[-1]
+                padding_mask_thd = torch.zeros(total_tokens_padded, dtype=torch.bool)
+                for i, real_seqlen in enumerate(seqlens_list):
+                    pad_start = cu_seqlens_padded[i] + real_seqlen
+                    pad_end = cu_seqlens_padded[i + 1]
+                    if pad_end > pad_start:
+                        padding_mask_thd[pad_start:pad_end] = True
 
-            packed_batch["input_ids"] = torch.concat(input_ids_list, dim=0).unsqueeze(0)
-            packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
-            packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
-            packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
-            packed_batch["pixel_values"] = torch.concat(pixel_values_list)
-            packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
-            # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
-            # so each rank can build an identical PackedSeqParams.
-            packed_batch["cu_seqlens"] = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
-            packed_batch["cu_seqlens_padded"] = torch.tensor(
-                cu_seqlens_padded, dtype=torch.int32, device=device
-            )
+                packed_batch["input_ids"] = torch.concat(input_ids_list, dim=0).unsqueeze(0)
+                packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
+                packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
+                packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
+                packed_batch["pixel_values"] = torch.concat(pixel_values_list)
+                packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
+                # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
+                # so each rank can build an identical PackedSeqParams.
+                packed_batch["cu_seqlens"] = torch.tensor(
+                    cu_seqlens, dtype=torch.int32, device=device
+                )
+                packed_batch["cu_seqlens_padded"] = torch.tensor(
+                    cu_seqlens_padded, dtype=torch.int32, device=device
+                )
+                # Verdict before staging: moving an over-budget payload to the
+                # device is itself the OOM this guard exists to pre-empt.
+                _check_vision_patch_budget(
+                    packed_batch["pixel_values"], packed_batch["image_grid_thw"], args
+                )
+                packed_batch = _stage_batch_for_broadcast(packed_batch, device)
+            except Exception as exc:
+                pack_error = exc
 
+        _propagate_pack_status(is_src, pack_error, device=device)
         packed_batch = broadcast_data_batch(packed_batch, device=device)
 
         cu_seqlens_t = packed_batch.pop("cu_seqlens")
@@ -580,54 +646,77 @@ def pack_or_pad_batch(
     assert seq_length is not None, "seq_length must be provided when use_packed_sequence is False"
     padded_batch: Dict[str, Any] = {}
 
+    pack_error: Optional[Exception] = None
     if is_src:
-        assert batch is not None, "source TP rank must provide a batch"
-        if any(
-            sample.get("seq_lens") is not None and sample["seq_lens"].numel() > 1
-            for sample in batch
-        ):
-            raise ValueError(
-                "Multi-segment packed_window samples require --use-packed-sequence "
-                "(THD); the padded BSHD layout has no segment representation."
-            )
-        max_seqlens = max(x["input_ids"].shape[0] for x in batch)
-        target_seqlens = min(max_seqlens, seq_length)
-        # Round target seqlen up to the parallelism alignment factor so the
-        # batched tensor is divisible for CP (+SP) splitting downstream.
-        if divisible_by > 1:
-            target_seqlens = math.ceil(target_seqlens / divisible_by) * divisible_by
+        try:
+            assert batch is not None, "source TP rank must provide a batch"
+            if any(
+                sample.get("seq_lens") is not None and sample["seq_lens"].numel() > 1
+                for sample in batch
+            ):
+                raise ValueError(
+                    "Multi-segment packed samples require --use-packed-sequence "
+                    "(THD); the padded BSHD layout has no segment representation."
+                )
+            max_seqlens = max(x["input_ids"].shape[0] for x in batch)
+            if max_seqlens > seq_length:
+                # F.pad with a negative pad would silently truncate the token
+                # stream while pixel_values/image_grid_thw keep every image,
+                # desynchronizing vision payloads from their placeholder tokens.
+                raise ValueError(
+                    f"A sample of length {max_seqlens} exceeds the --seq-length cap "
+                    f"{seq_length}. The padded BSHD path never truncates. The "
+                    "fixed-shape providers (mock, cord_v2) size their samples from "
+                    "--total-seq-length while the packer caps at --seq-length, so "
+                    "the usual cause is --total-seq-length > --seq-length; otherwise "
+                    "the dataset provider is emitting over-length samples."
+                )
+            target_seqlens = min(max_seqlens, seq_length)
+            # Round target seqlen up to the parallelism alignment factor so the
+            # batched tensor is divisible for CP (+SP) splitting downstream.
+            if divisible_by > 1:
+                target_seqlens = math.ceil(target_seqlens / divisible_by) * divisible_by
 
-        # Capture real lengths before in-place padding so we can build a
-        # padding_mask for MoE routing (True at collate-padded positions).
-        real_seqlens = [s["input_ids"].shape[0] for s in batch]
+            # Capture real lengths before in-place padding so we can build a
+            # padding_mask for MoE routing (True at collate-padded positions).
+            real_seqlens = [s["input_ids"].shape[0] for s in batch]
 
-        for sample in batch:
-            sample["input_ids"] = F.pad(
-                sample["input_ids"], (0, target_seqlens - sample["input_ids"].shape[0]), value=0
-            )
-            sample["labels"] = F.pad(
-                sample["labels"], (0, target_seqlens - sample["labels"].shape[0]), value=-100
-            )
-            sample["loss_mask"] = F.pad(
-                sample["loss_mask"], (0, target_seqlens - sample["loss_mask"].shape[0]), value=0
-            )
+            for sample in batch:
+                sample["input_ids"] = F.pad(
+                    sample["input_ids"], (0, target_seqlens - sample["input_ids"].shape[0]), value=0
+                )
+                sample["labels"] = F.pad(
+                    sample["labels"], (0, target_seqlens - sample["labels"].shape[0]), value=-100
+                )
+                sample["loss_mask"] = F.pad(
+                    sample["loss_mask"], (0, target_seqlens - sample["loss_mask"].shape[0]), value=0
+                )
 
-        padded_batch["input_ids"] = torch.concat(
-            [x["input_ids"].unsqueeze(0) for x in batch], dim=0
-        )
-        padded_batch["labels"] = torch.concat([x["labels"].unsqueeze(0) for x in batch], dim=0)
-        padded_batch["loss_mask"] = torch.concat(
-            [x["loss_mask"].unsqueeze(0) for x in batch], dim=0
-        )
-        # Keep None as the known-no-padding fast path for MoE routing.
-        has_padding = any(real_seqlen < target_seqlens for real_seqlen in real_seqlens)
-        if has_padding:
-            positions = torch.arange(target_seqlens).unsqueeze(0)
-            padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
-        padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
-        padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
+            padded_batch["input_ids"] = torch.concat(
+                [x["input_ids"].unsqueeze(0) for x in batch], dim=0
+            )
+            padded_batch["labels"] = torch.concat([x["labels"].unsqueeze(0) for x in batch], dim=0)
+            padded_batch["loss_mask"] = torch.concat(
+                [x["loss_mask"].unsqueeze(0) for x in batch], dim=0
+            )
+            # Keep None as the known-no-padding fast path for MoE routing.
+            has_padding = any(real_seqlen < target_seqlens for real_seqlen in real_seqlens)
+            if has_padding:
+                positions = torch.arange(target_seqlens).unsqueeze(0)
+                padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
+            padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
+            padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
+            # See the packed branch: verdict, then stage, both protected.
+            _check_vision_patch_budget(
+                padded_batch["pixel_values"], padded_batch["image_grid_thw"], args
+            )
+            padded_batch = _stage_batch_for_broadcast(padded_batch, device)
+        except Exception as exc:
+            pack_error = exc
 
-    return broadcast_data_batch(padded_batch, device=device)
+    _propagate_pack_status(is_src, pack_error, device=device)
+    padded_batch = broadcast_data_batch(padded_batch, device=device)
+    return padded_batch
 
 
 # -------------------------------------------------------------------

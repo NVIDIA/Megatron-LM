@@ -648,6 +648,26 @@ class TestVisionPatchGuard:
         monkeypatch.setattr(forward_step, "get_args", lambda: args)
         return args
 
+    def test_microbatch_patch_budget_rejects_oversized_payload(self, guard_args):
+        guard_args.max_vision_patches_per_microbatch = 7
+        batch = [_make_sample(5, num_patches=4), _make_sample(5, num_patches=4)]
+        with pytest.raises(ValueError, match="8 raw patches across 2 image"):
+            pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+
+    def test_per_image_patch_budget_names_the_worst_image(self, guard_args):
+        guard_args.max_vision_patches_per_image = 4
+        sample = _make_sample(5, num_patches=8)
+        sample["image_grid_thw"] = torch.tensor([[2, 2, 2]], dtype=torch.long, device="cuda")
+        with pytest.raises(ValueError, match=r"grid \[2, 2, 2\] has 8 raw patches"):
+            pack_or_pad_batch([sample], use_packed_sequence=True, device="cuda")
+
+    def test_guard_applies_to_the_padded_branch_too(self, guard_args):
+        guard_args.max_vision_patches_per_microbatch = 7
+        batch = [_make_sample(5, num_patches=4), _make_sample(5, num_patches=4)]
+        with pytest.raises(ValueError, match="raw patches across"):
+            pack_or_pad_batch(batch, use_packed_sequence=False, seq_length=8, device="cuda")
+
+
 class TestPackOrPadBatchPadded:
     """``pack_or_pad_batch(..., use_packed_sequence=False)`` produces ``[B, S]``."""
 

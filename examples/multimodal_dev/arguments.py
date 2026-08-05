@@ -89,6 +89,28 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--max-vision-patches-per-microbatch",
+        type=int,
+        default=None,
+        help=(
+            "Fail fast when one microbatch's vision payload exceeds this many "
+            "raw patches (verified on the TP source before the batch is staged or broadcast; the verdict reaches every rank of the TP group through the pack-status handshake). The vision tower's "
+            "packed attention workspace scales stepwise with total raw patches, "
+            "so exceeding the memory envelope otherwise surfaces as an opaque "
+            "CUDA OOM. Unset by default."
+        ),
+    )
+    group.add_argument(
+        "--max-vision-patches-per-image",
+        type=int,
+        default=None,
+        help=(
+            "Fail fast when any single image exceeds this many raw patches "
+            "(verified on the TP source before staging, then propagated to the "
+            "TP group). Unset by default."
+        ),
+    )
+    group.add_argument(
         "--use-vanilla-collate-fn",
         action="store_true",
         default=False,
