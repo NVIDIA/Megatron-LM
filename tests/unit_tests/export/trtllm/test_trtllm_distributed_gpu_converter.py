@@ -12,6 +12,7 @@ from megatron.core.export.trtllm.trtllm_weights_converter.distributed_trtllm_mod
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -46,6 +47,7 @@ class TestTRTLLMDistributedGPUConverter:
             transformer_layer_spec=get_gpt_layer_local_spec(),
             vocab_size=_VOCAB_SIZE,
             max_sequence_length=_SEQUENCE_LENGTH,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):

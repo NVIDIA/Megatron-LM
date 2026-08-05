@@ -12,6 +12,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE, TELMHeadColumnP
 from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -118,6 +119,7 @@ class TestGPTModelOutputLayerSelection:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert isinstance(model.output_layer, tensor_parallel.ColumnParallelLinear)
         assert not isinstance(model.output_layer, TELMHeadColumnParallelLinear)
@@ -133,6 +135,7 @@ class TestGPTModelOutputLayerSelection:
             vocab_size=100,
             max_sequence_length=4,
             logit_dtype=torch.float32,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert model.output_layer.output_dtype == torch.float32
 
@@ -158,5 +161,6 @@ class TestGPTModelOutputLayerSelection:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=128,
             max_sequence_length=8,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert isinstance(model.output_layer, TELMHeadColumnParallelLinear)
