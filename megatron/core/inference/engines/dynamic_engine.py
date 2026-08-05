@@ -106,6 +106,9 @@ try:
 except ImportError:
     HAVE_PSUTIL = False
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
 DEPRECATED_ARGS = [
     "enable_cuda_graph",
     "random_seed",
@@ -311,7 +314,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.logging_step_interval > 0 and self.metrics_writer is not None:
-            logging.info(
+            logger.info(
                 f"\033[1;93m[INFERENCE]\033[0m "
                 f"\033[1;95mLogging inference metrics to wandb (rank {self.rank})\033[0m"
             )
@@ -440,9 +443,9 @@ class DynamicInferenceEngine(AbstractEngine):
         # Pool-scoped baselines for the per-iteration deltas.
         prev_pool_reserved, prev_pool_alloc = _cuda_graph_mempool_bytes()
 
-        logging.info("> dynamic_engine.py: building cuda graphs for ")
+        logger.info("> dynamic_engine.py: building cuda graphs for ")
         for graph in context.cuda_graph_batch_dimensions_list:
-            logging.info(graph)
+            logger.info(graph)
 
         # Enable inference dispatcher for EP during graph capture
         model_config = controller.inference_wrapped_model.model.config
@@ -489,7 +492,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if HAVE_TQDM:
                 tbar.set_description(tbar_str)
             else:
-                logging.info(
+                logger.info(
                     f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
                 )
 
@@ -539,7 +542,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # This isolates pool growth from process-wide scratch churn (KV cache,
             # NCCL workspaces, etc.) that pollutes `torch.cuda.memory_stats()`.
             pool_reserved, pool_alloc = _cuda_graph_mempool_bytes()
-            logging.info(
+            logger.info(
                 "  [graph %d/%d] %s | pool reserved=%s (Δiter=%s) " "pool allocated=%s (Δiter=%s)",
                 tbar_idx + 1,
                 len(context.cuda_graph_batch_dimensions_list),
@@ -552,7 +555,7 @@ class DynamicInferenceEngine(AbstractEngine):
             prev_pool_reserved, prev_pool_alloc = pool_reserved, pool_alloc
 
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
-            logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
+            logger.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.
         time_end = time.time()
@@ -565,7 +568,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "pool_reserved_bytes": final_pool_reserved,
             "pool_allocated_bytes": final_pool_alloc,
         }
-        logging.info(
+        logger.info(
             "> built cuda graph(s) in %.2f sec. "
             "Mempool: reserved %s, allocated %s. "
             "Process-wide delta: allocated %s, reserved %s.",
@@ -691,7 +694,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Check if the port number is not inference_coordinator_port
             actual_port = int(dp_addr.rsplit(":", 1)[-1])
             if inference_coordinator_port != None and actual_port != inference_coordinator_port:
-                logging.warning(
+                logger.warning(
                     f"Requested InferenceCoordinator port {inference_coordinator_port} "
                     f"but got port {actual_port} instead. This happens if the request port "
                     f"is already in use."
@@ -771,8 +774,8 @@ class DynamicInferenceEngine(AbstractEngine):
             await await_process_call(
                 coordinator_ready_event.wait, self.inference_coordinator_process
             )
-            logging.info("Inference co-ordinator is ready to receive requests!")
-            logging.info(f"Data parallel coordinator can be found at {dp_addr}")
+            logger.info("Inference co-ordinator is ready to receive requests!")
+            logger.info(f"Data parallel coordinator can be found at {dp_addr}")
 
         # Finally run the engine infinite loop.
         loop = get_asyncio_loop(loop)
@@ -835,7 +838,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"res {end_mem_res / 1024**3:.1f} gb",
                 )
             )
-            logging.info(
+            logger.info(
                 f"[rank {rank_str}] dynamic engine {key}, "
                 f"unified {unified_memory_level}, "
                 f"{dir_str} "
@@ -950,7 +953,7 @@ class DynamicInferenceEngine(AbstractEngine):
             add_time = time.time() - add_time
 
         # Print inner timing (must be outside context manager above for correct formatting).
-        logging.info(
+        logger.info(
             "    > "
             + ", ".join(
                 (
@@ -1844,7 +1847,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         req.cg_wait_iters += 1
         if req.cg_wait_iters % self._cg_admission_warn_after == 0:
-            logging.warning(
+            logger.warning(
                 "request %d has been deferred by CG-aware admission for %d steps — "
                 "possible starvation (strict=%s, active P=%d D=%d tok=%d)",
                 req.request_id,
@@ -2524,7 +2527,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
             if color_decode_only:
                 output_str = f"\033[94m{output_str}\033[0m"
-            logging.info(output_str)
+            logger.info(output_str)
 
         nvtx_range_pop("console_logging")
 
@@ -3007,7 +3010,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 elif self.state == EngineState.STOPPING:
                     await self._world_barrier()
                     if self.rank == 0:
-                        logging.info("Stopping engine.")
+                        logger.info("Stopping engine.")
                     break
 
         finally:
