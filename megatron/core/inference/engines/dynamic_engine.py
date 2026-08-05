@@ -1509,7 +1509,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.add_event_finish()
                     # Keep handoff blocks only when the request needs them.
                     handoff_blocks = handoff_blocks_by_request.get(request_id, [])
-                    if getattr(request.sampling_params, "do_kv_handoff", False):
+                    if request.sampling_params.do_kv_handoff:
                         self._capture_handoff_meta(
                             request, handoff_blocks, prepared_handoff_metadata.get(request_id)
                         )

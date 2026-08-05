@@ -103,6 +103,7 @@ class NixlTransferBackend:
     """
 
     name = "nixl"
+    is_push = False
 
     def __init__(
         self,

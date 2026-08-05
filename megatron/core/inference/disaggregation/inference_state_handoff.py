@@ -108,8 +108,7 @@ class InferenceStateHandoffMixin:
     def _release_handoff_import_owner(self, request_id: int) -> bool:
         """Release blocks retained until a decode request enters the context."""
 
-        owners = getattr(self, "_handoff_import_owners", None)
-        local_blocks = owners.pop(request_id, None) if owners is not None else None
+        local_blocks = self._handoff_import_owners.pop(request_id, None)
         if not local_blocks:
             return False
         block_tensor = torch.tensor(local_blocks, dtype=torch.int32, device="cpu")
@@ -154,7 +153,7 @@ class InferenceStateHandoffMixin:
             backend: transfer backend name, resolved through the explicit
                 registry ("nixl"; "nccl" selects the two-sided push family).
         """
-        if getattr(self.context, "is_hybrid_model", False):
+        if self.context.is_hybrid_model:
             raise RuntimeError(
                 "Hybrid models require recurrent-state handoff in addition to KV-cache "
                 "handoff; this engine only has KV transfer support."
@@ -275,7 +274,7 @@ class InferenceStateHandoffMixin:
         handoffs = [
             (request, list(block_ids))
             for request, block_ids in requests_and_blocks
-            if getattr(request.sampling_params, "do_kv_handoff", False)
+            if request.sampling_params.do_kv_handoff
         ]
         if not handoffs:
             return {}
@@ -422,7 +421,7 @@ class InferenceStateHandoffMixin:
 
         allocator = self.context.kv_block_allocator
         cached_blocks = []
-        if not getattr(self._kv_transfer_agent, "is_push", False):
+        if not self._kv_transfer_agent.is_push:
             cached_blocks = self._find_cached_handoff_prefix(handoff.hashes, handoff.num_blocks)
 
         num_blocks_to_import = handoff.num_blocks - len(cached_blocks)
@@ -525,7 +524,7 @@ class InferenceStateHandoffMixin:
             num_blocks, potential_matched_count=potential_matched_count
         )
 
-        mp_group = getattr(self.pg_collection, "mp", None)
+        mp_group = self.pg_collection.mp
         world_size = (
             torch.distributed.get_world_size(mp_group)
             if (mp_group is not None and torch.distributed.is_initialized())
@@ -551,7 +550,7 @@ class InferenceStateHandoffMixin:
     def _all_ranks_started_handoff(self, local_started: bool) -> bool:
         """Agree that every model-parallel rank submitted its local transfer."""
 
-        mp_group = getattr(self.pg_collection, "mp", None)
+        mp_group = self.pg_collection.mp
         world_size = (
             torch.distributed.get_world_size(mp_group)
             if (mp_group is not None and torch.distributed.is_initialized())
@@ -683,7 +682,7 @@ class InferenceStateHandoffMixin:
                 local.append((done, False, None))
             except Exception as exc:  # quarantined by the caller
                 local.append((False, True, exc))
-        mp_group = getattr(self.pg_collection, "mp", None)
+        mp_group = self.pg_collection.mp
         world_size = (
             torch.distributed.get_world_size(mp_group)
             if (mp_group is not None and torch.distributed.is_initialized())

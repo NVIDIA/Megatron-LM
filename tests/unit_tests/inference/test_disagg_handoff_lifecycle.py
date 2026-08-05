@@ -162,6 +162,7 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
     engine.context = SimpleNamespace(
         kv_block_allocator=allocator,
         memory_buffer=torch.empty(2, 1, 8, 4, 1, 1),
+        is_hybrid_model=False,
         num_attention_layers=1,
         num_attention_heads_per_partition=1,
         hidden_size_per_attention_head=1,
