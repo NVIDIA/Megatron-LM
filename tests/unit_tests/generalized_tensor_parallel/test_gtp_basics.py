@@ -518,6 +518,75 @@ class TestGroupedDoubleBuffer:
         assert fwd[-1] == 0 and bwd[-1] == 0 and rs[-1] == 0
 
 
+def _worker_same_key_neighbours_dont_share_a_buffer(rank, world_size, port):
+    """Two same-shaped weights adjacent in a plain (non-grouped) chain need two buffers.
+
+    This is the GTP_ungraphed chain under CUDA graphs: every layer weight is captured, leaving
+    only embedding + output_layer behind — same shape, same dtype, same cache key. One-step-ahead
+    prefetch keeps both live (w0's consume issues w1's gather), so one buffer means w1's gather
+    lands on the weight w0's GEMM is still reading.
+    """
+    torch.manual_seed(0)
+    in_f, out_f = 32, 64
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    l0 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+    l1 = _make_gtp_linear(in_f, out_f, gtp_remat_group, dtype)
+    # Distinct values so a clobber shows up in the gathered data, not just in the address.
+    with torch.no_grad():
+        l0.weight.fill_(1.0)
+        l1.weight.fill_(-1.0)
+
+    inp = torch.randn(4, in_f, dtype=dtype, device="cuda")
+    dist.broadcast(inp, src=0)
+
+    # First pass wires the chain; the second is the one that prefetches.
+    for _ in range(2):
+        l0(inp, is_first_microbatch=True)
+        l1(inp, is_first_microbatch=True)
+
+    w0, w1 = l0.weight, l1.weight
+    assert w0.next_w is w1 and w1.prev_w is w0, "w0 and w1 must be adjacent in one chain"
+    assert w0._gather_buffer_identity(dtype) == w1._gather_buffer_identity(
+        dtype
+    ), "nothing is being tested unless both weights want the same buffer"
+
+    cache = gtp_module.get_global_GTP_cache()
+    b0, b1 = cache.get(w0._ag_ticket_fwd), cache.get(w1._ag_ticket_fwd)
+    torch.cuda.synchronize()
+    assert b0.data_ptr() != b1.data_ptr(), (
+        "same-key chain neighbours share one gather buffer — w1's prefetch can clobber "
+        "the weight w0's GEMM is still reading"
+    )
+    assert (b0 == 1).all(), "w0's gathered weight was clobbered by w1's prefetch"
+    assert (b1 == -1).all(), "w1's buffer does not hold w1's weight"
+
+
+class TestSameKeyNeighbourTiebreak:
+    """A non-grouped chain buys a second buffer only where two adjacent weights would actually
+    share one — unlike the grouped chains above, which alternate unconditionally."""
+
+    _Fake = TestGroupedDoubleBuffer._Fake
+
+    def _key(self, parity=None):
+        f = self._Fake("GTP_ungraphed")
+        if parity is not None:
+            f._buf_parity = parity
+        return f._get_cache_key(torch.bfloat16, fwd=True, reduce_scatter=False)
+
+    def test_parity_zero_keeps_the_shared_buffer(self):
+        # Unset and 0 must give the same key: only the second weight of a pair pays.
+        assert self._key(0) == self._key() == ((128, 256), torch.bfloat16, 0, False)
+
+    def test_parity_one_gets_its_own_buffer(self):
+        assert self._key(1) != self._key()
+
+    def test_adjacent_same_shape_weights_get_distinct_buffers(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_same_key_neighbours_dont_share_a_buffer, 4)
+
+
 # ---------------------------------------------------------------------------
 # Wgrad reduce-scatter: shape and deferred async path
 # ---------------------------------------------------------------------------
@@ -1152,6 +1221,10 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
     grad_data (corrupts reduce_scatter_with_fp32_accumulation). The fix routes grad-ready through
     register_grad_accum_hook (fired after the add) and skips the autograd hook. This pins that
     wiring: every GTP weight has _grad_accum_hook set and none falls through to the autograd list.
+
+    It also checks that the AccumulateGrad node is materialized and stored on the param. Holding
+    that reference is what keeps the leaf on the capture stream for full-iteration CUDA-graph
+    capture.
     """
     from megatron.core import parallel_state as ps
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
@@ -1190,6 +1263,12 @@ def _worker_gtp_ddp_grad_ready_wiring(rank, world_size, port):
             assert (
                 getattr(w, "_grad_accum_hook", None) is not None
             ), f"{name}.weight must have _grad_accum_hook set (manual grad-ready, not autograd)"
+            # The node must also be RETAINED: a live strong reference across the
+            # warmup->capture boundary is what keeps the leaf on the capture stream.
+            # Identity (not just non-None): a dropped node would be recreated by expand_as here.
+            assert (
+                getattr(w, "_grad_accum_node", None) is w.expand_as(w).grad_fn.next_functions[0][0]
+            ), f"{name}.weight must retain its AccumulateGrad node (full-iteration CG capture)"
 
         # bias=False -> all params are GTP_remat -> none took the autograd path.
         assert len(ddp_model.grad_accs) == 0, (

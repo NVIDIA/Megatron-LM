@@ -31,7 +31,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 from packaging.version import Version
@@ -316,6 +316,18 @@ def _wgrad_pool_put(buf: torch.Tensor):
     _wgrad_buf_pool[key].append(buf)
 
 
+class _GTPCompositeWorkHandle:
+    """Waits on several collective handles as one, so GTPShardHandle still sees one handle."""
+
+    def __init__(self, handles):
+        self.handles = [h for h in handles if h is not None]
+
+    def wait(self):
+        """Wait on every underlying handle, in issue order."""
+        for handle in self.handles:
+            handle.wait()
+
+
 def _stream_key(chain_id: str, group) -> tuple:
     """Key for the per-(chain, group) AG/RS stream dicts.
 
@@ -349,15 +361,21 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
 def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """Fence the current stream against all GTP backward grad work before the DP gradient sync.
 
-    Drains the eager AG/RS side streams, then waits on each CG runner's replay stream
-    (its tail = captured Phase 2 main_grad.add_). No-op when GTP is inactive.
+    Drains the eager AG/RS side streams, then — outside CUDA-graph capture — waits on each CG
+    runner's replay stream (its tail = captured Phase 2 main_grad.add_). Under whole-step capture
+    there are no per-layer runners, so that second wait is skipped. No-op when GTP is inactive.
     """
     wait_async_comms()
     cur = torch.cuda.current_stream()
+    # Join the async AG/RS side streams for both the eager and CUDA-graph capture paths.
     for s in _AG_STREAMS.values():
         cur.wait_stream(s)
     for s in _RS_STREAMS.values():
         cur.wait_stream(s)
+    # The per-layer CG runner replay streams exist only in the eager / per-layer-CG path; under
+    # whole-step capture there are no runners, so stop here while capturing.
+    if torch.cuda.is_current_stream_capturing():
+        return
     # Local import: cuda_graphs imports this module, so a module-level import would be circular.
     from megatron.core.transformer.cuda_graphs import get_gtp_runner_streams
 
@@ -383,6 +401,10 @@ class GTPRematConfig:
     # normalization. When False, the gtp_remat reduce-scatter takes the MEAN so it composes with
     # DDP's 1/replicate scaling to yield the full (replicate x gtp) mean.
     calculate_per_token_loss: bool = False
+    # Run the gtp_remat wgrad reduce-scatter as all-to-all + local FP32 sum: same bytes on the
+    # wire, but accumulation no longer loses precision as the axis grows. Bypassed at axis size
+    # <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
+    reduce_scatter_with_fp32_accumulation: bool = False
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -408,7 +430,12 @@ def tag_gtp_params_with_names(model):
 
 
 def configure_gtp_remat_from_recipe(
-    *, fp4=False, fp8_recipe=None, fp8=False, calculate_per_token_loss=False
+    *,
+    fp4=False,
+    fp8_recipe=None,
+    fp8=False,
+    calculate_per_token_loss=False,
+    reduce_scatter_with_fp32_accumulation=False,
 ):
     """
     Configure GTP weight-remat (padding + loss reduction) from the quantization recipe.
@@ -417,7 +444,11 @@ def configure_gtp_remat_from_recipe(
     # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
     # check_param_states=False: GTP buffer reuse (notably under CUDA-graph capture) trips the
     # param-state debug asserts, so keep them off for GTP runs.
-    update_gtp_config(calculate_per_token_loss=calculate_per_token_loss, check_param_states=False)
+    update_gtp_config(
+        calculate_per_token_loss=calculate_per_token_loss,
+        check_param_states=False,
+        reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
+    )
     if fp4:
         update_gtp_config(pad_for_alignment=16)
     elif fp8_recipe == "mxfp8":
@@ -501,11 +532,14 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
     shard = tensor[gtp_rank * shard_size : (gtp_rank + 1) * shard_size]
     gtp_shard = GTPShardedParam(shard.clone())
     gtp_shard.pad_length = pad_length
-    # Preserve the source weight's TP attributes (dropped when wrapping into GTPShardedParam),
-    # so param_is_not_tensor_parallel_duplicate still classifies it without GTP-specific code.
-    from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+    # Preserve duplicate-filtering metadata dropped when wrapping into GTPShardedParam.
+    from megatron.core.tensor_parallel import (
+        copy_gtp_attributes,
+        copy_tensor_model_parallel_attributes,
+    )
 
     copy_tensor_model_parallel_attributes(gtp_shard, param)
+    copy_gtp_attributes(gtp_shard, param)
     return gtp_shard
 
 
@@ -539,10 +573,14 @@ def _gtp_wrap_bf16_shard(module, name, param):
     :func:`_gtp_slice_one_param`, which slices a full weight — this only wraps it, no slicing.
     Returns the new param (also swapped into the module).
     """
-    from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+    from megatron.core.tensor_parallel import (
+        copy_gtp_attributes,
+        copy_tensor_model_parallel_attributes,
+    )
 
     gtp_shard = GTPShardedParam(param.data)
     copy_tensor_model_parallel_attributes(gtp_shard, param)
+    copy_gtp_attributes(gtp_shard, param)
     delattr(module, name)
     module._parameters[name] = gtp_shard
     return gtp_shard
@@ -788,6 +826,9 @@ def _init_gtp_runtime_attrs(obj):
     # DDP backward hook (set by register_grad_accum_hook); invoked after
     # the wgrad RS accumulation completes (Graphed.backward / chain cascade).
     obj._grad_accum_hook = None
+    # The weight's AccumulateGrad node (set by register_grad_accum_hook). Retained so the leaf
+    # lands on the capture stream for full-iteration CUDA-graph capture; None until DDP registers.
+    obj._grad_accum_node = None
     # Quantization. For native-FP8 GTP the reclass path overwrites _quantizer with the tensor's
     # own MXFP8 quantizer and points quantized at self; BF16 GTP leaves both unset.
     obj._quantizer = None
@@ -820,6 +861,7 @@ def _init_gtp_runtime_attrs(obj):
     obj._wgrad_rs_handle = None
     obj.rs_event = torch.cuda.Event(external=True)
     obj._rs_ticket = None
+    obj._rs_a2a_bufs = None  # all-to-all scratch held by an in-flight fp32-accum RS
     # Padding
     obj.pad_length = 0
     # Debug
@@ -999,6 +1041,33 @@ class GTPShardedParam(torch.nn.Parameter):
             self._buf_parity = p
         return p
 
+    def _gather_buffer_identity(self, dtype) -> tuple:
+        """The part of the cache key that decides which weights share a gather buffer."""
+        return (self._unsharded_shape_padded, dtype, self.expert_idx)
+
+    def _ensure_distinct_buffer_from_prev(self, dtype):
+        """Move self to a second buffer if its chain predecessor would share one.
+
+        One-step-ahead prefetch keeps prev_w and self live at once, so sharing a buffer lets
+        self's gather clobber the weight prev_w's GEMM is still reading. Neighbours normally
+        differ in shape; a CUDA-graph-partitioned chain can leave two same-shaped weights
+        adjacent (embedding + output_layer alone in the UNGRAPHED chain).
+
+        Grouped chains use their own counter (``_GTP_GROUPED_BUF_PARITY_COUNTER``).
+        """
+        prev = self.prev_w
+        if prev is None or _chain_is_grouped(self.chain_id):
+            return
+        if self.is_routed_expert or prev.is_routed_expert:
+            return
+        if prev._cached_dtypes is None:  # never gathered — no buffer to collide with
+            return
+        if prev._gather_buffer_identity(prev._cached_dtypes[0]) != self._gather_buffer_identity(
+            dtype
+        ):
+            return
+        self._buf_parity = 1 - (getattr(prev, "_buf_parity", None) or 0)
+
     def _get_cache_key(self, dtype, fwd: bool, reduce_scatter: bool) -> tuple:
         """Build cache key from output shape + dtype.
 
@@ -1025,6 +1094,10 @@ class GTPShardedParam(torch.nn.Parameter):
             # chain_id keeps fc1/fc2 apart (both can be in flight at once, even if same-shaped);
             # parity alternates consecutive blocks between two buffers.
             key = key + (self.chain_id, self._double_buffer_parity())
+        elif getattr(self, "_buf_parity", None):
+            # Set by _ensure_distinct_buffer_from_prev. Parity 0 keeps the shared buffer, so
+            # only the second weight of an adjacent same-key pair costs an extra allocation.
+            key = key + (self._buf_parity,)
         return key
 
     def _strip_padding(self, tensor):
@@ -1423,6 +1496,9 @@ class GTPShardedParam(torch.nn.Parameter):
             dtypes = [
                 q.dtype if q is not None else w.dtype for q, w in zip(quantizers, self._weights)
             ]
+            # Must run before the reserve below — it decides which buffer the ticket gets.
+            self._ensure_distinct_buffer_from_prev(dtypes[0])
+
             for w, dt in zip(self._weights, dtypes):
                 w._ag_ticket_fwd = cache.reserve(w, dt, fwd=True)
                 cache.get(w._ag_ticket_fwd)
@@ -1446,16 +1522,22 @@ class GTPShardedParam(torch.nn.Parameter):
         """Pool-allocate a wgrad scratch tensor of unsharded shape for the bwd GEMM."""
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
 
-    def register_grad_accum_hook(self, grad_accum_node, hook):
+    def register_grad_accum_hook(
+        self, grad_accum_node: torch.autograd.graph.Node | None, hook: Callable[..., None] | None
+    ) -> None:
         """Register a DDP backward hook to call after the wgrad RS finalize.
 
         For GTP params autograd may receive None (async RS), so the normal grad-accumulator
         hook never fires; the integrator (Graphed.backward for captured chains, or the eager
         chain-tail cascade) calls this hook explicitly after RS wait + accumulation, so DDP's
-        register_grad_ready fires at the right time. grad_accum_node is accepted for API
-        compatibility but not retained — only the hook callable.
+        register_grad_ready fires at the right time. We retain grad_accum_node (the weight's
+        AccumulateGrad) here. Keeping a live strong reference across the warmup->capture
+        boundary is what places the node on the capture stream for full-iteration CG; an
+        un-retained node stays stranded on the default stream and trips capture. The node is
+        not added to DDP's grad_accs (that list is for autograd-hooked nodes) and never gets
+        .register_hook'd, because grad-ready is fired manually via _grad_accum_hook.
         """
-        del grad_accum_node
+        self._grad_accum_node = grad_accum_node
         self._grad_accum_hook = hook
 
     @staticmethod
@@ -1504,13 +1586,23 @@ class GTPShardedParam(torch.nn.Parameter):
                     for w in self._weights:
                         self._handle_megatron_grad_accum(w)
                     self._already_finalized = True
-        # Release stashed wgrad inputs: UNGRAPHED buffers go back to the pool;
-        # GRAPHED just drops Python refs (addresses must stay stable for CG).
-        if getattr(self, "_wgrad_input_bufs", None) is not None:
+        self._release_comm_scratch()
+
+    def _release_comm_scratch(self, attrs=("_wgrad_input_bufs", "_rs_a2a_bufs")):
+        """Release the buffers a finished RS was reading.
+
+        Its wgrad inputs, and the fp32-accum all-to-all scratch (input to the deferred FP32 sum,
+        so only free once the handle has been waited on). UNGRAPHED buffers go back to the pool;
+        GRAPHED just drops Python refs (addresses must stay stable for CG).
+        """
+        for attr in attrs:
+            bufs = getattr(self, attr, None)
+            if bufs is None:
+                continue
             if not _chain_is_graphed(self.chain_id):
-                for buf in self._wgrad_input_bufs:
+                for buf in bufs:
                     _wgrad_pool_put(buf)
-            self._wgrad_input_bufs = None
+            setattr(self, attr, None)
 
     def _prescale_wgrads_for_mean_rs(self, wgrads):
         """Pre-scale wgrad by 1/gtp_remat so the SUM reduce-scatter yields the gtp_remat mean.
@@ -1524,6 +1616,40 @@ class GTPShardedParam(torch.nn.Parameter):
         gtp_remat_size = self.group.size()
         if gtp_remat_size > 1 and not GTP_CONFIG.calculate_per_token_loss:
             torch._foreach_mul_(list(wgrads), 1.0 / gtp_remat_size)
+
+    def _reduce_scatter_fp32_accum(self, tensor, out_buffer):
+        """Issue one fp32-accum reduce-scatter (all-to-all now, FP32 sum at wait) -> (out, handle).
+
+        Always issued async, even for a sync RS: under a coalescing manager the all-to-all is
+        only enqueued at context exit, so the handle's FP32 sum must never run inline here. The
+        caller waits the handle (immediately when sync) and then releases the scratch.
+
+        The all-to-all scratch is unsharded-sized, so it comes from the wgrad pool: GTP keeps
+        several RS in flight and an empty_like each would add that much peak memory.
+        """
+        # Local import: tensor_parallel has no top-level dependency on core.distributed.
+        from megatron.core.distributed.reduce_scatter_with_fp32_accumulation import (
+            reduce_scatter_with_fp32_accumulation,
+        )
+
+        tensor = tensor.contiguous()
+        if out_buffer is None:
+            out_shape = [tensor.shape[0] // self.group.size(), *tensor.shape[1:]]
+            out_buffer = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
+
+        a2a_buf = _wgrad_pool_get(tuple(tensor.shape), tensor.dtype, tensor.device)
+        handle = reduce_scatter_with_fp32_accumulation(
+            out_buffer,
+            tensor,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self.group,
+            async_op=True,
+            all_to_all_output_tensor=a2a_buf,
+        )
+        # Input to the deferred FP32 sum: held until the handle is waited on, then released by
+        # _release_comm_scratch (from _wait_reduce_scatter, or inline on the sync path).
+        self._rs_a2a_bufs = (self._rs_a2a_bufs or []) + [a2a_buf]
+        return out_buffer, handle
 
     def _reduce_scatter(self, wgrads, async_op, nvtx_label=None):
         """Reduce-scatter one or more wgrads → (outputs, handle). Single tensor: plain RS;
@@ -1571,6 +1697,42 @@ class GTPShardedParam(torch.nn.Parameter):
             rs_ctx = nullcontext()
 
         with rs_ctx:
+            # Size <= 2 gains nothing (one addition) and still costs the scratch, so it bypasses.
+            # self.group is per chain, so each axis decides on its own.
+            if GTP_CONFIG.reduce_scatter_with_fp32_accumulation and self.group.size() > 2:
+                nvtx_range_push(f"{nvtx_label}.gtp_rs_fp32accum")
+                outputs, sum_handles = [], []
+                if len(wgrads) > 1:
+                    # Batched: group the all-to-alls into one ncclGroupStart/End, exactly like
+                    # the plain batched RS below. Unlike that path we cannot hand the manager
+                    # back as the handle: the manager waits only on the underlying NCCL collective
+                    # to complete, and each fp32-accum handle still owes a local FP32 sum. So the
+                    # sums are deferred behind the manager's work in one composite handle.
+                    with torch.distributed._coalescing_manager(
+                        group=self.group, device=wgrads[0].device, async_ops=True
+                    ) as cm:
+                        for out_buffer, tensor in zip(out_buffers, wgrads):
+                            out, h = self._reduce_scatter_fp32_accum(tensor, out_buffer)
+                            outputs.append(out)
+                            sum_handles.append(h)
+                    # The grouped work from _end_coalescing is the real completion; the per-op
+                    # handles returned inside the region are not, so drop them and let cm wait.
+                    for h in sum_handles:
+                        h.all_to_all_handle = None
+                    handle = _GTPCompositeWorkHandle([cm, *sum_handles])
+                else:
+                    out, handle = self._reduce_scatter_fp32_accum(wgrads[0], out_buffers[0])
+                    outputs.append(out)
+                nvtx_range_pop(f"{nvtx_label}.gtp_rs_fp32accum")
+                if async_op:
+                    return outputs, handle
+                # Sync RS: the FP32 sums were deferred out of the issue loop, so finish here.
+                # Only the a2a scratch is ours to release — the wgrad inputs belong to the
+                # caller on this path (recycled in wgrad_reduce_scatter).
+                handle.wait()
+                self._release_comm_scratch(("_rs_a2a_bufs",))
+                return outputs, None
+
             if len(wgrads) == 1:
                 nvtx_range_push(f"{nvtx_label}.gtp_rs")
                 out, handle = reduce_scatter_along_first_dim(

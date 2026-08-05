@@ -15,6 +15,7 @@
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
 from contextlib import nullcontext
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -34,13 +35,22 @@ def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGro
     return getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
 
 
+@dataclass(frozen=True, eq=False)
+class FsdpParameter:
+    """One physical parameter and its FSDP runtime representations."""
+
+    # Tied weights register one physical parameter under multiple FQNs, all relative
+    # to the containing group's owning_module.
+    fqns: tuple[str, ...]
+    sharded: nn.Parameter
+    unsharded: nn.Parameter
+
+
 class FsdpParameterGroup:
     """A dtype and requires-grad homogeneous group of FSDP-owned parameters."""
 
     owning_module: nn.Module
-    parameter_names: tuple[str, ...]
-    sharded_parameters: tuple[nn.Parameter, ...]
-    unsharded_parameters: tuple[nn.Parameter, ...]
+    fsdp_parameters: tuple[FsdpParameter, ...]
     mesh: DeviceMesh
     dtype: torch.dtype
     requires_grad: bool
@@ -73,34 +83,37 @@ class FsdpParameterGroup:
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
 
+        parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
+        for fqn, parameter in parameters.items():
+            parameter_to_fqns.setdefault(parameter, []).append(fqn)
+
         model_weight_placements = tuple(placements.parameter)
         main_grad_placements = tuple(placements.gradient)
         main_weight_placements = tuple(placements.optimizer)
 
-        # Python dicts preserve insertion order, so parameter_names and
-        # parameters.values() define the same stable DBuffer tensor order.
+        # Python dicts preserve insertion order, so parameter_to_fqns and
+        # fsdp_parameters define the same stable DBuffer tensor order.
         self.owning_module = owning_module
         self.mesh = mesh
-        self.parameter_names = tuple(parameters)
-        first_parameter = next(iter(parameters.values()))
+        first_parameter = next(iter(parameter_to_fqns))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
-        for name, parameter in parameters.items():
+        for parameter, fqns in parameter_to_fqns.items():
             if parameter.dtype != self.dtype:
                 raise ValueError(
-                    f"Expected parameter {name!r} to have dtype {self.dtype}, "
+                    f"Expected parameter {fqns!r} to have dtype {self.dtype}, "
                     f"got {parameter.dtype}."
                 )
             if parameter.requires_grad != self.requires_grad:
                 raise ValueError(
-                    f"Expected parameter {name!r} to have requires_grad={self.requires_grad}, "
+                    f"Expected parameter {fqns!r} to have requires_grad={self.requires_grad}, "
                     f"got {parameter.requires_grad}."
                 )
 
-        tensor_shapes = tuple(parameter.shape for parameter in parameters.values())
+        tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
-            (parameter.to(dtype=main_weight_dtype) for parameter in parameters.values()),
+            (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
             mesh=self.mesh,
             placements=main_weight_placements,
         )
@@ -153,14 +166,23 @@ class FsdpParameterGroup:
             # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
             # is finalized to main_weight's placements after the last microbatch.
             self._accumulation_placements = main_grad_placements
-        sharded_parameters: list[nn.Parameter] = []
-        unsharded_parameters: list[nn.Parameter] = []
+        fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
-        for index, parameter in enumerate(parameters.values()):
-            parameter.data = self._unsharded_model_weight.get_local_tensor(index)
-            parameter.grad = None
+        for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
+            unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
+            if parameter.is_meta:
+                # A meta Parameter cannot set .data to a real tensor because their
+                # TensorImpl types are incompatible, so swap in a materialized Parameter.
+                # This may be problematic if attributes from the original Parameter need
+                # to be copied to the unsharded Parameter.
+                materialized_parameter = nn.Parameter(
+                    unsharded_tensor, requires_grad=parameter.requires_grad
+                )
+                torch.utils.swap_tensors(parameter, materialized_parameter)
+            else:
+                parameter.data = unsharded_tensor
+                parameter.grad = None
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
-            unsharded_parameters.append(parameter)
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
@@ -168,9 +190,10 @@ class FsdpParameterGroup:
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
-            sharded_parameters.append(sharded_parameter)
-        self.sharded_parameters = tuple(sharded_parameters)
-        self.unsharded_parameters = tuple(unsharded_parameters)
+            fsdp_parameters.append(
+                FsdpParameter(fqns=tuple(fqns), sharded=sharded_parameter, unsharded=parameter)
+            )
+        self.fsdp_parameters = tuple(fsdp_parameters)
 
         # Compute weights must be initialized before the first forward; subsequent
         # refreshes happen from the FSDP optimizer's post-step hook.
@@ -183,16 +206,18 @@ class FsdpParameterGroup:
             return nullcontext()
         return torch.cuda.use_mem_pool(self._symm_mem_pool)
 
-    def _set_module_parameters(self, parameters: tuple[nn.Parameter, ...]) -> None:
-        for name, parameter in zip(self.parameter_names, parameters, strict=True):
-            module, parameter_name = _get_parameter_owner(self.owning_module, name)
+    def _set_module_parameter(self, fqns: tuple[str, ...], parameter: nn.Parameter) -> None:
+        for fqn in fqns:
+            module, parameter_name = _get_parameter_owner(self.owning_module, fqn)
             module._parameters[parameter_name] = parameter
 
     def _switch_to_sharded_parameters(self) -> None:
-        self._set_module_parameters(self.sharded_parameters)
+        for fsdp_parameter in self.fsdp_parameters:
+            self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.sharded)
 
     def _switch_to_unsharded_parameters(self) -> None:
-        self._set_module_parameters(self.unsharded_parameters)
+        for fsdp_parameter in self.fsdp_parameters:
+            self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
@@ -250,12 +275,6 @@ class FsdpParameterGroup:
         # so keep the shared storage-release path.
         self._unsharded_model_weight.release_storage()
 
-    def _install_sharded_grads(self) -> None:
-        """Point each sharded parameter's grad at main_grad's current DTensor view."""
-        assert self.main_grad is not None
-        for index, sharded_parameter in enumerate(self.sharded_parameters):
-            sharded_parameter.grad = self.main_grad.get_dtensor(index)
-
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
@@ -264,10 +283,10 @@ class FsdpParameterGroup:
         # Preserve AVG semantics by reducing SUM and scaling the output below.
         partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
         grads: list[torch.Tensor] = []
-        for name, parameter in zip(self.parameter_names, self.unsharded_parameters, strict=True):
-            if parameter.grad is None:
-                raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
-            grads.append(parameter.grad)
+        for fsdp_parameter in self.fsdp_parameters:
+            if fsdp_parameter.unsharded.grad is None:
+                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
+            grads.append(fsdp_parameter.unsharded.grad)
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
@@ -280,9 +299,21 @@ class FsdpParameterGroup:
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
         # A future fused-wgrad path can write directly into these buffer views.
-        for index, parameter in enumerate(self.unsharded_parameters):
-            partial_grad.get_local_tensor(index).copy_(parameter.grad)
-            parameter.grad = None
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            partial_grad.get_local_tensor(index).copy_(fsdp_parameter.unsharded.grad)
+            fsdp_parameter.unsharded.grad = None
+
+    def _has_sharded_grads(self) -> bool:
+        has_any_grad = False
+        has_any_missing_grad = False
+        for fsdp_parameter in self.fsdp_parameters:
+            if fsdp_parameter.sharded.grad is None:
+                has_any_missing_grad = True
+            else:
+                has_any_grad = True
+        if has_any_grad and has_any_missing_grad:
+            raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
+        return has_any_grad
 
     def reduce_partial_gradients(
         self, partial_grad: DBuffer, is_last_microbatch: bool = True
@@ -298,22 +329,10 @@ class FsdpParameterGroup:
         """
         assert self.main_grad is not None
 
-        def has_grad(parameters: tuple[nn.Parameter, ...]) -> bool:
-            has_any_grad = False
-            has_any_missing_grad = False
-            for parameter in parameters:
-                if parameter.grad is None:
-                    has_any_missing_grad = True
-                else:
-                    has_any_grad = True
-            if has_any_grad and has_any_missing_grad:
-                raise RuntimeError("FSDP sharded gradients must be either all set or all None.")
-            return has_any_grad
-
         # zero_grad(set_to_none=True) clears sharded parameter grads, so this
         # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
         # leaves sharded grads installed, so this backward accumulates into main_grad.
-        has_sharded_grads = has_grad(self.sharded_parameters)
+        has_sharded_grads = self._has_sharded_grads()
 
         # A non-accumulation main_grad means the previous step finalized it; this
         # only happens on the first microbatch. Redistribute it back to the
@@ -321,8 +340,6 @@ class FsdpParameterGroup:
         # and a fresh reduce-scattered buffer for HFSDP in the future.
         if self.main_grad.placements != self._accumulation_placements:
             self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
-            if has_sharded_grads:
-                self._install_sharded_grads()
 
         can_reduce_into_main_grad = (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
@@ -346,14 +363,15 @@ class FsdpParameterGroup:
                 self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
-        if not has_sharded_grads:
-            self._install_sharded_grads()
 
         if is_last_microbatch:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
-            # reduce-scatter for HFSDP) and install the sharded parameter gradients.
+            # reduce-scatter for HFSDP) before binding the sharded parameter grads.
             self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
-            self._install_sharded_grads()
+
+        # Make each sharded parameter's .grad consistent with the final main_grad.
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            fsdp_parameter.sharded.grad = self.main_grad.get_dtensor(index)
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
