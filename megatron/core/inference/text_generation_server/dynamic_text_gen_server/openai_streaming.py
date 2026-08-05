@@ -83,37 +83,6 @@ def _finish_reason(result):
     return "length" if requested is not None and generated >= requested else "stop"
 
 
-def _common_prefix(left, right):
-    end = 0
-    for left_char, right_char in zip(left, right):
-        if left_char != right_char:
-            break
-        end += 1
-    return left[:end]
-
-
-def _safe_argument_prefix(arguments):
-    """Exclude incomplete empty values inserted by tool parsers."""
-    try:
-        parsed_arguments = json.loads(arguments)
-    except (TypeError, ValueError):
-        return arguments
-    if not isinstance(parsed_arguments, dict):
-        return arguments
-
-    prefix_parts = ["{"]
-    for index, (name, value) in enumerate(parsed_arguments.items()):
-        if index:
-            prefix_parts.append(", ")
-        prefix_parts.extend((json.dumps(name, ensure_ascii=False), ": "))
-        if value == "":
-            return "".join(prefix_parts)
-        prefix_parts.append(json.dumps(value, ensure_ascii=False))
-
-    # An empty object may still acquire parameters on a later parse step.
-    return arguments if parsed_arguments else "{"
-
-
 def _safe_content_prefix(content, markers):
     """Hold text that may still become a parser control marker."""
     safe_end = len(content)
@@ -136,15 +105,13 @@ class StreamingChatParser:
         self._named_tool_choice = named_tool_choice
         self._content_sent = ""
         self._reasoning_sent = ""
-        self._previous_arguments = []
-        self._streamed_arguments = []
+        self._tool_arguments_sent = []
         self._tool_ids = []
         self._tool_names_sent = []
         self.tools_streamed = False
 
     def _append_state_for_tool(self):
-        self._previous_arguments.append("")
-        self._streamed_arguments.append("")
+        self._tool_arguments_sent.append(False)
         self._tool_ids.append(f"call_{uuid.uuid4().hex[:24]}")
         self._tool_names_sent.append(False)
 
@@ -211,30 +178,21 @@ class StreamingChatParser:
                 self.tools_streamed = True
 
             if self._tool_names_sent[index]:
-                previous_arguments = self._previous_arguments[index]
                 call_is_complete = finished or index + 1 < len(tool_calls)
-                stable_arguments = (
-                    current_arguments
-                    if call_is_complete
-                    else _common_prefix(previous_arguments, current_arguments)
-                )
-                if not call_is_complete:
-                    safe_arguments = _safe_argument_prefix(current_arguments)
-                    stable_arguments = stable_arguments[: len(safe_arguments)]
-                already_sent = self._streamed_arguments[index]
-                if stable_arguments.startswith(already_sent):
-                    argument_delta = stable_arguments[len(already_sent) :]
-                    if argument_delta:
-                        deltas.append(
-                            {
-                                "tool_calls": [
-                                    {"index": index, "function": {"arguments": argument_delta}}
-                                ]
-                            }
-                        )
-                        self._streamed_arguments[index] += argument_delta
-
-            self._previous_arguments[index] = current_arguments
+                # Re-serialized arguments are not append-stable while XML parameters arrive.
+                # Emit the complete JSON object once instead of streaming corrupt prefixes.
+                if call_is_complete and not self._tool_arguments_sent[index]:
+                    deltas.append(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "function": {"arguments": current_arguments},
+                                }
+                            ]
+                        }
+                    )
+                    self._tool_arguments_sent[index] = True
 
         return deltas
 
