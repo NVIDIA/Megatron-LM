@@ -132,8 +132,7 @@ def _pending_import(engine, request_id, block_id, block_hash):
         sampling_params=SamplingParams(num_tokens_to_generate=2),
         local_blocks=[block_id],
         hashes=[block_hash],
-        hashes_to_register=1,
-        hash_registration_start=0,
+        cached_prefix_block_count=0,
         handle=None,
         future=engine._loop.create_future(),
     )
@@ -372,8 +371,7 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     pending = engine._pending_kv_imports[0]
     assert engine._kv_transfer_agent.calls == [({"request_id": 5}, [102], [12])]
     assert pending.local_blocks == [10, 11, 12]
-    assert pending.hash_registration_start == 2
-    assert pending.hashes_to_register == 1
+    assert pending.cached_prefix_block_count == 2
     engine._finalize_kv_handoff_import(pending)
     assert engine.precomputed_hashes[5] == hashes
     assert engine.context.kv_block_allocator.registered_parent_hashes == [hashes[1]]

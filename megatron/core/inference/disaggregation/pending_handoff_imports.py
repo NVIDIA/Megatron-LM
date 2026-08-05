@@ -33,8 +33,7 @@ class PendingKvImport:
     prompt: list
     sampling_params: SamplingParams
     local_blocks: List[int]
-    hashes: list
-    hashes_to_register: int
-    hash_registration_start: int
+    hashes: List[int]
+    cached_prefix_block_count: int
     handle: Any
     future: asyncio.Future

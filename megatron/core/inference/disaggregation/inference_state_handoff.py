@@ -51,8 +51,8 @@ class InferenceStateHandoffMixin:
         self._pp_kv_peer_metas = None  # Each PP stage's set of TP KV descriptors.
         self._deferred_kv_handoffs = deque()
         self._pending_kv_imports = deque()
-        # Retain imported blocks until the admitted request acquires its own references.
-        self._handoff_import_owners: Dict[int, list[int]] = {}  # Request ID -> imported KV blocks.
+        # Retain handoff blocks until the admitted request acquires its own references.
+        self._handoff_import_owners: Dict[int, list[int]] = {}  # Request ID -> local KV blocks.
         self._pending_kv_pushes: list = []
 
     @property
@@ -480,10 +480,7 @@ class InferenceStateHandoffMixin:
             sampling_params=handoff.sampling_params,
             local_blocks=local_blocks,
             hashes=handoff.hashes,
-            hashes_to_register=max(
-                0, min(handoff.num_blocks, len(handoff.hashes)) - len(cached_blocks)
-            ),
-            hash_registration_start=len(cached_blocks),
+            cached_prefix_block_count=len(cached_blocks),
             handle=handle,
             future=handoff.future,
         )
@@ -583,23 +580,25 @@ class InferenceStateHandoffMixin:
 
     def _finalize_kv_handoff_import(self, pending: PendingKvImport) -> None:
         allocator = self.context.kv_block_allocator
-        n = pending.hashes_to_register
-        start = pending.hash_registration_start
-        end = start + n
         local_blocks = pending.local_blocks
+        cached_prefix_block_count = pending.cached_prefix_block_count
+        registration_end = min(len(local_blocks), len(pending.hashes))
+        num_hashes_to_register = registration_end - cached_prefix_block_count
 
         if pending.request_id in self._handoff_import_owners:
             raise RuntimeError(f"Duplicate decode handoff request ID {pending.request_id}")
 
-        if n > 0:
+        if num_hashes_to_register > 0:
             # The imported suffix extends any retained local prefix. Preserve
             # that predecessor link in the allocator's parent-aware LRU forest.
             parent_hashes = [
                 pending.hashes[block_idx - 1] if block_idx > 0 else 0
-                for block_idx in range(start, end)
+                for block_idx in range(cached_prefix_block_count, registration_end)
             ]
             allocator.register_kv_block_hashes(
-                local_blocks[start:end], pending.hashes[start:end], parent_hashes=parent_hashes
+                local_blocks[cached_prefix_block_count:registration_end],
+                pending.hashes[cached_prefix_block_count:registration_end],
+                parent_hashes=parent_hashes,
             )
 
         logging.debug(
@@ -607,9 +606,9 @@ class InferenceStateHandoffMixin:
             "cached_blocks=%d imported_blocks=%d hashes_registered=%d pending_imports=%d",
             pending.request_id,
             len(pending.prompt),
-            start,
-            len(local_blocks) - start,
-            n,
+            cached_prefix_block_count,
+            len(local_blocks) - cached_prefix_block_count,
+            num_hashes_to_register,
             len(self._pending_kv_imports),
         )
 
@@ -620,7 +619,9 @@ class InferenceStateHandoffMixin:
                 pending.request_id,
                 pending.prompt,
                 pending.sampling_params,
-                precomputed_block_hashes=pending.hashes[:end] if end > 0 else None,
+                precomputed_block_hashes=(
+                    pending.hashes[:registration_end] if registration_end > 0 else None
+                ),
             )
         except Exception:
             self._release_handoff_import_owner(pending.request_id)
