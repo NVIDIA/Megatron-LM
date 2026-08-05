@@ -739,6 +739,9 @@ def selective_log_softmax(logits, index):
         # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
         per_token_logps = []
         for row_logits, row_labels in zip(logits, index):  # loop to reduce peak mem consumption
+            # Match inference by running batch-invariant log-softmax in FP32.
+            if use_bik_logsoftmax:
+                row_logits = row_logits.float()
             row_logps = torch.nn.functional.log_softmax(row_logits, dim=-1)
             row_per_token_logps = row_logps.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(
                 -1
@@ -1733,9 +1736,12 @@ def prepare_data_for_update(
                     use_single_mempool=args.cuda_graph_use_single_mempool,
                 )
 
-            dtype = (
-                torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
-            )
+            if is_batch_invariant_mode_enabled():
+                dtype = torch.float32
+            else:
+                dtype = (
+                    torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+                )
 
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp

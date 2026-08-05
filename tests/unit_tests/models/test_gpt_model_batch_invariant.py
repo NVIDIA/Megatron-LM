@@ -18,7 +18,10 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    set_batch_invariant_mode,
+    te_supports_batch_invariant_attention,
+)
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -48,6 +51,10 @@ except ImportError:
 # Batch-invariant mode requires an explicit FlashAttention version; pick the newest
 # one available so training and inference run the same kernel.
 _BIK_FA_VERSION = 4 if HAVE_FA4 else 3
+pytestmark = pytest.mark.skipif(
+    not te_supports_batch_invariant_attention(),
+    reason="Batch-invariant attention requires TransformerEngine PR #3204 or >= 2.18.",
+)
 
 
 class DummyTokenizer:

@@ -19,6 +19,8 @@ def _build_tiny_moe_gpt(
     tensor_parallel_size: int,
     expert_parallel_size: int,
     expert_tensor_parallel_size: int,
+    tensor_parallel_num_weight_shards: int | None = None,
+    expert_tensor_parallel_num_weight_shards: int | None = None,
     bf16: bool = False,
     add_bias_linear: bool = False,
 ) -> GPTModel:
@@ -36,6 +38,8 @@ def _build_tiny_moe_gpt(
         tensor_model_parallel_size=tensor_parallel_size,
         expert_model_parallel_size=expert_parallel_size,
         expert_tensor_parallel_size=expert_tensor_parallel_size,
+        tensor_parallel_num_weight_shards=tensor_parallel_num_weight_shards,
+        expert_tensor_parallel_num_weight_shards=expert_tensor_parallel_num_weight_shards,
         sequence_parallel=tensor_parallel_size > 1,
         use_cpu_initialization=True,
         add_bias_linear=add_bias_linear,
@@ -119,21 +123,115 @@ def test_moe_param_norm_counts_each_logical_parameter_once(
         Utils.destroy_model_parallel()
 
 
+def test_moe_param_norm_uses_expert_gtp_topology_when_it_differs_from_dense_gtp(monkeypatch):
+    """Expert parameters must use EGTP even when EP, TP, and ETP alone do not distinguish them."""
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        GTP_CONFIG,
+        GTPShardedParam,
+        reset_gtp_state,
+        update_gtp_config,
+    )
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if not HAVE_GTP:
+        pytest.skip("GTP requires TransformerEngine >= 2.19")
+    if Utils.world_size < 2 or Utils.world_size % 2 != 0:
+        pytest.skip("test requires an even world size")
+
+    monkeypatch.setattr(
+        common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=False, bf16=False)
+    )
+    # Keep the all-ones assertion focused on topology rather than physical GTP padding.
+    original_pad_for_alignment = GTP_CONFIG.pad_for_alignment
+    update_gtp_config(pad_for_alignment=0)
+
+    try:
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+        reference_model = _build_tiny_moe_gpt(
+            tensor_parallel_size=1, expert_parallel_size=1, expert_tensor_parallel_size=1
+        )
+        _fill_parameters_with_ones(reference_model)
+        expected_numel = sum(param.numel() for param in reference_model.parameters())
+        expected_norm = math.sqrt(expected_numel)
+        del reference_model
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            gtp_remat_size=1,
+            expert_gtp_remat_size=2,
+        )
+        model = _build_tiny_moe_gpt(
+            tensor_parallel_size=1,
+            expert_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            tensor_parallel_num_weight_shards=1,
+            expert_tensor_parallel_num_weight_shards=2,
+        )
+        _fill_parameters_with_ones(model)
+
+        expert_params = [param for name, param in model.named_parameters() if ".experts." in name]
+        assert any(isinstance(param, GTPShardedParam) for param in expert_params)
+
+        actual_norm = common_utils.calc_params_l2_norm(model)
+
+        assert actual_norm == pytest.approx(expected_norm)
+    finally:
+        update_gtp_config(pad_for_alignment=original_pad_for_alignment)
+        reset_gtp_state()
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("use_distributed_optimizer", (False, True), ids=("optimizer", "distopt"))
 @pytest.mark.parametrize(
-    ("tensor_parallel_size", "expert_parallel_size", "expert_tensor_parallel_size"),
-    ((2, 2, 1), (2, 1, 2), (4, 1, 2), (2, 1, 4)),
-    ids=("expert-parallel", "expert-tensor-parallel", "tp-larger-than-etp", "etp-larger-than-tp"),
+    (
+        "tensor_parallel_size",
+        "expert_parallel_size",
+        "expert_tensor_parallel_size",
+        "gtp_weight_remat_size",
+        "expert_gtp_weight_remat_size",
+    ),
+    ((2, 2, 1, 1, 1), (2, 1, 2, 1, 1), (4, 1, 2, 1, 1), (2, 1, 4, 1, 1), (1, 1, 1, 1, 2)),
+    ids=(
+        "expert-parallel",
+        "expert-tensor-parallel",
+        "tp-larger-than-etp",
+        "etp-larger-than-tp",
+        "expert-gtp-differs-from-dense-gtp",
+    ),
 )
 def test_moe_gradient_stats_and_clipping_count_each_logical_gradient_once(
     tensor_parallel_size: int,
     expert_parallel_size: int,
     expert_tensor_parallel_size: int,
+    gtp_weight_remat_size: int,
+    expert_gtp_weight_remat_size: int,
     use_distributed_optimizer: bool,
 ):
     """Gradient norm, clipping, and zero count should include each logical gradient once."""
+    if expert_gtp_weight_remat_size > 1:
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+        if not HAVE_GTP:
+            pytest.skip("GTP requires TransformerEngine >= 2.19")
     if Utils.world_size < 4 or Utils.world_size % 4 != 0:
         pytest.skip("test requires a world size divisible by four")
+
+    original_pad_for_alignment = None
+    if expert_gtp_weight_remat_size > 1:
+        from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+            GTP_CONFIG,
+            update_gtp_config,
+        )
+
+        # Keep the all-ones assertion focused on topology rather than physical GTP padding.
+        original_pad_for_alignment = GTP_CONFIG.pad_for_alignment
+        update_gtp_config(pad_for_alignment=0)
 
     try:
         Utils.initialize_model_parallel(
@@ -152,11 +250,17 @@ def test_moe_gradient_stats_and_clipping_count_each_logical_gradient_once(
             tensor_model_parallel_size=tensor_parallel_size,
             expert_model_parallel_size=expert_parallel_size,
             expert_tensor_parallel_size=expert_tensor_parallel_size,
+            gtp_remat_size=gtp_weight_remat_size,
+            expert_gtp_remat_size=expert_gtp_weight_remat_size,
         )
         model = _build_tiny_moe_gpt(
             tensor_parallel_size=tensor_parallel_size,
             expert_parallel_size=expert_parallel_size,
             expert_tensor_parallel_size=expert_tensor_parallel_size,
+            tensor_parallel_num_weight_shards=(tensor_parallel_size * gtp_weight_remat_size),
+            expert_tensor_parallel_num_weight_shards=(
+                expert_tensor_parallel_size * expert_gtp_weight_remat_size
+            ),
             bf16=True,
         )
         ddp_config = DistributedDataParallelConfig(
@@ -211,6 +315,14 @@ def test_moe_gradient_stats_and_clipping_count_each_logical_gradient_once(
             grads_checked += 1
         assert grads_checked > 0
     finally:
+        if expert_gtp_weight_remat_size > 1:
+            from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+                reset_gtp_state,
+                update_gtp_config,
+            )
+
+            update_gtp_config(pad_for_alignment=original_pad_for_alignment)
+            reset_gtp_state()
         Utils.destroy_model_parallel()
 
 

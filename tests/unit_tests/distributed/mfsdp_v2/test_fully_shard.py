@@ -88,6 +88,20 @@ class MultiChildModel(nn.Module):
         return x
 
 
+class TiedLM(nn.Module):
+    """Tiny language model with shared input and output embedding weights."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(8, 4, dtype=torch.bfloat16)
+        self.lm_head = nn.Linear(4, 8, bias=False, dtype=torch.bfloat16)
+        self.lm_head.weight = self.embed_tokens.weight
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Compute a scalar loss using both aliases of the shared weight."""
+        return self.lm_head(self.embed_tokens(token_ids)).float().sum()
+
+
 class SaveNonLeafWeightView(torch.autograd.Function):
     """Autograd function that saves a non-leaf parameter view for backward."""
 
@@ -394,11 +408,25 @@ def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    inner_names = [name for group in model.inner.parameter_groups for name in group.parameter_names]
-    outer_names = [name for group in model.parameter_groups for name in group.parameter_names]
+    (inner_group,) = model.inner.parameter_groups
+    (outer_group,) = model.parameter_groups
 
-    assert inner_names == ["weight"]
-    assert outer_names == ["bias"]
+    assert [parameter.fqns for parameter in inner_group.fsdp_parameters] == [("weight",)]
+    assert [parameter.fqns for parameter in outer_group.fsdp_parameters] == [("bias",)]
+
+
+def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
+    """Tied registrations should allocate one DBuffer entry and optimizer parameter."""
+    model = TiedLM()
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    (parameter_group,) = model.parameter_groups
+    (parameter,) = parameter_group.fsdp_parameters
+    assert parameter.fqns == ("embed_tokens.weight", "lm_head.weight")
+    assert parameter_group.main_weight.layout.size == 8 * 4
+    # Both aliases must expose the same optimizer-visible sharded parameter.
+    assert len(list(model.parameters())) == 1
 
 
 def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setup):
@@ -888,6 +916,32 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
 
     output = model(x.to(device))
     torch.testing.assert_close(output, expected_output)
+
+
+def test_meta_parameters_shard_to_mesh_device(distributed_setup):
+    """A sharded meta model should support initialization and forward."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Sequential(
+        nn.Linear(4, 4, bias=False, device="meta", dtype=torch.bfloat16),
+        nn.Linear(4, 4, bias=False, device="meta", dtype=torch.bfloat16),
+    )
+
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    with torch.no_grad():
+        model[0].weight.fill_(2.0)
+        model[1].weight.fill_(3.0)
+    # The exposed parameters update FP32 main weights, while forward uses separate BF16
+    # model weights. This simulates load_checkpoint() until
+    # https://github.com/NVIDIA/Megatron-LM/pull/6024 lands and syncs after loading.
+    for parameter_group in model.parameter_groups:
+        parameter_group.sync_model_weight_from_main_weight()
+
+    output = model(torch.ones(1, 4, device=device, dtype=torch.bfloat16))
+    torch.testing.assert_close(output, torch.full_like(output, 96.0))
 
 
 def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
