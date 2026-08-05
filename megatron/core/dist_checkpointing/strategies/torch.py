@@ -1,6 +1,7 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-""" Strategies using PyTorch distributed.checkpoint as an underlying format. """
+"""Strategies using PyTorch distributed.checkpoint as an underlying format."""
+
 import inspect
 import io
 import os
@@ -339,7 +340,7 @@ def mcore_to_pyt_state_dict(
 
 
 def _unwrap_pyt_sharded_tensor(
-    sh_ten: Union[TorchShardedTensor, CheckpointableShardedTensor, LocalShardsContainer, Any]
+    sh_ten: Union[TorchShardedTensor, CheckpointableShardedTensor, LocalShardsContainer, Any],
 ) -> Union[List[torch.Tensor], Any]:
     """Unwrap tensor from PyT ShardedTensor instance.
 
@@ -769,7 +770,7 @@ class TorchDistSaveShardedStrategy:
 
         # Translate the state dict
         with trace_region("_replace_state_dict_keys_with_sharded_keys"):
-            (sharded_state_dict, flat_mapping, rename_mapping) = (
+            sharded_state_dict, flat_mapping, rename_mapping = (
                 _replace_state_dict_keys_with_sharded_keys(
                     sharded_state_dict, self.keep_only_main_replica
                 )
@@ -991,12 +992,18 @@ def _get_filesystem_reader(
 class TorchDistLoadShardedStrategy:
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self, cache_metadata: bool = False, replicate_local_replicas: bool = False):
+    def __init__(
+        self,
+        cache_metadata: bool = False,
+        checkpoint_name: str = None,
+        replicate_local_replicas: bool = False,
+    ):
         """
         Args:
             cache_metadata (bool): keep the parsed ``.metadata`` pickle alive
                 across calls so the second and later loads avoid re-parsing
                 it. Defaults to False.
+            checkpoint_name (str): name of the checkpoint being loaded.
             replicate_local_replicas (bool): when True, requests for an FQN
                 whose ``__shadow_<rank>__<fqn>`` is present in the
                 checkpoint metadata are routed to that shadow entry —
@@ -1012,6 +1019,7 @@ class TorchDistLoadShardedStrategy:
         """
         self.cached_global_metadata: Optional[Metadata] = None
         self.cache_metadata = cache_metadata
+        self.checkpoint_name = checkpoint_name
         self.replicate_local_replicas = replicate_local_replicas
 
     def load(
@@ -1045,7 +1053,7 @@ class TorchDistLoadShardedStrategy:
         orig_sharded_state_dict = sharded_state_dict
         with trace_region("_replace_state_dict_keys_with_sharded_keys"):
             # MCore state dict to PyT Distributed compatible
-            (sharded_state_dict, flat_mapping, rename_mapping) = (
+            sharded_state_dict, flat_mapping, rename_mapping = (
                 _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
             )
         with trace_region("mcore_to_pyt_state_dict"):
@@ -1213,16 +1221,16 @@ class TorchDistLoadShardedStrategy:
             except AttributeError:
                 os.sync()
         ## move the old metadata
-        fs_writer.fs.rename(fs_writer.metadata_path, old_path)
+        fs_writer.fs.rename(metadata_filename, old_path)
         try:
             ## rename the new metadata
-            fs_writer.fs.rename(tmp_path, fs_writer.metadata_path)
+            fs_writer.fs.rename(tmp_path, metadata_filename)
 
             ## finally, remove the files we want to drop
             for f in files_to_remove:
-                fs_writer.fs.rm_file(checkpoint_dir / f)
+                fs_writer.fs.rm_file(Path(checkpoint_dir) / f)
         except Exception as e:
-            fs_writer.fs.rename(old_path, fs_writer.metadata_path)
+            fs_writer.fs.rename(old_path, metadata_filename)
             raise e
         else:
             fs_writer.fs.rm_file(old_path)

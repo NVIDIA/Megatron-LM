@@ -327,8 +327,8 @@ class FullyParallelLoadStrategyWrapper:
         with trace_region("apply_loading_parallelization"):
             # Step 1 and 2: exchange load metadata and distribute the load
             with debug_time("self.apply_loading_parallelization", logger):
-                precomputed_distribution: ShardDistribution | None = self.apply_loading_parallelization(
-                    sharded_state_dict
+                precomputed_distribution: ShardDistribution | None = (
+                    self.apply_loading_parallelization(sharded_state_dict)
                 )
                 assert (
                     precomputed_distribution is not None
@@ -338,7 +338,7 @@ class FullyParallelLoadStrategyWrapper:
         # ShardedTensors keep the FullyParallel distribution: each rank reads
         # only the shards it was assigned (`to_load_shards`) and receives the
         # rest (`unloaded_shards`) via the cross-rank exchange in step 4.
-        (sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards) = (
+        sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards = (
             self._defer_loading_sharded_tensors(sharded_state_dict)
         )
 
@@ -353,7 +353,7 @@ class FullyParallelLoadStrategyWrapper:
         # so this rank loads every object in its state dict. This replaces the
         # former WORLD-wide `all_gather_object` collective with extra (but cheap)
         # local reads of small artifacts (RNG states, `_extra_state`, ...).
-        (sharded_objects, sharded_state_dict, to_load_objects, unloaded_objects) = (
+        sharded_objects, sharded_state_dict, to_load_objects, unloaded_objects = (
             self._defer_loading_sharded_objects(sharded_state_dict)
         )
         all_objects_to_load = {**to_load_objects, **unloaded_objects}

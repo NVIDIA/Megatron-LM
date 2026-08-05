@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 
-
 @dataclass(kw_only=True)
 class TrainingConfig:
     """Configuration settings related to the training loop."""
@@ -366,6 +365,27 @@ class LoggerConfig:
 
     save_config_filepath: str | None = None
     """If set, save the task configuration (ConfigContainer) to this file."""
+
+    moe_routing_trace_path: str | None = None
+    """Directory for MoE router decision traces (JSONL).  When set, a RouterTracer is initialized
+    at training start and hooks are registered on all TopKRouter modules.
+    Traces are written in the same format as inference traces so the analysis scripts under
+    tools/moe_routing work on both."""
+
+    moe_routing_trace_max_training_iters: int | None = None
+    """Maximum number of training iterations to trace.  Tracing stops
+    automatically after this many calls to advance_step().  Defaults
+    to tracing all iterations when moe_routing_trace_path is set.
+    (Inference uses --moe-routing-trace-max-inference-steps instead.)"""
+
+    moe_routing_trace_capture_logits: bool = False
+    """Capture pre-topk routing logits for each router call."""
+
+    moe_routing_trace_capture_hidden_states: bool = False
+    """Capture input hidden-state tensors for each router call."""
+
+    moe_routing_trace_dump_weights: bool = False
+    """Save router weight tensors to a .pt sidecar file."""
 
 
 @dataclass(kw_only=True)

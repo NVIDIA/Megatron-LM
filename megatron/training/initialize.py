@@ -51,6 +51,7 @@ def initialize_megatron(
     seed_tp_group=None,
     seed_ep_group=None,
     seed_etp_group=None,
+    skip_random_seed=False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -107,20 +108,21 @@ def initialize_megatron(
             skip_model_parallel_init=skip_model_parallel_init,
         )
 
-        # Random seeds for reproducibility.
-        print_rank_0("> setting random seeds to {} ...".format(args.seed))
-        _set_random_seed(
-            args.seed,
-            args.data_parallel_random_init,
-            args.te_rng_tracker,
-            args.inference_rng_tracker,
-            use_cudagraphable_rng=args.cuda_graph_impl != "none",
-            pp_group=seed_pp_group,
-            dp_group=seed_dp_group,
-            tp_group=seed_tp_group,
-            ep_group=seed_ep_group,
-            etp_group=seed_etp_group,
-        )
+        # Random seeds for reproducibility; multimodal MiMo seeds per module in its builder.
+        if not skip_random_seed:
+            print_rank_0("> setting random seeds to {} ...".format(args.seed))
+            _set_random_seed(
+                args.seed,
+                args.data_parallel_random_init,
+                args.te_rng_tracker,
+                args.inference_rng_tracker,
+                use_cudagraphable_rng=args.cuda_graph_impl != "none",
+                pp_group=seed_pp_group,
+                dp_group=seed_dp_group,
+                tp_group=seed_tp_group,
+                ep_group=seed_ep_group,
+                etp_group=seed_etp_group,
+            )
 
         # Setup MoE aux loss scale value.
         if args.num_experts is not None:
@@ -357,12 +359,24 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
+            if args.gtp_weight_remat_size > 1 or args.expert_gtp_weight_remat_size > 1:
+                from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+                assert HAVE_GTP, (
+                    "GTP requires TransformerEngine >= 2.19. "
+                    "Set both --gtp_remat-weight-remat-size and "
+                    "--expert-generalized-tensor-parallel-remat-size to 1 to disable GTP."
+                )
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
                 pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
                 use_sharp=args.use_sharp,
+                # GTP_remat/EGTP_remat need world divisible by TP*PP*CP*GTP_remat (expert grid
+                # by ETP*EP*PP*EGTP_remat). Inactive when the remat sizes are 1.
+                gtp_remat_size=args.gtp_weight_remat_size,
+                expert_gtp_remat_size=args.expert_gtp_weight_remat_size,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 hybrid_context_parallel=args.hybrid_context_parallel,
@@ -381,6 +395,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             print_rank_0(
                 f"> initialized tensor model parallel with size "
                 f"{mpu.get_tensor_model_parallel_world_size()}"
+            )
+            print_rank_0(
+                f"> initialized gtp weight remat with size "
+                f"{mpu.get_gtp_weight_remat_world_size()}"
             )
             print_rank_0(
                 f"> initialized pipeline model parallel with size "

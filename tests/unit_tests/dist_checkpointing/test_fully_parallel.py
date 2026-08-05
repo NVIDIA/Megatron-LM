@@ -27,12 +27,6 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
     is_main_replica,
 )
-from megatron.core.dist_checkpointing.strategies.base import (
-    LoadShardedStrategy,
-    SaveShardedStrategy,
-    StrategyAction,
-    get_default_strategy,
-)
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
@@ -48,7 +42,7 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
-class MockSaveStrategy(SaveShardedStrategy):
+class MockSaveStrategy(TorchDistSaveShardedStrategy):
     def __init__(self):
         super().__init__('mock', 1)
         self.save_keys = set()
@@ -59,7 +53,7 @@ class MockSaveStrategy(SaveShardedStrategy):
                 self.save_keys.add(sh_ten.key)
 
 
-class MockLoadStrategy(LoadShardedStrategy):
+class MockLoadStrategy(TorchDistLoadShardedStrategy):
     def __init__(self, device='cpu'):
         super().__init__()
         self.device = device

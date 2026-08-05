@@ -2,6 +2,11 @@
 
 """RL rollout submission and consumption granularity values."""
 
+from typing import Literal
+
+SubmissionGranularity = Literal["R", "G", "B"]
+ConsumptionGranularity = Literal["G", "B"]
+
 
 def get_rl_parallel_generation_tasks(args) -> int:
     """Return the number of generation slots implied by RL lag and submission granularity."""

@@ -1065,3 +1065,120 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         assert hybrid_cp_group is None
 
     Utils.destroy_model_parallel()
+
+
+def create_inter_document_masking_data_iterator(seq_length: int = 1024, micro_batch_size: int = 2):
+    """Create a mock data iterator for inter-document masking with mbs > 1.
+
+    Mimics what default_collate produces from GPTDataset with
+    inter_document_masking=True: each sample has its own padded cu_seqlens
+    row, collated into (micro_batch_size, padded_len).
+    """
+    padded_len = seq_length + 1
+    cu_seqlens = torch.full((micro_batch_size, padded_len), seq_length, dtype=torch.int32)
+    max_seqlens = []
+
+    for i in range(micro_batch_size):
+        n_docs = torch.randint(2, 6, (1,)).item()
+        boundaries = sorted(torch.randint(1, seq_length, (n_docs - 1,)).tolist())
+        boundaries = [0] + boundaries + [seq_length]
+        for j, val in enumerate(boundaries):
+            cu_seqlens[i, j] = val
+        seg_lengths = [boundaries[k + 1] - boundaries[k] for k in range(len(boundaries) - 1)]
+        max_seqlens.append(max(seg_lengths))
+
+    max_seqlen = torch.tensor(max_seqlens, dtype=torch.int32)
+
+    tokens = torch.randint(0, 10000, (micro_batch_size, seq_length), dtype=torch.int64)
+    labels = torch.randint(0, 10000, (micro_batch_size, seq_length), dtype=torch.int64)
+    loss_mask = torch.ones(micro_batch_size, seq_length, dtype=torch.float32)
+    position_ids = (
+        torch.arange(seq_length, dtype=torch.int64)
+        .unsqueeze(0)
+        .expand(micro_batch_size, -1)
+        .clone()
+    )
+
+    batch = {
+        "tokens": tokens,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "position_ids": position_ids,
+        "cu_seqlens": cu_seqlens,
+        "max_seqlen": max_seqlen,
+    }
+    return iter([batch])
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("micro_batch_size", [1, 2, 4])
+@pytest.mark.parametrize("seq_length", [1024])
+def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_length):
+    """Verify cu_seqlens is correctly broadcast and merged when mbs > 1 with TP > 1.
+
+    Regression test: the receiver in get_batch_on_this_tp_rank used to allocate
+    cu_seqlens as (1, numel) instead of (mbs, padded_len), which caused
+    flatten_batch_for_packed_sequences to silently drop all samples after the
+    first on non-zero TP ranks.
+    """
+    if tp_size > torch.cuda.device_count():
+        pytest.skip(
+            f"Skipping test because tp_size > torch.cuda.device_count() "
+            f"({tp_size} > {torch.cuda.device_count()})"
+        )
+
+    dp_size = int(os.environ.get("WORLD_SIZE", 1)) // tp_size
+    global_batch_size = micro_batch_size * dp_size
+    args = initialize_test_environment(
+        tp_size,
+        pp_size=1,
+        cp_size=1,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        global_batch_size=global_batch_size,
+        sft=False,
+    )
+    args.dataloader_inter_document_masking = True
+
+    data_iterator = None
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        data_iterator = create_inter_document_masking_data_iterator(
+            seq_length, micro_batch_size=micro_batch_size
+        )
+
+    (
+        attention_mask,
+        cu_seqlens,
+        cu_seqlens_padded,
+        hybrid_cp_group,
+        labels,
+        local_cp_size,
+        loss_mask,
+        max_seqlen,
+        position_ids,
+        tokens,
+    ) = get_batch(data_iterator)
+
+    total_tokens = micro_batch_size * seq_length
+
+    assert tokens is not None
+    assert tokens.shape == (1, total_tokens)
+    assert labels is not None
+    assert labels.shape == (1, total_tokens)
+    assert loss_mask is not None
+    assert loss_mask.shape == (1, total_tokens)
+    assert position_ids is not None
+    assert position_ids.shape == (1, total_tokens)
+
+    assert cu_seqlens is not None
+    assert cu_seqlens.dim() == 2
+    assert cu_seqlens.shape[0] == 1
+    assert cu_seqlens.dtype == torch.int32
+    assert cu_seqlens[0, 0].item() == 0
+    assert cu_seqlens[0, -1].item() == total_tokens
+    assert cu_seqlens.shape[1] >= micro_batch_size + 1
+
+    assert max_seqlen is not None
+    assert max_seqlen.numel() == 1
+
+    Utils.destroy_model_parallel()
