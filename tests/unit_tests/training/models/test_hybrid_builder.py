@@ -1,11 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import pytest
 
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.models.base import ModelConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 
 # ---------------------------------------------------------------------------
@@ -73,6 +75,14 @@ class TestHybridModelConfigInitialization:
     def test_hybrid_stack_spec_default_is_none(self):
         config = _make_hybrid_config()
         assert config.hybrid_stack_spec is None
+
+    def test_legacy_as_dict_matches_the_historical_field_set(self):
+        config = _make_hybrid_config(hybrid_layer_pattern="M*")
+        historical = ModelConfig.as_dict(config)
+        historical.pop("layer_specs")
+        historical.pop("mtp_layer_specs")
+
+        assert config.as_dict() == historical
 
 
 class TestHybridModelConfigGetAttr:
@@ -175,6 +185,39 @@ class TestHybridModelBuilderInit:
 
     def test_stores_model_config(self):
         assert self.builder._model_config is self.config
+
+    def test_legacy_pattern_is_not_pre_resolved_or_allowed_to_mutate_topology(self):
+        transformer = _make_transformer(pipeline_model_parallel_size=2)
+        config = _make_hybrid_config(transformer=transformer, hybrid_layer_pattern="M|M|M|M")
+
+        builder = HybridModelBuilder(config)
+
+        assert not hasattr(builder, "_resolved_architecture")
+        assert not hasattr(builder, "_hybrid_stack_spec")
+        assert transformer.virtual_pipeline_model_parallel_size is None
+
+    def test_legacy_builder_init_does_not_select_or_resolve_a_stack(self):
+        config = _make_hybrid_config(hybrid_layer_pattern="M*")
+
+        with (
+            patch.object(HybridModelBuilder, "_get_hybrid_stack_spec") as get_stack_spec,
+            patch("megatron.training.models.hybrid.resolve_hybrid_architecture") as resolve,
+        ):
+            builder = HybridModelBuilder(config)
+
+        assert not hasattr(builder, "_hybrid_stack_spec")
+        assert not hasattr(builder, "_resolved_architecture")
+        get_stack_spec.assert_not_called()
+        resolve.assert_not_called()
+
+    def test_legacy_config_is_ignored_by_direct_distributed_preparation(self):
+        config = _make_hybrid_config(hybrid_layer_pattern="M*")
+        args = SimpleNamespace(virtual_pipeline_model_parallel_size=None)
+
+        prepared = HybridModelBuilder.prepare_config_for_distributed_init(config, args)
+
+        assert prepared is False
+        assert args.virtual_pipeline_model_parallel_size is None
 
 
 class TestHybridModelBuilderBuildModel:
@@ -319,6 +362,24 @@ class TestHybridModelBuilderBuildModel:
         mock_last.assert_called_once_with(self.pg.pp)
         assert mock_model.call_args.kwargs["post_process"] is True
 
+    @patch("megatron.training.models.hybrid.is_vp_last_stage")
+    @patch("megatron.training.models.hybrid.is_vp_first_stage")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=False)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_legacy_builder_keeps_pp_only_defaults_when_vp_stage_is_supplied(
+        self, mock_model, _mock_first, _mock_last, mock_vp_first, mock_vp_last
+    ):
+        self.builder.build_model(self.pg, vp_stage=1)
+
+        kwargs = mock_model.call_args.kwargs
+        assert kwargs["vp_stage"] == 1
+        assert kwargs["pre_process"] is False
+        assert kwargs["post_process"] is True
+        assert "resolved_hybrid_architecture" not in kwargs
+        mock_vp_first.assert_not_called()
+        mock_vp_last.assert_not_called()
+
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
@@ -327,7 +388,7 @@ class TestHybridModelBuilderBuildModel:
         config = _make_hybrid_config(
             vocab_size=32000,
             seq_length=4096,
-            hybrid_layer_pattern="M-A-",
+            hybrid_layer_pattern="M*",
             fp16_lm_cross_entropy=True,
             parallel_output=False,
             share_embeddings_and_output_weights=True,
@@ -343,7 +404,7 @@ class TestHybridModelBuilderBuildModel:
         assert kw["config"] is config.transformer
         assert kw["vocab_size"] == 32000
         assert kw["max_sequence_length"] == 4096
-        assert kw["hybrid_layer_pattern"] == "M-A-"
+        assert kw["hybrid_layer_pattern"] == "M*"
         assert kw["fp16_lm_cross_entropy"] is True
         assert kw["parallel_output"] is False
         assert kw["share_embeddings_and_output_weights"] is True
@@ -353,6 +414,7 @@ class TestHybridModelBuilderBuildModel:
         assert kw["seq_len_interpolation_factor"] is None
         assert kw["pg_collection"] is pg
         assert kw["vp_stage"] is None
+        assert "resolved_hybrid_architecture" not in kw
 
 
 class TestHybridModelBuilderBuildDistributedModels:

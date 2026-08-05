@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import megatron.training.training as training_module
+from megatron.training.hybrid_metrics import get_hybrid_moe_metric_metadata
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     num_floating_point_operations,
@@ -96,6 +97,58 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     args.mamba_head_dim = 64
     args.mamba_num_groups = 8
     args.mamba_num_heads = 128
+    return args
+
+
+def _make_resolved_layer(layer_type, **overrides):
+    config_values = {
+        "hidden_size": 64,
+        "num_attention_heads": 4,
+        "num_query_groups": 2,
+        "kv_channels": 8,
+        "mamba_state_dim": 16,
+        "mamba_head_dim": 8,
+        "mamba_num_groups": 2,
+        "mamba_num_heads": 8,
+        "ffn_hidden_size": 160,
+        "gated_linear_unit": True,
+        "moe_ffn_hidden_size": 96,
+        "moe_shared_expert_intermediate_size": 32,
+        "moe_router_topk": 2,
+        "moe_latent_size": None,
+        "linear_key_head_dim": 16,
+        "linear_value_head_dim": 16,
+        "linear_num_key_heads": 4,
+        "linear_num_value_heads": 4,
+        "linear_conv_kernel_dim": 4,
+    }
+    config_values.update(overrides)
+    return SimpleNamespace(layer_type=layer_type, config=SimpleNamespace(**config_values))
+
+
+def _make_resolved_hybrid_args():
+    args = _make_gpt_args(
+        num_layers=4, hidden_size=64, num_attention_heads=4, seq_length=16, padded_vocab_size=100
+    )
+    # Direct metrics take MTP depth from the resolved architecture, not from
+    # legacy command-line state.
+    args.mtp_num_layers = None
+    args.resolved_hybrid_architecture = SimpleNamespace(
+        source="direct",
+        mtp_num_layers=2,
+        main_layers=(
+            _make_resolved_layer("attention"),
+            _make_resolved_layer("mamba"),
+            _make_resolved_layer("mlp"),
+            _make_resolved_layer("moe"),
+        ),
+        mtp_layers=(
+            _make_resolved_layer(
+                "attention", num_attention_heads=8, num_query_groups=1, kv_channels=4
+            ),
+            _make_resolved_layer("moe", moe_ffn_hidden_size=224, moe_router_topk=3),
+        ),
+    )
     return args
 
 
@@ -253,6 +306,131 @@ class TestHybridTHDScaling:
         expected_delta_per_layer_per_unit_sum = 2 * kv * n * 3  # *3 for fwd+bwd
         expected_delta = num_attn_layers * expected_delta_per_layer_per_unit_sum * bshd_sum
         assert flops_doubled - flops_bshd == expected_delta
+
+
+class TestResolvedHybridMetrics:
+    """Direct hybrid metrics use every occurrence's resolved configuration."""
+
+    def test_heterogeneous_layer_flops(self):
+        args = _make_resolved_hybrid_args()
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        seqlen_squared_sum = batch_size * args.seq_length**2
+
+        def attention_flops(config):
+            p = config.kv_channels * config.num_attention_heads / config.hidden_size
+            return (
+                4
+                * total_tokens
+                * config.hidden_size
+                * p
+                * (
+                    config.hidden_size
+                    + config.hidden_size * (config.num_query_groups / config.num_attention_heads)
+                )
+                + 2 * seqlen_squared_sum * config.hidden_size * p
+            )
+
+        def mamba_flops(config):
+            # MambaMixer derives d_inner from explicit per-occurrence head geometry.
+            d_in = config.mamba_num_heads * config.mamba_head_dim
+            return (
+                2
+                * total_tokens
+                * config.hidden_size
+                * (
+                    2 * d_in
+                    + 2 * config.mamba_num_groups * config.mamba_state_dim
+                    + config.mamba_num_heads
+                )
+                + 7 * total_tokens * d_in * config.mamba_state_dim
+                + 2 * total_tokens * d_in * config.hidden_size
+            )
+
+        def mlp_flops(config):
+            return 4 * 1.5 * total_tokens * config.hidden_size * config.ffn_hidden_size
+
+        def moe_flops(config):
+            return (
+                4
+                * total_tokens
+                * config.hidden_size
+                * config.moe_ffn_hidden_size
+                * config.moe_router_topk
+                * 1.5
+                + 4
+                * total_tokens
+                * config.hidden_size
+                * config.moe_shared_expert_intermediate_size
+                * 1.5
+            )
+
+        architecture = args.resolved_hybrid_architecture
+        main = architecture.main_layers
+        mtp = architecture.mtp_layers
+        expected_forward = (
+            attention_flops(main[0].config)
+            + mamba_flops(main[1].config)
+            + mlp_flops(main[2].config)
+            + moe_flops(main[3].config)
+            + architecture.mtp_num_layers
+            * (attention_flops(mtp[0].config) + moe_flops(mtp[1].config))
+            + 2
+            * total_tokens
+            * architecture.mtp_num_layers
+            * (3 * args.hidden_size + 2 * args.hidden_size**2)
+            + 2
+            * total_tokens
+            * args.hidden_size
+            * args.padded_vocab_size
+            * (1 + architecture.mtp_num_layers)
+        )
+
+        actual = num_floating_point_operations(args, batch_size)
+
+        assert actual == pytest.approx(expected_forward * 3)
+
+    def test_moe_metadata_uses_expanded_metric_slots(self):
+        args = _make_resolved_hybrid_args()
+
+        metadata = get_hybrid_moe_metric_metadata(args.resolved_hybrid_architecture)
+
+        assert metadata.num_layers == 8
+        assert metadata.moe_layer_freq == [0, 0, 0, 1, 0, 1, 0, 1]
+        assert metadata.mtp_num_layers == 0
+        assert metadata.num_moe_layers == 3
+
+
+class TestLegacyHybridMetricsCompatibility:
+    """Legacy string patterns retain their historical args-based metric formulas."""
+
+    def test_legacy_mamba_flops_keep_model_global_d_in(self):
+        args = _make_hybrid_args(num_layers=1)
+        args.hybrid_layer_pattern = "M"
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        d_in = 2 * args.hidden_size
+        expected_forward = (
+            2
+            * total_tokens
+            * args.hidden_size
+            * (2 * d_in + 2 * args.mamba_num_groups * args.mamba_state_dim + args.mamba_num_heads)
+            + 7 * total_tokens * d_in * args.mamba_state_dim
+            + 2 * total_tokens * d_in * args.hidden_size
+            + 2 * total_tokens * args.hidden_size * args.padded_vocab_size
+        )
+
+        assert num_floating_point_operations(args, batch_size) == expected_forward * 3
+
+    def test_legacy_resolved_summary_does_not_select_direct_metric_path(self):
+        args = _make_hybrid_args()
+        batch_size = 2
+        expected = num_floating_point_operations(args, batch_size)
+        args.resolved_hybrid_architecture = SimpleNamespace(
+            source="legacy", main_layers=(), mtp_layers=(), mtp_num_layers=0
+        )
+
+        assert num_floating_point_operations(args, batch_size) == expected
 
 
 class TestPaddingRemoval:

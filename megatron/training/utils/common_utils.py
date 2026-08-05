@@ -12,10 +12,10 @@ from typing import Optional
 
 import torch
 
-from megatron.core.msc_utils import maybe_msc
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core._slurm_utils import resolve_slurm_local_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.msc_utils import maybe_msc
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -46,7 +46,6 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.training import get_adlr_autoresume, get_args, get_timers
-
 
 
 def _compute_norm_2(params_list):
@@ -476,7 +475,11 @@ def print_rank_last(message):
 
 def is_hybrid_model(args):
     """Returns True if the model is a hybrid Mamba-Transformer model."""
-    return args.hybrid_layer_pattern is not None
+    resolved_architecture = getattr(args, 'resolved_hybrid_architecture', None)
+    return (
+        getattr(args, 'hybrid_layer_pattern', None) is not None
+        or getattr(resolved_architecture, 'source', None) == 'direct'
+    )
 
 
 def is_gtp_remat_active(args):
