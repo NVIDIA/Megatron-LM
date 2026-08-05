@@ -89,8 +89,8 @@ class TestFP8Param:
         layer_spec_fn=get_gpt_layer_with_transformer_engine_spec,
         **config_kwargs,
     ):
-        model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
+        model_parallel_cuda_manual_seed(_SEED, te_rng_tracker=args.te_rng_tracker)
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn(
             num_experts=args.num_experts, moe_grouped_gemm=args.moe_grouped_gemm
@@ -250,7 +250,9 @@ class TestFP8Param:
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size
         )
-        model_parallel_cuda_manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(
+            _SEED, te_rng_tracker=args.te_rng_tracker, force_reset_rng=True
+        )
         cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         if inference:

@@ -63,15 +63,12 @@ class TinyModel(nn.Module):
 def test_layerwise_step_hook_is_noop_without_chunked_offload():
     """Disabled offload must not inspect child-only manager attributes or rebuild pipeline state."""
 
-    optimizer = SimpleNamespace(
-        config=SimpleNamespace(chunked_optimizer_state_offload=False), chained_optimizers=[object()]
-    )
+    optimizer = object.__new__(LayerWiseDistributedOptimizer)
+    optimizer.config = SimpleNamespace(chunked_optimizer_state_offload=False)
+    optimizer.chained_optimizers = [object()]
 
-    assert (
-        LayerWiseDistributedOptimizer._managed_optimizer_state_offload_child_indices(optimizer)
-        == ()
-    )
-    LayerWiseDistributedOptimizer._before_child_step(optimizer, 0)
+    assert optimizer._managed_optimizer_state_offload_child_indices() == ()
+    optimizer._before_child_step(0)
 
 
 def test_layerwise_fraction_zero_skips_offload_specific_child_inspection(monkeypatch):

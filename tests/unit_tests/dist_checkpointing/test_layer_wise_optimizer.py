@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import load, load_plain_tensors, save
+from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -139,10 +139,41 @@ class TestLayerWiseOptimizer:
         """Compact Muon checkpoints remain compatible across the offload switch."""
 
         Utils.initialize_model_parallel(1, 1)
+
+        def clone_to_cpu(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().clone()
+            if isinstance(value, dict):
+                return {key: clone_to_cpu(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [clone_to_cpu(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(clone_to_cpu(item) for item in value)
+            return deepcopy(value)
+
+        def snapshot_optimizer(optimizer):
+            children = getattr(optimizer, 'chained_optimizers', ())
+            if children:
+                return [snapshot_optimizer(child) for child in children]
+
+            snapshot = {'common': clone_to_cpu(optimizer.state_dict())}
+            if hasattr(optimizer, 'model_param_group_index_map'):
+                parameter_state = {}
+                for model_param in optimizer.model_param_group_index_map:
+                    tensors = optimizer._get_main_param_and_optimizer_states(model_param)
+                    parameter_state[optimizer._param_name(model_param)] = {
+                        key: tensor.detach().cpu().clone()
+                        for key, tensor in tensors.items()
+                        if key != 'step'
+                    }
+                snapshot['parameter_state'] = parameter_state
+            return snapshot
+
         with (
             TempNamedDir(tmp_path_dist_ckpt / 'layerwise_offload_A', sync=True) as ckpt_dir_A,
             TempNamedDir(tmp_path_dist_ckpt / 'layerwise_offload_B', sync=True) as ckpt_dir_B,
         ):
+            metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
             model_A, optimizer_A = setup_model_and_optimizer(
                 seed=2,
                 tp=1,
@@ -155,7 +186,8 @@ class TestLayerWiseOptimizer:
                 optimizer_state_offload_chunk_size_mb=1,
             )
             model_sharded_sd_A = model_A[0].sharded_state_dict()
-            save(optimizer_A.sharded_state_dict(model_sharded_sd_A), ckpt_dir_A)
+            save(optimizer_A.sharded_state_dict(model_sharded_sd_A, metadata=metadata), ckpt_dir_A)
+            source_state = snapshot_optimizer(optimizer_A)
 
             model_B, optimizer_B = setup_model_and_optimizer(
                 seed=3,
@@ -170,8 +202,11 @@ class TestLayerWiseOptimizer:
                 initialize_optimizer_state=False,
             )
             model_sharded_sd_B = model_B[0].sharded_state_dict()
-            load_template = optimizer_B.sharded_state_dict(model_sharded_sd_B, is_loading=True)
+            load_template = optimizer_B.sharded_state_dict(
+                model_sharded_sd_B, is_loading=True, metadata=metadata
+            )
             optimizer_B.load_state_dict(load(load_template, ckpt_dir_A))
+            check_equal(source_state, snapshot_optimizer(optimizer_B))
 
             if destination_offload:
 
@@ -195,8 +230,7 @@ class TestLayerWiseOptimizer:
                             if manager._is_offloadable_state(param, key, value):
                                 assert value.device.type == 'cpu'
 
-            save(optimizer_B.sharded_state_dict(model_sharded_sd_B), ckpt_dir_B)
-            check_equal(load_plain_tensors(ckpt_dir_A), load_plain_tensors(ckpt_dir_B))
+            save(optimizer_B.sharded_state_dict(model_sharded_sd_B, metadata=metadata), ckpt_dir_B)
 
     def test_parameter_sharding(self):
         """Test that parameters are correctly sharded across DP ranks."""

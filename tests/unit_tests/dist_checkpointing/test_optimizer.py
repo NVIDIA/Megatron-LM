@@ -632,6 +632,7 @@ class TestDistributedOptimizer:
             TempNamedDir(tmp_path_dist_ckpt / 'chunked_offload_A', sync=True) as ckpt_dir_A,
             TempNamedDir(tmp_path_dist_ckpt / 'chunked_offload_B', sync=True) as ckpt_dir_B,
         ):
+            metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
             model_A, optimizer_A = setup_model_and_optimizer(
                 seed=2,
                 tp=1,
@@ -641,7 +642,17 @@ class TestDistributedOptimizer:
                 use_precision_aware_optimizer=use_precision_aware_optimizer,
             )
             model_sharded_sd_A = model_A[0].sharded_state_dict()
-            save(optimizer_A.sharded_state_dict(model_sharded_sd_A), ckpt_dir_A)
+            save(optimizer_A.sharded_state_dict(model_sharded_sd_A, metadata=metadata), ckpt_dir_A)
+
+            dist_optimizer_A = optimizer_A.chained_optimizers[0]
+            source_states = {}
+            for model_param in dist_optimizer_A.model_param_group_index_map:
+                tensors = dist_optimizer_A._get_main_param_and_optimizer_states(model_param)
+                source_states[dist_optimizer_A._param_name(model_param)] = {
+                    key: tensor.detach().cpu().clone()
+                    for key, tensor in tensors.items()
+                    if key != 'step'
+                }
 
             model_B, optimizer_B = setup_model_and_optimizer(
                 seed=3,
@@ -653,12 +664,28 @@ class TestDistributedOptimizer:
                 initialize_optimizer_state=False,
             )
             model_sharded_sd_B = model_B[0].sharded_state_dict()
-            load_template = optimizer_B.sharded_state_dict(model_sharded_sd_B, is_loading=True)
+            load_template = optimizer_B.sharded_state_dict(
+                model_sharded_sd_B, is_loading=True, metadata=metadata
+            )
             optimizer_B.load_state_dict(load(load_template, ckpt_dir_A))
 
+            dist_optimizer_B = optimizer_B.chained_optimizers[0]
+            destination_param_names = {
+                dist_optimizer_B._param_name(param)
+                for param in dist_optimizer_B.model_param_group_index_map
+            }
+            assert destination_param_names == source_states.keys()
+            for model_param in dist_optimizer_B.model_param_group_index_map:
+                param_name = dist_optimizer_B._param_name(model_param)
+                restored = dist_optimizer_B._get_main_param_and_optimizer_states(model_param)
+                for key, expected in source_states[param_name].items():
+                    assert torch.equal(restored[key].detach().cpu(), expected), (
+                        f"optimizer state '{key}' of parameter '{param_name}' "
+                        "was not restored from the checkpoint"
+                    )
+
             if destination_offload:
-                dist_optimizer = optimizer_B.chained_optimizers[0]
-                manager = dist_optimizer._optimizer_state_offloader
+                manager = dist_optimizer_B._optimizer_state_offloader
                 assert manager is not None
                 for param in manager.selected_params:
                     for value in manager.optimizer.state[param].values():
@@ -671,12 +698,7 @@ class TestDistributedOptimizer:
                     elif id(param) in manager._explicit_master_param_ids:
                         assert param.device.type == 'cpu'
 
-            save(optimizer_B.sharded_state_dict(model_sharded_sd_B), ckpt_dir_B)
-
-            checkpoint_A = load_plain_tensors(ckpt_dir_A)
-            checkpoint_B = load_plain_tensors(ckpt_dir_B)
-            diffs = diff(checkpoint_A, checkpoint_B)
-            assert not any(map(bool, diffs)), diffs
+            save(optimizer_B.sharded_state_dict(model_sharded_sd_B, metadata=metadata), ckpt_dir_B)
 
     @pytest.mark.parametrize("fully_parallel", [False, True])
     @pytest.mark.parametrize(
