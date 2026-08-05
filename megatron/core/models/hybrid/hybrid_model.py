@@ -74,6 +74,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         layer_specs (HybridLayerPattern, optional): Preferred direct decoder architecture.
             Existing layer ``ModuleSpec`` objects are paired with per-occurrence configs, and
             ``PipelineSplit`` nodes define PP/VPP chunks.
+        mtp_layer_specs (HybridLayerPattern, optional): Direct template for one MTP prediction
+            depth. ``config.mtp_num_layers`` controls repetition.
         resolved_hybrid_architecture (ResolvedHybridArchitecture, optional): Internal global
             architecture supplied by ``HybridModelBuilder`` after validation.
         hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
@@ -141,17 +143,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
         layer_specs: HybridLayerPattern | None = None,
+        mtp_layer_specs: HybridLayerPattern | None = None,
         resolved_hybrid_architecture: ResolvedHybridArchitecture | None = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
-        has_direct_architecture = layer_specs is not None or (
-            resolved_hybrid_architecture is not None
-            and resolved_hybrid_architecture.source == "direct"
+        has_direct_architecture = (
+            layer_specs is not None
+            or mtp_layer_specs is not None
+            or (
+                resolved_hybrid_architecture is not None
+                and resolved_hybrid_architecture.source == "direct"
+            )
         )
         if has_config_logger_enabled(config):
             config_logger_args = dict(locals())
             config_logger_args.pop("layer_specs", None)
+            config_logger_args.pop("mtp_layer_specs", None)
             config_logger_args.pop("resolved_hybrid_architecture", None)
             config_logger_args.pop("has_direct_architecture", None)
             log_config_to_disk(config, config_logger_args, prefix=type(self).__name__)
@@ -224,14 +232,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     config.num_layers, attn_ratio, mlp_ratio
                 )
 
-        if resolved_hybrid_architecture is None and layer_specs is not None:
+        if resolved_hybrid_architecture is None and (
+            layer_specs is not None or mtp_layer_specs is not None
+        ):
             resolved_hybrid_architecture = resolve_hybrid_architecture(
                 config=self.config,
                 hybrid_stack_spec=hybrid_stack_spec,
                 layer_specs=layer_specs,
+                mtp_layer_specs=mtp_layer_specs,
                 hybrid_layer_pattern=self.hybrid_layer_pattern,
             )
-        elif layer_specs is not None:
+        elif layer_specs is not None or mtp_layer_specs is not None:
             raise ValueError(
                 "resolved_hybrid_architecture cannot be combined with unresolved direct specs."
             )
@@ -241,16 +252,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and resolved_hybrid_architecture.source == "direct"
         )
 
-        # Keep the existing string-based MTP path until direct MTP support is
-        # introduced. Direct decoder specs are supported independently here.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             parse_hybrid_pattern,
             select_pipeline_segment,
         )
 
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
-        if is_direct_architecture and resolved_hybrid_architecture.mtp_layers:
-            raise ValueError("Direct MTP layer specs are not supported by this runtime yet.")
 
         if not is_direct_architecture:
             # Preserve the legacy selector, shared config, symbol API, and constructor defaults.
@@ -266,6 +273,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 **logging_pg_kwargs,
             )
             local_layer_specs = None
+            self.mtp_pattern = parsed.mtp_pattern
+            self.mtp_num_depths = parsed.mtp_num_depths
+            self.mtp_process = (
+                self.mtp_pattern is not None
+                and self.mtp_num_depths > 0
+                and mtp_on_this_rank(
+                    layout=self.config.pipeline_model_parallel_layout,
+                    mtp_num_layers=self.config.mtp_num_layers,
+                    ignore_virtual=False,
+                    vp_stage=self.vp_stage,
+                )
+            )
         else:
             # Every physical/virtual chunk intentionally keeps the same global summary.
             self.resolved_hybrid_architecture = resolved_hybrid_architecture
@@ -292,19 +311,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 pp_rank=pp_rank, pp_size=pp_size, vp_stage=vp_stage
             )
             layer_type_list = None
-
-        self.mtp_pattern = parsed.mtp_pattern
-        self.mtp_num_depths = parsed.mtp_num_depths
-        self.mtp_process = (
-            self.mtp_pattern is not None
-            and self.mtp_num_depths > 0
-            and mtp_on_this_rank(
-                layout=self.config.pipeline_model_parallel_layout,
-                mtp_num_layers=self.config.mtp_num_layers,
-                ignore_virtual=False,
-                vp_stage=self.vp_stage,
+            segment_index = vp_rank * pp_size + pp_rank
+            is_final_segment = segment_index == len(resolved_hybrid_architecture.segments) - 1
+            self.mtp_pattern = None
+            self.mtp_num_depths = resolved_hybrid_architecture.mtp_num_layers
+            self.mtp_process = bool(
+                resolved_hybrid_architecture.mtp_layers
+                and self.mtp_num_depths > 0
+                and is_final_segment
             )
-        )
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -355,9 +370,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         else:
             # Standard attention occurrences may use different KV widths. Keep one RoPE
             # module/input per width; MLA and DSA continue to own their decoupled RoPE.
+            rotary_layers = list(local_layer_specs)
+            if self.mtp_process:
+                rotary_layers.extend(resolved_hybrid_architecture.mtp_layers)
             rotary_configs = {
                 layer.config.kv_channels: layer.config
-                for layer in local_layer_specs
+                for layer in rotary_layers
                 if layer.layer_type == "attention"
             }
             if not rotary_configs:
@@ -413,7 +431,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         decoder_architecture_kwargs = (
             {"layer_type_list": layer_type_list}
             if not is_direct_architecture
-            else {"layer_specs": local_layer_specs}
+            else {
+                "layer_specs": local_layer_specs,
+                "moe_metric_layer_offset": layer_offset,
+                "moe_metric_num_layers": resolved_hybrid_architecture.metric_num_layers,
+            }
         )
         self.decoder = build_module(
             hybrid_stack_spec,
@@ -436,15 +458,23 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "Ensure hybrid_stack_spec includes mtp_block_spec for MTP support."
             )
 
+            mtp_architecture_kwargs = (
+                {"mtp_layer_pattern": self.mtp_pattern}
+                if not is_direct_architecture
+                else {
+                    "mtp_layer_specs": resolved_hybrid_architecture.mtp_layers,
+                    "moe_metric_num_layers": resolved_hybrid_architecture.metric_num_layers,
+                }
+            )
             self.mtp = MultiTokenPredictionBlock(
                 config=self.config,
                 spec=mtp_block_spec,
                 pg_collection=self.pg_collection,
                 vp_stage=self.vp_stage,
-                mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
                 name="mtp",
+                **mtp_architecture_kwargs,
             )
             self._setup_mtp_cuda_graphs()
 

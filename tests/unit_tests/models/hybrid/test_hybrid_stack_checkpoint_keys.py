@@ -264,8 +264,65 @@ def test_direct_hybrid_model_parameters_are_appended_after_legacy_signature():
 
     parameter_names = list(parameters)
     assert parameter_names.index("layer_specs") > parameter_names.index("vp_stage")
+    assert parameter_names.index("mtp_layer_specs") > parameter_names.index("vp_stage")
     assert parameter_names.index("resolved_hybrid_architecture") > parameter_names.index("vp_stage")
     assert parameters["pre_process"].default is True
     assert parameters["post_process"].default is True
     assert parameters["pre_process"].annotation is bool
     assert parameters["post_process"].annotation is bool
+
+
+def test_legacy_hybrid_model_keeps_string_mtp_construction_path():
+    config = _config()
+    config.num_layers = 1
+    config.mtp_num_layers = 2
+    stack_spec = ModuleSpec(
+        module=HybridStack,
+        submodules=HybridStackSubmodules(
+            mamba_layer=MAMBA_SPEC, mtp_block_spec=ModuleSpec(module=torch.nn.Identity)
+        ),
+    )
+    pg_collection = SimpleNamespace(tp=None, cp=None, pp=None, embd=None)
+
+    with (
+        patch(
+            "megatron.core.models.common.language_module.language_module."
+            "LanguageModule._set_attention_backend"
+        ),
+        patch(
+            "megatron.core.models.hybrid.hybrid_model.LanguageModelEmbedding",
+            return_value=torch.nn.Identity(),
+        ),
+        patch(
+            "megatron.core.models.hybrid.hybrid_model.tensor_parallel.ColumnParallelLinear",
+            return_value=torch.nn.Identity(),
+        ),
+        patch(
+            "megatron.core.models.hybrid.hybrid_model.HybridModel."
+            "setup_embeddings_and_output_layer"
+        ),
+        patch("megatron.core.models.hybrid.hybrid_model.HybridModel._setup_mtp_cuda_graphs"),
+        patch(
+            "megatron.core.models.hybrid.hybrid_model.build_module",
+            return_value=torch.nn.Identity(),
+        ),
+        patch("megatron.core.models.hybrid.hybrid_model.mtp_on_this_rank", return_value=True),
+        patch(
+            "megatron.core.models.hybrid.hybrid_model.MultiTokenPredictionBlock",
+            return_value=torch.nn.Identity(),
+        ) as mtp_block,
+    ):
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=stack_spec,
+            vocab_size=128,
+            max_sequence_length=16,
+            hybrid_layer_pattern="M/M/M",
+            pg_collection=pg_collection,
+        )
+
+    assert model.mtp_pattern == "M"
+    assert model.mtp_num_depths == 2
+    assert mtp_block.call_args.kwargs["mtp_layer_pattern"] == "M"
+    assert "mtp_layer_specs" not in mtp_block.call_args.kwargs
+    assert "moe_metric_num_layers" not in mtp_block.call_args.kwargs

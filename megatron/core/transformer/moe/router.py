@@ -140,6 +140,12 @@ class Router(ABC, MegatronModule):
         if getattr(self, "router_replay", None) is not None:
             self.router_replay.layer_number = layer_number
 
+    def set_metric_layer_number(self, layer_number: int, num_layers: Optional[int] = None) -> None:
+        """Set an architecture-aware slot used only for MoE metric reporting."""
+
+        self.metric_layer_number = layer_number
+        self.metric_num_layers = num_layers
+
 
 class TopKRouter(Router):
     """Route each token to the top-k experts.
@@ -587,11 +593,18 @@ class TopKRouter(Router):
         # add the aux loss logging value to other layer's since it is difficult to get the
         # correct layer_number for MTP. It does not affect the correctness of the calculation
         # results and the reduced load_balancing_loss logging value.
-        num_layers = self.config.num_layers
-        if self.config.mtp_num_layers is not None:
-            num_layers += self.config.mtp_num_layers
+        metric_num_layers = getattr(self, "metric_num_layers", None)
+        metric_layer_number = getattr(self, "metric_layer_number", None)
+        if metric_num_layers is not None:
+            num_layers = metric_num_layers
+        else:
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
 
-        if self.is_mtp_layer:
+        if metric_layer_number is not None:
+            layer_number = metric_layer_number
+        elif self.is_mtp_layer:
             layer_number = self.layer_number + self.config.num_layers
         else:
             layer_number = self.layer_number
@@ -688,11 +701,18 @@ class TopKRouter(Router):
             ):
                 z_loss = z_loss / self.config.mtp_num_layers
 
-            num_layers = self.config.num_layers
-            if self.config.mtp_num_layers is not None:
-                num_layers += self.config.mtp_num_layers
+            metric_num_layers = getattr(self, "metric_num_layers", None)
+            metric_layer_number = getattr(self, "metric_layer_number", None)
+            if metric_num_layers is not None:
+                num_layers = metric_num_layers
+            else:
+                num_layers = self.config.num_layers
+                if self.config.mtp_num_layers is not None:
+                    num_layers += self.config.mtp_num_layers
 
-            if self.is_mtp_layer:
+            if metric_layer_number is not None:
+                layer_number = metric_layer_number
+            elif self.is_mtp_layer:
                 layer_number = self.layer_number + self.config.num_layers
             else:
                 layer_number = self.layer_number

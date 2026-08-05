@@ -93,6 +93,8 @@ class HybridStack(MegatronModule):
         is_mtp_layer: bool = False,
         name: str | None = None,
         layer_specs: Optional[Sequence[HybridLayerSpec]] = None,
+        moe_metric_layer_offset: int | None = None,
+        moe_metric_num_layers: int | None = None,
     ) -> None:
         """
         Args:
@@ -150,6 +152,8 @@ class HybridStack(MegatronModule):
                 pg_collection=pg_collection,
                 is_mtp_layer=is_mtp_layer,
                 name=name,
+                moe_metric_layer_offset=moe_metric_layer_offset,
+                moe_metric_num_layers=moe_metric_num_layers,
             )
 
         if self.config.cuda_graph_impl == "local":
@@ -269,6 +273,8 @@ class HybridStack(MegatronModule):
         pg_collection: ProcessGroupCollection,
         is_mtp_layer: bool,
         name: str | None,
+        moe_metric_layer_offset: int | None,
+        moe_metric_num_layers: int | None,
     ) -> nn.ModuleList:
         """Build occurrence-specific existing layer specs."""
 
@@ -298,12 +304,30 @@ class HybridStack(MegatronModule):
                     build_kwargs["pp_layer_offset"] = pp_layer_offset
                 else:
                     build_kwargs["add_layer_offset"] = False
-                    if layer_type in {"attention", "dsa", "mla"}:
+                    if layer_type != "mlp":
                         build_kwargs["is_mtp_layer"] = is_mtp_layer
+                    if layer_type in {"attention", "dsa", "mla"}:
                         build_kwargs["pp_layer_offset"] = pp_layer_offset
                 layer = build_module(layer_spec.module_spec, **build_kwargs)
+
+            if layer_type == "moe" and moe_metric_layer_offset is not None:
+                metric_layer_number = moe_metric_layer_offset + i + 1
+                if hasattr(layer, "mlp") and hasattr(layer.mlp, "set_metric_layer_number"):
+                    layer.mlp.set_metric_layer_number(metric_layer_number, moe_metric_num_layers)
             layers.append(layer)
         return layers
+
+    def set_moe_metric_layer_offset(self, layer_offset: int, num_layers: int | None = None) -> None:
+        """Retarget MoE metric slots without changing model/checkpoint layer numbers."""
+
+        layer_specs = getattr(self, "layer_specs", None)
+        if layer_specs is None:
+            return
+        for index, (layer_spec, layer) in enumerate(zip(layer_specs, self.layers)):
+            if layer_spec.layer_type != "moe":
+                continue
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "set_metric_layer_number"):
+                layer.mlp.set_metric_layer_number(layer_offset + index + 1, num_layers)
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`
