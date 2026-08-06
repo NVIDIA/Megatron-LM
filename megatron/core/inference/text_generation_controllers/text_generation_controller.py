@@ -1940,6 +1940,12 @@ class TextGenerationController:
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
+        chunked_prefill_idx = context.get_index_of_chunked_prefill_request(safe=True)
+        if chunked_prefill_idx >= 0:
+            # The provisional length mask can mark a partial prefill chunk as
+            # finished. update_requests() keeps it active; keep completion-side
+            # routing and handoff bookkeeping consistent with that decision.
+            finished_idxs = finished_idxs[finished_idxs != chunked_prefill_idx]
         finished_request_ids = context.request_ids[finished_idxs]
 
         # Save block IDs for finished requests before update_requests releases them.

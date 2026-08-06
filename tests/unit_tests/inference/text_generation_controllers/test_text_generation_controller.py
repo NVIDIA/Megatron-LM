@@ -981,6 +981,25 @@ def test_build_async_sched_request_state_keeps_partial_chunk_active():
     assert finished_request_ids.tolist() == [11]
 
 
+def test_legacy_bookkeeping_keeps_partial_chunk_active():
+    """Legacy bookkeeping must not finish a request midway through its prompt."""
+    context = _make_async_sched_context(total_request_count=1)
+    context.chunked_prefill_request_id = 10
+    context.get_index_of_chunked_prefill_request = mock.Mock(return_value=0)
+    context.get_active_sequence_lengths.return_value = torch.tensor([3])
+    context.get_max_sequence_lengths.return_value = torch.tensor([4])
+    context.kv_block_allocator = SimpleNamespace(block_routing=False, enable_handoff_pinning=True)
+    context.request_to_kv_block_ids = torch.tensor([[1, 2, -1]], dtype=torch.int32)
+    controller = _make_async_sched_controller(context)
+    controller._sampled_tokens_cuda[0] = 7
+
+    result = controller._dynamic_step_context_bookkeeping()
+
+    assert result["finished_request_ids"].numel() == 0
+    assert result["finished_handoff_block_ids"] == {}
+    context.update_requests.assert_called_once()
+
+
 @pytest.mark.parametrize(
     "termination_ids, stop_word_finished_ids",
     [([99, 99, 99], set()), ([99, 2, 99], set()), ([99, 99, 99], {11})],
