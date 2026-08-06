@@ -69,6 +69,16 @@ def _samples_from_bshd(input_ids, labels, loss_mask, seq_lengths=None):
     return samples
 
 
+def _packed_microbatch_from_samples(samples):
+    return {
+        "input_ids": [sample["input_ids"] for sample in samples],
+        "labels": [sample["labels"] for sample in samples],
+        "loss_mask": [sample["loss_mask"] for sample in samples],
+        "pixel_values": [sample["pixel_values"] for sample in samples],
+        "image_grid_thw": [sample["image_grid_thw"] for sample in samples],
+    }
+
+
 def _thd_position_ids(seq_lengths, device):
     """Build ``[1, T]`` THD position_ids: each segment restarts at 0."""
     return (
@@ -135,7 +145,12 @@ def run_equal_length_test(model, batch_size, seq_len, vocab_size, seed, atol_los
 
     # ---- THD forward / backward ----
     samples = _samples_from_bshd(input_ids, labels, loss_mask)
-    packed = pack_or_pad_batch(samples, use_packed_sequence=True, device="cuda")
+    packed = pack_or_pad_batch(
+        [_packed_microbatch_from_samples(samples)],
+        use_packed_sequence=True,
+        seq_length=B * S,
+        device="cuda",
+    )
     psp = packed.pop("packed_seq_params")
     thd_position_ids = _thd_position_ids([S] * B, device="cuda")
 
@@ -208,7 +223,12 @@ def run_variable_length_smoke_test(model, vocab_size, seed):
         loss_mask[i, sl:] = 0.0
 
     samples = _samples_from_bshd(input_ids, labels, loss_mask, seq_lengths=seq_lengths)
-    packed = pack_or_pad_batch(samples, use_packed_sequence=True, device="cuda")
+    packed = pack_or_pad_batch(
+        [_packed_microbatch_from_samples(samples)],
+        use_packed_sequence=True,
+        seq_length=sum(seq_lengths),
+        device="cuda",
+    )
     psp = packed.pop("packed_seq_params")
     thd_position_ids = _thd_position_ids(seq_lengths, device="cuda")
 

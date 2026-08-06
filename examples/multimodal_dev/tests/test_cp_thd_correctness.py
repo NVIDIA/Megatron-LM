@@ -222,7 +222,19 @@ def _run_thd(model, B, S, vocab_size, image_token_id, cp_size, seed):
                 "image_grid_thw": torch.empty(0, 3, dtype=torch.long, device="cuda"),
             }
         )
-    packed = pack_or_pad_batch(samples, use_packed_sequence=True, device="cuda")
+    microbatch = {
+        "input_ids": [sample["input_ids"] for sample in samples],
+        "labels": [sample["labels"] for sample in samples],
+        "loss_mask": [sample["loss_mask"] for sample in samples],
+        "pixel_values": [sample["pixel_values"] for sample in samples],
+        "image_grid_thw": [sample["image_grid_thw"] for sample in samples],
+    }
+    packed = pack_or_pad_batch(
+        [microbatch],
+        use_packed_sequence=True,
+        seq_length=B * S,
+        device="cuda",
+    )
     psp = packed.pop("packed_seq_params")
 
     # THD position_ids: per-sample restart at 0.  Each sample has length S

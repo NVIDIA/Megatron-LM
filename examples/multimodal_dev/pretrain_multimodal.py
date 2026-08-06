@@ -32,7 +32,7 @@ sys.path.insert(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
 )
 
-from examples.multimodal_dev.arguments import add_multimodal_args
+from examples.multimodal_dev.arguments import add_multimodal_args, validate_multimodal_args
 from examples.multimodal_dev.forward_step import forward_step
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
@@ -148,6 +148,9 @@ if __name__ == "__main__":
         extra_args_provider=add_multimodal_args,
         args_defaults={},
     )
+    if getattr(args, "dataset_provider", None) == "energon":
+        args.dataloader_type = "external"
+    validate_multimodal_args(args)
     # multimodal_dev's model_provider builds the full model on every rank and
     # does not honor pre_process / post_process pipeline-stage flags. PP>1
     # would silently violate Megatron's pipeline-parallel contract.

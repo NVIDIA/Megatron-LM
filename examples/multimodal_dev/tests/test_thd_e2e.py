@@ -24,7 +24,12 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from examples.multimodal_dev.forward_step import _build_packed_seq_params, pack_or_pad_batch
+from examples.multimodal_dev.forward_step import (
+    EXTERNAL_MICROBATCH_KEY,
+    _build_packed_seq_params,
+    _normalise_microbatch,
+    pack_or_pad_batch,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -54,6 +59,35 @@ def _make_sample(
     }
 
 
+def _packed_microbatch(*samples):
+    """One THD microbatch containing multiple logical packed segments."""
+    return {
+        "input_ids": [sample["input_ids"] for sample in samples],
+        "labels": [sample["labels"] for sample in samples],
+        "loss_mask": [sample["loss_mask"] for sample in samples],
+        "pixel_values": [sample["pixel_values"] for sample in samples],
+        "image_grid_thw": [sample["image_grid_thw"] for sample in samples],
+    }
+
+
+# ===================================================================
+# External dataloader envelope
+# ===================================================================
+
+
+class TestExternalMicrobatchEnvelope:
+    """Energon list batches stay compatible with core full-iteration CUDA graph."""
+
+    def test_normalise_unwraps_dict_envelope(self):
+        sample = _make_sample(4, device="cpu")
+        wrapped = {EXTERNAL_MICROBATCH_KEY: [sample]}
+
+        normalised = _normalise_microbatch(wrapped)
+
+        assert isinstance(normalised, list)
+        assert normalised[0] is sample
+
+
 # ===================================================================
 # _build_packed_seq_params — pure helper, exercised independently
 # ===================================================================
@@ -73,6 +107,7 @@ class TestBuildPackedSeqParams:
         assert params.total_tokens == 15
         assert params.cu_seqlens_q_padded.tolist() == [0, 5, 8, 15]
         assert params.cu_seqlens_kv_padded.tolist() == [0, 5, 8, 15]
+        assert params.pad_between_seqs is False
 
     def test_equal_lengths(self):
         """Equal-length samples produce uniform cu_seqlens."""
@@ -110,9 +145,9 @@ class TestPackOrPadBatchPacked:
     """``pack_or_pad_batch(..., use_packed_sequence=True)`` produces ``[1, T]``."""
 
     def test_equal_lengths(self):
-        """Two equal-length samples → packed ``[1, 2S]``."""
+        """Two equal-length logical samples → packed ``[1, 2S]``."""
         S = 8
-        batch = [_make_sample(S, base=0), _make_sample(S, base=1000)]
+        batch = [_packed_microbatch(_make_sample(S, base=0), _make_sample(S, base=1000))]
         packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
 
         T = 2 * S
@@ -124,11 +159,14 @@ class TestPackOrPadBatchPacked:
         assert psp.cu_seqlens_q_padded.tolist() == [0, S, T]
         assert psp.max_seqlen_q == S
         assert psp.total_tokens == T
+        assert psp.pad_between_seqs is False
 
     def test_variable_lengths(self):
         """Variable-length samples concatenated end-to-end."""
         lens = [5, 8, 3]
-        batch = [_make_sample(L, base=i * 1000) for i, L in enumerate(lens)]
+        batch = [
+            _packed_microbatch(*[_make_sample(L, base=i * 1000) for i, L in enumerate(lens)])
+        ]
         packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
 
         T = sum(lens)
@@ -143,7 +181,7 @@ class TestPackOrPadBatchPacked:
         """Sample 0's tokens precede sample 1's tokens in the packed sequence."""
         s0 = _make_sample(3, base=10)
         s1 = _make_sample(3, base=40)
-        packed = pack_or_pad_batch([s0, s1], use_packed_sequence=True, device="cuda")
+        packed = pack_or_pad_batch([_packed_microbatch(s0, s1)], use_packed_sequence=True, device="cuda")
         assert packed["input_ids"][0].tolist() == [10, 11, 12, 40, 41, 42]
 
     def test_labels_loss_mask_content_preserved(self):
@@ -157,7 +195,7 @@ class TestPackOrPadBatchPacked:
         """``pixel_values`` are concatenated along the patch dim."""
         s0 = _make_sample(4, base=0, num_patches=4, pixel_dim=8)
         s1 = _make_sample(4, base=10, num_patches=6, pixel_dim=8)
-        packed = pack_or_pad_batch([s0, s1], use_packed_sequence=True, device="cuda")
+        packed = pack_or_pad_batch([_packed_microbatch(s0, s1)], use_packed_sequence=True, device="cuda")
         assert packed["pixel_values"].shape == (10, 8)
         assert packed["pixel_values"][:4].eq(0.0).all().item()
         assert packed["pixel_values"][4:].eq(10.0).all().item()
@@ -166,7 +204,7 @@ class TestPackOrPadBatchPacked:
         """``image_grid_thw`` rows are concatenated along the first dim."""
         s0 = _make_sample(4, base=0)
         s1 = _make_sample(4, base=10)
-        packed = pack_or_pad_batch([s0, s1], use_packed_sequence=True, device="cuda")
+        packed = pack_or_pad_batch([_packed_microbatch(s0, s1)], use_packed_sequence=True, device="cuda")
         assert packed["image_grid_thw"].shape == (2, 3)
 
     def test_single_sample_round_trip(self):
@@ -254,8 +292,8 @@ class TestPackOrPadBatchDivisibleBy4:
 
     def test_packed_aligned_samples_no_padding(self, cp2):
         """Samples already multiples of 4 → cu_seqlens == cu_seqlens_padded."""
-        batch = [_make_sample(8, base=0), _make_sample(4, base=100)]
-        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+        batch = [_packed_microbatch(_make_sample(8, base=0), _make_sample(4, base=100))]
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, seq_length=12, device="cuda")
 
         T = 12
         assert packed["input_ids"].shape == (1, T)
@@ -264,12 +302,19 @@ class TestPackOrPadBatchDivisibleBy4:
         assert psp.cu_seqlens_q_padded.tolist() == [0, 8, 12]
         assert psp.max_seqlen_q == 8
         assert psp.total_tokens == 12
+        assert psp.pad_between_seqs is False
 
     def test_packed_misaligned_samples_padded_per_sample(self, cp2):
         """Each sample padded up to the nearest multiple of 4."""
         # lens=[5, 8, 3] → padded=[8, 8, 4] → T_padded = 20.
-        batch = [_make_sample(5, base=0), _make_sample(8, base=100), _make_sample(3, base=200)]
-        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+        batch = [
+            _packed_microbatch(
+                _make_sample(5, base=0),
+                _make_sample(8, base=100),
+                _make_sample(3, base=200),
+            )
+        ]
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, seq_length=20, device="cuda")
 
         T_padded = 20
         assert packed["input_ids"].shape == (1, T_padded)
@@ -281,12 +326,13 @@ class TestPackOrPadBatchDivisibleBy4:
         # max_seqlen comes from the padded lengths.
         assert psp.max_seqlen_q == 8
         assert psp.total_tokens == T_padded
+        assert psp.pad_between_seqs is False
 
     def test_packed_pad_values(self, cp2):
         """Pad slots filled with input_ids=0, labels=-100, loss_mask=0."""
         # Single sample len=3 → target_len=4 → 1 pad slot at position 3.
         batch = [_make_sample(3, base=10)]
-        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, seq_length=4, device="cuda")
 
         assert packed["input_ids"].shape == (1, 4)
         assert packed["input_ids"][0].tolist() == [10, 11, 12, 0]
@@ -297,6 +343,7 @@ class TestPackOrPadBatchDivisibleBy4:
         assert psp.cu_seqlens_q_padded.tolist() == [0, 4]
         assert psp.max_seqlen_q == 4
         assert psp.total_tokens == 4
+        assert psp.pad_between_seqs is False
 
     def test_padded_target_rounded_up_to_multiple_of_4(self, cp2):
         """Padded (BSHD) mode: ``target = ceil(min(max, seq_length) / 4) * 4``."""

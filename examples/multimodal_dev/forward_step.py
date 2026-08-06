@@ -33,6 +33,12 @@ _DTYPE_MAP = {
 }
 _ID_MAP = {v: k for k, v in _DTYPE_MAP.items()}
 
+# Top-level dict key used by external dataloaders whose natural batch is a
+# list of per-sample dicts. Megatron core's full-iteration CUDA graph static
+# loader requires a dict at the top level, so examples wrap/unwrap the batch
+# without changing the forward-step sample contract.
+EXTERNAL_MICROBATCH_KEY = "__multimodal_dev_samples__"
+
 
 def _dtype_to_id(dtype):
     return _DTYPE_MAP.get(dtype, 0)
@@ -147,6 +153,26 @@ def _build_packed_seq_params(seq_lengths: torch.Tensor, device: torch.device) ->
     return _build_packed_seq_params_from_cu_seqlens(cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
 
 
+
+def _as_tensor_sequence(value, key: str):
+    """Return a per-segment tensor list for THD packing.
+
+    Energon can yield either one raw tensor per sample or a pre-packed
+    list/tuple of tensors. The THD packer operates on segment lists, so
+    normalize both forms here without changing the dataloader contract.
+    """
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(item, torch.Tensor) for item in value
+    ):
+        return list(value)
+    raise TypeError(
+        f"Expected {key} to be a tensor or a list/tuple of tensors, "
+        f"got {type(value).__name__}."
+    )
+
+
 def _build_packed_seq_params_from_cu_seqlens(
     cu_seqlens: torch.Tensor, max_seqlen: int
 ) -> PackedSeqParams:
@@ -165,6 +191,9 @@ def _build_packed_seq_params_from_cu_seqlens(
         max_seqlen_kv=max_seqlen,
         qkv_format='thd',
         total_tokens=total_tokens,
+        # Token-like tensors include padded rows; keep TE attention outputs padded
+        # so they align with CP-sharded labels/loss masks.
+        pad_between_seqs=False,
     )
 
 
@@ -203,26 +232,66 @@ def pack_or_pad_batch(
 
     if use_packed_sequence:
         packed_batch: Dict[str, Any] = {}
-
         if is_src:
             assert batch is not None, "source TP rank must provide a batch"
+            if len(batch) != 1:
+                raise ValueError(
+                    "multimodal_dev THD packing expects one microbatch item. "
+                    "Use --micro-batch-size 1; Energon pre-packing may provide "
+                    "multiple logical segments inside that single item."
+                )
             input_ids_list, labels_list, loss_mask_list = [], [], []
             pixel_values_list, image_grid_thw_list = [], []
             seqlens_list, seqlens_padded_list = [], []
-
-            for sample in batch:
-                seqlen = sample["input_ids"].shape[0]
-                assert (
-                    sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape
-                ), "labels, input_ids, and loss_mask must have the same shape"
-                target_len = math.ceil(seqlen / divisible_by) * divisible_by
-                input_ids_list.append(F.pad(sample["input_ids"], (0, target_len - seqlen), value=0))
-                labels_list.append(F.pad(sample["labels"], (0, target_len - seqlen), value=-100))
-                loss_mask_list.append(F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0))
+            sample = batch[0]
+            input_ids_segments = _as_tensor_sequence(sample["input_ids"], "input_ids")
+            labels_segments = _as_tensor_sequence(sample["labels"], "labels")
+            loss_mask_segments = _as_tensor_sequence(sample["loss_mask"], "loss_mask")
+            pixel_values_segments = _as_tensor_sequence(sample["pixel_values"], "pixel_values")
+            image_grid_thw_segments = _as_tensor_sequence(
+                sample["image_grid_thw"], "image_grid_thw"
+            )
+            segment_count = len(input_ids_segments)
+            assert (
+                len(labels_segments)
+                == segment_count
+                == len(loss_mask_segments)
+                == len(pixel_values_segments)
+                == len(image_grid_thw_segments)
+            ), "input_ids, labels, loss_mask, pixel_values, and image_grid_thw must align"
+            if seq_length is None:
+                try:
+                    seq_len = get_args().seq_length
+                except AssertionError:
+                    seq_len = sum(int(segment.shape[0]) for segment in input_ids_segments)
+            else:
+                seq_len = seq_length
+            for i in range(segment_count):
+                seqlen = input_ids_segments[i].shape[0]
+                if i == segment_count - 1:
+                    target_len = seq_len - sum(seqlens_padded_list)
+                    if target_len < seqlen:
+                        raise ValueError(
+                            f"Packed sample length exceeds seq_length={seq_len}: "
+                            f"previous padded tokens={sum(seqlens_padded_list)}, "
+                            f"last segment length={seqlen}."
+                        )
+                else:
+                    target_len = math.ceil(seqlen / divisible_by) * divisible_by
+                input_ids_list.append(
+                    F.pad(input_ids_segments[i], (0, target_len - seqlen), value=0)
+                )
+                labels_list.append(
+                    F.pad(labels_segments[i], (0, target_len - seqlen), value=-100)
+                )
+                loss_mask_list.append(
+                    F.pad(loss_mask_segments[i], (0, target_len - seqlen), value=0)
+                )
                 seqlens_list.append(seqlen)
                 seqlens_padded_list.append(target_len)
-                pixel_values_list.append(sample["pixel_values"])
-                image_grid_thw_list.append(sample["image_grid_thw"])
+                pixel_values_list.append(pixel_values_segments[i])
+                image_grid_thw_list.append(image_grid_thw_segments[i])
+
 
             cu_seqlens = list(accumulate(seqlens_list, initial=0))
             cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
@@ -271,6 +340,9 @@ def pack_or_pad_batch(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=max_seqlen_q,
             total_tokens=total_tokens,
+            # Token-like tensors include padded rows; keep TE attention outputs padded
+            # so they align with CP-sharded labels/loss masks.
+            pad_between_seqs=False,
         )
         return packed_batch
 
@@ -317,6 +389,50 @@ def pack_or_pad_batch(
     return broadcast_data_batch(padded_batch, device=device)
 
 
+def _normalise_microbatch(data):
+    """Convert external-loader microbatches to a list of per-sample dicts."""
+    if isinstance(data, dict) and EXTERNAL_MICROBATCH_KEY in data:
+        return _normalise_microbatch(data[EXTERNAL_MICROBATCH_KEY])
+    if data is None or isinstance(data, list):
+        return data
+    if isinstance(data, tuple):
+        return list(data)
+    if not isinstance(data, dict):
+        raise TypeError(f"Unsupported microbatch type: {type(data).__name__}")
+
+    input_ids = data.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor):
+        raise TypeError("Microbatch dict must contain tensor key 'input_ids'.")
+    if input_ids.dim() <= 1:
+        return [data]
+    if input_ids.shape[0] != 1:
+        raise TypeError(
+            "Batched dict microbatches with batch size > 1 are not supported "
+            "by multimodal_dev. Return list[dict] from the dataloader task "
+            "encoder so variable image tensors stay sample-aligned."
+        )
+
+    sample = {}
+    for key, value in data.items():
+        if isinstance(value, torch.Tensor) and value.dim() > 1 and key in (
+            "input_ids",
+            "labels",
+            "loss_mask",
+            "position_ids",
+        ):
+            sample[key] = value[0]
+        elif (
+            isinstance(value, torch.Tensor)
+            and value.dim() == 3
+            and key in ("pixel_values", "image_grid_thw")
+            and value.shape[0] == 1
+        ):
+            sample[key] = value[0]
+        else:
+            sample[key] = value
+    return [sample]
+
+
 # -------------------------------------------------------------------
 # get_batch
 # -------------------------------------------------------------------
@@ -346,6 +462,7 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
         return None
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
+    data = _normalise_microbatch(data)
     batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
 
     # Fix shapes produced by default_collate.

@@ -57,6 +57,10 @@ MODEL_REGISTRY = {
                 "examples.multimodal_dev.data.cord_v2"
                 ".train_valid_test_datasets_provider"
             ),
+            "energon": (
+                "examples.multimodal_dev.data.energon"
+                ".train_valid_test_dataloaders_provider"
+            ),
         },
     },
 }

@@ -11,7 +11,8 @@ multimodal_dev/
 ├── forward_step.py          # Forward step, TP broadcast, loss computation
 ├── arguments.py             # Multimodal CLI arguments
 ├── data/
-│   └── mock.py              # Mock dataset for end-to-end testing
+│   ├── mock.py              # Mock dataset for end-to-end testing
+│   └── energon.py           # Megatron-Energon VQASample provider
 ├── models/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
 │   ├── base.py              # MultimodalModel base class (vision encoder + GPTModel)
@@ -201,6 +202,16 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 Register it in the `dataset_providers` dict of the registry entry.
 Providers can be either direct callables or dotted import path strings
 (resolved lazily at runtime).
+
+Energon-backed providers may return external dataloaders instead of
+torch datasets. The qwen3.5 VL `energon` provider consumes
+Megatron-Energon `VQASample` WebDataset directories, converts records to
+the standard multimodal_dev sample dict, and the entry point switches
+`--dataloader-type` to `external` automatically. Use
+`--use-packed-sequence` with `--micro-batch-size 1` for Megatron THD
+packing; optional `--packing-buffer-size` only lets Energon pre-combine
+short samples before the forward step builds final `PackedSeqParams` and
+applies the required CP/SP alignment padding.
 
 ### Step 5 — Launch
 
