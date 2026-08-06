@@ -75,6 +75,7 @@ class FsdpParameterGroup:
         mesh: DeviceMesh,
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
+        reduce_scatter_stream: torch.cuda.Stream,
         use_symm_mem: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
@@ -85,6 +86,7 @@ class FsdpParameterGroup:
             mesh: Device mesh used for all DBuffer storage in this version.
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
+            reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
             use_symm_mem: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
         """
@@ -160,13 +162,14 @@ class FsdpParameterGroup:
             # eagerly deallocated right after optimizer.step(), avoiding main_grad
             # storage during forward. That requires a separate lifetime contract with
             # the optimizer, so this version keeps the simpler persistent buffer.
-            self.main_grad = DBuffer(
-                mesh=self.mesh,
-                placements=main_grad_placements,
-                tensor_shapes=self.main_weight.layout.tensor_shapes,
-                dtype=grad_dtype,
-                device=self.main_weight.device,
-            )
+            with torch.cuda.stream(reduce_scatter_stream):
+                self.main_grad = DBuffer(
+                    mesh=self.mesh,
+                    placements=main_grad_placements,
+                    tensor_shapes=self.main_weight.layout.tensor_shapes,
+                    dtype=grad_dtype,
+                    device=self.main_weight.device,
+                )
             assert self.main_grad.layout == self.main_weight.layout, (
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
