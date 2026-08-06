@@ -6,13 +6,12 @@ import logging
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
     start_text_gen_server,
     stop_text_gen_server,
 )
-from megatron.core.utils import configure_nvtx_profiling, trace_async_exceptions
+from megatron.core.utils import configure_nvtx_profiling, get_pg_size, trace_async_exceptions
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_args
@@ -67,7 +66,7 @@ async def run_text_generation_server(
         # Each replica is a single event loop, so frontend capacity has to scale with
         # the number of engines it feeds. The floor of 4 preserves the previous default
         # for small deployments.
-        num_replicas = max(parallel_state.get_data_parallel_world_size(), 4)
+        num_replicas = max(get_pg_size(engine.pg_collection.dp), 4)
     if rank == 0:
         logging.info("Starting %d HTTP frontend replica(s).", num_replicas)
 
