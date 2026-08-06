@@ -170,10 +170,21 @@ class TestLifecycleGuards:
         monkeypatch.setattr(dist, "get_rank", lambda: 0)
         monkeypatch.setattr(tgs, "start_text_gen_server", lambda **kw: started.update(kw))
 
-        llm.serve(ServeConfig(port=1234), blocking=False)
+        llm.serve(
+            ServeConfig(
+                port=1234,
+                default_top_p=0.95,
+                default_top_k=20,
+                serving_mode=True,
+            ),
+            blocking=False,
+        )
         assert llm._serve_started is True
         assert started["coordinator_addr"] == "tcp://coord:5555"
         assert started["server_port"] == 1234
+        assert started["default_top_p"] == 0.95
+        assert started["default_top_k"] == 20
+        assert started["serving_mode"] is True
 
 
 class TestNormalizePrompts:

@@ -49,6 +49,9 @@ async def _run_text_gen_server(
     verbose: bool = False,
     fd: Optional[int] = None,
     hostname: Optional[str] = None,
+    default_top_p: float = 1.0,
+    default_top_k: int = 0,
+    serving_mode: bool = False,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -80,6 +83,9 @@ async def _run_text_gen_server(
         app.config['tokenizer'] = tokenizer
         app.config['parsers'] = parsers
         app.config['verbose'] = verbose
+        app.config['default_top_p'] = default_top_p
+        app.config['default_top_k'] = default_top_k
+        app.config['serving_mode'] = serving_mode
 
         # Register all blueprints from the 'endpoints' package
         for endpoint in endpoints.__all__:
@@ -101,6 +107,8 @@ async def _run_text_gen_server(
             logger.info(f"Starting text generation server on http://{hostname}:{server_port}")
             logger.info(f"Using tokenizer: {type(tokenizer)}")
             logger.info(f"Using parsers: {parsers}")
+            logger.info(f"Default sampling: top_p={default_top_p}, top_k={default_top_k}")
+            logger.info(f"Serving mode: {serving_mode}")
 
         # Quart is natively ASGI, so we can serve the app directly
         await serve(app, config)
@@ -120,6 +128,9 @@ def _server_process_worker(
     verbose: bool = False,
     fd: Optional[int] = None,
     hostname: Optional[str] = None,
+    default_top_p: float = 1.0,
+    default_top_k: int = 0,
+    serving_mode: bool = False,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -127,7 +138,17 @@ def _server_process_worker(
     try:
         loop.run_until_complete(
             _run_text_gen_server(
-                coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd, hostname
+                coordinator_addr,
+                tokenizer,
+                rank,
+                server_port,
+                parsers,
+                verbose,
+                fd,
+                hostname,
+                default_top_p,
+                default_top_k,
+                serving_mode,
             )
         )
     except KeyboardInterrupt:
@@ -151,6 +172,9 @@ def start_text_gen_server(
     num_replicas: int = 4,
     hostname: Optional[str] = None,
     sock: Optional[socket.socket] = None,
+    default_top_p: float = 1.0,
+    default_top_k: int = 0,
+    serving_mode: bool = False,
 ):
     """Start the text generation server."""
     global _SERVER_PROCESSES
@@ -190,7 +214,19 @@ def start_text_gen_server(
     for i in range(num_replicas):
         p = mp.Process(
             target=_server_process_worker,
-            args=(coordinator_addr, tokenizer, rank, server_port, parsers, verbose, fd, hostname),
+            args=(
+                coordinator_addr,
+                tokenizer,
+                rank,
+                server_port,
+                parsers,
+                verbose,
+                fd,
+                hostname,
+                default_top_p,
+                default_top_k,
+                serving_mode,
+            ),
             daemon=True,
         )
         p.start()
