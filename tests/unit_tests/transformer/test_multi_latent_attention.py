@@ -2044,3 +2044,210 @@ class TestFusedMLARequiresQLora:
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
             )
+
+
+# ---------------------------------------------------------------------------
+# Fused Q up-proj autograd test (forward + backward via _FusedMLAQUpProjFunction)
+# ---------------------------------------------------------------------------
+try:
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+    from megatron.core.transformer.multi_latent_attention import _FusedMLAQUpProjFunction
+
+    if HAVE_TE:
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.attention import FusedMLAQUpProjRopeQuant
+        from transformer_engine.pytorch.cpp_extensions import general_gemm as _fused_general_gemm
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
+
+    _fused_uproj_available = HAVE_TE and FusedMLAQUpProjRopeQuant.is_supported()
+except Exception:
+    _fused_uproj_available = False
+
+_fused_uproj_skip = pytest.mark.skipif(
+    not _fused_uproj_available,
+    reason="FusedMLAQUpProjRopeQuant not supported (requires SM100+, cudnn-frontend >= 1.27.0)",
+)
+
+# DSv3 671B MLA dims used by the fused kernel
+_NH = 128
+_HEAD_DIM_NOPE = 128
+_HEAD_DIM_ROPE = 64
+_HEAD_DIM = _HEAD_DIM_NOPE + _HEAD_DIM_ROPE  # 192
+_Q_LORA_RANK = 1536
+_PROJ_DIM = _NH * _HEAD_DIM  # 24576
+
+
+def _build_rope_tables_fused(tokens, device):
+    inv_freq = 1.0 / (
+        10000
+        ** (torch.arange(0, _HEAD_DIM_ROPE, 2, dtype=torch.float32, device=device) / _HEAD_DIM_ROPE)
+    )
+    freqs = torch.cat(
+        [torch.outer(torch.arange(tokens, dtype=torch.float32, device=device), inv_freq)] * 2,
+        dim=-1,
+    )
+    return freqs.cos().to(torch.bfloat16), freqs.sin().to(torch.bfloat16)
+
+
+def MxFP8Tensor_to_bf16(query, tokens):
+    """Dequantize a rowwise MXFP8Tensor (4D) to bf16 via a 2D reshape."""
+    q_2d = MXFP8Tensor(
+        shape=(tokens, _PROJ_DIM),
+        dtype=torch.bfloat16,
+        rowwise_data=query._rowwise_data.view(tokens, _PROJ_DIM),
+        rowwise_scale_inv=query._rowwise_scale_inv.view(tokens, _PROJ_DIM // 32),
+        columnwise_data=None,
+        columnwise_scale_inv=None,
+        quantizer=query._quantizer,
+        requires_grad=False,
+        fp8_dtype=query._fp8_dtype,
+        with_gemm_swizzled_scales=False,
+    )
+    return q_2d.dequantize().to(torch.bfloat16)
+
+
+class TestFusedMLAQUpProjAutograd:
+    """Forward + backward tests for _FusedMLAQUpProjFunction using the actual production code."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    @_fused_uproj_skip
+    def test_forward_numerics(self):
+        """Fused forward must be close to a bf16 dequantized reference."""
+        tokens, s, b = 256, 256, 1
+        device = torch.device("cuda")
+        torch.manual_seed(42)
+
+        x = torch.randn(tokens, _Q_LORA_RANK, dtype=torch.bfloat16, device=device)
+        w_bf16 = torch.randn(_PROJ_DIM, _Q_LORA_RANK, dtype=torch.bfloat16, device=device)
+        w = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)(w_bf16)
+        cos, sin = _build_rope_tables_fused(tokens, device)
+
+        query, _ = FusedMLAQUpProjRopeQuant.run(x, w, cos, sin, s, b)
+        q_2d = MxFP8Tensor_to_bf16(query, tokens)
+
+        x_dq = (
+            MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)(x)
+            .dequantize()
+            .to(torch.bfloat16)
+        )
+        w_dq = w.dequantize().to(torch.bfloat16)
+        out = (x_dq @ w_dq.t()).reshape(tokens, _NH, _HEAD_DIM)
+        q_nope = out[..., :_HEAD_DIM_NOPE]
+        q_rope = out[..., _HEAD_DIM_NOPE:]
+        cos_ = cos[:, None, :].to(q_rope.dtype)
+        sin_ = sin[:, None, :].to(q_rope.dtype)
+        half = _HEAD_DIM_ROPE // 2
+        x1, x2 = q_rope[..., 0::2], q_rope[..., 1::2]
+        q_rope_out = torch.cat(
+            [
+                x1 * cos_[..., :half] - x2 * sin_[..., :half],
+                x2 * cos_[..., half:] + x1 * sin_[..., half:],
+            ],
+            dim=-1,
+        )
+        ref = torch.cat([q_nope, q_rope_out], dim=-1)
+
+        torch.testing.assert_close(q_2d.reshape(tokens, _NH, _HEAD_DIM), ref, atol=0.5, rtol=0.1)
+
+    @_fused_uproj_skip
+    def test_backward_gradients(self):
+        """Backward via _FusedMLAQUpProjFunction must produce correct dgrad and wgrad.
+
+        Calls the backward staticmethod directly with a mock context. The reference
+        runs the same operations manually in sequence — Triton RoPE backward, MXFP8
+        quantize, general_gemm — and compares against the production backward output.
+        This keeps the reference as close to production as possible and avoids the
+        larger tolerance needed when using a Python RoPE reference.
+
+        Note: the Triton RoPE backward kernel modifies its input in-place via a
+        contiguous view of the upstream gradient (no copy when b=1), so grad_out
+        must be cloned before passing to the backward AND before the reference run.
+        """
+        import triton as _triton
+
+        from megatron.core.fusions.fused_mla_yarn_rope_apply import rotary_bwd_q_kernel as _rbk
+
+        tokens, s, b = 256, 256, 1
+        device = torch.device("cuda")
+        torch.manual_seed(42)
+
+        x = torch.randn(tokens, _Q_LORA_RANK, dtype=torch.bfloat16, device=device)
+        w = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)(
+            torch.randn(_PROJ_DIM, _Q_LORA_RANK, dtype=torch.bfloat16, device=device)
+        )
+        cos, sin = _build_rope_tables_fused(tokens, device)
+
+        def _flat(t):
+            return t.reshape(s, -1).to(torch.bfloat16).contiguous()
+
+        cos_flat = _flat(cos[:, None, None, :])
+        sin_flat = _flat(sin[:, None, None, :])
+
+        _, x_saved = FusedMLAQUpProjRopeQuant.run(x, w.detach(), cos_flat, sin_flat, s, b)
+
+        class _MockCtx:
+            saved_tensors = (x_saved, w, cos_flat, sin_flat)
+            dims = (_NH, _HEAD_DIM, _HEAD_DIM_NOPE, _HEAD_DIM_ROPE, s, b)
+            act_dtype = torch.bfloat16
+            wgrad_store = None
+            fuse_wgrad_accumulation = False
+            tp_group = None
+            sequence_parallel = False
+
+        grad_out = torch.randn(s, b, _NH, _HEAD_DIM, dtype=torch.bfloat16, device=device)
+
+        # Production backward (clone: Triton kernel modifies input in-place).
+        grads = _FusedMLAQUpProjFunction.backward(_MockCtx, grad_out.clone())
+        grad_x = grads[0].reshape(tokens, _Q_LORA_RANK)
+        grad_w = grads[1]
+
+        # Reference: run the same operations manually.
+        # 1. Triton RoPE backward (clone for same reason).
+        dq3 = grad_out.reshape(tokens, _NH, _HEAD_DIM).clone().contiguous()
+        grid = lambda META: (tokens, _triton.cdiv(_NH, META["BLOCK_H"]))
+        _rbk[grid](
+            dq3,
+            cos_flat.contiguous(),
+            sin_flat.contiguous(),
+            _HEAD_DIM_NOPE,
+            _HEAD_DIM_ROPE,
+            _NH,
+            1,
+            None,
+            None,
+            dq3.stride(0),
+            dq3.stride(1),
+            0,
+            1,
+        )
+        dq2d = dq3.reshape(tokens, _PROJ_DIM).contiguous()
+
+        # 2. Quantize gradient (matching the production backward exactly).
+        gy_quantizer = MXFP8Quantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True
+        )
+        gy_quantizer.optimize_for_gemm = True
+        gy = gy_quantizer(dq2d)
+
+        # 3. Same GEMMs with same w and x_saved.
+        w.update_usage(rowwise_usage=True, columnwise_usage=True)
+        grad_x_ref = _fused_general_gemm(
+            w, gy, layout="NN", grad=True, out_dtype=torch.bfloat16, use_split_accumulator=True
+        )[0]
+        grad_w_ref = _fused_general_gemm(
+            x_saved,
+            gy,
+            layout="NT",
+            grad=True,
+            out_dtype=torch.bfloat16,
+            use_split_accumulator=True,
+        )[0]
+
+        torch.testing.assert_close(grad_x.to(torch.bfloat16), grad_x_ref, atol=0.5, rtol=0.1)
+        torch.testing.assert_close(grad_w.to(torch.bfloat16), grad_w_ref, atol=0.5, rtol=0.1)

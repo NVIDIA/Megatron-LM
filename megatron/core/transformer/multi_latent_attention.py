@@ -64,7 +64,11 @@ except:
 
 if HAVE_TE:
     import transformer_engine_torch as tex
-    from transformer_engine.pytorch.attention import FusedMLAQUpProjRopeQuant
+
+    try:
+        from transformer_engine.pytorch.attention import FusedMLAQUpProjRopeQuant
+    except ImportError:
+        FusedMLAQUpProjRopeQuant = None
     from transformer_engine.pytorch.attention.dot_product_attention.utils import (
         mxfp8_quantize_only,
         mxfp8_transpose_swizzle,
@@ -1152,16 +1156,16 @@ class MLASelfAttention(MultiLatentAttention):
                     self.tp_group,
                     self.config.sequence_parallel,
                 )
-            elif self.config.q_lora_rank is not None:
-                # q_compressed: [num_tokens, q_lora_rank]
-                # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_up_proj(q_compressed)
-                # q: [num_tokens, n, q_head_dim]
-                q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
             else:
-                # q_compressed: [num_tokens, hidden_size]
-                # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_proj(q_compressed)
+                if self.config.q_lora_rank is not None:
+                    # q_compressed: [num_tokens, q_lora_rank]
+                    # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+                    q, _ = self.linear_q_up_proj(q_compressed)
+                else:
+                    # q_compressed: [num_tokens, hidden_size]
+                    # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+                    q, _ = self.linear_q_proj(q_compressed)
+
                 # q: [num_tokens, n, q_head_dim]
                 q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
