@@ -345,13 +345,15 @@ def _print_compare(label, baseline, trial, atol, rtol):
     return ok
 
 
-def run_cp_comparison(cp_size=DEFAULTS["cp_size"], **overrides):
+def run_cp_comparison(**overrides):
     """Run the CP=1 baseline and the CP=``cp_size`` trial on identical weights.
 
+    Any key of :data:`DEFAULTS` may be overridden, including ``cp_size``.
     Returns ``{"BSHD loss": (cp1, cpN), "BSHD grad_norm": (...), ...}``.
     Leaves the model-parallel groups destroyed.
     """
     cfg = {**DEFAULTS, **overrides}
+    cp_size = cfg["cp_size"]
     image_token_id = 0  # never appears in input (data filters this id out)
 
     def _phase(context_parallel_size, snapshot):
@@ -419,7 +421,7 @@ def test_cp_matches_cp1_for_bshd_and_thd():
     if world_size % cp_size != 0:
         pytest.skip(f"world_size={world_size} is not divisible by cp_size={cp_size}")
 
-    results = run_cp_comparison(cp_size)
+    results = run_cp_comparison()
 
     atol, rtol = DEFAULTS["atol_loss"], DEFAULTS["rtol_grad"]
     for label, (baseline, trial) in results.items():
