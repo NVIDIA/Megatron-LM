@@ -52,6 +52,7 @@ DEPENDENCIES:
     WORKDIR /home/
     RUN git clone https://github.com/Dao-AILab/fast-hadamard-transform.git && \
         cd fast-hadamard-transform && \
+        git checkout f134af63deb2df17e1171a9ec1ea4a7d8604d5ca && \
         pip install --no-build-isolation .
 
     # Emerging-Optimizers (Muon)
@@ -64,6 +65,7 @@ DEPENDENCIES:
     WORKDIR /opt/
     RUN git clone --branch nv_dev https://github.com/deepseek-ai/FlashMLA.git && \
         cd FlashMLA && \
+        git checkout b7643bd && \
         FLASH_MLA_DISABLE_SM90=1 \
         NVCC_THREADS=16 \
         CFLAGS="-I/usr/local/cuda/include/cccl" \
