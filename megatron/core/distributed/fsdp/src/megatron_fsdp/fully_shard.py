@@ -91,6 +91,7 @@ def fully_shard_model(
     fsdp_buffer_count: int = 2,
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
+    fsdp_ubr_registration_scope: str = 'all',
     enable_fine_grained_param_gather: bool = False,
     prefetch_recompute_forward_weights: bool = False,
     cache_param_bucket_views: bool = False,
@@ -252,6 +253,11 @@ def fully_shard_model(
             This option forces conventional (local) UB registration when nccl_ub is set.
             Defaults to False.
 
+        fsdp_ubr_registration_scope (str):
+            FSDP communicator scope for NCCL user-buffer registration. ``all`` preserves
+            the default behavior; ``dense_inner`` registers only dense inner-FSDP
+            parameter all-gathers. Defaults to ``all``.
+
         enable_fine_grained_param_gather (bool):
             Whether to enable "fine-grained" param all-gather, which can improve performance
             when using MXFP8 parameters with activation recomputation. Specifically, it
@@ -394,6 +400,7 @@ def fully_shard_model(
         fsdp_buffer_count=fsdp_buffer_count,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        fsdp_ubr_registration_scope=fsdp_ubr_registration_scope,
         megatron_fsdp_prefetch_recompute_forward_weights=prefetch_recompute_forward_weights,
         megatron_fsdp_cache_param_bucket_views=cache_param_bucket_views,
         megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
@@ -704,6 +711,7 @@ def fully_shard(
     fsdp_buffer_count: int = 2,
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
+    fsdp_ubr_registration_scope: str = 'all',
     enable_fine_grained_param_gather: bool = False,
     prefetch_recompute_forward_weights: bool = False,
     cache_param_bucket_views: bool = False,
@@ -760,6 +768,7 @@ def fully_shard(
         fsdp_buffer_count=fsdp_buffer_count,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        fsdp_ubr_registration_scope=fsdp_ubr_registration_scope,
         enable_fine_grained_param_gather=enable_fine_grained_param_gather,
         prefetch_recompute_forward_weights=prefetch_recompute_forward_weights,
         cache_param_bucket_views=cache_param_bucket_views,

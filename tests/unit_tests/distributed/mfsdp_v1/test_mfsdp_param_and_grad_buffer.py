@@ -2,6 +2,7 @@
 
 import math
 
+import pytest
 import torch
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp import param_and_grad_buffer as pgb_module
@@ -10,7 +11,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer impo
     FixedPoolAllocator,
     MaxPoolAllocator,
     ParameterGroup,
+    _build_ubr_arena_layout,
     _get_parameter_groups,
+    _get_ubr_registration_groups,
     _mem_pool_registration_signature,
 )
 
@@ -83,6 +86,58 @@ class _TestMemoryPool:
         return self.segments
 
 
+class _TestDistIndex:
+    def __init__(self, use_hybrid_fsdp):
+        self.use_hybrid_fsdp = use_hybrid_fsdp
+        self.dense = object()
+        self.expert = object()
+        self.dense_ag = object()
+        self.expert_ag = object()
+        self.outer = object()
+
+    def get_fsdp_group(self, is_expert_parallel=False, independent_all_gather=False):
+        if is_expert_parallel:
+            return self.expert_ag if independent_all_gather else self.expert
+        return self.dense_ag if independent_all_gather else self.dense
+
+    def get_outer_fsdp_group(self):
+        return self.outer
+
+
+def test_dense_inner_ubr_scope_selects_hsdp_dense_helper_group_only():
+    """HSDP inner parameter AG uses the base dense FSDP group, not outer/expert groups."""
+    dist_index = _TestDistIndex(use_hybrid_fsdp=True)
+
+    assert _get_ubr_registration_groups(dist_index, "dense_inner") == [dist_index.dense]
+
+
+def test_dense_inner_ubr_scope_prefers_independent_ag_without_hsdp():
+    """Non-HSDP parameter AG uses its independent communicator when one is provided."""
+    dist_index = _TestDistIndex(use_hybrid_fsdp=False)
+
+    assert _get_ubr_registration_groups(dist_index, "dense_inner") == [dist_index.dense_ag]
+
+
+def test_all_ubr_scope_preserves_every_registration_group():
+    """The default scope remains backward compatible with the previous group list."""
+    dist_index = _TestDistIndex(use_hybrid_fsdp=True)
+
+    assert _get_ubr_registration_groups(dist_index, "all") == [
+        dist_index.dense,
+        dist_index.expert,
+        dist_index.dense_ag,
+        dist_index.expert_ag,
+        dist_index.outer,
+    ]
+
+
+def test_ubr_scope_rejects_unknown_value():
+    dist_index = _TestDistIndex(use_hybrid_fsdp=True)
+
+    with pytest.raises(ValueError, match="Invalid FSDP UBR registration scope"):
+        _get_ubr_registration_groups(dist_index, "outer")
+
+
 def test_mem_pool_registration_signature_uses_registration_order():
     """Signature order must match ProcessGroupNCCL's registration order."""
     pool = _TestMemoryPool(
@@ -102,6 +157,20 @@ def test_mem_pool_registration_signature_ignores_local_addresses():
     second = _TestMemoryPool([{"total_size": 1024, "address": 0x9000}])
 
     assert _mem_pool_registration_signature(first) == _mem_pool_registration_signature(second)
+
+
+def test_ubr_arena_layout_aligns_requests_in_logical_order():
+    requests = [
+        (17, "max_pool", object(), 17, torch.uint8, "first"),
+        (512, "persistent", object(), 128, torch.float32, "second"),
+        (33, "max_pool", object(), 33, torch.uint8, "third"),
+    ]
+
+    layout, arena_size = _build_ubr_arena_layout(requests, alignment=256)
+
+    assert [offset for offset, _ in layout] == [0, 256, 768]
+    assert [request[-1] for _, request in layout] == ["first", "second", "third"]
+    assert arena_size == 1024
 
 
 def test_max_pool_materialize_uses_exact_largest_padded_bucket(monkeypatch):
@@ -144,6 +213,40 @@ def test_max_pool_materialize_uses_exact_largest_padded_bucket(monkeypatch):
         ("test_pool_1_torch.float32_0", torch.float32): 8,
         ("test_pool_1_torch.uint8_0", torch.uint8): 64,
     }
+
+
+def test_max_pool_bucket_filter_keeps_dense_and_expert_slots_disjoint():
+    """Dense-inner UBR cannot share registered MaxPool slots with expert traffic."""
+    dense_param = torch.nn.Parameter(torch.empty(4, dtype=torch.bfloat16))
+    expert_param = torch.nn.Parameter(torch.empty(8, dtype=torch.bfloat16))
+    parameter_groups = [
+        ParameterGroup([dense_param], dtype=torch.bfloat16, fsdp_unit_id=0),
+        ParameterGroup([expert_param], dtype=torch.bfloat16, is_expert_param=True, fsdp_unit_id=0),
+    ]
+
+    dense_allocator = MaxPoolAllocator(
+        "dense_pool",
+        parameter_groups,
+        size=2,
+        bucket_filter=lambda _, group: not group.is_expert_param,
+    )
+    expert_allocator = MaxPoolAllocator(
+        "expert_pool",
+        parameter_groups,
+        size=2,
+        bucket_filter=lambda _, group: group.is_expert_param,
+    )
+
+    assert set(dense_allocator.bucket_alloc_index) == {0}
+    assert set(expert_allocator.bucket_alloc_index) == {1}
+    assert dense_allocator.materialization_requests({0: (16, torch.bfloat16)}) == [
+        (16, torch.bfloat16, "dense_pool_0_torch.bfloat16_0"),
+        (16, torch.bfloat16, "dense_pool_1_torch.bfloat16_0"),
+    ]
+    assert expert_allocator.materialization_requests({1: (32, torch.bfloat16)}) == [
+        (32, torch.bfloat16, "expert_pool_0_torch.bfloat16_0"),
+        (32, torch.bfloat16, "expert_pool_1_torch.bfloat16_0"),
+    ]
 
 
 def test_grouped_expert_weights_split_when_chunk_size_factors_differ():

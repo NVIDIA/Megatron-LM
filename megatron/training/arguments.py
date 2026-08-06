@@ -4236,6 +4236,15 @@ def _add_distributed_args(parser):
         'This option will force to use conventional (local) userbuffer registration when use-nccl-ub is set.',
     )
     group.add_argument(
+        '--fsdp-ubr-registration-scope',
+        type=str,
+        choices=['all', 'dense_inner'],
+        default='all',
+        help='Select FSDP communicators registered with the NCCL memory pool. '
+        '"all" preserves the default behavior; "dense_inner" registers only the '
+        'dense inner-FSDP parameter all-gather communicator.',
+    )
+    group.add_argument(
         '--fsdp-manual-registration',
         action='store_true',
         dest='fsdp_manual_registration',

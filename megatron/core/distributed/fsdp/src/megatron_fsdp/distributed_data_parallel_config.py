@@ -121,6 +121,14 @@ class DistributedDataParallelConfig:
       when nccl_ub is set.
     """
 
+    fsdp_ubr_registration_scope: str = 'all'
+    """Communicator scope for FSDP NCCL user-buffer registration.
+
+    ``all`` registers every supported FSDP communicator. ``dense_inner`` registers
+    only dense inner-FSDP parameter all-gathers, leaving expert and outer-DP
+    collectives on ordinary NCCL kernels.
+    """
+
     fsdp_manual_registration: bool = False
     """If true, manually register the FSDP communication buffers to NCCL user buffer.
       This option is only effective when use_megatron_fsdp and nccl_ub is set.
@@ -209,6 +217,11 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.fsdp_ubr_registration_scope not in ("all", "dense_inner"):
+            raise ValueError(
+                "fsdp_ubr_registration_scope must be one of: all, dense_inner; "
+                f"got {self.fsdp_ubr_registration_scope!r}."
+            )
         if self.megatron_fsdp_prefetch_recompute_forward_weights:
             assert self.data_parallel_sharding_strategy == "optim_grads_params", (
                 "megatron_fsdp_prefetch_recompute_forward_weights is only supported with "
