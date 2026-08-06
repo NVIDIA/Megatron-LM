@@ -8,6 +8,7 @@ spec:
   build: mcore-pyt-{environment}
   nodes: 2
   gpus: 4
+  segment: 2
   n_repeat: 5
   platforms: dgx_gb200
   script_setup: |
