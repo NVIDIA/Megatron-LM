@@ -22,7 +22,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.utils import (
     divide,
     get_pg_rank,
@@ -100,7 +100,7 @@ def param_is_not_tensor_parallel_duplicate(param, tp_group=None, expert_tp_group
     """
     if hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel:
         return True
-    # allreduce=False marks parameters reduced over expert DP, so filter their duplicates over ETP.
+    # allreduce=False marks parameters using the expert topology, so filter duplicates over ETP.
     if not getattr(param, "allreduce", True) and expert_tp_group is not None:
         tp_group = expert_tp_group
     # Prefer provided tp_group when available (new explicit path).
@@ -251,6 +251,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         reduce_scatter_embeddings: bool = False,
         config: ModelParallelConfig,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super(VocabParallelEmbedding, self).__init__()
         # Keep the input dimensions.
@@ -261,7 +262,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.tp_group = get_tensor_model_parallel_group_if_none(self.tp_group)
 
-        (self.vocab_start_index, self.vocab_end_index) = (
+        self.vocab_start_index, self.vocab_end_index = (
             VocabUtility.vocab_range_from_global_vocab_size(
                 self.num_embeddings, get_pg_rank(self.tp_group), get_pg_size(self.tp_group)
             )
@@ -314,9 +315,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
 
         self.gtp_remat_size = 1
-        gtp_remat_group = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat"]
-        ).gtp_remat
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert=False)
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
@@ -935,6 +934,7 @@ class ColumnParallelLinear(torch.nn.Module):
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -961,6 +961,7 @@ class ColumnParallelLinear(torch.nn.Module):
         use_expert_pgs = self.is_expert and (
             self.expert_parallel
             or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+            or self.config.expert_gtp_weight_remat_size != self.config.gtp_weight_remat_size
         )
         self.output_size_per_partition = divide(output_size, world_size)
 
@@ -1019,10 +1020,7 @@ class ColumnParallelLinear(torch.nn.Module):
             self.weight = None
 
         self.gtp_remat_size = 1
-        _pg = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat", "expt_gtp_remat"]
-        )
-        gtp_remat_group = _pg.expt_gtp_remat if self.is_expert else _pg.gtp_remat
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, self.is_expert)
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
@@ -1298,6 +1296,7 @@ class RowParallelLinear(torch.nn.Module):
         tp_comm_buffer_name: str | None = None,  # Not used
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super(RowParallelLinear, self).__init__()
 
@@ -1379,14 +1378,12 @@ class RowParallelLinear(torch.nn.Module):
         use_expert_pgs = self.is_expert and (
             self.expert_parallel
             or self.config.expert_tensor_parallel_size != self.config.tensor_model_parallel_size
+            or self.config.expert_gtp_weight_remat_size != self.config.gtp_weight_remat_size
         )
         setattr(self.weight, "allreduce", not use_expert_pgs)
 
         self.gtp_remat_size = 1
-        _pg = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["gtp_remat", "expt_gtp_remat"]
-        )
-        gtp_remat_group = _pg.expt_gtp_remat if self.is_expert else _pg.gtp_remat
+        gtp_remat_group = resolve_gtp_remat_group(pg_collection, self.is_expert)
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
