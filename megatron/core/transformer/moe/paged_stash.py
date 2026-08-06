@@ -19,9 +19,8 @@ from megatron.core.utils import get_attr_wrapped_model
 
 logger = logging.getLogger(__name__)
 
-# One retry only. The retry replays at a budget grown to the peak the first attempt needed, so it
-# drops again only if the replay routes differently -- possible because the rerun does not restore
-# RNG state, so dropout (if any) shifts the routing.
+# One retry only, and it is enough: prepare_for_rerun clears the capacity factor (dropless, so no
+# receive budget to exceed) and disables paged stashing, so the retry cannot fail either way.
 _MAX_RERUN_ATTEMPTS = 2
 
 SCALE_INV_BLOCK_SIZE = 32
@@ -1121,8 +1120,13 @@ class PagedStashRunner:
 
         return stash_overflow_ranks, overbudget_ranks, host_spill_ranks
 
-    def prepare_for_rerun(self, is_training=True, ep_overbudget=False):
-        """Prepare for rerun"""
+    def prepare_for_rerun(self, is_training=True):
+        """Prepare for rerun: go dropless, disable paged stashing, and reset grads/graph.
+
+        One path for both overflow kinds. Clearing the capacity factor sends HybridEP dropless
+        and ncclEP into eager mode, neither of which can overflow a receive budget, and paged
+        stashing is off, so the retry cannot fail the same way twice.
+        """
         log_single_rank(
             logger,
             logging.INFO,
@@ -1131,16 +1135,23 @@ class PagedStashRunner:
         )
         # check for token dispatcher overflow
         for mlp in self.moe_layers:
-            if not hasattr(mlp, 'token_dispatcher'):
-                continue
-            comm_manager = mlp.token_dispatcher._comm_manager
-            if hasattr(comm_manager, 'moe_expert_rank_capacity_factor'):
-                # Backends that can grow their receive budget (ncclEP) replay at the peak the
-                # dropped step needed instead of going dropless, so their capacity factor must
-                # stay set -- it still sizes the budget, and clearing it would break it.
-                if not hasattr(comm_manager, 'grow_recv_capacity'):
-                    comm_manager.moe_expert_rank_capacity_factor = None
+            if hasattr(mlp, 'token_dispatcher') and hasattr(
+                mlp.token_dispatcher._comm_manager, 'moe_expert_rank_capacity_factor'
+            ):
+                mlp.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = None
                 mlp.token_dispatcher.reset_over_budget()
+                mlp.token_dispatcher.invalidate_ep_bootstrap()
+        # Record the peak the dropped step needed while it is still valid
+        if self._required_recv_capacity is not None:
+            for mlp in self.moe_layers:
+                mlp.token_dispatcher.grow_ep_recv_capacity(self._required_recv_capacity)
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"NCCL EP: grew the receive capacity to {self._required_recv_capacity} tokens "
+                "per rank after the token drop; set moe_expert_rank_capacity_factor accordingly "
+                "to avoid the rerun cost.",
+            )
         if self.stash_manager.overflow is not None:
             self.stash_manager.overflow.zero_()
         if self.stash_manager.host_spill is not None:
@@ -1178,19 +1189,7 @@ class PagedStashRunner:
                 stage='training' if is_training else 'validation'
             )
 
-        # Replay at a budget grown to the peak the dropped step needed, which is dropless as long
-        # as the replay routes the same way.
-        if ep_overbudget and self._required_recv_capacity is not None:
-            for mlp in self.moe_layers:
-                mlp.token_dispatcher.grow_ep_recv_capacity(self._required_recv_capacity)
-            nccl_ep_release_context()
-            log_single_rank(
-                logger,
-                logging.INFO,
-                "NCCL EP: grew the receive capacity to "
-                f"{self._required_recv_capacity} tokens per rank and will replay the step; set "
-                "moe_expert_rank_capacity_factor accordingly to avoid the rerun cost.",
-            )
+        nccl_ep_release_context()
 
         # Only drop page buffers on training fallback. Validation uses forward_only=True, so
         # paged_stash_reset disables the stash manager and eval forward never reads/writes the
@@ -1267,8 +1266,11 @@ class PagedStashRunner:
                         mlp.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = (
                             mlp.token_dispatcher.config.moe_expert_rank_capacity_factor
                         )
-                # Nothing to restore for ncclEP: prepare_for_rerun grew the budget in place and
-                # never changed the mode, so the grown capacity simply carries forward.
+                # Only after an actual rerun: rebootstrap NCCL EP
+                if num_tries > 1:
+                    for mlp in self.moe_layers:
+                        mlp.token_dispatcher.invalidate_ep_bootstrap()
+                    nccl_ep_release_context()
                 self._set_moe_paged_stash_all(saved_moe_paged_stash)
                 break
 
@@ -1307,5 +1309,5 @@ class PagedStashRunner:
             assert (
                 num_tries < _MAX_RERUN_ATTEMPTS
             ), f"PagedStashRunner: num_tries {num_tries} exceeded max attempts!!!"
-            self.prepare_for_rerun(is_training=training, ep_overbudget=overbudget_ranks > 0)
+            self.prepare_for_rerun(is_training=training)
         return result

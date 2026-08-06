@@ -651,7 +651,7 @@ def ensure_nccl_ep_bootstrapped(
             "transformer_engine.pytorch.ep is unavailable. The 'ncclep' flex dispatcher backend "
             "requires a TransformerEngine build with NCCL EP support (NVTE_BUILD_WITH_NCCL_EP=1)."
         )
-    if te_ep._BOOTSTRAPPED:  # reuse TE's own one-time guard; no parallel state to drift
+    if is_nccl_ep_bootstrapped():  # reuse TE's own one-time guard; no parallel state to drift
         return
     te_ep.ep_bootstrap(
         ep_group,
@@ -664,6 +664,15 @@ def ensure_nccl_ep_bootstrapped(
         zero_copy=zero_copy,
         drop_on_overflow=recv_capacity_per_rank is not None,
     )
+
+
+def is_nccl_ep_bootstrapped() -> bool:
+    """Whether TE's process-wide NCCL EP context is live. is_ep_bootstrapped is TE 3321."""
+    if not HAVE_TE_EP:
+        return False
+    if hasattr(te_ep, "is_ep_bootstrapped"):
+        return te_ep.is_ep_bootstrapped()
+    return te_ep._BOOTSTRAPPED
 
 
 def nccl_ep_finalize():

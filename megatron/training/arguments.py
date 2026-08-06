@@ -1080,23 +1080,6 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
-    # Streaming dequantize is unsafe with tensorwise (current) FP8 scaling.
-    # The streaming planner does a BF16->FP8 ``copy_`` per slice; tensorwise
-    # recomputes the per-tensor scale from each slice's amax, so multi-shard
-    # destinations (e.g. resharded loads) end up with inconsistent scales
-    # across slices and the loaded weights are corrupted. Block-scaled
-    # recipes (mxfp8, blockwise, nvfp4) carry per-block scales and are
-    # unaffected. Force the upfront ``force_all_tensors_to_non_fp8`` path
-    # for tensorwise.
-    if args.fp8 and args.fp8_recipe == "tensorwise" and args.stream_ckpt_dequant:
-        warn_rank_0(
-            "--fp8-recipe=tensorwise is incompatible with the streaming "
-            "checkpoint dequantize path; falling back to the upfront "
-            "dequantize pass. Pass --no-stream-ckpt-dequant to silence "
-            "this warning."
-        )
-        args.stream_ckpt_dequant = False
-
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -2994,6 +2977,12 @@ def _add_distributed_args(parser):
                        default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
                        'values over the wire (using an all-to-all to keep total communication overhead in line '
                        'with the standard ring implementation) but performs accumulation locally in FP32.')
+    group.add_argument('--gtp-remat-reduce-scatter-with-fp32-accumulation', action='store_true',
+                       default=False, help='Same trade as --ddp-reduce-scatter-with-fp32-accumulation, but for '
+                       'the wgrad reduce-scatter GTP weight-remat performs over the gtp_remat axis: send '
+                       'low-precision values over the wire via an all-to-all and accumulate locally in FP32. '
+                       'Independent of the DDP flag (different collective, different process group). Costs one '
+                       'extra unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter.')
     group.add_argument('--ddp-param-name-patterns-for-fp32-local-accumulation', nargs='+', default=[],
                        help='List of param_name patterns (in Python\'s fnmatch format) to match against '
                        'to do local gradient accumulation in FP32. The special pattern \'all\' matches '
