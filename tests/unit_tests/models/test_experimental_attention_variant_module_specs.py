@@ -319,12 +319,14 @@ class TestGetDsaModuleSpec:
         with pytest.raises(AssertionError, match="qk_l2_norm is not supported"):
             get_dsa_module_spec_for_backend(cfg, backend=_make_backend())
 
-    def test_returns_mla_self_attention_spec(self):
-        """Verify the returned attention module is MLA self-attention with causal mask."""
-        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+    def test_returns_absorbed_mla_self_attention_spec(self):
+        """Verify the returned attention module is absorbed MLA with causal mask."""
+        from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+            AbsorbedMLASelfAttention,
+        )
 
         spec = self._call()
-        assert spec.module is MLASelfAttention
+        assert spec.module is AbsorbedMLASelfAttention
         assert spec.params == {"attn_mask_type": AttnMaskType.causal}
         assert spec.metainfo == {"fuse_input_layernorm": False}
 

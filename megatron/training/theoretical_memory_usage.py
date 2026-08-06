@@ -102,12 +102,26 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     attention_params = self_attn_term
     dense_mlp_params = 2 * args.hidden_size * args.ffn_hidden_size * gated_linear_multiplier
     shared_expert_params = 2 * args.hidden_size * shared_expert_ffn_hidden_size * gated_linear_multiplier
+    # Latent MoE projects tokens down before routed experts and projects them back after
+    # combine. Shared experts still operate on the full hidden dimension.
+    routed_expert_hidden_size = (
+        args.moe_latent_size if args.moe_latent_size is not None else args.hidden_size
+    )
     routed_expert_params = (
-        2 * args.hidden_size * moe_ffn_hidden_size * num_experts * gated_linear_multiplier
+        2 * routed_expert_hidden_size * moe_ffn_hidden_size * num_experts * gated_linear_multiplier
     )
     active_routed_expert_params = (
-        2 * args.hidden_size * moe_ffn_hidden_size * args.moe_router_topk * gated_linear_multiplier
+        2
+        * routed_expert_hidden_size
+        * moe_ffn_hidden_size
+        * args.moe_router_topk
+        * gated_linear_multiplier
         if args.num_experts is not None
+        else 0
+    )
+    latent_projection_params = (
+        2 * args.hidden_size * args.moe_latent_size
+        if args.num_experts is not None and args.moe_latent_size is not None
         else 0
     )
     layernorm_params = 2 * args.hidden_size * norm_size
@@ -129,6 +143,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         attention_params
         + shared_expert_params
         + routed_expert_params
+        + latent_projection_params
         + layernorm_params
         + router_params
         + shared_expert_gate_params
@@ -137,6 +152,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         attention_params
         + shared_expert_params
         + active_routed_expert_params
+        + latent_projection_params
         + layernorm_params
         + router_params
         + shared_expert_gate_params
@@ -202,7 +218,13 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     )
     replicated_params_in_transformer_block = (
         layernorm_params * num_dense_layers
-        + (layernorm_params + router_params + shared_expert_gate_params) * num_moe_layers
+        + (
+            layernorm_params
+            + latent_projection_params
+            + router_params
+            + shared_expert_gate_params
+        )
+        * num_moe_layers
         + final_layernorm
     )
     expert_sharded_params_in_transformer_block = routed_expert_params * num_moe_layers
@@ -212,7 +234,13 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     )
     replicated_params_in_mtp_block = (
         layernorm_params * mtp_num_dense_layers
-        + (layernorm_params + router_params + shared_expert_gate_params) * mtp_num_moe_layers
+        + (
+            layernorm_params
+            + latent_projection_params
+            + router_params
+            + shared_expert_gate_params
+        )
+        * mtp_num_moe_layers
     )
     expert_sharded_params_in_mtp_block = routed_expert_params * mtp_num_moe_layers
 

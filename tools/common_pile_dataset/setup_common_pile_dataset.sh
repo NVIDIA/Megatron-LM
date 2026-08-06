@@ -29,7 +29,7 @@ DATASET_NAME="common-pile/comma_v0.1_training_dataset"
 WORK_DIR="/tmp/mcore_dataset_setup_$$"
 
 # Redirect HuggingFace cache to lustre so it doesn't fill up /home
-export HF_HOME="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci/.hf_cache"
+export HF_HOME="/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci/hf_home"
 export HF_DATASETS_CACHE="${HF_HOME}/datasets"
 
 echo "============================================================"

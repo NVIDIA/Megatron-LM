@@ -1,36 +1,41 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import ast
+import builtins
 import dataclasses
-import typing
-import types
-from typing import Any, Callable, Optional
-from argparse import ArgumentParser, _ArgumentGroup, Namespace
+import enum
 import inspect
 import itertools
-import builtins
-import ast
-import enum
-from dataclasses import Field, fields
+import types
+import typing
 import warnings
-import torch.nn.functional as F
+from argparse import ArgumentParser, Namespace, _ArgumentGroup
+from dataclasses import Field, fields
+from typing import Any, Callable, Optional
+
 import torch
+import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
-
 from megatron.training.config import (
-    DistributedInitConfig, 
-    PretrainConfigContainer, 
-    SchedulerConfig, 
-    TokenizerConfig,
-    TrainingConfig, 
-    ValidationConfig, 
-    RNGConfig, 
+    CheckpointConfig,
+    DistributedInitConfig,
+    InferenceConfigContainer,
+    InferenceSetupConfig,
     LoggerConfig,
+    PretrainConfigContainer,
+    ProfilingConfig,
+    RerunStateMachineConfig,
+    RNGConfig,
+    SchedulerConfig,
     StragglerDetectionConfig,
-    RerunStateMachineConfig, CheckpointConfig, ProfilingConfig
+    TokenizerConfig,
+    TrainingConfig,
+    ValidationConfig,
 )
-from megatron.training.models import HybridModelConfig, GPTModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig
+
 # TODO: support arg renames
 
 class TypeInferenceError(Exception):
@@ -272,13 +277,13 @@ class ArgumentGroupFactory:
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
-    from megatron.core.transformer import MLATransformerConfig
-    from megatron.core.transformer.heterogeneous.heterogeneous_config import (
-        HeterogeneousTransformerConfig,
-    )
     from megatron.core.quantization.utils import (
         kitchen_quantization_recipe_config,
         load_quantization_recipe,
+    )
+    from megatron.core.transformer import MLATransformerConfig
+    from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+        HeterogeneousTransformerConfig,
     )
 
     # Config class.
@@ -367,8 +372,45 @@ def core_transformer_config_from_args(args, config_class=None):
     if hasattr(args, "kitchen_attention_backend"):
         kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
 
+    # Build config.
+    config = config_class(**kw_args)
+
+    _apply_yarn_config_from_args(config, args)
+
     # Return config.
-    return config_class(**kw_args)
+    return config
+
+
+def _apply_yarn_config_from_args(config, args) -> None:
+    """Populate ``config.yarn_*`` attributes from args for non-MLA YaRN models.
+
+    GPTModel's ``yarn`` branch and ``yarn_rotary_pos_embedding`` read these as
+    dynamic attributes off the config (``getattr(config, "yarn_rotary_scaling_factor")``
+    etc.) with no default, so the attributes must exist whenever
+    ``position_embedding_type == 'yarn'``. The CLI exposes some of these without a
+    ``yarn_`` prefix (``--rotary-scaling-factor``, ``--mscale``, ``--mscale-all-dim``),
+    so the mapping is explicit. Pre-existing values on ``config`` (e.g. from YAML or a
+    ModelOpt GPT-OSS builder) are preserved. Defaults mirror ``YarnRotaryEmbedding``.
+    """
+    if getattr(args, 'position_embedding_type', None) != 'yarn':
+        return
+    if getattr(args, 'multi_latent_attention', False):
+        # MLATransformerConfig declares the unprefixed YaRN fields and its
+        # attention path consumes them directly; do not shadow them here.
+        return
+
+    def _set(attr: str, value, default) -> None:
+        if hasattr(config, attr):
+            return
+        setattr(config, attr, value if value is not None else default)
+
+    _set('yarn_rotary_scaling_factor', args.rotary_scaling_factor, 1.0)
+    _set('yarn_original_max_position_embeddings', args.yarn_original_max_position_embeddings, 4096)
+    _set('yarn_beta_fast', args.yarn_beta_fast, 32.0)
+    _set('yarn_beta_slow', args.yarn_beta_slow, 1.0)
+    _set('yarn_mscale', args.mscale, 1.0)
+    _set('yarn_mscale_all_dim', args.mscale_all_dim, 0.0)
+    _set('yarn_correction_range_round_to_int', args.yarn_correction_range_round_to_int, True)
 
 
 def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
@@ -388,8 +430,16 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
         return kwargs
 
 
-def gpt_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
-    """Create a GPTModelConfig from the appropriate values in the `args` Namespace."""
+def gpt_config_from_args(
+    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = GPTModelConfig
+) -> Any:
+    """Create a GPTModelConfig (or a compatible subclass) from the `args` Namespace.
+
+    `model_config_cls` lets callers reuse this same arg-derivation logic for
+    subclasses that only override metadata (e.g. `builder`) and add no new fields,
+    such as `ModelOptModelConfig`.
+    """
+    assert issubclass(model_config_cls, GPTModelConfig)
 
     kwargs = {}
     if config is None:
@@ -405,7 +455,6 @@ def gpt_config_from_args(args: Namespace, config: TransformerConfig | None=None)
 
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = import_module(args.spec)
-
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["position_embedding_type"] = args.position_embedding_type
@@ -429,11 +478,19 @@ def gpt_config_from_args(args: Namespace, config: TransformerConfig | None=None)
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return GPTModelConfig(**kwargs)
-    
+    return model_config_cls(**kwargs)
 
-def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
-    """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""
+
+def hybrid_config_from_args(
+    args: Namespace, config: TransformerConfig | None = None, model_config_cls: type = HybridModelConfig
+) -> Any:
+    """Create a HybridModelConfig (or a compatible subclass) from the `args` Namespace.
+
+    `model_config_cls` lets callers reuse this same arg-derivation logic for
+    subclasses that only override metadata (e.g. `builder`) and add no new fields,
+    such as `ModelOptHybridModelConfig`.
+    """
+    assert issubclass(model_config_cls, HybridModelConfig)
 
     kwargs = {}
     if config is None:
@@ -448,7 +505,6 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=No
         ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
         kwargs["hybrid_stack_spec"] = import_module(args.spec)
-
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
@@ -472,7 +528,7 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=No
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
-    return HybridModelConfig(**kwargs)
+    return model_config_cls(**kwargs)
 
 
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
@@ -519,6 +575,65 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
+    )
+
+    return cfg
+
+
+def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
+    """Build an InferenceSetupConfig from the argparse arguments.
+
+    InferenceSetupConfig field names map one-to-one onto the argparse ``dest`` names produced
+    by ``_add_inference_args``, so this is a direct copy of the relevant values from ``args``.
+
+    This builds the declarative/serializable inference config. To obtain the runtime engine
+    config (``megatron.core.inference.config.InferenceConfig``), call
+    ``inference_cfg_from_args(args).to_inference_config(model, ...)``.
+    """
+    return _default_config_from_args(InferenceSetupConfig, args)
+
+
+def inference_cfg_container_from_args(
+    args: Namespace, model_cfg=None
+) -> InferenceConfigContainer:
+    """Build an InferenceConfigContainer from the argparse arguments.
+
+    This mirrors ``pretrain_cfg_container_from_args`` but assembles only the configs that
+    inference needs (no optimizer, scheduler, training, validation, DDP, rerun, or straggler
+    configs). It is intended to be passed to ``initialize_megatron`` from inference entry points.
+
+    Args:
+        args: Parsed and validated argparse namespace (e.g. from ``parse_and_validate_args``).
+        model_cfg: Optional pre-built model config. If None, a model config is constructed from
+            ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
+            GPTModelConfig).
+    """
+    if model_cfg is None:
+        if getattr(args, "hybrid_layer_pattern", None) is not None:
+            model_cfg = hybrid_config_from_args(args)
+        else:
+            model_cfg = gpt_config_from_args(args)
+
+    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
+    ckpt_kwargs["save_optim"] = not args.no_save_optim
+    ckpt_kwargs["save_rng"] = not args.no_save_rng
+    ckpt_kwargs["load_optim"] = not args.no_load_optim
+    ckpt_kwargs["load_rng"] = not args.no_load_rng
+    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
+    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
+
+    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
+    prof_kwargs["use_nsys_profiler"] = args.profile
+
+    cfg = InferenceConfigContainer(
+        model=model_cfg,
+        checkpoint=CheckpointConfig(**ckpt_kwargs),
+        inference=inference_cfg_from_args(args),
+        dist=_default_config_from_args(DistributedInitConfig, args),
+        rng=_default_config_from_args(RNGConfig, args),
+        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        logger=_default_config_from_args(LoggerConfig, args),
+        profiling=ProfilingConfig(**prof_kwargs),
     )
 
     return cfg

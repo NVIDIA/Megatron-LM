@@ -128,7 +128,8 @@ def set_global_variables(args, build_tokenizer=True):
         rank=args.rank,
         global_batch_size=args.global_batch_size,
         micro_batch_size=args.micro_batch_size,
-        data_parallel_size=args.data_parallel_size,
+        # Full DP x gtp_remat degree (args.data_parallel_size is the gtp_remat-excluded replicate).
+        data_parallel_size=args.data_parallel_size * args.gtp_weight_remat_size,
         decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
         step_batch_size_schedule=args.step_batch_size_schedule,
         seq_length=args.seq_length,

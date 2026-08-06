@@ -4,7 +4,7 @@ description: Bump the NVIDIA PyTorch base image (`nvcr.io/nvidia/pytorch:YY.MM-p
 license: Apache-2.0
 when_to_use: User wants to upgrade the PyTorch container (e.g. "bump base image to 26.04"); CI is failing after a previous bump because the GitLab pin was missed; functional tests are failing with `lm loss` / `num-zeros` / `iteration-time` drift right after a container bump; a functional test hangs, times out, or OOMs after a bump; the user mentions `.ngc_version.dev`, `nvcr.io/nvidia/pytorch`, "container base image", or "Update Docker image version".
 metadata:
-  author: Philip Petrakian <ppetrakian@nvidia.com>
+  author: Oliver Koenig <okoenig@nvidia.com>
 ---
 
 # Bump the PyTorch base image
