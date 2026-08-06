@@ -16,6 +16,7 @@
 
 from collections.abc import Callable
 from typing import Literal, cast
+from weakref import ReferenceType, ref
 
 import torch
 from torch import nn
@@ -36,7 +37,9 @@ class FsdpContext:
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
-    root_module: "FsdpModule"
+    # A context is owned by its FSDP module tree, so runtime backedges to modules
+    # must be weak; otherwise deleting the tree requires cyclic GC.
+    _root_module: ReferenceType["FsdpModule"]
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
@@ -50,7 +53,7 @@ class FsdpContext:
             device: Device on which this context schedules communication.
             root_module: Outermost module that owns this context.
         """
-        self.root_module = root_module
+        self._root_module = ref(root_module)
         self.is_last_microbatch = True
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
@@ -61,6 +64,10 @@ class FsdpContext:
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
+
+    def is_module_root(self, module: "FsdpModule") -> bool:
+        """Return whether ``module`` is this context's root module."""
+        return self._root_module() is module
 
     def register_post_backward_final_callback(self) -> None:
         """Register this root context's final callback for the current backward.
@@ -190,16 +197,26 @@ class FsdpModule:
 
     def is_root(self) -> bool:
         """Return whether this module is the outermost FsdpModule in its context."""
-        return self.context.root_module is self
+        return self.context.is_module_root(self)
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
-        module.register_forward_pre_hook(lambda _module, _args: self.pre_forward())
-        module.register_forward_hook(lambda _module, _args, _output: self.post_forward())
-        module.register_full_backward_pre_hook(lambda _module, _grad_output: self.pre_backward())
+        # Use PyTorch's callback module argument instead of capturing self so
+        # these hooks do not retain a deleted FSDP module.
+        module.register_forward_pre_hook(
+            lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
+        )
+        module.register_forward_hook(
+            lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
+        )
+        module.register_full_backward_pre_hook(
+            lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
+        )
         if self._num_trainable_parameters == 0:
             module.register_full_backward_hook(
-                lambda _module, _grad_input, _grad_output: self.post_backward()
+                lambda hooked_module, _grad_input, _grad_output: cast(
+                    FsdpModule, hooked_module
+                ).post_backward()
             )
             return
 
@@ -214,10 +231,15 @@ class FsdpModule:
                 fsdp_parameter.unsharded.register_post_accumulate_grad_hook(self._make_grad_hook())
 
     def _make_grad_hook(self) -> Callable[[nn.Parameter], None]:
+        module_ref = ref(self)
+
         def grad_hook(_parameter: nn.Parameter) -> None:
-            self._num_ready_grad_parameters += 1
-            if self._num_ready_grad_parameters == self._num_trainable_parameters:
-                self.post_backward()
+            module = module_ref()
+            if module is None:
+                return
+            module._num_ready_grad_parameters += 1
+            if module._num_ready_grad_parameters == module._num_trainable_parameters:
+                module.post_backward()
 
         return grad_hook
 
