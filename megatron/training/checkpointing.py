@@ -2669,7 +2669,7 @@ def load_checkpoint(
             # Optimizer state dict can overwrite per-group max_lr/min_lr values.
             # If scheduler override is requested, re-apply runtime lr bounds from
             # args so scheduler math does not stay pinned to checkpoint lr settings.
-            if getattr(args, 'override_opt_param_scheduler', False):
+            if getattr(args, "override_opt_param_scheduler", False):
                 if (
                     optimizer is None
                     or getattr(optimizer, "is_stub_optimizer", False)
@@ -2682,16 +2682,16 @@ def load_checkpoint(
                     )
                 else:
                     for param_group in optimizer.param_groups:
-                        if param_group.get('is_decoupled_lr', False):
-                            max_lr = getattr(args, 'decoupled_lr', None)
-                            min_lr = getattr(args, 'decoupled_min_lr', None)
+                        if param_group.get("is_decoupled_lr", False):
+                            max_lr = getattr(args, "decoupled_lr", None)
+                            min_lr = getattr(args, "decoupled_min_lr", None)
                         else:
                             max_lr = args.lr
                             min_lr = args.min_lr
                         if max_lr is not None:
-                            param_group['max_lr'] = max_lr
+                            param_group["max_lr"] = max_lr
                         if min_lr is not None:
-                            param_group['min_lr'] = min_lr
+                            param_group["min_lr"] = min_lr
                     # Synchronize scheduler num_steps with consumed_train_samples
                     # to ensure lr calculation is based on current training progress
                     if opt_param_scheduler.num_steps != args.consumed_train_samples:
