@@ -22,7 +22,9 @@ class TestSaveTokenizerAssets:
 
     @patch("torch.distributed.is_initialized")
     @patch("torch.distributed.get_rank")
-    def test_save_tokenizer_assets_none_tokenizer(self, mock_get_rank, mock_dist_init, checkpoint_path_fixture):
+    def test_save_tokenizer_assets_none_tokenizer(
+        self, mock_get_rank, mock_dist_init, checkpoint_path_fixture
+    ):
         """Test that function returns early when tokenizer is None."""
         mock_dist_init.return_value = False
 
@@ -38,7 +40,9 @@ class TestSaveTokenizerAssets:
 
     @patch("torch.distributed.is_initialized")
     @patch("torch.distributed.get_rank")
-    def test_save_tokenizer_assets_non_rank0(self, mock_get_rank, mock_dist_init, checkpoint_path_fixture):
+    def test_save_tokenizer_assets_non_rank0(
+        self, mock_get_rank, mock_dist_init, checkpoint_path_fixture
+    ):
         """Test that non-rank-0 processes don't save files."""
         mock_dist_init.return_value = True
         mock_get_rank.return_value = 1  # Not rank 0
@@ -90,7 +94,9 @@ class TestSaveTokenizerAssets:
     @patch("torch.distributed.is_initialized")
     @patch("torch.distributed.get_rank")
     @patch("megatron.training.checkpointing.logger")
-    def test_save_tokenizer_assets_gpt2bpe(self, mock_logger, mock_get_rank, mock_dist_init, checkpoint_path_fixture):
+    def test_save_tokenizer_assets_gpt2bpe(
+        self, mock_logger, mock_get_rank, mock_dist_init, checkpoint_path_fixture
+    ):
         """Test saving GPT2BPE tokenizer files (vocab + merges)."""
         mock_dist_init.return_value = False
 
@@ -119,7 +125,9 @@ class TestSaveTokenizerAssets:
     @patch("torch.distributed.is_initialized")
     @patch("torch.distributed.get_rank")
     @patch("megatron.training.checkpointing.logger")
-    def test_save_tokenizer_assets_bert(self, mock_logger, mock_get_rank, mock_dist_init, checkpoint_path_fixture):
+    def test_save_tokenizer_assets_bert(
+        self, mock_logger, mock_get_rank, mock_dist_init, checkpoint_path_fixture
+    ):
         """Test saving BERT tokenizer files."""
         mock_dist_init.return_value = False
 
@@ -143,7 +151,9 @@ class TestSaveTokenizerAssets:
     @patch("torch.distributed.is_initialized")
     @patch("torch.distributed.get_rank")
     @patch("megatron.training.checkpointing.logger")
-    def test_save_tokenizer_assets_tiktoken(self, mock_logger, mock_get_rank, mock_dist_init, checkpoint_path_fixture):
+    def test_save_tokenizer_assets_tiktoken(
+        self, mock_logger, mock_get_rank, mock_dist_init, checkpoint_path_fixture
+    ):
         """Test saving TikToken tokenizer files."""
         mock_dist_init.return_value = False
 
@@ -255,10 +265,7 @@ class TestSaveTokenizerAssets:
         with open(fake_model_path, "wb") as f:
             f.write(b"fake model data")
 
-        tokenizer_types = [
-            "SentencePieceTokenizer",
-            "GPTSentencePieceTokenizer",
-        ]
+        tokenizer_types = ["SentencePieceTokenizer", "GPTSentencePieceTokenizer"]
 
         for tokenizer_type in tokenizer_types:
             # Clear previous tokenizer directory
@@ -301,7 +308,9 @@ class TestSaveTokenizerAssets:
     @patch("torch.distributed.is_initialized")
     @patch("torch.distributed.get_rank")
     @patch("megatron.training.checkpointing.logger")
-    def test_save_tokenizer_assets_with_msc(self, mock_logger, mock_get_rank, mock_dist_init, mock_msc_feature):
+    def test_save_tokenizer_assets_with_msc(
+        self, mock_logger, mock_get_rank, mock_dist_init, mock_msc_feature
+    ):
         """Test saving tokenizer files with MultiStorageClient enabled."""
         mock_dist_init.return_value = False
         mock_msc_feature.is_enabled.return_value = True
