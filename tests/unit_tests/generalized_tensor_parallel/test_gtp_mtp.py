@@ -2,22 +2,21 @@
 
 """GTP weight-remat correctness with Multi-Token Prediction (MTP).
 
-MTP breaks an assumption the GTP prefetch/reduce-scatter machinery was built on: that every
-weight is consumed exactly once per forward, so backward visits the chain in exact reverse
-order. MTP re-uses the main model's embedding and output_layer (and, under
-``mtp_use_repeated_layer``, replays its own layer), which violates that in two ways:
+GTP's chain assumes one consume per weight per pass: one all-gather from its neighbour, one
+backward in reverse chain order. MTP consumes the shared embedding/output_layer once per
+prediction head, and under ``mtp_use_repeated_layer`` replays its own layer once per depth.
 
-  * ``output_layer`` runs once per prediction head (main + one per MTP depth), so its wgrad
-    reduce-scatter can still be in flight when the next wgrad arrives. ``_reduce_scatter``
-    re-uses the weight's ticket -- the SAME output buffer -- and only one handle is tracked,
-    so a later RS can overwrite an earlier result and silently drop a head's gradient.
-  * ``embedding`` is the chain head, but MTP re-embeds near the END of forward, so its backward
-    runs long before its chain successor (decoder layer 0) has issued any RS. The deferred
-    finalize must not assume the successor has one pending -- doing so read a never-reserved
-    ticket and raised ``KeyError: None``.
+Three ways that breaks:
 
-The first failure mode is SILENT (wrong gradients, no exception), which is why it needs a
-numeric guard rather than a smoke test.
+  * Forward -- consumes past the first get no all-gather of their own, so the GEMM reads
+    whatever the shared buffer last held.
+  * Backward -- a weight's reduce-scatters overlap. They share one ticket and one tracked
+    handle, so a later one overwrites an earlier result and drops a head's gradient.
+  * Backward -- a shared weight is reached far from its chain position, so the deferred
+    finalize cannot assume its successor has a reduce-scatter pending (``KeyError: None``).
+
+Only the third ever raised. The other two just train on wrong numbers, hence the numeric and
+accounting guards below rather than smoke tests.
 """
 
 import pytest
@@ -327,6 +326,97 @@ def _worker_runs_end_to_end(rank, world_size, port, repeated_layer=False, moe=Fa
         GTP_CONFIG.pad_for_alignment = saved_pad
 
 
+def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=False, moe=False):
+    """N consumes of a weight need N all-gathers, not the one its chain neighbour issues.
+
+    The neighbour runs once per pass; MTP consumes shared weights once per prediction head and
+    replays the MTP block once per depth. Extra consumes would ``cache.get()`` a stale buffer --
+    silently, since that keeps the loss finite and merely wrong.
+
+    So: tally all-gathers issued against consumes, and fail if a consume outruns its issues.
+    Behavioural, not structural, so it survives a redesign of how the prefetch is armed.
+
+    Does not cover the recompute chain (separate ``_recompute_*`` slots).
+    """
+    from collections import defaultdict
+
+    from megatron.core import parallel_state as ps
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
+    from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    P = GTPShardedParam
+    o_ag = P._all_gather_weight
+    o_get = P._get_prefetched_weight
+    o_ondemand = P._all_gather_weight_on_demand
+
+    # Keyed by (name, direction) rather than id(), which can be recycled onto another object.
+    issued, consumed, violations = defaultdict(int), defaultdict(int), []
+
+    # Signatures spelled out, not *args: a signature change should fail loudly, not mis-key.
+    def ag(self, async_op, fwd, nvtx_label=None):
+        issued[(self._debug_name, bool(fwd))] += 1
+        return o_ag(self, async_op, fwd, nvtx_label=nvtx_label)
+
+    def get_prefetched(self, fwd):
+        key = (self._debug_name, bool(fwd))
+        if consumed[key] >= issued[key]:
+            violations.append(
+                f"{self._debug_name} ({'fwd' if fwd else 'bwd'}): consume "
+                f"#{consumed[key] + 1} but only {issued[key]} all-gather(s) issued"
+            )
+        consumed[key] += 1
+        return o_get(self, fwd)
+
+    def on_demand(self, fwd):
+        # Issues its own AG then consumes it, so both tallies stay balanced on this path.
+        out = o_ondemand(self, fwd)
+        consumed[(self._debug_name, bool(fwd))] += 1
+        return out
+
+    saved_pad = GTP_CONFIG.pad_for_alignment
+    try:
+        GTP_CONFIG.pad_for_alignment = 0
+        P._all_gather_weight, P._get_prefetched_weight = ag, get_prefetched
+        P._all_gather_weight_on_demand = on_demand
+
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            gtp_remat_size=world_size,
+            **_expert_parallel_kwargs(moe, world_size),
+        )
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+
+        model = _build_mtp_gpt_model(repeated_layer, moe)
+        classify_gtp_remat_chains([model])
+        _forward_backward(model)
+        del model
+    finally:
+        # _run_distributed shares ONE process across tests: undo everything even on failure.
+        P._all_gather_weight = o_ag
+        P._get_prefetched_weight = o_get
+        P._all_gather_weight_on_demand = o_ondemand
+        GTP_CONFIG.pad_for_alignment = saved_pad
+        ps.destroy_model_parallel()
+        GTPShardedParam._chain_state = {}
+        GTPShardedParam._recompute_chain_state = {}
+        GTPShardedParam._link_tables_flushed = False
+
+    # Every rank asserts: the tallies are rank-local, so rank 0 alone could miss a violation.
+    repeats = {name: n for (name, _), n in consumed.items() if n > 1}
+    assert repeats, (
+        "no GTP weight was consumed more than once per pass, so this test would pass even with "
+        "the prefetch bug present -- check that MTP is still attached and GTP-sharded"
+    )
+    assert not violations, (
+        "a GTP weight was consumed without an all-gather issued for that consume, so the GEMM "
+        "read a stale shared buffer (silently wrong weights):\n  " + "\n  ".join(violations)
+    )
+
+
 def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False):
     """A weight consumed N times per forward fires DDP grad-ready N times, not once.
 
@@ -447,6 +537,20 @@ class TestGTPMTP:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_shared_weight_grads, 4, repeated_layer, moe)
+
+    @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+    @pytest.mark.parametrize("repeated_layer", [False, True])
+    def test_repeated_consume_gets_its_own_all_gather(self, repeated_layer, moe):
+        """A weight consumed N times per pass needs N all-gathers, not one.
+
+        The chain prefetches from a weight's neighbour, which runs once, so every consume past
+        the first used to read whatever the shared buffer last held. Guards a SILENT failure:
+        the stale buffer keeps the loss finite and merely wrong, and the in-tree state guard
+        that would catch it is disabled outside debug builds.
+        """
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_repeated_consume_all_gathers, 4, repeated_layer, moe)
 
     @pytest.mark.parametrize("repeated_layer", [False, True])
     def test_mtp_shared_weight_ddp_grad_ready_counts(self, repeated_layer):

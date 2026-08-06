@@ -1355,6 +1355,20 @@ class GTPShardedParam(torch.nn.Parameter):
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
+    def _prefetch_available(self) -> bool:
+        """True when an all-gather was actually issued for THIS consume (either direction).
+
+        A weight is prefetched by its chain neighbour -- predecessor in forward, successor in
+        backward -- so one pass of the chain issues one AG per weight. MTP with
+        --mtp-use-repeated-layer replays the MTP block once per depth while those neighbours run
+        only once, so the second consume has no AG of its own. Taking the prefetched path there
+        would cache.get() the previous AG's buffer: stale weights, silently, since the state
+        guard is compiled out unless check_param_states is on.
+
+        Falling back to an on-demand AG costs the overlap for that consume but keeps it correct.
+        """
+        return self._prefetch_handle is not None or getattr(self, "_already_ag_drained", False)
+
     def _get_prefetched_weight(self, fwd):
         # Stale-read guard: state must reflect an AG issued for this cycle;
         # otherwise cache.get() would return the prior iter's AG buffer.
@@ -1447,7 +1461,7 @@ class GTPShardedParam(torch.nn.Parameter):
         if not type(self)._link_tables_flushed:
             type(self).flush_link_tables()
 
-        if GTP_CONFIG.weight_prefetch and self.next_w is not None:
+        if GTP_CONFIG.weight_prefetch and self.next_w is not None and self._prefetch_available():
             result = self._get_prefetched_weight(False)
         else:
             result = self._all_gather_weight_on_demand(False)
@@ -1497,7 +1511,12 @@ class GTPShardedParam(torch.nn.Parameter):
         # Consume current weight.
         if use_recompute_chain and self._recompute_prev is not None:
             result = self._get_recompute_prefetched_weight()
-        elif not in_recompute and GTP_CONFIG.weight_prefetch and self.prev_w is not None:
+        elif (
+            not in_recompute
+            and GTP_CONFIG.weight_prefetch
+            and self.prev_w is not None
+            and self._prefetch_available()
+        ):
             result = self._get_prefetched_weight(True)
         else:
             # On-demand: chain head (fwd or recompute global-first) or first-iter build.
