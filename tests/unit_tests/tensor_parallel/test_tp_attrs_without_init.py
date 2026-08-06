@@ -96,12 +96,18 @@ def test_copy_tensor_model_parallel_attributes_preserves_qkv_split_shapes():
     source = torch.empty(4, 4)
     destination = torch.empty_like(source)
     source.is_qkv = True
-    source.qkv_split_shapes = [256, 64, 64]
+    source.qkv_split_shapes = [2, 2]
+    source.qkv_split_shapes_global = [2] * 4
+    source.qkv_split_groups_are_complete = True
+    source.qkv_split_heads_are_complete = True
 
     copy_tensor_model_parallel_attributes(destination, source)
 
     assert destination.is_qkv is True
     assert destination.qkv_split_shapes == source.qkv_split_shapes
+    assert destination.qkv_split_shapes_global == source.qkv_split_shapes_global
+    assert destination.qkv_split_groups_are_complete is True
+    assert destination.qkv_split_heads_are_complete is True
 
 
 def test_copy_gtp_attributes_preserves_pad_length():
