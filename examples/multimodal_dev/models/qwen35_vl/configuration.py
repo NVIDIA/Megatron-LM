@@ -141,6 +141,11 @@ def get_qwen35_vl_vision_config(
 # Language config variants
 # ---------------------------------------------------------------------------
 
+# ``num_layers`` below counts *Qwen transformer blocks* (one attention + one
+# MLP each), which is what the HuggingFace releases report.  The decoder is a
+# ``HybridModel``, whose ``num_layers`` counts pattern symbols instead — one
+# per attention layer AND one per MLP layer — so the block count is doubled in
+# ``get_qwen35_vl_language_config`` below.  Keep this dict in block units.
 _VARIANT_CONFIGS = {
     "0.8b": {
         "num_layers": 24,
@@ -281,8 +286,14 @@ def get_qwen35_vl_language_config(
 ) -> TransformerConfig:
     """TransformerConfig for the Qwen3.5-VL language decoder.
 
+    The decoder is a ``HybridModel``, so ``num_layers`` on the returned config
+    is the hybrid *layer* count (two per Qwen transformer block: one attention
+    layer plus one MLP layer) and must match the length of the
+    ``--hybrid-layer-pattern`` used to build the model.
+
     The ``397b_a17b`` variant reproduces the MIMO
-    ``get_qwen35_language_model_config()`` output exactly.
+    ``get_qwen35_language_model_config()`` output exactly, except for this
+    doubled ``num_layers``.
 
     Args:
         variant: One of ``0.8b``, ``2b``, ``4b``, ``9b``, ``27b``,
@@ -302,8 +313,9 @@ def get_qwen35_vl_language_config(
     v = _VARIANT_CONFIGS[variant]
 
     kwargs = dict(
-        # Architecture
-        num_layers=v["num_layers"],
+        # Architecture. HybridModel counts one layer per pattern symbol, so each
+        # Qwen block ('G'/'*' plus '-'/'E') contributes two layers.
+        num_layers=2 * v["num_layers"],
         hidden_size=v["hidden_size"],
         ffn_hidden_size=v["ffn_hidden_size"],
         num_attention_heads=v["num_attention_heads"],

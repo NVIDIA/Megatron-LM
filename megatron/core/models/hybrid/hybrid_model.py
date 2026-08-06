@@ -10,7 +10,10 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+    MultimodalRotaryEmbedding,
+    RotaryEmbedding,
+)
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -87,8 +90,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             parallel ranks. Defaults to True.
         share_embeddings_and_output_weights (bool, optional): When True, input embeddings and
             output logit weights are shared. Defaults to False.
-        position_embedding_type (Literal[learned_absolute,rope,yarn,none], optional):  Position
-            embedding type. Defaults to 'none'.
+        position_embedding_type (Literal[learned_absolute,rope,mrope,yarn,none], optional):
+            Position embedding type. Defaults to 'none'.
         rotary_percent (float, optional): Percent of rotary dimension to use for rotary position
             embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
         rotary_base (int, optional): Base period for rotary position embeddings. Ignored unless
@@ -116,7 +119,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         # Mamba with no attention has no need for position embeddings, so none is default
-        position_embedding_type: Literal['learned_absolute', 'rope', 'yarn', 'none'] = 'none',
+        position_embedding_type: Literal[
+            'learned_absolute', 'rope', 'mrope', 'yarn', 'none'
+        ] = 'none',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         scatter_embedding_sequence_parallel: bool = True,
@@ -149,6 +154,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.position_embedding_type = position_embedding_type
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
+        self._fused_mrope_available = False
 
         # Backward compatibility for deprecated hybrid parameters
         if hybrid_override_pattern is not None:
@@ -272,6 +278,26 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
+        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+            self.rotary_pos_emb = MultimodalRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                interleaved_mrope=self.config.mrope_interleaved,
+            )
+            self.mrope_section = self.config.mrope_section
+            assert (
+                self.mrope_section is not None
+            ), "mrope require mrope_section setting, but we got None from TransformerConfig"
+            if self.config.apply_rope_fusion and not self.config.rotary_interleaved:
+                try:
+                    from megatron.core.fusions.fused_mrope import is_fused_mrope_available
+
+                    self._fused_mrope_available = is_fused_mrope_available()
+                except ImportError:
+                    self._fused_mrope_available = False
         self.decoder = build_module(
             hybrid_stack_spec,
             self.config,
@@ -494,6 +520,29 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
             )
+        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+            if not InferenceMode.is_active() or not self.config.flash_decode:
+                packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                in_inference = in_inference_mode or inference_context is not None
+                use_raw_mrope_freqs = (
+                    self.config.apply_rope_fusion
+                    and not self.config.rotary_interleaved
+                    and not self.config.fused_single_qkv_rope
+                    and not in_inference
+                )
+                use_fused_mrope = use_raw_mrope_freqs and self._fused_mrope_available
+                rotary_pos_emb = self.rotary_pos_emb(
+                    position_ids,
+                    self.mrope_section,
+                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    return_raw_freqs=use_fused_mrope,
+                    packed_seq=packed_seq,
+                )
+            else:
+                raise NotImplementedError(
+                    "Flash decoding uses precomputed cos and sin for RoPE, not implemented in "
+                    "MultimodalRotaryEmbedding yet."
+                )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
         # reference held by this caller function, enabling early garbage collection

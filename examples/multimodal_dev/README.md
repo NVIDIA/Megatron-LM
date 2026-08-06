@@ -14,12 +14,12 @@ multimodal_dev/
 │   └── mock.py              # Mock dataset for end-to-end testing
 ├── models/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
-│   ├── base.py              # MultimodalModel base class (vision encoder + GPTModel)
+│   ├── base.py              # MultimodalModel base class (vision encoder + HybridModel)
 │   └── qwen35_vl/           # Qwen3.5-VL architecture
 │       ├── factory.py       # Factory functions for pretrain entry point
 │       ├── model.py         # Qwen35VLModel (MRoPE, vision encoder wiring)
 │       ├── configuration.py # TransformerConfig builders and constants
-│       ├── specs.py         # Layer spec builders (hybrid attention, ViT)
+│       ├── specs.py         # Vision layer spec builders
 │       ├── mrope.py         # 3D MRoPE position ID computation
 │       └── vision_encoder.py# ViT encoder (patch embed, merger, RoPE)
 └── scripts/                 # Launch scripts (torchrun, Slurm)
@@ -31,8 +31,49 @@ multimodal_dev/
 torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
     --model-arch qwen35_vl \
     --dataset-provider mock \
-    ... # other Megatron args (--num-layers, --hidden-size, etc.)
+    --hybrid-layer-pattern GEGEGE*E/*E \
+    ... # other Megatron args (--hidden-size, etc.)
 ```
+
+## HybridModel decoder
+
+`multimodal_dev` uses `HybridModel` for the Qwen3.5-VL language decoder.
+The unified `--hybrid-layer-pattern` is required. It replaces `--num-layers`
+and the GPTModel-specific implicit in-layer attention/MLP ordering. The Qwen
+launcher still declares `--experimental-attention-variant gated_delta_net`
+and `--linear-attention-freq 4` so `TransformerConfig` validates the GDN
+dimensions and related runtime constraints.
+
+Each historical Qwen transformer block becomes two HybridModel layers:
+
+- `G-` / `GE`: GatedDeltaNet followed by dense MLP / MoE.
+- `*-` / `*E`: full attention followed by dense MLP / MoE.
+- Qwen3.5's four-block cadence is `G-G-G-*-` for dense variants and
+  `GEGEGE*E` for MoE variants.
+- MTP patterns follow `/`; one Qwen MTP depth repeats the last block — `/*-`
+  or `/*E` at the usual depths — because the former GPT path replicated the
+  final transformer layer.
+
+The supplied `scripts/run_qwen35_vl.sh` derives this pattern from
+`NUM_LAYERS`, `NUM_EXPERTS`, and `MTP_NUM_LAYERS`. A `NUM_LAYERS` that is not
+a multiple of 4 leaves trailing GatedDeltaNet blocks (and a `/G-` or `/GE` MTP
+depth), which is what `--linear-attention-freq 4` produced on the GPT path, so
+shallow proxy runs keep working.
+
+### Existing checkpoints
+
+The decoder checkpoint layout changes when moving from GPTModel to
+HybridModel: one GPT decoder layer is split across two Hybrid decoder layer
+indices, the final norm key changes, and Hybrid MTP uses a nested HybridStack.
+Therefore an existing GPTModel-format Qwen3.5-VL checkpoint is not directly
+loadable by this path.
+
+`tools/checkpoint/gpt_hybrid_conversion.py` is not currently sufficient for
+Qwen3.5-VL because it explicitly rejects GDN (`G`) and MTP checkpoints. Use a
+checkpoint exported directly for the HybridModel layout, or extend the
+converter with Qwen-specific GDN and MTP key mapping and validate logits before
+resuming training. `CKPT_LOAD` in the launch script must point to a
+HybridModel-format checkpoint.
 
 ## Checkpoint Conversion (HF → Megatron-FSDP DTensor)
 
@@ -147,16 +188,12 @@ def set_vision_flops_metadata(args, language_config, vision_config):
 def build_model(args, language_config, vision_config, **kwargs):
     """(Required) Build and return the complete model instance."""
     from .model import LlavaNextModel
-    from .specs import get_llava_next_language_spec
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 
-    language_spec = get_llava_next_language_spec(
-        config=language_config,
-        vp_stage=kwargs.get("vp_stage", None),
-        pp_rank=None,
-    )
     return LlavaNextModel(
         language_config=language_config,
-        language_spec=language_spec,
+        hybrid_stack_spec=hybrid_stack_spec,
+        hybrid_layer_pattern=args.hybrid_layer_pattern,
         vision_config=vision_config,
         # ... model-specific args
     )

@@ -17,6 +17,7 @@ from megatron.core.inference.contexts.dynamic_context import DynamicInferenceCon
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.common.embeddings.rotary_pos_embedding import MultimodalRotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.hybrid.hybrid_block import (
     HybridStack,
@@ -91,6 +92,33 @@ def test_hybrid_logging_process_groups_are_paired():
         _hybrid_logging_pg_kwargs(SimpleNamespace(tp=tp_group, dp_cp=None))
     with pytest.raises(ValueError, match="tp.*dp_cp"):
         _hybrid_logging_pg_kwargs(SimpleNamespace(tp=None, dp_cp=dp_cp_group))
+
+
+def test_hybrid_model_constructor_with_mrope():
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mrope_section=[2, 3, 3],
+            mrope_interleaved=True,
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="*-",
+            position_embedding_type="mrope",
+            rotary_percent=0.25,
+        )
+
+        assert isinstance(model.rotary_pos_emb, MultimodalRotaryEmbedding)
+        assert model.mrope_section == [2, 3, 3]
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(

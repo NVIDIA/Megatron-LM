@@ -54,7 +54,7 @@ class HybridModelConfig(ModelConfig):
     hybrid_layer_pattern: str | None = None
     seq_length: int = 8192
     # HybridModel with no attention has no need for position embeddings, so none is default
-    position_embedding_type: Literal["learned_absolute", "rope", "none"] = "none"
+    position_embedding_type: Literal["learned_absolute", "rope", "mrope", "yarn", "none"] = "none"
     rotary_percent: float = 1.0
     rotary_base: int = 10000
     seq_len_interpolation_factor: float | None = None

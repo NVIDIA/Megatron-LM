@@ -2,7 +2,7 @@
 
 """Base multimodal model for FSDP + EP training.
 
-Composes a vision encoder and a ``GPTModel`` language decoder.  Designed
+Composes a vision encoder and a ``HybridModel`` language decoder.  Designed
 for FSDP + EP: always builds the **full** model on every rank (no PP
 flags).  PP support is only available through the MIMO ``MimoModel``
 assembly path.
@@ -18,7 +18,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.gpt import GPTModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -82,13 +82,14 @@ def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
 class MultimodalModel(MegatronModule):
     """Base class for multimodal vision-language models.
 
-    Composes a pre-constructed vision encoder and a ``GPTModel`` language
+    Composes a pre-constructed vision encoder and a ``HybridModel`` language
     decoder.  Designed for FSDP + EP; always builds the full model on
     every rank.
 
     Args:
         language_config: ``TransformerConfig`` for the language decoder.
-        language_spec: ``ModuleSpec`` for decoder transformer layers.
+        hybrid_stack_spec: ``ModuleSpec`` defining HybridModel layer families.
+        hybrid_layer_pattern: Ordered HybridModel decoder and MTP layer pattern.
         vision_encoder: Pre-constructed vision encoder module.
         vocab_size: Language model vocabulary size.
         max_sequence_length: Maximum sequence length.
@@ -96,8 +97,6 @@ class MultimodalModel(MegatronModule):
         position_embedding_type: Position embedding type for the decoder.
         rotary_percent: Fraction of hidden dim for RoPE.
         rotary_base: Base frequency for RoPE.
-        mrope_section: MRoPE channel sections.
-        mtp_block_spec: Optional MTP block spec.
         parallel_output: Keep outputs split across TP ranks.
         share_embeddings_and_output_weights: Tie input/output embeddings.
     """
@@ -105,7 +104,8 @@ class MultimodalModel(MegatronModule):
     def __init__(
         self,
         language_config: TransformerConfig,
-        language_spec: ModuleSpec,
+        hybrid_stack_spec: ModuleSpec,
+        hybrid_layer_pattern: str,
         vision_encoder: MegatronModule,
         vocab_size: int,
         max_sequence_length: int,
@@ -113,8 +113,6 @@ class MultimodalModel(MegatronModule):
         position_embedding_type: str = "rope",
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
-        mrope_section: Optional[list] = None,
-        mtp_block_spec: Optional[ModuleSpec] = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
     ):
@@ -123,11 +121,12 @@ class MultimodalModel(MegatronModule):
         self.image_token_id = image_token_id
 
         self.vision_model = vision_encoder
-        self.language_model = GPTModel(
+        self.language_model = HybridModel(
             config=language_config,
-            transformer_layer_spec=language_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=vocab_size,
             max_sequence_length=max_sequence_length,
+            hybrid_layer_pattern=hybrid_layer_pattern,
             pre_process=True,
             post_process=True,
             parallel_output=parallel_output,
@@ -135,7 +134,6 @@ class MultimodalModel(MegatronModule):
             position_embedding_type=position_embedding_type,
             rotary_percent=rotary_percent,
             rotary_base=rotary_base,
-            mtp_block_spec=mtp_block_spec,
         )
 
     def set_input_tensor(self, input_tensor):

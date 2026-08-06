@@ -667,6 +667,8 @@ def test_vision_rope_wrapper_forwards_max_seqlen_to_thd(monkeypatch):
     config = SimpleNamespace(
         rotary_interleaved=False,
         multi_latent_attention=False,
+        mrope_section=None,
+        apply_rope_fusion=False,
     )
     t = torch.zeros(6, 2, 8, dtype=torch.bfloat16)
     freqs = torch.zeros(3, 1, 1, 8, dtype=torch.float32)
