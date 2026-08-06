@@ -564,6 +564,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         placements = Placements(
             dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
         )
+        # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
+        # without symmetric memory: it uses ncclCommRegister rather than the more performant
+        # ncclCommWindowRegister:
+        # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
+        use_symm_mem = ddp_config.nccl_ub
         with fully_shard_context(device=device):
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -576,9 +581,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         mesh=mesh,
                         placements=placements,
                         mixed_precision_policy=self.mp_policy,
+                        use_symm_mem=use_symm_mem,
                     )
             fully_shard(
-                module, mesh=mesh, placements=placements, mixed_precision_policy=self.mp_policy
+                module,
+                mesh=mesh,
+                placements=placements,
+                mixed_precision_policy=self.mp_policy,
+                use_symm_mem=use_symm_mem,
             )
         super().__init__(config=config, module=module)
 
@@ -642,12 +652,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError(
                 "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."
             )
-        if ddp_config.num_distributed_optimizer_instances != 1:
-            raise ValueError("MFSDP v2 does not currently support HSDP.")
         if ddp_config.outer_dp_sharding_strategy != "no_shard":
             raise ValueError("MFSDP v2 does not currently support outer DP sharding.")
-        if ddp_config.overlap_grad_reduce or ddp_config.overlap_param_gather:
-            raise ValueError("MFSDP v2 does not currently support communication overlap modes.")
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss:
@@ -657,16 +663,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if config.cuda_graph_impl != "none" or ddp_config.megatron_fsdp_cuda_graph_mode:
             raise ValueError("MFSDP v2 does not currently support CUDA graphs.")
 
-        if ddp_config.fsdp_double_buffer:
-            raise ValueError("MFSDP v2 does not support fsdp_double_buffer.")
         if ddp_config.fsdp_db_use_persist_buf_on_alloc_fail:
-            raise ValueError("MFSDP v2 does not support fsdp_db_use_persist_buf_on_alloc_fail.")
-        if ddp_config.fsdp_all_gather_in_start_param_sync:
-            raise ValueError("MFSDP v2 does not support fsdp_all_gather_in_start_param_sync.")
-        if ddp_config.nccl_ub:
-            raise ValueError("MFSDP v2 does not support nccl_ub.")
-        if ddp_config.disable_symmetric_registration:
-            raise ValueError("MFSDP v2 does not support disable_symmetric_registration.")
+            raise ValueError(
+                "MFSDP v2 does not support fsdp_db_use_persist_buf_on_alloc_fail: "
+                "it allocates communication buffers from PyTorch memory pools."
+            )
+        if ddp_config.nccl_ub and ddp_config.disable_symmetric_registration:
+            raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
         if ddp_config.delay_wgrad_compute:

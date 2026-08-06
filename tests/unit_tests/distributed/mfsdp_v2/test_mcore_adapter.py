@@ -7,6 +7,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -73,7 +74,6 @@ class TestMcoreAdapter:
                 data_parallel_sharding_strategy="optim_grads_params",
                 megatron_fsdp_main_params_dtype=torch.float32,
                 megatron_fsdp_main_grads_dtype=torch.float32,
-                fsdp_all_gather_in_start_param_sync=False,
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer],
@@ -99,6 +99,40 @@ class TestMcoreAdapter:
         }
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
+
+    def test_nccl_ub_enables_symmetric_memory(self, monkeypatch):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+            device="cuda", dtype=config.params_dtype
+        )
+        fully_shard_calls = []
+        original_fully_shard = mcore_fsdp_adapter.fully_shard
+
+        def record_fully_shard(*args, **kwargs):
+            fully_shard_calls.append(kwargs["use_symm_mem"])
+            return original_fully_shard(*args, **kwargs)
+
+        monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard", record_fully_shard)
+        FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                data_parallel_sharding_strategy="optim_grads_params",
+                nccl_ub=True,
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert fully_shard_calls == [True]
 
     def test_build_train_and_step(self):
         config = TransformerConfig(
@@ -128,7 +162,6 @@ class TestMcoreAdapter:
                 data_parallel_sharding_strategy="optim_grads_params",
                 megatron_fsdp_main_params_dtype=torch.float32,
                 megatron_fsdp_main_grads_dtype=torch.bfloat16,
-                fsdp_all_gather_in_start_param_sync=False,
             ),
             module=model,
             pg_collection=self.pg_collection,
