@@ -26,6 +26,17 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 logger = logging.getLogger(__name__)
 
+# Score-buffer sizing contract for the fused cuDNN indexer kernel. Widths are
+# quantized to _KV_BOUND_QUANTUM so the set of distinct (max_seqlen_q, max_seqlen_kv)
+# shapes stays tiny (the kernel JIT-compiles and reallocates its fp32 score buffer per
+# shape). The ceiling encodes an EMPIRICAL kernel property: a tight score width
+# narrower than the declared per-sequence KV length is only safe up to
+# _KV_TIGHT_WIDTH_CEILING columns (wider tight values hit an illegal memory access; a
+# width equal to the declared per-sequence length is always fine). Revisit both if the
+# kernel contract changes.
+_KV_BOUND_QUANTUM = 8192
+_KV_TIGHT_WIDTH_CEILING = 65536
+
 
 def _all_gather_rows(x, l_local, cp_group, cp_size):
     """AllGather x[l_local, D] across the CP group -> [cp_size*l_local, D] (global-row order)."""
@@ -110,7 +121,14 @@ def _a2a_meta(cp_group, cp_size, l_local):
     return meta
 
 
-def _a2a_buf(tag, rows, width, dtype, dev, cp_group):
+def _a2a_buf(tag, rows, width, dtype, dev, cp_group, persistent=True):
+    if not persistent:
+        # S-sized fallback buffers: allocate transiently. In eager the caching
+        # allocator reuses the block; under capture the allocation comes from the
+        # graph's private pool, which already guarantees a stable address across
+        # replays — caching a pool-owned tensor in this process-global dict would
+        # instead risk a dangling pointer if that graph is ever re-recorded.
+        return torch.empty((rows, width), dtype=dtype, device=dev)
     key = (tag, _group_key(cp_group), rows, width, dtype)
     buf = _A2A_BUF.get(key)
     if buf is None:
@@ -177,10 +195,10 @@ def dispatch_chunks_async(
     cp_group,
     cp_size,
     l_local,
-    max_seqlen_q=None,
     config=None,
     use_fused=True,
     multi_seq=False,
+    layout_cache=None,
 ):
     """Issue the chunk dispatch as early as possible; returns an opaque handle.
 
@@ -196,8 +214,33 @@ def dispatch_chunks_async(
     q2 = indexer_qr.reshape(-1, q_lora)
     w2 = weights_indexer_cp.reshape(-1, n_heads)
     if config is not None and _use_zigzag(multi_seq, cp_size, l_local, use_fused, config):
-        # Per-sequence zigzag path: static-shape AllGather; row selection happens on device
-        # from cu_seqlens at consume time (CUDA-graph friendly with per-iteration packs).
+        plan = layout_cache.get(("zigzag", cp_group.rank())) if layout_cache else None
+        if plan is not None and "disp_send_rows" in plan and q2.dtype == w2.dtype:
+            # Route-A2A dispatch (PR #5664-style prebuilt exchange): each rank sends and
+            # receives only ~l_local rows instead of the S-row AllGather. Splits are host
+            # ints prebuilt at data-prep time, so the exchange is CUDA-graph capturable.
+            width = q_lora + n_heads
+            payload = _a2a_buf("zzr_pay", l_local, width, q2.dtype, q2.device, cp_group)
+            payload[:, :q_lora].copy_(q2)
+            payload[:, q_lora:].copy_(w2)
+            send = _a2a_buf("zzr_send", l_local, width, q2.dtype, q2.device, cp_group)
+            # copy_(index_select(...)) instead of index_select(out=...): the staging
+            # buffer picks up requires_grad from the copy_ of q2/w2, and out= variants
+            # reject autograd-tracked inputs. Gradients never flow through the dispatch.
+            send.copy_(torch.index_select(payload, 0, plan["disp_send_rows"]))
+            recv = _a2a_buf("zzr_recv", l_local, width, q2.dtype, q2.device, cp_group)
+            work = dist.all_to_all_single(
+                recv,
+                send,
+                output_split_sizes=plan["disp_out_splits"],
+                input_split_sizes=plan["disp_in_splits"],
+                group=cp_group,
+                async_op=True,
+            )
+            return {"kind": "zzr", "works": [work], "recv": recv, "plan": plan, "q_lora": q_lora}
+        # Fallback: static-shape AllGather; row selection happens on device from
+        # cu_seqlens at consume time (CUDA-graph friendly with per-iteration packs).
+        _warn_allgather_fallback()
         if q2.dtype == w2.dtype:
             width = q_lora + n_heads
             payload = _a2a_buf("zz_qw", l_local, width, q2.dtype, q2.device, cp_group)
@@ -236,6 +279,23 @@ def dispatch_chunks_async(
         async_op=True,
     )
     return {"kind": "a2a", "meta": meta, "works": [work], "recvs": [recv], "q_lora": q_lora}
+
+
+_AG_FALLBACK_WARNED = False
+
+
+def _warn_allgather_fallback():
+    """One-time heads-up that the heavy AllGather zigzag fallback engaged (eager only)."""
+    global _AG_FALLBACK_WARNED
+    if _AG_FALLBACK_WARNED or torch.cuda.is_current_stream_capturing():
+        return
+    _AG_FALLBACK_WARNED = True
+    logger.warning(
+        "balanced CP indexer: no prebuilt zigzag plan for this pack; using the S-row "
+        "AllGather dispatch/combine fallback (correct, but heavier than the routed "
+        "exchange). Call prebuild_balanced_layouts from the data step (see "
+        "pretrain_gpt.get_batch) to enable the ~l_local-row A2A routes."
+    )
 
 
 def _dispatch_wait(handle, meta):
@@ -285,12 +345,16 @@ def _alltoall_combine(tk_head, tk_tail, meta, cp_group):
 
 
 def _all_gather_rows_buf(x, l_local, cp_group, cp_size, tag):
-    """AllGather into a persistent buffer (async): returns (work, gathered[cp_size*l_local, D])."""
+    """AllGather into a buffer (async): returns (work, gathered[cp_size*l_local, D]).
+
+    The l_local-sized send stage stays cached; the S-sized receive buffer is always
+    transient (see ``_a2a_buf``).
+    """
     D = x.shape[-1]
     x2 = x.reshape(l_local, D)
     send = _a2a_buf(tag + "_agsend", l_local, D, x2.dtype, x.device, cp_group)
     send.copy_(x2)
-    g = _a2a_buf(tag + "_agrecv", cp_size * l_local, D, x2.dtype, x.device, cp_group)
+    g = _a2a_buf(tag + "_agrecv", cp_size * l_local, D, x2.dtype, x.device, cp_group, persistent=False)
     work = dist.all_gather_into_tensor(g, send, group=cp_group, async_op=True)
     return work, g
 
@@ -315,11 +379,10 @@ def _use_zigzag(multi_seq, cp_size, l_local, use_fused, config):
         verdict = False
     elif not use_fused:
         verdict = False
-    elif not multi_seq:
-        # Single full-pack sequence: the per-sequence zigzag degenerates to the global
-        # folding, whose static all_to_all is cheaper — keep the fast path.
-        verdict = False
     if verdict is None:
+        # Unified path: single-full-pack sequences are the nseg==1 special case of the
+        # per-sequence zigzag (identical chunks to the global folding), served by the same
+        # plan/route machinery with per-call tight compressed-K bounds (K-slice general).
         pad = getattr(config, "pad_packed_seq_alignment", None)
         verdict = isinstance(pad, int) and pad % (2 * cp_size) == 0 and (l_local % 2 == 0)
     if os.environ.get("MCORE_DSA_CP_BAL_DEBUG") == "1" and not getattr(
@@ -564,24 +627,21 @@ def balanced_compute_cp_indexer_topk(
         # lengths inside the chunk are ``<= sz``.
         mq = min(int(max_seqlen_q), sz)
         gkv = max(1, int(max_seqlen_q) // int(ratio))
-        # Exact causal need for this chunk, rounded UP to a multiple of 8192. Rounding up is
-        # always safe (the kernel's block count is clamped by the true per-sequence KV length,
-        # so extra columns are never written or read), and it keeps the set of distinct widths
-        # tiny: the fused kernel JIT-compiles per (max_seqlen_q, max_seqlen_kv) pair and
-        # reallocates the score buffer per shape, so unquantized widths would trigger
-        # recompilation whenever varlen packs change max_seqlen_q between iterations.
+        # Exact causal need for this chunk, rounded UP to the shared width quantum
+        # (see _KV_BOUND_QUANTUM/_KV_TIGHT_WIDTH_CEILING at module scope for the
+        # kernel contract). Rounding up is always safe: the kernel's block count is
+        # clamped by the true per-sequence KV length, so extra columns are never
+        # written or read.
         bound = min(gkv, (gs + sz) // int(ratio))
-        bound_q = max(8192, (bound + 8191) // 8192 * 8192)
-        # Empirical kernel guard: score widths narrower than the declared per-sequence KV
-        # length are only safe up to 65536 columns on the cuDNN indexer kernel (wider tight
-        # values hit an illegal memory access; a width equal to the declared per-sequence
-        # length is always fine). Beyond 64K, a single-full-pack sequence instead scores
-        # against a sliced K prefix with a synthetic [0, bound] layout, so width == declared
-        # length (the reference call's contract shape) at any size; multi-sequence packs
-        # fall back to the full width.
+        q_ = _KV_BOUND_QUANTUM
+        bound_q = max(q_, (bound + q_ - 1) // q_ * q_)
+        # Beyond the tight-width ceiling, a single-full-pack sequence instead scores
+        # against a sliced K prefix with a synthetic [0, bound] layout, so width ==
+        # declared length (the reference call's contract shape) at any size;
+        # multi-sequence packs fall back to the full width.
         k_pass = k_seq_major
         layout_pass = _layout_at(gs, sz)
-        if bound_q <= 65536:
+        if bound_q <= _KV_TIGHT_WIDTH_CEILING:
             mkv = bound_q
         elif single_full_seq:
             mkv = min(bound_q, comp)
@@ -616,7 +676,7 @@ def balanced_compute_cp_indexer_topk(
         return _chunk_topk(indexer_qr, weights_indexer_cp, int(global_start), l_local), layout
 
     zz = (
-        dispatch_handle.get("kind") in ("ag", "ag2")
+        dispatch_handle.get("kind") in ("ag", "ag2", "zzr")
         if dispatch_handle is not None
         else (
             dispatch != 'hybridep' and _use_zigzag(multi_seq, cp_size, l_local, use_fused, config)
@@ -624,14 +684,17 @@ def balanced_compute_cp_indexer_topk(
     )
     if zz:
         # ---- Per-sequence zigzag: exact balance for any pack composition -------------
-        plan = _zigzag_plan(
-            cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev, layout_cache
-        )
+        if dispatch_handle is not None and dispatch_handle.get("kind") == "zzr":
+            plan = dispatch_handle["plan"]
+        else:
+            plan = _zigzag_plan(
+                cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev, layout_cache
+            )
         half = plan["half"]
         mq = max(1, min(int(max_seqlen_q), half))
         gkv = max(1, int(max_seqlen_q) // int(ratio))
 
-        def _packed_topk(qr_rows, w_rows, layout3, pos_ids):
+        def _packed_topk(qr_rows, w_rows, layout3, pos_ids, kv_rows, mkv):
             sz = qr_rows.shape[0]
             q, _ = indexer.linear_wq_b(qr_rows.reshape(sz, 1, q_lora))
             q = q.reshape(sz, n_heads, head_dim)
@@ -642,7 +705,7 @@ def balanced_compute_cp_indexer_topk(
             tk, _ = _cu.compute_cp_indexer_topk(
                 q,
                 w_rows.reshape(sz, n_heads),
-                k_seq_major,
+                kv_rows,
                 cu_seqlens,
                 cu_seqlens_compressed,
                 0,
@@ -651,16 +714,39 @@ def balanced_compute_cp_indexer_topk(
                 softmax_scale,
                 max_seqlen_q=mq,
                 use_fused=True,
-                max_seqlen_kv=gkv,
+                max_seqlen_kv=mkv,
                 prebuilt_layout=layout3,
             )
             return tk
+
+        # Per-call tight compressed-K bounds (K-slice generalized per segment); the
+        # capture-safe fallback plan carries no bounds and keeps the full width.
+        mkv_h = int(plan.get("mkv_head", gkv))
+        mkv_t = int(plan.get("mkv_tail", gkv))
+        k_rows_total = k_seq_major.shape[0]
+        k_h = (
+            k_seq_major[: plan["k_end_head"]]
+            if plan.get("k_end_head", k_rows_total) < k_rows_total
+            else k_seq_major
+        )
+        k_t = (
+            k_seq_major[: plan["k_end_tail"]]
+            if plan.get("k_end_tail", k_rows_total) < k_rows_total
+            else k_seq_major
+        )
 
         nvtx_range_push("Bal_Dispatch")
         if dispatch_handle is not None:
             for work in dispatch_handle["works"]:
                 work.wait()
-            if dispatch_handle["kind"] == "ag":
+            if dispatch_handle["kind"] == "zzr":
+                qlw = dispatch_handle["q_lora"]
+                recv = dispatch_handle["recv"]
+                rows = torch.empty_like(recv)
+                rows.index_copy_(0, plan["disp_recv_rows"], recv)
+                qr_h, w_h = rows[:half, :qlw].contiguous(), rows[:half, qlw:].contiguous()
+                qr_t, w_t = rows[half:, :qlw].contiguous(), rows[half:, qlw:].contiguous()
+            elif dispatch_handle["kind"] == "ag":
                 g = dispatch_handle["g"]
                 qlw = dispatch_handle["q_lora"]
                 rows = torch.index_select(g, 0, plan["gather_idx"])
@@ -673,6 +759,7 @@ def balanced_compute_cp_indexer_topk(
                 qr_h, qr_t = qh[:half].contiguous(), qh[half:].contiguous()
                 w_h, w_t = wh[:half].contiguous(), wh[half:].contiguous()
         else:
+            _warn_allgather_fallback()
             q2 = indexer_qr.reshape(l_local, q_lora)
             w2 = weights_indexer_cp.reshape(l_local, n_heads)
             wq, gq = _all_gather_rows_buf(q2, l_local, cp_group, cp_size, "zz_q")
@@ -687,21 +774,36 @@ def balanced_compute_cp_indexer_topk(
 
         nvtx_range_push("BalancedIndexerScore")
         nvtx_range_push("Bal_Head")
-        tk_head = _packed_topk(qr_h, w_h, plan["head_layout"], plan["pos_head"])
+        tk_head = _packed_topk(qr_h, w_h, plan["head_layout"], plan["pos_head"], k_h, mkv_h)
         nvtx_range_pop("Bal_Head")
         nvtx_range_push("Bal_Tail")
-        tk_tail = _packed_topk(qr_t, w_t, plan["tail_layout"], plan["pos_tail"])
+        tk_tail = _packed_topk(qr_t, w_t, plan["tail_layout"], plan["pos_tail"], k_t, mkv_t)
         nvtx_range_pop("Bal_Tail")
         nvtx_range_pop("BalancedIndexerScore")
 
         nvtx_range_push("Bal_Combine")
         tkw = tk_head.shape[-1]
-        send = _a2a_buf("zz_cmb_send", l_local, tkw, tk_head.dtype, dev, cp_group)
-        send[:half].copy_(tk_head)
-        send[half:].copy_(tk_tail)
-        Z = _a2a_buf("zz_cmb_recv", S, tkw, tk_head.dtype, dev, cp_group)
-        dist.all_gather_into_tensor(Z, send, group=cp_group)
-        compressed_topk = torch.index_select(Z, 0, plan["inv_idx"])
+        ht = _a2a_buf("zz_cmb_send", l_local, tkw, tk_head.dtype, dev, cp_group)
+        ht[:half].copy_(tk_head)
+        ht[half:].copy_(tk_tail)
+        if "cmb_send_rows" in plan:
+            # Route-A2A combine: exact inverse exchange, ~l_local rows per rank.
+            send = _a2a_buf("zzr_cmb_send", l_local, tkw, tk_head.dtype, dev, cp_group)
+            send.copy_(torch.index_select(ht, 0, plan["cmb_send_rows"]))
+            recv = _a2a_buf("zzr_cmb_recv", l_local, tkw, tk_head.dtype, dev, cp_group)
+            dist.all_to_all_single(
+                recv,
+                send,
+                output_split_sizes=plan["disp_in_splits"],
+                input_split_sizes=plan["disp_out_splits"],
+                group=cp_group,
+            )
+            compressed_topk = torch.empty((l_local, tkw), dtype=tk_head.dtype, device=dev)
+            compressed_topk.index_copy_(0, plan["cmb_recv_rows"], recv)
+        else:
+            Z = _a2a_buf("zz_cmb_recv", S, tkw, tk_head.dtype, dev, cp_group, persistent=False)
+            dist.all_gather_into_tensor(Z, ht, group=cp_group)
+            compressed_topk = torch.index_select(Z, 0, plan["inv_idx"])
         nvtx_range_pop("Bal_Combine")
         return compressed_topk, layout
 
@@ -929,9 +1031,9 @@ def prebuild_balanced_layouts(packed_seq_params, cp_group=None, pad_alignment=No
     seg_lens = cu[1:] - cu[:-1]
     nseg_real = int((seg_lens > 0).sum().item())
     packed_seq_params._dsa_cp_multi_seq = nseg_real != 1
-    if not packed_seq_params._dsa_cp_multi_seq:
-        # Single full sequence: the folding + K-slice path is used, no zigzag plan.
-        return
+    # The unified zigzag path also serves single-full-sequence packs (per-sequence zigzag
+    # of one pack-spanning sequence IS the global folding), so the plan and its A2A routes
+    # are built for every pack composition.
 
     if pad_alignment is not None and not (
         isinstance(pad_alignment, int) and pad_alignment % (2 * N) == 0
@@ -994,6 +1096,58 @@ def prebuild_balanced_layouts(packed_seq_params, cp_group=None, pad_alignment=No
     ).reshape(-1)
     comp_pad = torch.cat((cu_comp, cu_comp[-1:]))
     nch = 2 * N
+
+    # ---- route-A2A metadata (PR #5664-style precomputed exchange) --------------------
+    # Dispatch: contiguous rows -> my [heads | tails] order. Sender convention: rows are
+    # sent to each destination ordered by the DESTINATION's [heads | tails] order, so the
+    # receiver's per-source blocks interleave back via one index_copy_.
+    ordered_all = [per_rank[rho].index_select(0, perm) for rho in range(N)]
+    src_of = torch.div(ordered_all[r], l_local, rounding_mode="floor")
+    disp_out_splits = torch.bincount(src_of, minlength=N).tolist()
+    disp_recv_rows = torch.argsort(src_of, stable=True)
+    send_parts, disp_in_splits = [], []
+    for dst in range(N):
+        need = ordered_all[dst]
+        m = torch.div(need, l_local, rounding_mode="floor") == r
+        rows = need[m] - r * l_local
+        send_parts.append(rows)
+        disp_in_splits.append(int(rows.numel()))
+    disp_send_rows = torch.cat(send_parts).long()
+    # Combine (inverse): my computed [heads | tails] rows -> their contiguous owners.
+    # Send grouped by owner in my-order (stable) == the dispatch recv permutation; the
+    # receiver's arrival order is (computer rank, computer-local position) == pos_global.
+    cmb_send_rows = disp_recv_rows
+    cmb_recv_rows = torch.argsort(inv_idx, stable=True)
+
+    # ---- per-call tight compressed-K bounds (K-slice generalized per segment) --------
+    gkv = max(1, total // ratio)
+    comp_lens_list = [int(v) for v in comp_lens.tolist()] + [0]
+    cu_comp_list = [int(v) for v in cu_comp.tolist()]
+
+    def _kv_bounds(chunk_idx):
+        spans, ends = [1], [1]
+        for i, (ci, cl) in enumerate(zip(c_list, comp_lens_list)):
+            if ci == 0 or cl == 0:
+                continue
+            span = min(cl, -(-((chunk_idx + 1) * ci) // ratio))
+            spans.append(span)
+            ends.append(cu_comp_list[i] + span)
+        span = max(spans)
+        q_ = _KV_BOUND_QUANTUM
+        bound = max(q_, ((span + q_ - 1) // q_) * q_)
+        # Tight widths past the ceiling are unsafe (see the module-scope kernel
+        # contract note); fall back to the full compressed width.
+        # max(1, ...): a degenerate pack whose every sequence is shorter than the
+        # compress ratio has zero compressed rows; k_end == 0 would slice an empty K.
+        # (The consumer's ``comp == 0`` early-exit fires first for truly empty
+        # buffers, so the clamp is pure defense.)
+        if bound > _KV_TIGHT_WIDTH_CEILING or bound >= gkv:
+            return gkv, max(1, cu_comp_list[-1])
+        return bound, max(1, min(max(ends), cu_comp_list[-1]))
+
+    mkv_head, k_end_head = _kv_bounds(r)
+    mkv_tail, k_end_tail = _kv_bounds(nch - 1 - r)
+
     plan = {
         "gather_idx": gather_idx.long(),
         "inv_idx": inv_idx.long(),
@@ -1002,6 +1156,16 @@ def prebuild_balanced_layouts(packed_seq_params, cp_group=None, pad_alignment=No
         "head_layout": (cu_q, comp_pad, (r * c_t).to(dt)),
         "tail_layout": (cu_q, comp_pad, ((nch - 1 - r) * c_t).to(dt)),
         "half": half,
+        "disp_send_rows": disp_send_rows,
+        "disp_in_splits": disp_in_splits,
+        "disp_out_splits": disp_out_splits,
+        "disp_recv_rows": disp_recv_rows.long(),
+        "cmb_send_rows": cmb_send_rows.long(),
+        "cmb_recv_rows": cmb_recv_rows.long(),
+        "mkv_head": mkv_head,
+        "k_end_head": k_end_head,
+        "mkv_tail": mkv_tail,
+        "k_end_tail": k_end_tail,
     }
     cache = getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None)
     if cache is None:

@@ -2790,10 +2790,12 @@ class CompressedSparseAttention(MegatronModule):
                             cp_group,
                             cp_size,
                             l_local,
-                            max_seqlen_q=max_seqlen_q,
                             config=self.config,
                             use_fused=self.use_fused_kernels,
                             multi_seq=bal_multi_seq,
+                            layout_cache=getattr(
+                                packed_seq_params, "_dsa_cp_balance_layout_cache", None
+                            ),
                         )
 
                 nvtx_range_push("dsv4_cp_indexer_k_all_gather_wait")
