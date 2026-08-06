@@ -1114,9 +1114,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.config.sequence_parallel and not getattr(
             embedding, "scatter_to_sequence_parallel", True
         ):
-            decoder_input = scatter_to_sequence_parallel_region(
-                decoder_input, group=self.tp_group
-            )
+            decoder_input = scatter_to_sequence_parallel_region(decoder_input, group=self.tp_group)
 
         if self.config.mtp_detach_heads:
             decoder_input = decoder_input.detach()
