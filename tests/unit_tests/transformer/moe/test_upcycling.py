@@ -293,6 +293,10 @@ class TestGPTModel:
             chunk = state_dict['model%d' % i]
             assert chunk.keys() == single['model'].keys()
             for k in chunk:
+                # ``_extra_state`` entries are not tensors; the local linear layers return
+                # ``None`` for them to stay compatible with the TE state dict.
+                if k.endswith('_extra_state'):
+                    continue
                 assert torch.equal(chunk[k], single['model'][k]), f"Value mismatch for key {k}"
             moe_model[0].load_state_dict(chunk, strict=True)
 

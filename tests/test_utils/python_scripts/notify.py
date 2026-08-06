@@ -8,13 +8,13 @@ from typing import Any
 
 import click
 import gitlab
-from nemo_ci_triage.slack_notification import notification
-from nemo_ci_triage.slack_notification.utils import repository_settings
+from cerno.slack_notification import notification
+from cerno.slack_notification.utils import repository_settings
 
 from tests.test_utils.python_scripts import linear_ci
 
-TRIAGE_CONFIG = Path(os.getenv("NEMO_CI_TRIAGE_CONFIG", ".gitlab/nemo-ci-triage.yml"))
-PROJECT_ID, REPO_NAME = repository_settings(TRIAGE_CONFIG)
+CERNO_CONFIG = Path(os.getenv("CERNO_CONFIG", ".gitlab/cerno.yml"))
+PROJECT_ID, REPO_NAME = repository_settings(CERNO_CONFIG)
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 SLACK_BOT_TOKEN = os.getenv("MCORE_SLACK_BOT_TOKEN") or os.getenv("ALERTMANAGER_TOKEN", "")
 SLACK_CHANNEL_ID = os.getenv("MCORE_SLACK_CHANNEL_ID", "")
@@ -29,7 +29,7 @@ TEAM_SLUG = os.getenv("TEAM_SLUG", "")
 JOB_PREFIXES = {
     "unit-tests": "test:unit_tests",
     "integration-tests": "integration:run_",
-    "functional-tests": "functional:run_",
+    "functional-tests": ("functional:run_", "functional:smoke-"),
     "smoke-tests": "functional:smoke-",
 }
 
@@ -55,9 +55,9 @@ def _bridge_gpu(bridge_name: str) -> str:
 
 
 def get_pipeline_jobs(
-    pipeline_id: int, job_prefix: str, project: Any | None = None
+    pipeline_id: int, job_prefix: str | tuple[str, ...], project: Any | None = None
 ) -> list[tuple[str, int, list[dict]]]:
-    """Collect Megatron-LM's direct child pipelines using nemo-ci-triage-2."""
+    """Collect Megatron-LM's direct child pipelines using Cerno."""
     project = project or get_project()
     root_pipeline = project.pipelines.get(pipeline_id)
     pipeline_jobs = []
@@ -153,7 +153,7 @@ def main(
         webhook_url=WEBHOOK_URL or None,
         slack_bot_token=SLACK_BOT_TOKEN if use_bot else None,
         slack_channel_id=SLACK_CHANNEL_ID if use_bot else None,
-        config=TRIAGE_CONFIG,
+        config=CERNO_CONFIG,
     )
     write_slack_context(slack_output, thread_timestamp)
 

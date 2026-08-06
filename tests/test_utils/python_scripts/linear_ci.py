@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Megatron-LM adapters for nemo-ci-triage's failure-reporting workflow.
+"""Megatron-LM adapters for Cerno's failure-reporting workflow.
 
-The triage package owns LLM summarization, Linear reconciliation, and Slack
+Cerno owns LLM summarization, Linear reconciliation, and Slack
 follow-up logic. This module only converts Megatron-LM's direct child-pipeline
 jobs into the generic failure records consumed by the package summarizer.
 """
@@ -14,15 +14,22 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from nemo_ci_triage.agent import summarize_pipeline_failures as summarizer
+from cerno.agent import summarize_pipeline_failures as summarizer
 
 LINEAR_MODULE = "megatron_lm"
 _FUNCTIONAL_PREFIX = "functional:run_"
+_SMOKE_PREFIX = "functional:smoke-"
 
 
 def _variant_name(pipeline_name: str) -> str:
     """Return the stable environment/platform suffix of a functional bridge."""
-    return pipeline_name.removeprefix(_FUNCTIONAL_PREFIX).replace("_", "-")
+    if pipeline_name.startswith(_FUNCTIONAL_PREFIX):
+        variant = pipeline_name.removeprefix(_FUNCTIONAL_PREFIX)
+    elif pipeline_name.startswith(_SMOKE_PREFIX):
+        variant = f"smoke-{pipeline_name.removeprefix(_SMOKE_PREFIX)}"
+    else:
+        variant = pipeline_name
+    return variant.replace("_", "-")
 
 
 def _recipe_name(pipeline_name: str, config_name: str) -> str:
@@ -87,7 +94,7 @@ def build_pipeline_reports(
     load_error_report: Callable[[int], dict | None],
     project_url: str,
 ) -> tuple[dict, dict]:
-    """Build the two JSON contracts consumed by nemo-ci-triage reconciliation.
+    """Build the two JSON contracts consumed by Cerno reconciliation.
 
     Each recipe is qualified by its child-pipeline variant. A recipe is only
     included in ``passed_tests`` when that exact variant completed successfully;
