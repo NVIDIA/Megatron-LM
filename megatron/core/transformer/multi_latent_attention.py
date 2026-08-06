@@ -716,23 +716,19 @@ class MLASelfAttention(MultiLatentAttention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.rope_type == "rope":
+        if self.config.apply_rope_fusion:
+            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
+            )
+            rotary_pos_emb = None
+            assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
+            assert (
+                fused_apply_mla_rope_for_q is not None and fused_apply_mla_rope_for_kv is not None
+            ), "Fused MLA RoPE apply is not imported successfully"
+        elif self.config.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
         else:
-            if self.config.apply_rope_fusion:
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
-                )
-                rotary_pos_emb = None
-                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
-                assert (
-                    fused_apply_mla_rope_for_q is not None
-                    and fused_apply_mla_rope_for_kv is not None
-                ), "Fused MLA RoPE apply is not imported successfully"
-            else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq=thd_packed_seq
-                )
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=thd_packed_seq)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:
