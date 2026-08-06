@@ -17,11 +17,12 @@ from megatron.core.ssm.gated_delta_net.common import (
     tensor_a2a_hp2cp,
     torch_chunk_gated_delta_rule,
 )
-from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet, GDNLayerConfig
 
 __all__ = [
     "HAVE_FLA",
     "GatedDeltaNet",
+    "GDNLayerConfig",
     "GatedDeltaNetSubmodules",
     "causal_conv1d",
     "chunk_gated_delta_rule",

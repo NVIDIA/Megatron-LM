@@ -286,6 +286,10 @@ class CrossAttentionSubmodules:
     linear_proj: LinearProjBuilder
 
 
+class AttentionLayerConfig(TransformerConfig):
+    """Configuration for an attention layer in a hybrid stack."""
+
+
 class Attention(MegatronModule, ABC):
     """Attention layer abstract class.
 
