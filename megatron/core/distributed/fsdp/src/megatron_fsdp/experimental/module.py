@@ -28,14 +28,6 @@ from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Placements
 
 
-class FsdpModulePhase(enum.Enum):
-    """Lifecycle phase of one FSDP module."""
-
-    RESTING = enum.auto()
-    FORWARD = enum.auto()
-    BACKWARD = enum.auto()
-
-
 class FsdpContext:
     """Runtime stream and prefetch state shared by one FSDP subtree."""
 
@@ -82,17 +74,19 @@ class FsdpContext:
 
         def post_backward_final_callback() -> None:
             self.current_stream().wait_stream(self.reduce_scatter_stream)
-            # forward_order contains every FsdpModule in the root subtree. A
-            # module skipped by this backward has no post-backward hook to reset
-            # its phase, so restore the complete subtree here.
-            for module in self.forward_order:
-                module._phase = FsdpModulePhase.RESTING
 
         torch.autograd.Variable._execution_engine.queue_callback(post_backward_final_callback)
 
 
 class FsdpModule:
     """Mixin attached to modules managed by the minimal FSDP path."""
+
+    class Phase(enum.Enum):
+        """Lifecycle phase of this FsdpModule."""
+
+        RESTING = enum.auto()
+        FORWARD = enum.auto()
+        BACKWARD = enum.auto()
 
     # Name relative to the root FSDP module from named_modules().
     # Root uses "" and None means uninitialized.
@@ -105,9 +99,9 @@ class FsdpModule:
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
     _unshard_event: torch.cuda.Event | None
-    # The root backward-pre hook sets this to BACKWARD before activation
-    # recomputation can run. Module hooks otherwise own its transitions.
-    _phase: FsdpModulePhase
+    # Backward-pre hook sets this to BACKWARD before activation recomputation
+    # can run. Forward and backward hooks own all other transitions.
+    _phase: Phase
 
     def __init__(
         self,
@@ -120,7 +114,7 @@ class FsdpModule:
         self._context = None
         self._name = None
         self._unshard_event = None
-        self._phase = FsdpModulePhase.RESTING
+        self._phase = FsdpModule.Phase.RESTING
         owned_parameters = _collect_owned_parameters(self)
         assert tuple(placements.dp_axes) == tuple(
             range(mesh.ndim)
@@ -246,9 +240,9 @@ class FsdpModule:
         on the comm stream, so ``AG_{i+1}`` is launched before ``F_i`` finishes.
         """
         self._lazy_init_context()
-        is_recomputing = self._phase is FsdpModulePhase.BACKWARD
+        is_recomputing = self._phase is FsdpModule.Phase.BACKWARD
         if not is_recomputing:
-            self._phase = FsdpModulePhase.FORWARD
+            self._phase = FsdpModule.Phase.FORWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
         self._num_ready_grad_parameters = 0
         context = self.context
@@ -294,9 +288,9 @@ class FsdpModule:
         # Recomputed parameters are consumed immediately by this module's
         # backward. Keep them materialized to avoid an unnecessary all-gather;
         # post_backward() will reshard them after gradient reduction.
-        if self._phase is not FsdpModulePhase.BACKWARD:
+        if self._phase is not FsdpModule.Phase.BACKWARD:
             self._reshard_parameter_groups()
-            self._phase = FsdpModulePhase.RESTING
+            self._phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
     def _reshard_parameter_groups(self) -> None:
@@ -319,16 +313,15 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
-        self._phase = FsdpModulePhase.BACKWARD
+        # post_forward() resets the phase after a non-recomputed forward, so a
+        # FORWARD phase here means this backward-pre hook ran without its
+        # matching forward completing.
+        assert self._phase is not FsdpModule.Phase.FORWARD
+        self._phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
-            # Reentrant checkpointing recomputes a child before that child's own
-            # backward-pre hook runs, so mark the entire subtree from the root
-            # hook. Each module clears its state after its matching backward.
-            for module in context.forward_order:
-                module._phase = FsdpModulePhase.BACKWARD
             context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
@@ -351,7 +344,7 @@ class FsdpModule:
         """Reduce gradients and return parameters to their sharded resting state."""
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
-        self._phase = FsdpModulePhase.RESTING
+        self._phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
