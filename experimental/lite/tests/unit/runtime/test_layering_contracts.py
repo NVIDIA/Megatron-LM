@@ -1,17 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Static layering guards for MLite public data boundaries and imports.
 
-Five layers — bench, verl_mlite, runtime, model, primitive — have directional
-import boundaries (``test_layer_import_boundaries``). On top of that the bench
-and verl connector layers must hand the runtime only a model-agnostic batch:
-``packed_seq_params`` / ``position_ids`` are *transient* THD metadata that may be
-materialised only at the immediate forward boundary, inside the explicitly marked
+Bench, runtime, model, and primitive layers have directional import boundaries.
+The bench layer must hand the runtime only a model-agnostic batch:
+``packed_seq_params`` / ``position_ids`` are transient THD metadata that may be
+materialized only at the immediate forward boundary, inside the explicitly marked
 allow range in the bridge runtime.
 
 The guard enforces the contract; it does not police prose. Substring scans ignore
-string/comment content (so a docstring may still document a dependency), and the
-import denylist honours :data:`IMPORT_ALLOWLIST` for vetted, optional cross-layer
-imports whose reason is recorded inline.
+string/comment content (so a docstring may still document a dependency), while the
+import denylist enforces the core layer boundaries.
 """
 
 from __future__ import annotations
@@ -24,7 +22,6 @@ from pathlib import Path
 
 LITE_ROOT = Path(__file__).resolve().parents[3]
 BENCH_ROOT = LITE_ROOT / "examples" / "bench"
-VERL_MLITE_ROOT = LITE_ROOT / "examples" / "verl" / "verl_mlite"
 RUNTIME_ROOT = LITE_ROOT / "megatron" / "lite" / "runtime"
 MODEL_ROOT = LITE_ROOT / "megatron" / "lite" / "model"
 PRIMITIVE_ROOT = LITE_ROOT / "megatron" / "lite" / "primitive"
@@ -34,7 +31,6 @@ ALLOW_BEGIN = "MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_BEGIN"
 ALLOW_END = "MLITE_LAYERING_ALLOW_BRIDGE_FORWARD_METADATA_END"
 LAYER_ROOTS = {
     "bench": BENCH_ROOT,
-    "verl_mlite": VERL_MLITE_ROOT,
     "runtime": RUNTIME_ROOT,
     "model": MODEL_ROOT,
     "primitive": PRIMITIVE_ROOT,
@@ -48,34 +44,22 @@ MODEL_PACKAGE_PREFIXES = (
 )
 MODEL_NAME_TERMS = {"deepseek_v4", "glm5", "kimi_k2", "qwen3", "qwen3_5", "qwen3_moe"}
 DENIED_IMPORT_PREFIXES = {
-    "bench": ("examples.verl", "verl", "verl_mlite", "megatron.lite.model"),
-    "verl_mlite": ("examples.bench", *MODEL_PACKAGE_PREFIXES),
-    "runtime": ("examples", "verl", "verl_mlite", *MODEL_PACKAGE_PREFIXES),
-    "model": ("examples", "verl", "verl_mlite", "megatron.lite.runtime.backends"),
+    "bench": ("examples.verl", "megatron.lite.model", "verl", "verl_mlite"),
+    "runtime": ("examples", *MODEL_PACKAGE_PREFIXES, "verl", "verl_mlite"),
+    "model": ("examples", "megatron.lite.runtime.backends", "verl", "verl_mlite"),
     "primitive": (
         "examples",
-        "verl",
-        "verl_mlite",
         "megatron.lite.model",
         "megatron.lite.runtime.backends",
         "megatron.lite.runtime.megatron_utils",
+        "verl",
+        "verl_mlite",
     ),
 }
-
-# Vetted cross-layer imports that override the denylist. Each entry is a single
-# file -> {allowed module prefix: reason}. Use this ONLY for a sanctioned,
-# self-contained optional dependency — never to paper over a structural leak.
-IMPORT_ALLOWLIST: dict[str, dict[str, str]] = {
-    # The primitive linear-cross-entropy op uses VERL's Triton-backed fused kernel
-    # as an optional CUDA fast path and falls back to the local torch implementation
-    # when the kernel (or verl) is not importable. It is a legitimate optional
-    # dependency on a single leaf op, not a connector back-edge, so it overrides the
-    # primitive `verl` denylist.
-    "megatron/lite/primitive/ops/linear_cross_entropy.py": {
-        "verl.utils.kernel.linear_cross_entropy": (
-            "optional VERL fused linear-cross-entropy kernel fast-path with local fallback"
-        ),
-    },
+IMPORT_ALLOWLIST: dict[str, tuple[str, ...]] = {
+    "megatron/lite/primitive/ops/linear_cross_entropy.py": (
+        "verl.utils.kernel.linear_cross_entropy",
+    ),
 }
 
 
@@ -87,13 +71,6 @@ def _matches_prefix(module: str, prefix: str) -> bool:
     return module == prefix or module.startswith(prefix + ".")
 
 
-def _allowlisted_import(rel_path: str, module: str) -> bool:
-    for allowed in IMPORT_ALLOWLIST.get(rel_path, {}):
-        if _matches_prefix(module, allowed):
-            return True
-    return False
-
-
 def _imported_modules(path: Path) -> list[tuple[int, str]]:
     tree = ast.parse(path.read_text(encoding="utf-8"))
     imports: list[tuple[int, str]] = []
@@ -103,6 +80,13 @@ def _imported_modules(path: Path) -> list[tuple[int, str]]:
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             imports.append((node.lineno, node.module))
     return imports
+
+
+def _allowlisted_import(relative_path: str, module: str) -> bool:
+    return any(
+        _matches_prefix(module, allowed)
+        for allowed in IMPORT_ALLOWLIST.get(relative_path, ())
+    )
 
 
 def _code_lines(path: Path) -> list[str]:
@@ -195,31 +179,22 @@ def test_layer_import_boundaries() -> None:
 
 
 def test_import_allowlist_entries_are_live() -> None:
-    """Each allowlisted import must still exist — stop the allowlist from rotting."""
     stale: list[str] = []
-    for rel_path, allowed in IMPORT_ALLOWLIST.items():
-        path = LITE_ROOT / rel_path
+    for relative_path, allowed_modules in IMPORT_ALLOWLIST.items():
+        path = LITE_ROOT / relative_path
         if not path.is_file():
-            stale.append(f"{rel_path}: file missing")
+            stale.append(f"{relative_path}: file missing")
             continue
         modules = {module for _, module in _imported_modules(path)}
-        for allowed_module in allowed:
+        for allowed_module in allowed_modules:
             if not any(_matches_prefix(module, allowed_module) for module in modules):
-                stale.append(f"{rel_path}: no import matches allowlisted {allowed_module}")
+                stale.append(f"{relative_path}: no import matches {allowed_module}")
     assert stale == []
 
 
 def test_bench_layer_does_not_see_model_internal_batch_fields() -> None:
     violations = _violations(
         _python_files(BENCH_ROOT),
-        {"packed_seq_params", "position_ids", "to_bridge_dict"},
-    )
-    assert violations == []
-
-
-def test_verl_mlite_layer_does_not_see_model_internal_batch_fields() -> None:
-    violations = _violations(
-        _python_files(VERL_MLITE_ROOT),
         {"packed_seq_params", "position_ids", "to_bridge_dict"},
     )
     assert violations == []

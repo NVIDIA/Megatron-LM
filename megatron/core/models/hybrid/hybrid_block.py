@@ -169,7 +169,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
-            pad_between_seqs=False,
+            # This Python flag is baked into the captured graph and cannot vary
+            # between replay batches. Use the conservative THD-safe branch.
+            pad_between_seqs=True,
         )
         kwargs['packed_seq_params'] = packed_seq_params
 
