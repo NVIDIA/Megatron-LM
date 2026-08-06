@@ -16,9 +16,9 @@ from megatron.core.models.gpt.moe_module_specs import (
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
-from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.gated_delta_product import (
-    MambaMixerSubmodules as GatedDeltaProductMixerSubmodules,
+    GatedDeltaProductMixer,
+    GatedDeltaProductMixerSubmodules,
 )
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
