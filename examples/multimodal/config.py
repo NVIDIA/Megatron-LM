@@ -164,6 +164,9 @@ def get_language_model_config(config):
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 8192
+    elif config.language_model_type == "nemotron6-moe":
+        config.bias_activation_fusion = False
+        config.bias_dropout_fusion = False
     elif config.language_model_type.startswith("hf://"):
         # Loaded from HuggingFace config file.
         import transformers
@@ -379,6 +382,10 @@ def get_vision_projection_config(config, hidden_size):
         config.ffn_hidden_size = 2048
         config.activation_func = torch.nn.functional.gelu
         config.normalization = "LayerNorm"
+    elif config.language_model_type == "nemotron6-moe":
+        config.ffn_hidden_size = 20480
+        config.bias_activation_fusion = False
+        config.bias_dropout_fusion = False
     elif config.language_model_type.startswith("hf://"):
         config.activation_func = torch.nn.functional.gelu
         config.ffn_hidden_size = 4096

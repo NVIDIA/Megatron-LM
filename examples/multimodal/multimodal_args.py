@@ -90,4 +90,20 @@ def add_multimodal_extra_args(parser):
     )
     group.add_argument("--use-mcore-inference", action="store_true", default=False, help="Use the MCore inference API")
 
+    # Dynamic resolution
+    group.add_argument("--dynamic-resolution", action="store_true", default=False,
+                        help="Use dynamic resolution for vision model")
+    group.add_argument("--dynamic-resolution-min-patches", type=int, default=4,
+                        help="Minimum pre-merge patch count for dynamic-resolution image preprocessing")
+    group.add_argument("--dynamic-resolution-max-patches", type=int, default=0,
+                        help="Maximum pre-merge patch count for dynamic-resolution image preprocessing; 0 means unlimited")
+    group.add_argument("--dynamic-resolution-min-side", type=int, default=None,
+                        help="Optional minimum pixel side for dynamic-resolution image preprocessing")
+    group.add_argument("--dynamic-resolution-max-side", type=int, default=None,
+                        help="Optional maximum pixel side for dynamic-resolution image preprocessing")
+    group.add_argument("--class-token-len", type=int, default=None,
+                        help="Override class token length for vision model")
+    group.add_argument("--spatial-merge-size", type=int, default=1,
+                        help="Vision-token spatial merge factor used by dynamic-resolution image preprocessing")
+
     return parser

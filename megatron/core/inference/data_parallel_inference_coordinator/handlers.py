@@ -80,7 +80,16 @@ def handle_submit_request(coordinator, sender_identity, payload):
         return
     # this is a message from a client.
     # route it to a data parallel rank
-    client_request_id, prompt, sampling_params = payload[1:]
+    # Payload is [SUBMIT_REQUEST, client_request_id, prompt, sampling_params,
+    # image_bytes_list?] — older clients omit the 5th element, so default it
+    # to None.
+    fields = payload[1:]
+    if len(fields) == 3:
+        client_request_id, prompt, sampling_params = fields
+        image_bytes_list = None
+    else:
+        client_request_id, prompt, sampling_params, image_bytes_list = fields[:4]
+
     # map client request_id to server request_id
     # necessary because multiple clients might have the same request_id.
     request_id = coordinator.next_request_id
@@ -98,15 +107,22 @@ def handle_submit_request(coordinator, sender_identity, payload):
         raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
     engine_payload = msgpack.packb(
-        [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params], use_bin_type=True
+        [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params, image_bytes_list],
+        use_bin_type=True,
     )
 
-    request_hashes = coordinator.compute_request_hashes(prompt)
-    if (
-        coordinator.prefix_caching_coordinator_policy
-        == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
-    ):
-        request_hashes = request_hashes[:1]
+    # Skip prefix-aware routing for image-bearing requests: two prompts with
+    # identical text tokens but different images would otherwise hash the same
+    # and falsely share kv-cache prefixes.
+    if image_bytes_list:
+        request_hashes = []
+    else:
+        request_hashes = coordinator.compute_request_hashes(prompt)
+        if (
+            coordinator.prefix_caching_coordinator_policy
+            == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+        ):
+            request_hashes = request_hashes[:1]
 
     # Account for the fact that some engines may have died.
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
