@@ -976,15 +976,16 @@ class PagedStashRunner:
         self.optimizer = optimizer
         self.forward_backward_func = forward_backward_func
         self.moe_layers = []
-        # TransformerConfig objects that must stay in sync for moe_paged_stash: the training
-        # loop `config` (schedules / paged_stash_reset) plus each VP chunk's GPT root config
-        # (GPTModel.forward). MoE mlps use the same config reference as that root, so we do
-        # not track mlp.config separately.
+        # Config objects that must stay in sync for moe_paged_stash: the training loop config
+        # (schedules / paged_stash_reset), each model chunk's root config (model forward), and
+        # every MoE layer config (expert forward). Hybrid models may use a distinct config for
+        # each layer.
         seen_cfg_ids = set()
+        seen_moe_layer_ids = set()
         self._configs_to_sync_moe_paged_stash = []
 
         def _track_cfg(c):
-            if c is None:
+            if c is None or not hasattr(c, 'moe_paged_stash'):
                 return
             cid = id(c)
             if cid not in seen_cfg_ids:
@@ -993,43 +994,26 @@ class PagedStashRunner:
 
         _track_cfg(config)
 
-        # Local import avoids circular import: schedules -> paged_stash -> multi_token_prediction
-        # -> megatron.core (still loading).
-        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
-
         for model_chunk in self.model:
             model_with_decoder = get_attr_wrapped_model(
                 model_chunk, "decoder", allow_none=False, return_model_obj=True
             )
             _track_cfg(model_with_decoder.config)
-            for layer in model_with_decoder.decoder.layers:
-                transformer_layer = (
-                    layer.mtp_model_layer if isinstance(layer, MultiTokenPredictionLayer) else layer
-                )
-                mlp = getattr(transformer_layer, "mlp", None)
-                if (
-                    mlp is not None
-                    and hasattr(mlp, 'token_dispatcher')
-                    and hasattr(mlp.token_dispatcher, 'check_over_budget')
-                ):
-                    self.moe_layers.append(mlp)
-            if model_with_decoder.mtp_process:
-                for layer in model_with_decoder.mtp.layers:
-                    transformer_layer = (
-                        layer.mtp_model_layer
-                        if isinstance(layer, MultiTokenPredictionLayer)
-                        else layer
-                    )
-                    mlp = getattr(transformer_layer, "mlp", None)
-                    if (
-                        mlp is not None
-                        and hasattr(mlp, 'token_dispatcher')
-                        and hasattr(mlp.token_dispatcher, 'check_over_budget')
-                    ):
-                        self.moe_layers.append(mlp)
+            for module in model_with_decoder.modules():
+                token_dispatcher = getattr(module, 'token_dispatcher', None)
+                if token_dispatcher is None or not hasattr(token_dispatcher, 'check_over_budget'):
+                    continue
+
+                module_id = id(module)
+                if module_id in seen_moe_layer_ids:
+                    continue
+
+                seen_moe_layer_ids.add(module_id)
+                self.moe_layers.append(module)
+                _track_cfg(getattr(module, 'config', None))
 
     def _set_moe_paged_stash_all(self, value: bool) -> None:
-        """Set moe_paged_stash on every tracked config (train + per VP chunk root)."""
+        """Set moe_paged_stash on every tracked training, model, and MoE config."""
         for c in self._configs_to_sync_moe_paged_stash:
             c.moe_paged_stash = value
 
@@ -1179,7 +1163,9 @@ class PagedStashRunner:
 
         training = not kwargs['forward_only']
         data_iterator = kwargs['data_iterator']
-        saved_moe_paged_stash = self.config.moe_paged_stash
+        saved_moe_paged_stash_values = [
+            (config, config.moe_paged_stash) for config in self._configs_to_sync_moe_paged_stash
+        ]
         num_tries = 0
         while True:
             assert (
@@ -1214,7 +1200,8 @@ class PagedStashRunner:
                         mlp.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = (
                             mlp.token_dispatcher.config.moe_expert_rank_capacity_factor
                         )
-                self._set_moe_paged_stash_all(saved_moe_paged_stash)
+                for config, value in saved_moe_paged_stash_values:
+                    config.moe_paged_stash = value
                 break
 
             # Overflow or over-budget: prepare_for_rerun clears capacity factor and paged stash.
