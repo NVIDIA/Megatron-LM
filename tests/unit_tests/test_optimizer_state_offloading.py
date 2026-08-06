@@ -38,15 +38,22 @@ except ImportError:
 class SimpleModel(nn.Module):
     """Small model with enough parameters to exercise multiple state chunks."""
 
-    def __init__(self, hidden_size: int = 256) -> None:
+    def __init__(self, hidden_size: int = 256, num_layers: int = 2) -> None:
         super().__init__()
+        assert num_layers >= 2
         self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.hidden_layers = nn.ModuleList(
+            nn.Linear(hidden_size, hidden_size) for _ in range(num_layers - 2)
+        )
         self.fc2 = nn.Linear(hidden_size, hidden_size)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Run the two-layer MLP."""
+        """Run the test MLP."""
 
-        return self.fc2(torch.relu(self.fc1(inputs)))
+        output = torch.relu(self.fc1(inputs))
+        for layer in self.hidden_layers:
+            output = torch.relu(layer(output))
+        return self.fc2(output)
 
 
 @pytest.fixture
@@ -860,6 +867,7 @@ def test_precision_aware_master_planning_uses_real_storage():
 
 def create_model_and_optimizer(
     hidden_size: int = 256,
+    num_layers: int = 2,
     chunked_optimizer_state_offload: bool = True,
     chunk_size_mb: int = 1,
     offload_fraction: float = 1.0,
@@ -868,7 +876,7 @@ def create_model_and_optimizer(
 ):
     """Create a bf16 DDP model and DistributedOptimizer."""
 
-    model = SimpleModel(hidden_size=hidden_size).bfloat16().cuda()
+    model = SimpleModel(hidden_size=hidden_size, num_layers=num_layers).bfloat16().cuda()
     if include_native_fp32_param:
         model.native_fp32_param = nn.Parameter(torch.zeros(hidden_size, device='cuda'))
     ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
@@ -960,7 +968,9 @@ def test_chunk_plan_and_initial_master_offload():
     manager = dist_optimizer._optimizer_state_offloader
 
     assert manager is not None
-    assert len(manager.chunks) > 1
+    # Direct manager tests cover exact chunk splitting independently of DP sharding. This
+    # integration test only needs a valid plan before checking the initial master offload.
+    assert manager.chunks
     assert manager.selected_params
 
     expected_masters = {
@@ -1133,14 +1143,17 @@ def test_partial_offload_keeps_data_parallel_ranks_in_sync():
 def test_chunked_step_advances_group_step_once():
     """Calling the external optimizer for several chunks advances logical step only once."""
 
-    model, optimizer = create_model_and_optimizer(hidden_size=512, chunk_size_mb=1)
+    # DistOpt shards the flat parameter buffer across DP ranks. Give every rank about three
+    # small layers so each local shard contains several bundles and must span multiple chunks.
+    num_layers = 3 * torch.distributed.get_world_size()
+    model, optimizer = create_model_and_optimizer(num_layers=num_layers, chunk_size_mb=1)
     dist_optimizer = optimizer.chained_optimizers[0]
     manager = dist_optimizer._optimizer_state_offloader
     assert manager is not None and len(manager.chunks) > 1
 
     for _ in range(3):
         offload_before_forward(optimizer)
-        run_forward_backward_step(model, optimizer, hidden_size=512)
+        run_forward_backward_step(model, optimizer)
 
     steps = [
         group['step']
