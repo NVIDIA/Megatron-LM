@@ -4198,6 +4198,14 @@ def _add_distributed_args(parser):
         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.",
     )
     group.add_argument(
+        '--fsdp-buffer-count',
+        type=int,
+        default=2,
+        help="Number of persistent buffers in each Megatron FSDP communication pool. "
+        "The default of two provides conventional double buffering; combined 1F1B "
+        "overlap with forward prefetch requires at least three.",
+    )
+    group.add_argument(
         '--suggested-communication-unit-size',
         type=int,
         default=None,
