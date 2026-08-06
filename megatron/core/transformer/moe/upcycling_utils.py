@@ -1,5 +1,6 @@
 # Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
-""" Helpers for converting a dense model to a MoE model in runtime """
+"""Helpers for converting a dense model to a MoE model in runtime"""
+
 import copy
 from enum import Enum
 
