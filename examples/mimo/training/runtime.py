@@ -80,13 +80,18 @@ def _ddp_config_from_args(
     args: argparse.Namespace, enable_overlap: bool
 ) -> DistributedDataParallelConfig:
     """Build a DDP config from CLI args; when ``enable_overlap`` is False both overlaps are off."""
+    use_layer_wise_layout = getattr(
+        args, "use_layer_wise_distributed_optimizer", False
+    ) and getattr(args, "use_layer_wise_param_layout", True)
     return DistributedDataParallelConfig(
         overlap_grad_reduce=enable_overlap and getattr(args, "overlap_grad_reduce", False),
         overlap_param_gather=enable_overlap and getattr(args, "overlap_param_gather", False),
         num_buckets=getattr(args, "ddp_num_buckets", None),
         bucket_size=getattr(args, "ddp_bucket_size", None),
         pad_buckets_for_high_nccl_busbw=getattr(args, "ddp_pad_buckets_for_high_nccl_busbw", False),
-        use_distributed_optimizer=True,
+        use_distributed_optimizer=(
+            getattr(args, "use_distributed_optimizer", False) or use_layer_wise_layout
+        ),
         grad_reduce_in_fp32=getattr(args, "accumulate_allreduce_grads_in_fp32", True),
     )
 
@@ -110,6 +115,10 @@ def wrap_active_modules_with_ddp(
             ddp_config=_ddp_config_from_args(args, enable_overlap=True),
             data_parallel_random_init=data_parallel_random_init,
             mixed_precision_wrapper=Float16Module,
+            use_layer_wise_distributed_optimizer=getattr(
+                args, "use_layer_wise_distributed_optimizer", False
+            ),
+            use_layer_wise_param_layout=getattr(args, "use_layer_wise_param_layout", True),
         )[0]
 
     for name, submodule in mimo_model.modality_submodules.items():
@@ -128,5 +137,9 @@ def wrap_active_modules_with_ddp(
                 ),
                 data_parallel_random_init=data_parallel_random_init,
                 mixed_precision_wrapper=_EncoderFloat16Module,
+                use_layer_wise_distributed_optimizer=getattr(
+                    args, "use_layer_wise_distributed_optimizer", False
+                ),
+                use_layer_wise_param_layout=getattr(args, "use_layer_wise_param_layout", True),
             )[0]
         )

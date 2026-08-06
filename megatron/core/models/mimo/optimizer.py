@@ -355,6 +355,8 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     pg.tp = grid.get_pg("tp")
     pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
+    pg.ep = grid.get_pg("ep", view=_EXPERT_VIEW)
+    pg.expt_tp = grid.get_pg("expt_tp", view=_EXPERT_VIEW)
     pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view=_EXPERT_VIEW)
     pg.expt_dp = grid.get_pg("expt_dp", view=_EXPERT_VIEW)
     # Distributed-optimizer grad-stats group spans the dense shards (mirrors the topology PGC).

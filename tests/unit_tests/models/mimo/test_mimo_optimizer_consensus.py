@@ -2,12 +2,24 @@
 
 """Distributed test for MimoOptimizer cross-grid step-success consensus."""
 
+from unittest import mock
+
 import pytest
 import torch
 
-from megatron.core.models.mimo.optimizer import MimoOptimizer
+from megatron.core.models.mimo.optimizer import MimoOptimizer, _get_pg_collection_for_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_optimizer_pg_collection_includes_layer_wise_groups():
+    grid = mock.Mock()
+    grid.get_pg.side_effect = lambda dims, view=None: (dims, view)
+
+    pg_collection = _get_pg_collection_for_optimizer(grid)
+
+    assert pg_collection.ep == ("ep", "expert")
+    assert pg_collection.expt_tp == ("expt_tp", "expert")
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires >= 2 ranks.")
