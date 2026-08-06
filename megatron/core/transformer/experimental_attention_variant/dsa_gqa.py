@@ -365,11 +365,18 @@ class DSGQAttention(DSAttention):
         # NOT read by this path; only these env-derived flags matter.
         if not getattr(self, "_dsa_backend_logged", False):
             self._dsa_backend_logged = True
+            from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton import (
+                HAVE_TRITON,
+            )
+
             cudnn_active = _cudnn_available_for_indexer(use_cudnn, self.indexer.index_n_heads)
+            # triton_active = the request AND Triton actually importable; if False while
+            # use_triton=True, the Triton kernels silently fell back to the PyTorch oracle.
+            triton_active = bool(use_triton and HAVE_TRITON)
             print(
                 f"[DSGQAttention layer{self.layer_number}] min-memory backend: "
-                f"use_triton={use_triton} use_cudnn={use_cudnn} "
-                f"cudnn_indexer_active={cudnn_active}",
+                f"use_triton={use_triton} triton_active={triton_active} "
+                f"use_cudnn={use_cudnn} cudnn_indexer_active={cudnn_active}",
                 flush=True,
             )
 
