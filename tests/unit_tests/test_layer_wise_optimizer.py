@@ -433,20 +433,35 @@ class TestLayerWiseOptimizer:
             use_param_layout=True, copy_from=model
         )
 
-        managed_children = [
+        layerwise_optimizer = next(
             child
             for child in optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
+        managed_children = [
+            child
+            for child in layerwise_optimizer.chained_optimizers
             if child._optimizer_state_offloader is not None
         ]
-        assert managed_children
-        assert (
-            len({id(child._optimizer_state_offloader._d2h_stream) for child in managed_children})
-            == 1
-        )
-        assert (
-            len({id(child._optimizer_state_offloader._h2d_stream) for child in managed_children})
-            == 1
-        )
+        # Whole-parameter compact layout can leave some DP ranks without a local Muon
+        # parameter. Those ranks legitimately have no LayerWise state offloader, but must
+        # continue through the distributed optimizer step with the ranks that do own one.
+        max_managed_children = torch.tensor(len(managed_children), dtype=torch.int, device='cuda')
+        torch.distributed.all_reduce(max_managed_children, op=torch.distributed.ReduceOp.MAX)
+        assert max_managed_children.item() > 0
+        if managed_children:
+            assert (
+                len(
+                    {id(child._optimizer_state_offloader._d2h_stream) for child in managed_children}
+                )
+                == 1
+            )
+            assert (
+                len(
+                    {id(child._optimizer_state_offloader._h2d_stream) for child in managed_children}
+                )
+                == 1
+            )
 
         optimizer.offload_optimizer_state_for_forward()
         optimizer.zero_grad()
@@ -506,9 +521,12 @@ class TestLayerWiseOptimizer:
                 collect(child)
 
         collect(optimizer)
-        assert len(managers) >= 2
-        assert len({id(manager.transfer_streams[0]) for manager in managers}) == 1
-        assert len({id(manager.transfer_streams[1]) for manager in managers}) == 1
+        max_manager_count = torch.tensor(len(managers), dtype=torch.int, device='cuda')
+        torch.distributed.all_reduce(max_manager_count, op=torch.distributed.ReduceOp.MAX)
+        assert max_manager_count.item() >= 2
+        if len(managers) >= 2:
+            assert len({id(manager.transfer_streams[0]) for manager in managers}) == 1
+            assert len({id(manager.transfer_streams[1]) for manager in managers}) == 1
 
     def test_get_grad_norm(self):
         """Test LayerWiseDistributedOptimizer gradient norm computation."""
