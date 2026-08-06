@@ -31,7 +31,9 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
             config = core_transformer_config_from_args(args)
-    cp_stage_entry_partition_mode = "zigzag"
+    cp_stage_entry_partition_mode = (
+        "zigzag" if config.cp_partition_mode == "auto" else config.cp_partition_mode
+    )
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
     else:
@@ -43,11 +45,12 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 if pg_collection is not None and hasattr(pg_collection, "pp")
                 else None
             )
-            cp_stage_entry_partition_mode = (
-                get_experimental_attention_variant_stage_input_cp_partition_mode(
-                    config=config, vp_stage=vp_stage, pp_rank=pp_rank
+            if config.cp_partition_mode == "auto":
+                cp_stage_entry_partition_mode = (
+                    get_experimental_attention_variant_stage_input_cp_partition_mode(
+                        config=config, vp_stage=vp_stage, pp_rank=pp_rank
+                    )
                 )
-            )
             transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
                 config=config, vp_stage=vp_stage, pp_rank=pp_rank
             )

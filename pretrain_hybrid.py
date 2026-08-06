@@ -122,8 +122,9 @@ def _build_packed_seq_params_for_batch(batch, args, cp_partition_mode):
         owner_name="pretrain_hybrid.get_batch",
         cp_group=packed_seq_params.cp_group,
     )
-    # TODO(cp-layout): prebuild routes only when this model chunk needs internal layout conversion.
-    prebuild_thd_cp_partition_routes(packed_seq_params)
+    # TODO(yuzhongw): prebuild routes only when this model chunk needs internal layout conversion.
+    if getattr(args, "cp_partition_mode", "zigzag") == "auto":
+        prebuild_thd_cp_partition_routes(packed_seq_params)
     return packed_seq_params
 
 
@@ -187,9 +188,10 @@ def get_batch(data_iterator, vp_stage=None, cp_partition_mode="zigzag"):
                 owner_name="pretrain_hybrid.get_batch",
                 cp_group=packed_seq_params.cp_group,
             )
-        # TODO(cp-layout): prebuild routes only when this model chunk needs internal layout
+        # TODO(yuzhongw): prebuild routes only when this model chunk needs internal layout
         # conversion.
-        prebuild_thd_cp_partition_routes(packed_seq_params)
+        if config.cp_partition_mode == "auto":
+            prebuild_thd_cp_partition_routes(packed_seq_params)
         return (
             attention_mask,
             None,

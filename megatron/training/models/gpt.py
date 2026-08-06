@@ -337,12 +337,18 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             ) and is_pp_last_stage(pg_collection.pp)
 
         cp_stage_entry_partition_mode = (
-            get_experimental_attention_variant_stage_input_cp_partition_mode(
-                self._model_config.transformer,
-                vp_stage=vp_stage,
-                pp_rank=get_pg_rank(pg_collection.pp),
-            )
+            "zigzag"
+            if self._model_config.transformer.cp_partition_mode == "auto"
+            else self._model_config.transformer.cp_partition_mode
         )
+        if self._model_config.transformer.cp_partition_mode == "auto":
+            cp_stage_entry_partition_mode = (
+                get_experimental_attention_variant_stage_input_cp_partition_mode(
+                    self._model_config.transformer,
+                    vp_stage=vp_stage,
+                    pp_rank=get_pg_rank(pg_collection.pp),
+                )
+            )
 
         model = GPTModel(
             config=self._model_config.transformer,

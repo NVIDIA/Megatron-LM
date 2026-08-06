@@ -29,6 +29,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_hybrid_stage_input_cp_partition_mode,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -39,6 +40,33 @@ class _PipelineLayout:
 
     def get_layer_offset(self, **_kwargs):
         return self.offset
+
+
+def _minimal_transformer_config_kwargs():
+    return dict(num_layers=1, hidden_size=8, num_attention_heads=1)
+
+
+def test_transformer_config_cp_partition_mode_selector():
+    assert TransformerConfig(**_minimal_transformer_config_kwargs()).cp_partition_mode == "zigzag"
+    assert (
+        TransformerConfig(
+            **_minimal_transformer_config_kwargs(), cp_partition_mode="contiguous"
+        ).cp_partition_mode
+        == "contiguous"
+    )
+    assert (
+        TransformerConfig(**_minimal_transformer_config_kwargs(), cp_partition_mode="auto")
+        .cp_partition_mode
+        == "auto"
+    )
+
+    with pytest.raises(ValueError, match="Unsupported cp_partition_mode"):
+        TransformerConfig(**_minimal_transformer_config_kwargs(), cp_partition_mode="invalid")
+
+
+def test_packed_seq_params_rejects_auto_cp_partition_mode():
+    with pytest.raises(ValueError, match="concrete runtime layout"):
+        PackedSeqParams(qkv_format="sbhd", cp_partition_mode="auto")
 
 
 class IdentityOp:

@@ -78,14 +78,16 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
     else:
         raise ValueError("You must provide a valid hybrid layer spec via --spec")
 
-    cp_stage_entry_partition_mode = get_hybrid_stage_input_cp_partition_mode_for_stage(
-        config,
-        args.hybrid_layer_pattern,
-        getattr(pg_collection, "pp", None),
-        vp_stage,
-        first_stage_layers=config.num_layers_in_first_pipeline_stage,
-        last_stage_layers=config.num_layers_in_last_pipeline_stage,
-    )
+    cp_stage_entry_partition_mode = config.cp_partition_mode
+    if config.cp_partition_mode == "auto":
+        cp_stage_entry_partition_mode = get_hybrid_stage_input_cp_partition_mode_for_stage(
+            config,
+            args.hybrid_layer_pattern,
+            getattr(pg_collection, "pp", None),
+            vp_stage,
+            first_stage_layers=config.num_layers_in_first_pipeline_stage,
+            last_stage_layers=config.num_layers_in_last_pipeline_stage,
+        )
 
     model = HybridModel(
         config=config,

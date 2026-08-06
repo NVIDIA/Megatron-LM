@@ -309,11 +309,12 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
-    cp_partition_mode: Optional[Literal["zigzag", "contiguous"]] = None
-    """DEPRECATED. CP partition mode is inferred from the model's layer layout.
+    cp_partition_mode: Literal["zigzag", "contiguous", "auto"] = "zigzag"
+    """Context-parallel sequence partition mode.
 
-    This compatibility field is ignored by model-level CP layout planning. Pass
-    cp_partition_mode explicitly to low-level data/layout helpers when needed.
+    ``"zigzag"`` and ``"contiguous"`` preserve the configured fixed layout.
+    ``"auto"`` enables model-level per-layer layout transitions in supported
+    training entry points.
     """
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
@@ -1557,16 +1558,12 @@ class TransformerConfig(ModelParallelConfig):
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
 
-        if self.cp_partition_mode is not None:
-            if self.cp_partition_mode not in ("zigzag", "contiguous"):
-                raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
-            warnings.warn(
-                "TransformerConfig.cp_partition_mode is deprecated and ignored by "
-                "model-level CP layout planning. CP partition mode is inferred from "
-                "the model's layer layout; pass cp_partition_mode explicitly to "
-                "low-level data/layout helpers when needed.",
-                DeprecationWarning,
-                stacklevel=2,
+        if self.cp_partition_mode not in ("zigzag", "contiguous", "auto"):
+            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+        if self.cp_partition_mode == "auto" and self.overlap_moe_expert_parallel_comm:
+            raise ValueError(
+                'cp_partition_mode="auto" is not supported with '
+                "overlap_moe_expert_parallel_comm in this rollout."
             )
 
         if self.experimental_attention_variant == "dsv4_hybrid" and (

@@ -62,7 +62,6 @@ _CANDIDATE_LINEAR_CP_MODE = "chunkwise"
 _CP_LAYOUT_WARNING_SUBSTRINGS = (
     "missing precomputed context-parallel layout routes",
     "received no PackedSeqParams while running under context parallelism",
-    "TransformerConfig.cp_partition_mode is deprecated and ignored",
 )
 _PARALLEL_CASES = (
     pytest.param(4, 1, _PARALLEL_EP_SIZE, False, id="cp4_tp1_ep4"),
@@ -214,6 +213,7 @@ def _make_config(
         expert_model_parallel_size=expert_model_parallel_size,
         expert_tensor_parallel_size=1,
         context_parallel_size=context_parallel_size,
+        cp_partition_mode="auto",
         sequence_parallel=sequence_parallel,
         hidden_dropout=0.0,
         attention_dropout=0.0,

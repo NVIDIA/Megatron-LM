@@ -178,25 +178,22 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         post_process = (
             post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
         )
-        cp_layout_needed = self._model_config.transformer.context_parallel_size > 1 or getattr(
-            self._model_config.transformer, "dynamic_context_parallel", False
-        )
-        cp_stage_entry_partition_mode = (
-            get_hybrid_stage_input_cp_partition_mode_for_stage(
-                self._model_config.transformer,
-                self._model_config.hybrid_layer_pattern,
-                pg_collection.pp,
-                vp_stage,
-                first_stage_layers=(
-                    self._model_config.transformer.num_layers_in_first_pipeline_stage
-                ),
-                last_stage_layers=(
-                    self._model_config.transformer.num_layers_in_last_pipeline_stage
-                ),
+        cp_stage_entry_partition_mode = self._model_config.transformer.cp_partition_mode
+        if self._model_config.transformer.cp_partition_mode == "auto":
+            cp_stage_entry_partition_mode = (
+                get_hybrid_stage_input_cp_partition_mode_for_stage(
+                    self._model_config.transformer,
+                    self._model_config.hybrid_layer_pattern,
+                    pg_collection.pp,
+                    vp_stage,
+                    first_stage_layers=(
+                        self._model_config.transformer.num_layers_in_first_pipeline_stage
+                    ),
+                    last_stage_layers=(
+                        self._model_config.transformer.num_layers_in_last_pipeline_stage
+                    ),
+                )
             )
-            if cp_layout_needed
-            else None
-        )
         return HybridModel(
             config=self._model_config.transformer,
             hybrid_stack_spec=hybrid_stack_spec,

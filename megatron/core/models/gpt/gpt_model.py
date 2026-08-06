@@ -756,7 +756,11 @@ class GPTModel(LanguageModule):
         cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
         cp_size = cp_group.size() if cp_group is not None else 1
 
-        needs_batch_layout = cp_size > 1 and (self.post_process or mtp_forward_ran)
+        needs_batch_layout = (
+            cp_size > 1
+            and self.config.cp_partition_mode == "auto"
+            and (self.post_process or mtp_forward_ran)
+        )
         if needs_batch_layout:
             if input_partition_mode is None:
                 input_partition_mode = self.decoder.cp_stage_entry_partition_mode

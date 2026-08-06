@@ -1009,7 +1009,11 @@ class HybridStack(MegatronModule):
 
         with outer_fp8_context:
             cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
-            cp_layout_needed = cp_group is not None and cp_group.size() > 1
+            cp_layout_needed = (
+                cp_group is not None
+                and cp_group.size() > 1
+                and self.config.cp_partition_mode == "auto"
+            )
             current_partition_mode = None
             if cp_layout_needed:
                 current_partition_mode = get_stage_entry_partition_mode(

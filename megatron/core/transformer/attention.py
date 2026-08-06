@@ -11,7 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
-from megatron.core.context_parallel_layout import get_required_cp_partition_mode_for_layer
+from megatron.core.context_parallel_layout import CpPartitionModeConverter
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -289,6 +289,7 @@ class Attention(MegatronModule, ABC):
     """
 
     required_cp_partition_mode = "zigzag"
+    accepted_cp_partition_modes = None
 
     def __init__(
         self,
@@ -448,22 +449,20 @@ class Attention(MegatronModule, ABC):
             rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
             self._build_per_layer_rotary_pos_emb(rotary_base)
 
-    def _get_cp_partition_mode(self):
-        """Return the concrete CP partition mode this attention module expects."""
-        cp_partition_mode = get_required_cp_partition_mode_for_layer(
-            self, self.config, cp_comm_type=self.cp_comm_type
-        )
-        if cp_partition_mode is None:
-            raise ValueError(
-                f"{self.__class__.__name__} must declare a concrete CP partition mode."
-            )
-        return cp_partition_mode
-
     def _validate_packed_seq_params_cp_partition_mode(
-        self, packed_seq_params: Optional[PackedSeqParams], expected_cp_partition_mode: str
+        self, packed_seq_params: Optional[PackedSeqParams]
     ) -> None:
-        """Validate block-provided THD CP partition metadata against this attention."""
-        if packed_seq_params is None or packed_seq_params.qkv_format != 'thd':
+        """Validate block-provided CP partition metadata against this attention."""
+        if packed_seq_params is None:
+            return
+        accepted_cp_partition_modes = self.accepted_cp_partition_modes
+        if accepted_cp_partition_modes is None:
+            accepted_cp_partition_modes = (self.required_cp_partition_mode,)
+        elif isinstance(accepted_cp_partition_modes, str):
+            accepted_cp_partition_modes = (accepted_cp_partition_modes,)
+        else:
+            accepted_cp_partition_modes = tuple(accepted_cp_partition_modes)
+        if accepted_cp_partition_modes == (None,):
             return
         cp_group = packed_seq_params.cp_group if packed_seq_params.cp_group is not None else None
         if cp_group is None:
@@ -473,19 +472,109 @@ class Attention(MegatronModule, ABC):
 
         actual_cp_partition_mode = packed_seq_params.cp_partition_mode
         if actual_cp_partition_mode is None:
-            # Direct attention-module callers may construct THD PackedSeqParams
-            # without the block-level layout annotation. In that legacy path,
-            # assume the caller provided inputs in the attention module's native
-            # layout and record it for downstream RoPE/attention helpers.
-            packed_seq_params.cp_partition_mode = expected_cp_partition_mode
-            return
-        if actual_cp_partition_mode != expected_cp_partition_mode:
             raise ValueError(
-                f"{self.__class__.__name__} requires cp_partition_mode="
-                f"{expected_cp_partition_mode!r}, but packed_seq_params has "
+                f"{self.__class__.__name__} requires PackedSeqParams.cp_partition_mode "
+                "when context parallelism is active."
+            )
+        if actual_cp_partition_mode not in accepted_cp_partition_modes:
+            raise ValueError(
+                f"{self.__class__.__name__} accepts cp_partition_mode in "
+                f"{accepted_cp_partition_modes!r}, but packed_seq_params has "
                 f"{actual_cp_partition_mode!r}. CP partition conversion must be handled "
                 "by TransformerBlock before entering attention."
             )
+
+    def _supports_fixed_cp_partition_adapter(self) -> bool:
+        """Return whether this attention class has an audited fixed-mode adapter."""
+        return self.__class__.__module__ == __name__ and self.__class__.__name__ == "SelfAttention"
+
+    def convert_tensors_to_preferred_layout(
+        self,
+        *,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor],
+        key_value_states: Optional[Tensor],
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]],
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+    ):
+        """Adapt fixed-layout callers to this attention module's native CP layout."""
+        if self.config.cp_partition_mode == "auto":
+            return hidden_states, key_value_states, rotary_pos_emb, packed_seq_params, None
+        preferred_cp_partition_mode = self.required_cp_partition_mode
+        if preferred_cp_partition_mode is None:
+            return hidden_states, key_value_states, rotary_pos_emb, packed_seq_params, None
+        if packed_seq_params is None:
+            return hidden_states, key_value_states, rotary_pos_emb, packed_seq_params, None
+
+        cp_group = packed_seq_params.cp_group if packed_seq_params.cp_group is not None else None
+        if cp_group is None:
+            cp_group = self.pg_collection.cp if hasattr(self.pg_collection, 'cp') else None
+        if cp_group is None or get_pg_size(cp_group) <= 1:
+            return hidden_states, key_value_states, rotary_pos_emb, packed_seq_params, None
+
+        actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+        if actual_cp_partition_mode is None:
+            raise ValueError(
+                f"{self.__class__.__name__} requires PackedSeqParams.cp_partition_mode "
+                "before fixed-mode CP layout conversion."
+            )
+        if actual_cp_partition_mode == preferred_cp_partition_mode:
+            return hidden_states, key_value_states, rotary_pos_emb, packed_seq_params, None
+        if not (
+            actual_cp_partition_mode == "contiguous"
+            and preferred_cp_partition_mode == "zigzag"
+            and self._supports_fixed_cp_partition_adapter()
+        ):
+            raise ValueError(
+                f"{self.__class__.__name__} cannot consume fixed CP partition mode "
+                f"{actual_cp_partition_mode!r}; it prefers {preferred_cp_partition_mode!r} "
+                "and has no audited fixed-mode local adapter for this combination."
+            )
+        if key_value_states is not None:
+            raise NotImplementedError(
+                "Fixed contiguous CP local adapter is audited for self-attention only; "
+                "cross-attention key/value states are not supported yet."
+            )
+
+        input_to_attention_converter = CpPartitionModeConverter(
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            source_partition_mode=actual_cp_partition_mode,
+            target_partition_mode=preferred_cp_partition_mode,
+            tp_group=self.pg_collection.tp,
+        )
+        input_to_attention_converter.assert_no_dense_attention_inputs(
+            attention_mask=attention_mask,
+            attention_bias=attention_bias,
+            context=f"{self.__class__.__name__} fixed-mode local adapter",
+            hidden_states=hidden_states,
+        )
+        hidden_states = input_to_attention_converter.convert(
+            hidden_states,
+            seq_dim=0,
+            sequence_parallel=self.config.sequence_parallel,
+        )
+        rotary_pos_emb = input_to_attention_converter.convert_rank_local_rotary(
+            rotary_pos_emb, seq_dim=0
+        )
+
+        local_packed_seq_params = copy.copy(packed_seq_params)
+        local_packed_seq_params.cp_partition_mode = preferred_cp_partition_mode
+        attention_to_input_converter = CpPartitionModeConverter(
+            cp_group=cp_group,
+            packed_seq_params=local_packed_seq_params,
+            source_partition_mode=preferred_cp_partition_mode,
+            target_partition_mode=actual_cp_partition_mode,
+            tp_group=self.pg_collection.tp,
+        )
+        return (
+            hidden_states,
+            key_value_states,
+            rotary_pos_emb,
+            local_packed_seq_params,
+            attention_to_input_converter,
+        )
 
     def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
         """Build self.rotary_pos_emb using a layer-specific rotary base."""
@@ -1404,10 +1493,21 @@ class Attention(MegatronModule, ABC):
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             self.pg_collection.cp = packed_seq_params.cp_group
-        expected_cp_partition_mode = self._get_cp_partition_mode()
-        self._validate_packed_seq_params_cp_partition_mode(
-            packed_seq_params, expected_cp_partition_mode
+        (
+            hidden_states,
+            key_value_states,
+            rotary_pos_emb,
+            packed_seq_params,
+            fixed_cp_partition_output_converter,
+        ) = self.convert_tensors_to_preferred_layout(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            key_value_states=key_value_states,
+            rotary_pos_emb=rotary_pos_emb,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
         )
+        self._validate_packed_seq_params_cp_partition_mode(packed_seq_params)
 
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
@@ -1593,10 +1693,14 @@ class Attention(MegatronModule, ABC):
             not self.config.flash_decode or inference_context is None
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            cp_partition_mode = expected_cp_partition_mode
+            cp_partition_mode = (
+                packed_seq_params.cp_partition_mode
+                if packed_seq_params is not None
+                and packed_seq_params.cp_partition_mode is not None
+                else self.required_cp_partition_mode
+            )
 
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                cp_partition_mode = packed_seq_params.cp_partition_mode
                 if packed_seq_params.cu_seqlens_q_padded is not None:
                     cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
                 else:
@@ -1750,6 +1854,13 @@ class Attention(MegatronModule, ABC):
             output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
+
+        if fixed_cp_partition_output_converter is not None:
+            output = fixed_cp_partition_output_converter.convert(
+                output,
+                seq_dim=0,
+                sequence_parallel=self.config.sequence_parallel,
+            )
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias

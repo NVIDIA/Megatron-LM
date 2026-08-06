@@ -7,6 +7,7 @@
 
 import logging
 import math
+import copy
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Union
@@ -17,6 +18,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import CpPartitionModeConverter
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -381,6 +383,14 @@ class GatedDeltaNet(MegatronModule):
             )
         cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
         cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
+        hidden_states, packed_seq_params, fixed_cp_partition_output_converter = (
+            self.convert_tensors_to_preferred_layout(
+                hidden_states=hidden_states,
+                packed_seq_params=packed_seq_params,
+                cp_group_chunkwise=cp_group_chunkwise,
+                cp_size_chunkwise=cp_size_chunkwise,
+            )
+        )
 
         seq_len_local, batch, _ = hidden_states.shape
         seq_len_post_headwise = seq_len_local * self.sp_size * cp_size_headwise
@@ -394,15 +404,17 @@ class GatedDeltaNet(MegatronModule):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
+        if packed_seq_params is not None:
+            if cp_size_chunkwise > 1:
+                self._validate_packed_seq_params_cp_partition_mode(packed_seq_params, "contiguous")
+            elif cp_size_headwise > 1:
+                self._validate_packed_seq_params_cp_partition_mode(packed_seq_params, "zigzag")
+
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (
                 not self.config.deterministic_mode
             ), "Packed sequence does not support deterministic mode."
-            if cp_size_chunkwise > 1:
-                self._validate_packed_seq_params_cp_partition_mode(packed_seq_params, "contiguous")
-            elif cp_size_headwise > 1:
-                self._validate_packed_seq_params_cp_partition_mode(packed_seq_params, "zigzag")
 
             # Resolve cu_seqlens with alignment padding handling.
             # cu_seqlens in packed_seq_params is the global (pre-CP-split) cu_seqlens, so we
@@ -496,6 +508,13 @@ class GatedDeltaNet(MegatronModule):
                 cu_seqlens_q,
                 packed_seq_params,
                 chunkwise_cp_context,
+            )
+
+        if fixed_cp_partition_output_converter is not None:
+            out = fixed_cp_partition_output_converter.convert(
+                out,
+                seq_dim=0,
+                sequence_parallel=self.config.sequence_parallel,
             )
 
         return out, out_bias
@@ -998,7 +1017,7 @@ class GatedDeltaNet(MegatronModule):
     def _validate_packed_seq_params_cp_partition_mode(
         self, packed_seq_params: PackedSeqParams, expected_cp_partition_mode: str
     ) -> None:
-        """Ensure block-level CP layout conversion satisfied GDN's THD layout contract."""
+        """Ensure block-level CP layout conversion satisfied GDN's layout contract."""
         actual_cp_partition_mode = packed_seq_params.cp_partition_mode
         if actual_cp_partition_mode != expected_cp_partition_mode:
             raise ValueError(
@@ -1007,6 +1026,65 @@ class GatedDeltaNet(MegatronModule):
                 f"{actual_cp_partition_mode!r}. CP partition conversion must be handled before "
                 "calling GatedDeltaNet."
             )
+
+    def convert_tensors_to_preferred_layout(
+        self,
+        *,
+        hidden_states: Tensor,
+        packed_seq_params: Optional[PackedSeqParams],
+        cp_group_chunkwise,
+        cp_size_chunkwise: int,
+    ):
+        """Restore the legacy fixed-zigzag GDN chunkwise CP local conversion."""
+        if self.config.linear_cp_mode != "chunkwise" or cp_size_chunkwise <= 1:
+            return hidden_states, packed_seq_params, None
+        if self.config.cp_partition_mode == "auto":
+            return hidden_states, packed_seq_params, None
+        if self.config.cp_partition_mode == "contiguous":
+            raise NotImplementedError(
+                "Fixed contiguous CP with GDN chunkwise mode is not supported in this "
+                "rollout. Use cp_partition_mode='zigzag' for the legacy fallback or "
+                "cp_partition_mode='auto' for block-level layout conversion."
+            )
+        if packed_seq_params is None:
+            actual_cp_partition_mode = "zigzag"
+        else:
+            actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+            if actual_cp_partition_mode is None:
+                raise ValueError(
+                    "GDN fixed-zigzag chunkwise fallback requires "
+                    "PackedSeqParams.cp_partition_mode before layout conversion."
+                )
+        if actual_cp_partition_mode != "zigzag":
+            raise ValueError(
+                "GDN fixed-zigzag chunkwise fallback expected zigzag input layout, "
+                f"but packed_seq_params has {actual_cp_partition_mode!r}."
+            )
+
+        input_to_gdn_converter = CpPartitionModeConverter(
+            cp_group=cp_group_chunkwise,
+            packed_seq_params=packed_seq_params,
+            source_partition_mode="zigzag",
+            target_partition_mode="contiguous",
+            tp_group=self.tp_group,
+        )
+        hidden_states = input_to_gdn_converter.convert(
+            hidden_states,
+            seq_dim=0,
+            sequence_parallel=self.config.sequence_parallel,
+        )
+        local_packed_seq_params = packed_seq_params
+        if packed_seq_params is not None:
+            local_packed_seq_params = copy.copy(packed_seq_params)
+            local_packed_seq_params.cp_partition_mode = "contiguous"
+        gdn_to_input_converter = CpPartitionModeConverter(
+            cp_group=cp_group_chunkwise,
+            packed_seq_params=local_packed_seq_params,
+            source_partition_mode="contiguous",
+            target_partition_mode="zigzag",
+            tp_group=self.tp_group,
+        )
+        return hidden_states, local_packed_seq_params, gdn_to_input_converter
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""

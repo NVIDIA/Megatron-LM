@@ -117,6 +117,12 @@ def model_provider(
         HybridModel: The returned model
     """
     args = get_args()
+    if getattr(args, "cp_partition_mode", "zigzag") == "auto":
+        raise ValueError(
+            'megatron/elastification/pretrain_hybrid_flex.py does not support '
+            'cp_partition_mode="auto"; use pretrain_hybrid.py for the CP layout '
+            'refactor path.'
+        )
     if has_nvidia_modelopt:
 
         model = model_provider_modelopt(
