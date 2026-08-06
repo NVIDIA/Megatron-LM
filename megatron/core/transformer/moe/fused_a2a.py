@@ -30,11 +30,16 @@ try:
 except ImportError:
     HAVE_DEEP_EP_V2 = False
 
-# `EventHandle` / `EventOverlap` live in `deep_ep.utils` in both V1
-# (PR #605 base) and V2, but the import is only safe when some
-# flavour of deep_ep is installed.
+# `EventHandle` / `EventOverlap` live in `deep_ep.utils` in V1. In V2
+# (PR #605 onwards) `EventOverlap` is defined in `deep_ep.utils.event`
+# but is not re-exported from the package `__init__`. Import with
+# graceful fall-through so the module loads under either flavour.
 if HAVE_DEEP_EP or HAVE_DEEP_EP_V2:
-    from deep_ep.utils import EventHandle, EventOverlap  # noqa: F401
+    try:
+        from deep_ep.utils import EventHandle, EventOverlap  # noqa: F401
+    except ImportError:
+        from deep_ep.utils import EventHandle  # noqa: F401
+        from deep_ep.utils.event import EventOverlap  # noqa: F401
 
 import torch
 
