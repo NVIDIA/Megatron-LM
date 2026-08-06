@@ -6,6 +6,7 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.context_parallel_layout import (
+    CpPartitionModeConverter,
     get_required_cp_partition_mode_for_layer,
     get_stage_entry_partition_mode,
     replace_packed_seq_params_cp_partition_mode,
@@ -89,6 +90,34 @@ def checkpointed_forward(
                 local_packed_seq_params = replace_packed_seq_params_cp_partition_mode(
                     packed_seq_params, current_partition_mode
                 )
+            if cp_layout_needed and current_partition_mode != stage_entry_partition_mode:
+                chunk_entry_converter = CpPartitionModeConverter(
+                    cp_group=cp_group,
+                    packed_seq_params=local_packed_seq_params,
+                    source_partition_mode=stage_entry_partition_mode,
+                    target_partition_mode=current_partition_mode,
+                    tp_group=self.pg_collection.tp,
+                )
+                chunk_entry_converter.assert_no_dense_attention_inputs(
+                    attention_mask=attention_mask,
+                    attention_bias=attention_bias,
+                    context=f"{type(self).__name__}: recompute chunk start={start}",
+                    hidden_states=hidden_states,
+                )
+                rotary_pos_emb = chunk_entry_converter.convert_rank_local_rotary(
+                    rotary_pos_emb, seq_dim=0
+                )
+                if padding_mask is not None:
+                    padding_mask = chunk_entry_converter.convert(
+                        padding_mask,
+                        seq_dim=1,
+                        sequence_parallel=self.config.sequence_parallel,
+                    )
+                if local_input_ids is not None:
+                    local_input_ids = chunk_entry_converter.convert(
+                        local_input_ids,
+                        seq_dim=1,
+                    )
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
