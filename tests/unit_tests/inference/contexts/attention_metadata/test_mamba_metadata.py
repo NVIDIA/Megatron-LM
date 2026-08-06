@@ -40,6 +40,17 @@ class TestMambaMetadata:
 
         assert metadata._batch_indices_decode_buffer.dtype == dtype
 
+    def test_free_unbound_live_slot(self):
+        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+
+        slot = int(metadata.allocate_slot())
+        assert metadata.mamba_state_free_slot_count == 1
+
+        metadata.free_slot(slot)
+
+        assert metadata.mamba_state_free_slot_count == 2
+        assert int(metadata.allocate_slot()) == slot
+
     def _run_update_test(
         self,
         metadata: MambaMetadata,

@@ -752,6 +752,16 @@ class MambaMetadata:
 
         return mamba_idx
 
+    def free_slot(self, mamba_idx: int) -> None:
+        """Return one unbound slot to the live Mamba state pool."""
+
+        if not 0 <= mamba_idx < self.max_requests:
+            raise ValueError(f"Mamba state slot {mamba_idx} is outside the live state pool")
+        if self.mamba_state_free_slot_count >= self.max_requests:
+            raise RuntimeError("Cannot free a Mamba state slot when the pool is already full")
+        self.mamba_state_free_slots[self.mamba_state_free_slot_count] = mamba_idx
+        self.mamba_state_free_slot_count += 1
+
     def batch_allocate_slots(self, num_slots: int) -> Optional[torch.Tensor]:
         """
         Allocates new slots for the given number of requests in the Mamba state buffers.

@@ -109,8 +109,13 @@ class MambaSlotAllocator:
         self._intermediate_block_ids_cpu = torch.full(
             (context.max_requests, k), -1, dtype=torch.int32, device='cpu'
         )
+        # Track each request's end-of-prefill SSM state by its KV block ID.
+        # Handoff states are marked so they are cached before optional prefix snapshots.
         self._eos_cache_block_id_cpu = torch.full(
             (context.max_requests,), -1, dtype=torch.int32, device='cpu'
+        )
+        self._eos_handoff_required_cpu = torch.zeros(
+            context.max_requests, dtype=torch.bool, device='cpu'
         )
         # CPU flag to skip GPU sync when no intermediates exist
         self._has_intermediates = False
@@ -487,22 +492,25 @@ class MambaSlotAllocator:
             self._has_intermediates = True
         self._intermediate_counts_cpu[current_id] = count
 
-        # Block-aligned EOS: when the prompt length is exactly block-aligned, the
-        # request's live final state IS the last block boundary's state and can be
-        # cached directly. Only valid on the final chunk (otherwise the live state
-        # is mid-prompt). Non-block-aligned prompts cache their last complete block
-        # via the intermediate-extraction path above instead.
-        if is_last_chunk and last_aligned_abs == prompt_len and prompt_len > 0:
-            last_block_idx = prompt_len // bs - 1
+        # A handoff needs the exact post-prompt recurrent state, including for a
+        # partial final KV block. Ordinary prefix caching stores only block-boundary
+        # states because only complete blocks have reusable hashes.
+        handoff_required = req.sampling_params.do_kv_handoff
+        cache_final_state = last_aligned_abs == prompt_len or handoff_required
+        if is_last_chunk and cache_final_state and prompt_len > 0:
+            last_block_idx = (prompt_len - 1) // bs
             if last_block_idx >= 0:
                 self._eos_cache_block_id_cpu[current_id] = ctx.request_to_kv_block_ids[current_id][
                     last_block_idx
                 ]
+                self._eos_handoff_required_cpu[current_id] = handoff_required
                 self._has_intermediates = True
             else:
                 self._eos_cache_block_id_cpu[current_id] = -1
+                self._eos_handoff_required_cpu[current_id] = False
         else:
             self._eos_cache_block_id_cpu[current_id] = -1
+            self._eos_handoff_required_cpu[current_id] = False
 
     def get_intermediate_cpu_data(self):
         """Get intermediate offsets and counts as CPU tensor slices for current prefill batch.
@@ -548,6 +556,26 @@ class MambaSlotAllocator:
     # Intermediate state commit
     # =========================================================================
 
+    def _allocate_slots_up_to_capacity(self, block_ids: list) -> tuple[list[int], list[int]]:
+        """Allocate candidates that fit and return their original indices and slots."""
+
+        try:
+            return list(range(len(block_ids))), self.allocate_slots_batch(block_ids)
+        except MambaSlotCapacityError as error:
+            # Keep existing slots and the earliest unique new blocks that fit.
+            existing_slots = self.block_to_slot[block_ids].tolist()
+            kept_indices: list[int] = []
+            kept_new_bids: set[int] = set()
+            for index, (block_id, slot) in enumerate(zip(block_ids, existing_slots)):
+                if slot >= 0 or block_id in kept_new_bids:
+                    kept_indices.append(index)
+                elif len(kept_new_bids) < error.available:
+                    kept_new_bids.add(block_id)
+                    kept_indices.append(index)
+
+            kept_bids = [block_ids[index] for index in kept_indices]
+            return kept_indices, self.allocate_slots_batch(kept_bids)
+
     def commit_intermediate_states(self) -> None:
         """Commit intermediate states from pre-allocated output buffers to cache.
 
@@ -557,29 +585,63 @@ class MambaSlotAllocator:
         collected = self._collect_commit_data()
         if collected is None:
             return
-        intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes = collected
+        (
+            intermediate_bids,
+            src_offsets,
+            eos_bids,
+            eos_ctx_indices,
+            eos_handoff_required,
+            all_hashes,
+        ) = collected
 
-        # These snapshots only improve future cache hits; the active requests
-        # continue from their live Mamba state if durable capacity is exhausted.
+        # Reserve slots for exact handoff states before optional prefix snapshots.
+        handoff_eos_indices = [
+            index for index, required in enumerate(eos_handoff_required) if required
+        ]
+        requested_handoff_bids = [eos_bids[index] for index in handoff_eos_indices]
+        requested_handoff_ctx_indices = [eos_ctx_indices[index] for index in handoff_eos_indices]
+        requested_handoff_hashes = [
+            all_hashes[len(intermediate_bids) + index] for index in handoff_eos_indices
+        ]
+        if requested_handoff_bids:
+            kept_handoffs, handoff_slots = self._allocate_slots_up_to_capacity(
+                requested_handoff_bids
+            )
+            handoff_bids = [requested_handoff_bids[index] for index in kept_handoffs]
+            handoff_ctx_indices = [requested_handoff_ctx_indices[index] for index in kept_handoffs]
+            handoff_hashes = [requested_handoff_hashes[index] for index in kept_handoffs]
+            self.store_from_live_batch(handoff_slots, handoff_ctx_indices)
+            self.register_block_hashes_batch(handoff_bids, handoff_hashes)
+
+        # Remove optional snapshots for blocks claimed by exact handoff state.
+        handoff_bid_set = set(requested_handoff_bids)
+        optional_eos_indices = [
+            index
+            for index, block_id in enumerate(eos_bids)
+            if index not in handoff_eos_indices and block_id not in handoff_bid_set
+        ]
+        eos_bids = [eos_bids[index] for index in optional_eos_indices]
+        eos_ctx_indices = [eos_ctx_indices[index] for index in optional_eos_indices]
+        eos_hashes = [all_hashes[len(intermediate_bids) + index] for index in optional_eos_indices]
+        keep_intermediate = [
+            index
+            for index, block_id in enumerate(intermediate_bids)
+            if block_id not in handoff_bid_set
+        ]
+        intermediate_bids = [intermediate_bids[index] for index in keep_intermediate]
+        src_offsets = [src_offsets[index] for index in keep_intermediate]
+        intermediate_hashes = [all_hashes[index] for index in keep_intermediate]
+        all_hashes = intermediate_hashes + eos_hashes
+
+        # Fill the remaining capacity with optional reusable prefix snapshots.
         all_bids = intermediate_bids + eos_bids
         n_intermediate = len(intermediate_bids)
-        try:
-            all_slots = self.allocate_slots_batch(all_bids)
-        except MambaSlotCapacityError as error:
-            existing_slots = self.block_to_slot[all_bids].tolist()
-            kept_indices = []
-            kept_new_bids = set()
-            for index, (block_id, slot) in enumerate(zip(all_bids, existing_slots)):
-                if slot >= 0 or block_id in kept_new_bids:
-                    kept_indices.append(index)
-                elif len(kept_new_bids) < error.available:
-                    kept_new_bids.add(block_id)
-                    kept_indices.append(index)
-
-            if not kept_indices:
-                self._clear_intermediate_state()
-                return
-
+        kept_indices, all_slots = self._allocate_slots_up_to_capacity(all_bids)
+        if all_bids and not kept_indices:
+            self._clear_intermediate_state()
+            return
+        if len(kept_indices) != len(all_bids):
+            # Keep block, hash, and state-source lists aligned after truncation.
             all_bids = [all_bids[index] for index in kept_indices]
             all_hashes = [all_hashes[index] for index in kept_indices]
             src_offsets = [src_offsets[index] for index in kept_indices if index < n_intermediate]
@@ -588,17 +650,17 @@ class MambaSlotAllocator:
                 for index in kept_indices
                 if index >= n_intermediate
             ]
-            all_slots = self.allocate_slots_batch(all_bids)
             n_intermediate = len(src_offsets)
 
-        # Copy intermediate states from output buffers to cache
-        self._copy_intermediate_to_cache(src_offsets, all_slots[:n_intermediate])
+        if all_bids:
+            # Intermediate snapshots come from the extraction buffers.
+            self._copy_intermediate_to_cache(src_offsets, all_slots[:n_intermediate])
 
-        # Copy EOS states from live buffers to cache
-        self.store_from_live_batch(all_slots[n_intermediate:], eos_ctx_indices)
+            # End-of-prefill snapshots come from the live request state.
+            self.store_from_live_batch(all_slots[n_intermediate:], eos_ctx_indices)
 
-        # Register hashes for all committed blocks
-        self.register_block_hashes_batch(all_bids, all_hashes)
+            # Publish hashes only after their state has been copied.
+            self.register_block_hashes_batch(all_bids, all_hashes)
 
         self._clear_intermediate_state()
 
@@ -607,8 +669,9 @@ class MambaSlotAllocator:
 
         Returns:
             Tuple of (intermediate_bids, src_offsets, eos_bids, eos_ctx_indices,
-            all_hashes) or None if nothing to commit. all_hashes covers
-            intermediate_bids + eos_bids in that order.
+            eos_handoff_required, all_hashes), or None if nothing needs to be
+            committed. ``all_hashes`` covers ``intermediate_bids + eos_bids``
+            in that order.
         """
         ctx = self.context
         metadata = ctx.mamba_metadata
@@ -631,6 +694,9 @@ class MambaSlotAllocator:
         eos_bids_cpu = self._eos_cache_block_id_cpu[
             prefill_start : prefill_start + prefill_count
         ].tolist()
+        eos_handoff_required_cpu = self._eos_handoff_required_cpu[
+            prefill_start : prefill_start + prefill_count
+        ].tolist()
 
         # Flatten intermediate block IDs and source offsets
         intermediate_bids = []
@@ -643,14 +709,17 @@ class MambaSlotAllocator:
                     src_offsets.append(ssm_offset + j)
                 ssm_offset += count
 
-        # Collect EOS block IDs and their context indices
+        # Collect aligned EOS block IDs, live context indices, and handoff flags.
         eos_bids = []
         eos_ctx_indices = []
-        for req_batch_idx in range(prefill_count):
-            eos_bid = eos_bids_cpu[req_batch_idx]
+        eos_handoff_required = []
+        for req_batch_idx, (eos_bid, handoff_required) in enumerate(
+            zip(eos_bids_cpu, eos_handoff_required_cpu)
+        ):
             if eos_bid >= 0:
                 eos_bids.append(eos_bid)
                 eos_ctx_indices.append(prefill_start + req_batch_idx)
+                eos_handoff_required.append(bool(handoff_required))
 
         if not intermediate_bids and not eos_bids:
             self._clear_intermediate_state()
@@ -662,7 +731,14 @@ class MambaSlotAllocator:
         bid_tensor = torch.tensor(all_bids_for_hash, dtype=torch.int64, device=device)
         all_hashes = ctx.kv_block_allocator.block_hashes[bid_tensor].tolist()
 
-        return intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes
+        return (
+            intermediate_bids,
+            src_offsets,
+            eos_bids,
+            eos_ctx_indices,
+            eos_handoff_required,
+            all_hashes,
+        )
 
     def _copy_intermediate_to_cache(self, src_offsets: list, slots: list) -> None:
         """Copy intermediate states from output buffers to cache slots.
@@ -694,6 +770,7 @@ class MambaSlotAllocator:
             self._intermediate_offsets_cpu[prefill_start:end].fill_(0)
             self._intermediate_block_ids_cpu[prefill_start:end].fill_(-1)
             self._eos_cache_block_id_cpu[prefill_start:end].fill_(-1)
+            self._eos_handoff_required_cpu[prefill_start:end].fill_(False)
         self._has_intermediates = False
 
     # =========================================================================
@@ -713,4 +790,5 @@ class MambaSlotAllocator:
         self._intermediate_counts_cpu.fill_(0)
         self._intermediate_block_ids_cpu.fill_(-1)
         self._eos_cache_block_id_cpu.fill_(-1)
+        self._eos_handoff_required_cpu.fill_(False)
         self._has_intermediates = False

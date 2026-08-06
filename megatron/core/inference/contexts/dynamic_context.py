@@ -901,17 +901,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and prefix_caching_mamba_gb is not None
                 and prefix_caching_mamba_gb > 0
             ):
+                assert self.mamba_slot_allocator is not None
                 prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
-                # Mirror the split done in _allocate_mamba_cache so this preview
-                # matches what is actually allocated: the "scratch" buffers
-                # (intermediate_ssm_out/intermediate_conv_out) are reserved from the
-                # budget first, then the rest sizes the "durable" cache
-                # (ssm_states/conv_states). mamba_bytes_per_req is the shared
-                # per-slot footprint of both.
+                # The allocator contains the PP-synchronized durable capacity.
+                # Scratch remains stage-local because it is temporary forward
+                # storage and does not participate in prefix-cache matching.
                 scratch_slots = self.max_mamba_intermediate_states_per_step
                 scratch_bytes = scratch_slots * mamba_bytes_per_req
-                durable_slots = (prefix_cache_bytes - scratch_bytes) // mamba_bytes_per_req
-                durable_slots = max(durable_slots, 0)
+                durable_slots = self.mamba_slot_allocator.max_slots
                 log_lines += [
                     f"  Mamba prefix cache:",
                     f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
@@ -1826,6 +1823,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         scratch_slots = self.max_mamba_intermediate_states_per_step
         scratch_bytes = scratch_slots * per_slot_bytes
         max_slots = (total_bytes - scratch_bytes) // per_slot_bytes  # durable slots
+
+        # Prefix-cache state is replicated across pipeline stages. Use the
+        # smallest stage-local capacity so identical cache operations produce
+        # identical block-to-slot mappings on every stage. A recurrent prefix
+        # is executable only when all stages retain its state, so additional
+        # slots on an individual stage would not increase usable cache capacity.
+        if get_pg_size(self.pipeline_parallel_group) > 1:
+            max_slots_tensor = torch.tensor(
+                max_slots, dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(
+                max_slots_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.pipeline_parallel_group,
+            )
+            max_slots = int(max_slots_tensor.item())
+
         if max_slots < 1:
             raise ValueError(
                 f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
@@ -3511,6 +3525,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             sa._intermediate_offsets_cpu[request_indexes] = 0
             sa._intermediate_block_ids_cpu[request_indexes] = -1
             sa._eos_cache_block_id_cpu[request_indexes] = -1
+            sa._eos_handoff_required_cpu[request_indexes] = False
 
     def _get_paused_request_count_within_block_budget(self) -> int:
         """Count the left-most paused requests whose blocks fit the paused budget."""
