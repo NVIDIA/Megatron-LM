@@ -366,11 +366,13 @@ class DynamicInferenceEngine(AbstractEngine):
         """Hook overridden by the KV-handoff engine composition."""
         self._raise_kv_handoff_not_enabled("KV handoff completion notification")
 
-    def _prepare_handoff_metadata_batch(self, requests_and_blocks: list[tuple]) -> dict:
+    def _prepare_handoff_metadata_batch(
+        self, requests_and_blocks: list[tuple], decode_tokens_by_request: Dict[int, list[int]]
+    ) -> dict:
         """Hook overridden by the KV-handoff engine composition."""
         return {}
 
-    def _capture_handoff_meta(self, request, block_ids: list, prepared=None) -> None:
+    def _capture_handoff_meta(self, request, prepared) -> None:
         self._raise_kv_handoff_not_enabled("KV handoff completion")
 
     def _release_pinned_handoff_blocks(self, block_ids: list) -> int:
@@ -1320,6 +1322,7 @@ class DynamicInferenceEngine(AbstractEngine):
         pre_fwd_step_count: Optional[int] = None,
         finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
         finished_handoff_block_ids: Optional[Dict[int, list[int]]] = None,
+        finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -1342,6 +1345,9 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_routing_block_ids: (Dict[int, List[int]]): Block IDs for
                 finished requests, saved before update_requests released them.
                 Used for per-block routing reconstruction.
+            finished_handoff_block_ids: Prompt KV block IDs retained for state handoff.
+            finished_handoff_decode_tokens: First sampled token and optional MTP proposals
+                needed to resume directly from imported prefill state on decode.
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -1382,7 +1388,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 (self.get_request(request_id), handoff_blocks_by_request.get(request_id, []))
                 for request_id in request_id_list
                 if request_id in finished_request_ids
-            ]
+            ],
+            finished_handoff_decode_tokens or {},
         )
 
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
@@ -1524,9 +1531,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Keep handoff blocks only when the request needs them.
                     handoff_blocks = handoff_blocks_by_request.get(request_id, [])
                     if request.sampling_params.do_kv_handoff:
-                        self._capture_handoff_meta(
-                            request, handoff_blocks, prepared_handoff_metadata.get(request_id)
-                        )
+                        self._capture_handoff_meta(request, prepared_handoff_metadata[request_id])
                     # A prefill-role engine may also serve regular requests; release the
                     # temporary block references when no handoff was requested.
                     elif handoff_blocks:
@@ -2348,6 +2353,7 @@ class DynamicInferenceEngine(AbstractEngine):
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
             finished_handoff_block_ids = step_result.get("finished_handoff_block_ids", None)
+            finished_handoff_decode_tokens = step_result.get("finished_handoff_decode_tokens", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -2370,6 +2376,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 pre_fwd_step_count=context_state.get("step_count"),
                 finished_routing_block_ids=finished_routing_block_ids,
                 finished_handoff_block_ids=finished_handoff_block_ids,
+                finished_handoff_decode_tokens=finished_handoff_decode_tokens,
             )
 
         else:

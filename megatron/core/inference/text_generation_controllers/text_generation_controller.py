@@ -1956,6 +1956,7 @@ class TextGenerationController:
         # Retain finished prefill blocks before request cleanup releases them;
         # the handoff path owns this reference until the decode transfer completes.
         finished_handoff_block_ids = {}
+        finished_handoff_decode_tokens = {}
         allocator = context.kv_block_allocator
         if allocator.enable_handoff_pinning and finished_idxs.numel() > 0:
             for fidx in finished_idxs.tolist():
@@ -1968,6 +1969,13 @@ class TextGenerationController:
                     # ownership. For an exclusively owned handoff block: active=1, retain=2,
                     # request cleanup=1, coordinator RELEASE_KV=0.
                     allocator.retain_memory_blocks(valid)
+                active_idx = fidx - context.paused_request_count
+                decode_tokens = [int(sampled_tokens_cpu[active_idx].item())]
+                if sampled_mtp_tokens_cpu is not None:
+                    decode_tokens.extend(
+                        int(token) for token in sampled_mtp_tokens_cpu[:, active_idx].tolist()
+                    )
+                finished_handoff_decode_tokens[req_id] = decode_tokens
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused buffer.
@@ -1990,6 +1998,7 @@ class TextGenerationController:
             "sample": sampled_tokens_cpu,
             "finished_routing_block_ids": finished_routing_block_ids,
             "finished_handoff_block_ids": finished_handoff_block_ids,
+            "finished_handoff_decode_tokens": finished_handoff_decode_tokens,
             **(update_result or {}),
         }
 

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List
 
 from megatron.core.inference.sampling_params import SamplingParams
@@ -13,7 +13,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 @dataclass(kw_only=True)
 class DeferredKvHandoff:
-    """Decode handoff waiting for local KV-cache capacity."""
+    """Decode handoff waiting for local cache capacity before transfer starts."""
 
     request_id: int
     prompt: list
@@ -37,6 +37,8 @@ class PendingKvImport:
     cached_prefix_block_count: int
     handle: Any
     future: asyncio.Future
+    resume_tokens: List[int] = field(default_factory=list)
+    continuation_blocks: List[int] = field(default_factory=list)
     local_error: Exception | None = None  # Exact local error, if this rank failed.
     destinations_safe: bool = True  # Whether allocated blocks may return to the pool.
     terminal_state_reported: bool = False  # This rank sent its completion report.
