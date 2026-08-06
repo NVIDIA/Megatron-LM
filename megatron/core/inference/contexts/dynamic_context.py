@@ -3231,47 +3231,34 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = token_offset_range
-        # Tokens recomputed inside an already-matched block must not write to it.
-        # The block is shared with whatever request cached it, and a hash match
-        # guarantees it already holds the correct KV for exactly these tokens, so
-        # the recomputed values are redundant. Rewriting them anyway would perturb
-        # a concurrent reader's KV by the low bits (the same math under a different
-        # batch shape reduces in a different order), which is a needless source of
-        # run-to-run nondeterminism.
-        #
-        # Only the write mapping is redirected. `request_to_kv_block_ids` still
-        # points at the real block, so attention reads the cached values through
-        # the block table and nothing has to be restored after the chunk --
-        # `token_to_block_idx` is rebuilt from scratch every step.
-        #
-        # This region is non-empty whenever `prefix_skip_tokens` ends up below
-        # `num_matched_blocks * block_size_tokens`: via the ">= 2 computed tokens"
-        # clamp, via the Mamba back-off, or in memory-only hybrid mode where the
-        # skip is 0 but blocks are still shared for dedup.
         self.token_to_block_idx[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
         if num_matched_blocks > 0:
-            # The matched blocks occupy block indices
-            # [already_allocated_blocks, already_allocated_blocks + num_matched),
-            # i.e. token positions [matched_start_token, matched_end_token). This
-            # chunk's token positions are `effective_kv_offset + i`, so the tokens
-            # to redirect form the contiguous range [lo, hi) below.
+            # Blocks matched from the prefix cache are read-only: a hash match means
+            # the block already holds the correct KV for exactly these tokens, and it
+            # is shared with whoever cached it. Any tokens this chunk still recomputes
+            # inside them are redirected to the dummy block rather than rewritten in
+            # place, which would perturb a concurrent reader's KV in the low bits.
+            # Only the write mapping moves -- request_to_kv_block_ids still points at
+            # the real block, so attention reads the cached values through the block
+            # table, and token_to_block_idx is rebuilt from scratch every step.
             #
-            # `lo` is only non-zero when `finished_chunk_token_count` is not
-            # block-aligned: `prefix_skip_tokens` is 0 there, so the chunk starts
-            # inside the request's own partial block from the previous chunk, whose
-            # KV nothing else holds and must not be discarded.
-            matched_start_token = already_allocated_blocks * self.block_size_tokens
-            matched_end_token = (
-                already_allocated_blocks + num_matched_blocks
-            ) * self.block_size_tokens
-            lo = max(0, matched_start_token - effective_kv_offset)
-            hi = min(effective_prefill_chunk_length, matched_end_token - effective_kv_offset)
-            if hi > lo:
-                self.token_to_block_idx[
-                    self.active_token_count + lo : self.active_token_count + hi
-                ] = self.kv_block_allocator.dummy_block_idx
+            # The matched blocks start at block `already_allocated_blocks`, i.e. at
+            # this offset into the chunk. It is negative when tokens were skipped
+            # (the common block-aligned case, so the region starts at 0) and positive
+            # only when `finished_chunk_token_count` is not block-aligned: the chunk
+            # then opens inside the request's own partial block from the previous
+            # chunk, whose KV nothing else holds and which must still be written.
+            matched_start = already_allocated_blocks * self.block_size_tokens - effective_kv_offset
+            lo = max(matched_start, 0)
+            hi = min(
+                matched_start + num_matched_blocks * self.block_size_tokens,
+                effective_prefill_chunk_length,
+            )
+            self.token_to_block_idx[
+                self.active_token_count + lo : self.active_token_count + hi
+            ] = self.kv_block_allocator.dummy_block_idx
         self.token_to_local_position_within_kv_block[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = (token_offset_range % self.block_size_tokens)
