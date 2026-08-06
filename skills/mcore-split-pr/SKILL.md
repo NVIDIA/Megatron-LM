@@ -7,6 +7,7 @@ user_invocable: true
 argument: "PR URL or number"
 metadata:
   author: Philip Petrakian <ppetrakian@nvidia.com>
+  version: "1.0.1"
 ---
 
 # Split PR by CODEOWNERS Groups
