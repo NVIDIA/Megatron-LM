@@ -81,7 +81,18 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """When True, return cu_seqlens marking document boundaries within each sample so
     that attention is restricted to individual documents."""
     sft_mock_dataset_config_json: Optional[str] = None
-    """This config provides the necessary information for the mock dataset."""
+    """JSON string (or path to a JSON file) configuring the mock SFT dataset's
+    sequence-length distribution. Two modes:
+
+      * ``{"mode": "file", "path": "/path/to/seqlens.csv"}`` -- read the
+        per-sample sequence lengths from a CSV file.
+      * ``{"mode": "distribution", "type": "lognormal", "min_seq_len": 1024,
+        "max_seq_len": 8192, "mean_seq_len": 4096, "lognormal_sigma": 1.1}``
+        -- draw lengths from a clipped lognormal distribution.
+
+    Consumed by ``MockSFTLowLevelDataset`` in
+    ``megatron/training/datasets/sft_dataset.py``, which documents the fields.
+    """
 
     varlen_mock_dataset_config_json: Optional[str] = None
     """Mock-dataset config (same JSON schema as ``sft_mock_dataset_config_json``)
