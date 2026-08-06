@@ -301,6 +301,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Throw a cudagraph-admission warning if deferred for > max_sequence_length steps.
         # The floor value of 100 avoids warnings in test configs where max_sequence_length < 100.
         self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
+        self._initialize_disaggregation_state()
         # Initialize engine.
         self.reset()
 
@@ -336,8 +337,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()
-
-        self._initialize_disaggregation_state()
 
         # Create cuda graphs.
         self.create_cuda_graphs()
