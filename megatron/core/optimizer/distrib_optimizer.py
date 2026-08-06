@@ -353,38 +353,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return local_param_group_map, group_ranges
 
     @staticmethod
-    def _clear_unowned_high_precision_init_values(
-        opt_group_ranges: List,
-        param_gbuf_map: Dict[torch.nn.Parameter, Tuple],
-        config: OptimizerConfig,
-    ) -> Tuple[int, int]:
-        """Clear initialization values after this rank no longer needs them.
+    def _clear_high_precision_init_values(
+        model_params: List[torch.nn.Parameter], config: OptimizerConfig
+    ) -> int:
+        """Clear initialization values after main-parameter initialization.
 
         Quantized parameters retain a high-precision CPU initialization value
         until the distributed optimizer creates its FP32 main-parameter shard.
-        Parameters that have no shard on this rank never enter the shard-copy
-        loop, so their initialization values must be released separately.
         """
         if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-            return 0, 0
+            return 0
 
-        observed = 0
         cleared = 0
-        for group_range in opt_group_ranges:
-            for model_param in group_range["orig_group"]["params"]:
-                getter = getattr(model_param, 'get_high_precision_init_val', None)
-                if getter is None:
-                    continue
-                high_precision_init_value = getter()
-                if high_precision_init_value is None:
-                    continue
-                observed += 1
-                if model_param not in param_gbuf_map:
-                    model_param.clear_high_precision_init_val()
-                    cleared += 1
-                del high_precision_init_value
+        for model_param in model_params:
+            getter = getattr(model_param, 'get_high_precision_init_val', None)
+            if getter is None or getter() is None:
+                continue
+            model_param.clear_high_precision_init_val()
+            cleared += 1
 
-        return observed, cleared
+        return cleared
 
     @classmethod
     def _build_model_and_main_param_groups(
@@ -478,7 +466,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     .to(model_param.device)
                                     .float()
                                 )
-                                model_param.clear_high_precision_init_val()
                             else:
                                 shard_main_param = model_param.float().view(-1)[
                                     param_range.start : param_range.end
@@ -813,9 +800,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
         )
 
-        self._high_precision_init_value_count, _ = self._clear_unowned_high_precision_init_values(
-            self.opt_group_ranges, self.model_param_gbuf_map, config
-        )
+        # Preserve model-parameter references before main-parameter initialization replaces each
+        # optimizer group's parameter list with its local shards.
+        original_model_params = [
+            model_param
+            for group_range in self.opt_group_ranges
+            for model_param in group_range["orig_group"]["params"]
+        ]
 
         # Allocate main param shards.
         (
@@ -826,6 +817,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_fp32_from_float16_groups,
         ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
+        )
+        self._high_precision_init_value_count = self._clear_high_precision_init_values(
+            original_model_params, config
         )
 
         # _build_model_and_main_param_groups() installs each group's params as
