@@ -25,6 +25,20 @@ TOPK=${TOPK:-2048}               # must be a multiple of 128 for cuDNN
 export DSA_GQA_KERNEL=${DSA_GQA_KERNEL:-min_memory}
 DSA_BACKEND=${DSA_BACKEND:-cudnn}  # cudnn | tilelang | none
 
+# --- wandb (opt-in): set WANDB_PROJECT to enable. Each run gets a distinct name
+# encoding backend + seq so runs compare cleanly in the wandb UI. Needs wandb login
+# / WANDB_API_KEY in the container. Example:
+#   WANDB_PROJECT=dsa-gqa-main DSA_MIN_MEMORY_USE_TRITON=1 DSA_MIN_MEMORY_USE_CUDNN=1 \
+#     bash train_hybrid_dsa_gqa_main.sh
+_T=${DSA_MIN_MEMORY_USE_TRITON:-0}; _C=${DSA_MIN_MEMORY_USE_CUDNN:-0}
+if   [ "$_T" = 1 ] && [ "$_C" = 1 ]; then _BK=triton_cudnn
+elif [ "$_T" = 1 ]; then _BK=triton
+elif [ "$_C" = 1 ]; then _BK=cudnn
+else _BK=oracle; fi
+WANDB_PROJECT=${WANDB_PROJECT:-}
+WANDB_NAME=${WANDB_NAME:-dsa_${DSA_GQA_KERNEL}_${_BK}_seq${SEQ_LEN}_topk${TOPK}}
+WANDB_SAVE_DIR=${WANDB_SAVE_DIR:-./wandb_dsa}
+
 export CUDA_DEVICE_MAX_CONNECTIONS=1   # pre-Blackwell TP>1/CP>1 non-FSDP; harmless otherwise
 
 # --- layer pattern: M=mamba, D=DSA(GQA) attention, -=dense MLP, E=MoE, *=attention ---
@@ -100,5 +114,14 @@ MODEL_ARGS=(
   --vocab-size 131072
   --tokenizer-type NullTokenizer
 )
+
+if [ -n "${WANDB_PROJECT}" ]; then
+  MODEL_ARGS+=(
+    --wandb-project "${WANDB_PROJECT}"
+    --wandb-exp-name "${WANDB_NAME}"
+    --wandb-save-dir "${WANDB_SAVE_DIR}"
+  )
+  echo "wandb enabled: project=${WANDB_PROJECT} name=${WANDB_NAME} save-dir=${WANDB_SAVE_DIR}"
+fi
 
 torchrun --nproc-per-node ${GPUS_PER_NODE} pretrain_hybrid.py "${MODEL_ARGS[@]}"
