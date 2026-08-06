@@ -45,26 +45,15 @@ def build_packed_seq_idx(packed_seq_params: PackedSeqParams, total_tokens: int) 
     the helper is agnostic to TP/SP/CP shapes upstream.
     """
     cu_seqlens = get_cu_seqlens(packed_seq_params)
-    # Guard against a caller passing an upstream-sliced ``total_tokens``
-    # (e.g. ``hidden_states.shape[0]`` from before the SP all-gather / CP
-    # all-to-all). Without this check, the trailing-chunk diff below goes
-    # negative and ``repeat_interleave`` fails with the unhelpful message
-    # ``repeats can not be negative``.
-    last_cu = int(cu_seqlens[-1].item())
-    assert total_tokens >= last_cu, (
-        f"build_packed_seq_idx: total_tokens={total_tokens} is smaller than "
-        f"cu_seqlens[-1]={last_cu}. This usually means the caller passed an "
-        f"upstream-sliced seq_len (SP-sharded or pre-CP-all-to-all). Pass the "
-        f"post-gather length instead — e.g. ``zVKQba.shape[0]`` taken after "
-        f"``self.cp.pre_conv_ssm(...)``."
-    )
     total_tokens_tensor = torch.tensor(
         [total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
     )
     cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
     seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
     seq_idx = torch.repeat_interleave(
-        torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
+        torch.arange(seq_lengths.numel(), device=cu_seqlens.device),
+        seq_lengths,
+        output_size=total_tokens,
     )
     return seq_idx.to(torch.int32).unsqueeze(0)
 
