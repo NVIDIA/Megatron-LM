@@ -17,6 +17,7 @@ light) and chunk ``2 * cp_size - 1 - r`` (a high-position "tail", heavy), so
 """
 
 import logging
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -46,6 +47,13 @@ def _all_gather_rows(x, l_local, cp_group, cp_size):
 # staging buffers keep the allocator pool static (no expandable-segments cuMem churn).
 _A2A_META: dict = {}
 _A2A_BUF: dict = {}
+
+# Last prebuilt zigzag plan per (group, rank, l_local). TE's graph-capture argument
+# cloning strips dynamically attached PackedSeqParams attributes, so the per-batch
+# layout cache can be invisible during capture; this module-level copy keeps the
+# prebuilt plan (and its route tensors) alive and reachable there. Pack composition
+# must be static under CUDA graphs, so the last plan is always the right one.
+_LAST_PLAN: dict = {}
 
 
 def _group_key(cp_group):
@@ -198,6 +206,8 @@ def dispatch_chunks_async(
     w2 = weights_indexer_cp.reshape(-1, n_heads)
     if config is not None and _use_zigzag(multi_seq, cp_size, l_local, use_fused, config):
         plan = layout_cache.get(("zigzag", cp_group.rank())) if layout_cache else None
+        if plan is None:
+            plan = _LAST_PLAN.get((_group_key(cp_group), cp_group.rank(), l_local))
         if plan is not None and "disp_send_rows" in plan and q2.dtype == w2.dtype:
             # Route-A2A dispatch (PR #5664-style prebuilt exchange): each rank sends and
             # receives only ~l_local rows instead of the S-row AllGather. Splits are host
@@ -649,9 +659,13 @@ def balanced_compute_cp_indexer_topk(
         if dispatch_handle is not None and dispatch_handle.get("kind") == "zzr":
             plan = dispatch_handle["plan"]
         else:
-            plan = _zigzag_plan(
-                cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev, layout_cache
+            plan = (layout_cache or {}).get(("zigzag", r)) or _LAST_PLAN.get(
+                (_group_key(cp_group), r, l_local)
             )
+            if plan is None:
+                plan = _zigzag_plan(
+                    cu_seqlens, cu_seqlens_compressed, cp_size, l_local, r, dev, layout_cache
+                )
         half = plan["half"]
         mq = max(1, min(int(max_seqlen_q), half))
         gkv = max(1, int(max_seqlen_q) // int(ratio))
@@ -988,6 +1002,19 @@ def prebuild_balanced_layouts(packed_seq_params, cp_group=None):
     # are built for every pack composition.
 
     cu_list = [int(v) for v in cu.tolist()]
+    # Idempotent prebuild: for static pack compositions (every CUDA-graph run, and
+    # any fixed-length workload) the plan content is identical each microbatch.
+    # Reuse the previous plan object instead of re-allocating its tensors — this
+    # keeps steady-state allocations at zero (no expandable-segments cuMem churn)
+    # and keeps capture-baked pointers valid.
+    prev = _LAST_PLAN.get((_group_key(cp_group), r, l_local))
+    if prev is not None and prev.get("_cu_list") == cu_list:
+        cache = getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None)
+        if cache is None:
+            cache = {}
+            packed_seq_params._dsa_cp_balance_layout_cache = cache
+        cache[("zigzag", r)] = prev
+        return
     # Same sequence enumeration as _zigzag_plan: real segments plus the
     # capacity-padding pseudo-sequence [cu[-1], total) (empty for full packs).
     seq_lens_list = [e - s for s, e in zip(cu_list[:-1], cu_list[1:])] + [total - cu_list[-1]]
@@ -1104,9 +1131,41 @@ def prebuild_balanced_layouts(packed_seq_params, cp_group=None):
         "k_end_head": k_end_head,
         "mkv_tail": mkv_tail,
         "k_end_tail": k_end_tail,
+        "_cu_list": cu_list,
     }
+    if prev is not None:
+        # A CUDA graph may have baked pointers to the previous plan's tensors.
+        # When only the values changed (same shapes; e.g. varlen data under a
+        # fixed pad_packed_seq_alignment), refresh the previous tensors in
+        # place so captured graphs keep reading correct data. Host-side split
+        # lists are baked into captured collectives and cannot be refreshed:
+        # if they change, any existing capture needs re-recording.
+        same_shapes = all(
+            torch.is_tensor(prev.get(k)) == torch.is_tensor(v)
+            and (not torch.is_tensor(v) or prev[k].shape == v.shape)
+            for k, v in plan.items()
+            if k not in ("_cu_list", "head_layout", "tail_layout", "half")
+        )
+        if same_shapes and (
+            prev["disp_in_splits"] == plan["disp_in_splits"]
+            and prev["disp_out_splits"] == plan["disp_out_splits"]
+        ):
+            for k, v in plan.items():
+                if torch.is_tensor(v):
+                    prev[k].copy_(v)
+                else:
+                    prev[k] = v
+            plan = prev
+        else:
+            warnings.warn(
+                "prebuild_balanced_layouts: plan shapes or A2A splits changed for a "
+                "previously built layout; any CUDA graph captured with the old plan "
+                "must be re-recorded.",
+                stacklevel=2,
+            )
     cache = getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None)
     if cache is None:
         cache = {}
         packed_seq_params._dsa_cp_balance_layout_cache = cache
     cache[("zigzag", r)] = plan
+    _LAST_PLAN[(_group_key(cp_group), r, l_local)] = plan
