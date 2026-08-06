@@ -524,9 +524,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
     #
     # These methods implement legacy static-batching inference (and the
     # non-memory-efficient training prefill fallback). They are deliberately
-    # kept separate from the dynamic inference hooks (``ssm_decode`` /
-    # ``ssm_prefill``) so that static-batching bookkeeping does not pollute the
-    # dynamic inference interface defined by ``SSMDynamicInferenceMixin``.
+    # kept separate from the dynamic inference hooks (`ssm_decode` /
+    # `ssm_prefill`) so that static-batching bookkeeping does not pollute the
+    # dynamic inference interface defined by `SSMDynamicInferenceMixin`.
     # ==================================================================
     def _static_decode(
         self, hidden_states, conv_state, ssm_state
@@ -556,16 +556,16 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
     ) -> torch.Tensor:
         """
         Performs single-sequence SSM prefill for static-batching inference and the
-        non-memory-efficient (``use_mem_eff_path=False``) training fallback.
+        non-memory-efficient (`use_mem_eff_path=False`) training fallback.
 
-        ``conv_state`` / ``ssm_state`` are ``None`` for the training fallback and
-        non-``None`` for static-batching inference (updated in place).
+        `conv_state` / `ssm_state` are `None` for the training fallback and
+        non-`None` for static-batching inference (updated in place).
 
         Args:
             zxBCdt: The input tensor of shape (l, b, d), a concatenation of
                 z, x, B, C, and dt projections.
-            conv_state: The convolution state tensor, or ``None`` for training.
-            ssm_state: The selective scan state tensor, or ``None`` for training.
+            conv_state: The convolution state tensor, or `None` for training.
+            ssm_state: The selective scan state tensor, or `None` for training.
 
         Returns:
             Output tensor of shape (l, b, d).
@@ -737,10 +737,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         All varlen metadata (cu_seqlens, seq_idx, batch_indices, chunk boundaries,
         intermediate extraction buffers, etc.) is read directly from
-        ``context.mamba_metadata`` / ``context.mamba_slot_allocator`` -- there is no
+        `context.mamba_metadata` / `context.mamba_slot_allocator` -- there is no
         intermediate layer that unpacks the metadata into a long argument list. All
         prefill requests (including chunked prefill) are processed together through a
-        single varlen kernel call; the precomputed metadata avoids ``.item()`` calls
+        single varlen kernel call; the precomputed metadata avoids `.item()` calls
         and data-dependent control flow, enabling CUDA graph compatibility.
         Intermediate state extraction (for Mamba prefix caching) is performed via
         pre-allocated output buffers, also CUDA graph compatible.
@@ -749,7 +749,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         rank in expert parallelism that must match a mixed CUDA graph), the full kernel
         path still runs; the metadata reflects zero-length sequences (cu_seqlens all
         equal, batch_indices all -1) so the kernels produce a correctly-shaped zero
-        output tensor, which is required by the merge logic in ``ssm_dynamic_inference``.
+        output tensor, which is required by the merge logic in `ssm_dynamic_inference`.
 
         Args:
             zxBCdt: The input tensor of shape (l, b, d), which is a concatenation of
@@ -760,7 +760,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         Returns:
             Output tensor of shape (l, b, d). Intermediate states (if any) are written
-            directly into the slot-allocator buffers held by ``context``.
+            directly into the slot-allocator buffers held by `context`.
         """
         assert (
             self.cp.cp_size == 1

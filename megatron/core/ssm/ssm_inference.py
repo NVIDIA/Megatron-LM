@@ -12,33 +12,33 @@ All of these variants share an *identical* request-level control flow for the
 dynamic inference engine:
 
     1. Fetch this layer's (conv_state, ssm_state) slabs from the context.
-    2. Project the packed input (``in_proj``).
+    2. Project the packed input (`in_proj`).
     3. Split the packed batch into a decode partition (1 token per request,
        placed first) and a prefill partition (variable length, placed after).
        The kernels cannot mix the two, so they run independently.
     4. Run the decode and prefill kernels on their respective partitions.
     5. Merge the two partitions back into packed token order.
-    6. Apply the output projection (``out_proj``).
+    6. Apply the output projection (`out_proj`).
 
 Only the kernels in step 4 differ between variants. This mixin owns the shared
 control flow (steps 1-3, 5, 6 and the orchestration) and delegates the
-variant-specific work to two hooks, ``ssm_decode`` and ``ssm_prefill``. New
+variant-specific work to two hooks, `ssm_decode` and `ssm_prefill`. New
 linear-attention variants should subclass this mixin and implement those two
 hooks rather than re-deriving the decode/prefill bookkeeping.
 
-Both hooks are given the ``DynamicInferenceContext`` directly and read whatever
-per-step metadata they need from ``context.mamba_metadata`` /
-``context.mamba_slot_allocator`` themselves; there is deliberately no
+Both hooks are given the `DynamicInferenceContext` directly and read whatever
+per-step metadata they need from `context.mamba_metadata` /
+`context.mamba_slot_allocator` themselves; there is deliberately no
 intermediate "unpack the metadata into a long argument list" layer.
 
 Speculative decoding is supported by the shared orchestration: the decode path
-reshapes tokens into ``[batch, seq_len, d]``, fetches intermediate state buffers
-from the context, and passes them to ``ssm_decode``. Variants that do not yet
-support speculative decoding should assert ``seq_len == 1`` inside their
-``ssm_decode`` implementation.
+reshapes tokens into `[batch, seq_len, d]`, fetches intermediate state buffers
+from the context, and passes them to `ssm_decode`. Variants that do not yet
+support speculative decoding should assert `seq_len == 1` inside their
+`ssm_decode` implementation.
 
-Chunked prefill and prefix caching are handled entirely inside ``ssm_prefill``
-via ``context.mamba_metadata`` and ``context.mamba_slot_allocator``; the mixin
+Chunked prefill and prefix caching are handled entirely inside `ssm_prefill`
+via `context.mamba_metadata` and `context.mamba_slot_allocator`; the mixin
 orchestration is unaware of them.
 
 Note: static-batching ("legacy") inference is intentionally *not* part of this
@@ -62,7 +62,7 @@ from megatron.core.utils import is_using_quantization_scales
 
 class SSMDynamicInferenceMixin:
     """Mixin providing the shared decode/prefill orchestration for the dynamic
-    inference engine. Concrete mixers implement the two ``ssm_*`` hooks below."""
+    inference engine. Concrete mixers implement the two `ssm_*` hooks below."""
 
     # ------------------------------------------------------------------
     # Hooks implemented by concrete mixers.
@@ -79,20 +79,20 @@ class SSMDynamicInferenceMixin:
         """Run the single-token-per-request decode kernels.
 
         Args:
-            zxBCdt: ``[decode_req_count, seq_len, proj_dim]`` projected decode tokens,
-                where ``seq_len = 1 + num_speculative_tokens``.
-            conv_state: ``[num_slots, conv_channels, d_conv]`` conv state cache.
-            ssm_state: ``[num_slots, *ssm_shape]`` SSM state cache.
-            batch_indices: ``[decode_req_count]`` slot index per decode request
-                (``-1`` marks padding slots).
+            zxBCdt: `[decode_req_count, seq_len, proj_dim]` projected decode tokens,
+                where `seq_len = 1 + num_speculative_tokens`.
+            conv_state: `[num_slots, conv_channels, d_conv]` conv state cache.
+            ssm_state: `[num_slots, *ssm_shape]` SSM state cache.
+            batch_indices: `[decode_req_count]` slot index per decode request
+                (`-1` marks padding slots).
             intermediate_conv_state: Optional buffer for storing conv states at
                 intermediate sequence steps (speculative decoding).
             intermediate_ssm_state: Optional buffer for storing SSM states at
                 intermediate sequence steps (speculative decoding).
 
-        Returns ``[decode_req_count, seq_len, d_inner]``; updates state in place.
+        Returns `[decode_req_count, seq_len, d_inner]`; updates state in place.
         Variants that do not yet support speculative decoding should assert
-        ``seq_len == 1`` inside their implementation.
+        `seq_len == 1` inside their implementation.
         """
         raise NotImplementedError
 
@@ -105,13 +105,13 @@ class SSMDynamicInferenceMixin:
     ) -> torch.Tensor:
         """Run the variable-length prefill kernels for all prefill requests.
 
-        The implementation reads its varlen metadata (``cu_seqlens``,
-        ``batch_indices_prefill``, ``seq_idx``, chunk boundaries, intermediate
-        extraction buffers, etc.) directly from ``context.mamba_metadata`` and
-        ``context.mamba_slot_allocator`` and processes every prefill request in
+        The implementation reads its varlen metadata (`cu_seqlens`,
+        `batch_indices_prefill`, `seq_idx`, chunk boundaries, intermediate
+        extraction buffers, etc.) directly from `context.mamba_metadata` and
+        `context.mamba_slot_allocator` and processes every prefill request in
         one varlen call, writing the resulting final states back into the caches.
 
-        Returns ``[prefill_token_count, 1, d_inner]``; updates state in place.
+        Returns `[prefill_token_count, 1, d_inner]`; updates state in place.
         """
         raise NotImplementedError
 
