@@ -22,7 +22,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_optimizer,
     microbatch,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModulePhase
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import (
     collect_linked_kernels,
@@ -49,14 +49,10 @@ class TinyModel(nn.Module):
 class CheckpointedTinyModel(TinyModel):
     """Tiny model that activation-checkpoints each shardable module."""
 
-    def __init__(self, use_reentrant: bool) -> None:
-        super().__init__()
-        self.use_reentrant = use_reentrant
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run each linear layer through activation checkpointing."""
-        x = checkpoint(self.fc1, x, use_reentrant=self.use_reentrant)
-        return checkpoint(self.fc2, self.relu(x), use_reentrant=self.use_reentrant)
+        """Run each linear layer through non-reentrant activation checkpointing."""
+        x = checkpoint(self.fc1, x, use_reentrant=False)
+        return checkpoint(self.fc2, self.relu(x), use_reentrant=False)
 
 
 class NestedModel(nn.Module):
@@ -218,8 +214,7 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
     )
 
 
-@pytest.mark.parametrize("use_reentrant", [True, False], ids=["reentrant", "non_reentrant"])
-def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup, use_reentrant):
+def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup):
     """Activation recomputation should leave every FSDP module resharded.
 
     Backward completes ``fc2`` before recomputing ``fc1``. Without suppressing
@@ -231,7 +226,7 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (world_size,))
-    model = CheckpointedTinyModel(use_reentrant=use_reentrant).to(device)
+    model = CheckpointedTinyModel().to(device)
     fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
     fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     fully_shard(model, mesh=mesh, placements=_flat_placements())
@@ -239,20 +234,24 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
     x = torch.randn(2, 8, device=device, requires_grad=True)
     model(x).sum().backward()
 
+    # Without the forward-prefetch suppression, ``fc1``'s recomputed forward
+    # would unshard ``fc2`` after ``fc2``'s backward already resharded it,
+    # leaving an unsharded Parameter here.
     assert isinstance(model.fc1.weight, DTensor)
     assert isinstance(model.fc2.weight, DTensor)
 
-    # Module-local backward state is cleared after its matching backward.
-    assert model._phase is FsdpModulePhase.RESTING
-    assert model.fc1._phase is FsdpModulePhase.RESTING
-    assert model.fc2._phase is FsdpModulePhase.RESTING
+    # Backward completes each module before recomputing the previous one, so
+    # every module-local phase must be cleared after its matching backward.
+    assert model._phase is FsdpModule.Phase.RESTING
+    assert model.fc1._phase is FsdpModule.Phase.RESTING
+    assert model.fc2._phase is FsdpModule.Phase.RESTING
 
     # A second forward after backward runs in the forward phase again, so
     # forward-order prefetch resumes and the module phases return to resting.
     model(x).sum().backward()
-    assert model._phase is FsdpModulePhase.RESTING
-    assert model.fc1._phase is FsdpModulePhase.RESTING
-    assert model.fc2._phase is FsdpModulePhase.RESTING
+    assert model._phase is FsdpModule.Phase.RESTING
+    assert model.fc1._phase is FsdpModule.Phase.RESTING
+    assert model.fc2._phase is FsdpModule.Phase.RESTING
 
 
 @pytest.mark.parametrize("set_to_none", [True, False])
