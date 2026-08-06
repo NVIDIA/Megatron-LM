@@ -422,6 +422,10 @@ class FusedCombine(torch.autograd.Function):
             # V2 dispatch reuses the forward handle; backward receives a
             # 5-tuple (recv_x, recv_topk_idx, recv_topk_weights, handle,
             # event). We only need the first element (grad_x).
+            # V2 `ElasticBuffer.dispatch` at elastic.py:768 calls
+            # `get_theoretical_num_sms(num_experts, num_topk)` before
+            # resolving `num_experts` from the handle, so we must pass
+            # it explicitly when `num_sms=0`.
             _prev_evt = None
             _alloc_on_comm = ctx.allocate_on_comm_stream
             if ctx.async_finish:
@@ -430,9 +434,11 @@ class FusedCombine(torch.autograd.Function):
                     _alloc_on_comm = True
                 except Exception:
                     _prev_evt = None
+            _handle_num_experts = getattr(ctx.handle, "num_experts", None)
             grad_x, _, _, _, after_event = buffer.dispatch(
                 grad_output.contiguous(),
                 handle=ctx.handle,
+                num_experts=_handle_num_experts,
                 num_sms=0,
                 num_qps=0,
                 previous_event=_prev_evt,
