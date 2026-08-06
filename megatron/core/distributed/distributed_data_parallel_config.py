@@ -152,6 +152,13 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
     """
 
+    fsdp_buffer_count: int = 2
+    """Number of persistent buffers allocated for each Megatron FSDP communication pool.
+      The default of two preserves the conventional double-buffer behavior. Combined 1F1B
+      overlap may require three buffers because a backward/recompute unit, the current
+      forward unit, and its forward-prefetched successor can be live concurrently.
+    """
+
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 
@@ -311,3 +318,4 @@ class DistributedDataParallelConfig:
         if self.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of double-buffer allocator.
             self.fsdp_double_buffer = True
+        assert self.fsdp_buffer_count >= 2, "fsdp_buffer_count must be at least 2."
