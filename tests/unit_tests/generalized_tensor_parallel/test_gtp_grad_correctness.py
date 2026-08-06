@@ -111,12 +111,16 @@ def _run_one_backward(ddp_model, rank, calculate_per_token_loss=False):
     # overlap_grad_reduce=False. Do NOT also call start_grad_sync() — that double-
     # reduces, which is idempotent at full-DP size but halves at replicate size.
     ddp_model.finish_grad_sync()
+    from megatron.core import parallel_state as ps
     from megatron.core.distributed.finalize_model_grads import (
         _allreduce_replicated_grads_over_gtp_remat_group,
     )
 
     _allreduce_replicated_grads_over_gtp_remat_group(
-        [ddp_model], calculate_per_token_loss=calculate_per_token_loss
+        [ddp_model],
+        ps.get_gtp_weight_remat_group(check_initialized=False),
+        ps.get_expert_gtp_weight_remat_group(check_initialized=False),
+        calculate_per_token_loss=calculate_per_token_loss,
     )
     return float(loss.item())
 
@@ -307,11 +311,16 @@ def _run_step_distopt(ddp_model, optim, rank):
     loss.backward()
     # Production order (finalize_model_grads): reduce across DP first, THEN the gtp_remat finalize.
     ddp_model.finish_grad_sync()
+    from megatron.core import parallel_state as ps
     from megatron.core.distributed.finalize_model_grads import (
         _allreduce_replicated_grads_over_gtp_remat_group,
     )
 
-    _allreduce_replicated_grads_over_gtp_remat_group([ddp_model])
+    _allreduce_replicated_grads_over_gtp_remat_group(
+        [ddp_model],
+        ps.get_gtp_weight_remat_group(check_initialized=False),
+        ps.get_expert_gtp_weight_remat_group(check_initialized=False),
+    )
     _, grad_norm, _ = optim.step()
     return float(grad_norm)
 
