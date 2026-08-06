@@ -113,6 +113,9 @@ class FsdpModule:
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
     _unshard_event: torch.cuda.Event | None
+    # Reentrant checkpointing runs its original forward with grad disabled and
+    # recomputes with grad enabled. Once observed, checkpoint usage is assumed static.
+    _uses_reentrant_checkpoint: bool
 
     def __init__(
         self,
@@ -125,6 +128,7 @@ class FsdpModule:
         self._context = None
         self._name = None
         self._unshard_event = None
+        self._uses_reentrant_checkpoint = False
         owned_parameters = _collect_owned_parameters(self)
         axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
         assert axis_indices == tuple(
@@ -251,6 +255,13 @@ class FsdpModule:
         on the comm stream, so ``AG_{i+1}`` is launched before ``F_i`` finishes.
         """
         self._lazy_init_context()
+        module = cast(nn.Module, self)
+        grad_enabled = torch.is_grad_enabled()
+        if module.training and not grad_enabled:
+            self._uses_reentrant_checkpoint = True
+        is_recomputing = self.context.phase is FsdpContextPhase.BACKWARD or (
+            self._uses_reentrant_checkpoint and grad_enabled
+        )
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
         self._ready_grad_parameters.clear()
         context = self.context
@@ -269,7 +280,7 @@ class FsdpModule:
         # Activation recomputation runs forward hooks inside backward. Do not
         # prefetch the next module in forward order: its backward may already
         # be complete, so no later backward hook would reshard it.
-        if context.phase is not FsdpContextPhase.BACKWARD:
+        if not is_recomputing:
             next_module = context.forward_order.next_item(self)
             if next_module is not None:
                 next_module._unshard_parameter_groups()
@@ -296,7 +307,10 @@ class FsdpModule:
         # Recomputed parameters are consumed immediately by this module's
         # backward. Keep them materialized to avoid an unnecessary all-gather;
         # post_backward() will reshard them after gradient reduction.
-        if self.context.phase is not FsdpContextPhase.BACKWARD:
+        is_recomputing = self.context.phase is FsdpContextPhase.BACKWARD or (
+            self._uses_reentrant_checkpoint and torch.is_grad_enabled()
+        )
+        if not is_recomputing:
             self._reshard_parameter_groups()
         torch.cuda.nvtx.range_pop()
 
