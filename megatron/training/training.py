@@ -494,12 +494,12 @@ def num_floating_point_operations(
     def gated_delta_product_layer_flops(
         total_tokens,
         hidden_size,
+        num_householder,
         state_dim=128,
         head_dim=64,
         num_groups=8,
         num_heads=None,
         conv_kernel_dim=4,
-        num_householder=3,
     ):
         """Calculate FLOPs for a Gated Delta Product (GDP) layer."""
         if num_heads is None:
@@ -545,6 +545,7 @@ def num_floating_point_operations(
 
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
+                     gdp_num_householder,
                      num_gdn_layers=0,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
@@ -561,6 +562,7 @@ def num_floating_point_operations(
         """Calculate total FLOPs for the hybrid model."""
         mamba_flops = (
             gated_delta_product_layer_flops(total_tokens, hidden_size,
+                                            gdp_num_householder,
                                             mamba_state_dim, mamba_head_dim,
                                             mamba_num_groups, mamba_num_heads)
             if use_gated_delta_product
@@ -935,6 +937,7 @@ def num_floating_point_operations(
             mamba_head_dim=args.mamba_head_dim,
             mamba_num_groups=args.mamba_num_groups,
             mamba_num_heads=args.mamba_num_heads,
+            gdp_num_householder=args.gdp_num_householder,
             num_attn_heads=args.num_attention_heads,
             gqa=args.group_query_attention,
             gqa_groups=args.num_query_groups,

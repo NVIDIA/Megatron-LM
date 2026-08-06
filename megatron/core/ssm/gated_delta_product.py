@@ -182,7 +182,7 @@ class GatedDeltaProductMixer(MegatronModule):
         ok, reason = check_fla_sequence_packing_support()
         assert ok, reason
 
-        self.num_householder = 3
+        self.num_householder = config.gdp_num_householder
 
         self.config = config
         self.d_model = d_model
@@ -198,6 +198,7 @@ class GatedDeltaProductMixer(MegatronModule):
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
         self.nheads = self.config.mamba_num_heads
+        assert self.nheads is not None, "mamba_num_heads must be set for GatedDeltaProductMixer"
         self.d_inner = self.nheads * self.headdim
 
         self.layer_number = layer_number
