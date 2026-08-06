@@ -1964,6 +1964,9 @@ class TextGenerationController:
                 valid = [int(b) for b in blocks.tolist() if b != -1]
                 if valid:
                     finished_handoff_block_ids[req_id] = valid
+                    # Retain across update_requests(), which releases the active request's
+                    # ownership. For an exclusively owned handoff block: active=1, retain=2,
+                    # request cleanup=1, coordinator RELEASE_KV=0.
                     allocator.retain_memory_blocks(valid)
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,

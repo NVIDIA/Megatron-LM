@@ -1528,6 +1528,8 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._capture_handoff_meta(
                             request, handoff_blocks, prepared_handoff_metadata.get(request_id)
                         )
+                    # A prefill-role engine may also serve regular requests; release the
+                    # temporary block references when no handoff was requested.
                     elif handoff_blocks:
                         self._release_pinned_handoff_blocks(handoff_blocks)
                     finished_entry = self.requests.pop(request_id)
@@ -2932,9 +2934,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 if self.context.get_active_request_count() > 0 or self.waiting_request_ids:
                     await self.async_step()
                 else:
-                    # Transfer handles expose polling but no async completion
-                    # callback. Yield briefly without adding the normal 20 ms
-                    # idle-loop delay to decode admission.
+                    # Reached when there is no model work to step but a handoff transfer is
+                    # still pending. Handles expose polling rather than an async completion
+                    # callback, so yield briefly to avoid busy-spinning while keeping decode
+                    # admission responsive when the transfer completes.
                     await asyncio.sleep(0.001)
         except asyncio.CancelledError:
             pass
