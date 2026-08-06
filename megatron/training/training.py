@@ -1111,6 +1111,7 @@ def pretrain(
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 
+
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
@@ -1446,7 +1447,7 @@ def pretrain(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator,
+                train_data_iterator=train_data_iterator
             )
 
         one_logger and one_logger.log_metrics(
