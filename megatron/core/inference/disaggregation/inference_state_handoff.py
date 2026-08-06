@@ -20,6 +20,9 @@ from megatron.core.inference.disaggregation.decode_admission import (
 from megatron.core.inference.disaggregation.handoff_completion_tracker import (
     HandoffCompletionTracker,
 )
+from megatron.core.inference.disaggregation.handoff_wire_protocol import (
+    strip_registered_nixl_agent_metadata,
+)
 from megatron.core.inference.disaggregation.pending_handoff_imports import (
     DeferredKvHandoff,
     PendingKvImport,
@@ -65,6 +68,7 @@ class InferenceStateHandoffMixin:
     def _initialize_disaggregation_state(self) -> None:
         """Initialize state without importing or constructing a transfer backend."""
 
+        self._disagg_config = None
         self._pinned_handoff_blocks: Dict[int, list] = {}  # Request ID -> pinned KV block IDs.
         self._pinned_handoff_ssm_slots: Dict[int, int] = {}  # Request ID -> detached live slot.
         self._kv_transfer_agent = None
@@ -79,6 +83,9 @@ class InferenceStateHandoffMixin:
         self._handoff_completion_notifications: dict[int, bool] = {}  # Request ID -> failed.
         self._pending_kv_pushes: list = []
         self._kv_transfer_role: str | None = None
+
+    def _notify_kv_read_done(self, request_id: int) -> None:
+        """Hook for control planes that release source storage after decode admission."""
 
     def _setup_handoff_completion_tracking(self, hostname: str | None = None) -> None:
         """Create the CPU path used to aggregate model-parallel transfer completion."""
@@ -603,6 +610,13 @@ class InferenceStateHandoffMixin:
         kv_meta["resume_tokens"] = prepared.resume_tokens
         if ssm_meta is not None:
             kv_meta["ssm"] = ssm_meta
+        if (
+            self._disagg_config is not None
+            and self._disagg_config["kv_transport_backend"] == "nixl"
+        ):
+            # Native engines register static NIXL agent blobs once. Keep each
+            # request payload limited to addresses, layouts, and block mappings.
+            kv_meta = strip_registered_nixl_agent_metadata(kv_meta)
 
         request.disaggregated_params = {
             "request_id": rid,
@@ -1028,6 +1042,7 @@ class InferenceStateHandoffMixin:
                 pending.continuation_blocks = []
                 if self.use_coordinator and self.is_mp_coordinator:
                     self._try_send_streaming_partials()
+            self._notify_kv_read_done(pending.request_id)
 
         def _relay_result(src: asyncio.Future) -> None:
             """Forward decode completion to the handoff future."""

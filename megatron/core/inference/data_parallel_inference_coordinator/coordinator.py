@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoordinatorRuntime
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -44,6 +45,7 @@ faulthandler.register(signal.SIGINT, all_threads=False, chain=True)
 
 
 class DataParallelInferenceCoordinator:
+    disagg = None
     """
     Coordinates inference requests between clients and distributed model engines.
 
@@ -101,6 +103,9 @@ class DataParallelInferenceCoordinator:
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        disaggregated: bool = False,
+        disagg_router: str = "round_robin",
+        disagg_max_outstanding: int = 32,
     ):
         """
         Initializes the inference coordinator.
@@ -229,6 +234,11 @@ class DataParallelInferenceCoordinator:
 
         # Header -> handler dispatch table, sourced from the handler registry.
         self._handlers = dict(HANDLERS)
+        self.disagg = (
+            DisaggCoordinatorRuntime(self, disagg_router, disagg_max_outstanding)
+            if disaggregated
+            else None
+        )
 
     def get_least_loaded_data_parallel_rank(self):
         """
@@ -271,6 +281,8 @@ class DataParallelInferenceCoordinator:
         rebuild are acceptable because the number of connected engines is small; optimize
         only if dynamic registration/deregistration at high engine counts becomes a use case.
         """
+        if identity not in self.identities_of_data_parallel_ranks:
+            return
         self.identities_of_data_parallel_ranks.remove(identity)
         self.removed_engine_identities.add(identity)
         idx = self.identity_to_rank_index.pop(identity, None)
@@ -297,6 +309,8 @@ class DataParallelInferenceCoordinator:
             if new_row:
                 new_hash_table[h] = new_row
         self._hash_table = new_hash_table
+        if self.disagg is not None:
+            self.disagg.remove_engine(identity)
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
@@ -491,6 +505,9 @@ class DataParallelInferenceCoordinator:
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        disaggregated: bool = False,
+        disagg_router: str = "round_robin",
+        disagg_max_outstanding: int = 32,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -525,6 +542,9 @@ class DataParallelInferenceCoordinator:
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
+            disaggregated=disaggregated,
+            disagg_router=disagg_router,
+            disagg_max_outstanding=disagg_max_outstanding,
         )
         ready_event.set()
         try:

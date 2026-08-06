@@ -1497,6 +1497,20 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
+def _rl_inference_model_alloc_ctx(args):
+    """Return the weight-allocation context for a separate RL inference model."""
+    uvm_level = args.rl_inference_model_unified_memory_level
+    if (
+        args.rl_offload_inference_model_weights_when_idle
+        and uvm_level == 0
+        and HAVE_TORCH_MEMORY_SAVER
+    ):
+        return torch_memory_saver.region(tag="rl_inference_model", enable_cpu_backup=True)
+    if uvm_level and uvm_level > 0:
+        return torch.cuda.use_mem_pool(create_unified_mempool())
+    return nullcontext()
+
+
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -1836,10 +1850,19 @@ def pretrain(
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
+        from megatron.rl.inference.disagg import build_disagg_inference_model, is_disagg_rollout
+
         # RL inference doesn't support CP; when training uses CP>1, always build a
         # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
         force_cp1_inference_model = args.context_parallel_size > 1
-        if (
+        if is_disagg_rollout(args):
+            # Disaggregated rollouts: build this rank's prefill/decode shard
+            # model on its shard groups; the per-pool refit keeps it fresh.
+            inference_model = build_disagg_inference_model(
+                args, model_provider, model_type, model_cfg, get_model,
+                model_alloc_ctx=_rl_inference_model_alloc_ctx(args),
+            )
+        elif (
             args.rl_inference_tensor_model_parallel_size is not None
             or args.rl_inference_pipeline_model_parallel_size is not None
             or args.rl_inference_expert_model_parallel_size is not None
@@ -1885,32 +1908,7 @@ def pretrain(
                     args.rl_inference_expert_tensor_model_parallel_size
                 )
 
-            # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
-            # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
-            # Alternatively, use torch_memory_saver to offload the weights to CPU when idle.
-            uvm_mempool = None
-            uvm_level = args.rl_inference_model_unified_memory_level
-            if uvm_level and uvm_level > 0:
-                uvm_mempool = create_unified_mempool()
-
-            # Determine which context manager to use for model allocation
-            # Use torch_memory_saver if offloading is requested but UVM is not enabled
-            use_torch_saver_for_inference_model = (
-                args.rl_offload_inference_model_weights_when_idle
-                and uvm_level == 0
-                and HAVE_TORCH_MEMORY_SAVER
-            )
-            if use_torch_saver_for_inference_model:
-                # Use torch_memory_saver for offloading - allocate within a tagged region
-                model_alloc_ctx = torch_memory_saver.region(
-                    tag="rl_inference_model", enable_cpu_backup=True
-                )
-            elif uvm_mempool is not None:
-                model_alloc_ctx = torch.cuda.use_mem_pool(uvm_mempool)
-            else:
-                model_alloc_ctx = nullcontext()
-
-            with model_alloc_ctx:
+            with _rl_inference_model_alloc_ctx(args):
                 inference_model = get_model(
                     model_provider,
                     model_type,

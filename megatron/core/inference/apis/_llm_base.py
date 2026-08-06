@@ -19,12 +19,17 @@ import torch.distributed as dist
 
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.disaggregation.coordinator_setup import (
+    configure_prebuilt_disagg_engine,
+)
+from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.shards_spec import normalize_shard_specs
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -261,9 +266,14 @@ class _MegatronLLMBase:
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
+        inference_shards=None,
+        disagg_router: str = "round_robin",
+        kv_transport_backend: str = "nixl",
     ) -> None:
         if (coordinator_host is not None or coordinator_port is not None) and not use_coordinator:
             raise ValueError("coordinator_host/port require use_coordinator=True")
+        if inference_shards is not None and not use_coordinator:
+            raise ValueError("inference_shards (disaggregation) requires use_coordinator=True")
 
         if not use_coordinator:
             from megatron.core import parallel_state
@@ -282,7 +292,18 @@ class _MegatronLLMBase:
         context = DynamicInferenceContext(model.config, inference_config)
         wrapper = GPTInferenceWrapper(model, context)
         controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)
-        engine = DynamicInferenceEngine(controller=controller, context=context)
+        engine_cls = (
+            DisaggDynamicInferenceEngine if inference_shards is not None else DynamicInferenceEngine
+        )
+        engine = engine_cls(controller=controller, context=context)
+        if inference_shards is not None:
+            specs = normalize_shard_specs(inference_shards, dist.get_world_size())
+            configure_prebuilt_disagg_engine(
+                engine,
+                specs,
+                disagg_router=disagg_router,
+                kv_transport_backend=kv_transport_backend,
+            )
 
         if use_coordinator:
             is_primary_rank = dist.get_rank() == 0

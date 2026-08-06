@@ -2239,6 +2239,10 @@ def _add_inference_args(parser):
                             'world. Tagging shards role=prefill|decode enables disaggregated '
                             'inference (prefill hands KV to the decode pool); a dp>1 decode shard '
                             'is several independent decode instances.')
+    group.add_argument('--disagg-kv-transport-backend', type=str, default='nixl',
+                       choices=['nccl', 'nixl'],
+                       help='State transport for native disaggregated inference: '
+                            '"nccl" uses two-sided transfers and "nixl" uses one-sided pulls.')
     return parser
 
 

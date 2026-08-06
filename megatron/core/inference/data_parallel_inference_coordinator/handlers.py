@@ -18,6 +18,11 @@ import logging
 import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.disaggregation.handoff_wire_protocol import (
+    make_release_kv_message,
+    make_submit_request_with_kv_message,
+    parse_submit_request_with_kv_fields,
+)
 from megatron.core.inference.headers import Headers
 
 from .state import CONTROL_TRANSITIONS, CoordinatorState
@@ -49,6 +54,16 @@ def message_handler(*headers):
         return fn
 
     return decorator
+
+
+@message_handler(Headers.REGISTER_ROLE)
+def handle_register_role(coordinator, sender_identity, payload):
+    """Register a coordinator-native prefill or decode engine."""
+
+    if coordinator.disagg is None:
+        raise RuntimeError("REGISTER_ROLE requires a disaggregated coordinator")
+    _, role, transport, instance_meta = payload
+    coordinator.disagg.register_engine(sender_identity, role, transport, instance_meta)
 
 
 @message_handler(Headers.CONNECT)
@@ -96,6 +111,10 @@ def handle_submit_request(coordinator, sender_identity, payload):
         prompt = prompt.tolist()
     else:
         raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
+
+    if coordinator.disagg is not None:
+        coordinator.disagg.route_submit(request_id, prompt, sampling_params)
+        return
 
     engine_payload = msgpack.packb(
         [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params], use_bin_type=True
@@ -258,8 +277,12 @@ def handle_engine_reply(coordinator, sender_identity, payload):
     finished_requests = payload[1]
 
     for finished_request in finished_requests:
-        coordinator.detokenize(finished_request)
         fid = finished_request["request_id"]
+        if coordinator.disagg is not None and fid in coordinator.disagg.hop1_request_ids:
+            coordinator.disagg.handle_prefill_done(fid, finished_request)
+            continue
+
+        coordinator.detokenize(finished_request)
         client_identity = coordinator.request_id_to_client_id[fid]
         client_request_id = coordinator.request_id_to_client_request_id[fid]
         del coordinator.request_id_to_client_id[fid]
@@ -271,6 +294,8 @@ def handle_engine_reply(coordinator, sender_identity, payload):
             if idx is not None:
                 assert coordinator._pending_counts[idx] >= 1
                 coordinator._pending_counts[idx] -= 1
+        if coordinator.disagg is not None:
+            coordinator.disagg.handle_decode_done(fid)
 
         coordinator.router_socket.send_multipart(
             [
@@ -281,6 +306,79 @@ def handle_engine_reply(coordinator, sender_identity, payload):
                 ),
             ]
         )
+
+
+@message_handler(Headers.KV_READ_DONE)
+def handle_kv_read_done(coordinator, sender_identity, payload):
+    """Release prefill-owned cache storage after decode imports it."""
+
+    if coordinator.disagg is None:
+        raise RuntimeError("KV_READ_DONE requires a disaggregated coordinator")
+    coordinator.disagg.handle_kv_read_done(int(payload[1]))
+
+
+@message_handler(Headers.SUBMIT_REQUEST_WITH_KV)
+def handle_submit_request_with_kv(coordinator, sender_identity, payload):
+    """Route a client-supplied handoff to a decode engine."""
+
+    if sender_identity not in coordinator.known_clients:
+        logging.info(
+            "Received SUBMIT_REQUEST_WITH_KV from unknown client %s; ignoring.", sender_identity
+        )
+        return
+    try:
+        client_request_id, prompt, sampling_params, kv_meta, src_block_ids = (
+            parse_submit_request_with_kv_fields(payload[1:])
+        )
+    except ValueError:
+        logging.error(
+            "Coordinator: malformed SUBMIT_REQUEST_WITH_KV payload with %d fields", len(payload) - 1
+        )
+        return
+
+    request_id = coordinator.next_request_id
+    coordinator.next_request_id += 1
+    coordinator.request_id_to_client_id[request_id] = sender_identity
+    coordinator.request_id_to_client_request_id[request_id] = client_request_id
+    coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
+    if isinstance(prompt, torch.Tensor):
+        prompt = prompt.tolist()
+    engine_payload = msgpack.packb(
+        make_submit_request_with_kv_message(
+            Headers.SUBMIT_REQUEST_WITH_KV.value,
+            request_id,
+            prompt,
+            sampling_params,
+            kv_meta,
+            src_block_ids,
+        ),
+        use_bin_type=True,
+    )
+
+    for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
+        next_identity = coordinator.get_least_loaded_data_parallel_rank()
+        if coordinator._send_to_engine(next_identity, engine_payload):
+            break
+    else:
+        logging.error("Coordinator: no reachable engines for handoff request %d", request_id)
+        del coordinator.request_id_to_client_id[request_id]
+        del coordinator.request_id_to_client_request_id[request_id]
+        coordinator.client_request_to_request_id.pop((sender_identity, client_request_id), None)
+        return True
+    coordinator.request_id_to_rank[request_id] = next_identity
+    coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
+
+
+@message_handler(Headers.RELEASE_KV)
+def handle_release_kv(coordinator, sender_identity, payload):
+    """Broadcast a client handoff release to every engine."""
+
+    if sender_identity not in coordinator.known_clients:
+        logging.warning("Coordinator: ignoring RELEASE_KV from unknown client.")
+        return
+    coordinator._broadcast_to_engines(
+        make_release_kv_message(Headers.RELEASE_KV.value, int(payload[1]))
+    )
 
 
 @message_handler(Headers.ENGINE_REPLY_PARTIAL)

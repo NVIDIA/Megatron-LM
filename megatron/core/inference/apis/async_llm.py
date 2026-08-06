@@ -38,6 +38,9 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
+        inference_shards=None,
+        disagg_router: str = "round_robin",
+        kv_transport_backend: str = "nixl",
     ) -> None:
         # MegatronAsyncLLM requires coordinator mode: direct mode invokes the
         # synchronous ``engine.generate()`` from inside the caller's asyncio
@@ -60,6 +63,9 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             use_coordinator=use_coordinator,
             coordinator_host=coordinator_host,
             coordinator_port=coordinator_port,
+            inference_shards=inference_shards,
+            disagg_router=disagg_router,
+            kv_transport_backend=kv_transport_backend,
         )
 
     async def generate(

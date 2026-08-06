@@ -32,6 +32,8 @@ class Request(IntEnum):
     SUBMIT_REQUEST_WITH_KV = 24  # Decode-side KV import.
     RELEASE_KV = 25  # Free pinned handoff blocks.
     SEND_KV = 26  # Tell the prefill engine to send a handoff's KV.
+    REGISTER_ROLE = 27  # Engine announces its prefill/decode role.
+    KV_READ_DONE = 28  # Decode finished importing a handoff.
 
 
 class Control(IntEnum):

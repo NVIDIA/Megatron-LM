@@ -3,7 +3,7 @@
 import logging
 import warnings
 from argparse import ArgumentParser, Namespace
-from typing import Literal, Optional
+from typing import Literal, Optional, Type
 
 import torch
 
@@ -36,6 +36,24 @@ except ImportError:
     HAS_NVIDIA_MODELOPT = False
 
 logger = logging.getLogger(__name__)
+
+
+async def serve_dynamic_inference_engine(
+    engine: DynamicInferenceEngine,
+    *,
+    coordinator_host: Optional[str] = None,
+    coordinator_port: Optional[int] = None,
+    on_ready=None,
+) -> None:
+    """Run a dynamic engine coordinator until the engine stops."""
+
+    address = await engine.start_listening_to_data_parallel_coordinator(
+        inference_coordinator_port=coordinator_port,
+        hostname=coordinator_host,
+    )
+    if on_ready is not None and torch.distributed.get_rank() == 0:
+        on_ready(address)
+    await engine.engine_loop_task
 
 
 def get_model_builder(
@@ -73,12 +91,26 @@ def get_model_builder(
     raise ValueError(f"Invalid model provider {provider}")
 
 
-def get_model_for_inference() -> MegatronModule:
-    """Initialize model and load checkpoint for inference."""
+def get_model_for_inference(
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> MegatronModule:
+    """Initialize a model and load its inference checkpoint.
+
+    Args:
+        pg_collection: Process groups used to build and load the model. When
+            omitted, the initialized global MPU process groups are used.
+        checkpoint_group: Ranks that collectively form this model replica's
+            complete checkpoint view. Defaults to the global process group.
+    """
 
     args = get_args()
 
     if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
+        if pg_collection is not None:
+            raise ValueError(
+                "Custom inference process groups are not supported by the ModelOpt builder"
+            )
         # ModelOpt path keeps the legacy callable-based builder because the
         # modelopt hooks (custom layer specs, calibration, etc.) have not been
         # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
@@ -86,7 +118,8 @@ def get_model_for_inference() -> MegatronModule:
         model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
     else:
         builder = get_model_builder(args)
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model = builder.build_distributed_models(
             pg_collection=pg_collection, wrap_with_ddp=False
         )
@@ -99,6 +132,12 @@ def get_model_for_inference() -> MegatronModule:
         optimizer=None,
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
+        tp_group=pg_collection.tp if pg_collection is not None else None,
+        pp_group=pg_collection.pp if pg_collection is not None else None,
+        dp_cp_group=pg_collection.dp_cp if pg_collection is not None else None,
+        dp_group=pg_collection.dp if pg_collection is not None else None,
+        expt_dp_group=pg_collection.expt_dp if pg_collection is not None else None,
+        checkpoint_group=checkpoint_group,
     )
 
     # No virtual PP.
@@ -363,8 +402,11 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     )
 
 
-def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> DynamicInferenceEngine:
-    """Builds a `DynamicInferenceEngine`."""
+def get_dynamic_inference_engine(
+    model: Optional[MegatronModule] = None,
+    engine_class: Type[DynamicInferenceEngine] = DynamicInferenceEngine,
+) -> DynamicInferenceEngine:
+    """Build a dynamic inference engine of the requested class."""
     args = get_args()
     if model is None:
         model = get_model_for_inference()
@@ -374,5 +416,5 @@ def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> Dyna
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = GPTInferenceWrapper(model, context)
     controller = TextGenerationController(inference_wrapped_model, tokenizer)
-    engine = DynamicInferenceEngine(controller, context)
+    engine = engine_class(controller, context)
     return engine

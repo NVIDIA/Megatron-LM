@@ -23,6 +23,7 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _maybe_setup_gpt_to_hybrid_load,
     get_checkpoint_tracker_filename,
     load_args_from_checkpoint,
     load_checkpoint,
@@ -33,6 +34,13 @@ from megatron.training.checkpointing import (
 from megatron.training.global_vars import set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_model_only_checkpoint_does_not_trigger_gpt_hybrid_interop():
+    """Missing checkpoint args do not identify a model-only checkpoint as GPT."""
+
+    args = SimpleNamespace(hybrid_layer_pattern="M*E")
+    assert _maybe_setup_gpt_to_hybrid_load(args, SimpleNamespace(), [object()]) == (None, False)
 
 
 class MockModel(MegatronModule):
