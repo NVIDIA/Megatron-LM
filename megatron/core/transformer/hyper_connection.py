@@ -3,6 +3,8 @@
 import math
 from typing import TYPE_CHECKING, Optional, Tuple
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,7 +15,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
 if TYPE_CHECKING:
-    from megatron.core.tensor_parallel.random import CheckpointManager
+    from megatron.core.tensor_parallel.random import CheckpointManager, CudaGraphCheckpointBridge
+    from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot
 
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
@@ -68,6 +71,45 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
 def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
+
+
+class NativeHAggregateInto(torch.autograd.Function):
+    """Native H-aggregate whose result is produced in caller-owned storage.
+
+    The explicit output is needed when the consumer is a CUDA Graph: its input
+    address is part of the captured launch parameters and therefore cannot be
+    repaired by rebinding a logical tensor after recomputation.
+    """
+
+    @staticmethod
+    def forward(ctx, x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
+        if out.shape != x.shape[:2] + x.shape[3:]:
+            raise ValueError(
+                f"H-aggregate output shape {tuple(out.shape)} does not match "
+                f"{tuple(x.shape[:2] + x.shape[3:])}"
+            )
+        if out.dtype != x.dtype or out.device != x.device:
+            raise ValueError("H-aggregate output dtype/device must match x")
+        if out.requires_grad:
+            raise ValueError("H-aggregate caller-owned output must be a detached tensor")
+
+        ctx.mark_dirty(out)
+        torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+        ctx.save_for_backward(x, h_pre)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        x, h_pre = ctx.saved_tensors
+        grad_output_expanded = grad_output.unsqueeze(2)
+        grad_x = grad_output_expanded * h_pre.unsqueeze(-1)
+        grad_h = torch.sum(grad_output_expanded * x, dim=-1)
+        return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype), None
+
+
+def native_h_aggregate_into(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
+    """Native weighted aggregation that writes directly to ``out``."""
+    return NativeHAggregateInto.apply(x, h_pre, out)
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
@@ -224,6 +266,7 @@ class HyperConnectionModule(MegatronModule):
         if config.use_fused_mhc:
             from megatron.core.fusions.fused_mhc_kernels import (
                 fused_h_aggregate,
+                fused_h_aggregate_into,
                 fused_h_post_bda,
                 fused_proj_rms_compute_h,
                 fused_sinkhorn,
@@ -233,11 +276,13 @@ class HyperConnectionModule(MegatronModule):
             log_fused_mhc_backend_once()
             self._sinkhorn_op = fused_sinkhorn
             self._h_aggregate_op = fused_h_aggregate
+            self._h_aggregate_into_op = fused_h_aggregate_into
             self._h_post_bda_op = fused_h_post_bda
             self._proj_rms_compute_h_op = fused_proj_rms_compute_h
         else:
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
+            self._h_aggregate_into_op = native_h_aggregate_into
             self._h_post_bda_op = native_h_post_bda
             self._proj_rms_compute_h_op = None
 
@@ -444,7 +489,7 @@ class HyperConnectionModule(MegatronModule):
 
         return x_out, bias_out
 
-    def aggregate(self, x: Tensor, h_pre: Tensor) -> Tensor:
+    def aggregate(self, x: Tensor, h_pre: Tensor, out: Optional[Tensor] = None) -> Tensor:
         """
         Aggregate n-stream to 1-stream.
 
@@ -458,7 +503,9 @@ class HyperConnectionModule(MegatronModule):
         s, b, _ = x.shape
         C = self.hidden_size
         x_streams = x.view(s, b, self.n, C)
-        return self._h_aggregate_op(x_streams, h_pre)
+        if out is None:
+            return self._h_aggregate_op(x_streams, h_pre)
+        return self._h_aggregate_into_op(x_streams, h_pre, out)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
     @torch.compile
@@ -487,7 +534,11 @@ class HyperConnectionModule(MegatronModule):
         return mixed.view(s, b, n * C)
 
     def forward(
-        self, hidden_states: Tensor, mhc_recompute_manager: Optional['CheckpointManager'] = None
+        self,
+        hidden_states: Tensor,
+        mhc_recompute_manager: Optional['CheckpointManager'] = None,
+        output_bridge: Optional['CudaGraphCheckpointBridge'] = None,
+        output_slot: Optional['MHCRecomputeArenaSlot'] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Full mHC forward pass.
@@ -501,6 +552,11 @@ class HyperConnectionModule(MegatronModule):
             hidden_states: [s, b, n*C] - n-stream hidden states
             mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
                 When provided, uses _forward_with_checkpoint for memory-efficient execution.
+            output_bridge: Optional fixed-address CUDA Graph consumer input.  This
+                is valid only with ``mhc_recompute_manager`` and causes aggregate
+                recompute to materialize into the captured input surface.
+            output_slot: Optional arena slot used as the aggregate kernel's
+                caller-owned output for both forward and recompute.
 
         Returns:
             A 4-tuple. This is an intentional breaking change from the older
@@ -512,8 +568,15 @@ class HyperConnectionModule(MegatronModule):
             residual: [s, b, n*C] - residual view for fused_h_res_h_post_bda
         """
         if mhc_recompute_manager is not None:
-            return self._forward_with_checkpoint(hidden_states, mhc_recompute_manager)
+            return self._forward_with_checkpoint(
+                hidden_states,
+                mhc_recompute_manager,
+                output_bridge=output_bridge,
+                output_slot=output_slot,
+            )
         else:
+            if output_bridge is not None or output_slot is not None:
+                raise ValueError("fixed mHC outputs require an mHC recompute manager")
             return self._forward_normal(hidden_states)
 
     def _forward_normal(self, hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -544,7 +607,11 @@ class HyperConnectionModule(MegatronModule):
         return aggregated, h_res, h_post, hs_for_residual
 
     def _forward_with_checkpoint(
-        self, hidden_states: Tensor, manager: 'CheckpointManager'
+        self,
+        hidden_states: Tensor,
+        manager: 'CheckpointManager',
+        output_bridge: Optional['CudaGraphCheckpointBridge'] = None,
+        output_slot: Optional['MHCRecomputeArenaSlot'] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Forward pass with checkpointing for memory efficiency.
@@ -557,6 +624,8 @@ class HyperConnectionModule(MegatronModule):
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
             manager: CheckpointManager for unified recomputation
+            output_bridge: Optional fixed-address attention CUDA Graph input.
+            output_slot: Optional direct-write attention CUDA Graph input slot.
 
         Returns:
             aggregated: [s, b, C] - aggregated input for layer computation
@@ -573,10 +642,18 @@ class HyperConnectionModule(MegatronModule):
 
         h_pre, h_post, h_res = self.compute_mappings(hs_for_mappings)
 
+
         # Checkpoint aggregate - auto-registers to manager
-        aggregated = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-            self.aggregate, hs_for_aggregate, h_pre
-        )
+        aggregate_function = self.aggregate
+        if output_slot is not None:
+
+            def aggregate_function(x, h):
+                return self.aggregate(x, h, out=output_slot.writer)
+
+        aggregated = CheckpointWithoutOutput(
+            ckpt_manager=manager, output_bridge=output_bridge, output_slot=output_slot
+        ).checkpoint(aggregate_function, hs_for_aggregate, h_pre)
+
 
         return aggregated, h_res, h_post, hs_for_residual
 

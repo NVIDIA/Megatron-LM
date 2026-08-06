@@ -224,6 +224,13 @@ class FullCudaGraphWrapper:
                     'Upgrade to a PyTorch build that includes pytorch/pytorch#180090.'
                 )
             torch.distributed.barrier()
+            # Release cached blocks reserved during the eager warmup iterations
+            # before the capture allocates its private pool: the two pools
+            # coexist for the lifetime of the graph, and warmup fragmentation
+            # (reserved-but-unallocated blocks) otherwise counts against the
+            # capture's headroom.
+            gc.collect()
+            torch.cuda.empty_cache()
             assert FullCudaGraphWrapper.cuda_graph[training_str] is None
             FullCudaGraphWrapper.cuda_graph[training_str] = torch.cuda.CUDAGraph()
             for _, state in get_all_rng_states().items():

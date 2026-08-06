@@ -18,6 +18,7 @@ from torch import Tensor
 from megatron.core.fusions.fused_mhc_kernels import is_cutile_available, is_triton_available
 from megatron.core.transformer.hyper_connection import (
     native_h_aggregate,
+    native_h_aggregate_into,
     native_h_post_bda,
     native_proj_rms,
     native_sinkhorn,
@@ -237,6 +238,28 @@ class TestNativeHAggregate:
         torch.testing.assert_close(xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
         torch.testing.assert_close(hf.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
 
+    def test_caller_owned_output_preserves_pointer_and_gradients(self):
+        x_data = _rand(2, 3, 4, 64)
+        h_data = _rand(2, 3, 4)
+        grad_out = _rand(2, 3, 64)
+
+        xf = x_data.clone().requires_grad_(True)
+        hf = h_data.clone().requires_grad_(True)
+        arena_view = torch.empty(2, 3, 64, dtype=xf.dtype, device=xf.device)
+        expected_ptr = arena_view.data_ptr()
+        of = native_h_aggregate_into(xf, hf, arena_view)
+        assert of.data_ptr() == expected_ptr
+        of.backward(grad_out)
+
+        xr = x_data.clone().requires_grad_(True)
+        hr = h_data.clone().requires_grad_(True)
+        oref = _ref_h_aggregate(xr, hr)
+        oref.backward(grad_out)
+
+        torch.testing.assert_close(of, oref, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
+        torch.testing.assert_close(hf.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
+
 
 class TestFusedHAggregate:
     """Public fused h_aggregate dispatch/fallback plus numerical correctness."""
@@ -260,6 +283,30 @@ class TestFusedHAggregate:
         of.backward(grad_out)
 
         # -- reference path --
+        xr = x_data.clone().requires_grad_(True)
+        hr = h_data.clone().requires_grad_(True)
+        oref = _ref_h_aggregate(xr, hr)
+        oref.backward(grad_out)
+
+        torch.testing.assert_close(of, oref, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
+        torch.testing.assert_close(hf.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
+
+    def test_caller_owned_output_preserves_pointer_and_gradients(self):
+        from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate_into
+
+        x_data = _rand(2, 3, 4, 64)
+        h_data = _rand(2, 3, 4)
+        grad_out = _rand(2, 3, 64)
+
+        xf = x_data.clone().requires_grad_(True)
+        hf = h_data.clone().requires_grad_(True)
+        arena_view = torch.empty(2, 3, 64, dtype=xf.dtype, device=xf.device)
+        expected_ptr = arena_view.data_ptr()
+        of = fused_h_aggregate_into(xf, hf, arena_view)
+        assert of.data_ptr() == expected_ptr
+        of.backward(grad_out)
+
         xr = x_data.clone().requires_grad_(True)
         hr = h_data.clone().requires_grad_(True)
         oref = _ref_h_aggregate(xr, hr)

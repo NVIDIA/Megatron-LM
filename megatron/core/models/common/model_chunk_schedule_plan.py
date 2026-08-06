@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, Callable, Optional
+
+import os
 
 import torch
 from torch import Tensor
@@ -53,6 +56,7 @@ class TransformerLayerSchedulePlan:
     moe_dispatch = None
     mlp = None
     moe_combine = None
+    mhc_post = None
     mhc_recompute = None
     mtp_post_process = None
 
@@ -99,6 +103,9 @@ class TransformerLayerSchedulePlan:
         if hasattr(self, 'moe_combine') and self.moe_combine is not None:
             del self.moe_combine
             self.moe_combine = None
+        if hasattr(self, 'mhc_post') and self.mhc_post is not None:
+            del self.mhc_post
+            self.mhc_post = None
         if hasattr(self, 'mhc_recompute') and self.mhc_recompute is not None:
             del self.mhc_recompute
             self.mhc_recompute = None
@@ -158,6 +165,7 @@ class TransformerLayerSchedulePlan:
             mlp_module,
             moe_combine_module,
             mtp_post_process_module,
+            mhc_post_module,
         ) = fwd_callables
 
         # Create nodes for different operations in the layer
@@ -171,16 +179,29 @@ class TransformerLayerSchedulePlan:
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
 
+        # mHC post-processing is compute and belongs on the compute stream: keeping
+        # it inside the communication-stream combine node made the recompute's
+        # tensors cross-stream (allocated on compute, read on comm, then freed),
+        # which the caching allocator cannot track.
+        if mhc_post_module is not None:
+            self.mhc_post = create_node(comp_stream, mhc_post_module, "mhc_post")
+        else:
+            self.mhc_post = NoopScheduleNode()
+
         mhc_recompute_manager = extra_args.get("mhc_recompute_manager")
         if mhc_recompute_manager is not None and extra_args.get(
             "is_last_layer_in_mhc_recompute_group", False
         ):
+            from megatron.core.transformer.mhc_recompute import MHCRecomputePhase
+
             group_index = extra_args["mhc_recompute_group_index"]
             # The group counter restarts per module (decoder / mtp), so fold the
             # module tag into the NVTX label to keep profiles unambiguous.
             module_tag = extra_args.get("mhc_recompute_module_tag", "decoder")
             self.mhc_recompute = ScheduleNode(
-                mhc_recompute_manager.recompute_now,
+                partial(
+                    mhc_recompute_manager.recompute_until, MHCRecomputePhase.BEFORE_COMBINE_BWD
+                ),
                 comp_stream,
                 event,
                 name="mhc_recompute",
@@ -227,8 +248,12 @@ class TransformerLayerSchedulePlan:
         # After the last backward op (attn), release backward-pass params.
         self.attn.set_post_backward_hook(lambda: post_backward_hook(hook_module))
 
-        # Determine the last node in forward order.
-        if isinstance(self.moe_combine, NoopScheduleNode):
+        # Determine the last node in forward order. mHC post-processing runs after
+        # the combine, so releasing forward-pass params at the combine would pull
+        # them out from under it.
+        if not isinstance(self.mhc_post, NoopScheduleNode):
+            last_fwd_node = self.mhc_post
+        elif isinstance(self.moe_combine, NoopScheduleNode):
             last_fwd_node = self.mlp
         else:
             last_fwd_node = self.moe_combine
@@ -245,6 +270,7 @@ class TransformerLayerSchedulePlan:
             self.moe_dispatch,
             self.mlp,
             self.moe_combine,
+            self.mhc_post,
             self.mtp_post_process,
         ):
             if isinstance(node, ScheduleNode):
@@ -306,7 +332,9 @@ class TransformerLayerSchedulePlan:
         When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
         comm_stream: combine_bwd | dispatch_fwd->dispatch_bwd  | combine_fwd
         comp_stream: attn_fwd    | mlp_bwd->mlp_bwd_dw->mlp_fwd| attn_bwd
-        MLP-side mHC post-processing runs inside the combine node on the communication stream.
+        MLP-side mHC post-processing runs in its own compute-stream node right after
+        combine, so the communication stream carries only communication and the
+        recompute's tensors are produced and consumed on the same stream.
         Group recompute runs on the normal compute stream immediately before the node containing
         mHC post-processing backward.
         For MTP, mtp_post_process_fwd is executed after the combine_fwd in the comp_stream,
@@ -328,6 +356,7 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             if b_layer.mhc_recompute is not None:
                 b_layer.mhc_recompute.forward()
+            b_grad = b_layer.mhc_post.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
@@ -355,6 +384,10 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.moe_combine.forward(f_input)
+
+        if f_layer is not None:
+            with f_layer.get_fp8_context():
+                f_input = f_layer.mhc_post.forward(f_input)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.attn.backward(b_grad)

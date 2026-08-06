@@ -445,18 +445,22 @@ if _TRITON_AVAILABLE:
             mask=mask_2d,
         )
 
-    def _triton_h_aggregate_fwd(x: Tensor, h_pre: Tensor) -> Tensor:
+    def _triton_h_aggregate_fwd(x: Tensor, h_pre: Tensor, out: Optional[Tensor] = None) -> Tensor:
         s, b, n, C = x.shape
         sb = s * b
-        out = torch.empty(sb, C, dtype=x.dtype, device=x.device)
+        if out is None:
+            out = torch.empty(s, b, C, dtype=x.dtype, device=x.device)
+        if out.shape != (s, b, C) or out.dtype != x.dtype or out.device != x.device:
+            raise ValueError("Invalid caller-owned Triton H-aggregate output")
+        out_flat = out.view(sb, C)
         x_flat = x.contiguous().view(sb, n, C)
         h_flat = h_pre.contiguous().view(sb, n)
 
         grid = lambda META: (triton.cdiv(sb, META["BLOCK_S"]), triton.cdiv(C, META["BLOCK_C"]))
         _triton_h_agg_fwd_kernel[grid](
-            x_flat, h_flat, out, sb, C, n, x_flat.stride(0), x_flat.stride(1), x_flat.stride(2)
+            x_flat, h_flat, out_flat, sb, C, n, x_flat.stride(0), x_flat.stride(1), x_flat.stride(2)
         )
-        return out.view(s, b, C)
+        return out
 
     # ============================================================================
     # H_post BDA
@@ -1081,21 +1085,28 @@ if _CUTILE_AVAILABLE:
             gh_acc += ct.sum(go_expanded.astype(ct.float32) * x_tile.astype(ct.float32), axis=2)
         ct.store(gh, index=(pid, 0), tile=gh_acc.astype(gh.dtype))
 
-    def _cutile_h_aggregate_fwd(x: Tensor, h_pre: Tensor) -> Tensor:
+    def _cutile_h_aggregate_fwd(x: Tensor, h_pre: Tensor, out: Optional[Tensor] = None) -> Tensor:
         s, b, n, C = x.shape
         sb = s * b
         stream = torch.cuda.current_stream()
-        out = torch.empty(sb, C, dtype=x.dtype, device=x.device)
+        if out is None:
+            out = torch.empty(s, b, C, dtype=x.dtype, device=x.device)
+        if out.shape != (s, b, C) or out.dtype != x.dtype or out.device != x.device:
+            raise ValueError("Invalid caller-owned cuTile H-aggregate output")
+        out_flat = out.view(sb, C)
         x_flat = x.view(sb, n, C)
         h_flat = h_pre.view(sb, n)
 
         # Autotune disabled — causes cudaErrorLaunchFailure during training.
         tm, tc = math.gcd(sb, 4), math.gcd(C, 1024)
         ct.launch(
-            stream, (math.ceil(sb / tm),), _ct_h_agg_fwd_kernel, (x_flat, h_flat, out, n, tm, tc)
+            stream,
+            (math.ceil(sb / tm),),
+            _ct_h_agg_fwd_kernel,
+            (x_flat, h_flat, out_flat, n, tm, tc),
         )
 
-        return out.view(s, b, C)
+        return out
 
     def _cutile_h_aggregate_bwd(
         grad_output: Tensor, x: Tensor, h_pre: Tensor
@@ -2932,6 +2943,45 @@ class FusedHAggregate(torch.autograd.Function):
         return _torch_h_aggregate_bwd(grad_output, x, h_pre)
 
 
+class FusedHAggregateInto(torch.autograd.Function):
+    """H-aggregate that writes into a fixed-address caller-owned tensor."""
+
+    @staticmethod
+    def forward(ctx, x: Tensor, h_pre: Tensor, out: Tensor):
+        expected_shape = x.shape[:2] + x.shape[3:]
+        if out.shape != expected_shape:
+            raise ValueError(
+                f"H-aggregate output shape {tuple(out.shape)} does not match "
+                f"{tuple(expected_shape)}"
+            )
+        if out.dtype != x.dtype or out.device != x.device:
+            raise ValueError("H-aggregate output dtype/device must match x")
+        if not out.is_contiguous():
+            raise ValueError("H-aggregate caller-owned output must be contiguous")
+        if out.requires_grad:
+            raise ValueError("H-aggregate caller-owned output must be a detached tensor")
+        ctx.mark_dirty(out)
+        triton_fwd = _get_triton_h_aggregate_fwd()
+        if triton_fwd is not None:
+            output = triton_fwd(x, h_pre, out)
+        elif is_cutile_available():
+            output = _cutile_h_aggregate_fwd(x, h_pre, out)
+        else:
+            torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+            output = out
+        ctx.save_for_backward(x, h_pre)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, h_pre = ctx.saved_tensors
+        if is_cutile_available():
+            grad_x, grad_h = _cutile_h_aggregate_bwd(grad_output, x, h_pre)
+        else:
+            grad_x, grad_h = _torch_h_aggregate_bwd(grad_output, x, h_pre)
+        return grad_x, grad_h, None
+
+
 class FusedHPostBDA(torch.autograd.Function):
     """H_post_bda with Triton/cuTile/torch forward and backward."""
 
@@ -2994,6 +3044,16 @@ def fused_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     if _TRITON_AVAILABLE or is_cutile_available():
         return FusedHAggregate.apply(x, h_pre)
     return native_h_aggregate(x, h_pre)
+
+
+def fused_h_aggregate_into(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
+    """Weighted aggregation that writes directly to fixed-address ``out``."""
+    _raise_mhc_backend_validation_error()
+    if _TRITON_AVAILABLE or is_cutile_available():
+        return FusedHAggregateInto.apply(x, h_pre, out)
+    from megatron.core.transformer.hyper_connection import native_h_aggregate_into
+
+    return native_h_aggregate_into(x, h_pre, out)
 
 
 def fused_h_post_bda(

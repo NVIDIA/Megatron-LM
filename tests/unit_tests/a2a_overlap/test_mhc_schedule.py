@@ -15,6 +15,7 @@ from megatron.core.pipeline_parallel.utils import get_comp_stream, set_streams
 from megatron.core.tensor_parallel.random import (
     CheckpointManager,
     CheckpointWithoutOutput,
+    CudaGraphCheckpointBridge,
     initialize_rng_tracker,
 )
 from megatron.core.transformer.module import float16_to_fp32
@@ -63,8 +64,18 @@ def _make_valid_mhc_overlap_config(**overrides):
     ({"cuda_graph_impl": "local"}, {"enable_cuda_graph": True}, {"external_cuda_graph": True}),
 )
 def test_mhc_overlap_recompute_rejects_cuda_graphs(cuda_graph_kwargs):
-    with pytest.raises(ValueError, match="eager-only"):
+    with pytest.raises(ValueError, match="explicit schedule-owned recompute barrier"):
         _make_valid_mhc_overlap_config(**cuda_graph_kwargs)
+
+
+def test_mhc_overlap_recompute_accepts_full_iteration_cuda_graph():
+    config = _make_valid_mhc_overlap_config(
+        cuda_graph_impl="full_iteration",
+        cuda_graph_modules=[],
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+    )
+    assert config.cuda_graph_impl == "full_iteration"
 
 
 class _RecordingNode:
@@ -92,6 +103,9 @@ class _RecordingLayer:
         self.moe_dispatch = _RecordingNode(calls, f"{prefix}.moe_dispatch")
         self.mlp = _RecordingNode(calls, f"{prefix}.mlp")
         self.moe_combine = _RecordingNode(calls, f"{prefix}.moe_combine")
+        # mHC post-processing is its own compute-stream node, ordered after the
+        # combine in forward and before it in backward.
+        self.mhc_post = _RecordingNode(calls, f"{prefix}.mhc_post")
         self.mhc_recompute = None
         self.mtp_post_process = _RecordingNode(calls, f"{prefix}.mtp_post_process")
 
@@ -260,6 +274,58 @@ def test_checkpoint_manager_explicit_recompute_is_idempotent_and_restores_gradie
 
     loss.backward()
     torch.testing.assert_close(input_tensor.grad, reference_input.grad)
+
+
+def test_overlap_schedule_materializes_bridge_before_consumer_backward(_initialized_model_parallel):
+    """The future EP-overlap recompute node restores B before captured BWD.
+
+    The graph replay itself is covered by the mHC bridge test. This test binds
+    the same primitive to ``TransformerLayerSchedulePlan`` and validates node
+    ordering for the later EP-overlap phase. Dense pipeline 1F1B is covered by
+    the PP=2 functional test instead.
+    """
+
+    def run_function(value):
+        return torch.sin(value) * value
+
+    initialize_rng_tracker(force_reset=True)
+    calls = []
+    input_tensor = torch.randn(32, device="cuda", requires_grad=True)
+    bridge_tensor = torch.empty_like(input_tensor, requires_grad=True)
+    bridge_ptr = bridge_tensor.data_ptr()
+    manager = CheckpointManager()
+    checkpoint = CheckpointWithoutOutput(
+        ckpt_manager=manager, output_bridge=CudaGraphCheckpointBridge(bridge_tensor)
+    )
+    output = checkpoint.checkpoint(run_function, input_tensor)
+    expected = output.detach().clone()
+    manager.discard_all_outputs()
+
+    with torch.no_grad():
+        bridge_tensor.fill_(float("nan"))
+
+    class _ManagerRecomputeNode:
+        def forward(self):
+            calls.append("backward.mhc_recompute.forward")
+            manager.recompute_now()
+
+    class _BridgeConsumerNode(_RecordingNode):
+        def backward(self, value):
+            calls.append(f"{self.name}.backward")
+            assert bridge_tensor.data_ptr() == bridge_ptr
+            torch.testing.assert_close(bridge_tensor, expected)
+            return value
+
+    backward_layer = _RecordingLayer(calls, "backward")
+    backward_layer.mhc_recompute = _ManagerRecomputeNode()
+    backward_layer.moe_combine = _BridgeConsumerNode(calls, "backward.captured_consumer")
+
+    TransformerLayerSchedulePlan.run(None, backward_layer, b_grad=object())
+
+    _assert_called_before(
+        calls, "backward.mhc_recompute.forward", "backward.captured_consumer.backward"
+    )
+    torch.testing.assert_close(output, expected)
 
 
 def _run_schedule_and_capture(model, data):
@@ -478,6 +544,33 @@ class TestMhcA2AOverlapNumerics:
         torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
         _assert_close_grads(overlap_gradients, reference_gradients)
 
+    def test_mtp_schedule_matches_eager(self):
+        # The MTP builder wraps build_transformer_layer_callables and re-unpacks its
+        # result, so it has to track that tuple's width. When mHC post-processing was
+        # split into its own schedule node the tuple grew a sixth slot and this builder
+        # kept unpacking five, which raises before the first iteration -- and had it
+        # unpacked loosely instead, the MTP layer would have silently dropped the
+        # inherited mHC post node and diverged from eager here. Unlike the delayed-wgrad
+        # case below this needs no particular TE version, so it runs everywhere.
+        mtp = {"mtp_num_layers": 1}
+        reference_config = _make_mhc_numerical_config(
+            overlap=False, recompute=False, extra_config=mtp
+        )
+        overlap_config = _make_mhc_numerical_config(recompute=False, extra_config=mtp)
+        with deterministic_mode():
+            data = build_input_data(seq_len=16)
+            reference_model = build_gpt_model(reference_config)
+            initial_parameters = reset_model(reference_model)
+            reference_output, reference_gradients = _run_eager_and_capture(reference_model, data)
+            del reference_model
+
+            overlap_model = build_gpt_model(overlap_config)
+            reset_model(overlap_model, initial_parameters)
+            overlap_output, overlap_gradients = _run_schedule_and_capture(overlap_model, data)
+
+        torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
+        _assert_close_grads(overlap_gradients, reference_gradients)
+
     @pytest.mark.skipif(
         not is_te_min_version("2.3.0"), reason="delay_wgrad_compute requires TE >= 2.3.0"
     )
@@ -553,15 +646,12 @@ class TestMhcA2AOverlapNumerics:
         _assert_close_grads(overlap_gradients, reference_gradients, rtol=3e-2, atol=3e-2)
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    def test_schedule_with_full_iteration_cuda_graph_matches_eager(self):
-        """mHC + EP overlap + ``cuda_graph_impl='full_iteration'`` (no mhc recompute).
+    def test_schedule_with_full_iteration_cuda_graph_and_recompute_matches_eager(self):
+        """mHC recompute + EP overlap + full-iteration graph matches eager.
 
-        The ``__post_init__`` guard added by this PR rejects CUDA graphs only when
-        mhc *recompute* is enabled (explicit group replay is eager-only); this test
-        proves the guard admits full-iteration CG + EP overlap without recompute,
-        and that the scheduled forward+backward step is actually capturable into a
-        ``torch.cuda.CUDAGraph`` and numerically faithful on replay — the core-level
-        equivalent of what ``FullCudaGraphWrapper`` captures in production.
+        The whole scheduled step, including group discard, the explicit
+        ``BEFORE_COMBINE_BWD`` barrier, recompute kernels, and consumer backward,
+        must be capturable and numerically faithful across repeated replay.
 
         MoE runs in drop_and_pad mode: the dropless alltoall dispatcher performs a
         mandatory D2H splits sync that is illegal during stream capture. The
@@ -573,10 +663,10 @@ class TestMhcA2AOverlapNumerics:
         # the padded slot count (8 * 16) matches the routing-map size exactly.
         drop_and_pad = {"moe_pad_expert_input_to_capacity": True, "moe_expert_capacity_factor": 4.0}
         reference_config = _make_mhc_numerical_config(
-            overlap=False, recompute=False, extra_config=drop_and_pad
+            overlap=False, recompute=True, extra_config=drop_and_pad
         )
         overlap_config = _make_mhc_numerical_config(
-            recompute=False, extra_config={**drop_and_pad, "cuda_graph_impl": "full_iteration"}
+            recompute=True, extra_config={**drop_and_pad, "cuda_graph_impl": "full_iteration"}
         )
         # Full-iteration capture requires a graph-safe RNG tracker (production
         # enforces use_te_rng_tracker with CUDA graphs): TE attention forks the
