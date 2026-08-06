@@ -89,7 +89,7 @@ class ExtendedRMSNorm(RMSNormGated):
 
 
 @dataclass
-class MambaMixerSubmodules:
+class GatedDeltaProductMixerSubmodules:
     """
     Contains the module specs for the input and output linear layers.
     """
@@ -143,7 +143,7 @@ class GatedDeltaProductMixer(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        submodules: MambaMixerSubmodules,
+        submodules: GatedDeltaProductMixerSubmodules,
         d_model,
         d_conv=4,
         conv_init=None,

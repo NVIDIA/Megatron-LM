@@ -30,7 +30,10 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer, MambaMixerSubmodules
+from megatron.core.ssm.gated_delta_product import (
+    GatedDeltaProductMixer,
+    GatedDeltaProductMixerSubmodules,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -127,7 +130,7 @@ def _build_mixer(cp_group):
     """Construct a v4 GDP mixer wired to the given CP group."""
     config = _make_config(cp_group.size())
     pg = ProcessGroupCollection(tp=parallel_state.get_tensor_model_parallel_group(), cp=cp_group)
-    submodules = MambaMixerSubmodules(
+    submodules = GatedDeltaProductMixerSubmodules(
         in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
     )
     mixer = GatedDeltaProductMixer(
