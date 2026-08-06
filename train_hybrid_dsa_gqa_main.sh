@@ -104,6 +104,10 @@ MODEL_ARGS=(
   --no-gradient-accumulation-fusion
   --attention-softmax-in-fp32
   # --- logging / memory ---
+  # NB: Megatron gates lm-loss/lr/memory wandb logging behind the tensorboard
+  # writer existing (training.py: `if writer and ...`). Without --tensorboard-dir,
+  # only 'indexer loss' reaches wandb. Set it so 'lm loss' etc. are logged too.
+  --tensorboard-dir ${TENSORBOARD_DIR:-./tb_dsa}
   --log-interval 1
   --log-memory-to-tensorboard
   --log-memory-interval 1
