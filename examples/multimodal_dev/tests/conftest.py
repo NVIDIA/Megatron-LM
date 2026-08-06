@@ -12,13 +12,31 @@ and none of its hooks apply here.  The pieces the CI runner
   flag, which would otherwise be rejected as an unknown option;
 * ``pytest_sessionfinish`` — that second invocation collects nothing in
   this bucket (there are no experimental tests), and pytest's "no tests
-  collected" exit code 5 must not fail the job.
+  collected" exit code 5 must not fail the job;
+* ``cleanup`` — without it the NCCL process group is still alive at
+  interpreter exit, which torch reports as a resource leak and which can
+  hang teardown in the CI container.
+
+Two hooks are *deliberately* not reproduced:
+
+* ``set_env`` — ``tests/unit_tests`` forces ``NVTE_FLASH_ATTN=0`` and
+  ``NVTE_FUSED_ATTN=0`` on every test.  This suite needs the fused and
+  flash attention backends *enabled*: the THD/packed-sequence paths under
+  test are only reachable through them, and pinning them off would make
+  the parity tests silently exercise the unfused fallback instead.
+* ``reset_env_vars`` — nothing here mutates the environment.
+
+Because ``--experimental`` is registered both here and in
+``tests/unit_tests/conftest.py``, the two directories cannot be passed to a
+single pytest invocation (pytest rejects the duplicate option). CI never
+does this; run them as separate commands locally.
 """
 
 import os
 import sys
 
 import pytest
+import torch.distributed
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 if _REPO_ROOT not in sys.path:
@@ -40,6 +58,18 @@ def pytest_addoption(parser):
 def experimental(request):
     """Simple fixture setting the experimental flag [CPU | GPU]"""
     config.ENABLE_EXPERIMENTAL = request.config.getoption("--experimental") is True
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup():
+    """Tear the process group down before exit, as the unit-test suite does."""
+    yield
+    if torch.distributed.is_initialized():
+        try:
+            torch.distributed.barrier()
+        except Exception:
+            return
+        torch.distributed.destroy_process_group()
 
 
 def pytest_sessionfinish(session, exitstatus):
