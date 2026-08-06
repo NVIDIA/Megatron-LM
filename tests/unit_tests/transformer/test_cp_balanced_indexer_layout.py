@@ -142,9 +142,56 @@ def test_prebuild_matches_runtime_plan(name, cu_list, cp_size, capacity):
                 assert torch.equal(a.to(torch.int64), b.to(torch.int64)), (name, r, key)
 
 
-def test_prebuild_single_full_seq_sets_gate_only():
-    """A single sequence filling the pack uses folding + K-slice: gate False, no plan."""
+def test_prebuild_single_full_seq_builds_unified_plan():
+    """A single pack-spanning sequence is the nseg==1 case of the unified zigzag path:
+    the gate flag is informational (False) but the plan + routes are still built."""
     psp = _packed_params([0, _S], _S)
     prebuild_balanced_layouts(psp, cp_group=_StubGroup(16, 3))
     assert psp._dsa_cp_multi_seq is False
-    assert getattr(psp, "_dsa_cp_balance_layout_cache", None) is None
+    plan = psp._dsa_cp_balance_layout_cache[("zigzag", 3)]
+    assert "disp_send_rows" in plan and "cmb_recv_rows" in plan
+
+
+def _sim_all_to_all(sends, in_splits_all):
+    """CPU emulation of all_to_all_single across N ranks (blocked by destination)."""
+    n = len(sends)
+    chunks = []
+    for r in range(n):
+        offs = [0]
+        for s in in_splits_all[r]:
+            offs.append(offs[-1] + s)
+        chunks.append([sends[r][offs[d] : offs[d + 1]] for d in range(n)])
+    return [torch.cat([chunks[s][r] for s in range(n)]) for r in range(n)]
+
+
+@pytest.mark.parametrize("name,cu_list,cp_size,capacity", [c for c in _CASES if c[2] <= 16])
+def test_route_a2a_roundtrip(name, cu_list, cp_size, capacity):
+    """Dispatch route must reproduce the [heads|tails] gather exactly, and the combine
+    route must return every computed row to its contiguous owner (bit-exact inverse)."""
+    l_local = capacity // cp_size
+    plans = []
+    for r in range(cp_size):
+        psp = _packed_params(cu_list, capacity)
+        prebuild_balanced_layouts(psp, cp_group=_StubGroup(cp_size, r))
+        plans.append(psp._dsa_cp_balance_layout_cache[("zigzag", r)])
+    payload = torch.arange(capacity, dtype=torch.int64).unsqueeze(1)
+    # dispatch: contiguous -> [heads|tails]
+    sends = [
+        payload[r * l_local : (r + 1) * l_local].index_select(0, plans[r]["disp_send_rows"])
+        for r in range(cp_size)
+    ]
+    recvs = _sim_all_to_all(sends, [p["disp_in_splits"] for p in plans])
+    ordered = []
+    for r in range(cp_size):
+        o = torch.empty_like(recvs[r])
+        o.index_copy_(0, plans[r]["disp_recv_rows"], recvs[r])
+        ordered.append(o)
+        assert torch.equal(o.squeeze(1), plans[r]["gather_idx"]), (name, r)
+    # combine: [heads|tails] -> contiguous owners
+    sends2 = [ordered[r].index_select(0, plans[r]["cmb_send_rows"]) for r in range(cp_size)]
+    recvs2 = _sim_all_to_all(sends2, [p["disp_out_splits"] for p in plans])
+    for r in range(cp_size):
+        out = torch.empty_like(recvs2[r])
+        out.index_copy_(0, plans[r]["cmb_recv_rows"], recvs2[r])
+        mine = torch.arange(r * l_local, (r + 1) * l_local, dtype=torch.int64)
+        assert torch.equal(out.squeeze(1), mine), (name, r)

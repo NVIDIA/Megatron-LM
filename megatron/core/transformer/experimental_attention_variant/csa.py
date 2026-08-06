@@ -2738,6 +2738,9 @@ class CompressedSparseAttention(MegatronModule):
                             config=self.config,
                             use_fused=self.use_fused_kernels,
                             multi_seq=bal_multi_seq,
+                            layout_cache=getattr(
+                                packed_seq_params, "_dsa_cp_balance_layout_cache", None
+                            ),
                         )
 
                 indexer_compressed_local, _ = indexer.compressor._forward_thd(
