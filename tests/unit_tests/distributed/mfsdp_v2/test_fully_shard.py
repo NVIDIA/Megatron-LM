@@ -447,7 +447,8 @@ def test_deleted_model_releases_fsdp_storage(distributed_setup):
     # only detects storage retained by the deleted FSDP model itself.
     allocated_before = torch.cuda.memory_allocated(device)
     model = ElementwiseModel(dim=8192).to(dtype=torch.bfloat16, device=device)
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     x = torch.ones(1, 8192, dtype=torch.bfloat16, device=device)
     output = model(x)
