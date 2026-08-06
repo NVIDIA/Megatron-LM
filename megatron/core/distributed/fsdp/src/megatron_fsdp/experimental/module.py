@@ -240,6 +240,10 @@ class FsdpModule:
         on the comm stream, so ``AG_{i+1}`` is launched before ``F_i`` finishes.
         """
         self._lazy_init_context()
+        # post_forward() resets the phase after a non-recomputed forward, so a
+        # FORWARD phase here means this forward-pre hook ran while the previous
+        # forward was still in progress.
+        assert self._phase is not FsdpModule.Phase.FORWARD
         is_recomputing = self._phase is FsdpModule.Phase.BACKWARD
         if not is_recomputing:
             self._phase = FsdpModule.Phase.FORWARD
@@ -313,10 +317,6 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
-        # post_forward() resets the phase after a non-recomputed forward, so a
-        # FORWARD phase here means this backward-pre hook ran without its
-        # matching forward completing.
-        assert self._phase is not FsdpModule.Phase.FORWARD
         self._phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
