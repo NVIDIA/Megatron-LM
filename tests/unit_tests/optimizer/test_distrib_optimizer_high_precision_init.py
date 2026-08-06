@@ -22,14 +22,14 @@ def _config(precision_aware=False):
     return SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=precision_aware)
 
 
-def test_clear_high_precision_init_values_clears_all_parameters():
+def test_finalize_high_precision_init_values_clears_all_parameters():
     first = _ParameterWithHighPrecisionInit(object())
     second = _ParameterWithHighPrecisionInit(object())
     already_clear = _ParameterWithHighPrecisionInit(None)
     without_high_precision_init = object()
     model_params = [first, second, already_clear, without_high_precision_init]
 
-    cleared = DistributedOptimizer._clear_high_precision_init_values(model_params, _config())
+    cleared = DistributedOptimizer._finalize_high_precision_init_values(model_params, _config())
 
     assert cleared == 2
     assert first.value is None
@@ -39,10 +39,10 @@ def test_clear_high_precision_init_values_clears_all_parameters():
     assert already_clear.clear_count == 0
 
 
-def test_clear_high_precision_init_values_skips_precision_aware_optimizer():
+def test_finalize_high_precision_init_values_skips_precision_aware_optimizer():
     model_param = _ParameterWithHighPrecisionInit(object())
 
-    cleared = DistributedOptimizer._clear_high_precision_init_values(
+    cleared = DistributedOptimizer._finalize_high_precision_init_values(
         [model_param], _config(precision_aware=True)
     )
 

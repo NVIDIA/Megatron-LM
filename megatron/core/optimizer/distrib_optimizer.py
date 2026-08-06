@@ -353,7 +353,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return local_param_group_map, group_ranges
 
     @staticmethod
-    def _clear_high_precision_init_values(
+    def _finalize_high_precision_init_values(
         model_params: List[torch.nn.Parameter], config: OptimizerConfig
     ) -> int:
         """Clear initialization values after main-parameter initialization.
@@ -818,7 +818,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
-        self._high_precision_init_value_count = self._clear_high_precision_init_values(
+        self._high_precision_init_value_count = self._finalize_high_precision_init_values(
             original_model_params, config
         )
 
