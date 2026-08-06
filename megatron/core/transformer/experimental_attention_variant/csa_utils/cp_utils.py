@@ -359,10 +359,19 @@ def compute_cp_indexer_topk(
 ) -> Tuple[Optional[torch.Tensor], Optional[CPIndexerLayout], Optional[torch.Tensor]]:
     """Return local top-k, packed layout, and optional compact Top-K softmax.
 
-    The prebuilt_layout argument is the existing balanced indexer's
-    local-Q/full-K layout. It uses the dense scorer, with an optional tight
-    max_seqlen_kv bound. Ordinary callers retain the compact layout and
-    workspace contract.
+    ``max_seqlen_kv`` optionally overrides the score-matrix width capacity (default
+    ``max_seqlen_q // ratio``). The fused kernel materializes an fp32 ``(rows, max_seqlen_kv)``
+    score buffer, so callers whose rows can only see a bounded causal prefix (e.g. the balanced
+    CP indexer scoring one chunk at global offset ``gs``: visible width <= ``(gs + rows) //
+    ratio``) should pass the tight bound to avoid allocating and masking the full-sequence width.
+
+    ``prebuilt_layout`` optionally supplies a ``(cu_q, cu_k, q_causal_offsets)`` tuple from a
+    previous ``_build_cp_indexer_layout(cu_seqlens_q, cu_seqlens_compressed, global_start,
+    rows)`` call with identical arguments, skipping the rebuild (the layout is constant across
+    layers within a microbatch). NOTE: only the FUSED path consumes the layout for masking;
+    the unfused path recomputes its masking from ``(cu_seqlens_q, global_start)`` and returns
+    the tuple as metadata only — passing a synthetic layout that differs from that recomputation
+    together with ``use_fused=False`` silently mis-masks and is unsupported.
     """
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
