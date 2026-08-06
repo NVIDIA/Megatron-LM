@@ -52,6 +52,8 @@ class FakeCPGroup:
 
     def rank(self):
         return self._rank
+
+
 class TestApplyRotaryPosEmbTHD:
     @pytest.mark.parametrize(
         ("unsupported_kwargs", "warning_text"),
@@ -172,6 +174,8 @@ class TestApplyRotaryPosEmbTHD:
 
         torch.testing.assert_close(out, expected)
         torch.testing.assert_close(out, compatibility_out)
+
+
 class _SaveOutputForBackward(torch.autograd.Function):
     """Minimal stand-in for a kernel whose backward consumes its output."""
 
@@ -187,7 +191,9 @@ class _SaveOutputForBackward(torch.autograd.Function):
         return saved_output
 
 
-def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleaving=False):
+def _test_fused_mla_rope_inplace(
+    input_format, inverse=False, remove_interleaving=False, rope_first=False
+):
     assert fused_mla_rope_inplace is not None
     num_heads = 32
     q_dim = 128
@@ -236,11 +242,14 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleavin
         )
 
     pytorch_fwd_input.requires_grad_(True)
-    fused_fwd_input = pytorch_fwd_input.detach()
+    fused_fwd_input = pytorch_fwd_input.detach().clone()
     fused_fwd_input.requires_grad_(True)
-    fused_bwd_input = pytorch_bwd_input.detach()
+    fused_bwd_input = pytorch_bwd_input.detach().clone()
 
-    no_pe, pe = torch.split(pytorch_fwd_input, [q_dim, emb_dim], dim=-1)
+    if rope_first:
+        pe, no_pe = torch.split(pytorch_fwd_input, [emb_dim, q_dim], dim=-1)
+    else:
+        no_pe, pe = torch.split(pytorch_fwd_input, [q_dim, emb_dim], dim=-1)
     pe_output = apply_rotary_pos_emb(
         pe,
         freqs,
@@ -253,7 +262,11 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleavin
         inverse=inverse,
         mla_output_remove_interleaving=remove_interleaving,
     )
-    pytorch_output = torch.concat([no_pe, pe_output], dim=-1)
+    pytorch_output = (
+        torch.concat([pe_output, no_pe], dim=-1)
+        if rope_first
+        else torch.concat([no_pe, pe_output], dim=-1)
+    )
     pytorch_output.backward(pytorch_bwd_input, retain_graph=True)
 
     fused_output = fused_mla_rope_inplace(
@@ -265,6 +278,7 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleavin
         cu_seqlens_q=cu_seqlens,
         inverse=inverse,
         remove_interleaving=remove_interleaving,
+        rope_first=rope_first,
     )
     fused_output.backward(fused_bwd_input, retain_graph=True)
 
@@ -280,6 +294,13 @@ def _test_fused_mla_rope_inplace(input_format, inverse=False, remove_interleavin
         fused_fwd_input.grad.float(),
         msg=lambda msg: f"Mismatch in bwd: {msg}",
         **tols,
+    )
+    nope_slice = slice(emb_dim, None) if rope_first else slice(0, q_dim)
+    torch.testing.assert_close(
+        fused_output[..., nope_slice], pytorch_fwd_input.detach()[..., nope_slice], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        fused_fwd_input.grad[..., nope_slice], pytorch_bwd_input[..., nope_slice], rtol=0, atol=0
     )
 
 
@@ -522,6 +543,10 @@ class TestFusedMLARope:
         _test_fused_mla_rope_inplace(
             input_format, inverse=inverse, remove_interleaving=remove_interleaving
         )
+
+    @pytest.mark.parametrize("rope_first", [False, True], ids=["nope-first", "rope-first"])
+    def test_inplace_leading_rope_forward_backward(self, input_format, rope_first):
+        _test_fused_mla_rope_inplace(input_format, rope_first=rope_first)
 
     @pytest.mark.parametrize("remove_interleaving", [False, True])
     def test_kv_split_forward_backward(self, input_format, remove_interleaving):

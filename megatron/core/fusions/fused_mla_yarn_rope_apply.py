@@ -95,6 +95,7 @@ def _mla_rope_fwd_inplace_kernel(
     cp_size,
     INVERSE: tl.constexpr,
     REMOVE_INTERLEAVING: tl.constexpr,
+    ROPE_FIRST: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
@@ -138,7 +139,8 @@ def _mla_rope_fwd_inplace_kernel(
 
     Q = Q + pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads
 
-    x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + nope_dim
+    rope_offset = 0 if ROPE_FIRST else nope_dim
+    x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + rope_offset
     mask = x_off < head_num * stride_x_nheads
     # x1 = t[..., 0::2], x2 = t[..., 1::2]
     x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
@@ -193,6 +195,7 @@ def _mla_rope_bwd_inplace_kernel(
     cp_size,
     INVERSE: tl.constexpr,
     REMOVE_INTERLEAVING: tl.constexpr,
+    ROPE_FIRST: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
@@ -234,7 +237,8 @@ def _mla_rope_bwd_inplace_kernel(
 
     DO = DO + pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads
 
-    x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + nope_dim
+    rope_offset = 0 if ROPE_FIRST else nope_dim
+    x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + rope_offset
     mask = x_off < head_num * stride_x_nheads
     if REMOVE_INTERLEAVING:
         x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
@@ -258,8 +262,7 @@ def _mla_rope_bwd_inplace_kernel(
 
 class _FusedMLARoPEInplace(torch.autograd.Function):
     """
-    Autograd function for applying RoPE inplace to the trailing emb_dim
-    elements of a multi-head tensor (leaving the first nope_dim elements unchanged).
+    Autograd function for applying RoPE inplace to either end of a multi-head tensor.
     """
 
     @staticmethod
@@ -277,6 +280,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         inverse=False,
         remove_interleaving=False,
         position_ids=None,
+        rope_first=False,
     ):
         """
         Forward function for _FusedMLARoPEInplace.
@@ -288,6 +292,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             cu_seqlens_q: [seq_num + 1] accumulated sequence lengths for thd format
             rotary_interleaved: whether to apply RoPE interleaved, only supports False for now
             inverse: if True, negate sin inside the kernel to apply the inverse rotation
+            rope_first: if True, rotate the leading emb_dim elements instead of the trailing ones
         """
         assert not rotary_interleaved
         max_seqlen = None
@@ -331,6 +336,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             cp_size,
             INVERSE=inverse,
             REMOVE_INTERLEAVING=remove_interleaving,
+            ROPE_FIRST=rope_first,
         )
         ctx.save_for_backward(cos, sin, *(() if position_ids is None else (position_ids,)))
         ctx.has_position_ids = position_ids is not None
@@ -340,6 +346,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
         ctx.rotary_interleaved = rotary_interleaved
         ctx.inverse = inverse
         ctx.remove_interleaving = remove_interleaving
+        ctx.rope_first = rope_first
         ctx.cp_rank = cp_rank
         ctx.cp_size = cp_size
         if cu_seqlens_q is None:
@@ -394,10 +401,11 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             ctx.cp_size,
             INVERSE=ctx.inverse,
             REMOVE_INTERLEAVING=ctx.remove_interleaving,
+            ROPE_FIRST=ctx.rope_first,
         )
         if ctx.cu_seqlens_q is None:
             grad = grad.view(max_seqlen, batch_size, nheads, headdim)
-        return grad, None, None, None, None, None, None, None, None, None, None, None
+        return grad, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def fused_mla_rope_inplace(
@@ -413,10 +421,11 @@ def fused_mla_rope_inplace(
     inverse: bool = False,
     remove_interleaving: bool = False,
     position_ids: Optional[torch.Tensor] = None,
+    rope_first: bool = False,
 ) -> torch.Tensor:
     """
-    Fused RoPE applied inplace to the trailing emb_dim elements of a tensor,
-    leaving the first nope_dim elements unchanged.
+    Fused RoPE applied inplace to emb_dim elements at either end of a tensor,
+    leaving the nope_dim elements unchanged.
     It supports both sbhd and thd input formats.
 
     When ``inverse=True`` the rotation is reversed, which is useful for
@@ -436,6 +445,7 @@ def fused_mla_rope_inplace(
         remove_interleaving: if True, output RoPE dims in non-interleaved layout
         position_ids: optional THD row positions. When supplied, these positions
             replace the built-in CP row-to-position mapping.
+        rope_first: if True, rotate the leading emb_dim elements instead of the trailing ones.
 
     Returns:
         t: inplace modified input tensor
@@ -453,6 +463,7 @@ def fused_mla_rope_inplace(
         inverse,
         remove_interleaving,
         position_ids,
+        rope_first,
     )
 
 
