@@ -147,7 +147,14 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         finalize_packed_seq_params(batch[5])
         if getattr(args, "dsa_cp_balance_indexer", False):
             prebuild_balanced_layouts(
-                batch[5], pad_alignment=getattr(args, "pad_packed_seq_alignment", None)
+                batch[5],
+                pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
+                min_seqlen=getattr(args, "dsa_cp_balance_min_seqlen", 0),
+                graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
+                build_routes=(
+                    getattr(args, "dsa_cp_balance_dispatch", "alltoall") != "hybridep"
+                    or getattr(args, "cuda_graph_impl", "none") != "none"
+                ),
             )
         return batch
 
@@ -193,18 +200,24 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         )
         finalize_packed_seq_params(packed_seq_params)
         if getattr(args, "dsa_cp_balance_indexer", False):
+            # Middle-stage PackedSeqParams carry the raw cu; the hidden states are
+            # padded, so probe/build at the physical capacity. NOTE: with the flag
+            # on, config validation forces the sequence-packing scheduler (which
+            # broadcasts the padded cu to every stage), so in-tree this branch only
+            # runs at CP<=1 where prebuild no-ops; the capacity machinery serves
+            # non-scheduler frontends and is pinned by unit tests.
             prebuild_balanced_layouts(
-                packed_seq_params, pad_alignment=getattr(args, "pad_packed_seq_alignment", None)
+                packed_seq_params,
+                pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
+                capacity=args.seq_length,
+                min_seqlen=getattr(args, "dsa_cp_balance_min_seqlen", 0),
+                graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
+                build_routes=(
+                    getattr(args, "dsa_cp_balance_dispatch", "alltoall") != "hybridep"
+                    or getattr(args, "cuda_graph_impl", "none") != "none"
+                ),
             )
-        return (
-            None,
-            None,
-            None,
-            None,
-            None,
-            packed_seq_params,
-            None,
-        )
+        return (None, None, None, None, None, packed_seq_params, None)
 
     thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
     if cu_seqlens is None:
@@ -258,7 +271,14 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     finalize_packed_seq_params(packed_seq_params)
     if getattr(args, "dsa_cp_balance_indexer", False):
         prebuild_balanced_layouts(
-            packed_seq_params, pad_alignment=getattr(args, "pad_packed_seq_alignment", None)
+            packed_seq_params,
+            pad_alignment=getattr(args, "pad_packed_seq_alignment", None),
+            min_seqlen=getattr(args, "dsa_cp_balance_min_seqlen", 0),
+            graphs_enabled=getattr(args, "cuda_graph_impl", "none") != "none",
+            build_routes=(
+                getattr(args, "dsa_cp_balance_dispatch", "alltoall") != "hybridep"
+                or getattr(args, "cuda_graph_impl", "none") != "none"
+            ),
         )
 
     # Unpack explicitly to avoid relying on dict insertion order.

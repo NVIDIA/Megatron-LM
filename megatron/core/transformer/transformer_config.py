@@ -393,14 +393,37 @@ class TransformerConfig(ModelParallelConfig):
     dsa_cp_balance_indexer: bool = False
     """Enable the load-balanced context-parallel DSA indexer path. The contiguous CP split makes the
     causal indexer's per-query cost grow with rank, so later CP ranks become stragglers. When True,
-    the indexer instead processes a head chunk and a tail chunk per rank (two launches of the
+    each rank instead scores a balanced low-position + high-position chunk pair (two launches of the
     existing indexer kernel) so every rank does ~constant work, then combines the top-k back to
-    contiguous order. When False, the indexer uses the contiguous CP split."""
+    contiguous order. Packs whose padded sequence lengths are all multiples of ``2 * cp_size`` take
+    the per-sequence zigzag with prebuilt A2A routes (``prebuild_balanced_layouts``) when
+    ``pad_packed_seq_alignment`` is an integer divisible by ``2 * cp_size`` (``None``/``"max"``
+    disqualify), the fused indexer kernel backend is active, and ``dsa_cp_balance_dispatch`` is
+    'alltoall'; any other pack
+    (or the unfused backend, or 'hybridep' dispatch) takes the fully general chunk-pair folding
+    fallback. The alignment condition is a prefilter: per-microbatch pack divisibility decides.
+    Under FP8 recipes, eval/no-grad forwards skip the indexer's loss-path projection, so its amax
+    history sees fewer recordings than the reference during eval (training forwards identical).
+    CUDA-graph support in this PR is scoped to STATIC pack compositions with
+    pipeline_model_parallel_size == 1 (enforced: PP/VPP with graphs is rejected at config
+    validation, and — for frontends that call ``prebuild_balanced_layouts`` every microbatch, as
+    ``pretrain_gpt.get_batch`` does — a cu_seqlens change between microbatches raises at
+    data-prep time);
+    varying-composition (varlen) and PP/VPP support with graphs land in a follow-up PR. When
+    False, the indexer uses the contiguous CP split."""
 
     dsa_cp_balance_min_seqlen: int = 0
-    """Minimum ``max_seqlen_q`` required to use the balanced CP indexer. Below this length the
-    indexer falls back to the contiguous CP split, since the redistribute overhead outweighs the
-    savings for short sequences. 0 means no lower bound (always balance when enabled)."""
+    """Minimum ``max_seqlen_q`` required to use the balanced CP indexer. In packed THD batches this
+    is the PER-SEQUENCE maximum, not the pack length — deliberately: the causal imbalance is driven
+    by sequences long enough to span multiple CP ranks, so packs of only-short sequences are already
+    balanced and the redistribute overhead outweighs the savings. Below this length the indexer
+    keeps the contiguous CP split. 0 means no lower bound (always balance when enabled). Under
+    CUDA graphs this gate is a host-side branch frozen at capture time (both branches are exact;
+    only the balancing benefit follows the captured decision). Caution: under the fused indexer
+    backend a nonzero gate alternates balanced (half-row) and reference (full-row) kernel calls
+    within one process, exercising a known cross-call issue in the kernel package (see the
+    WORKSPACE NOTE in tests/unit_tests/transformer/test_cp_balanced_indexer_layout.py); pending
+    the kernel-side fix, validate such mixed runs against the reference."""
 
     dsa_cp_balance_dispatch: Literal['alltoall', 'hybridep'] = 'alltoall'
     """Dispatch backend for the balanced CP indexer. 'alltoall' moves only the two chunks each rank
@@ -1742,6 +1765,42 @@ class TransformerConfig(ModelParallelConfig):
                         "cp_partition_mode='contiguous'."
                     )
 
+        if (
+            self.dsa_cp_balance_indexer
+            # The deprecated enable_cuda_graph/external_cuda_graph switches are
+            # folded into cuda_graph_impl LATER in __post_init__; a directly
+            # constructed config would bypass this gate if we tested only the
+            # normalized field (cf. the same three-way check further below).
+            and (
+                self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
+            )
+            and (
+                self.pipeline_model_parallel_size > 1
+                or (self.virtual_pipeline_model_parallel_size or 1) > 1
+            )
+        ):
+            # Under pipeline parallelism a process can host PackedSeqParams built
+            # from different cu views (padded first/last stage vs raw middle
+            # stage); the prebuilt-plan capture machinery does not disambiguate
+            # them yet. Support lands in a follow-up PR.
+            raise ValueError(
+                "dsa_cp_balance_indexer with CUDA graphs currently supports "
+                "pipeline_model_parallel_size == 1 only; PP/VPP support with "
+                "graphs lands in a follow-up PR. Disable the flag, CUDA graphs, "
+                "or pipeline parallelism."
+            )
+
+        if self.dsa_cp_balance_indexer and self.experimental_attention_variant != "dsv4_hybrid":
+            # The flag is consumed only by the CSA indexer; on any other model the
+            # data-step prebuild would burn per-microbatch host syncs for nothing.
+            raise ValueError(
+                "dsa_cp_balance_indexer requires " "experimental_attention_variant='dsv4_hybrid'."
+            )
+
+        if (self.dsa_cp_balance_min_seqlen or 0) < 0:
+            raise ValueError(
+                f"dsa_cp_balance_min_seqlen must be >= 0, got {self.dsa_cp_balance_min_seqlen!r}."
+            )
         if self.dsa_cp_balance_dispatch not in ('alltoall', 'hybridep'):
             # Literal annotations are not enforced for direct/YAML construction; a
             # typo would otherwise silently select the alltoall backend.

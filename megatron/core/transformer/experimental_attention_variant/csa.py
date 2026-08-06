@@ -2742,22 +2742,42 @@ class CompressedSparseAttention(MegatronModule):
                 bal_dispatch_handle = None
                 bal_multi_seq = False
                 if use_balance:
-                    # Real (non-empty) segment count for this microbatch: one D2H sync,
-                    # cached on PackedSeqParams and reused by every layer.
+                    # Real (non-empty) segment count for this microbatch: two host
+                    # syncs, cached on PackedSeqParams and reused by every layer. The cached
+                    # verdict is capacity-tagged (l_local, verdict): prebuild may have
+                    # probed a padded cu ending short of the physical pack, in which
+                    # case its verdict does not apply here and we re-probe.
                     bal_multi_seq = getattr(packed_seq_params, "_dsa_cp_multi_seq", None)
+                    if bal_multi_seq is not None:
+                        bal_multi_seq = bal_multi_seq[1] if bal_multi_seq[0] == l_local else None
                     if bal_multi_seq is not None and not torch.cuda.is_current_stream_capturing():
                         # Prebuild owns the probe on the normal path; mirror its verdict
                         # onto the module so the capture-time fallback below (which
                         # cannot see the TE-stripped PackedSeqParams attribute) replays
                         # the correct decision instead of defaulting to False.
-                        self._dsa_cp_multi_seq_eager = bal_multi_seq
+                        self._dsa_cp_multi_seq_eager = (l_local, bal_multi_seq)
                     if bal_multi_seq is None:
                         if torch.cuda.is_current_stream_capturing():
-                            # D2H is illegal during graph capture. CUDA graphs require
-                            # static shapes, so the verdict cannot change between the
-                            # eager warmup iterations and the captured ones: reuse the
-                            # last eager decision (kept on the module).
-                            bal_multi_seq = getattr(self, "_dsa_cp_multi_seq_eager", False)
+                            # D2H is illegal during graph capture. Contract: the
+                            # captured pack IS the eagerly warmed-up pack (TE captures
+                            # on the warmup batch's sample kwargs), so the last eager
+                            # decision (kept on the module) applies; a later verdict
+                            # flip is rejected by prebuild_balanced_layouts. Guessing
+                            # here would bake wrong causal visibility into the graph.
+                            if not hasattr(self, "_dsa_cp_multi_seq_eager"):
+                                raise RuntimeError(
+                                    "balanced CP indexer: no eager warmup preceded "
+                                    "this graph capture; the single/multi-sequence "
+                                    "verdict is unknown. Run an eager warmup first."
+                                )
+                            mirror = self._dsa_cp_multi_seq_eager
+                            if mirror[0] != l_local:
+                                raise RuntimeError(
+                                    "balanced CP indexer: the eagerly warmed-up pack "
+                                    f"had capacity {mirror[0]}, this capture sees "
+                                    f"{l_local}; static composition is required."
+                                )
+                            bal_multi_seq = mirror[1]
                         else:
                             seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
                             nseg_real = int((seg_lens > 0).sum().item())
@@ -2768,8 +2788,8 @@ class CompressedSparseAttention(MegatronModule):
                             # unbalanced under folding (tail chunks land in the dead zone)
                             # and belongs to the zigzag path.
                             bal_multi_seq = not (nseg_real == 1 and total_real == cp_size * l_local)
-                            self._dsa_cp_multi_seq_eager = bal_multi_seq
-                        packed_seq_params._dsa_cp_multi_seq = bal_multi_seq
+                            self._dsa_cp_multi_seq_eager = (l_local, bal_multi_seq)
+                        packed_seq_params._dsa_cp_multi_seq = (l_local, bal_multi_seq)
                 if use_balance:
                     from megatron.core.transformer.experimental_attention_variant import (
                         cp_balanced_indexer,
@@ -2781,6 +2801,11 @@ class CompressedSparseAttention(MegatronModule):
                     if bal_dispatch_mode == "hybridep" and self.config.cuda_graph_impl != "none":
                         bal_dispatch_mode = "alltoall"
                     if bal_dispatch_mode != "hybridep":
+                        # Create the per-microbatch cache BEFORE the first dispatch so
+                        # the eager pack probe of layer 1 lands in it (frontends that
+                        # never prebuild would otherwise pay a second D2H on layer 2).
+                        if getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None) is None:
+                            packed_seq_params._dsa_cp_balance_layout_cache = {}
                         # Issue the chunk dispatch now (async) so the transfer overlaps with the
                         # in-flight compressed-K/KV all-gathers instead of sitting on the
                         # critical path right before the top-k.
@@ -2792,10 +2817,10 @@ class CompressedSparseAttention(MegatronModule):
                             l_local,
                             config=self.config,
                             use_fused=self.use_fused_kernels,
-                            multi_seq=bal_multi_seq,
                             layout_cache=getattr(
                                 packed_seq_params, "_dsa_cp_balance_layout_cache", None
                             ),
+                            cu_seqlens=cu_seqlens,
                         )
 
                 nvtx_range_push("dsv4_cp_indexer_k_all_gather_wait")
@@ -2809,7 +2834,7 @@ class CompressedSparseAttention(MegatronModule):
                     k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
                 # Each top-k entry is still a logical compressed id within that
-                # query's sequence here.
+                # query's sequence (on both the balanced and the reference path).
                 if use_balance:
                     # Load-balanced CP indexer: process a head chunk + tail chunk per rank so each
                     # rank does ~constant work, then combine the top-k back to contiguous order (a

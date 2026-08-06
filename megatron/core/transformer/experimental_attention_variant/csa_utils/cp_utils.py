@@ -327,7 +327,10 @@ def compute_cp_indexer_topk(
     ``prebuilt_layout`` optionally supplies a ``(cu_q, cu_k, q_causal_offsets)`` tuple from a
     previous ``_build_cp_indexer_layout(cu_seqlens_q, cu_seqlens_compressed, global_start,
     rows)`` call with identical arguments, skipping the rebuild (the layout is constant across
-    layers within a microbatch).
+    layers within a microbatch). NOTE: only the FUSED path consumes the layout for masking;
+    the unfused path recomputes its masking from ``(cu_seqlens_q, global_start)`` and returns
+    the tuple as metadata only — passing a synthetic layout that differs from that recomputation
+    together with ``use_fused=False`` silently mis-masks and is unsupported.
     """
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
