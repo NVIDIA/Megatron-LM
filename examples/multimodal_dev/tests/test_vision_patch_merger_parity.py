@@ -26,6 +26,10 @@ implementation must agree:
 
 Run with::
 
+    # As a pytest module (this is what CI runs; world-size agnostic):
+    torchrun --nproc_per_node=1 -m pytest -q \\
+        examples/multimodal_dev/tests/test_vision_patch_merger_parity.py
+
     torchrun --nproc_per_node=1 \\
         examples/multimodal_dev/tests/test_vision_patch_merger_parity.py
 """
@@ -33,8 +37,8 @@ Run with::
 import os
 import sys
 
+import pytest
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 
 _REPO_ROOT = os.path.abspath(
@@ -44,12 +48,10 @@ if _REPO_ROOT in sys.path:
     sys.path.remove(_REPO_ROOT)
 sys.path.insert(0, _REPO_ROOT)
 
-from megatron.core import parallel_state as ps
+from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLPatchMerger
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-
-from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLPatchMerger
-
+from tests.unit_tests.test_utilities import Utils
 
 # Match Qwen3.5-VL 9B / 397B-A17B vision tower dims.
 HIDDEN_SIZE = 1152
@@ -83,18 +85,19 @@ class HFPatchMergerReference(nn.Module):
         return x
 
 
-def _init_distributed() -> int:
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+def _init_megatron_parallel() -> int:
+    """Init distributed + TP=1 model-parallel state; return this rank's local rank.
+
+    Goes through ``Utils`` (rather than ``parallel_state`` directly) so that
+    ``Utils.inited`` stays in sync with the real state — the other modules in
+    this suite tear down with ``Utils.destroy_model_parallel()``, which is a
+    no-op when that flag is stale.
+    """
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    model_parallel_cuda_manual_seed(42)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     return local_rank
-
-
-def _init_megatron_parallel() -> None:
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(tensor_model_parallel_size=1)
-    model_parallel_cuda_manual_seed(42)
 
 
 def _build_config(dtype: torch.dtype) -> TransformerConfig:
@@ -168,9 +171,31 @@ def _run_one(dtype: torch.dtype, atol: float, rtol: float, device: torch.device,
     torch.testing.assert_close(y_mcore, y_hf, atol=atol, rtol=rtol)
 
 
+# ===================================================================
+# pytest entry points
+# ===================================================================
+
+
+@pytest.fixture(scope="module")
+def merger_device():
+    """Init distributed + TP=1 model-parallel state; yield this rank's device."""
+    local_rank = _init_megatron_parallel()
+    yield torch.device(f"cuda:{local_rank}")
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "dtype,atol,rtol",
+    [(torch.float32, ATOL_FP32, RTOL_FP32), (torch.bfloat16, ATOL_BF16, RTOL_BF16)],
+    ids=["fp32", "bf16"],
+)
+def test_patch_merger_matches_hf_reference(merger_device, dtype, atol, rtol):
+    """Qwen35VLPatchMerger logits match the inline HF reference."""
+    _run_one(dtype, atol, rtol, merger_device)
+
+
 def main() -> None:
-    local_rank = _init_distributed()
-    _init_megatron_parallel()
+    local_rank = _init_megatron_parallel()
     device = torch.device(f"cuda:{local_rank}")
 
     _run_one(torch.float32, ATOL_FP32, RTOL_FP32, device)

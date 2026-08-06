@@ -22,6 +22,11 @@ asserting that loss and grad_norm match within tolerance.
 
 Run with::
 
+    # As a pytest module (this is what CI runs; skipped when the world
+    # size is not a multiple of the CP size under test):
+    PYTHONPATH=. torchrun --nproc-per-node 8 -m pytest -q \\
+        examples/multimodal_dev/tests/test_cp_thd_correctness.py
+
     PYTHONPATH=. torchrun --nproc-per-node 4 \\
         examples/multimodal_dev/tests/test_cp_thd_correctness.py
 """
@@ -30,6 +35,7 @@ import argparse
 import os
 import sys
 
+import pytest
 import torch
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
@@ -48,6 +54,25 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+# Proxy-model / data sizes and tolerances. Shared by the pytest test below
+# and by the CLI defaults in ``main`` so the two entry points cannot drift.
+# ``seq_len`` must be divisible by 2*cp_size for zigzag CP splitting.
+DEFAULTS = dict(
+    cp_size=4,
+    batch_size=2,
+    seq_len=64,
+    vocab_size=1024,
+    hidden_size=256,
+    num_layers=2,
+    num_heads=4,
+    num_kv_heads=2,
+    ffn_hidden_size=512,
+    seed=42,
+    data_seed=123,
+    atol_loss=1e-3,
+    rtol_grad=5e-3,
+)
 
 # ===================================================================
 # Stub vision encoder
@@ -320,133 +345,135 @@ def _print_compare(label, baseline, trial, atol, rtol):
     return ok
 
 
+def run_cp_comparison(**overrides):
+    """Run the CP=1 baseline and the CP=``cp_size`` trial on identical weights.
+
+    Any key of :data:`DEFAULTS` may be overridden, including ``cp_size``.
+    Returns ``{"BSHD loss": (cp1, cpN), "BSHD grad_norm": (...), ...}``.
+    Leaves the model-parallel groups destroyed.
+    """
+    cfg = {**DEFAULTS, **overrides}
+    cp_size = cfg["cp_size"]
+    image_token_id = 0  # never appears in input (data filters this id out)
+
+    def _phase(context_parallel_size, snapshot):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, context_parallel_size=context_parallel_size
+        )
+        model_parallel_cuda_manual_seed(cfg["seed"])
+        config = _make_config(
+            cfg["num_layers"],
+            cfg["hidden_size"],
+            cfg["ffn_hidden_size"],
+            cfg["num_heads"],
+            cfg["num_kv_heads"],
+            context_parallel_size=context_parallel_size,
+        )
+        torch.manual_seed(cfg["seed"])
+        model = _build_model(config, cfg["vocab_size"], cfg["seq_len"], image_token_id)
+        if snapshot is not None:
+            _restore_state_dict(model, snapshot)
+
+        run_args = (
+            model,
+            cfg["batch_size"],
+            cfg["seq_len"],
+            cfg["vocab_size"],
+            image_token_id,
+        )
+        bshd = _run_bshd(*run_args, cp_size=context_parallel_size, seed=cfg["data_seed"])
+        thd = _run_thd(*run_args, cp_size=context_parallel_size, seed=cfg["data_seed"])
+
+        # Snapshot weights *before* the optimizer would have touched them.
+        # (We've zeroed grads but never stepped; weights at this point are
+        # the just-initialised baseline.)
+        out_snapshot = _cpu_state_dict(model) if snapshot is None else None
+        del model
+        torch.cuda.empty_cache()
+        return bshd, thd, out_snapshot
+
+    _print_banner("Phase 1 — building CP=1 baseline (TP=1, CP=1)")
+    (bshd_cp1, thd_cp1, weights_snapshot) = _phase(1, None)
+
+    _print_banner(f"Phase 2 — re-initialising for CP={cp_size} (TP=1, CP={cp_size})")
+    Utils.destroy_model_parallel()
+    (bshd_cpN, thd_cpN, _) = _phase(cp_size, weights_snapshot)
+
+    Utils.destroy_model_parallel()
+    return {
+        "BSHD loss": (bshd_cp1[0], bshd_cpN[0]),
+        "BSHD grad_norm": (bshd_cp1[1], bshd_cpN[1]),
+        "THD  loss": (thd_cp1[0], thd_cpN[0]),
+        "THD  grad_norm": (thd_cp1[1], thd_cpN[1]),
+    }
+
+
+# ===================================================================
+# pytest entry point
+# ===================================================================
+
+
+def test_cp_matches_cp1_for_bshd_and_thd():
+    """CP=4 must reproduce the CP=1 loss and grad norm in both packings."""
+    Utils.initialize_distributed()
+    cp_size = DEFAULTS["cp_size"]
+    world_size = torch.distributed.get_world_size()
+    if world_size % cp_size != 0:
+        pytest.skip(f"world_size={world_size} is not divisible by cp_size={cp_size}")
+
+    results = run_cp_comparison()
+
+    atol, rtol = DEFAULTS["atol_loss"], DEFAULTS["rtol_grad"]
+    for label, (baseline, trial) in results.items():
+        abs_diff = abs(baseline - trial)
+        rel_diff = abs_diff / max(abs(baseline), 1e-8)
+        assert abs_diff < atol or rel_diff < rtol, (
+            f"{label}: CP=1 {baseline:.8f} vs CP={cp_size} {trial:.8f} "
+            f"(abs={abs_diff:.2e}, rel={rel_diff:.2e}, atol={atol}, rtol={rtol})"
+        )
+
+
 def main():
     """Run CP=1 baseline + CP=4 trial and compare losses / grad_norms."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=DEFAULTS["batch_size"])
     # Must be divisible by 2*cp_size (=8 for CP=4 zigzag).
-    parser.add_argument("--seq-len", type=int, default=64)
-    parser.add_argument("--vocab-size", type=int, default=1024)
-    parser.add_argument("--hidden-size", type=int, default=256)
-    parser.add_argument("--num-layers", type=int, default=2)
-    parser.add_argument("--num-heads", type=int, default=4)
-    parser.add_argument("--num-kv-heads", type=int, default=2)
-    parser.add_argument("--ffn-hidden-size", type=int, default=512)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--atol-loss", type=float, default=1e-3)
-    parser.add_argument("--rtol-grad", type=float, default=5e-3)
-    parser.add_argument("--data-seed", type=int, default=123)
+    parser.add_argument("--seq-len", type=int, default=DEFAULTS["seq_len"])
+    parser.add_argument("--vocab-size", type=int, default=DEFAULTS["vocab_size"])
+    parser.add_argument("--hidden-size", type=int, default=DEFAULTS["hidden_size"])
+    parser.add_argument("--num-layers", type=int, default=DEFAULTS["num_layers"])
+    parser.add_argument("--num-heads", type=int, default=DEFAULTS["num_heads"])
+    parser.add_argument("--num-kv-heads", type=int, default=DEFAULTS["num_kv_heads"])
+    parser.add_argument("--ffn-hidden-size", type=int, default=DEFAULTS["ffn_hidden_size"])
+    parser.add_argument("--seed", type=int, default=DEFAULTS["seed"])
+    parser.add_argument("--atol-loss", type=float, default=DEFAULTS["atol_loss"])
+    parser.add_argument("--rtol-grad", type=float, default=DEFAULTS["rtol_grad"])
+    parser.add_argument("--data-seed", type=int, default=DEFAULTS["data_seed"])
     args = parser.parse_args()
 
-    image_token_id = 0  # never appears in input (data filters this id out)
-
-    # ----------------------------------------------------------------
-    # Phase 1: CP=1 baseline
-    # ----------------------------------------------------------------
-    _print_banner("Phase 1 — building CP=1 baseline (TP=1, CP=1, DP=4)")
-    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
-    model_parallel_cuda_manual_seed(args.seed)
-
-    config_cp1 = _make_config(
-        args.num_layers,
-        args.hidden_size,
-        args.ffn_hidden_size,
-        args.num_heads,
-        args.num_kv_heads,
-        context_parallel_size=1,
-    )
-    torch.manual_seed(args.seed)
-    model_cp1 = _build_model(config_cp1, args.vocab_size, args.seq_len, image_token_id)
-
-    bshd_loss_cp1, bshd_gn_cp1 = _run_bshd(
-        model_cp1,
-        args.batch_size,
-        args.seq_len,
-        args.vocab_size,
-        image_token_id,
-        cp_size=1,
-        seed=args.data_seed,
-    )
-    thd_loss_cp1, thd_gn_cp1 = _run_thd(
-        model_cp1,
-        args.batch_size,
-        args.seq_len,
-        args.vocab_size,
-        image_token_id,
-        cp_size=1,
-        seed=args.data_seed,
+    results = run_cp_comparison(
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        vocab_size=args.vocab_size,
+        hidden_size=args.hidden_size,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        ffn_hidden_size=args.ffn_hidden_size,
+        seed=args.seed,
+        data_seed=args.data_seed,
     )
 
-    # Snapshot weights *before* the optimizer would have touched them.
-    # (We've zeroed grads but never stepped; weights at this point are
-    # the just-initialised baseline.)
-    weights_snapshot = _cpu_state_dict(model_cp1)
-    del model_cp1
-    torch.cuda.empty_cache()
-
-    # ----------------------------------------------------------------
-    # Phase 2: CP=4
-    # ----------------------------------------------------------------
-    _print_banner("Phase 2 — re-initialising for CP=4 (TP=1, CP=4)")
-    Utils.destroy_model_parallel()
-    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=4)
-    model_parallel_cuda_manual_seed(args.seed)
-
-    config_cp4 = _make_config(
-        args.num_layers,
-        args.hidden_size,
-        args.ffn_hidden_size,
-        args.num_heads,
-        args.num_kv_heads,
-        context_parallel_size=4,
-    )
-    torch.manual_seed(args.seed)
-    model_cp4 = _build_model(config_cp4, args.vocab_size, args.seq_len, image_token_id)
-    _restore_state_dict(model_cp4, weights_snapshot)
-
-    bshd_loss_cp4, bshd_gn_cp4 = _run_bshd(
-        model_cp4,
-        args.batch_size,
-        args.seq_len,
-        args.vocab_size,
-        image_token_id,
-        cp_size=4,
-        seed=args.data_seed,
-    )
-    thd_loss_cp4, thd_gn_cp4 = _run_thd(
-        model_cp4,
-        args.batch_size,
-        args.seq_len,
-        args.vocab_size,
-        image_token_id,
-        cp_size=4,
-        seed=args.data_seed,
-    )
-
-    # ----------------------------------------------------------------
-    # Compare
-    # ----------------------------------------------------------------
-    _print_banner("Results — CP=1 vs CP=4")
+    _print_banner(f"Results — CP=1 vs CP={DEFAULTS['cp_size']}")
     all_ok = True
-    all_ok &= _print_compare(
-        "BSHD loss", bshd_loss_cp1, bshd_loss_cp4, args.atol_loss, args.rtol_grad
-    )
-    all_ok &= _print_compare(
-        "BSHD grad_norm", bshd_gn_cp1, bshd_gn_cp4, args.atol_loss, args.rtol_grad
-    )
-    all_ok &= _print_compare(
-        "THD  loss", thd_loss_cp1, thd_loss_cp4, args.atol_loss, args.rtol_grad
-    )
-    all_ok &= _print_compare(
-        "THD  grad_norm", thd_gn_cp1, thd_gn_cp4, args.atol_loss, args.rtol_grad
-    )
+    for label, (baseline, trial) in results.items():
+        all_ok &= _print_compare(label, baseline, trial, args.atol_loss, args.rtol_grad)
 
     _print_banner("Summary")
     if _is_rank0():
         print(f"  {'ALL TESTS PASSED' if all_ok else 'SOME TESTS FAILED'}")
         print(f"{'=' * 60}\n")
 
-    Utils.destroy_model_parallel()
     if not all_ok:
         sys.exit(1)
 

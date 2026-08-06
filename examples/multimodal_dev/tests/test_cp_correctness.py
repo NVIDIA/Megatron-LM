@@ -8,6 +8,11 @@ deterministic data and comparing the per-rank reduced losses.
 
 Launch with torchrun (N must be >= 2*max_cp_size for zigzag splitting):
 
+    # As a pytest module (this is what CI runs; CP sizes that do not
+    # divide the world size are skipped):
+    torchrun --nproc_per_node=8 -m pytest -q \\
+        examples/multimodal_dev/tests/test_cp_correctness.py
+
     # Test CP=2 on 2 GPUs:
     torchrun --nproc_per_node=2 examples/multimodal_dev/tests/test_cp_correctness.py --cp-size 2
 
@@ -29,6 +34,7 @@ import argparse
 import os
 import sys
 
+import pytest
 import torch
 import torch.distributed as dist
 
@@ -36,6 +42,16 @@ import torch.distributed as dist
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+
+from tests.unit_tests.test_utilities import Utils  # noqa: E402
+
+# Proxy-model / data sizes and tolerances. Shared by the pytest tests below
+# and by the CLI defaults in ``main`` so the two entry points cannot drift.
+DEFAULTS = dict(seq_len=128, seed=42, vocab_size=1024, atol=1e-4, rtol=5e-2)
+
+# CP sizes the pytest entry point compares against the CP=1 baseline. Sizes
+# that do not divide the world size are skipped at runtime.
+CP_SIZES = [2, 4]
 
 
 def _parse_args():
@@ -45,19 +61,19 @@ def _parse_args():
         help="Target context-parallel size to compare against CP=1 baseline",
     )
     parser.add_argument(
-        "--seq-len", type=int, default=128,
+        "--seq-len", type=int, default=DEFAULTS["seq_len"],
         help="Sequence length (must be divisible by 2*max(cp_size, tp_size*cp_size))",
     )
     parser.add_argument(
-        "--atol", type=float, default=1e-4,
+        "--atol", type=float, default=DEFAULTS["atol"],
         help="Absolute tolerance for loss comparison",
     )
     parser.add_argument(
-        "--rtol", type=float, default=5e-2,
+        "--rtol", type=float, default=DEFAULTS["rtol"],
         help="Relative tolerance for loss comparison (default 5%%)",
     )
     parser.add_argument(
-        "--seed", type=int, default=42,
+        "--seed", type=int, default=DEFAULTS["seed"],
         help="Random seed for reproducibility",
     )
     # Megatron adds extra args; ignore them.
@@ -66,20 +82,24 @@ def _parse_args():
 
 
 def _init_distributed():
-    """Initialise torch.distributed if not already done."""
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+    """Initialise torch.distributed if not already done; return the local rank.
+
+    Goes through ``Utils`` (rather than ``torch.distributed`` directly) so
+    that ``Utils.inited`` stays in sync with the real state — the other
+    modules in this suite tear down with ``Utils.destroy_model_parallel()``,
+    which is a no-op when that flag is stale.
+    """
+    Utils.initialize_distributed()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     return local_rank
 
 
-def _init_megatron_parallel(tp_size=1, pp_size=1, cp_size=1, seed=42):
+def _init_megatron_parallel(tp_size=1, pp_size=1, cp_size=1, seed=DEFAULTS["seed"]):
     """(Re-)initialise Megatron model-parallel groups and RNG tracker."""
-    from megatron.core import parallel_state as ps
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-    ps.destroy_model_parallel()
-    ps.initialize_model_parallel(
+
+    Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
         context_parallel_size=cp_size,
@@ -199,89 +219,140 @@ def _forward_with_cp(model, batch, cp_size):
     return avg_loss.item()
 
 
-def main():
-    args = _parse_args()
+def cp_skip_reason(cp_size):
+    """Why this world size cannot run the given CP size, or ``None``."""
+    world_size = dist.get_world_size()
+    if world_size < cp_size:
+        return f"world_size={world_size} < cp_size={cp_size}; need at least {cp_size} GPUs"
+    if world_size % cp_size != 0:
+        return f"world_size={world_size} is not divisible by cp_size={cp_size}"
+    return None
+
+
+def aligned_seq_len(seq_len, cp_sizes):
+    """Round ``seq_len`` up to a multiple of ``2*cp`` for every CP size given.
+
+    Zigzag CP splitting needs the sequence to divide into ``2*cp_size``
+    chunks, so a baseline that is to be reused across several CP sizes must
+    satisfy all of them at once.
+    """
+    align = 2 * max(cp_sizes)
+    return ((seq_len + align - 1) // align) * align
+
+
+# Sequence length shared by the baseline and every trial in the pytest run.
+TEST_SEQ_LEN = aligned_seq_len(DEFAULTS["seq_len"], CP_SIZES)
+
+
+def run_cp(
+    cp_size,
+    seq_len,
+    seed=DEFAULTS["seed"],
+    vocab_size=DEFAULTS["vocab_size"],
+    state_dict=None,
+):
+    """Run the comparison at the given CP size.
+
+    Owns the whole leg: initialises the model-parallel groups, builds the
+    model and the batch, runs the forward pass and tears the groups back
+    down. CP=1 is not a special case — the baseline and every trial go
+    through here, differing only in ``cp_size``.
+
+    ``state_dict`` carries the reference weights between calls: the first
+    call passes ``None`` and returns the weights it initialised, every later
+    call passes them back so all CP sizes are compared on a bitwise
+    identical model. The batch needs no such threading — it is a pure
+    function of ``(seed, seq_len, vocab_size)`` and independent of CP, so
+    rebuilding it here yields the same tensors every time.
+
+    Returns ``(loss, state_dict)``. Leaves the model-parallel groups
+    destroyed.
+    """
     local_rank = _init_distributed()
     device = torch.device(f"cuda:{local_rank}")
-    world_size = dist.get_world_size()
     rank = dist.get_rank()
 
-    target_cp = args.cp_size
-    if world_size < target_cp:
-        if rank == 0:
-            print(
-                f"SKIP: world_size={world_size} < cp_size={target_cp}. "
-                f"Need at least {target_cp} GPUs.",
-                flush=True,
-            )
-        dist.destroy_process_group()
-        sys.exit(0)
-    if world_size % target_cp != 0:
-        if rank == 0:
-            print(
-                f"SKIP: world_size={world_size} is not divisible by cp_size={target_cp}.",
-                flush=True,
-            )
-        dist.destroy_process_group()
-        sys.exit(0)
-
-    vocab_size = 1024
-
-    # Ensure seq_len is divisible by 2 * target_cp
-    seq_len = args.seq_len
-    align = 2 * target_cp
-    if seq_len % align != 0:
-        seq_len = ((seq_len + align - 1) // align) * align
-        if rank == 0:
-            print(f"Adjusted seq_len to {seq_len} for alignment with CP={target_cp}", flush=True)
-
-    # --- Step 1: CP=1 baseline ---
     if rank == 0:
-        print(f"=== CP=1 baseline (world_size={world_size}) ===", flush=True)
+        print(f"=== CP={cp_size} (world_size={dist.get_world_size()}) ===", flush=True)
 
-    _init_megatron_parallel(cp_size=1)
+    _init_megatron_parallel(cp_size=cp_size, seed=seed)
 
     # Set deterministic seed for model init
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    model_cp1, _ = _build_tiny_model(cp_size=1, device=device)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    model, _ = _build_tiny_model(cp_size=cp_size, device=device)
+    if state_dict is None:
+        state_dict = model.state_dict()
+    else:
+        model.load_state_dict(state_dict, strict=True)
 
     batch = _make_deterministic_batch(
-        seed=args.seed + 1, batch_size=1, seq_len=seq_len,
+        seed=seed + 1, batch_size=1, seq_len=seq_len,
         vocab_size=vocab_size, device=device,
     )
 
-    loss_cp1 = _forward_with_cp(model_cp1, batch, cp_size=1)
+    loss = _forward_with_cp(model, batch, cp_size=cp_size)
 
     if rank == 0:
-        print(f"  CP=1 loss: {loss_cp1:.6f}", flush=True)
+        print(f"  CP={cp_size} loss: {loss:.6f}", flush=True)
 
-    # Save model state for reuse
-    state_dict = model_cp1.state_dict()
-    del model_cp1
+    del model
+    Utils.destroy_model_parallel()
     torch.cuda.empty_cache()
 
-    # --- Step 2: CP=target ---
-    if rank == 0:
-        print(f"=== CP={target_cp} (world_size={world_size}) ===", flush=True)
+    return loss, state_dict
 
-    _init_megatron_parallel(cp_size=target_cp)
 
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    model_cpN, _ = _build_tiny_model(cp_size=target_cp, device=device)
+# ===================================================================
+# pytest entry points
+# ===================================================================
 
-    # Load the same weights to ensure identical model
-    model_cpN.load_state_dict(state_dict, strict=True)
-    del state_dict
 
-    loss_cpN = _forward_with_cp(model_cpN, batch, cp_size=target_cp)
+@pytest.fixture(scope="module")
+def cp1_baseline():
+    """Memoise the CP=1 run so every CP size under test shares one baseline."""
+    return run_cp(1, TEST_SEQ_LEN)
 
-    if rank == 0:
-        print(f"  CP={target_cp} loss: {loss_cpN:.6f}", flush=True)
 
-    del model_cpN
-    torch.cuda.empty_cache()
+@pytest.mark.parametrize("cp_size", CP_SIZES)
+def test_cp_matches_cp1_baseline(request, cp_size):
+    """CP>1 must reproduce the CP=1 loss on identical weights and data."""
+    _init_distributed()
+    reason = cp_skip_reason(cp_size)
+    if reason is not None:
+        pytest.skip(reason)
+
+    # Requested lazily so an all-skipped world size never pays for the baseline.
+    loss_cp1, state_dict = request.getfixturevalue("cp1_baseline")
+    loss_cpN, _ = run_cp(cp_size, TEST_SEQ_LEN, state_dict=state_dict)
+
+    atol, rtol = DEFAULTS["atol"], DEFAULTS["rtol"]
+    diff = abs(loss_cpN - loss_cp1)
+    assert diff <= atol + rtol * abs(loss_cp1), (
+        f"CP={cp_size} loss {loss_cpN:.6f} differs from CP=1 loss {loss_cp1:.6f} "
+        f"(abs diff {diff:.3e}, atol={atol}, rtol={rtol})"
+    )
+
+
+def main():
+    args = _parse_args()
+    _init_distributed()
+    rank = dist.get_rank()
+
+    target_cp = args.cp_size
+    reason = cp_skip_reason(target_cp)
+    if reason is not None:
+        if rank == 0:
+            print(f"SKIP: {reason}.", flush=True)
+        dist.destroy_process_group()
+        sys.exit(0)
+
+    seq_len = aligned_seq_len(args.seq_len, [target_cp])
+    if seq_len != args.seq_len and rank == 0:
+        print(f"Adjusted seq_len to {seq_len} for alignment with CP={target_cp}", flush=True)
+
+    loss_cp1, state_dict = run_cp(1, seq_len, seed=args.seed)
+    loss_cpN, _ = run_cp(target_cp, seq_len, seed=args.seed, state_dict=state_dict)
 
     # --- Step 3: Compare ---
     if rank == 0:
