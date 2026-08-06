@@ -44,7 +44,19 @@ ssh -o BatchMode=yes "$COG_SSH_HOST" "mkdir -p '$RUN_DIR'; cat > '$REMOTE_SCRIPT
 #SBATCH --error=$RUN_DIR/slurm-%j.err
 set -euo pipefail
 
-MLM_HOST=\$(ls -dt "$COG_SCRATCH_ROOT"/workspaces/megatron_lm/*/repo 2>/dev/null | head -1)
+# Locate the benchmark client: an explicit MLM_REPO, else the most recently
+# synced mcore workspace. Use "sed -n 1p", not "head -1": head closes the pipe
+# after one line, which SIGPIPEs ls, and under pipefail that aborts the job
+# with exit 141 before a single line is logged. sed drains its input instead.
+MLM_HOST="${MLM_REPO:-}"
+if [[ -z "\$MLM_HOST" ]]; then
+  MLM_HOST=\$(ls -dt "$COG_SCRATCH_ROOT"/workspaces/megatron_lm/*/repo 2>/dev/null | sed -n 1p)
+fi
+if [[ -z "\$MLM_HOST" || ! -f "\$MLM_HOST/tests/performance_tests/client/static_benchmark.py" ]]; then
+  echo "ERROR: no benchmark client under '\$MLM_HOST'. Set MLM_REPO to a synced Megatron-LM workspace." >&2
+  exit 1
+fi
+echo "benchmark_client_repo=\$MLM_HOST"
 srun --container-image="$IMG" --container-mounts=/lustre:/lustre --no-container-mount-home bash -c '
 set -euo pipefail
 export HF_HOME="$RUN_DIR/hf_home"

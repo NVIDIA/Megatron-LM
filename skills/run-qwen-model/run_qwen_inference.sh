@@ -51,6 +51,7 @@ done
 
 # Prefer oci-hsg env when present; fall back to default cog env.
 _USER_REPO="${COG_MEGATRON_REPO:-}"
+_SCRIPT_REPO="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -f "${HOME}/.cog/setup.env.oci-hsg" ]]; then
   # shellcheck disable=SC1091
   source "${HOME}/.cog/setup.env.oci-hsg"
@@ -61,9 +62,18 @@ else
   echo "ERROR: no ~/.cog/setup.env — run cog-setup-and-help skill" >&2
   exit 1
 fi
-# Caller-exported repo wins over the value baked into setup.env.*.
+# Precedence: caller export > the checkout this script lives in > setup.env.
+# setup.env is machine-wide and can name a different (stale) checkout, which
+# would sync and benchmark code you did not edit — silently.
 if [[ -n "$_USER_REPO" ]]; then
   export COG_MEGATRON_REPO="$_USER_REPO"
+elif [[ -n "$_SCRIPT_REPO" ]]; then
+  if [[ -n "${COG_MEGATRON_REPO:-}" && "$COG_MEGATRON_REPO" != "$_SCRIPT_REPO" ]]; then
+    echo "WARNING: ~/.cog/setup.env names COG_MEGATRON_REPO=$COG_MEGATRON_REPO" >&2
+    echo "         but this script lives in $_SCRIPT_REPO — benchmarking the latter." >&2
+    echo "         Export COG_MEGATRON_REPO explicitly to override." >&2
+  fi
+  export COG_MEGATRON_REPO="$_SCRIPT_REPO"
 fi
 
 : "${COG_MEGATRON_REPO:?COG_MEGATRON_REPO not set}"

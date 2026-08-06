@@ -6,7 +6,7 @@
 #
 # Usage:
 #   source ~/.cog/setup.env.oci-hsg
-#   export COG_MEGATRON_REPO=/path/to/Megatron-LM
+#   # Deploys the checkout this script lives in; export COG_MEGATRON_REPO to override.
 #   QWEN30B_CKPT=/lustre/.../qwen3-30b-a3b-mcore \
 #   PROFILE_BS=256 PROFILE_OSL=128 \
 #   bash skills/run-qwen-model/profile_qwen_mcore.sh
@@ -16,6 +16,7 @@ PROFILE_BS="${PROFILE_BS:-256}"
 PROFILE_OSL="${PROFILE_OSL:-128}"
 
 _USER_REPO="${COG_MEGATRON_REPO:-}"
+_SCRIPT_REPO="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -f "${HOME}/.cog/setup.env.oci-hsg" ]]; then
   # shellcheck disable=SC1091
   source "${HOME}/.cog/setup.env.oci-hsg"
@@ -26,7 +27,19 @@ else
   echo "ERROR: no ~/.cog/setup.env — run cog-setup-and-help skill" >&2
   exit 1
 fi
-if [[ -n "$_USER_REPO" ]]; then export COG_MEGATRON_REPO="$_USER_REPO"; fi
+# Precedence: caller export > the checkout this script lives in > setup.env.
+# setup.env is machine-wide and can name a different (stale) checkout, which
+# would profile code you did not edit — silently.
+if [[ -n "$_USER_REPO" ]]; then
+  export COG_MEGATRON_REPO="$_USER_REPO"
+elif [[ -n "$_SCRIPT_REPO" ]]; then
+  if [[ -n "${COG_MEGATRON_REPO:-}" && "$COG_MEGATRON_REPO" != "$_SCRIPT_REPO" ]]; then
+    echo "WARNING: ~/.cog/setup.env names COG_MEGATRON_REPO=$COG_MEGATRON_REPO" >&2
+    echo "         but this script lives in $_SCRIPT_REPO — profiling the latter." >&2
+    echo "         Export COG_MEGATRON_REPO explicitly to override." >&2
+  fi
+  export COG_MEGATRON_REPO="$_SCRIPT_REPO"
+fi
 
 : "${COG_MEGATRON_REPO:?COG_MEGATRON_REPO not set}"
 : "${COG_SSH_HOST:?COG_SSH_HOST not set}"
@@ -77,8 +90,12 @@ nsys --version
 
 # Launch the server UNDER nsys. --cuda-graph-trace=node is required so kernels
 # inside the full_iteration_inference CUDA graph are individually traced.
+# Do NOT add osrt or --sample=process-tree: on this workload (MoE decode under
+# full-iteration CUDA graphs) either one hangs nsys in finalization and the
+# resulting qdstrm is rejected by QdstrmImporter. Bisected over several
+# sessions; see optimize-inference-siddharth/references/measuring.md.
 nsys profile \\
-  --trace=cuda,nvtx,osrt \\
+  --trace=cuda,nvtx \\
   --sample=none --cpuctxsw=none \\
   --cuda-graph-trace=node \\
   --force-overwrite=true \\

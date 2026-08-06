@@ -72,6 +72,14 @@ nsys profile --trace=cuda,nvtx --sample=none \
     -o inference_profile <launch command>
 ```
 
+**Grep the launch scripts for these flags before you submit, every time.** This
+table being written down does not mean the harness obeys it: both
+`profile_qwen_mcore.sh` and `profile_qwen_vllm.sh` shipped `--trace=cuda,nvtx,osrt`
+long after the bisection was recorded here, and would each have burned an
+allocation on an unusable capture. Removing `osrt` was the whole fix — both then
+finalized first try. A banned flag costs a full profile round-trip to discover
+and one `rg osrt` to prevent.
+
 This is a real constraint on method, not a nuisance: **the documented way to
 attribute host time is exactly the way that breaks.** Two consequences, both with
 working substitutes below — attribute host-side idle from the CUDA-API rows in a

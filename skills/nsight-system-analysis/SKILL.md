@@ -94,6 +94,12 @@ python scripts/forward_pass.py mcore.sqlite vllm.sqlite --label-a mcore --label-
 **Caveats:**
 - `GPU-time (Σ durations)` per category **sums** kernel durations and so over-counts wall time when streams overlap — that's intentional for composition. Use the reported **GPU-busy (interval union)** for the true single-step wall figure, and the anchor **period** for the forward-pass time.
 - The built-in taxonomy is tuned for MoE decode; verify the category assignments once (as in Step 3's YAML verification) if a large "other/misc" bucket appears, and extend via `--yaml`.
+- **Confirm the step boundary with a second anchor before quoting the period.** Re-run with `--anchor <other once-per-step kernel>`; two independent anchors should agree to a few µs on both period and kernel count. If they disagree, auto-detection latched onto something that does not fire exactly once per step and every downstream number is wrong.
+- **Reconcile the step-period ratio against the end-to-end ratio, and expect them to differ.** The step period measures only steady-state decode in the *densest* window; the benchmark's throughput and TPOT also carry prefill, scheduling, and client overhead. Report both and say which is which — a 2.31× step-period ratio next to a 1.52× throughput ratio is normal when a fixed prefill cost dilutes the shorter run, not evidence that one of them is wrong.
+
+**Sanity check the attribution arithmetic:** `Δ step wall` must equal `Δ GPU-busy + Δ idle` exactly. The per-category Δs sum to *less* than `Δ GPU-busy` (they are Σ-durations, so overlap differs). If the first identity fails, the two windows are not both one step.
+
+**Profile at the sequence length you intend to ship.** Per-step cost scales with context length, and the two engines need not scale alike — one MoE decode comparison measured 2.31× at OSL128 but 1.52× at OSL1024, because the faster engine's step grew 61% with context while the slower engine's grew 6%. A short OSL is cheaper to capture and can *invert* which levers matter, so treat a short-OSL profile as a lever-finder and re-measure the ceiling at the target OSL before committing to a change.
 
 For deeper attribution (source-level root cause, exposed comm, module-slicing) fall through to Steps 1–6 below, restricting the windows to the decode region this workflow identified.
 

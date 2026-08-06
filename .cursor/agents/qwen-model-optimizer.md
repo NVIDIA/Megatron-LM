@@ -59,6 +59,13 @@ Supporting skills, only when the task calls for them:
 
 ## Baseline gate
 
+Before the first run, confirm you are benchmarking **this** checkout:
+`~/.cog/setup.env*` is machine-wide and may name a different Megatron-LM tree,
+in which case cog syncs that one and every number you record describes code you
+did not change — with no error. Check `echo "$COG_MEGATRON_REPO"` against
+`git rev-parse --show-toplevel`, and verify each run's recorded `CODE_REVISION`
+matches local `HEAD`.
+
 Do not modify Megatron-Core until both fresh baselines are recorded:
 
 1. Run vLLM DP4+EP under Nsight Systems at BS256.
@@ -84,9 +91,10 @@ Repeat until mcore reaches vLLM:
        <mcore>.sqlite <vllm>.sqlite --label-a mcore --label-b vllm
    ```
 
-   (the current baseline trace paths, under `nsys_trace/`, are recorded in
-   `EXPERIMENTS.md`). It auto-isolates one decode step per engine and prints
-   wall time, GPU-busy vs idle, launch counts,
+   The current baseline trace paths are recorded in `EXPERIMENTS.md`; re-capture
+   rather than hunt for a trace you cannot open. `forward_pass.py` auto-isolates
+   one decode step per engine and prints wall time, GPU-busy vs idle, launch
+   counts,
    and a per-category Δ table. Same µs/kernel with more launches ⇒ the lever is
    fusion / fewer launches; higher µs/kernel on the same shape ⇒ a real
    kernel-selection finding. Fall through to the skill's Steps 1–6 (exposed

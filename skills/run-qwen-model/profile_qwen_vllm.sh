@@ -50,7 +50,10 @@ EXP=$EXP
 HF_CKPT=$HF_CKPT
 PROFILE_BS=$PROFILE_BS
 PROFILE_OSL=$PROFILE_OSL
-MLM_HOST=\$(ls -dt $COG_SCRATCH_ROOT/workspaces/megatron_lm/*/repo 2>/dev/null | head -1)
+# sed -n 1p rather than head -1: head closes the pipe early and SIGPIPEs ls,
+# which is fatal under pipefail. Override MLM_REPO to pin a specific workspace
+# instead of taking whichever one was modified most recently.
+MLM_HOST=\${MLM_REPO:-\$(ls -dt $COG_SCRATCH_ROOT/workspaces/megatron_lm/*/repo 2>/dev/null | sed -n 1p)}
 mkdir -p "\$EXP"
 rm -f "\$EXP/vqdone_status" "\$EXP/vqserver.log" "\$EXP/vqprof.log"
 
@@ -77,8 +80,10 @@ PROF_BASE=\$EXP/vllm_profile
 if ! command -v nsys >/dev/null 2>&1; then echo "ERROR: nsys not in vLLM image"; exit 3; fi
 nsys --version
 
+# osrt is omitted deliberately — see the note in profile_qwen_mcore.sh. It is
+# not needed for the GPU-kernel comparison and only inflates the trace.
 nsys profile \\
-  --trace=cuda,nvtx,osrt \\
+  --trace=cuda,nvtx \\
   --sample=none --cpuctxsw=none \\
   --cuda-graph-trace=node \\
   --force-overwrite=true \\

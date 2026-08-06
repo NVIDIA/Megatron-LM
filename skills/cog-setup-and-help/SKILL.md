@@ -33,11 +33,13 @@ cluster via cog" in four steps:
 > submit`, `cog session exec`, `cog ensure-env`, …) **must `source
 > ~/.cog/setup.env` first** and use the `$COG_*` variables it defines
 > (`$COG_SSH_HOST`, `$COG_RUNTIME_ACCOUNT`, `$COG_INTERACTIVE_PARTITION`,
-> `$COG_BATCH_PARTITION`, `$COG_SCRATCH_ROOT`, `$COG_MEGATRON_REPO`, …).
-> Never assume hardcoded hostnames, accounts, partitions, or repo
-> paths — read the env file. If the file is missing, run Step 3a to
-> populate it (asking the user for each value with the documented
-> defaults) before proceeding.
+> `$COG_BATCH_PARTITION`, `$COG_SCRATCH_ROOT`, …).
+> Never assume hardcoded hostnames, accounts, or partitions — read the
+> env file. If the file is missing, run Step 3a to populate it (asking
+> the user for each value with the documented defaults) before
+> proceeding. **The repo is the exception**: it is not in the env file,
+> because cog resolves it from your current directory. See *Which
+> checkout does cog deploy?* below.
 
 ## Prerequisites
 
@@ -136,10 +138,10 @@ hardcode anything):**
    Step 3b. Confirm each variable is set (`echo $COG_SSH_HOST`, …) and
    only re-prompt for any that come up empty.
 3. **If it does not exist**, ask the user for each variable in the
-   table below using `AskUserQuestion` (or equivalent). For every
-   variable except `COG_MEGATRON_REPO`, *offer the listed default* —
-   accept the default if the user doesn't override. `COG_MEGATRON_REPO`
-   has no default; require an answer.
+   table below using `AskUserQuestion` (or equivalent), *offering the
+   listed default* — accept the default if the user doesn't override.
+   Do not ask for a repo path: cog derives it from the working
+   directory, and persisting one here is a known footgun (below).
 
    | Variable | Prompt to the user | Default |
    |---|---|---|
@@ -151,7 +153,7 @@ hardcode anything):**
    | `COG_BATCH_PARTITION` | Partition for long-running batch jobs | `batch` |
    | `COG_IMPORT_PARTITION` | Partition that runs the CPU `enroot import` job | `cpu` |
    | `COG_SCRATCH_ROOT` | Absolute path to your scratch root on the cluster (cog will store `.sqsh`, `.venv`, workspaces, run logs under this) | `/lustre/fsw/portfolios/coreai/users/${USER}/agents-space` |
-   | `COG_MEGATRON_REPO` | Absolute path to your local Megatron-LM checkout | **no default — must come from the user** |
+   | `COG_MEGATRON_REPO` | *Not stored.* Optional per-shell override; omit it and cog uses the checkout you are standing in | **omit** |
 
 4. Write the answers to `~/.cog/setup.env`. **Each line must use
    `export KEY="value"`** — without the `export`, the variables exist
@@ -172,7 +174,7 @@ hardcode anything):**
    export COG_BATCH_PARTITION="batch"
    export COG_IMPORT_PARTITION="cpu"
    export COG_SCRATCH_ROOT="/lustre/fsw/portfolios/coreai/users/${USER}/agents-space"
-   export COG_MEGATRON_REPO="/Users/${USER}/Megatron-LM"
+   # No COG_MEGATRON_REPO — cog resolves the repo from your cwd.
    EOF
    source ~/.cog/setup.env
    # Sanity check — both lines must show the value, not blank:
@@ -182,6 +184,39 @@ hardcode anything):**
 
 5. From this point on, every `cog` invocation in this skill (and in
    later turns) references `$COG_*` rather than literal values.
+
+### Which checkout does cog deploy?
+
+**The one you are standing in.** `--repo` defaults to the current
+directory, resolved to its git toplevel, which also makes it correct
+inside a `git worktree add` worktree. So the normal usage is to `cd` into
+the checkout you want and omit `--repo` entirely, as the examples below
+do.
+
+Pass `--repo` explicitly only to deploy a checkout you are *not* in:
+
+```bash
+cog submit --repo /path/to/other/Megatron-LM …
+```
+
+**Never persist a repo path in `~/.cog/setup.env`.** That file is
+machine-wide, so a baked-in `COG_MEGATRON_REPO` overrides the cwd default
+in every shell. The moment a second checkout exists, half your commands
+deploy the wrong one — and nothing fails, because the other tree is a
+valid repo. Cog will happily sync it, the job runs, and the numbers get
+attributed to code you never sent.
+
+Two habits make this self-checking. Run cog from the tree you are editing
+so cwd resolution does the work, and verify after any run that the
+recorded revision matches your local `HEAD`:
+
+```bash
+git rev-parse HEAD   # must equal the CODE_REVISION in the run record
+```
+
+One trap to know: if your cwd is the **cog clone** rather than a
+Megatron-LM checkout, cwd resolution finds the cog repo and `doctor`
+fails the repo-profile check. That is a loud failure, not a silent one.
 
 ---
 
@@ -219,7 +254,7 @@ Verify and run `doctor`:
 
 ```bash
 cog cluster ls
-cog doctor --repo "$COG_MEGATRON_REPO"
+cog doctor        # run from inside your Megatron-LM checkout
 ```
 
 `cog doctor` checks: local Python / cog version, SSH reachability,
@@ -251,10 +286,9 @@ job. Skip if you'd rather see one combined job:
 
 ```bash
 source ~/.cog/setup.env
-cog prepare-image --repo "$COG_MEGATRON_REPO"
+cog prepare-image
 
 cog ensure-env \
-  --repo "$COG_MEGATRON_REPO" \
   --run-name env-warmup \
   --gpus 1 \
   --time 00:20:00 \
@@ -272,7 +306,6 @@ returns `cache_hit: true` instantly.
 ```bash
 source ~/.cog/setup.env
 cog submit \
-  --repo "$COG_MEGATRON_REPO" \
   --run-name verify-cog-basic \
   --command 'python -m pytest tests/unit_tests/test_basic.py -v -o addopts=' \
   --gpus 1 \
@@ -313,7 +346,6 @@ path:
 ```bash
 source ~/.cog/setup.env
 cog submit \
-  --repo "$COG_MEGATRON_REPO" \
   --run-name verify-cog-gpt \
   --command 'python -m torch.distributed.run --nproc-per-node 8 --log-dir "$TORCHRUN_LOG_DIR" -m pytest -xvs tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_constructor' \
   --gpus 8 \
@@ -353,8 +385,7 @@ torch.distributed.run` from the start avoids the trap.
 >
 > # Hold an 8-GPU node for 3 hours.
 > cog session start \
->   --repo "$COG_MEGATRON_REPO" \
->   --run-name iter-debug \
+> >   --run-name iter-debug \
 >   --gpus 8 --nodes 1 --ntasks-per-node 1 \
 >   --time 03:00:00 \
 >   --partition "$COG_INTERACTIVE_PARTITION"
@@ -404,7 +435,7 @@ it still works while sync is broken:
 
 ```bash
 source ~/.cog/setup.env
-cog profile --repo "$COG_MEGATRON_REPO" --run-name fallback --pretty   # sqsh_plan.sqsh_path
+cog profile --run-name fallback --pretty   # sqsh_plan.sqsh_path
 ```
 
 Do **not** reach for `cog ensure-env` to discover the venv path here — it
@@ -420,7 +451,7 @@ ssh "$COG_SSH_HOST" ls -d "$COG_SCRATCH_ROOT"/envs/megatron_lm/*/.venv
 ```bash
 STAGE="$COG_SCRATCH_ROOT/workspaces/megatron_lm/fallback_$(date +%s)/repo"
 ssh "$COG_SSH_HOST" mkdir -p "$STAGE"
-rsync -a --exclude .git "$COG_MEGATRON_REPO"/ "$COG_SSH_HOST:$STAGE/"
+rsync -a --exclude .git "$(git rev-parse --show-toplevel)"/ "$COG_SSH_HOST:$STAGE/"
 ```
 
 > **Why a fresh path, not `rsync --delete` over the old one.** `--delete`
@@ -578,6 +609,24 @@ cog logs app --lines 50
   (e.g. user moved their Megatron-LM checkout), edit just that line in
   the file rather than wiping it. Sourcing the file is cheap — always
   do it at the start of any turn that runs a `cog` command.
+- **Per-cluster overrides: `~/.cog/setup.env.<cluster>`.** Some workflows
+  keep a variant per cluster (e.g. `~/.cog/setup.env.oci-hsg`) and source
+  *that* in preference to the base file. Two things to know. Scripts that
+  choose between them usually do it by mere **existence** (`if [[ -f
+  setup.env.<cluster> ]]`), so once the variant exists it always wins and
+  the base file is effectively dead for those scripts, whichever cluster
+  you intended. And when you correct a variable, correct it in **every**
+  variant — `grep -n <VAR> ~/.cog/setup.env*` shows them all at once.
+- **A repo path in any `setup.env*` when you have more than one checkout.**
+  Do not put one there; see *Which checkout does cog deploy?* above. This is
+  the most dangerous value to persist, because nothing fails: cog syncs the
+  *other* checkout, the job runs, and you attribute its numbers to code you
+  never sent. Symptoms are a benchmark that ignores your edit and a
+  `CODE_REVISION` in the run record that does not match your `HEAD`. Note
+  that removing the variable does not merely fix the current mistake — it
+  converts the whole failure mode from silent to loud, since a command that
+  needed it now errors with `REPO_NOT_FOUND` instead of quietly deploying
+  the wrong tree.
 - **`cog` runs but `--repo` / `--partition` / `--ssh-host` flags
   receive empty strings.** The env file was written without `export`,
   so `source ~/.cog/setup.env` populated the variables in the current
@@ -677,7 +726,7 @@ Output: `checks[]` (each with `name`, `status` ∈ {`ok`,`degraded`,`fail`}, `du
 Exit `0` if `overall` is `ok` or `degraded`; `1` if `fail`.
 
 ```bash
-cog doctor --repo "$COG_MEGATRON_REPO"
+cog doctor
 ```
 
 ### `cog profile` — resolve the run plan without touching the cluster
@@ -966,9 +1015,10 @@ See Steps 1-3 above (`cluster add --set-default`, populate
 ### 2. Warm image + env once per recipe
 
 ```bash
+cd /path/to/your/Megatron-LM        # cog deploys the checkout you are in
 source ~/.cog/setup.env
-cog prepare-image --repo "$COG_MEGATRON_REPO"
-cog ensure-env --repo "$COG_MEGATRON_REPO" \
+cog prepare-image
+cog ensure-env \
   --run-name env-warmup --gpus 1 --time 00:20:00 \
   --partition "$COG_INTERACTIVE_PARTITION"
 ```
@@ -977,7 +1027,6 @@ cog ensure-env --repo "$COG_MEGATRON_REPO" \
 
 ```bash
 cog submit \
-  --repo "$COG_MEGATRON_REPO" \
   --run-name test-basic \
   --command 'python -m pytest tests/unit_tests/test_basic.py -v -o addopts=' \
   --gpus 1 --time 00:10:00 \
@@ -991,11 +1040,11 @@ you'll run **more than 2 commands** against the same code, start a
 session instead of submitting again.
 
 ```bash
-cog session start --repo "$COG_MEGATRON_REPO" \
+cog session start \
   --session-handle iter-debug --gpus 8 --time 03:00:00 \
   --partition "$COG_INTERACTIVE_PARTITION"
 
-cog session exec --session-handle iter-debug --repo "$COG_MEGATRON_REPO" \
+cog session exec --session-handle iter-debug \
   --command 'python -m pytest tests/unit_tests/test_basic.py -v'
 # … re-run as many times as needed …
 

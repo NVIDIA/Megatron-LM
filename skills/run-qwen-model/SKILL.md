@@ -30,17 +30,33 @@ export QWEN30B_HF="$QWEN30B_TOKENIZER"
 
 Before running:
 
+Run these from inside the checkout you want to benchmark — cog deploys the
+tree you are standing in:
+
 ```bash
 source ~/.cog/setup.env.oci-hsg
-export COG_MEGATRON_REPO=/path/to/Megatron-LM
-cog prepare-image --repo "$COG_MEGATRON_REPO" --cluster-name "$COG_CLUSTER_NAME"
-cog ensure-env --repo "$COG_MEGATRON_REPO" \
+cog prepare-image --cluster-name "$COG_CLUSTER_NAME"
+cog ensure-env \
   --cluster-name "$COG_CLUSTER_NAME" \
   --run-name qwen30b-env --gpus 4 --time 00:30:00 \
   --partition "$COG_BATCH_PARTITION"
 ```
 
 Never download checkpoints. If either path is missing, ask the user.
+
+**Confirm which checkout you are benchmarking.** With more than one Megatron-LM
+checkout on the machine, deploying the wrong one is silent — the run succeeds
+and measures code you never changed. The scripts here default to the checkout
+they live in and warn on a mismatch, and `COG_MEGATRON_REPO` is deliberately
+absent from `~/.cog/setup.env*` so nothing machine-wide can override that. If
+you set it by hand, it wins; check before a measurement run:
+
+```bash
+echo "${COG_MEGATRON_REPO:-<unset — cog will use cwd>}"; git rev-parse --show-toplevel
+```
+
+Cross-check afterwards: the `CODE_REVISION` recorded by the run must equal your
+local `HEAD`.
 
 ## If a cog command hangs, switch to `sbatch` after the second attempt
 
@@ -86,10 +102,15 @@ Three rules for any directly-submitted job here, all learned the hard way:
 - **A cascade of `ModuleNotFoundError` across unrelated packages is a bad node,
   not a bad venv.** Exclude it (`--exclude=<node>`) and resubmit; do not
   pip-install overlay copies to work around it.
+- **A job that dies in seconds with exit 141 and empty logs is SIGPIPE, and
+  under `set -euo pipefail` the writer is what failed.** `ls … | head -1`
+  is the usual culprit: `head` closes the pipe, `ls` takes SIGPIPE (128+13),
+  `pipefail` promotes it, and `set -e` aborts before a single line is logged.
+  This is latent until the glob grows, so it appears long after the script was
+  written. Drain the pipe (`sed -n 1p`) rather than closing it early. It bit
+  `run_qwen_vllm.sh` once the workspace glob reached 142 entries.
 
-`dev/moe_fused/rebased12.sbatch` is a working instance of this pattern if it is
-still present in your tree — but it is untracked, so treat the cog skill's
-inlined template as the source of truth.
+The cog skill's inlined template is the source of truth for the sbatch pattern.
 
 ## 1. Megatron-Core inference
 

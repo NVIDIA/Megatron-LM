@@ -37,6 +37,37 @@ Relevant files: [backends.py](megatron/core/models/backends.py)
 [moe_module_specs.py](megatron/core/models/gpt/moe_module_specs.py),
 [moe_layer.py](megatron/core/transformer/moe/moe_layer.py).
 
+### `--inference-grouped-gemm-backend vllm` is not the kernel vLLM runs
+
+The flag name invites the wrong conclusion. The mapping is:
+
+| value | kernel |
+|---|---|
+| `vllm` | vLLM's **Triton** `_fused_moe_kernel` |
+| `flashinfer` | FlashInfer **`cutlass_fused_moe`** |
+| `torch` | `torch._grouped_mm` |
+
+vLLM itself, on a BS256 MoE decode step, does **not** dispatch to its Triton
+kernel — it runs CUTLASS/TRT-LLM `bmm_Bfloat16_..._t128x8x128...`, whose N-tile
+of **8** is shaped for the handful of tokens each expert sees during decode. So
+selecting `vllm` reproduces vLLM's *slower* path while believing you matched it.
+On one matched pair this cost **25.2 vs 10.7 µs/kernel at identical launch
+counts** — 2.35×, the single largest row in the gap table.
+
+Two consequences worth internalizing:
+
+- **Identical launch counts with a large Δ means kernel selection, not fusion.**
+  Check the kernel *names* on both sides before reaching for a fusion lever;
+  `forward_pass.py`'s `µs/kernel` column versus `#` column is the tell.
+- **The CUTLASS path is gated shut for gated activations.**
+  `transformer_config.py` rejects `flashinfer` whenever `gated_linear_unit` is
+  set, so every SwiGLU/GeGLU model — Qwen3 included — is excluded from it *by
+  validation, not by kernel capability*. That same restriction is why mcore pays
+  a standalone `_silu_mul_bounded_kernel` per layer while vLLM shows **zero**
+  activation kernels (its CUTLASS epilogue fuses SwiGLU). Treat the GEMM and the
+  activation as **one** lever: measured together they were 3137 vs 1026 µs/step,
+  3.06×, 35% of the whole engine gap.
+
 ## What each replaced component does differently
 
 ### `InferenceTopKRouter`

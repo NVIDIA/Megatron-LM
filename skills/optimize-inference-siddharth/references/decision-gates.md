@@ -10,9 +10,9 @@ optimization worked perfectly, how much would the step actually get faster?* If
 the answer is small, or if the mechanism you plan to attack is not the mechanism
 that is slow, you stop before writing production code.
 
-Source: the Qwen3-30B-A3B EP4 campaign ledger
-(`skills/run-qwen-model/EXPERIMENTS.md`), where three gates each killed a
-multi-session effort, and a fourth picked the right candidate out of six.
+Source: a Qwen3-30B-A3B EP4 optimization campaign on 4×GB200, where three gates
+each killed a multi-session effort, and a fourth picked the right candidate out
+of six.
 
 ## Why share is not headroom
 
