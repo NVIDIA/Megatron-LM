@@ -3481,10 +3481,11 @@ def save_checkpoint_and_time(
     # Free overlap param-gather buffers and release cached GPU memory so
     # that the async checkpoint worker process has enough GPU headroom for
     # D2H tensor transfers.
-    for model_chunk in model:
-        if hasattr(model_chunk, 'free_overlap_buffers'):
-            model_chunk.free_overlap_buffers()
-    torch.cuda.empty_cache()
+    with _otel_managed_span('checkpoint', 'megatron.checkpoint.reclaim_memory'):
+        for model_chunk in model:
+            if hasattr(model_chunk, 'free_overlap_buffers'):
+                model_chunk.free_overlap_buffers()
+        torch.cuda.empty_cache()
 
     # timer.log() reports the min & max time. We do not need a barrier here.
     timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
@@ -3535,14 +3536,16 @@ def save_checkpoint_and_time(
         save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
     if should_report_memory:
         # Track memory after checkpoint save.
-        report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_group)
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.report_memory'):
+            report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_group)
     num_checkpoints_memory_reported += 1
 
     if args.fp8:
         # Run garbage collection after checkpoint saving to free memory from
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
-        gc.collect()
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.gc_collect'):
+            gc.collect()
 
     # timers.log reports min & max across ranks -> a collective. Sitting right
     # after the per-rank-imbalanced save (and outside the save spans), it's a
@@ -3669,7 +3672,8 @@ def post_training_step_callbacks(
     # manual_gc_interval=0 (the common case) it never fires.
     if args.manual_gc:
         if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
-            gc.collect()
+            with _otel_managed_span('step', 'megatron.train.gc_collect'):
+                gc.collect()
 
     # Return updated FLOPs accumulator so caller can persist the reset
     return num_floating_point_operations_since_last_log_event
