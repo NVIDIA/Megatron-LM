@@ -174,7 +174,6 @@ from .global_vars import (
     get_signal_handler,
     get_tensorboard_writer,
     get_timers,
-    get_tokenizer,
     get_wandb_writer,
 )
 from .theoretical_memory_usage import report_theoretical_memory
@@ -1447,7 +1446,7 @@ def pretrain(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
-                train_data_iterator=train_data_iterator
+                train_data_iterator=train_data_iterator,
             )
 
         one_logger and one_logger.log_metrics(
@@ -3397,7 +3396,6 @@ def train(
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior.
     """
-    print(config)
     args = get_args()
     timers = get_timers()
     fault_injector_kwargs = {}

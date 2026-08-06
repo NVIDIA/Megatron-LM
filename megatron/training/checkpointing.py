@@ -36,14 +36,16 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
-from megatron.core.msc_utils import maybe_msc
+from megatron.core.msc_utils import maybe_msc, MultiStorageClientFeature 
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
+from megatron.core._rank_utils import safe_get_rank as get_rank_safe 
 from megatron.post_training.utils import print_distributed_quant_summary
+from megatron.training.global_vars import get_tokenizer
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -600,7 +602,6 @@ def save_checkpoint(
         dp_group: Data parallel group (default: None, falls back to mpu API)
         expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
     """
-    print(checkpointing_context)
     start_ckpt = time()
     args = get_args()
 
@@ -1032,10 +1033,16 @@ def save_checkpoint(
                     f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
                     f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
                 )
-                # Save tokenizer files for self-contained checkpoints (if enabled)
-                if args.save_tokenizer_assets:
-                    print(dir(model))
-                    save_tokenizer_assets(tokenizer_instance, args, checkpoint_name)
+                # Save tokenizer files for torch_dist checkpoints (if enabled)
+                if (
+                    args.save_tokenizer_assets
+                    and args.ckpt_format == 'torch_dist'
+                    and iteration > 0
+                ):
+                    checkpoint_name = get_checkpoint_name(
+                        args.save, iteration=iteration, return_base_dir=True
+                    )
+                    save_tokenizer_assets(get_tokenizer(), args, checkpoint_name)
                 if args.log_progress and args.async_save:
                     append_to_progress_log(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
@@ -1220,8 +1227,8 @@ def save_tokenizer_assets(
 
     try:
         # Check if MultiStorageClient is enabled
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
+        if MultiStorageClientFeature .is_enabled():
+            msc = MultiStorageClientFeature .import_package()
             checkpoint_path_obj = msc.Path(checkpoint_path)
             tokenizer_dir = checkpoint_path_obj / "tokenizer"
             tokenizer_dir.mkdir(parents=True, exist_ok=True)
