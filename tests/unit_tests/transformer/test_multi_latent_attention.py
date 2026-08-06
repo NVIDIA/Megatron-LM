@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import os
+import warnings
 from inspect import signature
 from unittest import mock
 
@@ -388,6 +389,8 @@ class TestParallelMLAAttention:
                 qk_head_dim=128,
                 v_head_dim=64,
                 qk_pos_emb_head_dim=64,
+                # Pinned: this test covers the padded path, which is no longer the default.
+                mla_native_v_head_dim=False,
                 rope_type=self.transformer_config.rope_type,
                 rotary_base=self.transformer_config.rotary_base,
                 original_max_position_embeddings=self.transformer_config.original_max_position_embeddings,
@@ -497,6 +500,32 @@ class TestParallelMLAAttention:
                 assert output.shape[1] == micro_batch_size
                 assert output.shape[2] == transformer_config.hidden_size
                 assert bias.shape[0] == transformer_config.hidden_size
+
+    @pytest.mark.parametrize("capability,expect_warning", [((8, 0), True), ((9, 0), False)])
+    def test_native_v_warns_only_below_sm90(self, capability, expect_warning):
+        """The default is fast from sm90 on and a large regression below it, so warn there."""
+        mla_module._WARNED_NATIVE_V_BELOW_SM90 = False
+        with mock.patch("torch.cuda.is_available", return_value=True), mock.patch(
+            "torch.cuda.get_device_capability", return_value=capability
+        ):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                mla_module._warn_native_v_below_sm90()
+        assert bool(caught) is expect_warning
+        if expect_warning:
+            assert "mla_native_v_head_dim" in str(caught[0].message)
+
+    def test_native_v_warns_once(self):
+        """It sits on the per-layer path, so warning every call would flood the log."""
+        mla_module._WARNED_NATIVE_V_BELOW_SM90 = False
+        with mock.patch("torch.cuda.is_available", return_value=True), mock.patch(
+            "torch.cuda.get_device_capability", return_value=(8, 0)
+        ):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                for _ in range(5):
+                    mla_module._warn_native_v_below_sm90()
+        assert len(caught) == 1
 
     def test_checkpointed_gpu_forward(self):
         if is_te_min_version("1.10.0"):

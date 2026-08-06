@@ -2980,11 +2980,10 @@ class MLATransformerConfig(TransformerConfig):
     v_head_dim: int = 128
     """Dimension of the head in the V projection."""
 
-    mla_native_v_head_dim: bool = False
-    """Whether to hand the attention backend its native V width on the thd path instead of
-    padding V up to the QK width. The pad and the matching output trim cancel out, so skipping
-    them only saves work: a narrower V through the kernel, and no pad or trim. In some
-    configurations the padded shape also gets no fused backend and falls back to a slower one."""
+    mla_native_v_head_dim: bool = True
+    """Pass V at its native width on the thd path instead of padding it to the QK width.
+    Faster from compute capability 9.0. Below that no backend has a kernel for unequal QK
+    and V widths, so attention falls back to the unfused path: set it False there."""
 
     normalization: str = "RMSNorm"
     """Default normalization layer for MLA models is RMSNorm."""
