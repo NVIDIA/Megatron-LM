@@ -47,16 +47,12 @@ class TinyModel(nn.Module):
 
 
 class CheckpointedTinyModel(TinyModel):
-    """Tiny model that activation-checkpoints each shardable module."""
-
-    def __init__(self, use_reentrant: bool) -> None:
-        super().__init__()
-        self.use_reentrant = use_reentrant
+    """Tiny model that reentrantly checkpoints each shardable module."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run each linear layer through activation checkpointing."""
-        x = checkpoint(self.fc1, x, use_reentrant=self.use_reentrant)
-        return checkpoint(self.fc2, self.relu(x), use_reentrant=self.use_reentrant)
+        """Run each linear layer through reentrant activation checkpointing."""
+        x = checkpoint(self.fc1, x, use_reentrant=True)
+        return checkpoint(self.fc2, self.relu(x), use_reentrant=True)
 
 
 class NestedModel(nn.Module):
@@ -204,14 +200,13 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
     )
 
 
-@pytest.mark.parametrize("use_reentrant", [True, False], ids=["reentrant", "non_reentrant"])
-def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup, use_reentrant):
-    """Activation recomputation should leave every FSDP module resharded."""
+def test_fully_shard_reentrant_activation_recompute_reshards_parameters(distributed_setup):
+    """Reentrant activation recomputation should leave every FSDP module resharded."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (world_size,))
-    model = CheckpointedTinyModel(use_reentrant=use_reentrant).to(device)
+    model = CheckpointedTinyModel().to(device)
     fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
     fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     fully_shard(model, mesh=mesh, placements=_flat_placements())

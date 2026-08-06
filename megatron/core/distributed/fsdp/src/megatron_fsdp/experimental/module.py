@@ -28,6 +28,11 @@ from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import MeshAxis, Placements
 
 
+def _is_in_backward() -> bool:
+    """Return whether the current thread is executing an autograd GraphTask."""
+    return torch._C._current_graph_task_id() != -1
+
+
 class FsdpContextPhase(enum.Enum):
     """The lifecycle phase of an FSDP context.
 
@@ -254,6 +259,10 @@ class FsdpModule:
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
         self._ready_grad_parameters.clear()
         context = self.context
+        # A reentrant checkpoint recomputes before the child module's backward-pre
+        # hook can set the context phase. Its forward still runs inside the active
+        # autograd GraphTask, which is the signal PyTorch FSDP2 uses as well.
+        is_recomputing = context.phase is FsdpContextPhase.BACKWARD or _is_in_backward()
         allgather_stream = context.allgather_stream
         current_stream = context.current_stream()
 
@@ -269,7 +278,7 @@ class FsdpModule:
         # Activation recomputation runs forward hooks inside backward. Do not
         # prefetch the next module in forward order: its backward may already
         # be complete, so no later backward hook would reshard it.
-        if context.phase is not FsdpContextPhase.BACKWARD:
+        if not is_recomputing:
             next_module = context.forward_order.next_item(self)
             if next_module is not None:
                 next_module._unshard_parameter_groups()
@@ -296,7 +305,8 @@ class FsdpModule:
         # Recomputed parameters are consumed immediately by this module's
         # backward. Keep them materialized to avoid an unnecessary all-gather;
         # post_backward() will reshard them after gradient reduction.
-        if self.context.phase is not FsdpContextPhase.BACKWARD:
+        is_recomputing = self.context.phase is FsdpContextPhase.BACKWARD or _is_in_backward()
+        if not is_recomputing:
             self._reshard_parameter_groups()
         torch.cuda.nvtx.range_pop()
 
