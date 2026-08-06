@@ -125,7 +125,11 @@ class MockCoreAttention(torch.nn.Module):
 
 
 def get_mock_mla_config(
-    tensor_model_parallel_size: int, context_parallel_size: int, qk_layernorm: bool
+    tensor_model_parallel_size: int,
+    context_parallel_size: int,
+    qk_layernorm: bool,
+    apply_rope_fusion: bool = False,
+    rope_type: str = "yarn",
 ) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
     return MLATransformerConfig(
@@ -148,8 +152,8 @@ def get_mock_mla_config(
         tensor_model_parallel_size=tensor_model_parallel_size,
         sequence_parallel=tensor_model_parallel_size > 1,
         context_parallel_size=context_parallel_size,
-        apply_rope_fusion=False,
-        rope_type="yarn",
+        apply_rope_fusion=apply_rope_fusion,
+        rope_type=rope_type,
         rotary_scaling_factor=40,
         mscale=1.0,
         mscale_all_dim=1.0,
@@ -388,10 +392,14 @@ def test_load_from_state_dict_backwards_compatible_with_split_kv_up_projection(m
     assert f"{prefix}linear_v_up_proj._extra_state" not in captured_state_dict
 
 
-@pytest.mark.parametrize("tp_cp", [[1, 1], [2, 1], [1, 2], [2, 2]])
-@pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
-@pytest.mark.parametrize("down_proj_use_column_parallel", [False, True])
-def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_parallel: bool):
+def _run_functionality(
+    tp_cp: List[int],
+    qkv_format: str,
+    down_proj_use_column_parallel: bool,
+    apply_rope_fusion: bool = False,
+    rope_type: str = "yarn",
+    check_hidden_grad: bool = False,
+):
     """Test that AbsorbedMLASelfAttention is equivalent to standard MLA."""
     tp_size, cp_size = tp_cp
     Utils.initialize_model_parallel(
@@ -402,7 +410,11 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
     # Create model
     qk_layernorm = True
     config = get_mock_mla_config(
-        tensor_model_parallel_size=tp_size, context_parallel_size=cp_size, qk_layernorm=qk_layernorm
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
+        qk_layernorm=qk_layernorm,
+        apply_rope_fusion=apply_rope_fusion,
+        rope_type=rope_type,
     )
     absorbed_submodules = get_absorbed_mla_submodules(
         down_proj_use_column_parallel=down_proj_use_column_parallel,
@@ -470,12 +482,15 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
         grads = torch.randn_like(hidden_states)
         packed_seq_params = None
 
+    absorbed_hidden_states = hidden_states.detach().requires_grad_(check_hidden_grad)
+    standard_hidden_states = hidden_states.detach().clone().requires_grad_(check_hidden_grad)
+
     # Forward & Backward
     for name, param in absorbed_mla.named_parameters():
         if param.grad is not None:
             param.grad.zero_()
     absorbed_outputs, _ = absorbed_mla(
-        hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        absorbed_hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
     )
     absorbed_outputs.backward(grads)
 
@@ -483,7 +498,7 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
         if param.grad is not None:
             param.grad.zero_()
     standard_outputs, _ = standard_mla(
-        hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        standard_hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
     )
     standard_outputs.backward(grads)
 
@@ -504,6 +519,10 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
     assert cosine_sim > 0.9999, f"output cosine similarity = {cosine_sim} < 0.9999"
     assert _calculate_tensor_similarity(absorbed_outputs, standard_outputs) > 0.9999
     torch.testing.assert_close(absorbed_outputs, standard_outputs, atol=5e-3, rtol=5e-3)
+    if check_hidden_grad:
+        torch.testing.assert_close(
+            absorbed_hidden_states.grad, standard_hidden_states.grad, atol=5e-3, rtol=5e-3
+        )
 
     for name, param in absorbed_mla.named_parameters():
         assert param.grad is not None
@@ -528,3 +547,24 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
         assert _calculate_tensor_similarity(absorbed_grad, standard_grad) > 0.9999
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("tp_cp", [[1, 1], [2, 1], [1, 2], [2, 2]])
+@pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
+@pytest.mark.parametrize("down_proj_use_column_parallel", [False, True])
+def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_parallel: bool):
+    """Test that absorbed MLA is equivalent to standard MLA."""
+    _run_functionality(tp_cp, qkv_format, down_proj_use_column_parallel)
+
+
+@pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
+def test_standard_rope_fusion_functionality(qkv_format: str):
+    """Absorbed MLA's fused packing must match standard MLA end to end."""
+    _run_functionality(
+        [1, 1],
+        qkv_format,
+        down_proj_use_column_parallel=False,
+        apply_rope_fusion=True,
+        rope_type="rope",
+        check_hidden_grad=True,
+    )
