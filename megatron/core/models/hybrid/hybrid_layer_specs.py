@@ -14,6 +14,7 @@ from megatron.core.models.gpt.moe_module_specs import (
     get_inference_optimized_moe_spec,
     get_moe_module_spec,
 )
+from megatron.core.models.hybrid.hybrid_architecture import HYBRID_LAYER_TYPE
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -92,6 +93,7 @@ hybrid_stack_spec = ModuleSpec(
     submodules=HybridStackSubmodules(
         mamba_layer=ModuleSpec(
             module=MambaLayer,
+            metainfo={HYBRID_LAYER_TYPE: "mamba"},
             submodules=MambaLayerSubmodules(
                 mixer=ModuleSpec(
                     module=MambaMixer,
@@ -104,6 +106,7 @@ hybrid_stack_spec = ModuleSpec(
         ),
         gdn_layer=ModuleSpec(
             module=TransformerLayer,
+            metainfo={HYBRID_LAYER_TYPE: "gdn"},
             submodules=TransformerLayerSubmodules(
                 self_attention=ModuleSpec(
                     module=GatedDeltaNet,
@@ -121,6 +124,7 @@ hybrid_stack_spec = ModuleSpec(
         # working
         attention_layer=ModuleSpec(
             module=TransformerLayer,
+            metainfo={HYBRID_LAYER_TYPE: "attention"},
             submodules=TransformerLayerSubmodules(
                 self_attention=ModuleSpec(
                     module=SelfAttention,
@@ -136,6 +140,7 @@ hybrid_stack_spec = ModuleSpec(
         ),
         dsa_layer=ModuleSpec(
             module=TransformerLayer,
+            metainfo={HYBRID_LAYER_TYPE: "dsa"},
             submodules=TransformerLayerSubmodules(
                 input_layernorm=TENorm,
                 self_attention=ModuleSpec(
@@ -171,6 +176,7 @@ hybrid_stack_spec = ModuleSpec(
         ),
         mla_layer=ModuleSpec(
             module=TransformerLayer,
+            metainfo={HYBRID_LAYER_TYPE: "mla"},
             submodules=TransformerLayerSubmodules(
                 input_layernorm=TENorm,
                 self_attention=ModuleSpec(
@@ -196,6 +202,7 @@ hybrid_stack_spec = ModuleSpec(
         # working
         mlp_layer=ModuleSpec(
             module=MLPLayer,
+            metainfo={HYBRID_LAYER_TYPE: "mlp"},
             submodules=TransformerLayerSubmodules(
                 mlp=partial(
                     MLP.as_mlp_submodule,
@@ -208,6 +215,7 @@ hybrid_stack_spec = ModuleSpec(
         ),
         moe_layer=ModuleSpec(
             module=MoETransformerLayer,
+            metainfo={HYBRID_LAYER_TYPE: "moe"},
             submodules=TransformerLayerSubmodules(
                 pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),
@@ -222,6 +230,7 @@ hybrid_inference_stack_spec = ModuleSpec(
     submodules=HybridStackSubmodules(
         mamba_layer=ModuleSpec(
             module=MambaLayer,
+            metainfo={HYBRID_LAYER_TYPE: "mamba"},
             submodules=MambaLayerSubmodules(
                 mixer=ModuleSpec(
                     module=MambaMixer,
@@ -238,6 +247,7 @@ hybrid_inference_stack_spec = ModuleSpec(
         # working
         attention_layer=ModuleSpec(
             module=TransformerLayer,
+            metainfo={HYBRID_LAYER_TYPE: "attention"},
             submodules=TransformerLayerSubmodules(
                 self_attention=ModuleSpec(
                     module=SelfAttention,
@@ -253,6 +263,7 @@ hybrid_inference_stack_spec = ModuleSpec(
         ),
         dsa_layer=ModuleSpec(
             module=TransformerLayer,
+            metainfo={HYBRID_LAYER_TYPE: "dsa"},
             submodules=TransformerLayerSubmodules(
                 input_layernorm=TENorm,
                 self_attention=ModuleSpec(
@@ -288,6 +299,7 @@ hybrid_inference_stack_spec = ModuleSpec(
         ),
         mla_layer=ModuleSpec(
             module=TransformerLayer,
+            metainfo={HYBRID_LAYER_TYPE: "mla"},
             submodules=TransformerLayerSubmodules(
                 input_layernorm=TENorm,
                 self_attention=ModuleSpec(
@@ -313,6 +325,7 @@ hybrid_inference_stack_spec = ModuleSpec(
         # working
         mlp_layer=ModuleSpec(
             module=MLPLayer,
+            metainfo={HYBRID_LAYER_TYPE: "mlp"},
             submodules=TransformerLayerSubmodules(
                 mlp=partial(
                     MLP.as_mlp_submodule,
@@ -327,6 +340,7 @@ hybrid_inference_stack_spec = ModuleSpec(
         moe_layer=ModuleSpec(
             # Use inference-optimized MoE layer for end-to-end CUDA graph support
             module=TransformerLayer,
+            metainfo={HYBRID_LAYER_TYPE: "moe"},
             submodules=TransformerLayerSubmodules(
                 pre_mlp_layernorm=TENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add
             ),

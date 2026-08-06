@@ -139,6 +139,11 @@ class RouterInterface(Protocol):
         """
         ...
 
+    def set_metric_layer_number(self, layer_number: int, num_layers: int | None = None) -> None:
+        """Set a metric-only layer slot independent of checkpoint numbering."""
+
+        ...
+
 
 class RouterBuilder(Protocol):
     """Protocol for building a Router."""
@@ -208,6 +213,11 @@ class BaseMoELayer(MegatronModule, ABC):
         """Set the layer number for the MoE layer."""
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
+
+    def set_metric_layer_number(self, layer_number: int, num_layers: int | None = None) -> None:
+        """Set the layer slot used by the MoE metrics tracker."""
+
+        self.router.set_metric_layer_number(layer_number, num_layers)
 
 
 class MoELayer(BaseMoELayer):
@@ -647,8 +657,15 @@ class MoELayer(BaseMoELayer):
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
 
+        metric_layer_number = getattr(self.router, "metric_layer_number", None)
+        metric_num_layers = getattr(self.router, "metric_num_layers", None)
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            if metric_layer_number is not None:
+                # Selective MoE recomputation runs after a repeated direct-MTP module may have
+                # been retargeted to another prediction depth. Restore this invocation's slot.
+                self.router.set_metric_layer_number(metric_layer_number, metric_num_layers)
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)

@@ -1,27 +1,32 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, ClassVar, Literal, override
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.hybrid.hybrid_architecture import (
+    HybridLayerPattern,
+    resolve_hybrid_architecture,
+)
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
-    hybrid_inference_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.pipeline_parallel.utils import (
+    is_pp_first_stage,
+    is_pp_last_stage,
+    is_vp_first_stage,
+    is_vp_last_stage,
+)
 from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.models.base import (
-    ModelBuilder,
-    ModelConfig,
-    compose_hooks,
-)
+from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
@@ -39,7 +44,8 @@ class HybridModelConfig(ModelConfig):
     on the embedded ``transformer`` config are accessible directly on this object
     via ``__getattr__``/``__setattr__`` proxying.
 
-    Supports hybrid architectures via ``hybrid_layer_pattern``
+    Direct ``layer_specs`` are the preferred architecture API. The legacy
+    ``hybrid_layer_pattern`` string remains supported for compatibility.
 
     Note:
         ``vocab_size`` must be set before passing this config to ``HybridModelBuilder``.
@@ -56,6 +62,8 @@ class HybridModelConfig(ModelConfig):
     hybrid_mlp_ratio: float = 0.0
     hybrid_override_pattern: str | None = None
     hybrid_layer_pattern: str | None = None
+    layer_specs: HybridLayerPattern | None = field(default=None, repr=False)
+    mtp_layer_specs: HybridLayerPattern | None = field(default=None, repr=False)
     seq_length: int = 8192
     # HybridModel with no attention has no need for position embeddings, so none is default
     position_embedding_type: Literal["learned_absolute", "rope", "none"] = "none"
@@ -109,6 +117,18 @@ class HybridModelConfig(ModelConfig):
         if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
             self.transformer.finalize()
 
+    @override
+    def as_dict(self) -> dict[str, Any]:
+        """Serialize scalar configuration without live Python architecture objects.
+
+        The Python recipe must supply direct ``ModuleSpec`` trees again when resuming.
+        """
+
+        result = super().as_dict()
+        result.pop("layer_specs", None)
+        result.pop("mtp_layer_specs", None)
+        return result
+
 
 class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
     """Builder to construct Megatron Core Hybrid models.
@@ -126,6 +146,101 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
 
     def __init__(self, model_config: HybridModelConfig):
         super().__init__(model_config)
+        has_direct_specs = (
+            model_config.layer_specs is not None or model_config.mtp_layer_specs is not None
+        )
+        # Only direct descriptors need topology resolution before distributed construction.
+        # Legacy patterns retain the historical builder and runtime selector path.
+        if has_direct_specs:
+            self._hybrid_stack_spec = self._get_hybrid_stack_spec()
+            self._resolved_architecture = resolve_hybrid_architecture(
+                config=model_config.transformer,
+                hybrid_stack_spec=self._hybrid_stack_spec,
+                layer_specs=model_config.layer_specs,
+                mtp_layer_specs=model_config.mtp_layer_specs,
+                hybrid_layer_pattern=model_config.hybrid_layer_pattern,
+            )
+
+    @classmethod
+    def prepare_config_for_distributed_init(
+        cls, model_config: HybridModelConfig, args: Any
+    ) -> bool:
+        """Resolve split topology before Megatron initializes pipeline runtime state.
+
+        Direct Python specs are not present while command-line arguments are
+        validated, so their inferred VPP size must be copied to the runtime
+        namespace before ``initialize_model_parallel`` runs. Returns whether
+        direct architecture state was prepared.
+        """
+
+        if model_config.layer_specs is None and model_config.mtp_layer_specs is None:
+            return False
+
+        builder = cls(model_config)
+        resolved_architecture = getattr(builder, "_resolved_architecture", None)
+        if resolved_architecture is None:
+            return False
+
+        transformer = model_config.transformer
+        pp_size = transformer.pipeline_model_parallel_size
+        runtime_pp_size = getattr(args, "pipeline_model_parallel_size", pp_size)
+        if runtime_pp_size != pp_size:
+            raise ValueError(
+                "HybridModelConfig.transformer.pipeline_model_parallel_size must match the "
+                f"runtime pipeline topology; got {pp_size} != {runtime_pp_size}."
+            )
+
+        inferred_vp_size = transformer.virtual_pipeline_model_parallel_size
+        runtime_vp_size = getattr(args, "virtual_pipeline_model_parallel_size", None)
+        if runtime_vp_size is not None and runtime_vp_size != inferred_vp_size:
+            raise ValueError(
+                "Hybrid architecture splits disagree with the runtime virtual pipeline "
+                f"topology; got {inferred_vp_size} != {runtime_vp_size}."
+            )
+        args.virtual_pipeline_model_parallel_size = inferred_vp_size
+
+        # Argument validation temporarily disables interleaved-only options when
+        # direct Python split nodes are not available yet. Restore the user's
+        # requested settings now that those nodes have inferred VPP.
+        if inferred_vp_size is not None and runtime_vp_size is None:
+            requested_overlap = getattr(
+                args,
+                "_overlap_p2p_comm_before_direct_vpp",
+                getattr(args, "overlap_p2p_comm", False),
+            )
+            requested_align = getattr(
+                args,
+                "_align_param_gather_before_direct_vpp",
+                getattr(args, "align_param_gather", False),
+            )
+            if pp_size == 2 and not requested_overlap:
+                raise ValueError(
+                    "Direct PP2/VPP interleaving requires P2P communication overlap; "
+                    "remove --no-overlap-p2p-communication."
+                )
+            args.overlap_p2p_comm = requested_overlap
+            args.align_param_gather = requested_align
+            if hasattr(args, "batch_p2p_comm"):
+                args.batch_p2p_comm = not requested_overlap
+            transformer.overlap_p2p_comm = requested_overlap
+            transformer.batch_p2p_comm = not requested_overlap
+
+        return True
+
+    def _get_hybrid_stack_spec(self) -> ModuleSpec:
+        """Select the stack implementation used by every local model chunk."""
+
+        hybrid_stack_spec = self._model_config.hybrid_stack_spec
+        if hybrid_stack_spec is not None:
+            return hybrid_stack_spec
+        if self._model_config.transformer.transformer_impl == "inference_optimized":
+            return hybrid_inference_stack_spec
+        if self._model_config.restore_modelopt_state:
+            return get_hybrid_stack_modelopt_spec(
+                local_core_attention=False,
+                remap_te_layernorm=False,
+            )
+        return default_hybrid_stack_spec
 
     def build_model(
         self,
@@ -145,20 +260,25 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         Returns:
             The constructed model
 
-        Note:
-            Virtual pipeline model parallelism is not supported for Hybrid models.
         """
-        hybrid_stack_spec = self._model_config.hybrid_stack_spec
-        if hybrid_stack_spec is None:
-            if self._model_config.transformer.transformer_impl == "inference_optimized":
-                hybrid_stack_spec = hybrid_inference_stack_spec
-            elif self._model_config.restore_modelopt_state:
-                hybrid_stack_spec = get_hybrid_stack_modelopt_spec(
-                    local_core_attention=False,
-                    remap_te_layernorm=False,
-                )
-            else:
-                hybrid_stack_spec = default_hybrid_stack_spec
+        # Re-resolve if a caller selected a different implementation spec after
+        # builder construction (for example, modelopt or optimized inference).
+        hybrid_stack_spec = self._get_hybrid_stack_spec()
+        has_direct_specs = (
+            self._model_config.layer_specs is not None
+            or self._model_config.mtp_layer_specs is not None
+        )
+        if has_direct_specs and hybrid_stack_spec is not getattr(
+            self, "_hybrid_stack_spec", None
+        ):
+            self._hybrid_stack_spec = hybrid_stack_spec
+            self._resolved_architecture = resolve_hybrid_architecture(
+                config=self._model_config.transformer,
+                hybrid_stack_spec=hybrid_stack_spec,
+                layer_specs=self._model_config.layer_specs,
+                mtp_layer_specs=self._model_config.mtp_layer_specs,
+                hybrid_layer_pattern=self._model_config.hybrid_layer_pattern,
+            )
 
         assert self._model_config.vocab_size is not None, "vocab_size must be configured before calling build_model()"
         if self._model_config.should_pad_vocab:
@@ -170,8 +290,35 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         else:
             padded_vocab_size = self._model_config.vocab_size
 
-        pre_process = pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
-        post_process = post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
+        resolved_architecture = getattr(self, "_resolved_architecture", None)
+        is_direct = resolved_architecture is not None
+        if is_direct:
+            vp_size = self._model_config.transformer.virtual_pipeline_model_parallel_size
+            if vp_size is not None and vp_stage is None:
+                # A single-chunk build defaults to the first virtual stage, matching
+                # ResolvedHybridArchitecture.select_segment's public semantics.
+                vp_stage = 0
+            pre_process = (
+                pre_process
+                if pre_process is not None
+                else is_pp_first_stage(pg_collection.pp) and is_vp_first_stage(vp_stage, vp_size)
+            )
+            post_process = (
+                post_process
+                if post_process is not None
+                else is_pp_last_stage(pg_collection.pp) and is_vp_last_stage(vp_stage, vp_size)
+            )
+        else:
+            pre_process = (
+                pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
+            )
+            post_process = (
+                post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
+            )
+
+        direct_architecture_kwargs = (
+            {"resolved_hybrid_architecture": resolved_architecture} if is_direct else {}
+        )
         return HybridModel(
             config=self._model_config.transformer,
             hybrid_stack_spec=hybrid_stack_spec,
@@ -189,6 +336,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             post_process=post_process,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            **direct_architecture_kwargs,
         )
 
     def build_distributed_models(

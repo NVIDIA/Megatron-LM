@@ -12,6 +12,29 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
 
 
+def validate_dynamic_inference_model(model: MegatronModule) -> None:
+    """Reject incompatible direct specs before model-global inference buffers are allocated."""
+
+    from megatron.core.models.hybrid.hybrid_architecture import ResolvedHybridArchitecture
+
+    try:
+        architecture = get_attr_wrapped_model(model, "resolved_hybrid_architecture")
+    except RuntimeError:
+        return
+    if not isinstance(architecture, ResolvedHybridArchitecture):
+        return
+    if architecture.source != "direct":
+        return
+
+    model_config = get_attr_wrapped_model(model, "config", allow_none=False)
+    if architecture.has_incompatible_dynamic_inference_shapes(model_config):
+        raise NotImplementedError(
+            "Direct HybridModel occurrence configurations are incompatible with dynamic "
+            "inference's model-global cache or runtime buffers (Mamba state/cache dimensions, "
+            "attention KV dimensions, or MoE router top-k values)."
+        )
+
+
 @dataclass
 class MambaInferenceStateConfig:
     """
@@ -49,14 +72,41 @@ class MambaInferenceStateConfig:
         model: MegatronModule,
         conv_states_dtype: Optional[torch.dtype] = None,
         ssm_states_dtype: Optional[torch.dtype] = None,
+        *,
+        validate_dynamic_inference: bool = True,
     ) -> Optional["MambaInferenceStateConfig"]:
-        """Returns Mamba inference state config from the model if it is a hybrid model."""
+        """Returns Mamba inference state config from the model if it is a hybrid model.
+
+        Args:
+            validate_dynamic_inference: Validate direct specs against the model-global buffers
+                used by dynamic inference. The explicit legacy static engine disables this
+                because its Mamba, attention, and MoE state is allocated by each layer.
+        """
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
+        if validate_dynamic_inference:
+            validate_dynamic_inference_model(model)
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
+        # HybridStack's first-class API exposes stable semantic names, while
+        # dynamic inference's layer maps intentionally retain legacy symbols.
+        semantic_to_symbol = {
+            "mamba": Symbols.MAMBA,
+            "gdn": Symbols.GDN,
+            "attention": Symbols.ATTENTION,
+            "dsa": Symbols.DS_ATTENTION,
+            "mla": Symbols.MLA,
+            "mlp": Symbols.MLP,
+            "moe": Symbols.MOE,
+        }
+        if layer_type_list is not None and any(
+            layer_type in semantic_to_symbol for layer_type in layer_type_list
+        ):
+            layer_type_list = [
+                semantic_to_symbol.get(layer_type, layer_type) for layer_type in layer_type_list
+            ]
         if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
+            mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )
             if conv_states_dtype is None:
@@ -73,7 +123,7 @@ class MambaInferenceStateConfig:
             elif ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
             mamba_chunk_size = 128
-            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
+            for layer_type, layer in zip(layer_type_list, decoder.layers):
                 if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
                     mamba_chunk_size = layer.mixer.chunk_size
                     break

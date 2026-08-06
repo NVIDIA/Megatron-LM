@@ -94,7 +94,7 @@ class StaticInferenceEngine(AbstractEngine):
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
 
         mamba_inference_state_config = MambaInferenceStateConfig.from_model(
-            self.inference_wrapped_model.model
+            self.inference_wrapped_model.model, validate_dynamic_inference=not legacy
         )
 
         try:

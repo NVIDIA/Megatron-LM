@@ -50,31 +50,40 @@ def checkpointed_forward(
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
 
-    # Wrap non-dual RoPE to tuple to unify custom_forward interface.
+    # Flatten per-KV-width RoPE mappings because autograd checkpoint inputs must
+    # be tensors (or None), not dictionaries.
+    is_rotary_mapping = isinstance(rotary_pos_emb, dict)
+    rotary_mapping_keys = tuple(sorted(rotary_pos_emb)) if is_rotary_mapping else ()
     is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
     assert not is_dual_rope or len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
-    rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
+    if is_rotary_mapping:
+        rotary_inputs = tuple(rotary_pos_emb[key] for key in rotary_mapping_keys)
+    else:
+        rotary_inputs = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
 
     def custom(start: int, end: int):
-        def custom_forward(
-            hidden_states,
-            attention_mask,
-            context,
-            context_mask,
-            rotary_pos_emb_local,
-            rotary_pos_emb_global,
-            padding_mask=None,
-        ):
-            rotary_pos_emb = (
-                (rotary_pos_emb_local, rotary_pos_emb_global)
-                if is_dual_rope
-                else rotary_pos_emb_global
-            )
+        def custom_forward(hidden_states, attention_mask, context, context_mask, *rope_and_mask):
+            padding_mask = rope_and_mask[-1]
+            rope_values = rope_and_mask[:-1]
+            if is_rotary_mapping:
+                rotary_mapping = dict(zip(rotary_mapping_keys, rope_values))
+                rotary_pos_emb = None
+            else:
+                rotary_mapping = None
+                rotary_pos_emb = tuple(rope_values) if is_dual_rope else rope_values[1]
 
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
                 layer = self.layers[index]
+                layer_rotary_pos_emb = rotary_pos_emb
+                if rotary_mapping is not None:
+                    layer_spec = self.layer_specs[index]
+                    layer_rotary_pos_emb = (
+                        rotary_mapping.get(layer_spec.config.kv_channels)
+                        if layer_spec.layer_type == "attention"
+                        else None
+                    )
 
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
@@ -100,7 +109,7 @@ def checkpointed_forward(
                     attention_mask=attention_mask,
                     context=context,
                     context_mask=context_mask,
-                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_emb=layer_rotary_pos_emb,
                     attention_bias=attention_bias,
                     inference_context=None,
                     packed_seq_params=packed_seq_params,
@@ -126,7 +135,7 @@ def checkpointed_forward(
         nonlocal hidden_states, context
         cf = custom(start, end)
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
-        args = (hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
+        args = (hidden_states, attention_mask, context, context_mask, *rotary_inputs, padding_mask)
         if use_checkpoint:
             # Precision-aware activation checkpoint: TE under FP8/FP4,
             # tensor_parallel under BF16/FP16/FP32.

@@ -6,15 +6,15 @@ import argparse
 import dataclasses
 import json
 import os
-from pathlib import Path
 import re
 import types
+from pathlib import Path
 
 import torch
 
+from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     get_deprecated_cuda_graph_modules_migration,
@@ -23,23 +23,24 @@ from megatron.core.transformer.cuda_graph_config import (
     validate_deprecated_cuda_graph_modules_migration_inputs,
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
+from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
+    ArgumentGroupFactory,
+    core_transformer_config_from_args,
+)
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
-    update_use_dist_ckpt,
     print_rank_0,
+    update_use_dist_ckpt,
     warn_rank_0,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
-
-from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args  # noqa: F401 # pylint: disable=unused-import
-
 
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
@@ -398,8 +399,9 @@ def validate_args(args, defaults={}):
         'Currently only global and local checkpoints are supported'
     if args.non_persistent_ckpt_type == 'local':
         try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                LocalCheckpointManager,
+            )
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
@@ -740,8 +742,10 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        Symbols,
+        get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
+        parse_hybrid_pattern,
     )
     sep = Symbols.MTP_SEPARATOR
 
@@ -948,20 +952,10 @@ def validate_args(args, defaults={}):
         if args.hybrid_layer_pattern is None:
             args.virtual_pipeline_model_parallel_size = None
 
-        if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
-            # Divisibility check not applicable for T5 models which specify encoder_num_layers
-            # and decoder_num_layers, or for hybrid models using --hybrid-layer-pattern.
-            if args.num_layers is not None and args.hybrid_layer_pattern is None:
-                num_layers = args.num_layers
-
-                if args.account_for_embedding_in_pipeline_split:
-                    num_layers += 1
-
-                if args.account_for_loss_in_pipeline_split:
-                    num_layers += 1
-
-                assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-                    'Number of layers should be divisible by the pipeline-model-parallel size'
+        # Defer layer-count divisibility to the selected model builder. Direct
+        # HybridModel architecture specs are Python objects constructed after
+        # CLI validation and may legally define uneven or empty explicit chunks.
+        # Conventional transformer builders retain their own divisibility checks.
 
     if args.virtual_pipeline_model_parallel_size is not None:
         if args.overlap_p2p_comm:
@@ -975,6 +969,11 @@ def validate_args(args, defaults={}):
                 'p2p sends and recvs between same 2 ranks per communication batch'
     else:
         # Overlap P2P communication is disabled if not using the interleaved schedule.
+        # Preserve the requested values because a Python HybridModel architecture
+        # can infer VPP only after this CLI-only validation pass.
+        if args.hybrid_layer_pattern is None:
+            args._overlap_p2p_comm_before_direct_vpp = args.overlap_p2p_comm
+            args._align_param_gather_before_direct_vpp = args.align_param_gather
         args.overlap_p2p_comm = False
         args.align_param_gather = False
         # Only print warning if PP size > 1.
@@ -1034,8 +1033,13 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather-with-optimizer-step only supported with distributed optimizer'
         assert args.overlap_param_gather, \
             'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
-        assert args.virtual_pipeline_model_parallel_size is not None, \
-            '--overlap-param-gather-with-optimizer-step only supported with interleaved pipeline parallelism'
+        if args.hybrid_layer_pattern is not None:
+            assert args.virtual_pipeline_model_parallel_size is not None, (
+                '--overlap-param-gather-with-optimizer-step only supported with '
+                'interleaved pipeline parallelism'
+            )
+        # Otherwise, the interleaved-pipeline requirement is checked in pretrain after
+        # Python model builders have had a chance to infer direct VPP splits.
         assert not args.use_dist_ckpt, \
             '--overlap-param-gather-with-optimizer-step not supported with distributed checkpointing yet'
 
@@ -2714,8 +2718,7 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.config import TrainingConfig
-    from megatron.training.config import ProfilingConfig
+    from megatron.training.config import ProfilingConfig, TrainingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig)
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -3582,7 +3585,7 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
+        from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
     except (ImportError, ModuleNotFoundError):
         HAVE_KITCHEN = False
