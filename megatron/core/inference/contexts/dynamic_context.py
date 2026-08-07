@@ -2901,29 +2901,29 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Returns:
             Tuple of (matched_block_ids, num_blocks_from_pool,
-                      chunk_start_block, overall_required_blocks,
+                      already_allocated_blocks, overall_required_blocks,
                       prefix_skip_tokens, effective_prefill_chunk_length).
         """
         finished = req.finished_chunk_token_count
-        chunk_start_block = (finished + self.block_size_tokens - 1) // self.block_size_tokens
+        already_allocated_blocks = (finished + self.block_size_tokens - 1) // self.block_size_tokens
         overall_required_blocks = (
             finished + prefill_chunk_length + self.block_size_tokens - 1
         ) // self.block_size_tokens
 
         # Fast path: skip all prefix matching when disabled.
         if not self.enable_prefix_caching:
-            num_blocks_from_pool = max(0, overall_required_blocks - chunk_start_block)
+            num_blocks_from_pool = max(0, overall_required_blocks - already_allocated_blocks)
             return (
                 [],
                 num_blocks_from_pool,
-                chunk_start_block,
+                already_allocated_blocks,
                 overall_required_blocks,
                 0,
                 prefill_chunk_length,
             )
 
         matched_block_ids, _ = self._find_kv_match_count(
-            req, chunk_start_block, overall_required_blocks
+            req, already_allocated_blocks, overall_required_blocks
         )
         num_matched = len(matched_block_ids)
 
@@ -2938,7 +2938,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # already had Mamba state restored during the first chunk.
         if self.is_hybrid_model and self.mamba_slot_allocator is not None and finished == 0:
             num_mamba_matched = self._find_mamba_match_count(
-                req, chunk_start_block, chunk_start_block + num_matched
+                req, already_allocated_blocks, already_allocated_blocks + num_matched
             )
             if record_mamba_match:
                 req._mamba_num_matched_blocks = num_mamba_matched
@@ -2975,13 +2975,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(
-            0, overall_required_blocks - chunk_start_block - num_matched
+            0, overall_required_blocks - already_allocated_blocks - num_matched
         )
 
         return (
             matched_block_ids,
             num_blocks_from_pool,
-            chunk_start_block,
+            already_allocated_blocks,
             overall_required_blocks,
             prefix_skip_tokens,
             effective_prefill_chunk_length,
@@ -3103,6 +3103,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefix_skip_tokens,
             effective_prefill_chunk_length,
         ) = self._compute_prefix_match(req, prefill_chunk_length, record_mamba_match=True)
+        # _compute_prefix_match calls this already_allocated_blocks, which describes
+        # the state on entry. Below, this chunk's own blocks have been allocated by
+        # the time it is read, so what it denotes here is the block position where
+        # this chunk's blocks begin -- i.e. ceil(finished_chunk_token_count / block).
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
