@@ -125,6 +125,32 @@ class TestParallelTransformerLayer:
 
             assert torch.equal(outputs[1][0], outputs[4][0])
 
+            # Full-prefix eval without a cache context should use the same prefill chunks.
+            outputs = {}
+            mlp_input_sequence_lengths = {}
+            with InferenceMode.active():
+                for mlp_chunks_for_prefill in [1, 4]:
+                    transformer_config.mlp_chunks_for_prefill = mlp_chunks_for_prefill
+                    observed_sequence_lengths = []
+                    handle = parallel_transformer_layer.mlp.register_forward_pre_hook(
+                        lambda _module, args: observed_sequence_lengths.append(args[0].shape[0])
+                    )
+                    hidden_states, context = parallel_transformer_layer(
+                        hidden_states=input_hidden_states,
+                        attention_mask=attention_mask,
+                        inference_context=None,
+                    )
+                    handle.remove()
+                    assert hidden_states.shape[0] == sequence_length
+                    assert hidden_states.shape[1] == micro_batch_size
+                    assert hidden_states.shape[2] == hidden_size
+                    outputs[mlp_chunks_for_prefill] = (hidden_states, context)
+                    mlp_input_sequence_lengths[mlp_chunks_for_prefill] = observed_sequence_lengths
+
+            assert torch.equal(outputs[1][0], outputs[4][0])
+            assert mlp_input_sequence_lengths[1] == [sequence_length]
+            assert mlp_input_sequence_lengths[4] == [sequence_length // 4] * 4
+
             # Test chunked training: chunks=1 vs chunks=4 should be identical
             parallel_transformer_layer.train()
             outputs = {}
