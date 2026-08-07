@@ -2343,7 +2343,7 @@ def get_batch_on_this_tp_rank(
 def _get_batch_on_this_cp_rank_per_document_balancing(
     batch: dict[str, torch.Tensor],
     cp_group: torch.distributed.ProcessGroup,
-    cp_partition_mode: Optional[str] = None,
+    cp_partition_mode: Optional[str] = "zigzag",
 ):
     """Partition a batch across CP ranks with per-document zigzag load balancing.
 
@@ -2405,7 +2405,7 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
 def _get_batch_on_this_cp_rank_per_sequence_balancing(
     batch: dict[str, torch.Tensor],
     cp_group: torch.distributed.ProcessGroup,
-    cp_partition_mode: Optional[str] = None,
+    cp_partition_mode: Optional[str] = "zigzag",
 ):
     """Partition a batch across CP ranks with per-sequence zigzag load balancing.
 
@@ -2570,7 +2570,7 @@ def get_batch_on_this_cp_rank(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
     use_per_sequence_balancing: bool = False,
-    cp_partition_mode: Optional[str] = None,
+    cp_partition_mode: Optional[str] = "zigzag",
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
@@ -2599,6 +2599,8 @@ def get_batch_on_this_cp_rank(
             even when ``cu_seqlens`` is present (e.g., for inter-document
             masking where document lengths are not divisible by
             ``2 * cp_size``).
+        cp_partition_mode (Optional[str]): Runtime CP layout used to partition
+            sequence tensors. Defaults to ``"zigzag"`` for legacy callers.
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
@@ -2639,7 +2641,7 @@ def get_thd_batch_on_this_cp_rank(
     max_seqlen: torch.Tensor,
     cp_size: Optional[int] = None,
     cp_rank: Optional[int] = None,
-    cp_partition_mode: Optional[str] = None,
+    cp_partition_mode: Optional[str] = "zigzag",
 ):
     """Slice each sub-sample in a packed sample batch input along
     sequence dimension into multiple chunks, which are parallelized

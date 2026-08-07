@@ -20,39 +20,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
-def _call_rope_helper(helper, *args, **kwargs):
-    """Call a RoPE helper while tolerating small API drift across MCore versions."""
-    from inspect import signature
-
-    supported = signature(helper).parameters
-    if kwargs.get("cp_partition_mode", "zigzag") != "zigzag":
-        required = ("cp_partition_mode", "max_seqlen")
-        missing = [name for name in required if name not in supported]
-        if missing:
-            raise RuntimeError(
-                f"{helper.__name__} does not support {missing}, so it cannot safely "
-                f"apply RoPE for cp_partition_mode={kwargs['cp_partition_mode']!r}."
-            )
-        if kwargs.get("max_seqlen") is None:
-            raise RuntimeError(
-                f"{helper.__name__} requires max_seqlen for "
-                f"cp_partition_mode={kwargs['cp_partition_mode']!r}."
-            )
-    return helper(*args, **{k: v for k, v in kwargs.items() if k in supported})
-
-
 def _apply_rope_fp32(
-    t,
-    freqs,
-    config,
-    cu_seqlens=None,
-    mscale=1.0,
-    cp_group=None,
-    mla_rotary_interleaved=False,
-    inverse=False,
-    mla_output_remove_interleaving=False,
-    cp_partition_mode="zigzag",
-    max_seqlen=None,
+    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
 ):
     """Apply rotary positional embedding in fp32, then cast back to original dtype.
 
@@ -106,17 +75,14 @@ def _apply_rope_fp32(
         cu_seqlens=cu_seqlens,
         mscale=mscale,
         cp_group=cp_group,
-        mla_rotary_interleaved=mla_rotary_interleaved,
-        inverse=inverse,
-        mla_output_remove_interleaving=mla_output_remove_interleaving,
-        cp_partition_mode=cp_partition_mode,
+        mla_rotary_interleaved=getattr(config, 'multi_latent_attention', False),
         max_seqlen=max_seqlen,
     )
     return out.to(orig_dtype)
 
 
 def _apply_rope_fp32_no_cp(
-    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, **kwargs
+    t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
 ):
     """Same as ``_apply_rope_fp32`` but forces CP-size=1.
 
@@ -129,7 +95,13 @@ def _apply_rope_fp32_no_cp(
     nvtx_range_push(range_name)
     try:
         return _apply_rope_fp32(
-            t, freqs, config, cu_seqlens, mscale, cp_group=_NO_CP_GROUP, **kwargs,
+            t,
+            freqs,
+            config,
+            cu_seqlens,
+            mscale,
+            cp_group=_NO_CP_GROUP,
+            max_seqlen=max_seqlen,
         )
     finally:
         nvtx_range_pop(range_name)
