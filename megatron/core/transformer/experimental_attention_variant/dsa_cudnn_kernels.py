@@ -224,19 +224,19 @@ def run_fused_dsa_attention(
         return None
     if not torch.is_grad_enabled():
         loss_coeff = 0.0
-    # build_dsattention_forward_mask emits explicit varlen bounds even for the plain (non-packed,
-    # non-CP) causal case and flags them via ``varlen_is_plain_causal``. Those bounds are exactly
-    # equivalent to the no-varlen causal path the dense fused indexer loss was written for, so
-    # normalize them back to None: plain causal then takes the same fused path (relying on the
-    # kernel's internal causal masking) it took before that mask change, instead of declining
-    # dense loss and falling back to the slow reference-loss path. The flag carries the mask
-    # builder's structural knowledge, so we avoid the per-forward host/device sync a ``torch.equal``
-    # bounds comparison would force on this common path. Genuine packed/CP/custom-position varlen
-    # is left untouched (``varlen_is_plain_causal`` is False there) and is gated below, where it
-    # would otherwise trip the padded-row assert in FusedIndexerSparseAttnFunc.forward.
-    if cp_size == 1 and packed_seq_params is None and varlen_is_plain_causal:
-        varlen_starts = None
-        varlen_ends = None
+    # Plain causal bounds are equivalent to the no-varlen causal path the dense fused indexer
+    # loss was written for, so normalize them away: plain causal then takes the same fused path
+    # (relying on the kernel's internal causal masking) it took before that mask change, instead
+    # of declining dense loss and falling back to the slow reference-loss path. Genuine
+    # packed/CP/custom-position varlen is left untouched and is gated below, where it would
+    # otherwise trip the padded-row assert in FusedIndexerSparseAttnFunc.forward.
+    varlen_starts, varlen_ends = _normalize_plain_causal_bounds(
+        varlen_starts,
+        varlen_ends,
+        cp_size=cp_size,
+        packed_seq_params=packed_seq_params,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+    )
     has_varlen = varlen_starts is not None or varlen_ends is not None or key_positions is not None
     if has_varlen:
         if varlen_starts is None or varlen_ends is None:
@@ -413,6 +413,36 @@ def _bytes_to_chunk_rows(n_rows: int, bytes_per_row: int, max_bytes: int, alignm
 def _causal_seq_lens(q_positions: Tensor, ratio: int, sk: int) -> Tensor:
     """Per-query causal key length under the indexer ``ratio``, clamped to ``sk``."""
     return ((q_positions + 1) // ratio).clamp(max=sk)
+
+
+def _normalize_plain_causal_bounds(
+    starts: Optional[Tensor],
+    ends: Optional[Tensor],
+    *,
+    cp_size: int,
+    packed_seq_params: Optional["PackedSeqParams"],
+    varlen_is_plain_causal: bool,
+) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+    """Drop plain-causal varlen bounds so the single-kernel indexer scorer stays reachable.
+
+    ``build_dsattention_forward_mask`` emits explicit bounds even for the plain
+    (non-packed, non-CP) causal case and flags them via ``varlen_is_plain_causal``.
+    Those bounds are ``starts = 0`` and ``ends = arange(1, sq + 1).clamp(max=sk)``,
+    which is exactly what :func:`_causal_seq_lens` reconstructs internally under
+    ``_INDEXER_RATIO == 1``. Returning ``None`` here is therefore a no-op on
+    semantics, but it lets :func:`_indexer_topk_bshd` take its ``starts is None``
+    branch, which reaches the fused single-kernel ``indexer_forward_wrapper``
+    instead of the per-head scoring loop in
+    :func:`_compute_indexer_scores_chunk_with_global_rows`.
+
+    The flag carries the mask builder's structural knowledge, so we avoid the
+    per-forward host/device sync that a ``torch.equal`` bounds comparison would
+    force on this common path. Genuine packed/CP/custom-position varlen is left
+    untouched (``varlen_is_plain_causal`` is False there).
+    """
+    if cp_size == 1 and packed_seq_params is None and varlen_is_plain_causal:
+        return None, None
+    return starts, ends
 
 
 def _topk_tie_break_bias(positions: Tensor, key_count: int, dtype: torch.dtype) -> Tensor:
@@ -1359,6 +1389,7 @@ def run_fused_qk_topk(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Run the cuDNN fused indexer and return top-k indices for split DSA."""
     _assert_supported_indexer_scoring(use_relu)
@@ -1369,8 +1400,17 @@ def run_fused_qk_topk(
         return None
     if q.size(2) != weights.size(2) or q.size(3) != k.size(2):
         return None
+    # Guard first: bounds the caller could not build at all are a genuine decline. Only
+    # bounds that exist and are plain causal are normalized away below.
     if starts is None or ends is None:
         return None
+    starts, ends = _normalize_plain_causal_bounds(
+        starts,
+        ends,
+        cp_size=cp_size,
+        packed_seq_params=packed_seq_params,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+    )
 
     packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q, packed_max_seqlen_k = (
         _get_multi_packed_cp_thd_metadata(
@@ -1426,6 +1466,7 @@ def run_fused_qk_topk_with_loss(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
 ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
     """Run cuDNN fused indexer and sparse indexer loss for split DSA."""
     del block_size
@@ -1445,8 +1486,17 @@ def run_fused_qk_topk_with_loss(
         return None
     if query.size(3) != key.size(3):
         return None
+    # Guard first: bounds the caller could not build at all are a genuine decline. Only
+    # bounds that exist and are plain causal are normalized away below.
     if starts is None or ends is None:
         return None
+    starts, ends = _normalize_plain_causal_bounds(
+        starts,
+        ends,
+        cp_size=cp_size,
+        packed_seq_params=packed_seq_params,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+    )
 
     latent_v_channels = int(getattr(config, "kv_lora_rank", 0) or 0)
     if latent_v_channels <= 0:
@@ -1472,8 +1522,8 @@ def run_fused_qk_topk_with_loss(
         loss_coeff,
         calculate_per_token_loss,
         latent_v_channels,
-        starts.contiguous(),
-        ends.contiguous(),
+        starts.contiguous() if starts is not None else None,
+        ends.contiguous() if ends is not None else None,
         query_valid_rows,
         use_local_indexer_varlen,
         single_packed_thd_sequence,
@@ -2420,8 +2470,8 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         loss_coeff: float,
         calculate_per_token_loss: bool,
         d_v: int,
-        varlen_starts: Tensor,
-        varlen_ends: Tensor,
+        varlen_starts: Optional[Tensor],
+        varlen_ends: Optional[Tensor],
         query_valid_rows: Optional[Tensor],
         use_local_indexer_varlen: bool,
         single_packed_thd_sequence: bool,

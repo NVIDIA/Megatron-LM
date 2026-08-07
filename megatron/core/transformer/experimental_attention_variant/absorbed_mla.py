@@ -38,7 +38,13 @@ from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
+from megatron.core.utils import (
+    deprecate_inference_params,
+    dsa_mark_begin,
+    dsa_mark_end,
+    get_pg_size,
+    is_te_min_version,
+)
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -496,6 +502,7 @@ class AbsorbedMLASelfAttention(Attention):
             cu_seqlens_q = cu_seqlens_kv = None
             rope_max_seqlen_q = rope_max_seqlen_kv = None
 
+        dsa_mark_begin("mla.down_proj")
         # =========================================
         # Q down projection
         # =========================================
@@ -568,6 +575,8 @@ class AbsorbedMLASelfAttention(Attention):
         # manually.
         if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
             kv_compressed = gather_from_sequence_parallel_region(kv_compressed, group=self.tp_group)
+
+        dsa_mark_end("mla.down_proj")
 
         # =========================================
         # QKV up projection and RoPE apply
@@ -706,6 +715,7 @@ class AbsorbedMLASelfAttention(Attention):
 
             return q_absorbed, kv_compressed
 
+        dsa_mark_begin("mla.up_proj_absorb")
         if self.recompute_up_proj:
             quantization = self.config.fp8 or self.config.fp4
             assert not quantization, "FP8/FP4 is not supported for AbsorbedMLA"
@@ -718,6 +728,8 @@ class AbsorbedMLASelfAttention(Attention):
             q_absorbed, kv_compressed = qkv_up_proj_and_rope_apply(
                 q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
             )
+
+        dsa_mark_end("mla.up_proj_absorb")
 
         return q_absorbed, kv_compressed, q_compressed
 
