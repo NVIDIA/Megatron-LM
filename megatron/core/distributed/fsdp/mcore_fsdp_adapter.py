@@ -57,6 +57,7 @@ try:
         Flat,
         Placements,
         fully_shard,
+        fully_shard_context,
     )
 
     HAVE_MEGATRON_FSDP = True
@@ -563,19 +564,22 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         placements = Placements(
             dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
         )
-        for submodule in reversed(list(module.modules())):
-            if submodule is module:
-                # The root is always sharded after selected child units so it is not
-                # wrapped twice when its type also appears in fsdp_unit_modules.
-                continue
-            if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
-                fully_shard(
-                    submodule,
-                    mesh=mesh,
-                    placements=placements,
-                    mixed_precision_policy=self.mp_policy,
-                )
-        fully_shard(module, mesh=mesh, placements=placements, mixed_precision_policy=self.mp_policy)
+        with fully_shard_context(device=device):
+            for submodule in reversed(list(module.modules())):
+                if submodule is module:
+                    # The root is always sharded after selected child units so it is not
+                    # wrapped twice when its type also appears in fsdp_unit_modules.
+                    continue
+                if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
+                    fully_shard(
+                        submodule,
+                        mesh=mesh,
+                        placements=placements,
+                        mixed_precision_policy=self.mp_policy,
+                    )
+            fully_shard(
+                module, mesh=mesh, placements=placements, mixed_precision_policy=self.mp_policy
+            )
         super().__init__(config=config, module=module)
 
     @staticmethod
