@@ -76,7 +76,7 @@ class FsdpParameterGroup:
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
         reduce_scatter_stream: torch.cuda.Stream,
-        use_symm_mem: bool = False,
+        use_symmetric_memory: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -87,7 +87,7 @@ class FsdpParameterGroup:
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
             reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
-            use_symm_mem: Allocate communication staging buffers from PyTorch's
+            use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
         """
         if not parameters:
@@ -128,7 +128,7 @@ class FsdpParameterGroup:
             placements=main_weight_placements,
         )
 
-        if use_symm_mem:
+        if use_symmetric_memory:
             # PyTorch caches this in C++ and returns early when the backend is already NCCL.
             symm_mem.set_backend("NCCL")
             self._symm_mem_pool = symm_mem.get_mem_pool(self.main_weight.device)
