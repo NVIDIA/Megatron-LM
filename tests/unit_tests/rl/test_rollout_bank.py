@@ -97,8 +97,11 @@ def make_token_group(members, *, batch_id=0, index_in_batch=0):
 def sample_group(batch_id=0):
     return make_token_group(
         [
-            ([[1, 2, 3], [4, 5]], [[-0.1, -0.2, -0.3], [-0.4, -0.5]],
-             [[False, True, True], [True, True]]),
+            (
+                [[1, 2, 3], [4, 5]],
+                [[-0.1, -0.2, -0.3], [-0.4, -0.5]],
+                [[False, True, True], [True, True]],
+            ),
             ([[7, 8]], [[-1.5, -2.5]], [[True, True]]),
         ],
         batch_id=batch_id,
@@ -108,9 +111,15 @@ def sample_group(batch_id=0):
 def text_group():
     return RolloutGroup(
         rollouts=[
-            Rollout(trajectory=["hello world"], reward=0.5, env_id="t",
-                    policy_epoch=[[(0, 0)]], kv_cache_epoch=[[(0, 0)]], num_evictions=[0]),
-        ],
+            Rollout(
+                trajectory=["hello world"],
+                reward=0.5,
+                env_id="t",
+                policy_epoch=[[(0, 0)]],
+                kv_cache_epoch=[[(0, 0)]],
+                num_evictions=[0],
+            )
+        ]
     )
 
 
@@ -130,10 +139,7 @@ class TestRoundTrip:
 
     @pytest.mark.parametrize(
         "invalid_version",
-        [
-            pytest.param(None, id="missing"),
-            pytest.param(_FORMAT_VERSION + 1, id="unsupported"),
-        ],
+        [pytest.param(None, id="missing"), pytest.param(_FORMAT_VERSION + 1, id="unsupported")],
     )
     def test_restore_rejects_incompatible_manifest_version(self, tmp_path, invalid_version):
         bank = RolloutBank(str(tmp_path))
@@ -154,10 +160,7 @@ class TestRoundTrip:
 
     @pytest.mark.parametrize(
         "invalid_version",
-        [
-            pytest.param(None, id="missing"),
-            pytest.param(_FORMAT_VERSION + 1, id="unsupported"),
-        ],
+        [pytest.param(None, id="missing"), pytest.param(_FORMAT_VERSION + 1, id="unsupported")],
     )
     def test_restore_rejects_incompatible_ledger_version(self, tmp_path, invalid_version):
         bank = RolloutBank(str(tmp_path))
@@ -245,9 +248,7 @@ class TestRoundTrip:
 
 
 class TestDurability:
-    def test_manifest_replace_is_followed_by_bank_directory_fsync(
-        self, tmp_path, monkeypatch
-    ):
+    def test_manifest_replace_is_followed_by_bank_directory_fsync(self, tmp_path, monkeypatch):
         bank = RolloutBank(str(tmp_path))
         events = []
         real_replace = os.replace
@@ -258,29 +259,21 @@ class TestDurability:
 
         monkeypatch.setattr(os, "replace", replace)
         monkeypatch.setattr(
-            rollout_bank,
-            "_fsync_directory",
-            lambda path: events.append(f"dir:{path}"),
+            rollout_bank, "_fsync_directory", lambda path: events.append(f"dir:{path}")
         )
 
-        bank._write_manifest_atomic(
-            {"trained_through": 1, "segments": [], "compacted_at": 0}
-        )
+        bank._write_manifest_atomic({"trained_through": 1, "segments": [], "compacted_at": 0})
 
         assert events == ["replace", f"dir:{tmp_path}"]
 
-    def test_first_append_fsyncs_new_entries_after_file_contents(
-        self, tmp_path, monkeypatch
-    ):
+    def test_first_append_fsyncs_new_entries_after_file_contents(self, tmp_path, monkeypatch):
         bank = RolloutBank(str(tmp_path))
         bank.set_collection(0)
         segment = tmp_path / _segment_name(0)
         events = []
         monkeypatch.setattr(os, "fsync", lambda fd: events.append("file"))
         monkeypatch.setattr(
-            rollout_bank,
-            "_fsync_directory",
-            lambda path: events.append(f"dir:{path}"),
+            rollout_bank, "_fsync_directory", lambda path: events.append(f"dir:{path}")
         )
 
         bank.append(sample_group())
@@ -291,15 +284,11 @@ class TestDurability:
         bank.append(sample_group())
         assert events == ["file"] * 4
 
-    def test_new_segment_is_durable_before_manifest_publication(
-        self, tmp_path, monkeypatch
-    ):
+    def test_new_segment_is_durable_before_manifest_publication(self, tmp_path, monkeypatch):
         bank = RolloutBank(str(tmp_path))
         events = []
         monkeypatch.setattr(
-            rollout_bank,
-            "_fsync_directory",
-            lambda path: events.append(f"dir:{path}"),
+            rollout_bank, "_fsync_directory", lambda path: events.append(f"dir:{path}")
         )
         monkeypatch.setattr(
             bank,
@@ -311,9 +300,7 @@ class TestDurability:
 
         assert events == [f"dir:{tmp_path}", f"manifest:{_segment_name(7)}"]
 
-    def test_compacted_segment_is_durable_before_manifest_publication(
-        self, tmp_path, monkeypatch
-    ):
+    def test_compacted_segment_is_durable_before_manifest_publication(self, tmp_path, monkeypatch):
         bank = RolloutBank(str(tmp_path))
         bank.set_collection(1)
         events = []
@@ -326,9 +313,7 @@ class TestDurability:
 
         monkeypatch.setattr(os, "replace", replace)
         monkeypatch.setattr(
-            rollout_bank,
-            "_fsync_directory",
-            lambda path: events.append(f"dir:{path}"),
+            rollout_bank, "_fsync_directory", lambda path: events.append(f"dir:{path}")
         )
         monkeypatch.setattr(bank, "restore", lambda iteration: [])
         monkeypatch.setattr(bank, "_rewrite_segment", lambda *args: None)
@@ -352,9 +337,7 @@ class TestDurability:
         events = []
         monkeypatch.setattr(os, "fsync", lambda fd: events.append("file"))
         monkeypatch.setattr(
-            rollout_bank,
-            "_fsync_directory",
-            lambda path: events.append(f"dir:{path}"),
+            rollout_bank, "_fsync_directory", lambda path: events.append(f"dir:{path}")
         )
 
         bank.mark_consumed("gen-000000/0", 1)
@@ -423,9 +406,9 @@ class TestMarkerFilter:
     def test_marker_filter_rules(self, tmp_path):
         bank = RolloutBank(str(tmp_path))
         bank.set_collection(5)
-        trained = bank.append(sample_group())   # consumed at 5 <= T=10 -> discard
+        trained = bank.append(sample_group())  # consumed at 5 <= T=10 -> discard
         rolled_back = bank.append(sample_group())  # consumed at 12 > T=10 -> restore
-        _never = bank.append(sample_group())     # no marker -> restore
+        _never = bank.append(sample_group())  # no marker -> restore
         bank.mark_consumed(trained, 5)
         bank.mark_consumed(rolled_back, 12)
         bank.close()
