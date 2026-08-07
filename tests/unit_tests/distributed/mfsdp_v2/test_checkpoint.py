@@ -15,6 +15,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
     fully_shard,
+    fully_shard_context,
     fully_shard_optimizer,
     load_checkpoint,
     save_checkpoint,
@@ -47,8 +48,9 @@ def _build_sharded(
         # source; a correct load must overwrite them.
         for parameter in model.parameters():
             nn.init.zeros_(parameter)
-    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.02)
     # main_weight is fp32 by default, so a bf16 model feeds the fp32 optimizer bf16 grads; the
     # adapter casts them around each step.
