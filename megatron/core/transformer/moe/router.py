@@ -1033,12 +1033,21 @@ class InferenceTopKRouter(TopKRouter):
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
+    ):
         """Simplified forward pass for inference - returns dense tensors only.
 
         Args:
             input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Not used in inference.
+            seq_idx (torch.Tensor, optional): Per-token contiguous sequence id, shape
+                [num_tokens]. Only threaded through to the training/non-inference
+                fallback path (``TopKRouter.forward``, e.g. for SeqTopK routing); the
+                compiled inference path always applies standard per-token top-k.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -1047,6 +1056,16 @@ class InferenceTopKRouter(TopKRouter):
         """
 
         if not InferenceMode.is_active():
-            return super().forward(input, padding_mask)
+            return super().forward(input, padding_mask, seq_idx=seq_idx)
 
+        # The inference path always uses standard per-token top-k; a provided seq_idx (a
+        # SeqTopK request) is intentionally ignored here. Warn once so callers do not
+        # silently assume SeqTopK ran during inference.
+        if seq_idx is not None and self.topk_mode == "seq_topk":
+            warnings.warn(
+                "SeqTopK routing was requested (seq_idx provided), but the inference "
+                "TopKRouter path uses standard per-token top-k and ignores seq_idx. "
+                "Online SeqTopK for inference (prefill/decode) is not yet implemented; "
+                "falling back to standard top-k for this iteration."
+            )
         return self._forward(input, padding_mask)
