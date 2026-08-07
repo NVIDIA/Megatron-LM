@@ -49,10 +49,14 @@ class TinyModel(nn.Module):
 class CheckpointedTinyModel(TinyModel):
     """Tiny model that activation-checkpoints each shardable module."""
 
+    def __init__(self, use_reentrant: bool) -> None:
+        super().__init__()
+        self.use_reentrant = use_reentrant
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run each linear layer through non-reentrant activation checkpointing."""
-        x = checkpoint(self.fc1, x, use_reentrant=False)
-        return checkpoint(self.fc2, self.relu(x), use_reentrant=False)
+        """Run each linear layer through activation checkpointing."""
+        x = checkpoint(self.fc1, x, use_reentrant=self.use_reentrant)
+        return checkpoint(self.fc2, self.relu(x), use_reentrant=self.use_reentrant)
 
 
 class NestedModel(nn.Module):
@@ -214,7 +218,8 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
     )
 
 
-def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup):
+@pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
+def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup, use_reentrant):
     """Activation recomputation should leave every FSDP module resharded.
 
     Backward completes ``fc2`` before recomputing ``fc1``. Without suppressing
@@ -226,7 +231,7 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup)
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (world_size,))
-    model = CheckpointedTinyModel().to(device)
+    model = CheckpointedTinyModel(use_reentrant=use_reentrant).to(device)
     fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
     fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     fully_shard(model, mesh=mesh, placements=_flat_placements())
