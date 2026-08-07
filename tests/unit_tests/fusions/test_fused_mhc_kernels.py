@@ -260,13 +260,13 @@ class TestNativeHAggregate:
         torch.testing.assert_close(xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
         torch.testing.assert_close(hf.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
 
-    def test_torch_fallback_grad_h_accumulates_in_fp32(self):
-        """The torch fallback must reduce grad_h exactly like its fp32 siblings.
+    def test_torch_fallback_grad_h_upcasts_before_the_product(self):
+        """The torch fallback must compute grad_h exactly like its fp32 siblings.
 
         ``FusedHAggregateInto.backward`` routes here whenever cuTile is absent,
-        which includes ordinary Triton-only builds, so a bf16 reduction over the
-        hidden dimension would make the numerics of a run depend on whether
-        cuTile happens to be installed.
+        which includes ordinary Triton-only builds, so a precision difference
+        here would make the numerics of a run depend on whether cuTile happens to
+        be installed.
         """
         from megatron.core.fusions.fused_mhc_kernels import _torch_h_aggregate_bwd
 
@@ -287,25 +287,21 @@ class TestNativeHAggregate:
         # Same reduction, same inputs, same precision -> bitwise identical.
         assert torch.equal(fallback_grad_h, hr.grad)
 
-        # Pin the precision against an fp64 reference. The absolute bound is
-        # loose on purpose -- accumulating in fp32 and rounding once to bf16
-        # leaves roughly one bf16 ulp, while the size of a bf16 reduction's
-        # error depends on the reduction tree and so is not a stable constant to
-        # assert against. The discriminating check is the comparison: a bf16
-        # accumulation over C is systematically worse (the cuTile kernel's
-        # comment puts it at ~3x), and that ordering is what would flip if the
-        # upcast were dropped.
+        # What the upcast buys, measured against an fp64 reference. Note this
+        # compares the *pre-cast* reductions: grad_h is returned in h_pre's dtype,
+        # and that final bf16 rounding is ~one ulp of the result, which swamps the
+        # difference the upcast makes. It is also specifically the elementwise
+        # product that matters -- torch.sum already accumulates a bf16 input in
+        # fp32, so rounding each go*x product to bf16 first is the whole cost.
         reference = torch.sum(grad_out.unsqueeze(2).double() * x_data.double(), dim=-1)
-        scale = reference.abs().max()
+        upcast = torch.sum(grad_out.unsqueeze(2).float() * x_data.float(), dim=-1)
+        bf16_product = torch.sum(grad_out.unsqueeze(2) * x_data, dim=-1)
 
-        fp32_error = (fallback_grad_h.double() - reference).abs().max()
-        assert fp32_error < 0.01 * scale, f"fp32 accumulation drifted: {fp32_error} vs {scale}"
-
-        bf16_accumulated = torch.sum(grad_out.unsqueeze(2) * x_data, dim=-1)
-        bf16_error = (bf16_accumulated.double() - reference).abs().max()
-        assert bf16_error > fp32_error, (
-            f"bf16 accumulation ({bf16_error}) is no worse than fp32 ({fp32_error}), so this "
-            "test no longer discriminates -- check the reduction actually upcasts."
+        upcast_error = (upcast.double() - reference).abs().max()
+        bf16_error = (bf16_product.double() - reference).abs().max()
+        assert bf16_error > 10 * upcast_error, (
+            f"a bf16 product ({bf16_error}) is no longer materially worse than an fp32 one "
+            f"({upcast_error}), so this test no longer discriminates."
         )
 
 

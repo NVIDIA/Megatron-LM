@@ -81,6 +81,7 @@ class NativeHAggregateInto(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
+        """Aggregate into caller-owned ``out`` after validating its contract."""
         if out.shape != x.shape[:2] + x.shape[3:]:
             raise ValueError(
                 f"H-aggregate output shape {tuple(out.shape)} does not match "
@@ -105,15 +106,17 @@ class NativeHAggregateInto(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
+        """Back-propagate the aggregation, accumulating grad_h in fp32."""
         x, h_pre = ctx.saved_tensors
         grad_output_expanded = grad_output.unsqueeze(2)
         grad_x = grad_output_expanded * h_pre.unsqueeze(-1)
         # grad_h reduces over the hidden dimension, thousands of elements wide,
         # while the forward only reduces over the handful of residual streams.
-        # Accumulate it in fp32: h_pre carries the residual mixing coefficients,
-        # so error here shifts how streams combine in every layer, and casting
-        # after a low-precision sum cannot recover what the sum already lost.
-        # The fused sibling accumulates in fp32 for the same reason.
+        # Upcast both operands first: torch.sum already accumulates bf16 in fp32,
+        # but rounding each product to bf16 before that reduction does lose
+        # accuracy, and h_pre carries the residual mixing coefficients, so error
+        # here shifts how streams combine in every layer. The fused sibling
+        # upcasts for the same reason.
         grad_h = torch.sum(grad_output_expanded.float() * x.float(), dim=-1)
         return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype), None
 

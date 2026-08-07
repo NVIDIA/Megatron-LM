@@ -2734,11 +2734,14 @@ def _get_triton_h_post_bda_bwd():
 def _torch_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tuple[Tensor, Tensor]:
     grad_output_expanded = grad_output.unsqueeze(2)
     grad_x = grad_output_expanded * h_pre.unsqueeze(-1)
-    # Accumulate grad_h in fp32: the reduction spans the whole hidden dimension,
-    # and a bf16 product makes it ~3x noisier. The cuTile kernel
-    # (_ct_h_agg_bwd_kernel) and NativeHAggregateInto.backward both upcast for
-    # this reason, and this fallback is reachable whenever cuTile is absent --
-    # including Triton-present builds -- so it has to agree with them.
+    # Upcast both operands before the product. torch.sum already accumulates a
+    # bf16 input in fp32, so the accumulation was never the problem; what costs
+    # accuracy is rounding each go*x product to bf16 before it enters a reduction
+    # spanning the whole hidden dimension (the cuTile kernel's comment puts the
+    # result at ~3x noisier). _ct_h_agg_bwd_kernel and
+    # NativeHAggregateInto.backward upcast for the same reason, and this fallback
+    # is reachable whenever cuTile is absent -- including Triton-present builds --
+    # so it has to agree with them.
     grad_h = torch.sum(grad_output_expanded.float() * x.float(), dim=-1)
     return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype)
 
@@ -2953,6 +2956,7 @@ class FusedHAggregateInto(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: Tensor, h_pre: Tensor, out: Tensor):
+        """Aggregate into caller-owned ``out`` using the best available backend."""
         expected_shape = x.shape[:2] + x.shape[3:]
         if out.shape != expected_shape:
             raise ValueError(
@@ -2979,6 +2983,7 @@ class FusedHAggregateInto(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Run h_aggregate backward; the caller-owned output needs no grad slot."""
         x, h_pre = ctx.saved_tensors
         if is_cutile_available():
             grad_x, grad_h = _cutile_h_aggregate_bwd(grad_output, x, h_pre)
