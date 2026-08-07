@@ -986,7 +986,6 @@ class TestMHCWithCudaGraph:
         assert recorded["post_manager"] is manager
         assert recorded["mlp_manager"] is manager
         assert len(manager.checkpoints) == 1
-        assert manager.checkpoints[0].output_bridge is None
         assert manager.checkpoints[0].output_slot is not None
         assert len(manager.mhc_arena.slots) == 1
         assert recorded["graph_input"].data_ptr() == slot.data_ptr()

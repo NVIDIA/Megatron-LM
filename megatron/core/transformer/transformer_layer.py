@@ -1955,12 +1955,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         the dense attention consumer, so ``CheckpointWithoutOutput`` remains a
         real eager checkpoint rather than being bypassed during graph capture.
         """
-        return (
-            self.config.cuda_graph_impl == "transformer_engine"
-            and list(self.config.cuda_graph_modules or []) == [CudaGraphModule.attn]
-            and self.config.recompute_granularity == "selective"
-            and list(self.config.recompute_modules or []) == ["mhc"]
+        from megatron.core.transformer.mhc_recompute import (
+            uses_mhc_recompute_attn_cuda_graph_split,
         )
+
+        return uses_mhc_recompute_attn_cuda_graph_split(self.config)
 
     def _validate_mhc_recompute_attn_cuda_graph_split(self) -> None:
         """Reject unsupported variants of the initial mHC/partial-CG arena path."""

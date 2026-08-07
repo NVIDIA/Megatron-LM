@@ -1768,11 +1768,11 @@ class TECudaGraphHelper:
 
     def _uses_mhc_direct_write_arena(self):
         """Whether attention-only graphs consume eager mHC recompute outputs."""
-        return bool(
-            self.config.recompute_granularity == "selective"
-            and list(self.config.recompute_modules) == ["mhc"]
-            and list(self.config.cuda_graph_modules) == [CudaGraphModule.attn]
+        from megatron.core.transformer.mhc_recompute import (
+            uses_mhc_recompute_attn_cuda_graph_split,
         )
+
+        return uses_mhc_recompute_attn_cuda_graph_split(self.config)
 
     def _validate_mhc_static_hidden_inputs(self, sample_args):
         """Ensure aliased static inputs have disjoint [fwd, bwd] liveness windows.

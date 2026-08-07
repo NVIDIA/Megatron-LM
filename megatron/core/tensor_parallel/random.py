@@ -517,6 +517,15 @@ def _get_all_rng_states():
     generators with the clones (orphaning them from graph bookkeeping), and a
     live snapshot restored outside capture would write each state onto itself
     and silently skip the rewind.
+
+    Compatibility note: this is a behaviour change for configurations that
+    predate mHC. Any run combining a graph-safe tracker (``--te-rng-tracker`` or
+    ``use_cudagraphable_rng``) with activation recompute and non-zero dropout
+    previously restored through a live handle, which was a no-op by the time it
+    ran, so recompute drew a different dropout mask than its forward. Those runs
+    now rewind correctly and will not reproduce their prior loss curves. A
+    golden-value mismatch on such a configuration is expected and attributable
+    here.
     """
     cpu_rng_state = torch.get_rng_state()
     tracker = get_cuda_rng_tracker()
@@ -828,107 +837,6 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-class CudaGraphCheckpointBridge:
-    """Fixed-address tensors consumed by a captured checkpoint consumer.
-
-    A CUDA Graph backward replay dereferences the device addresses observed at
-    capture time. Rebinding the logical checkpoint output to recomputed storage
-    therefore cannot restore a captured consumer's activation. This descriptor
-    keeps those captured tensors separate from the logical autograd outputs and
-    materializes eager recompute values into their fixed addresses.
-
-    The descriptor is intentionally stateless with respect to a logical
-    microbatch. ``CheckpointWithoutOutput`` continues to own per-invocation
-    recompute state, while one descriptor may be reused by non-overlapping graph
-    slots.
-    """
-
-    def __init__(self, tensors: Union[torch.Tensor, tuple[torch.Tensor, ...]]):
-        if isinstance(tensors, torch.Tensor):
-            tensors = (tensors,)
-        elif not isinstance(tensors, tuple):
-            raise TypeError("CudaGraphCheckpointBridge tensors must be a Tensor or tuple")
-        if not tensors:
-            raise ValueError("CudaGraphCheckpointBridge requires at least one tensor")
-        if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
-            raise TypeError("CudaGraphCheckpointBridge only supports Tensor outputs")
-        if not all(tensor.is_cuda for tensor in tensors):
-            raise ValueError("CudaGraphCheckpointBridge tensors must be CUDA tensors")
-
-        self._tensors = tensors
-        self._data_ptrs = tuple(tensor.data_ptr() for tensor in tensors)
-
-    def validate_logical_outputs(self, outputs: tuple[torch.Tensor, ...]) -> None:
-        """Validate the logical-output contract before any storage is discarded."""
-        if len(outputs) != len(self._tensors):
-            raise ValueError(
-                "Checkpoint output/bridge arity mismatch: "
-                f"got {len(outputs)} outputs and {len(self._tensors)} bridge tensors"
-            )
-
-        for index, (logical, bridge) in enumerate(zip(outputs, self._tensors)):
-            # Storage identity via the private ``_cdata`` handle: unlike
-            # ``data_ptr()`` it also matches offset views that share one
-            # storage. Revisit if PyTorch removes this attribute.
-            if logical.untyped_storage()._cdata == bridge.untyped_storage()._cdata:
-                raise ValueError(
-                    f"Checkpoint output {index} must use different storage from its "
-                    "CUDA Graph bridge"
-                )
-            if logical.shape != bridge.shape:
-                raise ValueError(
-                    f"Checkpoint output {index} shape {tuple(logical.shape)} does not match "
-                    f"bridge shape {tuple(bridge.shape)}"
-                )
-            if logical.dtype != bridge.dtype:
-                raise ValueError(
-                    f"Checkpoint output {index} dtype {logical.dtype} does not match "
-                    f"bridge dtype {bridge.dtype}"
-                )
-            if logical.device != bridge.device:
-                raise ValueError(
-                    f"Checkpoint output {index} device {logical.device} does not match "
-                    f"bridge device {bridge.device}"
-                )
-            if logical.layout != bridge.layout:
-                raise ValueError(
-                    f"Checkpoint output {index} layout {logical.layout} does not match "
-                    f"bridge layout {bridge.layout}"
-                )
-
-    def materialize(self, outputs: tuple[torch.Tensor, ...]) -> None:
-        """Copy eager recompute values into the captured, fixed-address tensors."""
-        if len(outputs) != len(self._tensors):
-            raise ValueError(
-                "Recompute output/bridge arity mismatch: "
-                f"got {len(outputs)} outputs and {len(self._tensors)} bridge tensors"
-            )
-
-        with torch.no_grad():
-            for index, (recomputed, bridge, data_ptr) in enumerate(
-                zip(outputs, self._tensors, self._data_ptrs)
-            ):
-                if bridge.data_ptr() != data_ptr:
-                    raise RuntimeError(
-                        f"CUDA Graph bridge {index} changed address after capture: "
-                        f"expected {data_ptr}, got {bridge.data_ptr()}"
-                    )
-                if recomputed.shape != bridge.shape:
-                    raise ValueError(
-                        f"Recompute output {index} shape {tuple(recomputed.shape)} does not "
-                        f"match bridge shape {tuple(bridge.shape)}"
-                    )
-                if recomputed.dtype != bridge.dtype or recomputed.device != bridge.device:
-                    raise ValueError(
-                        f"Recompute output {index} metadata does not match its CUDA Graph bridge"
-                    )
-
-                # This restores bytes at the captured address. It deliberately
-                # does not create the producer autograd edge; the checkpoint
-                # Function propagates dR through ``recomputed`` separately.
-                bridge.copy_(recomputed.detach())
-
-
 class CheckpointManager:
     """Manage checkpoints that are recomputed together across transformer layers.
 
@@ -962,10 +870,23 @@ class CheckpointManager:
 
     def add_checkpoint(self, ckpt):
         """Add a checkpoint to the manager."""
+        from megatron.core.transformer.mhc_recompute import MHCRecomputePhase
+
         if not isinstance(ckpt, CheckpointWithoutOutput):
             raise TypeError("Expected CheckpointWithoutOutput object")
         if ckpt.outputs is None:
             raise ValueError("CheckpointWithoutOutput must call checkpoint() before adding")
+        # Make the deferred-partitioning invariant executable rather than
+        # documentary: recompute_until() filters on recompute_phase, but every
+        # checkpoint sits at BEFORE_COMBINE_BWD today, so both call sites replay
+        # the whole group. The first checkpoint registered at another phase is
+        # where that filter starts to matter -- fail there instead of quietly
+        # changing what gets replayed. See MHCRecomputePhase's TODO.
+        if ckpt.recompute_phase is not MHCRecomputePhase.BEFORE_COMBINE_BWD:
+            raise NotImplementedError(
+                "mHC recompute phase partitioning is not implemented: every checkpoint "
+                f"must register at BEFORE_COMBINE_BWD, got {ckpt.recompute_phase!r}"
+            )
         self.checkpoints.append(ckpt)
 
     def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
@@ -1066,7 +987,6 @@ class CheckpointWithoutOutput(object):
         self,
         fp8=False,
         ckpt_manager=None,
-        output_bridge=None,
         output_slot=None,
         recompute_phase=None,
     ):
@@ -1079,8 +999,6 @@ class CheckpointWithoutOutput(object):
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
-            output_bridge: Optional CudaGraphCheckpointBridge whose fixed-address
-                           tensors are read by a captured consumer backward graph.
             output_slot: Optional MHCRecomputeArenaSlot written directly by the
                          producer and consumed at its captured address.
             recompute_phase: Earliest explicit backward barrier that needs this
@@ -1090,13 +1008,8 @@ class CheckpointWithoutOutput(object):
 
         self.fp8 = bool(fp8)
         self.ckpt_manager = ckpt_manager
-        if output_bridge is not None and not isinstance(output_bridge, CudaGraphCheckpointBridge):
-            raise TypeError("output_bridge must be a CudaGraphCheckpointBridge")
-        self.output_bridge = output_bridge
         if output_slot is not None and not isinstance(output_slot, MHCRecomputeArenaSlot):
             raise TypeError("output_slot must be an MHCRecomputeArenaSlot")
-        if output_bridge is not None and output_slot is not None:
-            raise ValueError("output_bridge and output_slot are mutually exclusive")
         self.output_slot = output_slot
         self.recompute_phase = MHCRecomputePhase(
             MHCRecomputePhase.BEFORE_COMBINE_BWD if recompute_phase is None else recompute_phase
@@ -1138,8 +1051,6 @@ class CheckpointWithoutOutput(object):
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)
 
-        if self.output_bridge is not None:
-            self.output_bridge.validate_logical_outputs(self.outputs)
         if self.output_slot is not None:
             if len(self.outputs) != 1:
                 raise ValueError("mHC arena slots currently support one checkpoint output")
@@ -1190,10 +1101,6 @@ class CheckpointWithoutOutput(object):
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
 
-        if self.output_bridge is not None:
-            # Captured backward kernels keep raw bridge addresses in their launch
-            # parameters. Restore those bytes before the consumer graph replays.
-            self.output_bridge.materialize(outputs)
         if self.output_slot is not None:
             if len(outputs) != 1:
                 raise ValueError("mHC arena slots currently support one recompute output")

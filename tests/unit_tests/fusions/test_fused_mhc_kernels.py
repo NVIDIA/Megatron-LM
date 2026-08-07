@@ -271,6 +271,9 @@ class TestNativeHAggregate:
         """
         from megatron.core.fusions.fused_mhc_kernels import _torch_h_aggregate_bwd
 
+        # Seeded: this asserts on error magnitudes, so the inputs must not vary
+        # run to run.
+        torch.manual_seed(1234)
         s, b, n, C = 2, 2, 4, 2048
         x_data = _rand(s, b, n, C)
         h_data = _rand(s, b, n)
@@ -285,13 +288,26 @@ class TestNativeHAggregate:
         # Same reduction, same inputs, same precision -> bitwise identical.
         assert torch.equal(fallback_grad_h, hr.grad)
 
-        # And the fp32 accumulation is what buys the accuracy: a bf16 reduction
-        # over C=2048 lands measurably further from an fp64 reference.
+        # Pin the precision against an fp64 reference. The absolute bound is
+        # loose on purpose -- accumulating in fp32 and rounding once to bf16
+        # leaves roughly one bf16 ulp, while the size of a bf16 reduction's
+        # error depends on the reduction tree and so is not a stable constant to
+        # assert against. The discriminating check is the comparison: a bf16
+        # accumulation over C is systematically worse (the cuTile kernel's
+        # comment puts it at ~3x), and that ordering is what would flip if the
+        # upcast were dropped.
         reference = torch.sum(grad_out.unsqueeze(2).double() * x_data.double(), dim=-1)
-        bf16_accumulated = torch.sum(grad_out.unsqueeze(2) * x_data, dim=-1)
+        scale = reference.abs().max()
+
         fp32_error = (fallback_grad_h.double() - reference).abs().max()
+        assert fp32_error < 0.01 * scale, f"fp32 accumulation drifted: {fp32_error} vs {scale}"
+
+        bf16_accumulated = torch.sum(grad_out.unsqueeze(2) * x_data, dim=-1)
         bf16_error = (bf16_accumulated.double() - reference).abs().max()
-        assert fp32_error < bf16_error
+        assert bf16_error > fp32_error, (
+            f"bf16 accumulation ({bf16_error}) is no worse than fp32 ({fp32_error}), so this "
+            "test no longer discriminates -- check the reduction actually upcasts."
+        )
 
 
 class TestFusedHAggregate:

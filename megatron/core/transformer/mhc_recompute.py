@@ -20,6 +20,27 @@ import torch
 from torch import Tensor
 
 
+def uses_mhc_recompute_attn_cuda_graph_split(config) -> bool:
+    """Whether attention-only TE graphs consume eager mHC recompute outputs.
+
+    Single definition for a predicate that gates both the layer-side split
+    (``TransformerLayer._uses_mhc_recompute_attn_cuda_graph_split``) and the
+    capture-side arena validation (``TECudaGraphHelper._uses_mhc_direct_write_arena``).
+    Two spellings drift, and the failure is asymmetric: one site would raise on a
+    ``None`` field while the other silently returned False, disabling exactly the
+    static-input validation that keeps a rebound buffer from being read by a
+    captured backward.
+    """
+    from megatron.core.transformer.enums import CudaGraphModule
+
+    return (
+        config.cuda_graph_impl == "transformer_engine"
+        and list(config.cuda_graph_modules or []) == [CudaGraphModule.attn]
+        and config.recompute_granularity == "selective"
+        and list(config.recompute_modules or []) == ["mhc"]
+    )
+
+
 class MHCRecomputePhase(IntEnum):
     """Backward consumer barriers in EP 1F1B execution order.
 

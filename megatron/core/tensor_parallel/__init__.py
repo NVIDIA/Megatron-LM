@@ -32,7 +32,6 @@ from .mappings import (
 )
 from .random import (
     CheckpointWithoutOutput,
-    CudaGraphCheckpointBridge,
     checkpoint,
     convert_cuda_rng_state,
     get_cuda_rng_tracker,
@@ -77,7 +76,6 @@ __all__ = [
     "get_expert_parallel_rng_tracker_name",
     "is_graph_safe_cuda_rng_tracker",
     "CheckpointWithoutOutput",
-    "CudaGraphCheckpointBridge",
     # utils.py
     "split_tensor_along_last_dim",
     "split_tensor_into_1d_equal_chunks",
