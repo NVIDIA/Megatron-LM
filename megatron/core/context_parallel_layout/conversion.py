@@ -2,6 +2,7 @@
 
 """Tensor operations for converting between CP partition modes."""
 
+import copy
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
@@ -51,7 +52,6 @@ class CpPartitionModeConverter:
         *,
         attention_mask: Optional[torch.Tensor] = None,
         attention_bias: Optional[torch.Tensor] = None,
-        context: str,
         hidden_states: Optional[torch.Tensor] = None,
     ) -> None:
         """Reject dense attention tensors when this edge would reorder tokens."""
@@ -59,11 +59,11 @@ class CpPartitionModeConverter:
             return
         if attention_mask is not None:
             self._raise_unsupported_dense_attention(
-                "an explicit attention_mask", context=context, hidden_states=hidden_states
+                "an explicit attention_mask", hidden_states=hidden_states
             )
         if attention_bias is not None:
             self._raise_unsupported_dense_attention(
-                "attention_bias", context=context, hidden_states=hidden_states
+                "attention_bias", hidden_states=hidden_states
             )
 
     def convert(
@@ -123,18 +123,99 @@ class CpPartitionModeConverter:
         self,
         tensor_name: str,
         *,
-        context: str,
         hidden_states: Optional[torch.Tensor],
     ) -> None:
         hidden_shape = tuple(hidden_states.shape) if hidden_states is not None else None
         raise NotImplementedError(
             "Changing CP partition mode with "
-            f"{tensor_name} is not supported yet in {context}: "
+            f"{tensor_name} is not supported yet: "
             f"source={self.source_partition_mode!r}, "
             f"target={self.target_partition_mode!r}, "
             f"qkv_format={getattr(self.packed_seq_params, 'qkv_format', None)!r}, "
             f"hidden_shape={hidden_shape}."
         )
+
+
+def convert_module_input_tensors_cp_partition_mode(
+    *,
+    hidden_states: torch.Tensor,
+    packed_seq_params: Optional[Any],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    target_partition_mode: CpPartitionMode,
+    sequence_parallel: bool,
+    attention_mask: Optional[torch.Tensor] = None,
+    attention_bias: Optional[torch.Tensor] = None,
+    key_value_states: Optional[torch.Tensor] = None,
+    rotary_pos_emb: Optional[Any] = None,
+) -> Tuple[
+    torch.Tensor,
+    Optional[Any],
+    Optional[Any],
+    Optional[CpPartitionModeConverter],
+]:
+    """Convert a module's rank-local sequence tensors to a target CP layout.
+
+    This helper performs the common "entry conversion" pattern used by modules
+    that need to consume a different CP layout than their caller supplied.  It
+    returns a converter for the opposite edge so the module output can be
+    converted back to the original input layout.
+    """
+    if cp_group is None or cp_group.size() <= 1:
+        return hidden_states, rotary_pos_emb, packed_seq_params, None
+
+    source_partition_mode = getattr(packed_seq_params, "cp_partition_mode", None)
+    if source_partition_mode is None:
+        raise ValueError(
+            "PackedSeqParams.cp_partition_mode is required before module input CP layout "
+            "conversion when context parallelism is active."
+        )
+    if source_partition_mode == target_partition_mode:
+        return hidden_states, rotary_pos_emb, packed_seq_params, None
+
+    input_to_target_converter = CpPartitionModeConverter(
+        cp_group=cp_group,
+        packed_seq_params=packed_seq_params,
+        source_partition_mode=source_partition_mode,
+        target_partition_mode=target_partition_mode,
+        tp_group=tp_group,
+    )
+    input_to_target_converter.assert_no_dense_attention_inputs(
+        attention_mask=attention_mask,
+        attention_bias=attention_bias,
+        hidden_states=hidden_states,
+    )
+    if key_value_states is not None:
+        raise NotImplementedError(
+            "Changing CP partition mode with cross-attention key/value states is not supported "
+            f"yet: source={source_partition_mode!r}, target={target_partition_mode!r}."
+        )
+    hidden_states = input_to_target_converter.convert(
+        hidden_states,
+        seq_dim=0,
+        sequence_parallel=sequence_parallel,
+    )
+    rotary_pos_emb = input_to_target_converter.convert_rank_local_rotary(
+        rotary_pos_emb, seq_dim=0
+    )
+
+    local_packed_seq_params = packed_seq_params
+    if packed_seq_params is not None:
+        local_packed_seq_params = copy.copy(packed_seq_params)
+        local_packed_seq_params.cp_partition_mode = target_partition_mode
+    target_to_input_converter = CpPartitionModeConverter(
+        cp_group=cp_group,
+        packed_seq_params=local_packed_seq_params,
+        source_partition_mode=target_partition_mode,
+        target_partition_mode=source_partition_mode,
+        tp_group=tp_group,
+    )
+    return (
+        hidden_states,
+        rotary_pos_emb,
+        local_packed_seq_params,
+        target_to_input_converter,
+    )
 
 
 def zigzag_to_contiguous_chunks(

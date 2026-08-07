@@ -799,7 +799,6 @@ class HybridStack(MegatronModule):
 
         current_to_preferred_converter.assert_no_dense_attention_inputs(
             attention_mask=attention_mask,
-            context=f"{type(self).__name__}: local_index={local_index}",
             hidden_states=hidden_states,
         )
         hidden_states = current_to_preferred_converter.convert(

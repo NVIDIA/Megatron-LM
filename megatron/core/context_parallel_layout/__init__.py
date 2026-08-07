@@ -21,6 +21,7 @@ from megatron.core.context_parallel_layout.conversion import (
     CpPartitionModeConverter,
     contiguous_to_zigzag_chunks,
     convert_cp_partition_mode,
+    convert_module_input_tensors_cp_partition_mode,
     zigzag_to_contiguous_chunks,
 )
 from megatron.core.context_parallel_layout.metadata import (
@@ -47,6 +48,7 @@ __all__ = [
     "build_thd_cp_partition_route",
     "contiguous_to_zigzag_chunks",
     "convert_cp_partition_mode",
+    "convert_module_input_tensors_cp_partition_mode",
     "decode_thd_cp_partition_route",
     "get_context_parallel_layout_chunk_indices",
     "get_packed_seq_params_cp_partition_cu_seqlens",

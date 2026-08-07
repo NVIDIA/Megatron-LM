@@ -794,7 +794,6 @@ class GPTModel(LanguageModule):
                 )
                 input_to_postprocess_converter.assert_no_dense_attention_inputs(
                     attention_mask=attention_mask,
-                    context="GPTModel postprocess",
                     hidden_states=hidden_states,
                 )
                 input_ids = input_to_postprocess_converter.convert(input_ids, seq_dim=-1)

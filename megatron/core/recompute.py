@@ -105,7 +105,6 @@ def checkpointed_forward(
                 chunk_entry_converter.assert_no_dense_attention_inputs(
                     attention_mask=attention_mask,
                     attention_bias=attention_bias,
-                    context=f"{type(self).__name__}: recompute chunk start={start}",
                     hidden_states=hidden_states,
                 )
                 rotary_pos_emb = chunk_entry_converter.convert_rank_local_rotary(
