@@ -4,8 +4,6 @@ from contextlib import nullcontext
 from functools import partial
 from typing import Any, Callable, Optional
 
-import os
-
 import torch
 from torch import Tensor
 
@@ -41,7 +39,12 @@ class TransformerLayerSchedulePlan:
     ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
-    ├── moe_combine (TransformerLayerNode): combine All2All (incl. MLP-side mHC post-processing)
+    ├── moe_combine (TransformerLayerNode): combine All2All
+    ├── mhc_post (TransformerLayerNode): MLP-side mHC post-processing, on the
+    │   compute stream. It belongs here rather than folded into moe_combine:
+    │   running it in that communication-stream node let a recompute subgraph be
+    │   allocated on one stream and read from another, which the caching
+    │   allocator cannot track.
     ├── mhc_recompute (ScheduleNode): optional explicit replay before mHC backward
     └── mtp_post_process (PostProcessNode): mtp post process
 
@@ -116,6 +119,14 @@ class TransformerLayerSchedulePlan:
             del self.layer_state
             self.layer_state = None
         if hasattr(self, 'layer'):
+            # The schedule installs _mhc_recompute_manager on the layer directly,
+            # bypassing TransformerLayer.__call__, which is what would otherwise
+            # refresh or clear it each forward. Left in place it pins this
+            # iteration's CheckpointManager -- and every saved tensor it still
+            # holds -- on the module, and a later replay that arrives without a
+            # fresh assignment would bind arena slots against an already
+            # recomputed checkpoint set.
+            self.layer._mhc_recompute_manager = None
             del self.layer
 
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):

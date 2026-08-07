@@ -540,6 +540,16 @@ def _set_all_rng_states(cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker):
     ):
         _get_cuda_rng_state(graph_safe=True).set_state(cuda_rng_state.get_state())
         live_states = tracker.get_states()
+        # Unlike the tracker.set_states() branch below, which replaces the mapping
+        # wholesale, this one restores in place and so cannot express a change in
+        # the key set: a dropped name would raise KeyError mid-backward, and a name
+        # added since the snapshot would silently keep its advanced offsets and
+        # draw a different dropout mask on recompute than it did in forward.
+        if set(live_states) != set(cuda_rng_state_tracker):
+            raise RuntimeError(
+                "Graph-safe RNG tracker state names changed across the fork: snapshot "
+                f"{sorted(cuda_rng_state_tracker)} vs live {sorted(live_states)}"
+            )
         for name, state in cuda_rng_state_tracker.items():
             live_states[name].set_state(state.get_state())
     else:
@@ -969,6 +979,8 @@ class CheckpointManager:
         from megatron.core.transformer.mhc_recompute import MHCRecomputePhase
 
         phase = MHCRecomputePhase(phase)
+        if self._recomputed:
+            return
         if not self._outputs_discarded:
             raise RuntimeError("CheckpointManager.recompute_until() requires discarded outputs.")
         self.mhc_arena.validate_addresses()

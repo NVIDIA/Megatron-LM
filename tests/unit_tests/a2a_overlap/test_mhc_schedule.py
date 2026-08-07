@@ -544,7 +544,7 @@ class TestMhcA2AOverlapNumerics:
         torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
         _assert_close_grads(overlap_gradients, reference_gradients)
 
-    def test_mtp_schedule_matches_eager(self):
+    def test_mtp_builder_tracks_callable_tuple_width(self):
         # The MTP builder wraps build_transformer_layer_callables and re-unpacks its
         # result, so it has to track that tuple's width. When mHC post-processing was
         # split into its own schedule node the tuple grew a sixth slot and this builder

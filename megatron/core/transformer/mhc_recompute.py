@@ -12,7 +12,6 @@ this module deliberately reasons in views so schedule liveness and physical
 layout can evolve independently.
 """
 
-import os
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Dict, Hashable, Tuple
@@ -20,8 +19,7 @@ from typing import Dict, Hashable, Tuple
 import torch
 from torch import Tensor
 
-# Opt-in clobber detector for bring-up of new schedule shapes (e.g. VPP):
-# checksum the slot after every producer write and verify it is unchanged when
+
 class MHCRecomputePhase(IntEnum):
     """Backward consumer barriers in EP 1F1B execution order."""
 
@@ -137,9 +135,15 @@ class MHCRecomputeArena:
 
 
 def _fresh_view(backing: torch.Tensor) -> torch.Tensor:
-    """New TensorImpl (own version counter) over ``backing``'s storage."""
+    """New TensorImpl (own version counter) over ``backing``'s bytes.
+
+    The offset has to be carried through: a capture helper may pack several
+    slots into one backing allocation, and a view built at offset 0 would hand
+    the producer the base of the storage rather than this slot's bytes, so the
+    direct write would land on a neighbour's region.
+    """
     t = torch.empty(0, dtype=backing.dtype, device=backing.device)
-    t.set_(backing.untyped_storage(), 0, backing.shape)
+    t.set_(backing.untyped_storage(), backing.storage_offset(), backing.shape)
     return t
 
 

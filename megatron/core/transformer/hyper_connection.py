@@ -3,8 +3,6 @@
 import math
 from typing import TYPE_CHECKING, Optional, Tuple
 
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -103,7 +101,13 @@ class NativeHAggregateInto(torch.autograd.Function):
         x, h_pre = ctx.saved_tensors
         grad_output_expanded = grad_output.unsqueeze(2)
         grad_x = grad_output_expanded * h_pre.unsqueeze(-1)
-        grad_h = torch.sum(grad_output_expanded * x, dim=-1)
+        # grad_h reduces over the hidden dimension, thousands of elements wide,
+        # while the forward only reduces over the handful of residual streams.
+        # Accumulate it in fp32: h_pre carries the residual mixing coefficients,
+        # so error here shifts how streams combine in every layer, and casting
+        # after a low-precision sum cannot recover what the sum already lost.
+        # The fused sibling accumulates in fp32 for the same reason.
+        grad_h = torch.sum(grad_output_expanded.float() * x.float(), dim=-1)
         return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype), None
 
 
@@ -644,11 +648,14 @@ class HyperConnectionModule(MegatronModule):
 
 
         # Checkpoint aggregate - auto-registers to manager
-        aggregate_function = self.aggregate
-        if output_slot is not None:
-
-            def aggregate_function(x, h):
-                return self.aggregate(x, h, out=output_slot.writer)
+        # With an arena slot the aggregate direct-writes into the graph consumer's
+        # captured input surface, so forward and recompute land at the same fixed
+        # address. writer is read per call by design: it hands back a fresh view.
+        aggregate_function = (
+            self.aggregate
+            if output_slot is None
+            else lambda x, h: self.aggregate(x, h, out=output_slot.writer)
+        )
 
         aggregated = CheckpointWithoutOutput(
             ckpt_manager=manager, output_bridge=output_bridge, output_slot=output_slot

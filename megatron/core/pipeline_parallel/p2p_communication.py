@@ -421,9 +421,13 @@ class P2PCommunicator:
             # To protect against race condition when using batch_isend_irecv().
             # User should assert that we have a modern enough PyTorch to not need this.
             # Skipped during CUDA graph capture (cuda_graph_impl="full_iteration"
-            # records the whole pipeline schedule): host-side synchronization is
-            # illegal while a stream is capturing, and capture/replay already order
-            # the batched NCCL ops through stream dependencies.
+            # records the whole pipeline schedule), because host-side
+            # synchronization is illegal while a stream is capturing. The race this
+            # guards is cross-rank, so local stream ordering does not stand in for
+            # it; what does is that every rank replays one fixed op sequence, so the
+            # nondeterministic interleaving of group calls the flag protects against
+            # cannot arise inside a replay. Do not carry this skip over to a
+            # non-captured path on the strength of stream ordering alone.
             torch.cuda.synchronize()
 
         return tensor_recv_prev, tensor_recv_next, reqs

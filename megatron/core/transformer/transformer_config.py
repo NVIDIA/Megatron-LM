@@ -3,7 +3,6 @@
 import inspect
 import logging
 import math
-import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional, Tuple, Union
@@ -3071,8 +3070,15 @@ class TransformerConfig(ModelParallelConfig):
                     "the captured consumer."
                 )
             if self.virtual_pipeline_model_parallel_size is not None:
-                # full_iteration + VPP is admitted alongside the attention-split
-                # path: StaticBufferLoader is VPP-safe, since only the
+                # VPP is admitted only together with EP overlap. Interleaving used
+                # to diverge here (grad norms ~1e8 from the first iteration) on a
+                # caching-allocator use-after-free: mHC post-processing ran inside
+                # the communication-stream combine node, so the recompute subgraph
+                # was allocated on the compute stream and read from another, a
+                # window the allocator cannot track. The fix -- the post node owning
+                # a compute-stream schedule node -- lives in the overlap schedule,
+                # so the non-overlap VPP path has never carried it and stays
+                # unvalidated. StaticBufferLoader itself is VPP-safe, since only the
                 # pre_process chunk carries a data iterator.
                 if not self.overlap_moe_expert_parallel_comm:
                     raise ValueError(
@@ -3081,14 +3087,6 @@ class TransformerConfig(ModelParallelConfig):
                         "overlap_moe_expert_parallel_comm: the non-overlap VPP "
                         "path is unvalidated."
                     )
-                # VPP + attention-split + EP overlap is admitted. The PP4/VPP2
-                # divergence seen here (grad norms ~1e8 from the first
-                # iteration) was a caching-allocator use-after-free: mHC
-                # post-processing ran inside the communication-stream combine
-                # node, so the recompute subgraph was allocated on the compute
-                # stream and read from the communication stream, a window the
-                # allocator cannot track. Moving the post node onto the compute
-                # stream removes the cross-stream read at its source.
 
         if self.cuda_graph_impl != "none":
 

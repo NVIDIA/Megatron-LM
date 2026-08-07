@@ -2646,7 +2646,17 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             pre_mlp_layernorm_output, _ = pre_mlp_layernorm_output
 
         shared_expert_output = self.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-        probs, routing_map = self.mlp.route(pre_mlp_layernorm_output)
+        # Route with the same arguments the eager callable passes. The router
+        # consumes padding_mask in three places -- the z-loss mean, dropless
+        # gating, and the expert-load counters behind the aux-loss-free bias --
+        # so dropping it here would make the graphed path drift from eager on
+        # padded batches without failing anything.
+        probs, routing_map = self.mlp.route(
+            pre_mlp_layernorm_output,
+            padding_mask=kwargs.get("padding_mask"),
+            input_ids=kwargs.get("input_ids"),
+            packed_seq_params=kwargs.get("packed_seq_params"),
+        )
         local_tokens, probs = self.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
         return (residual, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post)
 

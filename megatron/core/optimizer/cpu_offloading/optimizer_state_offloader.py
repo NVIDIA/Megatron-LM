@@ -326,6 +326,15 @@ class OptimizerStateOffloader:
 
         This is separated from reload() to make it possible to move the reload ahead of time.
         """
+        # reload() defers while capturing, so if this join were ever itself
+        # captured the states would stay on the host and the optimizer would
+        # step on them -- silently, because waiting on a stream that was never
+        # forked succeeds trivially. The scope boundary that rules this out is
+        # not enforced anywhere, so check it here rather than assume it.
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "sync_before_step() must run outside CUDA graph capture: reload() defers "
+            "under capture, so optimizer states would still be on the host at step time."
+        )
         if self._offloaded:
             # The early reload was skipped or never ran: either it landed inside
             # a graph capture, or the iteration was a graph replay, which
