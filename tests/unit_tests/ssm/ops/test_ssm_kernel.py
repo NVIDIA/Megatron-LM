@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaMetadata
+
 # Assume the provided class is in mamba_mixer.py
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.ssm.ops.ssd_combined import _cutedsl_ssd_enabled
@@ -698,11 +700,10 @@ SSD_KERNEL_L = 128
 
 
 def _ssd_members_for_test(cu, chunk_size, device):
-    """Reproduce the per-step SSD tiling MambaMetadata publishes.
+    """The per-step SSD tiling MambaMetadata publishes, as device tensors.
 
-    Mirrors MambaMetadata._compute_mamba_chunk_meta: each sequence is tiled from
-    the chunk-aligned position at or below its start, so one starting mid-chunk
-    shares that chunk with its predecessor.
+    Delegates the derivation to ``MambaMetadata._compute_mamba_chunk_meta`` so a
+    stand-in can never drift from what production computes.
 
     Args:
         cu: Cumulative token counts, one entry per slot plus one.
@@ -712,24 +713,18 @@ def _ssd_members_for_test(cu, chunk_size, device):
     Returns:
         A dict of the ``ssd_*`` members, keyed as on MambaMetadata.
     """
-    active, base_l, count_l, start_l = [], [], [], []
-    tok_base, valid_lo, valid_hi, acc = [], [], [], 0
-    for i in range(len(cu) - 1):
-        start, end = cu[i], cu[i + 1]
-        if end <= start:
-            continue
-        base = start // chunk_size
-        count = -(-(end - base * chunk_size) // chunk_size)
-        active.append(i)
-        base_l.append(base)
-        count_l.append(count)
-        start_l.append(acc)
-        acc += count
-        for c in range(count):
-            tok_base.append((base + c) * chunk_size)
-            valid_lo.append(start)
-            valid_hi.append(end)
-    empty = [i for i in range(len(cu) - 1) if i not in set(active)]
+    (
+        active,
+        base_l,
+        count_l,
+        start_l,
+        tok_base,
+        valid_lo,
+        valid_hi,
+        empty,
+        starts_aligned,
+        active_is_prefix,
+    ) = MambaMetadata._compute_mamba_chunk_meta(cu, len(cu) - 1, chunk_size)
 
     def i32(values):
         return torch.tensor(values, dtype=torch.int32, device=device)
@@ -743,8 +738,8 @@ def _ssd_members_for_test(cu, chunk_size, device):
         ssd_chunk_token_base=i32(tok_base),
         ssd_chunk_valid_start=i32(valid_lo),
         ssd_chunk_valid_end=i32(valid_hi),
-        ssd_starts_aligned=all(cu[i] % chunk_size == 0 for i in active),
-        ssd_active_is_prefix=active == list(range(len(active))),
+        ssd_starts_aligned=starts_aligned,
+        ssd_active_is_prefix=active_is_prefix,
     )
 
 

@@ -1,11 +1,13 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
+
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 import megatron.core.ssm.ops.ssd_combined as ssd_combined
+from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaMetadata
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
@@ -61,19 +63,8 @@ class TestMambaMixer:
         mixer.cuda()
         return mixer
 
-    @pytest.mark.parametrize(
-        "tp_size,cp_size,use_mem_eff_path",
-        [
-            (1, 1, True),
-            (1, 1, False),
-            (8, 1, True),
-            (4, 2, True),
-            (2, 4, True),
-            (1, 8, True),
-            (1, 8, False),
-        ],
-    )
-    def test_gpu_forward(self, tp_size, cp_size, use_mem_eff_path):
+    @pytest.mark.parametrize("use_mem_eff_path", [True, False])
+    def test_gpu_forward(self, use_mem_eff_path):
         mixer = self.get_mixer(1, 1, use_mem_eff_path)
         micro_batch_size = 2
         sequence_length = 32
@@ -183,7 +174,14 @@ class TestMambaMixerCuteDSL:
         return mixer.cuda()
 
     def _run_prefill(
-        self, mixer, zxBCdt, seq_idx, cu_seqlens, batch_indices, num_requests, backend
+        self,
+        mixer: MambaMixer,
+        zxBCdt: torch.Tensor,
+        seq_idx: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        batch_indices: torch.Tensor,
+        num_requests: int,
+        backend: str,
     ):
         # Force the dispatcher's cached backend decision (no env knob anymore).
         ssd_combined._CUTEDSL_SSD_ENABLED = backend == "cutedsl"
@@ -193,9 +191,6 @@ class TestMambaMixerCuteDSL:
         ssm_state = torch.zeros(
             num_requests, mixer.nheads_local_tp, mixer.headdim, mixer.d_state, device="cuda"
         )
-        # Prefill runs under inference (no autograd) in production; mirror that here
-        # (the SSD scan returns plain state tensors, and cumsum(out=) needs no grad).
-        # _ssm_prefill mutates zxBCdt/states in place, so feed fresh copies per backend.
         with torch.no_grad():
             _md = _prefill_metadata_for_test(cu_seqlens, seq_idx, mixer.chunk_size, batch_indices)
             y = mixer._ssm_prefill(
@@ -235,15 +230,15 @@ class TestMambaMixerCuteDSL:
 
 
 SSD_KERNEL_L = 128
-"""The CuteDSL SSD kernel's tile length; the tiling arrays must be built at it."""
 
 
-def _ssd_members_for_test(cu, chunk_size, device):
-    """Reproduce the per-step SSD tiling MambaMetadata publishes.
+def _ssd_members_for_test(
+    cu_seqlens_list: list[int], chunk_size: int, device: torch.device
+) -> dict[str, torch.Tensor]:
+    """The per-step SSD tiling MambaMetadata publishes, as device tensors.
 
-    Mirrors MambaMetadata._compute_mamba_chunk_meta: each sequence is tiled from
-    the chunk-aligned position at or below its start, so one starting mid-chunk
-    shares that chunk with its predecessor.
+    Delegates the derivation to ``MambaMetadata._compute_mamba_chunk_meta`` so a
+    stand-in can never drift from what production computes.
 
     Args:
         cu: Cumulative token counts, one entry per slot plus one.
@@ -253,24 +248,20 @@ def _ssd_members_for_test(cu, chunk_size, device):
     Returns:
         A dict of the ``ssd_*`` members, keyed as on MambaMetadata.
     """
-    active, base_l, count_l, start_l = [], [], [], []
-    tok_base, valid_lo, valid_hi, acc = [], [], [], 0
-    for i in range(len(cu) - 1):
-        start, end = cu[i], cu[i + 1]
-        if end <= start:
-            continue
-        base = start // chunk_size
-        count = -(-(end - base * chunk_size) // chunk_size)
-        active.append(i)
-        base_l.append(base)
-        count_l.append(count)
-        start_l.append(acc)
-        acc += count
-        for c in range(count):
-            tok_base.append((base + c) * chunk_size)
-            valid_lo.append(start)
-            valid_hi.append(end)
-    empty = [i for i in range(len(cu) - 1) if i not in set(active)]
+    (
+        active,
+        base_l,
+        count_l,
+        start_l,
+        tok_base,
+        valid_lo,
+        valid_hi,
+        empty,
+        starts_aligned,
+        active_is_prefix,
+    ) = MambaMetadata._compute_mamba_chunk_meta(
+        cu_seqlens_list, len(cu_seqlens_list) - 1, chunk_size
+    )
 
     def i32(values):
         return torch.tensor(values, dtype=torch.int32, device=device)
@@ -284,12 +275,17 @@ def _ssd_members_for_test(cu, chunk_size, device):
         ssd_chunk_token_base=i32(tok_base),
         ssd_chunk_valid_start=i32(valid_lo),
         ssd_chunk_valid_end=i32(valid_hi),
-        ssd_starts_aligned=all(cu[i] % chunk_size == 0 for i in active),
-        ssd_active_is_prefix=active == list(range(len(active))),
+        ssd_starts_aligned=starts_aligned,
+        ssd_active_is_prefix=active_is_prefix,
     )
 
 
-def _prefill_metadata_for_test(cu_seqlens, seq_idx, chunk_size, batch_indices=None):
+def _prefill_metadata_for_test(
+    cu_seqlens: torch.Tensor,
+    seq_idx: torch.Tensor,
+    chunk_size: int,
+    batch_indices: torch.Tensor | None = None,
+) -> SimpleNamespace:
     """Stand-in for MambaMetadata carrying the fields ``_ssm_prefill`` reads.
 
     Args:
@@ -299,23 +295,23 @@ def _prefill_metadata_for_test(cu_seqlens, seq_idx, chunk_size, batch_indices=No
         batch_indices: Prefill slot map, or None.
 
     Returns:
-        A ``SimpleNamespace`` shaped like MambaMetadata.
+        A mock ``SimpleNamespace`` shaped like MambaMetadata.
     """
-    cu = cu_seqlens.tolist()
+    cu_seqlens_list = cu_seqlens.tolist()
     chunk_boundaries = [0]
     last_chunk_indices = []
-    for i in range(len(cu) - 1):
-        pos = cu[i] + chunk_size
-        while pos < cu[i + 1]:
+    for i in range(len(cu_seqlens_list) - 1):
+        pos = cu_seqlens_list[i] + chunk_size
+        while pos < cu_seqlens_list[i + 1]:
             chunk_boundaries.append(pos)
             pos += chunk_size
-        chunk_boundaries.append(cu[i + 1])
+        chunk_boundaries.append(cu_seqlens_list[i + 1])
         last_chunk_indices.append(len(chunk_boundaries) - 2)
     cu_chunk_seqlens = cu_seqlens.new_tensor(chunk_boundaries)
     return SimpleNamespace(
-        **_ssd_members_for_test(cu, SSD_KERNEL_L, cu_seqlens.device),
+        **_ssd_members_for_test(cu_seqlens_list, SSD_KERNEL_L, cu_seqlens.device),
         mamba_chunk_size=SSD_KERNEL_L,
-        real_prefill_token_count=cu[-1],
+        real_prefill_token_count=cu_seqlens_list[-1],
         seq_idx=seq_idx,
         cu_seqlens=cu_seqlens,
         cu_chunk_seqlens=cu_chunk_seqlens,

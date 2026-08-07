@@ -227,7 +227,8 @@ class MambaMetadata:
         self.intermediate_count = 0
         self.per_request_intermediate_counts = []
 
-    def _compute_mamba_chunk_meta(self, cu_seqlens_all, padded_prefill_count, chunk_size):
+    @staticmethod
+    def _compute_mamba_chunk_meta(cu_seqlens_all, padded_prefill_count, chunk_size):
         """Derive how the varlen SSD kernel tiles this prefill batch.
 
         Each sequence is tiled from the chunk-aligned position at or below its
