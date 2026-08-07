@@ -134,6 +134,10 @@ class MultiLatentAttention(Attention):
     "cross attn" specializations.
     """
 
+    def get_preferred_cp_partition_mode(self):
+        """Return MLA's CP layout preference for ``cp_partition_mode="auto"`` rollout."""
+        return "zigzag"
+
     def __init__(
         self,
         config: MLATransformerConfig,
@@ -349,6 +353,25 @@ class MultiLatentAttention(Attention):
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             self.pg_collection.cp = packed_seq_params.cp_group
+        if packed_seq_params is not None:
+            cp_group = packed_seq_params.cp_group
+            if cp_group is None:
+                cp_group = self.pg_collection.cp
+            if cp_group is not None and cp_group.size() > 1:
+                preferred_cp_partition_mode = self.get_preferred_cp_partition_mode()
+                actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+                if actual_cp_partition_mode is None:
+                    raise ValueError(
+                        "MultiLatentAttention requires PackedSeqParams.cp_partition_mode "
+                        "when context parallelism is active."
+                    )
+                if actual_cp_partition_mode != preferred_cp_partition_mode:
+                    raise ValueError(
+                        "MultiLatentAttention prefers "
+                        f"cp_partition_mode={preferred_cp_partition_mode!r}, but "
+                        f"packed_seq_params has {actual_cp_partition_mode!r}. CP partition "
+                        "conversion must be handled before entering MLA."
+                    )
 
         # =====================
         # Query, Key, and Value

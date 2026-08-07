@@ -37,22 +37,24 @@ def get_context_parallel_layout_chunk_indices(
 # fail loudly so new layer implementations add an explicit partition-mode policy.
 
 
-def _validate_required_cp_partition_mode(
+def _validate_cp_partition_mode_preference(
     mode: Optional[str], *, module_name: str
 ) -> Optional[CpPartitionMode]:
     if mode is None or mode in ("zigzag", "contiguous"):
         return mode
-    raise ValueError(f"Invalid CP partition mode requirement {mode!r} declared by {module_name}.")
+    raise ValueError(f"Invalid CP partition mode preference {mode!r} declared by {module_name}.")
 
 
-def get_required_cp_partition_mode_for_layer(
+def get_preferred_cp_partition_mode_for_layer(
     layer: Any, config: Any, *, cp_comm_type: Optional[str] = None
 ) -> Optional[CpPartitionMode]:
-    """Return the CP partition mode required by a layer or attention-like module.
+    """Return a layer/module's CP partition mode preference for auto layout rollout.
 
-    Modules must declare their layout contract via ``required_cp_partition_mode``
-    or ``get_required_cp_partition_mode()``.  Wrapper modules may delegate to
-    ``inner_layer`` or ``self_attention``.
+    Modules should declare their auto-mode layout preference via
+    ``get_preferred_cp_partition_mode()``.  This is a preference rather than a
+    hard requirement: some modules can consume more than one layout but still
+    prefer one for performance or rollout consistency.  Wrapper modules may
+    delegate to ``inner_layer`` or ``self_attention``.
     """
     if cp_comm_type is None:
         cp_comm_type = getattr(config, "cp_comm_type", None)
@@ -61,21 +63,18 @@ def get_required_cp_partition_mode_for_layer(
         raise ValueError("Cannot determine CP partition mode for None.")
 
     module_name = layer.__class__.__name__
-    get_required_mode = getattr(layer, "get_required_cp_partition_mode", None)
-    if callable(get_required_mode):
-        return _validate_required_cp_partition_mode(get_required_mode(), module_name=module_name)
-
-    if hasattr(layer, "required_cp_partition_mode"):
-        return _validate_required_cp_partition_mode(
-            getattr(layer, "required_cp_partition_mode"), module_name=module_name
+    get_preferred_mode = getattr(layer, "get_preferred_cp_partition_mode", None)
+    if callable(get_preferred_mode):
+        return _validate_cp_partition_mode_preference(
+            get_preferred_mode(), module_name=module_name
         )
 
     if hasattr(layer, "inner_layer"):
-        return get_required_cp_partition_mode_for_layer(
+        return get_preferred_cp_partition_mode_for_layer(
             layer.inner_layer, getattr(layer, "config", config), cp_comm_type=cp_comm_type
         )
     if hasattr(layer, "self_attention"):
-        return get_required_cp_partition_mode_for_layer(
+        return get_preferred_cp_partition_mode_for_layer(
             layer.self_attention, getattr(layer, "config", config), cp_comm_type=cp_comm_type
         )
 
@@ -90,10 +89,10 @@ def get_stage_entry_partition_mode(
     cp_group: Optional[Any] = None,
 ) -> Optional[CpPartitionMode]:
     """Return and validate the CP partition mode at a stage input boundary."""
-    expected_stage_entry_partition_mode = _validate_required_cp_partition_mode(
+    expected_stage_entry_partition_mode = _validate_cp_partition_mode_preference(
         expected_stage_entry_partition_mode, module_name=owner_name
     )
-    packed_partition_mode = _validate_required_cp_partition_mode(
+    packed_partition_mode = _validate_cp_partition_mode_preference(
         getattr(packed_seq_params, "cp_partition_mode", None), module_name=owner_name
     )
 

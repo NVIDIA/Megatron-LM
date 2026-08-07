@@ -7,7 +7,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.context_parallel_layout import (
     CpPartitionModeConverter,
-    get_required_cp_partition_mode_for_layer,
+    get_preferred_cp_partition_mode_for_layer,
     get_stage_entry_partition_mode,
     replace_packed_seq_params_cp_partition_mode,
 )
@@ -83,11 +83,11 @@ def checkpointed_forward(
                     # Use self.layers[index] (not self._get_layer) so this
                     # function works for both TransformerBlock and HybridStack.
                     layer = self.layers[index]
-                    required_partition_mode = get_required_cp_partition_mode_for_layer(
+                    preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
                         layer, getattr(layer, "config", self.config)
                     )
-                    if required_partition_mode is not None:
-                        current_partition_mode = required_partition_mode
+                    if preferred_partition_mode is not None:
+                        current_partition_mode = preferred_partition_mode
             local_packed_seq_params = packed_seq_params
             local_input_ids = input_ids
             if current_partition_mode is not None:
@@ -127,7 +127,7 @@ def checkpointed_forward(
                 # function works for both TransformerBlock and HybridStack.
                 layer = self.layers[index]
                 if cp_layout_needed:
-                    required_partition_mode = get_required_cp_partition_mode_for_layer(
+                    preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
                         layer, getattr(layer, "config", self.config)
                     )
                     (hidden_states, rotary_pos_emb, padding_mask, local_input_ids) = (
@@ -140,17 +140,17 @@ def checkpointed_forward(
                             packed_seq_params=local_packed_seq_params,
                             padding_mask=padding_mask,
                             input_ids=local_input_ids,
-                            required_partition_mode=required_partition_mode,
+                            preferred_partition_mode=preferred_partition_mode,
                         )
                     )
-                    if required_partition_mode is not None:
+                    if preferred_partition_mode is not None:
                         local_packed_seq_params = replace_packed_seq_params_cp_partition_mode(
-                            local_packed_seq_params, required_partition_mode
+                            local_packed_seq_params, preferred_partition_mode
                         )
                     current_partition_mode = getattr(
                         local_packed_seq_params,
                         "cp_partition_mode",
-                        required_partition_mode or current_partition_mode,
+                        preferred_partition_mode or current_partition_mode,
                     )
 
                 # Get appropriate inner quantization context

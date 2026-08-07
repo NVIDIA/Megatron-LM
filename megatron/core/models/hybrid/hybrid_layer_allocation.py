@@ -208,7 +208,7 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
 
 def get_hybrid_layer_cp_partition_mode(layer_symbol: str, config) -> Optional[CpPartitionMode]:
-    """Return the CP partition mode required by one hybrid layer symbol.
+    """Return the CP partition mode preferred by one hybrid layer symbol.
 
     ``None`` means the layer is token-layout agnostic and can preserve whatever
     CP partition mode it receives.
@@ -248,14 +248,14 @@ def get_hybrid_stage_input_cp_partition_mode(
     ]
 
     current_partition_mode = None
-    for required_partition_mode in layer_layouts[:stage_layer_offset]:
-        if required_partition_mode is not None:
-            current_partition_mode = required_partition_mode
+    for preferred_partition_mode in layer_layouts[:stage_layer_offset]:
+        if preferred_partition_mode is not None:
+            current_partition_mode = preferred_partition_mode
 
     if current_partition_mode is None:
-        for required_partition_mode in layer_layouts[stage_layer_offset:]:
-            if required_partition_mode is not None:
-                current_partition_mode = required_partition_mode
+        for preferred_partition_mode in layer_layouts[stage_layer_offset:]:
+            if preferred_partition_mode is not None:
+                current_partition_mode = preferred_partition_mode
                 break
 
     return current_partition_mode

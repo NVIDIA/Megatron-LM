@@ -8,9 +8,9 @@ import surface while splitting the implementation by responsibility.
 Ownership summary:
 
 - model builders choose the pipeline-stage input CP layout;
-- blocks convert rank-local sequence tensors between layer requirements;
+- blocks convert rank-local sequence tensors between layer preferences;
 - model postprocess restores the public output boundary to the input layout;
-- MTP validates its own layout requirement but does not own outer conversion.
+- MTP validates its inner-layer layout preference but does not own outer conversion.
 """
 
 from typing import Literal
@@ -30,7 +30,7 @@ from megatron.core.context_parallel_layout.metadata import (
 )
 from megatron.core.context_parallel_layout.policy import (
     get_context_parallel_layout_chunk_indices,
-    get_required_cp_partition_mode_for_layer,
+    get_preferred_cp_partition_mode_for_layer,
     get_stage_entry_partition_mode,
 )
 from megatron.core.context_parallel_layout.routes import (
@@ -50,7 +50,7 @@ __all__ = [
     "decode_thd_cp_partition_route",
     "get_context_parallel_layout_chunk_indices",
     "get_packed_seq_params_cp_partition_cu_seqlens",
-    "get_required_cp_partition_mode_for_layer",
+    "get_preferred_cp_partition_mode_for_layer",
     "get_stage_entry_partition_mode",
     "get_thd_cp_partition_route",
     "get_thd_context_parallel_rank_indices",

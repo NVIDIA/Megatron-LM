@@ -288,9 +288,6 @@ class Attention(MegatronModule, ABC):
     "cross attn" specializations.
     """
 
-    required_cp_partition_mode = "zigzag"
-    accepted_cp_partition_modes = None
-
     def __init__(
         self,
         config: TransformerConfig,
@@ -449,40 +446,9 @@ class Attention(MegatronModule, ABC):
             rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
             self._build_per_layer_rotary_pos_emb(rotary_base)
 
-    def _validate_packed_seq_params_cp_partition_mode(
-        self, packed_seq_params: Optional[PackedSeqParams]
-    ) -> None:
-        """Validate block-provided CP partition metadata against this attention."""
-        if packed_seq_params is None:
-            return
-        accepted_cp_partition_modes = self.accepted_cp_partition_modes
-        if accepted_cp_partition_modes is None:
-            accepted_cp_partition_modes = (self.required_cp_partition_mode,)
-        elif isinstance(accepted_cp_partition_modes, str):
-            accepted_cp_partition_modes = (accepted_cp_partition_modes,)
-        else:
-            accepted_cp_partition_modes = tuple(accepted_cp_partition_modes)
-        if accepted_cp_partition_modes == (None,):
-            return
-        cp_group = packed_seq_params.cp_group if packed_seq_params.cp_group is not None else None
-        if cp_group is None:
-            cp_group = self.pg_collection.cp if hasattr(self.pg_collection, 'cp') else None
-        if cp_group is None or get_pg_size(cp_group) <= 1:
-            return
-
-        actual_cp_partition_mode = packed_seq_params.cp_partition_mode
-        if actual_cp_partition_mode is None:
-            raise ValueError(
-                f"{self.__class__.__name__} requires PackedSeqParams.cp_partition_mode "
-                "when context parallelism is active."
-            )
-        if actual_cp_partition_mode not in accepted_cp_partition_modes:
-            raise ValueError(
-                f"{self.__class__.__name__} accepts cp_partition_mode in "
-                f"{accepted_cp_partition_modes!r}, but packed_seq_params has "
-                f"{actual_cp_partition_mode!r}. CP partition conversion must be handled "
-                "by TransformerBlock before entering attention."
-            )
+    def get_preferred_cp_partition_mode(self):
+        """Return Attention's CP layout preference for ``cp_partition_mode="auto"`` rollout."""
+        return "zigzag"
 
     def _supports_fixed_cp_partition_adapter(self) -> bool:
         """Return whether this attention class has an audited fixed-mode adapter."""
@@ -501,7 +467,7 @@ class Attention(MegatronModule, ABC):
         """Adapt fixed-layout callers to this attention module's native CP layout."""
         if self.config.cp_partition_mode == "auto":
             return hidden_states, key_value_states, rotary_pos_emb, packed_seq_params, None
-        preferred_cp_partition_mode = self.required_cp_partition_mode
+        preferred_cp_partition_mode = self.get_preferred_cp_partition_mode()
         if preferred_cp_partition_mode is None:
             return hidden_states, key_value_states, rotary_pos_emb, packed_seq_params, None
         if packed_seq_params is None:
@@ -1498,7 +1464,7 @@ class Attention(MegatronModule, ABC):
             key_value_states,
             rotary_pos_emb,
             packed_seq_params,
-            fixed_cp_partition_output_converter,
+            back_to_input_converter,
         ) = self.convert_tensors_to_preferred_layout(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -1507,7 +1473,26 @@ class Attention(MegatronModule, ABC):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
         )
-        self._validate_packed_seq_params_cp_partition_mode(packed_seq_params)
+        preferred_cp_partition_mode = self.get_preferred_cp_partition_mode()
+        if packed_seq_params is not None and preferred_cp_partition_mode is not None:
+            cp_group = packed_seq_params.cp_group
+            if cp_group is None and hasattr(self.pg_collection, 'cp'):
+                cp_group = self.pg_collection.cp
+            if cp_group is not None and get_pg_size(cp_group) > 1:
+                actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+                if actual_cp_partition_mode is None:
+                    raise ValueError(
+                        f"{self.__class__.__name__} requires "
+                        "PackedSeqParams.cp_partition_mode when context parallelism is active."
+                    )
+                if actual_cp_partition_mode != preferred_cp_partition_mode:
+                    raise ValueError(
+                        f"{self.__class__.__name__} prefers "
+                        f"cp_partition_mode={preferred_cp_partition_mode!r}, but "
+                        f"packed_seq_params has {actual_cp_partition_mode!r}. CP partition "
+                        "conversion must be handled by TransformerBlock before entering "
+                        "attention."
+                    )
 
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
@@ -1697,7 +1682,7 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params.cp_partition_mode
                 if packed_seq_params is not None
                 and packed_seq_params.cp_partition_mode is not None
-                else self.required_cp_partition_mode
+                else self.get_preferred_cp_partition_mode()
             )
 
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -1855,8 +1840,8 @@ class Attention(MegatronModule, ABC):
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
 
-        if fixed_cp_partition_output_converter is not None:
-            output = fixed_cp_partition_output_converter.convert(
+        if back_to_input_converter is not None:
+            output = back_to_input_converter.convert(
                 output,
                 seq_dim=0,
                 sequence_parallel=self.config.sequence_parallel,

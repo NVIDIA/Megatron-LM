@@ -13,7 +13,7 @@ from megatron.core.context_parallel_layout import (
     build_thd_cp_partition_route,
     decode_thd_cp_partition_route,
     get_context_parallel_layout_chunk_indices,
-    get_required_cp_partition_mode_for_layer,
+    get_preferred_cp_partition_mode_for_layer,
     get_stage_entry_partition_mode,
     get_thd_context_parallel_rank_indices,
     get_thd_cp_partition_route,
@@ -70,12 +70,14 @@ def test_packed_seq_params_rejects_auto_cp_partition_mode():
 
 
 class IdentityOp:
-    required_cp_partition_mode = None
+
+    def get_preferred_cp_partition_mode(self):
+        return None
 
 
 class GatedDeltaNet:
 
-    def get_required_cp_partition_mode(self):
+    def get_preferred_cp_partition_mode(self):
         mode = getattr(self.config, "linear_cp_mode", "chunkwise")
         if mode == "chunkwise":
             return "contiguous"
@@ -84,22 +86,28 @@ class GatedDeltaNet:
         raise ValueError(f"Unsupported GatedDeltaNet linear_cp_mode: {mode!r}.")
 
 
-class _DeclaredContiguousLayer:
-    required_cp_partition_mode = "contiguous"
+class _PreferredContiguousLayer:
+
+    def get_preferred_cp_partition_mode(self):
+        return "contiguous"
 
 
-class _DeclaredAgnosticLayer:
-    required_cp_partition_mode = None
+class _PreferredAgnosticLayer:
+
+    def get_preferred_cp_partition_mode(self):
+        return None
 
 
-class _DynamicDeclaredLayer:
+class _DynamicPreferredLayer:
 
-    def get_required_cp_partition_mode(self):
+    def get_preferred_cp_partition_mode(self):
         return "zigzag"
 
 
-class _InvalidDeclaredLayer:
-    required_cp_partition_mode = "unsupported"
+class _InvalidPreferredLayer:
+
+    def get_preferred_cp_partition_mode(self):
+        return "unsupported"
 
 
 class _FakeGroup:
@@ -486,31 +494,32 @@ def test_cp_partition_mode_converter_recurses_over_tensor_containers(monkeypatch
     assert all(call[2]["cu_seqlens"] is cu_seqlens for call in calls)
 
 
-def test_required_partition_mode_rejects_unknown_layer_type():
+def test_preferred_partition_mode_rejects_unknown_layer_type():
     with pytest.raises(ValueError, match="Cannot determine CP partition mode"):
-        get_required_cp_partition_mode_for_layer(object(), SimpleNamespace(cp_comm_type=None))
+        get_preferred_cp_partition_mode_for_layer(object(), SimpleNamespace(cp_comm_type=None))
 
 
-def test_required_partition_mode_uses_explicit_class_attribute():
+def test_preferred_partition_mode_uses_explicit_method():
     config = SimpleNamespace(cp_comm_type=None)
 
     assert (
-        get_required_cp_partition_mode_for_layer(_DeclaredContiguousLayer(), config) == "contiguous"
+        get_preferred_cp_partition_mode_for_layer(_PreferredContiguousLayer(), config)
+        == "contiguous"
     )
-    assert get_required_cp_partition_mode_for_layer(_DeclaredAgnosticLayer(), config) is None
+    assert get_preferred_cp_partition_mode_for_layer(_PreferredAgnosticLayer(), config) is None
 
 
-def test_required_partition_mode_uses_explicit_method():
+def test_preferred_partition_mode_uses_dynamic_method():
     config = SimpleNamespace(cp_comm_type=None)
 
-    assert get_required_cp_partition_mode_for_layer(_DynamicDeclaredLayer(), config) == "zigzag"
+    assert get_preferred_cp_partition_mode_for_layer(_DynamicPreferredLayer(), config) == "zigzag"
 
 
-def test_required_partition_mode_rejects_invalid_explicit_declaration():
+def test_preferred_partition_mode_rejects_invalid_explicit_declaration():
     config = SimpleNamespace(cp_comm_type=None)
 
-    with pytest.raises(ValueError, match="Invalid CP partition mode requirement"):
-        get_required_cp_partition_mode_for_layer(_InvalidDeclaredLayer(), config)
+    with pytest.raises(ValueError, match="Invalid CP partition mode preference"):
+        get_preferred_cp_partition_mode_for_layer(_InvalidPreferredLayer(), config)
 
 
 @pytest.mark.parametrize(
@@ -524,7 +533,7 @@ def test_gated_delta_net_layer_layout_policy_follows_cp_mode(
     layer = object.__new__(GatedDeltaNet)
     layer.config = config
 
-    assert get_required_cp_partition_mode_for_layer(layer, config) == expected_partition_mode
+    assert get_preferred_cp_partition_mode_for_layer(layer, config) == expected_partition_mode
 
 
 def test_get_stage_entry_partition_mode_uses_packed_metadata():

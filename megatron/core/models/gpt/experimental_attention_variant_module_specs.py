@@ -457,7 +457,7 @@ def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_la
 def get_experimental_attention_variant_layer_cp_partition_mode_pattern(
     config: TransformerConfig,
 ) -> List[Optional[CpPartitionMode]]:
-    """Return per-layer CP partition-mode requirements for experimental GPT specs."""
+    """Return per-layer CP partition-mode preferences for experimental GPT specs."""
     if config.experimental_attention_variant is None:
         return ["zigzag"] * config.num_layers
 
@@ -492,14 +492,14 @@ def get_experimental_attention_variant_stage_input_cp_partition_mode(
         )
 
     current_partition_mode = None
-    for required_partition_mode in layer_layouts[:stage_layer_offset]:
-        if required_partition_mode is not None:
-            current_partition_mode = required_partition_mode
+    for preferred_partition_mode in layer_layouts[:stage_layer_offset]:
+        if preferred_partition_mode is not None:
+            current_partition_mode = preferred_partition_mode
 
     if current_partition_mode is None:
-        for required_partition_mode in layer_layouts[stage_layer_offset:]:
-            if required_partition_mode is not None:
-                current_partition_mode = required_partition_mode
+        for preferred_partition_mode in layer_layouts[stage_layer_offset:]:
+            if preferred_partition_mode is not None:
+                current_partition_mode = preferred_partition_mode
                 break
 
     return current_partition_mode
@@ -508,7 +508,7 @@ def get_experimental_attention_variant_stage_input_cp_partition_mode(
 def _get_experimental_attention_variant_cp_partition_mode(
     config: TransformerConfig,
 ) -> CpPartitionMode:
-    """Return the CP partition mode required by the experimental attention variant."""
+    """Return the CP partition mode preferred by the experimental attention variant."""
     if config.experimental_attention_variant == "gated_delta_net":
         mode = getattr(config, "linear_cp_mode", "chunkwise")
         if mode == "chunkwise":

@@ -79,8 +79,8 @@ class GatedDeltaNet(MegatronModule):
     and returns output of the same size.
     """
 
-    def get_required_cp_partition_mode(self):
-        """Return the CP partition mode required by this GDN layer."""
+    def get_preferred_cp_partition_mode(self):
+        """Return GDN's CP layout preference for ``cp_partition_mode="auto"`` rollout."""
         mode = getattr(self.config, "linear_cp_mode", "chunkwise")
         if mode == "chunkwise":
             return "contiguous"
@@ -383,7 +383,7 @@ class GatedDeltaNet(MegatronModule):
             )
         cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
         cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
-        hidden_states, packed_seq_params, fixed_cp_partition_output_converter = (
+        hidden_states, packed_seq_params, back_to_input_converter = (
             self.convert_tensors_to_preferred_layout(
                 hidden_states=hidden_states,
                 packed_seq_params=packed_seq_params,
@@ -406,9 +406,27 @@ class GatedDeltaNet(MegatronModule):
 
         if packed_seq_params is not None:
             if cp_size_chunkwise > 1:
-                self._validate_packed_seq_params_cp_partition_mode(packed_seq_params, "contiguous")
+                expected_cp_partition_mode = "contiguous"
             elif cp_size_headwise > 1:
-                self._validate_packed_seq_params_cp_partition_mode(packed_seq_params, "zigzag")
+                expected_cp_partition_mode = "zigzag"
+            else:
+                expected_cp_partition_mode = None
+            actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+            if expected_cp_partition_mode is not None and actual_cp_partition_mode is None:
+                raise ValueError(
+                    "GatedDeltaNet requires PackedSeqParams.cp_partition_mode when context "
+                    "parallelism is active."
+                )
+            if (
+                expected_cp_partition_mode is not None
+                and actual_cp_partition_mode != expected_cp_partition_mode
+            ):
+                raise ValueError(
+                    f"GatedDeltaNet with linear_cp_mode={self.config.linear_cp_mode!r} prefers "
+                    f"cp_partition_mode={expected_cp_partition_mode!r}, but packed_seq_params "
+                    f"has {actual_cp_partition_mode!r}. CP partition conversion must be handled "
+                    "before calling GatedDeltaNet."
+                )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
@@ -510,8 +528,8 @@ class GatedDeltaNet(MegatronModule):
                 chunkwise_cp_context,
             )
 
-        if fixed_cp_partition_output_converter is not None:
-            out = fixed_cp_partition_output_converter.convert(
+        if back_to_input_converter is not None:
+            out = back_to_input_converter.convert(
                 out,
                 seq_dim=0,
                 sequence_parallel=self.config.sequence_parallel,
@@ -1013,19 +1031,6 @@ class GatedDeltaNet(MegatronModule):
             )
 
         return cu_seqlens
-
-    def _validate_packed_seq_params_cp_partition_mode(
-        self, packed_seq_params: PackedSeqParams, expected_cp_partition_mode: str
-    ) -> None:
-        """Ensure block-level CP layout conversion satisfied GDN's layout contract."""
-        actual_cp_partition_mode = packed_seq_params.cp_partition_mode
-        if actual_cp_partition_mode != expected_cp_partition_mode:
-            raise ValueError(
-                f"GatedDeltaNet with linear_cp_mode={self.config.linear_cp_mode!r} requires "
-                f"cp_partition_mode={expected_cp_partition_mode!r}, but packed_seq_params has "
-                f"{actual_cp_partition_mode!r}. CP partition conversion must be handled before "
-                "calling GatedDeltaNet."
-            )
 
     def convert_tensors_to_preferred_layout(
         self,
