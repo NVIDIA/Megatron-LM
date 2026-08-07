@@ -124,17 +124,35 @@ class HybridStack(MegatronModule):
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
             layer_number = i + 1 + pp_layer_offset
-            if self.config.fp8:
-                quant_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
-            elif self.config.fp4:
-                quant_init_context = get_fp4_context(self.config, i + pp_layer_offset, is_init=True)
+            # When per-layer overrides are set (e.g. Nemotron-H Puzzle's heterogeneous
+            # MoE topk / moe_ffn_hidden_size), resolve a layer-specific config; this
+            # mirrors how transformer_block.py handles heterogeneous_block_specs.
+            #
+            # MTP HybridStacks route through the MTP-specific resolver instead of the
+            # main-block one: MTP layer_number restarts at 1 with pp_layer_offset=0,
+            # so indexing into main-block per-layer lists would return the wrong
+            # layer's config. The MTP resolver indexes `mtp_*_per_layer` lists sized
+            # to `mtp_pattern_length` (positions within one MTP depth). All MTP
+            # depths share the same per-position overrides, matching Nemotron-H
+            # Puzzle's `mtp_block_configs`.
+            if self.config.heterogeneous_block_specs:
+                if is_mtp_layer:
+                    layer_config = self.config.get_config_for_mtp_layer(layer_number)
+                else:
+                    layer_config = self.config.get_config_for_layer(layer_number)
+            else:
+                layer_config = self.config
+            if layer_config.fp8:
+                quant_init_context = get_fp8_context(layer_config, i + pp_layer_offset, is_init=True)
+            elif layer_config.fp4:
+                quant_init_context = get_fp4_context(layer_config, i + pp_layer_offset, is_init=True)
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
                 if layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
                         submodules.mamba_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
@@ -143,7 +161,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.ATTENTION:
                     layer = build_module(
                         submodules.attention_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
@@ -154,7 +172,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.DS_ATTENTION:
                     layer = build_module(
                         submodules.dsa_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
@@ -165,7 +183,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.MLA:
                     layer = build_module(
                         submodules.mla_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
@@ -175,7 +193,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.MLP:
                     layer = build_module(
                         submodules.mlp_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
@@ -184,7 +202,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
                         submodules.moe_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
@@ -193,7 +211,7 @@ class HybridStack(MegatronModule):
                 elif layer_type == LayerSymbols.GDN:
                     layer = build_module(
                         submodules.gdn_layer,
-                        config=self.config,
+                        config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         # Set to False as we do not want to change offset.
