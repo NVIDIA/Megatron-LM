@@ -25,6 +25,7 @@ class Sampling(ABC):
         no_top_p: bool,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
+        output: Optional[Tensor] = None,
         eager: bool = False,
         cache_key: Any = None,
     ) -> Tensor:
@@ -41,6 +42,7 @@ class Sampling(ABC):
             gather_indices: If provided, only sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: Per-token request mapping; when set, sampling
                 parameters are gathered per-token instead of per-request.
+            output: Optional caller-owned destination tensor of shape `[n]`.
             eager, cache_key: Accepted for API symmetry; ignored (no CUDA graph).
 
         Returns:
@@ -63,12 +65,24 @@ class Sampling(ABC):
         """Sample tokens for the speculative-verify path.
 
         Decode requests contribute `1 + num_speculative_tokens` rows; prefill requests contribute 1.
-        Builds the per-token request mapping and dispatches to `sample_kernel`.
-        The `sample_kernel` is forced eager so its own `CudaGraphManager` wrapper does not fire.
+        Builds the per-token request mapping and dispatches to the return-valued `sample_kernel`.
 
         When `gather_indices` is supplied, the kernel selects via `logits[gather_indices[:n], :]`.
         When `gather_indices` is None, `required_logits` is expected to be already pre-gathered to
         the layout described above (e.g. when `materialize_only_last_token_logits=True` upstream).
+
+        Args:
+            required_logits: Logits containing base and speculative rows.
+            num_decode: Number of decode requests.
+            num_prefill: Number of prefill requests.
+            num_speculative_tokens: Number of draft tokens per decode request.
+            context: The active DynamicInferenceContext.
+            gather_indices: Optional rows to gather from `required_logits`.
+            eager: Whether to bypass a wrapped CUDA graph.
+            cache_key: CUDA graph lookup key.
+
+        Returns:
+            Sampled token IDs for all required base and speculative rows.
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
@@ -106,13 +120,15 @@ class Sampling(ABC):
 
     @abstractmethod
     def log_probs_kernel(
-        self, logits: Tensor, temperature: Tensor, top_k: Tensor, top_p: Tensor
+        self, logits: Tensor, context, *, token_to_request_index: Optional[Tensor] = None
     ) -> Tensor:
         """Per-row log-probs of the distribution this backend samples from.
 
         Args:
             logits: `[num_rows, vocab_size]` raw logits.
-            temperature, top_k, top_p: `[num_rows]` per-row sampling params.
+            context: The active DynamicInferenceContext.
+            token_to_request_index: Optional per-row request mapping. When
+                omitted, each logits row maps to the request at the same index.
 
         Returns:
             `[num_rows, vocab_size]` log-probs; filtered-out tokens are `-inf`.
