@@ -17,10 +17,10 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
-from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention import AttentionLayerConfig, SelfAttention
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
 )
@@ -87,7 +87,7 @@ def test_all_layer_configs_route_to_matching_specs(monkeypatch):
         name="decoder",
     )
 
-    assert block.layer_type_list == layer_symbols
+    assert not hasattr(block, "layer_type_list")
     assert [module_spec for module_spec, _ in build_calls] == expected_specs
     assert all(
         kwargs["config"] is layer_config
@@ -129,6 +129,27 @@ def test_all_layer_configs_route_to_matching_specs(monkeypatch):
     assert independent_layer_configs[0].tp_comm_overlap is False
     assert independent_layer_configs[1].tp_comm_overlap is True
     assert independent_root_config.tp_comm_overlap is True
+
+
+def test_mamba_state_shapes_are_selected_by_layer_config_type():
+    """Mamba state shape lookup does not depend on layer symbols or module methods alone."""
+    attention_config = object.__new__(AttentionLayerConfig)
+    mamba_config = object.__new__(MambaLayerConfig)
+    attention_shapes = ((1,), (2,))
+    mamba_shapes = ((3,), (4,))
+    block = SimpleNamespace(
+        layer_config_list=[attention_config, mamba_config],
+        layers=[
+            SimpleNamespace(mamba_state_shapes_per_request=lambda: attention_shapes),
+            SimpleNamespace(mamba_state_shapes_per_request=lambda: mamba_shapes),
+        ],
+    )
+
+    assert HybridStack.mamba_state_shapes_per_request(block) == mamba_shapes
+
+    block.layer_config_list = [attention_config]
+    block.layers = block.layers[:1]
+    assert HybridStack.mamba_state_shapes_per_request(block) is None
 
 
 def test_hybrid_stack_rejects_same_named_config_type():
@@ -366,7 +387,6 @@ class TestHybridBlock:
         assert isinstance(layers[1].self_attention, SelfAttention)
         assert isinstance(layers[2], TransformerLayer)
         assert isinstance(layers[2].mlp, MLP)
-        assert block.layer_type_list == list(layer_pattern)
         assert len({id(config) for config in block.layer_config_list}) == len(layer_pattern)
         assert all(
             layer.config is layer_config

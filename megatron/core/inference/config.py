@@ -24,8 +24,8 @@ class MambaInferenceStateConfig:
 
     layer_type_list: List[str]
     """
-    A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
-    See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
+    Derived layer symbols used by legacy dynamic inference cache indexing. See
+    `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
     """
 
     conv_states_shape: Tuple[int]
@@ -51,12 +51,15 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Returns Mamba inference state config from the model if it is a hybrid model."""
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        from megatron.core.models.hybrid.hybrid_layer_allocation import LAYER_SYMBOL_TO_CONFIG_CLASS
+        from megatron.core.ssm.mamba_layer import MambaLayerConfig
 
         decoder = get_attr_wrapped_model(model, "decoder")
-        layer_type_list = getattr(decoder, "layer_type_list", None)
-        if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
+        layer_config_list = getattr(decoder, "layer_config_list", None)
+        if layer_config_list is not None and any(
+            type(layer_config) is MambaLayerConfig for layer_config in layer_config_list
+        ):
+            mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )
             if conv_states_dtype is None:
@@ -73,10 +76,18 @@ class MambaInferenceStateConfig:
             elif ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
             mamba_chunk_size = 128
-            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
-                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
+            for layer_config, layer in zip(layer_config_list, decoder.layers):
+                if type(layer_config) is MambaLayerConfig and hasattr(layer, 'mixer'):
                     mamba_chunk_size = layer.mixer.chunk_size
                     break
+            # Legacy dynamic inference still indexes state caches by layer symbol.
+            config_class_to_symbol = {
+                config_class: symbol
+                for symbol, config_class in LAYER_SYMBOL_TO_CONFIG_CLASS.items()
+            }
+            layer_type_list = [
+                config_class_to_symbol[type(layer_config)] for layer_config in layer_config_list
+            ]
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,

@@ -5,8 +5,16 @@ from argparse import ArgumentParser
 from types import SimpleNamespace
 
 import pytest
+import torch
 
-from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    InferenceConfig,
+    MambaInferenceStateConfig,
+)
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.ssm.mamba_layer import MambaLayerConfig
+from megatron.core.transformer.attention import AttentionLayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import _add_inference_args
 from megatron.training.config.inference_config import InferenceSetupConfig
@@ -62,7 +70,7 @@ class TestInferenceConfig:
             position_embedding_type="rope",
             max_sequence_length=4096,
             pg_collection="pg",
-            decoder=SimpleNamespace(layer_type_list=None),
+            decoder=SimpleNamespace(layer_config_list=None),
         )
         setup_config = InferenceSetupConfig(inference_dynamic_batching_async_sched_mode="async")
 
@@ -91,7 +99,7 @@ class TestInferenceConfig:
             position_embedding_type="rope",
             max_sequence_length=4096,
             pg_collection="pg",
-            decoder=SimpleNamespace(layer_type_list=None),
+            decoder=SimpleNamespace(layer_config_list=None),
         )
         setup_config = InferenceSetupConfig(offset_sampling_seed_by_dp_rank=False)
 
@@ -104,3 +112,37 @@ class TestInferenceConfig:
         )
 
         assert inference_config.offset_sampling_seed_by_dp_rank is False
+
+    def test_mamba_state_config_uses_exact_layer_config_types(self, monkeypatch):
+        """Model-derived Mamba metadata comes from layer configs, not decoder symbols."""
+        attention_config = object.__new__(AttentionLayerConfig)
+        mamba_layer_config = object.__new__(MambaLayerConfig)
+        decoder = SimpleNamespace(
+            layer_config_list=[attention_config, mamba_layer_config],
+            layers=[
+                SimpleNamespace(mixer=SimpleNamespace(chunk_size=16)),
+                SimpleNamespace(mixer=SimpleNamespace(chunk_size=64)),
+            ],
+            mamba_state_shapes_per_request=lambda: ((4, 8), (8, 32, 16)),
+        )
+        model = SimpleNamespace(
+            config=SimpleNamespace(batch_invariant_mode=False, params_dtype=torch.bfloat16)
+        )
+        monkeypatch.setattr(
+            "megatron.core.inference.config.get_attr_wrapped_model",
+            lambda *_args, **_kwargs: decoder,
+        )
+
+        mamba_state_config = MambaInferenceStateConfig.from_model(model)
+
+        assert mamba_state_config is not None
+        assert mamba_state_config.layer_type_list == [Symbols.ATTENTION, Symbols.MAMBA]
+        assert mamba_state_config.conv_states_shape == (4, 8)
+        assert mamba_state_config.ssm_states_shape == (8, 32, 16)
+        assert mamba_state_config.conv_states_dtype is torch.bfloat16
+        assert mamba_state_config.ssm_states_dtype is torch.bfloat16
+        assert mamba_state_config.mamba_chunk_size == 64
+
+        decoder.layer_config_list = [attention_config]
+        decoder.layers = decoder.layers[:1]
+        assert MambaInferenceStateConfig.from_model(model) is None

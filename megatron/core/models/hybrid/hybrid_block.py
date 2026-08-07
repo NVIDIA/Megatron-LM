@@ -22,7 +22,6 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import HybridLayerConfig
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -119,8 +118,6 @@ class HybridStack(MegatronModule):
         self.pg_collection = pg_collection
 
         self.layer_config_list = layer_config_list
-        # Retain the symbol list for inference metadata and checkpoint mapping consumers.
-        self.layer_type_list = []
 
         if getattr(self.config, "mla_down_proj_fusion", False):
             submodules = self._fuse_mla_down_proj(submodules)
@@ -142,7 +139,6 @@ class HybridStack(MegatronModule):
                 quant_init_context = nullcontext()
             with quant_init_context:
                 if type(layer_config) is MambaLayerConfig:
-                    layer_type = LayerSymbols.MAMBA
                     layer = build_module(
                         submodules.mamba_layer,
                         config=layer_config,
@@ -152,7 +148,6 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is AttentionLayerConfig:
-                    layer_type = LayerSymbols.ATTENTION
                     layer = build_module(
                         submodules.attention_layer,
                         config=layer_config,
@@ -164,7 +159,6 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is DSALayerConfig:
-                    layer_type = LayerSymbols.DS_ATTENTION
                     layer = build_module(
                         submodules.dsa_layer,
                         config=layer_config,
@@ -176,7 +170,6 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is MLALayerConfig:
-                    layer_type = LayerSymbols.MLA
                     layer = build_module(
                         submodules.mla_layer,
                         config=layer_config,
@@ -187,7 +180,6 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                     )
                 elif type(layer_config) is MLPLayerConfig:
-                    layer_type = LayerSymbols.MLP
                     layer = build_module(
                         submodules.mlp_layer,
                         config=layer_config,
@@ -197,7 +189,6 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is MoELayerConfig:
-                    layer_type = LayerSymbols.MOE
                     layer = build_module(
                         submodules.moe_layer,
                         config=layer_config,
@@ -207,7 +198,6 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is GDNLayerConfig:
-                    layer_type = LayerSymbols.GDN
                     layer = build_module(
                         submodules.gdn_layer,
                         config=layer_config,
@@ -227,7 +217,6 @@ class HybridStack(MegatronModule):
             self.synchronize_shared_config_mutation(
                 "tp_comm_overlap", tp_comm_overlap, layer_config.tp_comm_overlap
             )
-            self.layer_type_list.append(layer_type)
             self.layers.append(layer)
 
         if self.config.cuda_graph_impl == "local":
@@ -297,8 +286,8 @@ class HybridStack(MegatronModule):
         Returns the Mamba conv and ssm states shapes per input sequence
         if this block contains Mamba layers (this may not be the case with PP > 1).
         """
-        for layer_type, layer in zip(self.layer_type_list, self.layers):
-            if layer_type == LayerSymbols.MAMBA:
+        for layer_config, layer in zip(self.layer_config_list, self.layers):
+            if type(layer_config) is MambaLayerConfig:
                 return layer.mamba_state_shapes_per_request()
         return None
 
