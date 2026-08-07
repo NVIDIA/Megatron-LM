@@ -16,6 +16,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from weakref import ReferenceType, ref
 
 import torch
 import torch.distributed as dist
@@ -32,7 +33,12 @@ _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
 def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
     """Return the FSDP parameter group that owns ``parameter``, if any."""
-    return getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
+    # This parameter-owned backedge must be weak; otherwise it forms a reference
+    # cycle with the parameter group and delays releasing its CUDA storage.
+    parameter_group_ref = getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
+    if parameter_group_ref is None:
+        return None
+    return parameter_group_ref()
 
 
 @dataclass(frozen=True, eq=False)
@@ -49,7 +55,9 @@ class FsdpParameter:
 class FsdpParameterGroup:
     """A dtype and requires-grad homogeneous group of FSDP-owned parameters."""
 
-    owning_module: nn.Module
+    # FsdpModule owns its parameter groups, so this backedge must be weak to avoid
+    # a reference cycle that delays releasing CUDA storage until cyclic GC.
+    _owning_module: ReferenceType[nn.Module]
     fsdp_parameters: tuple[FsdpParameter, ...]
     mesh: DeviceMesh
     dtype: torch.dtype
@@ -67,6 +75,7 @@ class FsdpParameterGroup:
         mesh: DeviceMesh,
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
+        reduce_scatter_stream: torch.cuda.Stream,
         use_symm_mem: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
@@ -77,6 +86,7 @@ class FsdpParameterGroup:
             mesh: Device mesh used for all DBuffer storage in this version.
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
+            reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
             use_symm_mem: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
         """
@@ -93,7 +103,7 @@ class FsdpParameterGroup:
 
         # Python dicts preserve insertion order, so parameter_to_fqns and
         # fsdp_parameters define the same stable DBuffer tensor order.
-        self.owning_module = owning_module
+        self._owning_module = ref(owning_module)
         self.mesh = mesh
         first_parameter = next(iter(parameter_to_fqns))
         self.dtype = first_parameter.dtype
@@ -152,13 +162,14 @@ class FsdpParameterGroup:
             # eagerly deallocated right after optimizer.step(), avoiding main_grad
             # storage during forward. That requires a separate lifetime contract with
             # the optimizer, so this version keeps the simpler persistent buffer.
-            self.main_grad = DBuffer(
-                mesh=self.mesh,
-                placements=main_grad_placements,
-                tensor_shapes=self.main_weight.layout.tensor_shapes,
-                dtype=grad_dtype,
-                device=self.main_weight.device,
-            )
+            with torch.cuda.stream(reduce_scatter_stream):
+                self.main_grad = DBuffer(
+                    mesh=self.mesh,
+                    placements=main_grad_placements,
+                    tensor_shapes=self.main_weight.layout.tensor_shapes,
+                    dtype=grad_dtype,
+                    device=self.main_weight.device,
+                )
             assert self.main_grad.layout == self.main_weight.layout, (
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
@@ -182,14 +193,15 @@ class FsdpParameterGroup:
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
-            setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
+            # Parameter-owned markers must not retain their FSDP module tree.
+            setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
-            setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
+            setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
             fsdp_parameters.append(
                 FsdpParameter(fqns=tuple(fqns), sharded=sharded_parameter, unsharded=parameter)
             )
@@ -207,8 +219,11 @@ class FsdpParameterGroup:
         return torch.cuda.use_mem_pool(self._symm_mem_pool)
 
     def _set_module_parameter(self, fqns: tuple[str, ...], parameter: nn.Parameter) -> None:
+        owning_module = self._owning_module()
+        if owning_module is None:
+            raise RuntimeError("FSDP parameter group outlived its owning module.")
         for fqn in fqns:
-            module, parameter_name = _get_parameter_owner(self.owning_module, fqn)
+            module, parameter_name = _get_parameter_owner(owning_module, fqn)
             module._parameters[parameter_name] = parameter
 
     def _switch_to_sharded_parameters(self) -> None:
