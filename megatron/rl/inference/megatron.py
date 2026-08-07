@@ -193,7 +193,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.suspend_engines()
         await self._inference_engine.wait_until(EngineState.SUSPENDED)
 
-    def take_request_ledger(self) -> dict[tuple[bytes, bytes], list[FinishedRequestRecord]]:
+    def merge_global_request_ledgers(self) -> dict[tuple[bytes, bytes], list[FinishedRequestRecord]]:
         """Union every engine's local-metadata ledger and clear them."""
         local = self._inference_engine.consume_local_metadata_ledger()
         shards = [None] * dist.get_world_size()

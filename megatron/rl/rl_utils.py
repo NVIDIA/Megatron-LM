@@ -715,7 +715,7 @@ def get_environment_rollouts(
             # Wait for Rollouts to be collected
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
-            request_ledger = inference_interface.take_request_ledger()
+            request_ledger = inference_interface.merge_global_request_ledgers()
         logger.debug(f"Got rollouts on rank {rank}")
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):

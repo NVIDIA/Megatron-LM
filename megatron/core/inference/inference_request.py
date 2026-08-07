@@ -826,9 +826,7 @@ class FinishedRequestRecord:
         # Epoch stamps exist only while the engine has a generation epoch set.
         record = cls(
             policy_epoch=(
-                None
-                if request.policy_epoch is None
-                else [tuple(b) for b in request.policy_epoch]
+                None if request.policy_epoch is None else [tuple(b) for b in request.policy_epoch]
             ),
             kv_cache_epoch=(
                 None
