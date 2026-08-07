@@ -15,6 +15,7 @@ Run with::
     torchrun --nproc_per_node=2 -m pytest \\
         tests/unit_tests/ssm/test_gdp_packed_seq.py -m internal -v
 """
+
 from __future__ import annotations
 
 import os
