@@ -55,6 +55,7 @@ from megatron.training.distillation.utils import (
     LOGPROBS_FORMAT_VERSION,
     LOGPROBS_TAR_MEMBER_SUFFIX,
     META_TAR_MEMBER,
+    batched_tar_prefix,
     compute_dataset_hash,
     get_consumed_train_samples,
     get_current_iteration,
@@ -62,6 +63,7 @@ from megatron.training.distillation.utils import (
     open_logit_file,
     quarantine_contained_tars,
     reassemble_cp_sequence,
+    storage_glob_with_caching,
     storage_makedirs,
     storage_move,
     v2_batched_tar_filename,
@@ -656,19 +658,44 @@ class LogitsSaverHooks:
     #  Flush helpers
     # ------------------------------------------------------------------
 
-    def take_pending_data(self) -> Tuple[str, "OrderedDict[Tuple[int, int], bytes]", bytes, bool]:
+    def take_pending_data(
+        self,
+    ) -> Tuple[str, "OrderedDict[Tuple[int, int], bytes]", bytes, bool, List[str]]:
         """Take ownership of buffered data for async flush at checkpoint time.
 
+        Also lists this rank's own DP shards here, on the main training
+        process, rather than leaving
+        :func:`~megatron.training.distillation.utils.quarantine_contained_tars`
+        to list them again from inside the (persistent, spawned) async
+        checkpoint worker process -- that process shares no state with
+        the main one, so every DP rank's worker independently re-listing
+        the same remote directory on every flush is what actually drives
+        object-store rate limiting (e.g. MSC "Too Many Requests").
+
+        The underlying listing call is a collective for remote storage
+        (broadcasts once per pipeline stage), so this must run
+        unconditionally on **every** rank owning a
+        :class:`LogitsSaverHooks` instance, not just the ranks with
+        pending writes -- otherwise idle ranks would never enter the
+        collective and the active ones would hang waiting for them.
+
         Returns:
-            Tuple of (tar_path, writes, meta_bytes, msc_enabled).  If there is
-            no pending data (e.g. non-TP-rank-0 or non-CP-rank-0), ``writes``
-            will be an empty OrderedDict and ``tar_path`` will be an empty string.
+            Tuple of (tar_path, writes, meta_bytes, msc_enabled, existing_tars).
+            If there is no pending data (e.g. non-TP-rank-0 or
+            non-CP-rank-0), ``writes`` will be an empty OrderedDict and
+            ``tar_path`` will be an empty string.
         """
         # NOTE: We need to re-enabled MSC in the async saving process, so we pass this flag.
         msc_enabled = MultiStorageClientFeature.is_enabled()
 
+        # Uncached: this is a point-in-time snapshot to hand off to the async
+        # writer, not something later calls in this (long-lived) process
+        # should keep reusing.
+        prefix = batched_tar_prefix(self.dp_rank)
+        existing_tars = storage_glob_with_caching(self.save_dir, f"*{prefix}*.tar", cached=False)
+
         if not self._pending_writes:
-            return ("", OrderedDict(), self._meta_bytes, msc_enabled)
+            return ("", OrderedDict(), self._meta_bytes, msc_enabled, existing_tars)
 
         writes = self._pending_writes
         self._pending_writes = OrderedDict()
@@ -678,7 +705,7 @@ class LogitsSaverHooks:
         tar_filename = v2_batched_tar_filename(self.dp_rank, bundle_start, bundle_end)
         tar_path = os.path.join(self.save_dir, tar_filename)
         print_rank_last(f"Handing off {len(writes)} logit iterations for async flush")
-        return (tar_path, writes, self._meta_bytes, msc_enabled)
+        return (tar_path, writes, self._meta_bytes, msc_enabled, existing_tars)
 
     @staticmethod
     def _write_batched_tar(
@@ -686,6 +713,7 @@ class LogitsSaverHooks:
         writes: "OrderedDict[Tuple[int, int], bytes]",
         meta_bytes: bytes,
         msc_enabled: bool = False,
+        existing_tars: Optional[List[str]] = None,
     ) -> None:
         """Write a tar archive containing multiple iterations.
 
@@ -712,6 +740,15 @@ class LogitsSaverHooks:
         so the resumed run naturally regenerates that range and
         reflushes it -- whereas an overlap would require the loader's
         sequential/no-overlap check to catch it as a hard error.
+
+        *existing_tars*, when provided, is a listing of this DP rank's
+        own shards under *save_dir*, fetched once on the main training
+        process (see :meth:`take_pending_data`) and handed off through
+        the async request rather than re-listed here -- this process is
+        a persistent, spawned worker with no shared state with the main
+        process, so every DP rank's worker independently calling
+        ``storage_glob`` on every flush is what actually triggers
+        object-store rate limiting.
         """
         if not writes:
             return
@@ -726,7 +763,7 @@ class LogitsSaverHooks:
             )
 
         storage_makedirs(os.path.dirname(tar_path), exist_ok=True)
-        for old_path, quarantined in quarantine_contained_tars(tar_path):
+        for old_path, quarantined in quarantine_contained_tars(tar_path, known_tars=existing_tars):
             print_rank_last(f"Quarantined superseded cached-logits shard {old_path} -> {quarantined}")
 
         write_path = tar_path if is_remote_storage_path(tar_path) else f"{tar_path}.tmp"

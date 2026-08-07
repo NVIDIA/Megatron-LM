@@ -723,7 +723,9 @@ def detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
     return max(dp_ranks_found) + 1
 
 
-def quarantine_contained_tars(tar_path: str) -> List[Tuple[str, str]]:
+def quarantine_contained_tars(
+    tar_path: str, known_tars: Optional[List[str]] = None
+) -> List[Tuple[str, str]]:
     """Quarantine existing v2 shards fully contained in *tar_path*'s range.
 
     Call this **before** writing *tar_path*.  An existing shard
@@ -749,6 +751,15 @@ def quarantine_contained_tars(tar_path: str) -> List[Tuple[str, str]]:
     checkpoint interval) -- left to the loader's sequential/no-overlap
     check as a safety net.
 
+    Args:
+        tar_path: Path of the tar about to be written.
+        known_tars: Optional pre-fetched listing, already scoped to
+            *tar_path*'s own DP rank prefix, used as-is instead of a
+            fresh ``storage_glob`` call (avoids re-listing the remote
+            directory from inside the async checkpoint worker on every
+            flush, which can trip object-store rate limits). Passing an
+            unscoped listing risks quarantining another DP rank's shard.
+
     Returns ``(old_path, quarantined_path)`` pairs for the caller to log;
     empty if nothing was quarantined.
     """
@@ -759,8 +770,11 @@ def quarantine_contained_tars(tar_path: str) -> List[Tuple[str, str]]:
     dp_rank = int(match.group("dp"))
     new_start, new_end = int(match.group("start")), int(match.group("end"))
 
-    prefix = batched_tar_prefix(dp_rank)
-    candidates = storage_glob(os.path.join(save_dir, f"*{prefix}*.tar"))
+    if known_tars is not None:
+        candidates = known_tars
+    else:
+        prefix = batched_tar_prefix(dp_rank)
+        candidates = storage_glob(os.path.join(save_dir, f"*{prefix}*.tar"))
 
     quarantined_pairs: List[Tuple[str, str]] = []
     for path in candidates:
