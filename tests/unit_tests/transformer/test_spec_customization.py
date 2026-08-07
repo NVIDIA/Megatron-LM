@@ -6,11 +6,13 @@ from dataclasses import fields
 import torch
 import transformer_engine as te
 
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.extensions.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
     TENorm,
     TERowParallelLinear,
+    _bind_tenorm_sharded_state_dict,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
@@ -27,6 +29,74 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+class TestGptLayerCheckpointKeys:
+    def test_dense_local_spec_uses_te_fused_layernorm_keys(self):
+        submodules = get_gpt_layer_local_submodules()
+
+        assert submodules.sharded_state_dict_keys_map == {
+            "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
+            "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
+        }
+
+    def test_moe_local_spec_keeps_te_standalone_pre_mlp_layernorm_key(self):
+        submodules = get_gpt_layer_local_submodules(num_experts=8)
+
+        assert submodules.sharded_state_dict_keys_map == {
+            "input_layernorm.": "self_attention.linear_qkv.layer_norm_"
+        }
+
+
+class TestTECheckpointCompatibility:
+    class _FakeTEModule(torch.nn.Module):
+        def __init__(self, extra_state):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(4))
+            self._test_extra_state = extra_state
+
+        def get_extra_state(self):
+            return self._test_extra_state
+
+        def set_extra_state(self, state):
+            self._test_extra_state = state
+
+    def test_empty_extra_state_is_local_nonpersistent(self):
+        norm = self._FakeTEModule(torch.empty(0, dtype=torch.uint8))
+        _bind_tenorm_sharded_state_dict(norm)
+
+        sharded_state_dict = norm.sharded_state_dict(
+            prefix="norm.", metadata={"dp_cp_group": object()}
+        )
+
+        assert isinstance(sharded_state_dict["norm._extra_state"], LocalNonpersistentObject)
+        assert sharded_state_dict["norm._extra_state"].unwrap().numel() == 0
+
+    def test_nonempty_extra_state_remains_checkpointed(self):
+        norm = self._FakeTEModule(torch.ones(1, dtype=torch.uint8))
+        _bind_tenorm_sharded_state_dict(norm)
+
+        sharded_state_dict = norm.sharded_state_dict(
+            prefix="norm.", metadata={"dp_cp_group": object()}
+        )
+
+        assert isinstance(sharded_state_dict["norm._extra_state"], ShardedObject)
+
+    def test_attention_empty_extra_state_is_local_nonpersistent(self):
+        class FakeConfig:
+            softmax_type = "learnable"
+
+        attention = self._FakeTEModule(torch.empty(0, dtype=torch.uint8))
+        attention.config = FakeConfig()
+        attention.softmax_offset = torch.nn.Parameter(torch.ones(4))
+        attention._tp_group = None
+
+        sharded_state_dict = TEDotProductAttention.sharded_state_dict(
+            attention, prefix="attention.", metadata={"dp_cp_group": object()}
+        )
+
+        assert "attention.softmax_offset" in sharded_state_dict
+        assert isinstance(sharded_state_dict["attention._extra_state"], LocalNonpersistentObject)
 
 
 class TestSpecCustomization:
