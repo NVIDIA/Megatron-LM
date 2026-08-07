@@ -28,6 +28,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
     fully_shard,
+    fully_shard_context,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -199,15 +200,16 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup):
 
     # Shard the model: experts over the expert-DP sub-mesh, dense params over the full DP mesh.
     # Experts additionally need grad_divisor=ep_size; see fully_shard.
-    for decoder_layer in model.decoder.layers:
-        if isinstance(decoder_layer, MoETransformerLayer):
-            fully_shard(
-                decoder_layer.mlp.experts,
-                mesh=moe_mesh["edp"],
-                placements=_FLAT_SHARD,
-                grad_divisor=ep_size,
-            )
-    fully_shard(model, mesh=world_mesh, placements=_FLAT_SHARD)
+    with fully_shard_context(device=device):
+        for decoder_layer in model.decoder.layers:
+            if isinstance(decoder_layer, MoETransformerLayer):
+                fully_shard(
+                    decoder_layer.mlp.experts,
+                    mesh=moe_mesh["edp"],
+                    placements=_FLAT_SHARD,
+                    grad_divisor=ep_size,
+                )
+        fully_shard(model, mesh=world_mesh, placements=_FLAT_SHARD)
 
     # One global batch, identical on every rank; the reference sees all of it, the model its shard.
     torch.manual_seed(4321)
