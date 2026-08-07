@@ -75,6 +75,7 @@ class FsdpParameterGroup:
         mesh: DeviceMesh,
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
+        reduce_scatter_stream: torch.cuda.Stream,
         use_symm_mem: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
@@ -85,11 +86,14 @@ class FsdpParameterGroup:
             mesh: Device mesh used for all DBuffer storage in this version.
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
+            reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
             use_symm_mem: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
+        if use_symm_mem and not hasattr(symm_mem, "is_symm_mem_tensor"):
+            raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
@@ -160,13 +164,14 @@ class FsdpParameterGroup:
             # eagerly deallocated right after optimizer.step(), avoiding main_grad
             # storage during forward. That requires a separate lifetime contract with
             # the optimizer, so this version keeps the simpler persistent buffer.
-            self.main_grad = DBuffer(
-                mesh=self.mesh,
-                placements=main_grad_placements,
-                tensor_shapes=self.main_weight.layout.tensor_shapes,
-                dtype=grad_dtype,
-                device=self.main_weight.device,
-            )
+            with torch.cuda.stream(reduce_scatter_stream):
+                self.main_grad = DBuffer(
+                    mesh=self.mesh,
+                    placements=main_grad_placements,
+                    tensor_shapes=self.main_weight.layout.tensor_shapes,
+                    dtype=grad_dtype,
+                    device=self.main_weight.device,
+                )
             assert self.main_grad.layout == self.main_weight.layout, (
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
@@ -291,9 +296,6 @@ class FsdpParameterGroup:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
 
-        # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
-        # Preserve AVG semantics by reducing SUM and scaling the output below.
-        partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
         grads: list[torch.Tensor] = []
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:
@@ -302,7 +304,7 @@ class FsdpParameterGroup:
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
-                placements=[Partial(partial_op)] * self.mesh.ndim,
+                placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
@@ -359,18 +361,10 @@ class FsdpParameterGroup:
         reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
         if reduce_axis is None:
             raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
-        partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
-        grad_divisor = self.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
-        if self._symm_mem_pool is not None:
-            partial_grad.rendezvous(reduce_axis)
         if can_reduce_into_main_grad:
             partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
-            if grad_divisor != 1:
-                self.main_grad.local_buffer.div_(grad_divisor)
         else:
             reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-            if grad_divisor != 1:
-                reduced_grad.local_buffer.div_(grad_divisor)
             if has_sharded_grads:
                 self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
             else:
