@@ -152,6 +152,13 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
     """
 
+    fsdp_buffer_count: int = 2
+    """Number of persistent buffers allocated for each Megatron FSDP communication pool.
+      The default of two preserves the conventional double-buffer behavior. Combined 1F1B
+      overlap may require three buffers because a backward/recompute unit, the current
+      forward unit, and its forward-prefetched successor can be live concurrently.
+    """
+
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 
@@ -181,6 +188,15 @@ class DistributedDataParallelConfig:
     """If true, disable symmetric (window) registration for NCCL userbuffer registration.
       This option will force to use conventional (local) userbuffer registration 
       when nccl_ub is set.
+    """
+
+    fsdp_ubr_registration_scope: str = 'all'
+    """Communicator scope for FSDP NCCL user-buffer registration.
+
+    ``all`` preserves the default behavior and registers dense, expert, independent
+    all-gather, and outer-DP groups. ``dense_inner`` registers only the communicator
+    used by dense inner-FSDP parameter all-gathers; expert and outer-DP collectives
+    remain unregistered and use ordinary NCCL kernels.
     """
 
     fsdp_manual_registration: bool = False
@@ -272,6 +288,11 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.fsdp_ubr_registration_scope not in ("all", "dense_inner"):
+            raise ValueError(
+                "fsdp_ubr_registration_scope must be one of: all, dense_inner; "
+                f"got {self.fsdp_ubr_registration_scope!r}."
+            )
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 
@@ -309,3 +330,4 @@ class DistributedDataParallelConfig:
         if self.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of double-buffer allocator.
             self.fsdp_double_buffer = True
+        assert self.fsdp_buffer_count >= 2, "fsdp_buffer_count must be at least 2."

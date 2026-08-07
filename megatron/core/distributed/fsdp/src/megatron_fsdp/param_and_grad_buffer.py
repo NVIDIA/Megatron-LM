@@ -6,6 +6,7 @@ import copy
 import dataclasses
 import functools
 import gc
+import hashlib
 import inspect
 import logging
 import math
@@ -15,7 +16,7 @@ import warnings
 from collections import defaultdict, namedtuple
 from contextlib import ExitStack, nullcontext
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
 
 import torch
 from torch.distributed import _coalescing_manager
@@ -103,6 +104,98 @@ except ImportError:
         nccl_allocator = None
 
 NCCL_MEMORY_POOL = None
+
+
+def _get_ubr_registration_groups(
+    dist_index: FSDPDistributedIndex, registration_scope: str
+) -> List[torch.distributed.ProcessGroup]:
+    """Return the process groups that should register the FSDP NCCL memory pool.
+
+    ``dense_inner`` is intended for HSDP configurations where only dense inner-DP
+    parameter all-gathers are large enough to justify symmetric registration. Outer-DP
+    and expert collectives remain valid on tensors allocated from the pool without
+    registering that pool to their communicators; NCCL then selects its ordinary path.
+
+    HSDP parameter all-gathers use the dense helper buffer's base inner-FSDP group. In
+    non-HSDP configurations, prefer the independent dense all-gather group when present.
+    """
+    if registration_scope == "dense_inner":
+        if dist_index.use_hybrid_fsdp:
+            dense_param_ag_group = dist_index.get_fsdp_group(is_expert_parallel=False)
+        else:
+            dense_param_ag_group = dist_index.get_fsdp_group(
+                is_expert_parallel=False, independent_all_gather=True
+            ) or dist_index.get_fsdp_group(is_expert_parallel=False)
+        return [dense_param_ag_group] if dense_param_ag_group is not None else []
+
+    if registration_scope != "all":
+        raise ValueError(
+            f"Invalid FSDP UBR registration scope: {registration_scope}. "
+            "Expected one of: all, dense_inner."
+        )
+
+    groups = [dist_index.get_fsdp_group(is_expert_parallel=False)]
+    expert_group = dist_index.get_fsdp_group(is_expert_parallel=True)
+    if expert_group is not None:
+        groups.append(expert_group)
+    dense_ag_group = dist_index.get_fsdp_group(
+        is_expert_parallel=False, independent_all_gather=True
+    )
+    if dense_ag_group is not None:
+        groups.append(dense_ag_group)
+    expert_ag_group = dist_index.get_fsdp_group(
+        is_expert_parallel=True, independent_all_gather=True
+    )
+    if expert_ag_group is not None:
+        groups.append(expert_ag_group)
+    outer_group = dist_index.get_outer_fsdp_group()
+    if outer_group is not None:
+        groups.append(outer_group)
+    return groups
+
+
+def _mem_pool_registration_signature(pool) -> Tuple[int, ...]:
+    """Return segment sizes in the order used by ProcessGroupNCCL registration.
+
+    ProcessGroupNCCL sorts a memory-pool snapshot by ``registration_counter``
+    and collectively registers every segment in that order.  A different
+    number or ordering of segment sizes across ranks can therefore deadlock
+    ``register_mem_pool`` before NCCL has a chance to report a useful error.
+    Addresses are intentionally excluded: each rank owns a different local
+    address, while collective registration requires the segment layout to
+    match.
+    """
+    snapshot = list(pool.snapshot())
+
+    def registration_order(item):
+        index, segment = item
+        return (segment.get("registration_counter", index), index)
+
+    ordered_segments = sorted(enumerate(snapshot), key=registration_order)
+    return tuple(int(segment["total_size"]) for _, segment in ordered_segments)
+
+
+def _build_ubr_arena_layout(
+    ordered_allocation_plan: Sequence[tuple], alignment: int = 256
+) -> Tuple[List[Tuple[int, tuple]], int]:
+    """Assign deterministic byte offsets inside one registered UBR arena.
+
+    A PyTorch MemPool can expose the same live allocations as differently ordered
+    physical segments across ranks, even when their logical allocation plan is
+    identical. Packing all registered tensors into one backing allocation makes the
+    ProcessGroupNCCL registration sequence a single segment and also guarantees equal
+    tensor offsets across ranks.
+    """
+    assert alignment > 0 and alignment & (alignment - 1) == 0
+    layout = []
+    next_offset = 0
+    for request in ordered_allocation_plan:
+        num_bytes = request[0]
+        aligned_offset = (next_offset + alignment - 1) // alignment * alignment
+        layout.append((aligned_offset, request))
+        next_offset = aligned_offset + num_bytes
+    arena_size = (next_offset + alignment - 1) // alignment * alignment
+    return layout, arena_size
 
 
 def _p_assert(cond: Any, s: str, raise_assertion_error: bool = True) -> None:
@@ -522,6 +615,12 @@ class TemporaryBucketAllocator:
             _free_storage(self.buckets[bucket_id].data)
             del self.buckets[bucket_id]
 
+    def can_allocate(
+        self, bucket_ids: List[int], releasable_bucket_ids: Optional[set[int]] = None
+    ) -> bool:
+        """Return whether ``bucket_ids`` fit after releasing the supplied buckets."""
+        return True
+
 
 class StorageResizeBasedBucketAllocator(TemporaryBucketAllocator):
     """
@@ -752,6 +851,33 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 return False
         return True
 
+    def can_allocate(
+        self, bucket_ids: List[int], releasable_bucket_ids: Optional[set[int]] = None
+    ) -> bool:
+        """Return whether the requested buckets fit in the fixed pool."""
+        releasable_bucket_ids = releasable_bucket_ids or set()
+        available_by_offset = defaultdict(int)
+        for _, bucket_offset in self.idle_buffer:
+            available_by_offset[bucket_offset] += 1
+        for bucket_id in releasable_bucket_ids:
+            if bucket_id in self.using_buffer:
+                _, bucket_offset = self.using_buffer[bucket_id]
+                available_by_offset[bucket_offset] += 1
+
+        required_by_offset = defaultdict(int)
+        for bucket_id in set(bucket_ids):
+            fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+            if fsdp_unit_id not in self.fsdp_double_buffer_units or (
+                bucket_id in self.using_buffer and bucket_id not in releasable_bucket_ids
+            ):
+                continue
+            _, bucket_offset = self.fsdp_unit_buckets[fsdp_unit_id][bucket_id]
+            required_by_offset[bucket_offset] += 1
+        return all(
+            required <= available_by_offset[bucket_offset]
+            for bucket_offset, required in required_by_offset.items()
+        )
+
     def allocate(
         self,
         bucket_id: int,
@@ -902,6 +1028,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         size: int = 2,
         dtype_fn: Callable[["ParameterGroup"], torch.dtype] = operator.attrgetter("dtype"),
         fallback_to_persistent_buffer: bool = False,
+        bucket_filter: Optional[Callable[[int, "ParameterGroup"], bool]] = None,
     ):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
@@ -910,10 +1037,13 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         self.bucket_alloc_index = {}  # map bucket ID to offset
         self.max_dtype_bucket_sizes = {}  # dtype -> [bucket sizes from smallest to largest]
         self.dtype_fn = dtype_fn
+        self.bucket_filter = bucket_filter
 
         # Build a mapping from FSDP unit id to its associated bucket ids.
         fsdp_unit_buckets = defaultdict(list)
         for bucket_id, param_group in enumerate(self.fsdp_param_groups):
+            if self.bucket_filter is not None and not self.bucket_filter(bucket_id, param_group):
+                continue
             # Filter out FSDP non-units. Only FSDP units can be double-buffered.
             if param_group.fsdp_unit_id is None:
                 continue
@@ -930,7 +1060,11 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         assert (
             len(self.fsdp_double_buffer_units) > 0
         ), "Found no FSDP units to use max-sized buffering."
-        if any(pg.fsdp_unit_id is None for pg in self.fsdp_param_groups):
+        if any(
+            pg.fsdp_unit_id is None
+            for bucket_id, pg in enumerate(self.fsdp_param_groups)
+            if self.bucket_filter is None or self.bucket_filter(bucket_id, pg)
+        ):
             log_single_rank(
                 logger,
                 logging.INFO,
@@ -1030,6 +1164,113 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
                     f"\tBucket Sizes: {bucket_sizes} / Max (Unit, Bucket): {max_bucket_ids}"
                 ),
             )
+
+    def can_allocate(
+        self, bucket_ids: List[int], releasable_bucket_ids: Optional[set[int]] = None
+    ) -> bool:
+        """Return whether the requested buckets fit in the max-sized pool."""
+        releasable_bucket_ids = releasable_bucket_ids or set()
+        available_by_slot = defaultdict(int)
+        for _, dtype, bucket_offset in self.idle_buffer:
+            available_by_slot[(dtype, bucket_offset)] += 1
+        for bucket_id in releasable_bucket_ids:
+            if bucket_id in self.using_buffer:
+                _, dtype, bucket_offset = self.using_buffer[bucket_id]
+                available_by_slot[(dtype, bucket_offset)] += 1
+
+        required_by_slot = defaultdict(int)
+        for bucket_id in set(bucket_ids):
+            fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+            if fsdp_unit_id is None or (
+                bucket_id in self.using_buffer and bucket_id not in releasable_bucket_ids
+            ):
+                continue
+            _, bucket_offset = self.bucket_alloc_index[bucket_id]
+            dtype = self.dtype_fn(self.fsdp_param_groups[bucket_id])
+            if dtype == "float8":
+                dtype = torch.uint8
+            required_by_slot[(dtype, bucket_offset)] += 1
+        return all(
+            required <= available_by_slot[slot] for slot, required in required_by_slot.items()
+        )
+
+    def materialization_requirements(
+        self, bucket_specs: Dict[int, Tuple[int, torch.dtype]]
+    ) -> Dict[Tuple[torch.dtype, int], int]:
+        """Return the maximum exact runtime size required by each pool slot."""
+        required_slot_sizes = {}
+        for bucket_id, (size, dtype) in bucket_specs.items():
+            if self.fsdp_param_groups[bucket_id].fsdp_unit_id is None:
+                continue
+            _, bucket_offset = self.bucket_alloc_index[bucket_id]
+            if dtype == "float8":
+                dtype = torch.uint8
+            slot = (dtype, bucket_offset)
+            required_slot_sizes[slot] = max(size, required_slot_sizes.get(slot, 0))
+        return required_slot_sizes
+
+    def materialization_requests(
+        self, bucket_specs: Dict[int, Tuple[int, torch.dtype]]
+    ) -> List[Tuple[int, torch.dtype, str]]:
+        """Return every backing tensor required to materialize this pool.
+
+        The returned requests are independent of parameter-group traversal order,
+        allowing callers to merge requests from multiple MaxPool allocators into
+        one globally ordered NCCL memory-pool allocation plan.
+        """
+        required_slot_sizes = self.materialization_requirements(bucket_specs)
+        requests = []
+        for buf_group_id in range(self.size):
+            for (dtype, bucket_offset), size in required_slot_sizes.items():
+                requests.append(
+                    (size, dtype, self._get_gbuf_name(buf_group_id, dtype, bucket_offset))
+                )
+        return requests
+
+    def record_materialized(self, size: int, dtype: torch.dtype, buffer_name: str) -> None:
+        """Record a backing tensor materialized by a shared allocation plan."""
+        self.allocation_tracker[(buffer_name, dtype)] = size
+
+    def materialize(
+        self,
+        bucket_specs: Dict[int, Tuple[int, torch.dtype]],
+        mem_alloc_context: Optional[Callable] = None,
+    ) -> None:
+        """Allocate every runtime-reachable pool slot in a deterministic order.
+
+        Manual NCCL memory-pool registration sorts segments by PyTorch's global
+        allocation counter. If the first allocation of a MaxPool slot happens
+        from overlapping FSDP streams, that order can differ across ranks even
+        when the final segment sizes are identical. Pre-materializing the slots
+        before training gives every rank the same registration order and keeps
+        the first 1F1B/CUDA-graph iteration allocation-free.
+
+        ``bucket_specs`` uses the exact padded ``DataParallelBuffer`` sizes,
+        rather than the unpadded parameter counts used for capacity planning.
+        """
+        total_bytes = 0
+        requests = self.materialization_requests(bucket_specs)
+        for size, dtype, buffer_name in sorted(
+            requests,
+            key=lambda item: (
+                item[0] * torch.empty((), dtype=item[1]).element_size(),
+                str(item[1]),
+                item[2],
+            ),
+        ):
+            materialized_buffer = get_global_memory_buffer().get_tensor(
+                [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
+            )
+            self.record_materialized(size, dtype, buffer_name)
+            total_bytes += size * materialized_buffer.element_size()
+
+        torch.cuda.synchronize()
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"[MaxPoolAllocator][{self.name}] Materialized {len(requests)} buffers "
+            f"({total_bytes} bytes) for manual NCCL registration.",
+        )
 
     def allocate(
         self,
@@ -2140,41 +2381,20 @@ class ParamAndGradBuffer:
                 logging.INFO,
                 f"[Rank {torch.distributed.get_rank()}] FSDP double buffer is enabled.",
             )
-            # Select the communicator groups to register FSDP buffers.
-            self.ubr_groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
-            if self.dist_index.get_fsdp_group(is_expert_parallel=True) is not None:
-                # Expert-DP group when using EP
-                self.ubr_groups.append(self.dist_index.get_fsdp_group(is_expert_parallel=True))
-            if (
-                self.dist_index.get_fsdp_group(
-                    is_expert_parallel=False, independent_all_gather=True
-                )
-                is not None
-            ):
-                # All-gather group used when overlapping all-gather and gradient reduction.
-                self.ubr_groups.append(
-                    self.dist_index.get_fsdp_group(
-                        is_expert_parallel=False, independent_all_gather=True
-                    )
-                )
-            if (
-                self.dist_index.get_fsdp_group(is_expert_parallel=True, independent_all_gather=True)
-                is not None
-            ):
-                # Expert all-gather group used when overlapping all-gather and gradient reduction.
-                self.ubr_groups.append(
-                    self.dist_index.get_fsdp_group(
-                        is_expert_parallel=True, independent_all_gather=True
-                    )
-                )
-            if self.dist_index.get_outer_fsdp_group() is not None:
-                # Outer/Inter-FSDP group when using hybrid FSDP (IB domain, registered last).
-                self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
+            # Register only the communicators selected by the configured UBR scope. A
+            # dense-inner-only scope deliberately leaves expert and outer-DP collectives
+            # on NCCL's ordinary path; this avoids registration cost and the requirement
+            # that their physical pool segment layouts match across ranks.
+            self.ubr_groups = _get_ubr_registration_groups(
+                self.dist_index, self.ddp_config.fsdp_ubr_registration_scope
+            )
 
             log_single_rank(
                 logger,
                 logging.INFO,
-                f"[ParamAndGradBuffer] FSDP UBRegistration Groups ({len(self.ubr_groups)}):",
+                f"[ParamAndGradBuffer] FSDP UBRegistration Scope "
+                f"{self.ddp_config.fsdp_ubr_registration_scope}; "
+                f"Groups ({len(self.ubr_groups)}):",
             )
             # All ranks in each group must participate in the collective to avoid deadlock.
             for i, group in enumerate(self.ubr_groups):
@@ -2201,6 +2421,12 @@ class ParamAndGradBuffer:
         self.mem_alloc_context = self.get_mem_alloc_context(
             groups=self.ubr_groups, symmetric=not self.ddp_config.disable_symmetric_registration
         )
+        # Registered-buffer collectives require matching pool-relative offsets
+        # across ranks. FSDP reduce-scatter is in-place and intentionally writes
+        # each rank's output to ``rank * recvcount`` inside the input bucket.
+        # Keep gradient communication outside the registered pool until this
+        # path provides a same-offset staging output.
+        self.grad_mem_alloc_context = nullcontext
 
         # Mark FP8 params. If TransformerEngine is not installed, we can skip this.
         meta_device_init_fp8_params = {}
@@ -2311,6 +2537,78 @@ class ParamAndGradBuffer:
         torch.distributed.barrier(async_op=False)
         torch.cuda.synchronize()
 
+        # register_mem_pool performs one collective registration per pool
+        # segment. Validate that every communicator sees the same segment-size
+        # sequence first, otherwise a rank that has fewer or differently sized
+        # segments can leave its peers blocked inside ProcessGroupNCCL forever.
+        pool_signature = _mem_pool_registration_signature(NCCL_MEMORY_POOL)
+        registration_errors = []
+        for group in self.ubr_groups:
+            group_signatures = [None] * torch.distributed.get_world_size(group)
+            torch.distributed.all_gather_object(group_signatures, pool_signature, group=group)
+            reference_signature = group_signatures[0]
+            if any(signature != reference_signature for signature in group_signatures[1:]):
+                group_ranks = torch.distributed.get_process_group_ranks(group)
+                signature_groups = defaultdict(list)
+                for rank, signature in zip(group_ranks, group_signatures):
+                    signature_groups[signature].append(rank)
+                summary = []
+                for signature, ranks in signature_groups.items():
+                    first_difference = next(
+                        (
+                            index
+                            for index, (reference_size, size) in enumerate(
+                                zip(reference_signature, signature)
+                            )
+                            if reference_size != size
+                        ),
+                        None,
+                    )
+                    if first_difference is None and len(signature) != len(reference_signature):
+                        first_difference = min(len(signature), len(reference_signature))
+                    window_start = max(0, (first_difference or 0) - 2)
+                    window_end = min(len(signature), (first_difference or 0) + 3)
+                    signature_bytes = ",".join(map(str, signature)).encode()
+                    summary.append(
+                        {
+                            "rank_count": len(ranks),
+                            "first_ranks": ranks[:8],
+                            "segments": len(signature),
+                            "total_bytes": sum(signature),
+                            "sha256": hashlib.sha256(signature_bytes).hexdigest()[:12],
+                            "first_difference": first_difference,
+                            "sizes_near_difference": signature[window_start:window_end],
+                        }
+                    )
+                registration_errors.append(f"{group.group_desc} (size={group.size()}): {summary}")
+
+        # Synchronize the validation outcome globally so no rank enters NCCL
+        # registration while another rank is already raising an exception.
+        has_registration_error = torch.tensor(
+            [bool(registration_errors)], dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        torch.distributed.all_reduce(has_registration_error, op=torch.distributed.ReduceOp.MAX)
+        if has_registration_error.item():
+            group_leader_ranks = {
+                torch.distributed.get_process_group_ranks(group)[0] for group in self.ubr_groups
+            }
+            if registration_errors and torch.distributed.get_rank() in group_leader_ranks:
+                logger.error(
+                    "[MCORE][FSDP][Manual REG] NCCL memory-pool layout mismatch: %s",
+                    " | ".join(registration_errors),
+                )
+            raise RuntimeError(
+                "NCCL memory-pool segment layout differs across an FSDP registration group. "
+                "See the rank-local mismatch log for segment details."
+            )
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"[MCORE][FSDP][Manual REG] Validated {len(pool_signature)} pool segments "
+            f"({sum(pool_signature)} bytes) across all registration groups.",
+        )
+
         for group in self.ubr_groups:
             log_single_rank(
                 logger,
@@ -2389,6 +2687,25 @@ class ParamAndGradBuffer:
         is_fp8 = isinstance(group.dtype, str) and group.dtype == "float8"
         # BF16 for FP8 parameters, otherwise grad.dtype == param.dtype.
         return torch.bfloat16 if is_fp8 else group.dtype
+
+    def _take_ubr_persistent_data(
+        self, buffer: DataParallelBuffer, size: int, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Consume canonically preallocated UBR storage, or allocate normally."""
+        persistent_data = getattr(self, "_ubr_persistent_data", None)
+        if persistent_data is None:
+            return torch.empty(size, dtype=dtype, device=self.device)
+
+        data = persistent_data.pop(id(buffer), None)
+        if data is None:
+            assert buffer.mem_alloc_context == nullcontext, (
+                "Registered FSDP parameter buffer was not included in the canonical "
+                "UBR allocation plan."
+            )
+            return torch.empty(size, dtype=dtype, device=self.device)
+        assert data.numel() == size, f"Preallocated UBR size mismatch: {data.numel()} != {size}"
+        assert data.dtype == dtype, f"Preallocated UBR dtype mismatch: {data.dtype} != {dtype}"
+        return data
 
     def _init_each_parameter_group_buffers(self, meta_device_init_fp8_params):
         """
@@ -2591,26 +2908,90 @@ class ParamAndGradBuffer:
         for group in self.parameter_groups:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
-            # Double Buffering
-            UB_BUFFER_NUM = 2
+            # Persistent communication-buffer pooling. The default pool size is two,
+            # while combined 1F1B overlap may require a third concurrently-live unit.
+            ub_buffer_num = self.ddp_config.fsdp_buffer_count
             # Double Buffer Allocator Choice
             FIXED_POOL_ALLOC_TYPE = (
                 MaxPoolAllocator
                 if self.ddp_config.megatron_fsdp_max_pool_double_buffer
                 else FixedPoolAllocator
             )
-            self.weight_alloc = FIXED_POOL_ALLOC_TYPE(
-                name="fsdp_params",
-                fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
-                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
+            dense_inner_ubr = (
+                self.ddp_config.nccl_ub
+                and self.ddp_config.fsdp_ubr_registration_scope == "dense_inner"
             )
-            self.transpose_weight_alloc = FIXED_POOL_ALLOC_TYPE(
-                name="fsdp_fp8_transpose_params",
-                fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
-                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
-            )
+            self.expert_weight_alloc = None
+            self.expert_transpose_weight_alloc = None
+            if dense_inner_ubr:
+                if FIXED_POOL_ALLOC_TYPE is not MaxPoolAllocator:
+                    raise ValueError(
+                        "Dense-inner-only FSDP UBR requires "
+                        "megatron_fsdp_max_pool_double_buffer=True."
+                    )
+
+                # Keep the registered dense inner-AG buffers in a pool that cannot be
+                # first-touched or resized by rank-dependent expert/outer-DP traffic.
+                # Expert collectives retain their own ordinary MaxPool allocator.
+                dense_bucket_filter = lambda _, pg: not pg.is_expert_param  # noqa: E731
+                expert_bucket_filter = lambda _, pg: pg.is_expert_param  # noqa: E731
+                self.weight_alloc = MaxPoolAllocator(
+                    name="fsdp_dense_params",
+                    fsdp_param_groups=self.parameter_groups,
+                    size=ub_buffer_num,
+                    fallback_to_persistent_buffer=(
+                        self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+                    ),
+                    bucket_filter=dense_bucket_filter,
+                )
+                self.transpose_weight_alloc = MaxPoolAllocator(
+                    name="fsdp_dense_fp8_transpose_params",
+                    fsdp_param_groups=self.parameter_groups,
+                    size=ub_buffer_num,
+                    fallback_to_persistent_buffer=(
+                        self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+                    ),
+                    bucket_filter=dense_bucket_filter,
+                )
+                if any(
+                    pg.is_expert_param and pg.fsdp_unit_id is not None
+                    for pg in self.parameter_groups
+                ):
+                    self.expert_weight_alloc = MaxPoolAllocator(
+                        name="fsdp_expert_params",
+                        fsdp_param_groups=self.parameter_groups,
+                        size=ub_buffer_num,
+                        fallback_to_persistent_buffer=(
+                            self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+                        ),
+                        bucket_filter=expert_bucket_filter,
+                    )
+                    self.expert_transpose_weight_alloc = MaxPoolAllocator(
+                        name="fsdp_expert_fp8_transpose_params",
+                        fsdp_param_groups=self.parameter_groups,
+                        size=ub_buffer_num,
+                        fallback_to_persistent_buffer=(
+                            self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+                        ),
+                        bucket_filter=expert_bucket_filter,
+                    )
+            else:
+                self.weight_alloc = FIXED_POOL_ALLOC_TYPE(
+                    name="fsdp_params",
+                    fsdp_param_groups=self.parameter_groups,
+                    size=ub_buffer_num,
+                    fallback_to_persistent_buffer=(
+                        self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+                    ),
+                )
+                self.transpose_weight_alloc = FIXED_POOL_ALLOC_TYPE(
+                    name="fsdp_fp8_transpose_params",
+                    fsdp_param_groups=self.parameter_groups,
+                    size=ub_buffer_num,
+                    fallback_to_persistent_buffer=(
+                        self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+                    ),
+                )
             # Resolve gradient bucket dtype used for MaxPoolAllocator bucket allocation
             # planning and FixedPoolAllocator unit symmetries. Falls back to each
             # parameter group's main `grad_dtype` when no comm-dtype override is set.
@@ -2622,7 +3003,7 @@ class ParamAndGradBuffer:
             self.main_grad_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_grads",
                 fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
+                size=ub_buffer_num,
                 dtype_fn=grad_dtype_fn,
                 fallback_to_persistent_buffer=(
                     self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
@@ -2636,16 +3017,23 @@ class ParamAndGradBuffer:
                 self.hsdp_grad_comm_alloc = FIXED_POOL_ALLOC_TYPE(
                     name="hsdp_grad_comm",
                     fsdp_param_groups=self.parameter_groups,
-                    size=UB_BUFFER_NUM,
+                    size=ub_buffer_num,
                     dtype_fn=grad_dtype_fn,
                     fallback_to_persistent_buffer=(
                         self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                     ),
                 )
-            self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
+            self.double_buf_units = list(self.weight_alloc.fsdp_double_buffer_units)
+            if self.expert_weight_alloc is not None:
+                self.double_buf_units = list(
+                    set(self.double_buf_units)
+                    | set(self.expert_weight_alloc.fsdp_double_buffer_units)
+                )
         else:
             self.weight_alloc = StorageResizeBasedBucketAllocator()
             self.transpose_weight_alloc = StorageResizeBasedBucketAllocator()
+            self.expert_weight_alloc = None
+            self.expert_transpose_weight_alloc = None
             self.main_grad_alloc = None
             if self.dist_index.use_hybrid_fsdp:
                 # Only required for custom communication dtype buffer allocation
@@ -2659,6 +3047,27 @@ class ParamAndGradBuffer:
 
         # For all bucket groups (partitioned parameter groups)...
         for group_id, group in enumerate(self.parameter_groups):
+            dense_inner_ubr = (
+                self.ddp_config.nccl_ub
+                and self.ddp_config.fsdp_ubr_registration_scope == "dense_inner"
+            )
+            param_mem_alloc_context = (
+                nullcontext if dense_inner_ubr and group.is_expert_param else self.mem_alloc_context
+            )
+            weight_alloc = (
+                self.expert_weight_alloc
+                if dense_inner_ubr and group.is_expert_param
+                else self.weight_alloc
+            )
+            transpose_weight_alloc = (
+                self.expert_transpose_weight_alloc
+                if dense_inner_ubr and group.is_expert_param
+                else self.transpose_weight_alloc
+            )
+            if dense_inner_ubr and group.is_expert_param:
+                assert weight_alloc is not None
+                assert transpose_weight_alloc is not None
+
             main_buf_extra_kwargs = {}
             if should_create_hfsdp_helper_buffers:
                 # DP-Outer + DP-Shard
@@ -2731,10 +3140,10 @@ class ParamAndGradBuffer:
                     # using basic HSDP or FSDP.
                     data_parallel_group=model_wbuf_dp_group,
                     is_transpose_buffer=False,
-                    temporary_bucket_allocator=self.weight_alloc,
+                    temporary_bucket_allocator=weight_alloc,
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
-                    mem_alloc_context=self.mem_alloc_context,
+                    mem_alloc_context=param_mem_alloc_context,
                     **main_buf_extra_kwargs,
                 )
                 if should_create_transpose_weight_buffer:
@@ -2747,10 +3156,10 @@ class ParamAndGradBuffer:
                         device=self.device,
                         data_parallel_group=main_buf_dp_group,
                         is_transpose_buffer=True,
-                        temporary_bucket_allocator=self.transpose_weight_alloc,
+                        temporary_bucket_allocator=transpose_weight_alloc,
                         bucket_id=group_id,
                         chunk_size_factor=group.chunk_size_factor,
-                        mem_alloc_context=self.mem_alloc_context,
+                        mem_alloc_context=param_mem_alloc_context,
                         **main_buf_extra_kwargs,
                     )
 
@@ -2770,7 +3179,7 @@ class ParamAndGradBuffer:
                     data_parallel_group=main_buf_dp_group,
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
-                    mem_alloc_context=self.mem_alloc_context,
+                    mem_alloc_context=param_mem_alloc_context,
                     **main_buf_extra_kwargs,
                 )
 
@@ -2796,7 +3205,7 @@ class ParamAndGradBuffer:
                     gradient_scaling_factor=gradient_scaling_factor,
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
-                    mem_alloc_context=self.mem_alloc_context,
+                    mem_alloc_context=self.grad_mem_alloc_context,
                     **main_buf_extra_kwargs,
                 )
 
@@ -2866,9 +3275,187 @@ class ParamAndGradBuffer:
                     temporary_bucket_allocator=self.hsdp_grad_comm_alloc,
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
-                    mem_alloc_context=self.mem_alloc_context,
+                    mem_alloc_context=self.grad_mem_alloc_context,
                     **hfsdp_kwargs,
                 )
+
+        if self.ddp_config.nccl_ub and self.ddp_config.fsdp_manual_registration:
+            # Materialize every MaxPool tensor before initialization and training
+            # can first-touch the slots from rank-dependent CUDA stream timings.
+            weight_specs = {}
+            transpose_weight_specs = {}
+            expert_weight_specs = {}
+            expert_transpose_weight_specs = {}
+            dense_inner_ubr = self.ddp_config.fsdp_ubr_registration_scope == "dense_inner"
+            for bucket_id, group in enumerate(self.parameter_groups):
+                weight_buffer = group.model_weight_buffer
+                if weight_buffer is not None and weight_buffer.is_data_distributed:
+                    target_specs = (
+                        expert_weight_specs
+                        if dense_inner_ubr and group.is_expert_param
+                        else weight_specs
+                    )
+                    target_specs[bucket_id] = (weight_buffer.bucket_index.size, weight_buffer.dtype)
+
+                transpose_buffer = group.transpose_weight_buffer
+                if transpose_buffer is not None and transpose_buffer.is_data_distributed:
+                    target_specs = (
+                        expert_transpose_weight_specs
+                        if dense_inner_ubr and group.is_expert_param
+                        else transpose_weight_specs
+                    )
+                    target_specs[bucket_id] = (
+                        transpose_buffer.bucket_index.size,
+                        transpose_buffer.dtype,
+                    )
+
+            allocator_specs = (
+                (self.weight_alloc, weight_specs),
+                (self.transpose_weight_alloc, transpose_weight_specs),
+            )
+            persistent_buffers = []
+            for group in self.parameter_groups:
+                if dense_inner_ubr and group.is_expert_param:
+                    continue
+                group_name_digest = hashlib.sha256(
+                    ",".join(sorted(self.param_to_name[param] for param in group.params)).encode()
+                ).hexdigest()[:16]
+                for buffer_role, buffer in (
+                    ("weight", group.hfsdp_helper_wbuf or group.model_weight_buffer),
+                    ("transpose_weight", group.hfsdp_helper_wtbuf or group.transpose_weight_buffer),
+                ):
+                    if buffer is not None:
+                        stable_name = (
+                            f"persistent:{buffer_role}:expert={group.is_expert_param}:"
+                            f"unit={group.fsdp_unit_id}:params={group_name_digest}"
+                        )
+                        persistent_buffers.append((buffer, stable_name))
+
+            # ProcessGroupNCCL registers memory-pool segments in allocator creation
+            # order.  Merge every known long-lived allocation into one global plan
+            # sorted by byte size so rank-local MoE parameter-group traversal cannot
+            # permute the registration sequence.  Unlike reserving a second pool-
+            # sized allocation, this creates only the storage training will consume.
+            allocation_plan = []
+            for allocator, bucket_specs in allocator_specs:
+                if isinstance(allocator, MaxPoolAllocator) and bucket_specs:
+                    for size, dtype, buffer_name in allocator.materialization_requests(
+                        bucket_specs
+                    ):
+                        allocation_plan.append(
+                            (
+                                size * torch.empty((), dtype=dtype).element_size(),
+                                "max_pool",
+                                allocator,
+                                size,
+                                dtype,
+                                buffer_name,
+                            )
+                        )
+
+            for buffer, stable_name in persistent_buffers:
+                allocation_plan.append(
+                    (
+                        buffer.data_size * torch.empty((), dtype=buffer.dtype).element_size(),
+                        "persistent",
+                        buffer,
+                        buffer.data_size,
+                        buffer.dtype,
+                        stable_name,
+                    )
+                )
+
+            ordered_allocation_plan = sorted(
+                allocation_plan, key=lambda item: (item[0], str(item[4]), item[1], item[5])
+            )
+            logical_plan_signature = tuple(
+                (num_bytes, request_kind, str(dtype), stable_name)
+                for num_bytes, request_kind, _, _, dtype, stable_name in ordered_allocation_plan
+            )
+            logical_plan_hash = hashlib.sha256(repr(logical_plan_signature).encode()).hexdigest()[
+                :12
+            ]
+            logical_plan_errors = []
+            for group in self.ubr_groups:
+                group_hashes = [None] * torch.distributed.get_world_size(group)
+                torch.distributed.all_gather_object(group_hashes, logical_plan_hash, group=group)
+                if any(plan_hash != group_hashes[0] for plan_hash in group_hashes[1:]):
+                    hash_rank_counts = defaultdict(int)
+                    for plan_hash in group_hashes:
+                        hash_rank_counts[plan_hash] += 1
+                    logical_plan_errors.append(
+                        f"{group.group_desc} (size={group.size()}): {dict(hash_rank_counts)}"
+                    )
+
+            has_logical_plan_error = torch.tensor(
+                [bool(logical_plan_errors)], dtype=torch.int32, device=self.device
+            )
+            torch.distributed.all_reduce(has_logical_plan_error, op=torch.distributed.ReduceOp.MAX)
+            if has_logical_plan_error.item():
+                if logical_plan_errors:
+                    logger.error(
+                        "[MCORE][FSDP][Manual REG] Logical allocation-plan mismatch: %s",
+                        " | ".join(logical_plan_errors),
+                    )
+                raise RuntimeError(
+                    "NCCL memory-pool logical allocation plan differs across an FSDP "
+                    "registration group. See the rank-local mismatch log for plan hashes."
+                )
+
+            self._ubr_persistent_data = {}
+            if dense_inner_ubr:
+                arena_layout, arena_size = _build_ubr_arena_layout(ordered_allocation_plan)
+                with self.mem_alloc_context():
+                    self._ubr_arena = torch.empty(
+                        arena_size, dtype=torch.uint8, device=self.device, requires_grad=False
+                    )
+                global_memory_buffer = get_global_memory_buffer()
+                for byte_offset, request in arena_layout:
+                    num_bytes, request_kind, owner, size, dtype, buffer_name = request
+                    data = self._ubr_arena.narrow(0, byte_offset, num_bytes).view(dtype)
+                    assert data.numel() == size
+                    if request_kind == "max_pool":
+                        global_memory_buffer.buffer[(buffer_name, dtype)] = data
+                        owner.record_materialized(size, dtype, buffer_name)
+                    elif request_kind == "persistent":
+                        self._ubr_persistent_data[id(owner)] = data
+                    else:
+                        raise AssertionError(f"Unexpected UBR allocation kind: {request_kind}")
+            else:
+                arena_size = None
+                with self.mem_alloc_context():
+                    for _, request_kind, owner, size, dtype, buffer_name in ordered_allocation_plan:
+                        if request_kind == "max_pool":
+                            get_global_memory_buffer().get_tensor(
+                                [size], dtype=dtype, name=buffer_name
+                            )
+                            owner.record_materialized(size, dtype, buffer_name)
+                        elif request_kind == "persistent":
+                            self._ubr_persistent_data[id(owner)] = torch.empty(
+                                size, dtype=dtype, device=self.device
+                            )
+                        else:
+                            raise AssertionError(f"Unexpected UBR allocation kind: {request_kind}")
+            torch.cuda.synchronize()
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[MCORE][FSDP][Manual REG] Materialized {len(allocation_plan)} buffers "
+                f"({sum(item[0] for item in allocation_plan)} requested bytes) in global order "
+                f"(logical plan {logical_plan_hash}, arena bytes {arena_size}).",
+            )
+
+            # Expert parameter AG uses an unregistered communicator in the dense-inner
+            # scope. Materialize its independent MaxPool outside the symmetric pool so
+            # expert/outer traffic cannot alter the registered physical segment order.
+            if dense_inner_ubr:
+                ordinary_allocator_specs = (
+                    (self.expert_weight_alloc, expert_weight_specs),
+                    (self.expert_transpose_weight_alloc, expert_transpose_weight_specs),
+                )
+                for allocator, bucket_specs in ordinary_allocator_specs:
+                    if isinstance(allocator, MaxPoolAllocator) and bucket_specs:
+                        allocator.materialize(bucket_specs, mem_alloc_context=nullcontext)
 
         reset_context_args = {"init_param_with_fp8": self.ddp_config.fp8_param_gather}
         module_reset_flag = {}
@@ -2904,13 +3491,13 @@ class ParamAndGradBuffer:
         for group in self.parameter_groups:
             wbuf = group.model_weight_buffer
             if wbuf:
-                with self.mem_alloc_context():
+                with wbuf.mem_alloc_context():
                     if group.hfsdp_helper_wbuf:
                         _init_hfsdp_helper_and_dp_buffer_data(
                             group.hfsdp_helper_wbuf,
                             wbuf,
-                            mem_alloc=lambda size, dtype: torch.empty(
-                                size, dtype=dtype, device=self.device
+                            mem_alloc=lambda size, dtype, buffer=group.hfsdp_helper_wbuf: (
+                                self._take_ubr_persistent_data(buffer, size, dtype)
                             ),
                             outer_dp_group=self.dist_index.get_outer_fsdp_group(
                                 is_expert_parallel=group.is_expert_param
@@ -2919,20 +3506,20 @@ class ParamAndGradBuffer:
                     else:
                         # When not using HSDP, the main buffer shards across the FSDP group.
                         wbuf.init_data(
-                            torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device)
+                            self._take_ubr_persistent_data(wbuf, wbuf.data_size, wbuf.dtype)
                         )
                 # Allocate some memory to initialize the model.
                 bucket = wbuf.fetch_bucket(strict_assignments=False)
 
             tbuf = group.transpose_weight_buffer
             if tbuf:
-                with self.mem_alloc_context():
+                with tbuf.mem_alloc_context():
                     if group.hfsdp_helper_wbuf:
                         _init_hfsdp_helper_and_dp_buffer_data(
                             group.hfsdp_helper_wtbuf,
                             tbuf,
-                            mem_alloc=lambda size, dtype: torch.empty(
-                                size, dtype=dtype, device=self.device
+                            mem_alloc=lambda size, dtype, buffer=group.hfsdp_helper_wtbuf: (
+                                self._take_ubr_persistent_data(buffer, size, dtype)
                             ),
                             outer_dp_group=self.dist_index.get_outer_fsdp_group(
                                 is_expert_parallel=group.is_expert_param
@@ -2941,7 +3528,7 @@ class ParamAndGradBuffer:
                     else:
                         # Initialize the transpose buffer.
                         tbuf.init_data(
-                            torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device)
+                            self._take_ubr_persistent_data(tbuf, tbuf.data_size, tbuf.dtype)
                         )
                 # Allocate some memory to initialize the model.
                 transpose_bucket = tbuf.fetch_bucket(strict_assignments=False)
@@ -3106,21 +3693,11 @@ class ParamAndGradBuffer:
 
         # Allocate the main_weight buffer and main_grad buffer data in one buffer.
         if self.buffer_all_in_one:
-            with self.mem_alloc_context():
-                self.buffer = {
-                    torch.float32: torch.empty(
-                        buffer_size[torch.float32], dtype=torch.float32, device=self.device
-                    ),
-                    torch.float16: torch.empty(
-                        buffer_size[torch.float16], dtype=torch.float16, device=self.device
-                    ),
-                    torch.bfloat16: torch.empty(
-                        buffer_size[torch.bfloat16], dtype=torch.bfloat16, device=self.device
-                    ),
-                    "float8": torch.empty(
-                        buffer_size["float8"], dtype=torch.uint8, device=self.device
-                    ),
-                }
+            with self.grad_mem_alloc_context():
+                self.buffer = {}
+                for dtype, size in buffer_size.items():
+                    actual_dtype = torch.uint8 if dtype == "float8" else dtype
+                    self.buffer[dtype] = torch.empty(size, dtype=actual_dtype, device=self.device)
             offset = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, "float8": 0}
 
         def _alloc(dtype, size):
@@ -3146,7 +3723,7 @@ class ParamAndGradBuffer:
                 # No gradient sharding.
                 continue
             # Allocate the main grad buffer data, and attach it to the main grad buffer.
-            with self.mem_alloc_context():
+            with self.grad_mem_alloc_context():
                 if group.hfsdp_helper_gbuf:
                     _init_hfsdp_helper_and_dp_buffer_data(
                         group.hfsdp_helper_gbuf,
@@ -4031,21 +4608,23 @@ class GradReducePipeline:
         if not self.buffer.ddp_config.fsdp_double_buffer:
             return
 
+        buffer_count = self.buffer.ddp_config.fsdp_buffer_count
         param_groups = self.buffer.parameter_groups
         double_buf_units = set()
         for bucket_id in add_buckets:
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
             if fsdp_unit_id in self.buffer.double_buf_units:
                 double_buf_units.add(fsdp_unit_id)
-        assert (
-            len(double_buf_units) <= 2
-        ), f"Double buffer limit exceeded. Current double_buf_units: {double_buf_units}."
+        assert len(double_buf_units) <= buffer_count, (
+            f"FSDP buffer pool limit ({buffer_count}) exceeded. "
+            f"Current double_buf_units: {double_buf_units}."
+        )
 
         keep_n = len(self.grad_reduce_queue)
         for _, _, bucket_id in reversed(self.grad_reduce_queue):
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
             double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 2:
+            if len(double_buf_units) > buffer_count:
                 keep_n -= 1
 
         with torch.cuda.stream(self.rs_stream):
@@ -4491,17 +5070,13 @@ class AllGatherPipeline:
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
-        if self.buffer.ddp_config.fsdp_double_buffer:
-            double_buf_units = set()
-            for bucket_id in ag_buckets:
-                fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
-                if fsdp_unit_id in self.buffer.double_buf_units:
-                    double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 2:
-                raise ValueError(
-                    f"{double_buf_units} FSDP units were requested, "
-                    "but double buffers can support no more than 2 FSDP units."
-                )
+        if self.buffer.ddp_config.fsdp_double_buffer and not self._persistent_allocators_can_fit(
+            ag_buckets, bwd
+        ):
+            raise ValueError(
+                f"FSDP buckets {ag_buckets} do not fit in the configured persistent "
+                f"buffer pools (fsdp_buffer_count={self.buffer.ddp_config.fsdp_buffer_count})."
+            )
 
         # Do not release the buckets that are being all-gathered.
         no_fsdp_units = True
@@ -4518,7 +5093,7 @@ class AllGatherPipeline:
             # Non-unit module pre-fetch can run inside other FSDP unit modules and
             # un-shard irrelevant model components that pointlessly steal buffer
             # allocations from the expected FSDP unit allocation and violating
-            # the maximum limit of 2 buffers allocated at any point in time.
+            # the configured persistent-buffer limit.
             self.buffer.ddp_config.fsdp_double_buffer
             and no_fsdp_units
         ):
@@ -4550,12 +5125,10 @@ class AllGatherPipeline:
                 # If use double buffer, we need to check if the next bucket
                 # is exceeding the coverage of the double buffer.
                 if self.buffer.ddp_config.fsdp_double_buffer:
-                    fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
-                    double_buf_units.add(fsdp_unit_id)
-                    if len(double_buf_units) > 2:
-                        # Prefetching the next bucket will exceed the coverage of
-                        # the double buffer, so we need to stop prefetching.
-                        return True
+                    candidate_buckets = self.buffer.bucket_to_bucket_group[bucket_id]
+                    return not self._persistent_allocators_can_fit(
+                        ag_buckets + candidate_buckets, bwd
+                    )
                 return False
 
             if suggested_AG_prefetch_size is None:
@@ -4764,6 +5337,27 @@ class AllGatherPipeline:
             return param_group.transpose_weight_buffer
         else:
             return param_group.model_weight_buffer
+
+    def _persistent_allocators_can_fit(self, bucket_ids: List[int], bwd: bool) -> bool:
+        """Check pool capacity, including allocations live before this all-gather call."""
+        allocator_buckets = defaultdict(list)
+        for bucket_id in set(bucket_ids):
+            allocator = self.get_fsdp_buffer(bucket_id, bwd=bwd).temporary_bucket_allocator
+            allocator_buckets[allocator].append(bucket_id)
+
+        allocator_releasable_buckets = defaultdict(set)
+        for bucket_key, can_be_released in self.bucket_can_be_released.items():
+            if not can_be_released:
+                continue
+            bucket_id, release_bwd = bucket_key
+            allocator = self.get_fsdp_buffer(bucket_id, bwd=release_bwd).temporary_bucket_allocator
+            if bucket_id not in allocator_buckets[allocator]:
+                allocator_releasable_buckets[allocator].add(bucket_id)
+
+        return all(
+            allocator.can_allocate(requested_buckets, allocator_releasable_buckets[allocator])
+            for allocator, requested_buckets in allocator_buckets.items()
+        )
 
     @torch.no_grad()
     def async_bucket_gather(self, bucket_id, bwd) -> None:
