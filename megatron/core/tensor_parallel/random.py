@@ -507,37 +507,65 @@ def _get_all_rng_states():
     dropout inside a checkpointed region must replay the forward-time offsets).
     Inside capture, host-side state reads are not capture-safe, so the original
     handle semantics are kept.
+
+    The snapshot carries an explicit ``cloned``/``live`` tag. Both
+    ``clone_state()`` and ``graphsafe_get_state()`` return ``torch.Generator``,
+    so the kind cannot be recovered by inspecting the value, and re-deriving it
+    from ``is_current_stream_capturing()`` at restore time is wrong whenever the
+    snapshot and the restore sit on opposite sides of a capture boundary: a
+    cloned snapshot restored under capture would replace the tracker's live
+    generators with the clones (orphaning them from graph bookkeeping), and a
+    live snapshot restored outside capture would write each state onto itself
+    and silently skip the rewind.
     """
     cpu_rng_state = torch.get_rng_state()
     tracker = get_cuda_rng_tracker()
     graph_safe = is_graph_safe_cuda_rng_tracker(tracker)
     if graph_safe and not torch.cuda.is_current_stream_capturing():
+        kind = "cloned"
         cuda_rng_state = _get_cuda_rng_state(clone=True, graph_safe=True)
         cuda_rng_state_tracker = {
             name: state.clone_state() for name, state in tracker.get_states().items()
         }
     else:
+        kind = "live"
         cuda_rng_state = _get_cuda_rng_state(graph_safe=graph_safe)
         cuda_rng_state_tracker = tracker.get_states()
-    return cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker
+    return cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker, kind
 
 
-def _set_all_rng_states(cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker):
+def _set_all_rng_states(cpu_rng_state, cuda_rng_state, cuda_rng_state_tracker, kind="live"):
     """Set all the rng states.
 
     Graph-safe eager restore writes the snapshot *contents* back into the live
     state objects instead of pointer-swapping generators: captured CUDA graphs
     and the RNG tracker hold references to the live generator states, and
     replacing those objects would orphan them from graph replay bookkeeping.
+
+    ``kind`` is the tag produced by ``_get_all_rng_states`` and selects the
+    restore path directly, so a snapshot taken on one side of a capture boundary
+    cannot be restored with the other side's semantics. It defaults to ``live``
+    for the pre-tag call convention, which is the handle-swap behaviour.
     """
     torch.set_rng_state(cpu_rng_state)
     tracker = get_cuda_rng_tracker()
     graph_safe = is_graph_safe_cuda_rng_tracker(tracker)
-    if (
-        graph_safe
-        and isinstance(cuda_rng_state, torch.Generator)
-        and not torch.cuda.is_current_stream_capturing()
-    ):
+    if kind == "cloned" and not graph_safe:
+        raise RuntimeError(
+            "Graph-safe RNG snapshot is being restored under a non-graph-safe tracker; "
+            "the tracker implementation changed across the fork."
+        )
+    if kind == "cloned" and torch.cuda.is_current_stream_capturing():
+        # The snapshot was taken eagerly but the restore landed inside capture,
+        # where these host-side state writes are not capture-safe. Fail loudly:
+        # the alternative is a graph that replays whatever offsets happened to be
+        # live at capture time.
+        raise RuntimeError(
+            "An eager graph-safe RNG snapshot is being restored inside CUDA graph "
+            "capture. Snapshot and restore must sit on the same side of a capture "
+            "boundary; restoring generator contents under capture is not capture-safe."
+        )
+    if kind == "cloned":
         _get_cuda_rng_state(graph_safe=True).set_state(cuda_rng_state.get_state())
         live_states = tracker.get_states()
         # Unlike the tracker.set_states() branch below, which replaces the mapping
@@ -776,6 +804,7 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
         with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
+
         # Save tensor and non-tensor arguments into ctx for recomputation
         _save_args_to_ctx(ctx, args)
 
@@ -985,12 +1014,15 @@ class CheckpointManager:
             raise RuntimeError("CheckpointManager.recompute_until() requires discarded outputs.")
         self.mhc_arena.validate_addresses()
         # NOTE: arena slots are deliberately never released in this method.
-        # Releasing one right after its recompute corrupts training (loss
-        # diverges from the baseline series): this group's consumers include
-        # communication-stream mHC post-processing that runs after the recompute
-        # node, so a later tenant's write can land before those reads. Slot
-        # recycling needs the real W2 end -- the last consumer of the group --
-        # not the recompute point.
+        # The recompute node is not the last reader of the group -- the
+        # compute-stream mhc_post backward and the captured attention backward
+        # both still read these slots afterwards -- so releasing a slot here
+        # lets a later tenant's write land before those reads, and training
+        # diverges from the baseline loss series. Slot recycling needs the real
+        # last-consumer point, not the recompute point. (This held when mHC post
+        # ran on the communication stream and still holds now that it has its own
+        # compute-stream node: the ordering problem is the extra readers, not
+        # which stream they are on.)
         for ckpt in self.checkpoints:
             if ckpt.recompute_phase <= phase:
                 ckpt._recompute(None)
@@ -1093,6 +1125,12 @@ class CheckpointWithoutOutput(object):
 
         self.run_function = run_function
 
+        # Snapshot is per checkpoint, not per recompute group, and has to stay
+        # that way: each checkpoint's recompute must rewind to the offsets its
+        # own forward saw. Sharing one group-level snapshot would rewind every
+        # member to the first checkpoint's state, so any RNG the group consumed
+        # in between would replay the wrong draw. The cost is one clone_state()
+        # per tracked state per checkpoint.
         self.rng_states = _get_all_rng_states()
 
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
@@ -1168,6 +1206,12 @@ class CheckpointWithoutOutput(object):
         #   - No tensor version-counter bump (no autograd complaint)
         # This remains necessary with a graph bridge: a later eager checkpoint
         # in the same recompute group may consume this logical output.
+        # NOTE: deliberate private-API dependency -- ``_cdata`` is storage object
+        # *identity*, which is the question being asked here, and it has no public
+        # equivalent. ``data_ptr()`` is not a substitute: ``self.outputs`` has been
+        # discarded (``resize_(0)``), and a freed storage reports ``data_ptr() == 0``,
+        # so two independently-freed storages would compare equal and the rebind
+        # would be skipped. Grep for ``_cdata`` on a torch upgrade.
         for output, recomputation_output in zip(self.outputs, outputs):
             if output.untyped_storage()._cdata != recomputation_output.untyped_storage()._cdata:
                 share_storage = _get_share_storage()

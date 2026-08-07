@@ -13,8 +13,8 @@ MODEL_ARGS:
   --global-batch-size: 32
   --seq-length: 1024
   --max-position-embeddings: 1024
-  --train-iters: 8
-  --exit-interval: 8
+  --train-iters: 50
+  --exit-interval: 50
   --timing-log-level: 0
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_SAVE_PATH}

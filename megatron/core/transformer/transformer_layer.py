@@ -18,6 +18,7 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1977,7 +1978,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             unsupported.append("MoE layers without EP overlap")
         if self.config.fp4:
             unsupported.append("FP4")
-        if self.config.fp8 and str(getattr(self.config, "fp8_recipe", "")) != "mxfp8":
+        # Compare against the enum member, not str(): Fp8Recipe is a str mixin, so
+        # equality holds for the plain-string form argparse produces, while
+        # str(Fp8Recipe.mxfp8) is "Fp8Recipe.mxfp8" and would reject an
+        # enum-valued config that is in fact supported.
+        if self.config.fp8 and getattr(self.config, "fp8_recipe", None) != Fp8Recipe.mxfp8:
             # MXFP8 block scaling keeps quantization inside the captured graph:
             # the attention graph's static input stays a BF16 hidden-states
             # tensor and there is no graph-external amax/scale state to drift

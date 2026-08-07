@@ -28,6 +28,12 @@ class MHCRecomputePhase(IntEnum):
     is the real backward order, which is what a later dependency partitioning
     would split on (see ``CheckpointManager.recompute_until``); until then
     nothing constructs it and the middle barrier is intentionally unreachable.
+
+    TODO: partition checkpoints across phases so ``recompute_until`` replays only
+    what each barrier needs. Until that lands, this member and the
+    ``recompute_phase`` parameter on ``CheckpointWithoutOutput`` are placeholders
+    with no runtime effect -- every checkpoint sits at ``BEFORE_COMBINE_BWD``, so
+    both ``recompute_until`` call sites replay the whole group.
     """
 
     BEFORE_COMBINE_BWD = 0

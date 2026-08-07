@@ -88,6 +88,13 @@ class NativeHAggregateInto(torch.autograd.Function):
             )
         if out.dtype != x.dtype or out.device != x.device:
             raise ValueError("H-aggregate output dtype/device must match x")
+        # Mirror FusedHAggregateInto.forward's contract exactly: the consumer graph
+        # dereferences the address seen at capture time, so a strided slot would
+        # hand it a layout it was not captured against. Unreachable while the arena
+        # only vends contiguous views -- the point is that both entry points fail
+        # on the same inputs if that ever changes.
+        if not out.is_contiguous():
+            raise ValueError("H-aggregate caller-owned output must be contiguous")
         if out.requires_grad:
             raise ValueError("H-aggregate caller-owned output must be a detached tensor")
 
@@ -645,7 +652,6 @@ class HyperConnectionModule(MegatronModule):
         )
 
         h_pre, h_post, h_res = self.compute_mappings(hs_for_mappings)
-
 
         # Checkpoint aggregate - auto-registers to manager
         # With an arena slot the aggregate direct-writes into the graph consumer's

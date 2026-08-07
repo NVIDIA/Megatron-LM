@@ -797,8 +797,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
         Trigger token combine and the remaining layer computation.
 
-        MHC post-processing stays in this communication-stream node so it preserves the
-        existing EP overlap stream topology.
+        On mHC layers this is combine communication only: mHC post-processing has moved
+        to a dedicated compute-stream node (the ``mhc_post`` slot in
+        ``build_transformer_layer_callables``). Running it here placed compute on the
+        communication stream and made the recompute's tensors cross-stream; see the
+        comment on the early return below.
         """
         residual = node.layer_state.residual
         shared_expert_output = getattr(node.layer_state, 'shared_expert_output', None)
@@ -1032,13 +1035,27 @@ def build_mtp_layer_callables(layer):
     # The MTP layer wraps a transformer layer, so it inherits that layer's mHC
     # post-processing node. Dropping it here would leave the MTP layer's
     # hyper-connection output unexpanded.
+    #
+    # It needs the same RNG fork as its siblings: mHC post runs the fused
+    # H_res/H_post bias-dropout-add, so under sequence parallelism it must draw
+    # from the tensor-parallel state. Before mHC post became its own node it ran
+    # inside combine_forward and inherited that wrapper; appending it raw here
+    # would leave every TP rank drawing the same mask, and the recompute replay
+    # would not reproduce the forward mask.
+    # None means "this layer has no mHC post node"; the schedule tests for it, so
+    # the guard has to survive the wrapping.
+    mhc_post_func = (
+        None
+        if inner_mhc_post_forward is None
+        else partial(rng_context_wrapper, inner_mhc_post_forward)
+    )
     forward_funcs = [
         attn_func,
         dispatch_func,
         mlp_func,
         combine_func,
         mtp_post_process_func,
-        inner_mhc_post_forward,
+        mhc_post_func,
     ]
     # Under hyper-connections the MTP layer builds separate e_proj/h_proj and
     # sets eh_proj to None; appending eh_proj unconditionally would place None

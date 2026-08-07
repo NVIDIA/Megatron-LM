@@ -2298,11 +2298,17 @@ class TransformerConfig(ModelParallelConfig):
         # Full-iteration capture is also valid because it records the explicit
         # schedule barrier and its fixed-address recompute kernels as part of
         # the iteration graph. Other per-layer graph forms remain rejected.
+        # Normalize locally: cuda_graph_modules is only normalized in bulk further
+        # down in __post_init__, so a config built directly (rather than through
+        # megatron/training/arguments.py) still holds string forms like ["attn"]
+        # here. Comparing them raw would reject a combination the later gate
+        # accepts, and the string form is part of this field's declared type.
+        normalized_graph_modules, _, _ = normalize_cuda_graph_modules(self.cuda_graph_modules)
         is_te_attn_split = (
             self.cuda_graph_impl == "transformer_engine"
             and not self.enable_cuda_graph
             and not self.external_cuda_graph
-            and list(self.cuda_graph_modules or []) == [CudaGraphModule.attn]
+            and list(normalized_graph_modules or []) == [CudaGraphModule.attn]
             and list(self.recompute_modules) == ["mhc"]
         )
         is_full_iteration = (
@@ -2329,9 +2335,7 @@ class TransformerConfig(ModelParallelConfig):
                 "explicit schedule-owned recompute barrier."
             )
 
-        if self.enable_hyper_connections and not (
-            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
-        ):
+        if self.enable_hyper_connections and not use_mhc_recompute:
             warnings.warn(
                 "HyperConnections are enabled but 'mhc' is not in "
                 "recompute_modules with selective recompute. Consider adding 'mhc' to "
@@ -3026,11 +3030,7 @@ class TransformerConfig(ModelParallelConfig):
         # cuda_graph_modules normalization and the deprecated flag migration above:
         # earlier placement would compare unnormalized string module forms and let
         # enable_cuda_graph/external_cuda_graph bypass the gate entirely.
-        if (
-            self.recompute_granularity == "selective"
-            and "mhc" in self.recompute_modules
-            and self.cuda_graph_impl != "none"
-        ):
+        if use_mhc_recompute and self.cuda_graph_impl != "none":
             if self.cuda_graph_impl == "local":
                 # Intentionally fail-closed even for inference-only local-graph
                 # configs that carry leftover training recompute args: mHC
