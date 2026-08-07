@@ -2445,6 +2445,13 @@ class TransformerConfig(ModelParallelConfig):
                 f"moe_flex_dispatcher_backend='{self.moe_flex_dispatcher_backend}'. "
                 "'alltoall', 'flex'+'hybridep', and 'flex'+'ncclep' are not yet supported."
             )
+            # The chunked MLP path in TransformerLayer doesn't thread packed_seq_params into the
+            # per-chunk MoE forward, so SeqTopK would silently fall back to standard topk per chunk.
+            assert self.mlp_chunks_for_prefill <= 1 and self.mlp_chunks_for_training <= 1, (
+                "moe_router_topk_mode='seq_topk' is incompatible with MLP chunking "
+                "(mlp_chunks_for_prefill>1 or mlp_chunks_for_training>1); "
+                "use mlp_chunks_for_prefill/training=1 with seq_topk."
+            )
             warnings.warn(
                 "SeqTopK routing is enabled. It requires THD packed sequences "
                 "(packed_seq_params.cu_seqlens_q) to define sequence boundaries; the uniform "
