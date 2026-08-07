@@ -945,14 +945,9 @@ def build_mtp_layer_callables(layer):
         AssertionError: If the underlying transformer layer is not an MoE layer.
     """
     forward_funcs, backward_dw = build_transformer_layer_callables(layer.mtp_model_layer)
-    (
-        attn_forward,
-        dispatch_forward,
-        mlp_forward,
-        combine_forward,
-        _,
-        inner_mhc_post_forward,
-    ) = forward_funcs
+    (attn_forward, dispatch_forward, mlp_forward, combine_forward, _, inner_mhc_post_forward) = (
+        forward_funcs
+    )
     is_moe = isinstance(layer.mtp_model_layer.mlp, MoELayer)
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 

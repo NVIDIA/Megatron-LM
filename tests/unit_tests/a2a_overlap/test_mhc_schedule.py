@@ -275,8 +275,6 @@ def test_checkpoint_manager_explicit_recompute_is_idempotent_and_restores_gradie
     torch.testing.assert_close(input_tensor.grad, reference_input.grad)
 
 
-
-
 def _run_schedule_and_capture(model, data):
     schedule_plan = model.build_schedule_plan(**data)
     output = TransformerModelChunkSchedulePlan.run(schedule_plan, None)

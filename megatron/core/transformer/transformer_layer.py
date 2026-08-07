@@ -1955,9 +1955,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         the dense attention consumer, so ``CheckpointWithoutOutput`` remains a
         real eager checkpoint rather than being bypassed during graph capture.
         """
-        from megatron.core.transformer.mhc_recompute import (
-            uses_mhc_recompute_attn_cuda_graph_split,
-        )
+        from megatron.core.transformer.mhc_recompute import uses_mhc_recompute_attn_cuda_graph_split
 
         return uses_mhc_recompute_attn_cuda_graph_split(self.config)
 

@@ -983,13 +983,7 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(
-        self,
-        fp8=False,
-        ckpt_manager=None,
-        output_slot=None,
-        recompute_phase=None,
-    ):
+    def __init__(self, fp8=False, ckpt_manager=None, output_slot=None, recompute_phase=None):
         """
         Initialize CheckpointWithoutOutput.
 

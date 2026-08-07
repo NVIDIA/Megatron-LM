@@ -180,5 +180,3 @@ def _fresh_view(backing: torch.Tensor) -> torch.Tensor:
     t = torch.empty(0, dtype=backing.dtype, device=backing.device)
     t.set_(backing.untyped_storage(), backing.storage_offset(), backing.shape)
     return t
-
-

@@ -658,7 +658,6 @@ class HyperConnectionModule(MegatronModule):
             ckpt_manager=manager, output_slot=output_slot
         ).checkpoint(aggregate_function, hs_for_aggregate, h_pre)
 
-
         return aggregated, h_res, h_post, hs_for_residual
 
     # ==================== Block-level utilities ====================

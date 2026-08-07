@@ -260,7 +260,6 @@ class TestNativeHAggregate:
         torch.testing.assert_close(xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
         torch.testing.assert_close(hf.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
 
-
     def test_torch_fallback_grad_h_accumulates_in_fp32(self):
         """The torch fallback must reduce grad_h exactly like its fp32 siblings.
 

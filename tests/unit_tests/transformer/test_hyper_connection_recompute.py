@@ -229,7 +229,6 @@ class TestHyperConnectionCheckpoint:
         assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-5)
 
 
-
 class TestMHCBlockRecomputeIntegration:
     """Test CheckpointManager integration with HyperConnection."""
 
@@ -688,11 +687,7 @@ class TestTransformerConfigRecomputeMhc:
             # Full-iteration capture reaches this layer too: the config-level gate
             # that admits it is not model-family aware, so without a matching
             # exemption here the hybrid path would construct silently.
-            {
-                "cuda_graph_impl": "full_iteration",
-                "hidden_dropout": 0.0,
-                "attention_dropout": 0.0,
-            },
+            {"cuda_graph_impl": "full_iteration", "hidden_dropout": 0.0, "attention_dropout": 0.0},
         ),
         ids=("attention-split", "full-iteration"),
     )
@@ -703,8 +698,6 @@ class TestTransformerConfigRecomputeMhc:
         config = TransformerConfig(**self._mhc_recompute_config_kwargs(**graph_kwargs))
         with pytest.raises(ValueError, match="HybridStack"):
             HyperConnectionHybridLayer(config, types.SimpleNamespace(layer_number=1))
-
-
 
 
 class TestCheckpointRngReplay:

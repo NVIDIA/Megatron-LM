@@ -1768,9 +1768,7 @@ class TECudaGraphHelper:
 
     def _uses_mhc_direct_write_arena(self):
         """Whether attention-only graphs consume eager mHC recompute outputs."""
-        from megatron.core.transformer.mhc_recompute import (
-            uses_mhc_recompute_attn_cuda_graph_split,
-        )
+        from megatron.core.transformer.mhc_recompute import uses_mhc_recompute_attn_cuda_graph_split
 
         return uses_mhc_recompute_attn_cuda_graph_split(self.config)
 
