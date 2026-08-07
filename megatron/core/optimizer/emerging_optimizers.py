@@ -301,6 +301,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         gathered_grad = grad
         gtp_slice = None
         gtp_remat_group = self._get_gtp_remat_group(p)
+        gtp_pad_length = int(getattr(p, "qkv_gtp_pad_length", 0))
+        if gtp_pad_length < 0:
+            raise RuntimeError(f"Muon QKV GTP padding must be non-negative: {gtp_pad_length}")
         if (
             gather_gtp
             and gtp_remat_group is not None
@@ -313,7 +316,18 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             shards = [torch.empty_like(gathered_grad) for _ in range(gtp_size)]
             torch.distributed.all_gather(shards, gathered_grad, gtp_remat_group)
             gathered_grad = torch.cat(shards, dim=0)
-            gtp_slice = (gtp_rank, gtp_local_rows)
+            if gtp_pad_length >= gathered_grad.shape[0]:
+                raise RuntimeError(
+                    "Invalid Muon QKV GTP padding after gathering: "
+                    f"pad_length={gtp_pad_length}, gathered_rows={gathered_grad.shape[0]}"
+                )
+            if gtp_pad_length > 0:
+                gathered_grad = gathered_grad[:-gtp_pad_length]
+            gtp_slice = (gtp_rank, gtp_local_rows, gtp_pad_length)
+        elif gtp_pad_length > 0:
+            raise RuntimeError(
+                "Muon QKV has GTP padding but its GTP-remat shards were not gathered"
+            )
 
         tp_slice = None
         if gathered_grad.shape[0] != expected_rows:
@@ -351,7 +365,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             tp_rank, tp_local_rows = tp_slice
             gathered_grad = gathered_grad[tp_rank * tp_local_rows : (tp_rank + 1) * tp_local_rows]
         if gtp_slice is not None:
-            gtp_rank, gtp_local_rows = gtp_slice
+            gtp_rank, gtp_local_rows, gtp_pad_length = gtp_slice
+            if gtp_pad_length > 0:
+                gathered_grad = torch.nn.functional.pad(gathered_grad, (0, 0, 0, gtp_pad_length))
             gathered_grad = gathered_grad[
                 gtp_rank * gtp_local_rows : (gtp_rank + 1) * gtp_local_rows
             ]
@@ -435,10 +451,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         """
         local_split_shapes = getattr(p, "qkv_split_shapes", None)
         heads_are_complete = getattr(p, "qkv_split_heads_are_complete", None)
-        use_local_layout = heads_are_complete is True or (
-            heads_are_complete is None
-            and local_split_shapes is not None
-            and sum(local_split_shapes) == grad.shape[0]
+        has_gtp_padding = int(getattr(p, "qkv_gtp_pad_length", 0)) > 0
+        use_local_layout = not has_gtp_padding and (
+            heads_are_complete is True
+            or (
+                heads_are_complete is None
+                and local_split_shapes is not None
+                and sum(local_split_shapes) == grad.shape[0]
+            )
         )
         if use_local_layout:
             qkv_split_shapes = local_split_shapes
@@ -526,8 +546,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 raise RuntimeError("Muon QKV split requested but qkv_split_shapes is not set")
             if (
                 getattr(p, "qkv_split_groups_are_complete", None) is False
-                and getattr(p, "qkv_split_shapes_global", None) is not None
-            ):
+                or int(getattr(p, "qkv_gtp_pad_length", 0)) > 0
+            ) and getattr(p, "qkv_split_shapes_global", None) is not None:
                 return self._orthogonalize_fragmented_qkv(p, grad, tp_group, qkv_split_shapes)
             log_single_rank(
                 logger,
