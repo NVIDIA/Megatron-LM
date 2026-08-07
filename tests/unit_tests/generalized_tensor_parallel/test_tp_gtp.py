@@ -15,6 +15,8 @@ Test groups
 2.  TestTPGTPColumnParallelLinear - column-parallel Linear: fwd/bwd correctness (weight shape verified inline)
 3.  TestTPGTPRowParallelLinear    - row-parallel Linear: fwd/bwd smoke test + numerical correctness
 4.  TestTPGTPLayerNormLinear      - LayerNormLinear column-parallel smoke test
+5.  TestTPGTPPaddingAlignment     - alignment padding is applied independently per TP slice
+6.  TestTPGTPMuonQKVPadding       - Muon excludes GTP padding from QKV orthogonalization
 
 Tests use (tp_size, gtp_remat_size) = (2, 2) → world_size = 4 (runs on 4-GPU machines).
 
@@ -27,7 +29,10 @@ import types
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
+from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS, TensorParallelMuon
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 
 if not HAVE_GTP:
@@ -395,3 +400,102 @@ class TestTPGTPPaddingAlignment:
         world_size = tp_size * gtp_remat_size
         _requires_multi_gpu(world_size)
         _run_distributed(_worker_pre_init_tp_padding, world_size, tp_size, gtp_remat_size)
+
+
+def _worker_muon_qkv_padding(
+    rank, world_size, port, tp_size, gtp_remat_size, split_per_head, split_shapes
+):
+    """Muon must exclude per-TP GTP padding from QKV orthogonalization."""
+    del port
+    tp_group, gtp_remat_group, tp_rank, gtp_rank = _build_groups(
+        rank, world_size, tp_size, gtp_remat_size
+    )
+
+    logical_rows = sum(split_shapes)
+    logical_tp_rows = logical_rows // tp_size
+    pad_length = 3
+    physical_tp_rows = logical_tp_rows + pad_length
+    gtp_local_rows = physical_tp_rows // gtp_remat_size
+    hidden_size = 4
+
+    global_grad = torch.arange(logical_rows * hidden_size, dtype=torch.float32, device="cuda").view(
+        logical_rows, hidden_size
+    )
+    tp_grad = global_grad[tp_rank * logical_tp_rows : (tp_rank + 1) * logical_tp_rows]
+    # Use a sentinel so the test detects padding entering the orthogonalization.
+    physical_tp_grad = F.pad(tp_grad, (0, 0, 0, pad_length), value=10_000.0)
+    local_grad = physical_tp_grad[
+        gtp_rank * gtp_local_rows : (gtp_rank + 1) * gtp_local_rows
+    ].clone()
+
+    param = torch.nn.Parameter(torch.zeros_like(local_grad))
+    param.partition_dim = 0
+    param.is_qkv = True
+    param.is_gtp_weight_remat = True
+    param.qkv_gtp_pad_length = pad_length
+    param.qkv_split_shapes = split_shapes
+    param.qkv_split_shapes_global = split_shapes
+    param.qkv_split_heads_are_complete = False
+    param.qkv_split_groups_are_complete = False
+
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        split_qkv_per_head=split_per_head,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=split_shapes,
+        pg_collection=ProcessGroupCollection(tp=tp_group, gtp_remat=gtp_remat_group),
+        tp_mode="blockwise",
+    )
+
+    def center_rows(x, tp_group=None, partition_dim=None):
+        del tp_group, partition_dim
+        return x - x.mean(dim=-2, keepdim=True)
+
+    optimizer.scaled_orthogonalize_fn = center_rows
+    actual = optimizer.orthogonalize(param, local_grad)
+
+    if split_per_head:
+        expected_global = torch.cat(
+            [center_rows(head) for head in torch.split(global_grad, split_shapes, dim=0)], dim=0
+        )
+    else:
+        grouped_grad = global_grad.view(1, logical_rows, hidden_size)
+        projections = torch.split(grouped_grad, split_shapes, dim=1)
+        expected_global = torch.cat(
+            [
+                center_rows(projection.reshape(-1, hidden_size)).view_as(projection)
+                for projection in projections
+            ],
+            dim=1,
+        ).view_as(global_grad)
+
+    expected_tp = expected_global[tp_rank * logical_tp_rows : (tp_rank + 1) * logical_tp_rows]
+    expected_tp = F.pad(expected_tp, (0, 0, 0, pad_length))
+    expected = expected_tp[gtp_rank * gtp_local_rows : (gtp_rank + 1) * gtp_local_rows]
+
+    torch.testing.assert_close(actual, expected)
+    assert actual.shape == local_grad.shape
+    if gtp_rank == gtp_remat_size - 1:
+        assert torch.count_nonzero(actual[-pad_length:]) == 0
+
+
+class TestTPGTPMuonQKVPadding:
+    @pytest.mark.parametrize(
+        "split_per_head,split_shapes", [(True, [2, 2, 2, 2, 2]), (False, [6, 2, 2])]
+    )
+    def test_padding_is_excluded_from_qkv_orthogonalization(self, split_per_head, split_shapes):
+        if not HAVE_EMERGING_OPTIMIZERS:
+            pytest.skip("emerging_optimizers package is not installed")
+        tp_size = 2
+        gtp_remat_size = 2
+        world_size = tp_size * gtp_remat_size
+        _requires_multi_gpu(world_size)
+        _run_distributed(
+            _worker_muon_qkv_padding,
+            world_size,
+            tp_size,
+            gtp_remat_size,
+            split_per_head,
+            split_shapes,
+        )
