@@ -14,9 +14,9 @@ def _softplus_cumsum_kernel(
     H,
     C,
     n_valid_tokens,
-    ws_token_base_ptr,
-    ws_valid_lo_ptr,
-    ws_valid_hi_ptr,
+    chunk_token_base_ptr,
+    chunk_valid_start_ptr,
+    chunk_valid_end_ptr,
     stride_dt_token,
     stride_dt_h,
     stride_bias_h,
@@ -44,10 +44,10 @@ def _softplus_cumsum_kernel(
         # General ragged: each workspace chunk carries its own token base and
         # real-token window (a chunk shared by two sequences appears once per
         # owner, each masked to its own tokens).
-        token = tl.load(ws_token_base_ptr + c) + offs
-        lo = tl.load(ws_valid_lo_ptr + c)
-        hi = tl.load(ws_valid_hi_ptr + c)
-        valid = (token >= lo) & (token < hi)
+        token = tl.load(chunk_token_base_ptr + c) + offs
+        valid_start = tl.load(chunk_valid_start_ptr + c)
+        valid_end = tl.load(chunk_valid_end_ptr + c)
+        valid = (token >= valid_start) & (token < valid_end)
     else:
         token = (b * C + c) * L + offs
         # A tail-ragged batch pads the LAST chunk: those lanes are not real

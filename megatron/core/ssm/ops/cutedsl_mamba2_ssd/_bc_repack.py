@@ -13,9 +13,9 @@ def _bc_repack_kernel(
     N,
     TC,
     n_valid_tokens,
-    ws_token_base_ptr,
-    ws_valid_lo_ptr,
-    ws_valid_hi_ptr,
+    chunk_token_base_ptr,
+    chunk_valid_start_ptr,
+    chunk_valid_end_ptr,
     stride_src_token,
     stride_src_g,
     stride_dst_g,
@@ -50,8 +50,10 @@ def _bc_repack_kernel(
     # keeps the reused workspace free of stale values.
     if RAGGED:
         # General ragged: per-workspace-chunk token base + real-token window.
-        token = tl.load(ws_token_base_ptr + c) + offs_l
-        tok_mask = (token >= tl.load(ws_valid_lo_ptr + c)) & (token < tl.load(ws_valid_hi_ptr + c))
+        token = tl.load(chunk_token_base_ptr + c) + offs_l
+        tok_mask = (token >= tl.load(chunk_valid_start_ptr + c)) & (
+            token < tl.load(chunk_valid_end_ptr + c)
+        )
     else:
         token = c * L + offs_l
         tok_mask = token < n_valid_tokens

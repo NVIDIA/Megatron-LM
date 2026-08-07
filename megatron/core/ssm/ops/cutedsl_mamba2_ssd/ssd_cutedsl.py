@@ -41,7 +41,7 @@ def _to_cute(torch_tensor, dynamic_modes):
 
 
 _COMPILE_CACHE_VARLEN = {}
-_DIV_WS_CACHE = {}
+_WORKSPACE_CACHE = {}
 # Prefix-caching intermediate-output buffers, keyed by (num_inter, H, P, N_pad, dtype).
 # num_inter varies per call, so these live in their own cache (not the shape workspace).
 _INTER_OUT_CACHE = {}
@@ -82,9 +82,9 @@ def _get_workspace(
     cumsum buffers + cute descriptors + compiled varlen kernel (x/y are zero-copy
     views supplied per call; cs/nc come from the metadata cache). When has_initial,
     a cached (S,H,P,N_pad) buffer holds the per-call initial SSM state."""
-    ws = _DIV_WS_CACHE.get(key)
-    if ws is not None:
-        return ws
+    workspace = _WORKSPACE_CACHE.get(key)
+    if workspace is not None:
+        return workspace
     device = "cuda"
     HP = H * P
     delta_d = torch.zeros(1, H, TC, L, device=device, dtype=torch.float32)
@@ -160,7 +160,7 @@ def _get_workspace(
         nc_ph_t,
         stream,
     )
-    ws = dict(
+    workspace = dict(
         delta_d=delta_d,
         cumsum_d=cumsum_d,
         B_d=B_d,
@@ -185,8 +185,8 @@ def _get_workspace(
         es_all_t=es_all_t,
         compiled=compiled,
     )
-    _DIV_WS_CACHE[key] = ws
-    return ws
+    _WORKSPACE_CACHE[key] = workspace
+    return workspace
 
 
 def _get_compiled_varlen(
@@ -492,7 +492,7 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
     # chunks. X is always a zero-copy chunk-major THD view on the global grid;
     # B/C/delta live in the (cached) dense workspace on the per-sequence grid,
     # which is larger than the global one only when a chunk is shared.
-    ws_chunks = tiling.chunk_token_base.numel()
+    workspace_chunks = tiling.chunk_token_base.numel()
     # Sharing is exactly what makes an in-place Y store unsafe: both owners
     # would TMA-store the same output rows, so Y goes via a scratch instead.
     ragged = not tiling.starts_aligned
@@ -510,7 +510,7 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
         S_kernel,
         H,
         P,
-        ws_chunks,
+        workspace_chunks,
         total_chunks,
         L,
         G,
@@ -523,12 +523,12 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
         has_intermediate,
         ragged,
     )
-    ws = _get_workspace(
+    workspace = _get_workspace(
         key,
         S_kernel,
         H,
         P,
-        ws_chunks,
+        workspace_chunks,
         total_chunks,
         L,
         G,
@@ -551,11 +551,11 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
         dt_bias,
         dt_softplus,
         dt_limit,
-        ws["delta_d"],
-        ws["cumsum_d"],
+        workspace["delta_d"],
+        workspace["cumsum_d"],
         1,
         H,
-        ws_chunks,
+        workspace_chunks,
         n_real_tokens,
         ragged_chunks,
     )
@@ -563,42 +563,54 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
         # Tiled transpose: coalesced on both the token-major loads and the
         # chunk-major stores, B and C in one launch (~5x the strided copy_).
         repack_bc_chunk_major(
-            B, C, ws["B_d"], ws["C_d"], N, ws_chunks, L, n_real_tokens, ragged_chunks
+            B,
+            C,
+            workspace["B_d"],
+            workspace["C_d"],
+            N,
+            workspace_chunks,
+            L,
+            n_real_tokens,
+            ragged_chunks,
         )
     else:
         assert not ragged, "ragged path needs the tiled repack (B/C must be n-contiguous)"
         GN = G * N
-        ws["B_d"][:, :, :N].copy_(B.as_strided((1, G, N, total_chunks, L), (0, N, 1, L * GN, GN)))
-        ws["C_d"][:, :, :N].copy_(C.as_strided((1, G, N, total_chunks, L), (0, N, 1, L * GN, GN)))
+        workspace["B_d"][:, :, :N].copy_(
+            B.as_strided((1, G, N, total_chunks, L), (0, N, 1, L * GN, GN))
+        )
+        workspace["C_d"][:, :, :N].copy_(
+            C.as_strided((1, G, N, total_chunks, L), (0, N, 1, L * GN, GN))
+        )
         if n_tokens != n_real_tokens:
             # Keep the pad lanes finite (stale workspace content could be
             # anything); delta == 0 already removes their contribution.
-            ws["B_d"][:, :, :, -1, n_real_tokens - n_tokens :] = 0
-            ws["C_d"][:, :, :, -1, n_real_tokens - n_tokens :] = 0
+            workspace["B_d"][:, :, :, -1, n_real_tokens - n_tokens :] = 0
+            workspace["C_d"][:, :, :, -1, n_real_tokens - n_tokens :] = 0
     if has_d:
-        ws["d_buf"].copy_(D.to(io_dtype) if d_has_hdim else D.to(io_dtype).view(H, 1))
+        workspace["d_buf"].copy_(D.to(io_dtype) if d_has_hdim else D.to(io_dtype).view(H, 1))
     if has_initial:
         init_src = initial_states[real_seq_idx] if has_empty else initial_states
-        ws["init_base"][..., :N].copy_(init_src.to(io_dtype))
+        workspace["init_base"][..., :N].copy_(init_src.to(io_dtype))
     if return_raw_states:
         # One row per CALLER chunk. The real chunks are emitted by the kernel
         # (identity emit map, cached); the trailing rows belong to the
         # zero-length chunks of empty sequences and are filled below.
         n_caller_chunks = cu_chunk_seqlens.shape[0] - 1
         inter_raw, _, inter_t = _inter_out(n_caller_chunks, H, P, N_pad, io_dtype)
-        es_t = ws["es_all_t"]
+        es_t = workspace["es_all_t"]
     elif has_intermediate:
         num_inter = intermediate_chunk_indices.shape[0]
-        emit_slot = ws["emit_slot_buf"]
+        emit_slot = workspace["emit_slot_buf"]
         emit_slot.fill_(-1)
         emit_slot[intermediate_chunk_indices] = torch.arange(
             num_inter, dtype=torch.int32, device=device
         )
         inter_raw, inter_final, inter_t = _inter_out(num_inter, H, P, N_pad, io_dtype)
-        es_t = ws["es_ph_t"]
+        es_t = workspace["es_ph_t"]
     else:
-        inter_t = ws["inter_ph_t"]
-        es_t = ws["es_ph_t"]
+        inter_t = workspace["inter_ph_t"]
+        es_t = workspace["es_ph_t"]
 
     x_v = x.as_strided((P, L, total_chunks, H, 1), (1, HP, L * HP, P, T * HP))
     x_t = _to_cute(x_v, [2, 3, 4])
@@ -606,7 +618,7 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
         # Kernel writes the expanded scratch (cached descriptor); the real
         # output is filled by the scatter below.
         y_target = None
-        y_t = ws["y_scratch_t"]
+        y_t = workspace["y_scratch_t"]
     else:
         y_target = out if out.dtype == io_dtype else torch.empty_like(x)
         y_v = y_target.as_strided((L, P, total_chunks, H, 1), (HP, 1, L * HP, P, T * HP))
@@ -618,17 +630,17 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
     nc_t = _to_cute(tiling.seq_chunk_count, [0])
     xs_t = _to_cute(tiling.seq_chunk_base, [0])
 
-    compiled_ssd_kernel = ws["compiled"]
+    compiled_ssd_kernel = workspace["compiled"]
     compiled_ssd_kernel(
         x_t,
-        ws["cumsum_t"],
-        ws["delta_t"],
-        ws["b_t"],
-        ws["c_t"],
+        workspace["cumsum_t"],
+        workspace["delta_t"],
+        workspace["b_t"],
+        workspace["c_t"],
         y_t,
-        ws["fstate_t"],
-        ws["d_t"],
-        ws["init_t"],
+        workspace["fstate_t"],
+        workspace["d_t"],
+        workspace["init_t"],
         inter_t,
         es_t,
         cs_t,
@@ -639,7 +651,7 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
 
     if ragged:
         scatter_y_ragged(
-            ws["y_scratch"],
+            workspace["y_scratch"],
             out,
             tiling.chunk_token_base,
             tiling.chunk_valid_start,
@@ -648,7 +660,7 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
         )
     elif y_target is not out:
         out.copy_(y_target)
-    fstate = ws["fstate_base"][..., :N].to(state_dtype)
+    fstate = workspace["fstate_base"][..., :N].to(state_dtype)
     if has_empty:
         # Scatter the compacted real-seq states back to full batch shape.
         # Empty seqs processed no tokens -> final state == their initial state
