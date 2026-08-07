@@ -261,6 +261,39 @@ class TestNativeHAggregate:
         torch.testing.assert_close(hf.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
 
 
+    def test_torch_fallback_grad_h_accumulates_in_fp32(self):
+        """The torch fallback must reduce grad_h exactly like its fp32 siblings.
+
+        ``FusedHAggregateInto.backward`` routes here whenever cuTile is absent,
+        which includes ordinary Triton-only builds, so a bf16 reduction over the
+        hidden dimension would make the numerics of a run depend on whether
+        cuTile happens to be installed.
+        """
+        from megatron.core.fusions.fused_mhc_kernels import _torch_h_aggregate_bwd
+
+        s, b, n, C = 2, 2, 4, 2048
+        x_data = _rand(s, b, n, C)
+        h_data = _rand(s, b, n)
+        grad_out = _rand(s, b, C)
+
+        xr = x_data.clone().requires_grad_(True)
+        hr = h_data.clone().requires_grad_(True)
+        arena_view = torch.empty(s, b, C, dtype=xr.dtype, device=xr.device)
+        native_h_aggregate_into(xr, hr, arena_view).backward(grad_out)
+
+        _, fallback_grad_h = _torch_h_aggregate_bwd(grad_out, x_data, h_data)
+        # Same reduction, same inputs, same precision -> bitwise identical.
+        assert torch.equal(fallback_grad_h, hr.grad)
+
+        # And the fp32 accumulation is what buys the accuracy: a bf16 reduction
+        # over C=2048 lands measurably further from an fp64 reference.
+        reference = torch.sum(grad_out.unsqueeze(2).double() * x_data.double(), dim=-1)
+        bf16_accumulated = torch.sum(grad_out.unsqueeze(2) * x_data, dim=-1)
+        fp32_error = (fallback_grad_h.double() - reference).abs().max()
+        bf16_error = (bf16_accumulated.double() - reference).abs().max()
+        assert fp32_error < bf16_error
+
+
 class TestFusedHAggregate:
     """Public fused h_aggregate dispatch/fallback plus numerical correctness."""
 

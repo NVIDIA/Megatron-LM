@@ -792,15 +792,26 @@ class TestTransformerConfigRecomputeMhc:
         )
         assert config.cuda_graph_modules == [CudaGraphModule.attn]
 
-    def test_hybrid_mhc_layer_rejects_attention_split_at_construction(self):
+    @pytest.mark.parametrize(
+        "graph_kwargs",
+        (
+            {"cuda_graph_impl": "transformer_engine", "cuda_graph_modules": [CudaGraphModule.attn]},
+            # Full-iteration capture reaches this layer too: the config-level gate
+            # that admits it is not model-family aware, so without a matching
+            # exemption here the hybrid path would construct silently.
+            {
+                "cuda_graph_impl": "full_iteration",
+                "hidden_dropout": 0.0,
+                "attention_dropout": 0.0,
+            },
+        ),
+        ids=("attention-split", "full-iteration"),
+    )
+    def test_hybrid_mhc_layer_rejects_cuda_graphs_at_construction(self, graph_kwargs):
         """HybridStack mHC layers capture the mHC producer and must fail closed."""
         from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
 
-        config = TransformerConfig(
-            **self._mhc_recompute_config_kwargs(
-                cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.attn]
-            )
-        )
+        config = TransformerConfig(**self._mhc_recompute_config_kwargs(**graph_kwargs))
         with pytest.raises(ValueError, match="HybridStack"):
             HyperConnectionHybridLayer(config, types.SimpleNamespace(layer_number=1))
 
