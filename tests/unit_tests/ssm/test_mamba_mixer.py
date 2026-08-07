@@ -1,5 +1,7 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -230,3 +232,101 @@ class TestMambaMixerCuteDSL:
         torch.testing.assert_close(
             st_cute[batch_indices], st_tri[batch_indices], rtol=3e-2, atol=3e-2
         )
+
+
+SSD_KERNEL_L = 128
+"""The CuteDSL SSD kernel's tile length; the tiling arrays must be built at it."""
+
+
+def _ssd_members_for_test(cu, chunk_size, device):
+    """Reproduce the per-step SSD tiling MambaMetadata publishes.
+
+    Mirrors MambaMetadata._compute_mamba_chunk_meta: each sequence is tiled from
+    the chunk-aligned position at or below its start, so one starting mid-chunk
+    shares that chunk with its predecessor.
+
+    Args:
+        cu: Cumulative token counts, one entry per slot plus one.
+        chunk_size: The kernel's L.
+        device: Where the index arrays live.
+
+    Returns:
+        A dict of the ``ssd_*`` members, keyed as on MambaMetadata.
+    """
+    active, base_l, count_l, start_l = [], [], [], []
+    tok_base, valid_lo, valid_hi, acc = [], [], [], 0
+    for i in range(len(cu) - 1):
+        start, end = cu[i], cu[i + 1]
+        if end <= start:
+            continue
+        base = start // chunk_size
+        count = -(-(end - base * chunk_size) // chunk_size)
+        active.append(i)
+        base_l.append(base)
+        count_l.append(count)
+        start_l.append(acc)
+        acc += count
+        for c in range(count):
+            tok_base.append((base + c) * chunk_size)
+            valid_lo.append(start)
+            valid_hi.append(end)
+    empty = [i for i in range(len(cu) - 1) if i not in set(active)]
+
+    def i32(values):
+        return torch.tensor(values, dtype=torch.int32, device=device)
+
+    return dict(
+        ssd_seq_chunk_start=i32(start_l),
+        ssd_seq_chunk_count=i32(count_l),
+        ssd_seq_chunk_base=i32(base_l),
+        ssd_active_seq_idx=i32(active),
+        ssd_empty_seq_idx=i32(empty),
+        ssd_chunk_token_base=i32(tok_base),
+        ssd_chunk_valid_start=i32(valid_lo),
+        ssd_chunk_valid_end=i32(valid_hi),
+        ssd_starts_aligned=all(cu[i] % chunk_size == 0 for i in active),
+        ssd_active_is_prefix=active == list(range(len(active))),
+    )
+
+
+def _prefill_metadata_for_test(cu_seqlens, seq_idx, chunk_size, batch_indices=None):
+    """Stand-in for MambaMetadata carrying the fields ``_ssm_prefill`` reads.
+
+    Args:
+        cu_seqlens: Per-sequence cumulative token counts.
+        seq_idx: Per-token request id, or None.
+        chunk_size: The caller's chunk size.
+        batch_indices: Prefill slot map, or None.
+
+    Returns:
+        A ``SimpleNamespace`` shaped like MambaMetadata.
+    """
+    cu = cu_seqlens.tolist()
+    chunk_boundaries = [0]
+    last_chunk_indices = []
+    for i in range(len(cu) - 1):
+        pos = cu[i] + chunk_size
+        while pos < cu[i + 1]:
+            chunk_boundaries.append(pos)
+            pos += chunk_size
+        chunk_boundaries.append(cu[i + 1])
+        last_chunk_indices.append(len(chunk_boundaries) - 2)
+    cu_chunk_seqlens = cu_seqlens.new_tensor(chunk_boundaries)
+    return SimpleNamespace(
+        **_ssd_members_for_test(cu, SSD_KERNEL_L, cu_seqlens.device),
+        mamba_chunk_size=SSD_KERNEL_L,
+        real_prefill_token_count=cu[-1],
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        cu_chunk_seqlens=cu_chunk_seqlens,
+        last_chunk_indices=cu_seqlens.new_tensor(last_chunk_indices),
+        seq_idx_for_varlen=(
+            seq_idx[0, cu_chunk_seqlens[:-1]].contiguous() if seq_idx is not None else None
+        ),
+        batch_indices_prefill=batch_indices,
+        conv_seq_idx=None,
+        conv_seq_start=None,
+        intermediate_chunk_indices=None,
+        intermediate_abs_positions=None,
+        intermediate_real_count=None,
+    )

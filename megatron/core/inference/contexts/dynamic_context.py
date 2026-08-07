@@ -1198,22 +1198,40 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_batch_indices_prefill_bytes = self.max_requests * 4
             _mamba_seq_idx_bytes = self.max_tokens * 4
             _mamba_cu_seqlens_bytes = (self.max_requests + 1) * 4
-            # SSD ragged tiling: per active sequence, or per workspace chunk
-            # (a sequence starting mid-chunk adds one).
-            _max_ssd_chunks = self._max_mamba_chunks + self.max_requests
-            _mamba_ssd_seq_chunk_start_bytes = self.max_requests * 4
-            _mamba_ssd_seq_chunk_count_bytes = self.max_requests * 4
-            _mamba_ssd_seq_chunk_base_bytes = self.max_requests * 4
-            _mamba_ssd_active_seq_idx_bytes = self.max_requests * 4
-            _mamba_ssd_empty_seq_idx_bytes = self.max_requests * 4
-            _mamba_ssd_chunk_token_base_bytes = _max_ssd_chunks * 4
-            _mamba_ssd_chunk_valid_start_bytes = _max_ssd_chunks * 4
-            _mamba_ssd_chunk_valid_end_bytes = _max_ssd_chunks * 4
             _mamba_cu_chunk_seqlens_bytes = (self._max_mamba_chunks + 1) * 4
             _mamba_last_chunk_indices_bytes = self.max_requests * 4
             _mamba_seq_idx_for_varlen_bytes = self._max_mamba_chunks * 4
             _mamba_conv_seq_idx_bytes = self.max_tokens * 4
             _mamba_conv_seq_start_bytes = self.max_tokens * 4
+            # SSD ragged tiling: per active sequence, or per workspace chunk
+            # (a sequence starting mid-chunk adds one).
+            _max_ssd_chunks = self._max_mamba_chunks + self.max_requests
+            # SSD arrays back CuteDSL descriptors, which require 16-byte aligned
+            # data pointers; pad so the block starts aligned (each field size is
+            # already rounded to 16, so every field within it stays aligned).
+            _mamba_ssd_align_pad = (
+                -(
+                    _pre_mamba_bytes
+                    + _mamba_align_pad
+                    + _mamba_batch_indices_decode_bytes
+                    + _mamba_batch_indices_prefill_bytes
+                    + _mamba_seq_idx_bytes
+                    + _mamba_cu_seqlens_bytes
+                    + _mamba_cu_chunk_seqlens_bytes
+                    + _mamba_last_chunk_indices_bytes
+                    + _mamba_seq_idx_for_varlen_bytes
+                    + _mamba_conv_seq_idx_bytes
+                    + _mamba_conv_seq_start_bytes
+                )
+            ) % 16
+            _mamba_ssd_seq_chunk_start_bytes = -(-self.max_requests * 4 // 16) * 16
+            _mamba_ssd_seq_chunk_count_bytes = -(-self.max_requests * 4 // 16) * 16
+            _mamba_ssd_seq_chunk_base_bytes = -(-self.max_requests * 4 // 16) * 16
+            _mamba_ssd_active_seq_idx_bytes = -(-self.max_requests * 4 // 16) * 16
+            _mamba_ssd_empty_seq_idx_bytes = -(-self.max_requests * 4 // 16) * 16
+            _mamba_ssd_chunk_token_base_bytes = -(-_max_ssd_chunks * 4 // 16) * 16
+            _mamba_ssd_chunk_valid_start_bytes = -(-_max_ssd_chunks * 4 // 16) * 16
+            _mamba_ssd_chunk_valid_end_bytes = -(-_max_ssd_chunks * 4 // 16) * 16
         else:
             _mamba_align_pad = 0
             self._max_mamba_chunks = 0
@@ -1221,6 +1239,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_batch_indices_prefill_bytes = 0
             _mamba_seq_idx_bytes = 0
             _mamba_cu_seqlens_bytes = 0
+            _mamba_ssd_align_pad = 0
             _mamba_ssd_seq_chunk_start_bytes = 0
             _mamba_ssd_seq_chunk_count_bytes = 0
             _mamba_ssd_seq_chunk_base_bytes = 0
@@ -1241,6 +1260,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             + _mamba_batch_indices_prefill_bytes
             + _mamba_seq_idx_bytes
             + _mamba_cu_seqlens_bytes
+            + _mamba_ssd_align_pad
             + _mamba_ssd_seq_chunk_start_bytes
             + _mamba_ssd_seq_chunk_count_bytes
             + _mamba_ssd_seq_chunk_base_bytes
@@ -1421,6 +1441,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 _off : _off + _mamba_conv_seq_start_bytes
             ].view(torch.int32)
             _off += _mamba_conv_seq_start_bytes
+            _off += _mamba_ssd_align_pad
             self._cpu_mamba_ssd_seq_chunk_start = self._cpu_bookkeeping_buf[
                 _off : _off + _mamba_ssd_seq_chunk_start_bytes
             ].view(torch.int32)
