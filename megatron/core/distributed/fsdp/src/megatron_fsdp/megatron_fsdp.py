@@ -770,8 +770,8 @@ class MegatronFSDP(torch.nn.Module):
                 # in start_grad_sync() or synchronize_gradient_reduce().
                 # Must only happen once on the final microbatch prior to optimization,
                 # or else unsharded gradient buffers will be redundantly reduced.
-                self.ddp_config.overlap_grad_reduce and
-                (is_last_microbatch or self.model_auto_sync)
+                self.ddp_config.overlap_grad_reduce
+                and (is_last_microbatch or self.model_auto_sync)
             ):
                 # Launch asynchronous reduce-scatter of gradients before the optimizer
                 # step. This requires a later call to finish_grad_sync() to wait for
@@ -887,8 +887,8 @@ class MegatronFSDP(torch.nn.Module):
                 # in start_grad_sync() or synchronize_gradient_reduce().
                 # Must only happen once on the final microbatch prior to optimization,
                 # or else unsharded gradient buffers will be redundantly reduced.
-                self.ddp_config.overlap_grad_reduce and
-                (is_last_microbatch or self.model_auto_sync)
+                self.ddp_config.overlap_grad_reduce
+                and (is_last_microbatch or self.model_auto_sync)
             ):
                 self.grad_reduce_pipeline.reduce_gradients(
                     ordered_params,

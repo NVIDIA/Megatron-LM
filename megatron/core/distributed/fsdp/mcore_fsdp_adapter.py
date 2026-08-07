@@ -170,8 +170,8 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         else:
             # FSDP unit modules control the granularity of FSDP communications.
             # "optim": Reduce-scatter communication groups on the final microbatch.
-            # "optim_grads": Additionally, reduce-scatter communication groups on all microbatches.
-            # "optim_grads_params": Reduce-scatter and all-gather communication groups on all microbatches.
+            # "optim_grads": Additionally, RS communication groups on all microbatches.
+            # "optim_grads_params": RS & AG communication groups on all microbatches.
             if self.ddp_config.data_parallel_sharding_strategy != "no_shard":
                 self.fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
             else:
