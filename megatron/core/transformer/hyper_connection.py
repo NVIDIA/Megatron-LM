@@ -112,11 +112,12 @@ class NativeHAggregateInto(torch.autograd.Function):
         grad_x = grad_output_expanded * h_pre.unsqueeze(-1)
         # grad_h reduces over the hidden dimension, thousands of elements wide,
         # while the forward only reduces over the handful of residual streams.
-        # Upcast both operands first: torch.sum already accumulates bf16 in fp32,
-        # but rounding each product to bf16 before that reduction does lose
-        # accuracy, and h_pre carries the residual mixing coefficients, so error
-        # here shifts how streams combine in every layer. The fused sibling
-        # upcasts for the same reason.
+        # Upcast both operands: torch.sum already accumulates bf16 in fp32, so
+        # asking for dtype=float32 would change nothing; the cost is rounding each
+        # product to bf16 before that reduction. h_pre carries the residual mixing
+        # coefficients, so error here shifts how streams combine in every layer.
+        # Matches _torch_h_aggregate_bwd, including its note on why the
+        # temporary-free matmul form is not used.
         grad_h = torch.sum(grad_output_expanded.float() * x.float(), dim=-1)
         return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype), None
 

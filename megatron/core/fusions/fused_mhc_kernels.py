@@ -450,7 +450,7 @@ if _TRITON_AVAILABLE:
         sb = s * b
         if out is None:
             out = torch.empty(s, b, C, dtype=x.dtype, device=x.device)
-        if out.shape != (s, b, C) or out.dtype != x.dtype or out.device != x.device:
+        elif out.shape != (s, b, C) or out.dtype != x.dtype or out.device != x.device:
             raise ValueError("Invalid caller-owned Triton H-aggregate output")
         out_flat = out.view(sb, C)
         x_flat = x.contiguous().view(sb, n, C)
@@ -1091,7 +1091,7 @@ if _CUTILE_AVAILABLE:
         stream = torch.cuda.current_stream()
         if out is None:
             out = torch.empty(s, b, C, dtype=x.dtype, device=x.device)
-        if out.shape != (s, b, C) or out.dtype != x.dtype or out.device != x.device:
+        elif out.shape != (s, b, C) or out.dtype != x.dtype or out.device != x.device:
             raise ValueError("Invalid caller-owned cuTile H-aggregate output")
         out_flat = out.view(sb, C)
         x_flat = x.view(sb, n, C)
@@ -2735,13 +2735,19 @@ def _torch_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tup
     grad_output_expanded = grad_output.unsqueeze(2)
     grad_x = grad_output_expanded * h_pre.unsqueeze(-1)
     # Upcast both operands before the product. torch.sum already accumulates a
-    # bf16 input in fp32, so the accumulation was never the problem; what costs
-    # accuracy is rounding each go*x product to bf16 before it enters a reduction
+    # bf16 input in fp32, so `dtype=torch.float32` alone would change nothing --
+    # what costs accuracy is rounding each go*x product to bf16 before a reduction
     # spanning the whole hidden dimension (the cuTile kernel's comment puts the
     # result at ~3x noisier). _ct_h_agg_bwd_kernel and
     # NativeHAggregateInto.backward upcast for the same reason, and this fallback
     # is reachable whenever cuTile is absent -- including Triton-present builds --
     # so it has to agree with them.
+    #
+    # This does allocate fp32 temporaries, and a batched matmul would avoid them
+    # by accumulating bf16 products in fp32 registers. Not taken: the precision of
+    # that form depends on torch.backends.cuda.matmul.allow_bf16_reduced_precision
+    # _reduction, a global the caller can flip, and grad_h feeds the residual
+    # mixing coefficients where the error compounds across every layer.
     grad_h = torch.sum(grad_output_expanded.float() * x.float(), dim=-1)
     return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype)
 

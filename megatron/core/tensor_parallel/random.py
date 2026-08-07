@@ -957,12 +957,10 @@ class CheckpointManager:
         Raises:
             RuntimeError: If the managed outputs have not been discarded before replay.
         """
-        if self._recomputed:
-            return
-        if not self._outputs_discarded:
-            raise RuntimeError("CheckpointManager.recompute_now() requires discarded outputs.")
         from megatron.core.transformer.mhc_recompute import MHCRecomputePhase
 
+        # Guards live in recompute_until; duplicating them here lets the two
+        # error paths drift apart.
         self.recompute_until(MHCRecomputePhase.BEFORE_ATTN_BWD)
 
     def _unified_recompute_hook(self, grad_output):
@@ -1009,9 +1007,10 @@ class CheckpointWithoutOutput(object):
             MHCRecomputePhase.BEFORE_COMBINE_BWD if recompute_phase is None else recompute_phase
         )
         self.run_function = None
-        self.fwd_cpu_rng_state = None
-        self.fwd_cuda_rng_state = None
-        self.fwd_cuda_rng_state_tracker = None
+        # Snapshot taken in checkpoint(), consumed and cleared in _recompute().
+        # This replaced three separate fwd_* fields; declaring it here keeps the
+        # field the code actually reads visible next to the rest of the state.
+        self.rng_states = None
         self.ctx = None
         self.outputs = None
 

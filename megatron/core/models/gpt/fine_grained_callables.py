@@ -2,7 +2,7 @@
 
 import weakref
 from contextlib import nullcontext
-from functools import partial
+from functools import partial, wraps
 from typing import Callable, Optional
 
 import torch
@@ -110,6 +110,26 @@ def should_free_input(name, is_moe, config, num_local_experts):
     }
 
     return free_input_nodes.get(name, False)
+
+
+def with_sequence_parallel_rng(func, config):
+    """Run ``func`` under the tensor-parallel RNG state when sequence parallel is on.
+
+    The fine-grained EP-overlap schedule invokes these callables directly, so it
+    never enters ``TransformerBlock.forward``'s fork. Any callable that consumes
+    randomness therefore has to establish the fork itself, or every TP rank in the
+    sequence-parallel partition draws the same mask and the recompute replay does
+    not reproduce the forward one.
+    """
+    if not config.sequence_parallel:
+        return func
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with tensor_parallel.get_cuda_rng_tracker().fork():
+            return func(*args, **kwargs)
+
+    return wrapper
 
 
 def finalize_decoder_layer_output(node, hidden_states):
@@ -612,7 +632,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # normally set. Thread it here so the attention-only split replay can
             # bind its fixed-address recompute arena slot (see
             # HyperConnectionTransformerLayer._te_cuda_graph_replay_mhc_attention_split_overlap).
-            layer._mhc_recompute_manager = mhc_recompute_manager
+            if is_hyper_connection_layer:
+                layer._mhc_recompute_manager = mhc_recompute_manager
             forward_func = layer._te_cuda_graph_replay
         else:
             # wrapper function that keeps consistent api with cuda graph replay
@@ -915,7 +936,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
     layer.init_backward_dw_wrapper()
 
-    mhc_post_func = submodule_mhc_post_forward if is_mhc_layer else None
+    # mHC post runs the fused H_res/H_post bias-dropout-add, so it needs the
+    # sequence-parallel RNG fork that this builder's other callables do not carry.
+    # That omission on dispatch/mlp/combine predates this PR -- the overlap
+    # schedule bypasses TransformerBlock.forward's fork for all of them -- and is
+    # left alone here rather than silently widening this PR's numerics change.
+    mhc_post_func = (
+        with_sequence_parallel_rng(submodule_mhc_post_forward, layer.config)
+        if is_mhc_layer
+        else None
+    )
 
     forward_funcs = [attn_func, dispatch_func, mlp_func, combine_func, None, mhc_post_func]
     backward_dw = {"attn": layer.backward_dw_wrapper, "mlp": layer.mlp}
@@ -1008,23 +1038,12 @@ def build_mtp_layer_callables(layer):
             hidden_states = pre_contraction_hidden_states
         return hidden_states
 
-    def rng_context_wrapper(func, *args, **kwargs):
-        """
-        Wrapper to add rng context to submodule callables
-        """
-        if layer.config.sequence_parallel:
-            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
-        else:
-            rng_context = nullcontext()
-        with rng_context:
-            return func(*args, **kwargs)
-
     # Build forward and backward callable functions
     # attn_forward already has rng context, no need to wrap
     attn_func = submodule_mtp_attn_forward
-    dispatch_func = partial(rng_context_wrapper, dispatch_forward)
-    mlp_func = partial(rng_context_wrapper, mlp_forward)
-    combine_func = partial(rng_context_wrapper, combine_forward)
+    dispatch_func = with_sequence_parallel_rng(dispatch_forward, layer.config)
+    mlp_func = with_sequence_parallel_rng(mlp_forward, layer.config)
+    combine_func = with_sequence_parallel_rng(combine_forward, layer.config)
     mtp_post_process_func = submodule_mtp_postprocess_forward
 
     # The MTP layer wraps a transformer layer, so it inherits that layer's mHC
@@ -1042,7 +1061,7 @@ def build_mtp_layer_callables(layer):
     mhc_post_func = (
         None
         if inner_mhc_post_forward is None
-        else partial(rng_context_wrapper, inner_mhc_post_forward)
+        else with_sequence_parallel_rng(inner_mhc_post_forward, layer.config)
     )
     forward_funcs = [
         attn_func,

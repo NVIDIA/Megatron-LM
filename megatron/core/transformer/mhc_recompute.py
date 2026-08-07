@@ -44,22 +44,18 @@ def uses_mhc_recompute_attn_cuda_graph_split(config) -> bool:
 class MHCRecomputePhase(IntEnum):
     """Backward consumer barriers in EP 1F1B execution order.
 
-    ``BEFORE_MLP_BWD`` has no producer today: the schedule recomputes the whole
-    group at ``BEFORE_COMBINE_BWD``. It is named here so that the phase ordering
-    is the real backward order, which is what a later dependency partitioning
-    would split on (see ``CheckpointManager.recompute_until``); until then
-    nothing constructs it and the middle barrier is intentionally unreachable.
+    Only ``BEFORE_COMBINE_BWD`` has a producer today -- ``add_checkpoint``
+    rejects anything else -- so ``recompute_until``'s filter currently admits
+    every checkpoint whatever phase it is asked for.
 
     TODO: partition checkpoints across phases so ``recompute_until`` replays only
-    what each barrier needs. Until that lands, this member and the
-    ``recompute_phase`` parameter on ``CheckpointWithoutOutput`` are placeholders
-    with no runtime effect -- every checkpoint sits at ``BEFORE_COMBINE_BWD``, so
-    both ``recompute_until`` call sites replay the whole group.
+    what each barrier needs, and add the intermediate ``BEFORE_MLP_BWD`` barrier
+    in the same change. Members are deliberately not declared ahead of a producer:
+    an unconstructible enum member invites comparisons that can never be true.
     """
 
     BEFORE_COMBINE_BWD = 0
-    BEFORE_MLP_BWD = 1
-    BEFORE_ATTN_BWD = 2
+    BEFORE_ATTN_BWD = 1
 
 
 @dataclass(frozen=True)
@@ -139,7 +135,6 @@ class MHCRecomputeArena:
 
     def __init__(self):
         self._slots: Dict[Hashable, MHCRecomputeArenaSlot] = {}
-        self._order: list[Hashable] = []
 
     def bind_external_slot(self, key: Hashable, tensor: Tensor) -> MHCRecomputeArenaSlot:
         """Bind a captured input view, preserving deterministic registration order."""
@@ -155,13 +150,17 @@ class MHCRecomputeArena:
 
         slot = MHCRecomputeArenaSlot(key, tensor)
         self._slots[key] = slot
-        self._order.append(key)
         return slot
 
     @property
     def slots(self) -> Tuple[MHCRecomputeArenaSlot, ...]:
-        """Return slots in producer registration order."""
-        return tuple(self._slots[key] for key in self._order)
+        """Return slots in producer registration order.
+
+        Dict insertion order is the registration order (guaranteed since 3.7), so
+        no parallel list is kept: two structures that must stay in lockstep are a
+        liability on an arena whose whole job is fixed addresses.
+        """
+        return tuple(self._slots.values())
 
     def validate_addresses(self) -> None:
         """Validate every slot before a phase barrier reuses it."""
