@@ -1057,6 +1057,12 @@ class LLaVAModel(MegatronModule):
                 chunks = torch.split(image_embeddings.squeeze(0), seq_lens, dim=0)
                 if self._drop_vision_class_token and ct_len > 0:
                     chunks = [c[ct_len:] for c in chunks]
+                if self._pixel_shuffle:
+                    chunks = _pixel_shuffle_dynamic_resolution_chunks(
+                        chunks,
+                        sizes_iter,
+                        self.vision_model.patch_dim,
+                    )
                 image_embeddings = torch.stack(chunks)  # [num_tubelets, patches, h_vision]
 
                 # Gather per-rank tubelet embeddings back to the full set so the
@@ -1067,11 +1073,15 @@ class LLaVAModel(MegatronModule):
                         image_embeddings, num_padded_imgs
                     )
 
-                # After temporal grouping each tubelet is one "tile" for LLaVAModel's
-                # _preprocess_data; one entry per post-grouping image (images have 1 frame,
-                # videos contribute ceil(nf/T) tubelets).
-                num_image_tiles = torch.ones(
-                    image_embeddings.shape[0], dtype=torch.int, device=image_embeddings.device
+                # Dynamic-resolution tubelets can have a different token count than
+                # ``self.img_seq_len``. Treat each output token as a packed tile so
+                # _preprocess_data expands every placeholder by the actual count.
+                is_packed_dynamic_res = True
+                num_image_tiles = torch.full(
+                    (image_embeddings.shape[0],),
+                    image_embeddings.shape[1],
+                    dtype=torch.int,
+                    device=image_embeddings.device,
                 )
             else:
                 # Packed dynamic-resolution image path: imgs_sizes carries per-image
@@ -1105,17 +1115,12 @@ class LLaVAModel(MegatronModule):
                         chunks = [c[ct_len:] for c in chunks]
 
                     if self._pixel_shuffle:
-                        shuffled_chunks = []
-                        for chunk, (h, w) in zip(chunks, sizes):
-                            ps_h, ps_w = int(h) // P, int(w) // P
-                            chunk_b = chunk.unsqueeze(0)  # [1, patches_i, h_vision]
-                            shuffled = pixel_shuffle(chunk_b, h=ps_h, w=ps_w)
-                            shuffled_chunks.append(shuffled.squeeze(0))
-                        cat = torch.cat(shuffled_chunks, dim=0)
+                        chunks = _pixel_shuffle_dynamic_resolution_chunks(chunks, sizes, P)
+                        cat = torch.cat(chunks, dim=0)
                     else:
                         cat = torch.cat(list(chunks), dim=0)
                     image_embeddings = cat.unsqueeze(0).contiguous()
-                    _tile_counts = [p // 4 if self._pixel_shuffle else p for p in patch_counts]
+                    _tile_counts = [chunk.shape[0] for chunk in chunks]
                     num_image_tiles = torch.tensor(
                         _tile_counts, dtype=torch.int, device=image_embeddings.device
                     )
@@ -1137,7 +1142,7 @@ class LLaVAModel(MegatronModule):
 
             # Packed dynamic-res path already pixel-shuffled per-image above; skip outer call.
             # For the single-image (non-packed) case pass h/w from imgs_sizes if available.
-            skip_outer_pixel_shuffle = (not use_temporal) and is_packed_dynamic_res
+            skip_outer_pixel_shuffle = is_packed_dynamic_res
             if self._pixel_shuffle and not skip_outer_pixel_shuffle:
                 ps_h = ps_w = None
                 if (
@@ -1328,6 +1333,25 @@ def _load_state_dict_hook_ignore_extra_state(
 # pylint: disable-next=line-too-long
 # Based on https://github.com/OpenGVLab/InternVL/blob/c7c5af1a8930b4862afe8ed14672307082ef61fa/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py#L218
 # Copyright (c) 2023 OpenGVLab.
+def _pixel_shuffle_dynamic_resolution_chunks(chunks, image_sizes, patch_dim):
+    """Pixel-shuffle dynamic-resolution image chunks using their real patch grids."""
+    assert len(chunks) == len(image_sizes), (
+        "each image chunk requires a matching image size"
+    )
+
+    shuffled_chunks = []
+    for chunk, (height, width) in zip(chunks, image_sizes):
+        patch_height = int(height) // int(patch_dim)
+        patch_width = int(width) // int(patch_dim)
+        shuffled = pixel_shuffle(
+            chunk.unsqueeze(0),
+            h=patch_height,
+            w=patch_width,
+        )
+        shuffled_chunks.append(shuffled.squeeze(0))
+    return shuffled_chunks
+
+
 def pixel_shuffle(x, scale_factor=0.5, version=2, h=None, w=None):
     """Pixel shuffle based on InternVL but adapted for our use case.
 
@@ -1344,8 +1368,25 @@ def pixel_shuffle(x, scale_factor=0.5, version=2, h=None, w=None):
         assert h is not None and w is not None, "h and w must both be provided"
         assert h * w == x.shape[1], f"h*w ({h}*{w}={h*w}) must equal patches ({x.shape[1]})"
         r = int(1 / scale_factor)
-        n, patches, c = x.shape
-        return x.reshape(n, patches // (r * r), c * r * r)
+        assert h % r == 0 and w % r == 0, (
+            f"h and w ({h}, {w}) must both be divisible by {r}"
+        )
+        x = x.reshape(x.shape[0], h, w, -1)
+
+        n, h, w, c = x.size()
+        x = x.view(n, h, int(w * scale_factor), int(c / scale_factor))
+        x = x.permute(0, 2, 1, 3).contiguous()
+        x = x.view(
+            n,
+            int(w * scale_factor),
+            int(h * scale_factor),
+            int(c / (scale_factor * scale_factor)),
+        )
+
+        if version == 2:
+            x = x.permute(0, 2, 1, 3).contiguous()
+
+        return x.reshape(x.shape[0], -1, x.shape[-1])
     h = w = int(x.shape[1] ** 0.5)  # sq
     x = x.reshape(x.shape[0], h, w, -1)  # [num_tiles, sq, sq, h_vision]
 

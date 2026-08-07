@@ -290,12 +290,33 @@ class TestPixelShuffleNonSquare:
     def test_non_square_h_w_required_for_dynamic_res(self):
         from megatron.core.models.multimodal.llava_model import pixel_shuffle
 
-        # 12 patches arranged as 3×4 (non-square). With h, w supplied the
-        # function must accept this and produce the shuffled output.
+        # An even 4x6 grid must group each spatial 2x2 neighborhood, not just
+        # reshape every four consecutive flattened patches together.
+        x = torch.arange(24, dtype=torch.float32).reshape(1, 24, 1)
+        out = pixel_shuffle(x, h=4, w=6)
+
+        expected = torch.tensor(
+            [
+                [
+                    [0, 1, 6, 7],
+                    [2, 3, 8, 9],
+                    [4, 5, 10, 11],
+                    [12, 13, 18, 19],
+                    [14, 15, 20, 21],
+                    [16, 17, 22, 23],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(out, expected)
+
+    @pytest.mark.internal
+    def test_non_square_h_w_must_be_even(self):
+        from megatron.core.models.multimodal.llava_model import pixel_shuffle
+
         x = torch.randn(1, 12, 4)
-        out = pixel_shuffle(x, h=3, w=4)
-        # scale=0.5 ⇒ each spatial dim halves ⇒ output area = (3*4)/(2*2) = 3.
-        assert out.shape == (1, 3, 16)
+        with pytest.raises(AssertionError, match="must both be divisible"):
+            pixel_shuffle(x, h=3, w=4)
 
     @pytest.mark.internal
     def test_h_w_mismatch_raises(self):
@@ -305,6 +326,24 @@ class TestPixelShuffleNonSquare:
         # Mismatch: h*w != patches.
         with pytest.raises(AssertionError):
             pixel_shuffle(x, h=2, w=2)
+
+    @pytest.mark.internal
+    def test_dynamic_resolution_video_chunks_use_their_non_square_grids(self):
+        from megatron.core.models.multimodal.llava_model import (
+            _pixel_shuffle_dynamic_resolution_chunks,
+        )
+
+        # The video validation path produces 448x576 frames: 28x36=1008 patches.
+        # Applying square-only pixel shuffle tries to reshape these as 31x31.
+        chunks = [torch.randn(1008, 8) for _ in range(16)]
+        shuffled = _pixel_shuffle_dynamic_resolution_chunks(
+            chunks,
+            [(448, 576)] * 16,
+            patch_dim=16,
+        )
+
+        assert len(shuffled) == 16
+        assert all(chunk.shape == (252, 32) for chunk in shuffled)
 
 
 class TestRADIODynamicResAndTemporal:
