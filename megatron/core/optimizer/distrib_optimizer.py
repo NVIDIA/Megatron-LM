@@ -2970,6 +2970,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             expanded_shard_fp32_from_fp8,
             expanded_shard_offsets_in_fp8,
             self.data_parallel_group,
+            preserve_columnwise=self.ddp_config.preserve_fp8_columnwise,
         )
 
         # Utility method for copying group params.
@@ -3491,7 +3492,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 expanded_offsets.extend(expanded_starts)
 
             quantize_param_shard(
-                model_params, expanded_shard_main_params, expanded_offsets, self.data_parallel_group
+                model_params,
+                expanded_shard_main_params,
+                expanded_offsets,
+                self.data_parallel_group,
+                preserve_columnwise=self.ddp_config.preserve_fp8_columnwise,
             )
 
             self._state_offloader.offload_initialized_states_for_params(

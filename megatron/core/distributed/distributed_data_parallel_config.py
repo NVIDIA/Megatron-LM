@@ -85,6 +85,10 @@ class DistributedDataParallelConfig:
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
 
+    preserve_fp8_columnwise: bool = True
+    """If true, preserve FP8 columnwise parameter storage across optimizer updates.
+       This is required when the parameter all-gather is captured by a CUDA graph."""
+
     fp4_param_gather: bool = False
     """If true, keep the compute param in fp4 (do not use any other intermediate dtype) and
        perform the param all-gather in fp4."""

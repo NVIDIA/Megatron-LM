@@ -330,7 +330,11 @@ class _ParamAndGradBucketGroup:
         quantized_params = []
         for bucket in self.buckets:
             for param in bucket.params:
-                if _param_uses_quantized_storage(param):
+                if (
+                    is_nvfp4tensor(param)
+                    or is_grouped_tensor_with_quantized_storage(param)
+                    or (self.ddp_config.preserve_fp8_columnwise and is_float8tensor(param))
+                ):
                     quantized_params.append(param)
         if len(quantized_params) > 0:
             post_all_gather_processing(quantized_params)

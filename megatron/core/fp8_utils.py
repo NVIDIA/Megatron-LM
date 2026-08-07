@@ -386,6 +386,7 @@ if HAVE_TE and is_te_min_version("2.2"):
         start_offsets: List[int],
         data_parallel_group: torch.distributed.ProcessGroup,
         fsdp_shard_model_params: Optional[List[torch.Tensor]] = None,
+        preserve_columnwise: bool = True,
     ) -> None:
         if len(model_params) == 0:
             return
@@ -409,7 +410,7 @@ if HAVE_TE and is_te_min_version("2.2"):
         # columnwise data and manually call post_all_gather_processing after all-gather, this
         # makes fp8 params compatible with CUDA graph.
         kwargs = {}
-        if te_post_all_gather_processing is not None:
+        if preserve_columnwise and te_post_all_gather_processing is not None:
             kwargs["manual_post_all_gather_processing"] = True
 
         cast_master_weights_to_fp8(*args, **kwargs)
@@ -437,6 +438,7 @@ elif HAVE_TE and is_te_min_version("2.0"):
         start_offsets: List[int],
         data_parallel_group: torch.distributed.ProcessGroup,
         fsdp_shard_model_params: Optional[List[torch.Tensor]] = None,
+        preserve_columnwise: bool = True,
     ) -> None:
         # Avoid circular import
         from megatron.core.optimizer.optimizer import _multi_tensor_copy_this_to_that
@@ -527,6 +529,7 @@ elif HAVE_TE and is_te_min_version("1.0"):
         start_offsets: List[int],
         data_parallel_group: torch.distributed.ProcessGroup,
         fsdp_shard_model_params: Optional[List[torch.Tensor]] = None,
+        preserve_columnwise: bool = True,
     ) -> None:
         # Avoid circular import
         from megatron.core.optimizer.optimizer import _multi_tensor_copy_this_to_that
@@ -632,11 +635,21 @@ def modify_underlying_storage(tensor: torch.Tensor, new_raw_data: torch.Tensor):
 
 # Interface Function
 def quantize_param_shard(
-    model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
+    model_params,
+    main_params,
+    start_offsets,
+    data_parallel_group,
+    fsdp_shard_model_params=None,
+    preserve_columnwise=True,
 ):
     """Cast shard fp32 main params to fp8 model params."""
     _quantize_param_shard_impl(
-        model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params
+        model_params,
+        main_params,
+        start_offsets,
+        data_parallel_group,
+        fsdp_shard_model_params,
+        preserve_columnwise,
     )
 
 

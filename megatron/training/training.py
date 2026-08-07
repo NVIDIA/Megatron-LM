@@ -2343,6 +2343,9 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
             args.ddp_param_name_patterns_for_fp32_local_accumulation
         )
         kwargs["average_in_collective"] = args.ddp_average_in_collective
+        kwargs["preserve_fp8_columnwise"] = (
+            args.cuda_graph_impl != "none" or args.optimizer_cuda_graph
+        )
         # Megatron-FSDP arguments.
         kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
         kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
