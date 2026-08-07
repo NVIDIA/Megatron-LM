@@ -29,6 +29,8 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
+
 # ---------------------------------------------------------------------------
 # Lazy kernel imports
 # ---------------------------------------------------------------------------
@@ -412,6 +414,86 @@ def _compute_dense_csa_teacher_lse(
         )
 
     return torch.logaddexp(non_compressed_lse.detach().float(), compressed_lse)
+
+
+@torch.no_grad()
+def _compute_full_csa_teacher_lse(
+    query: Tensor,
+    query_flat: Tensor,
+    full_kv_flat: Tensor,
+    compressed_kv: Tensor,
+    attn_sink: Tensor,
+    window_indices: Tensor,
+    softmax_scale: float,
+    ratio: int,
+    *,
+    cu_seqlens_q: Optional[Tensor] = None,
+    cu_seqlens_kv: Optional[Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_kv: Optional[int] = None,
+    q_causal_offsets: Optional[Tensor] = None,
+) -> Tensor:
+    """Return the full CSA teacher LSE through Triton or the eager reference.
+
+    The Triton path streams both key domains through online reductions and
+    emits only the per-row/per-head LSE. Unsupported layouts and dtypes retain
+    the eager implementation as a correctness fallback.
+    """
+    if can_use_fused_csa_teacher_lse(
+        query_flat, full_kv_flat, compressed_kv, attn_sink, window_indices
+    ):
+        if query.ndim == 4:
+            batch, seqlen_q = query.shape[:2]
+            return fused_csa_teacher_lse(
+                query_flat,
+                full_kv_flat,
+                compressed_kv,
+                attn_sink,
+                window_indices,
+                softmax_scale,
+                ratio,
+                batch_size=batch,
+                seqlen_q=seqlen_q,
+            )
+        return fused_csa_teacher_lse(
+            query_flat,
+            full_kv_flat,
+            compressed_kv,
+            attn_sink,
+            window_indices,
+            softmax_scale,
+            ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_kv,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_kv,
+            q_causal_offsets=q_causal_offsets,
+        )
+
+    non_compressed_lse_flat = _compute_csa_non_compressed_lse(
+        query_flat, full_kv_flat, attn_sink, window_indices, softmax_scale
+    )
+    if query.ndim == 4:
+        batch, seqlen_q, num_heads = query.shape[:3]
+        non_compressed_lse = (
+            non_compressed_lse_flat.reshape(seqlen_q, batch, num_heads)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
+    else:
+        non_compressed_lse = non_compressed_lse_flat
+    return _compute_dense_csa_teacher_lse(
+        query,
+        compressed_kv,
+        non_compressed_lse,
+        softmax_scale,
+        ratio,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
+        q_causal_offsets=q_causal_offsets,
+    )
 
 
 def local_to_global_flat(
@@ -1487,19 +1569,13 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                     max_seqlen_q=int(max_seqlen_q),
                     max_seqlen_kv=int(max_seqlen_compressed_idx),
                 )
-            non_compressed_lse_flat = _compute_csa_non_compressed_lse(
-                q_flat, kv_flat, attn_sink, global_idxs[:, indexer_topk:], softmax_scale
-            )
-            if is_thd:
-                non_compressed_lse = non_compressed_lse_flat
-            else:
-                non_compressed_lse = (
-                    non_compressed_lse_flat.reshape(sq, b, np_).permute(1, 0, 2).contiguous()
-                )
-            dense_teacher_lse = _compute_dense_csa_teacher_lse(
+            dense_teacher_lse = _compute_full_csa_teacher_lse(
                 q_attn_det,
+                q_flat,
+                kv_flat,
                 k_attn_compressed_det,
-                non_compressed_lse,
+                attn_sink,
+                global_idxs[:, indexer_topk:],
                 softmax_scale,
                 ratio,
                 **dense_attn_kwargs,
@@ -1871,13 +1947,13 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             if q_padding_mask is not None:
                 index_score = index_score.masked_fill(q_padding_mask.unsqueeze(-1), float("-inf"))
                 index_lse = index_lse.masked_fill(q_padding_mask, float("-inf"))
-            non_compressed_lse = _compute_csa_non_compressed_lse(
-                query, kv_full, attn_sink, topk_idxs[:, indexer_topk:], softmax_scale
-            )
-            dense_teacher_lse = _compute_dense_csa_teacher_lse(
+            dense_teacher_lse = _compute_full_csa_teacher_lse(
                 query.detach(),
+                query,
+                kv_full,
                 compressed_kv.detach(),
-                non_compressed_lse,
+                attn_sink,
+                topk_idxs[:, indexer_topk:],
                 softmax_scale,
                 ratio,
                 cu_seqlens_q=cu_seqlens_q,
