@@ -50,6 +50,10 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sp
     indexer_topk,
     local_to_global_flat,
 )
+from megatron.core.transformer.experimental_attention_variant.csa_teacher_lse import (
+    can_use_fused_csa_teacher_lse,
+    fused_csa_teacher_lse,
+)
 
 # ---------------------------------------------------------------------------
 # Test fixtures / helpers
@@ -320,6 +324,154 @@ class TestCsaTeacherLse:
             query, kv_full, sink, all_invalid, softmax_scale=0.5
         )
         torch.testing.assert_close(sink_only, sink.view(1, -1).expand_as(sink_only))
+
+
+class TestFusedCsaTeacherLse:
+    """Triton online-LSE kernels match the score-matrix reference."""
+
+    @staticmethod
+    def _require_kernel(query, full_kv, compressed_kv, sink, window_indices):
+        if not can_use_fused_csa_teacher_lse(query, full_kv, compressed_kv, sink, window_indices):
+            pytest.skip("Triton CSA teacher-LSE kernel is unavailable")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_sbhd_matches_eager_reference(self):
+        torch.manual_seed(123)
+        device = "cuda"
+        seqlen_q, batch, num_heads, head_dim = 17, 2, 16, 32
+        seqlen_full, seqlen_compressed, window_width, ratio = 23, 9, 5, 3
+        scale = head_dim**-0.5
+
+        query = torch.randn(
+            seqlen_q, batch, num_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        full_kv = torch.randn(seqlen_full, batch, head_dim, device=device, dtype=torch.bfloat16)
+        compressed_kv = torch.randn(
+            batch, seqlen_compressed, head_dim, device=device, dtype=torch.bfloat16
+        )
+        sink = torch.randn(num_heads, device=device, dtype=torch.float32)
+        window_local = torch.randint(
+            0, seqlen_full, (batch, seqlen_q, window_width), device=device, dtype=torch.int32
+        )
+        window_local[:, ::4, -1] = -1
+        window_global = local_to_global_flat(window_local, batch)
+        query_flat = query.reshape(seqlen_q * batch, num_heads, head_dim)
+        full_kv_flat = full_kv.reshape(seqlen_full * batch, head_dim)
+        self._require_kernel(query_flat, full_kv_flat, compressed_kv, sink, window_global)
+
+        actual = fused_csa_teacher_lse(
+            query_flat,
+            full_kv_flat,
+            compressed_kv,
+            sink,
+            window_global,
+            scale,
+            ratio,
+            batch_size=batch,
+            seqlen_q=seqlen_q,
+        )
+
+        non_compressed = _compute_csa_non_compressed_lse(
+            query_flat, full_kv_flat, sink, window_global, scale
+        )
+        non_compressed = (
+            non_compressed.reshape(seqlen_q, batch, num_heads).permute(1, 0, 2).contiguous()
+        )
+        expected = _compute_dense_csa_teacher_lse(
+            query.permute(1, 0, 2, 3).contiguous(), compressed_kv, non_compressed, scale, ratio
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
+
+        empty_window = window_global[:, :0]
+        sink_lse = sink.view(1, 1, num_heads).expand(batch, seqlen_q, num_heads)
+        sink_and_compressed_expected = _compute_dense_csa_teacher_lse(
+            query.permute(1, 0, 2, 3).contiguous(), compressed_kv, sink_lse, scale, ratio
+        )
+        sink_and_compressed_actual = fused_csa_teacher_lse(
+            query_flat,
+            full_kv_flat,
+            compressed_kv,
+            sink,
+            empty_window,
+            scale,
+            ratio,
+            batch_size=batch,
+            seqlen_q=seqlen_q,
+        )
+        torch.testing.assert_close(
+            sink_and_compressed_actual, sink_and_compressed_expected, atol=2e-2, rtol=1e-2
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_matches_eager_reference_with_offsets(self):
+        torch.manual_seed(456)
+        device = "cuda"
+        query_lengths = [5, 7]
+        full_kv_lengths = [8, 10]
+        compressed_lengths = [3, 4]
+        num_heads, head_dim, window_width, ratio = 16, 32, 4, 2
+        total_q = sum(query_lengths)
+        scale = head_dim**-0.5
+
+        query = torch.randn(total_q, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+        full_kv = torch.randn(sum(full_kv_lengths), head_dim, device=device, dtype=torch.bfloat16)
+        compressed_kv = torch.randn(
+            sum(compressed_lengths), head_dim, device=device, dtype=torch.bfloat16
+        )
+        sink = torch.randn(num_heads, device=device, dtype=torch.float32)
+        cu_q = _make_cu_seqlens(query_lengths, device=device)
+        cu_full = _make_cu_seqlens(full_kv_lengths, device=device)
+        cu_compressed = _make_cu_seqlens(compressed_lengths, device=device)
+        q_offsets = torch.tensor([1, 0], device=device, dtype=torch.int32)
+
+        window_global = torch.empty(total_q, window_width, device=device, dtype=torch.int32)
+        query_start = 0
+        for sequence, query_length in enumerate(query_lengths):
+            local = torch.randint(
+                0,
+                full_kv_lengths[sequence],
+                (query_length, window_width),
+                device=device,
+                dtype=torch.int32,
+            )
+            window_global[query_start : query_start + query_length] = local + cu_full[sequence]
+            query_start += query_length
+        window_global[::3, -1] = -1
+        self._require_kernel(query, full_kv, compressed_kv, sink, window_global)
+
+        actual = fused_csa_teacher_lse(
+            query,
+            full_kv,
+            compressed_kv,
+            sink,
+            window_global,
+            scale,
+            ratio,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_compressed,
+            max_seqlen_q=max(query_lengths),
+            max_seqlen_k=max(compressed_lengths),
+            q_causal_offsets=q_offsets,
+        )
+
+        non_compressed = _compute_csa_non_compressed_lse(query, full_kv, sink, window_global, scale)
+        expected = _compute_dense_csa_teacher_lse(
+            query,
+            compressed_kv,
+            non_compressed,
+            scale,
+            ratio,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_compressed,
+            max_seqlen_q=max(query_lengths),
+            max_seqlen_kv=max(compressed_lengths),
+            q_causal_offsets=q_offsets,
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
+
+
+class TestDenseCsaTeacherLseReference:
+    """Eager compressed-key LSE reference for SBHD and THD."""
 
     def test_dense_sbhd_lse_adds_every_causal_compressed_key(self):
         query = torch.tensor(
@@ -1560,7 +1712,7 @@ class TestDenseFusedIndexerSparseAttn:
             del args, kwargs
             return expected_teacher_lse
 
-        monkeypatch.setattr(dk, '_compute_dense_csa_teacher_lse', fake_dense_teacher_lse)
+        monkeypatch.setattr(dk, '_compute_full_csa_teacher_lse', fake_dense_teacher_lse)
 
         # ---- (a) forward kernel selection + arg shapes -------------------
         inputs_a = self._make_inputs()
