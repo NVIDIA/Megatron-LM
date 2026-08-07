@@ -33,7 +33,6 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
-    reduce_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.attention import Attention, LinearProjBuilder
@@ -73,7 +72,6 @@ if HAVE_TE:
         mxfp8_quantize_only,
         mxfp8_transpose_swizzle,
     )
-    from transformer_engine.pytorch.cpp_extensions import general_gemm
     from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
@@ -99,7 +97,6 @@ else:
         FusedMLAQUpProjRopeQuant,
         mxfp8_quantize_only,
         mxfp8_transpose_swizzle,
-        general_gemm,
         QuantizedTensor,
         MXFP8Quantizer,
     ) = (None, None, None, None, None, None, None, None, None, None, None, None, None, None)
@@ -187,105 +184,18 @@ class _FusedMLAQUpProjFunction(torch.autograd.Function):
         # grad w.r.t. the (pre-RoPE) up-proj GEMM output; bf16.
         dq2d = dq3.reshape(tokens, nh * q_head_dim).contiguous()
 
-        # Dispatch the adjoints on the projection precision (== forward kernel), inferred from w_q:
-        # QuantizedTensor -> fp8 projection (mxfp8in); plain bf16 tensor
-        #                                -> 16-bit projection (bf16in).
-        if isinstance(w_q, QuantizedTensor):
-            # FP8 projection: fp8 adjoints via TE general_gemm
-            # x_saved is the columnwise MXFP8 activation
-            # split_accumulator=True matches the MXFP8 recipe default for grad GEMMs.
-            grad_output_quantizer = MXFP8Quantizer(
-                fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True
-            )
-            # Pre-swizzle the grad-output scales at cast time, so general_gemm's in-GEMM swizzle
-            # is a no-op (avoids the extra cast_only + standalone row/col swizzle). Layout only,
-            # no effect on numerics.
-            grad_output_quantizer.optimize_for_gemm = True
-            gy = grad_output_quantizer(dq2d)  # MXFP8: rowwise (dgrad) + columnwise (wgrad)
-
-            w_q.update_usage(rowwise_usage=True, columnwise_usage=True)
-
-            # dgrad: grad_input = grad_output @ weight
-            # (A=weight[colwise], B=grad_output[rowwise], NN)
-            grad_x = general_gemm(
-                w_q, gy, layout="NN", grad=True, out_dtype=act_dtype, use_split_accumulator=True
-            )[0].reshape(s, b, -1)
-
-            # wgrad: grad_weight = grad_output^T @ input
-            # (A=input[colwise], B=grad_output[colwise], NT)
-            if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
-                if ctx.fuse_wgrad_accumulation and hasattr(w_q, "main_grad"):
-
-                    def _wgrad(x_, gy_):
-                        # Accumulate the fp8 wgrad directly into fp32 main_grad (out=main_grad,
-                        # accumulate=True), exactly as TE's fused-wgrad path does.
-                        general_gemm(
-                            x_,
-                            gy_,
-                            layout="NT",
-                            grad=True,
-                            out=w_q.main_grad,
-                            out_dtype=w_q.main_grad.dtype,
-                            accumulate=True,
-                            use_split_accumulator=True,
-                        )
-                        return w_q.main_grad, None
-
-                    ctx.wgrad_store.put([x_saved, gy], _wgrad)
-                    if hasattr(w_q, "grad_added_to_main_grad"):
-                        w_q.grad_added_to_main_grad = True
-                    ret_grad_w = torch.empty_like(w_q)  # dummy; discarded by the reduce hook
-                else:
-                    ctx.wgrad_store.put(
-                        [x_saved, gy],
-                        lambda x_, gy_: (
-                            general_gemm(
-                                x_,
-                                gy_,
-                                layout="NT",
-                                grad=True,
-                                out_dtype=act_dtype,
-                                use_split_accumulator=True,
-                            )[0],
-                            None,
-                        ),
-                    )
-                    ret_grad_w = None
-            else:
-                ret_grad_w = general_gemm(
-                    x_saved,
-                    gy,
-                    layout="NT",
-                    grad=True,
-                    out_dtype=act_dtype,
-                    use_split_accumulator=True,
-                )[0]
-        else:
-            # === 16-bit projection: bf16 adjoints, matching the unfused bf16 up-proj backward.
-            #     x_saved and w_q are bf16. ===
-            grad_x = (dq2d @ w_q).reshape(s, b, -1)  # [s, b, q_lora], bf16
-
-            if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
-                if ctx.fuse_wgrad_accumulation and hasattr(w_q, "main_grad"):
-
-                    def _wgrad(dq2d_, x_):
-                        w_q.main_grad.add_(
-                            (dq2d_.t() @ x_).to(w_q.main_grad.dtype).reshape(w_q.main_grad.shape)
-                        )
-                        return w_q.main_grad, None
-
-                    ctx.wgrad_store.put([dq2d, x_saved], _wgrad)
-                    if hasattr(w_q, "grad_added_to_main_grad"):
-                        w_q.grad_added_to_main_grad = True
-                    ret_grad_w = torch.empty_like(w_q)  # dummy; discarded by the reduce hook
-                else:
-                    ctx.wgrad_store.put([dq2d, x_saved], lambda dq_, x_: (dq_.t() @ x_, None))
-                    ret_grad_w = None
-            else:
-                ret_grad_w = dq2d.t() @ x_saved  # [nh*q_head_dim, q_lora], bf16
-
-        if get_pg_size(ctx.tp_group) > 1 and not ctx.sequence_parallel:
-            grad_x = reduce_from_tensor_model_parallel_region(grad_x, group=ctx.tp_group)
+        # Delegate the projection backward to TE's _linear_backward (via backward_linear)
+        grad_x, ret_grad_w = FusedMLAQUpProjRopeQuant.backward_linear(
+            grad_output=dq2d,
+            x_saved=x_saved,
+            w_q=w_q,
+            act_dtype=act_dtype,
+            wgrad_store=ctx.wgrad_store,
+            fuse_wgrad_accumulation=ctx.fuse_wgrad_accumulation,
+            tp_group=ctx.tp_group,
+            sequence_parallel=ctx.sequence_parallel,
+        )
+        grad_x = grad_x.reshape(s, b, -1)
 
         # grads for: q_normed, w_q, cos, sin, then 10 non-tensor args
         # (including tp_group, sequence_parallel)
