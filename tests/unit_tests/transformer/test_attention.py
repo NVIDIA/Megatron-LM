@@ -10,11 +10,11 @@ from packaging import version
 from torch.nn import functional as F
 
 import megatron.core.parallel_state as parallel_state
-from megatron.core.context_parallel_layout import get_thd_context_parallel_rank_indices
-from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.common.embeddings.rope_utils import (
-    get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
+from megatron.core.context_parallel_layout import (
+    get_context_parallel_layout_chunk_indices,
+    get_thd_context_parallel_rank_indices,
 )
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -847,9 +847,16 @@ def _test_parallel_attention_correctness(
                     )
                     tensor = tensor.index_select(0, index)
             elif cp > 1:
-                tensor = get_tensor_on_this_cp_rank(
-                    tensor, 0, cp_group, cp_partition_mode=cp_partition_mode
+                cp_rank = torch.distributed.get_rank(cp_group)
+                cp_idx = get_context_parallel_layout_chunk_indices(
+                    cp, cp_rank, cp_partition_mode
+                ).to(device=tensor.device)
+                tensor = tensor.view(
+                    2 * cp,
+                    -1,
+                    *tensor.shape[1:],
                 )
+                tensor = tensor.index_select(0, cp_idx).view(-1, *tensor.shape[2:])
             if tp > 1 and sp:
                 sp_seg = tensor.shape[0] // tp
                 tensor = tensor[tp_rank * sp_seg : (tp_rank + 1) * sp_seg]

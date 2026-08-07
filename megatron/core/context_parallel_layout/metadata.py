@@ -26,17 +26,6 @@ def get_packed_seq_params_cp_partition_cu_seqlens(
     )
 
 
-def is_cp_rank_local_rotary_pos_emb(packed_seq_params: Optional[Any]) -> bool:
-    """Return whether RoPE tensors are already sliced to the current CP rank.
-
-    THD RoPE frequency tables stay in global packed-token order and the apply
-    path indexes them with packed metadata. SBHD/non-packed RoPE tensors are
-    generated as rank-local sequence tensors, so block/model layout transitions
-    must convert them together with other rank-local sequence tensors.
-    """
-    return getattr(packed_seq_params, "qkv_format", None) != "thd"
-
-
 def replace_packed_seq_params_cp_partition_mode(
     packed_seq_params: Optional[Any], cp_partition_mode: Optional[CpPartitionMode]
 ) -> Optional[Any]:

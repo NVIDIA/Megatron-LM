@@ -594,7 +594,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         current_partition_mode: CpPartitionMode,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor],
-        rotary_pos_emb,
         attention_bias: Optional[Tensor],
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
@@ -604,9 +603,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         """Convert per-token tensors to the layout preferred by one local layer."""
         cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
         if cp_group is None or cp_group.size() <= 1:
-            return hidden_states, rotary_pos_emb, padding_mask, input_ids
+            return hidden_states, padding_mask, input_ids
         if preferred_partition_mode is None or preferred_partition_mode == current_partition_mode:
-            return hidden_states, rotary_pos_emb, padding_mask, input_ids
+            return hidden_states, padding_mask, input_ids
 
         current_to_preferred_converter = CpPartitionModeConverter(
             cp_group=cp_group,
@@ -616,7 +615,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             tp_group=self.pg_collection.tp,
         )
         if not current_to_preferred_converter.conversion_needed:
-            return hidden_states, rotary_pos_emb, padding_mask, input_ids
+            return hidden_states, padding_mask, input_ids
 
         current_to_preferred_converter.assert_no_dense_attention_inputs(
             attention_mask=attention_mask,
@@ -628,9 +627,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             seq_dim=0,
             sequence_parallel=self.config.sequence_parallel,
         )
-        rotary_pos_emb = current_to_preferred_converter.convert_rank_local_rotary(
-            rotary_pos_emb, seq_dim=0
-        )
+        # Model-level rotary_pos_emb is only consumed by regular attention, whose
+        # CP layout preference is zigzag. MLA/CSA/DSv4-style variants must ignore
+        # external RoPE and manage any RoPE positions internally, so this layout
+        # edge intentionally does not convert rotary_pos_emb.
         if padding_mask is not None:
             padding_mask = current_to_preferred_converter.convert(
                 padding_mask,
@@ -643,7 +643,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 seq_dim=1,
             )
 
-        return hidden_states, rotary_pos_emb, padding_mask, input_ids
+        return hidden_states, padding_mask, input_ids
 
     def _checkpointed_forward(
         self,
@@ -731,9 +731,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         attention_bias=attention_bias,
                         hidden_states=hidden_states,
                     )
-                    rotary_pos_emb = chunk_entry_converter.convert_rank_local_rotary(
-                        rotary_pos_emb, seq_dim=0
-                    )
+                    # Checkpoint chunks may enter after earlier layers changed the
+                    # current CP layout. Re-align batch/token side tensors here, but
+                    # keep model-level RoPE in the regular-attention zigzag layout.
                     if padding_mask is not None:
                         padding_mask = chunk_entry_converter.convert(
                             padding_mask,
@@ -751,13 +751,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
                             layer, getattr(layer, "config", self.config)
                         )
-                        (hidden_states, rotary_pos_emb, padding_mask, local_input_ids) = (
+                        (hidden_states, padding_mask, local_input_ids) = (
                             self._convert_cp_partition_mode_for_layer(
                                 local_index=index,
                                 current_partition_mode=current_partition_mode,
                                 hidden_states=hidden_states,
                                 attention_mask=attention_mask,
-                                rotary_pos_emb=rotary_pos_emb,
                                 attention_bias=attention_bias,
                                 packed_seq_params=local_packed_seq_params,
                                 padding_mask=padding_mask,
@@ -1148,13 +1147,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
                             layer, getattr(layer, "config", self.config)
                         )
-                        (hidden_states, rotary_pos_emb, padding_mask, input_ids) = (
+                        (hidden_states, padding_mask, input_ids) = (
                             self._convert_cp_partition_mode_for_layer(
                                 local_index=l_no,
                                 current_partition_mode=current_partition_mode,
                                 hidden_states=hidden_states,
                                 attention_mask=attention_mask,
-                                rotary_pos_emb=rotary_pos_emb,
                                 attention_bias=attention_bias,
                                 packed_seq_params=packed_seq_params,
                                 padding_mask=padding_mask,

@@ -1369,13 +1369,11 @@ class Attention(MegatronModule, ABC):
             self.pg_collection.cp = packed_seq_params.cp_group
         (
             hidden_states,
-            rotary_pos_emb,
             packed_seq_params,
             back_to_input_converter,
         ) = convert_module_input_tensors_cp_partition_mode(
             hidden_states=hidden_states,
             key_value_states=key_value_states,
-            rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
             cp_group=self.pg_collection.cp,
             tp_group=self.pg_collection.tp,
@@ -1589,12 +1587,6 @@ class Attention(MegatronModule, ABC):
             not self.config.flash_decode or inference_context is None
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            cp_partition_mode = (
-                packed_seq_params.cp_partition_mode
-                if packed_seq_params is not None
-                and packed_seq_params.cp_partition_mode is not None
-                else self.get_preferred_cp_partition_mode()
-            )
 
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
                 if packed_seq_params.cu_seqlens_q_padded is not None:
@@ -1622,7 +1614,6 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
                             cp_group=self.pg_collection.cp,
-                            cp_partition_mode=cp_partition_mode,
                             max_seqlen=rope_max_seqlen_q,
                         )
                     else:
@@ -1642,7 +1633,6 @@ class Attention(MegatronModule, ABC):
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
                         cp_group=self.pg_collection.cp,
-                        cp_partition_mode=cp_partition_mode,
                         max_seqlen=rope_max_seqlen_kv,
                     )
             else:

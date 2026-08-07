@@ -9,7 +9,6 @@ import torch
 
 from megatron.core.context_parallel_layout.metadata import (
     get_packed_seq_params_cp_partition_cu_seqlens,
-    is_cp_rank_local_rotary_pos_emb,
 )
 from megatron.core.context_parallel_layout.routes import (
     _cp_layout_nvtx_range,
@@ -76,8 +75,8 @@ class CpPartitionModeConverter:
         """Convert a tensor or nested tensor container across this layout edge."""
         if not self.conversion_needed or value is None:
             return value
-        # Nested values may contain optional tensors or structured RoPE tuples;
-        # traverse containers while preserving their original shape.
+        # Nested values may contain optional tensors; traverse containers while
+        # preserving their original shape.
         if isinstance(value, tuple):
             return tuple(
                 self.convert(part, seq_dim=seq_dim, sequence_parallel=sequence_parallel)
@@ -108,17 +107,6 @@ class CpPartitionModeConverter:
             ),
         )
 
-    def convert_rank_local_rotary(
-        self,
-        rotary_pos_emb: Any,
-        *,
-        seq_dim: Union[int, Callable[[torch.Tensor], int]] = 0,
-    ) -> Any:
-        """Convert RoPE tensors only when they are already CP-rank local."""
-        if not is_cp_rank_local_rotary_pos_emb(self.packed_seq_params):
-            return rotary_pos_emb
-        return self.convert(rotary_pos_emb, seq_dim=seq_dim)
-
     def _raise_unsupported_dense_attention(
         self,
         tensor_name: str,
@@ -147,10 +135,8 @@ def convert_module_input_tensors_cp_partition_mode(
     attention_mask: Optional[torch.Tensor] = None,
     attention_bias: Optional[torch.Tensor] = None,
     key_value_states: Optional[torch.Tensor] = None,
-    rotary_pos_emb: Optional[Any] = None,
 ) -> Tuple[
     torch.Tensor,
-    Optional[Any],
     Optional[Any],
     Optional[CpPartitionModeConverter],
 ]:
@@ -162,7 +148,7 @@ def convert_module_input_tensors_cp_partition_mode(
     converted back to the original input layout.
     """
     if cp_group is None or cp_group.size() <= 1:
-        return hidden_states, rotary_pos_emb, packed_seq_params, None
+        return hidden_states, packed_seq_params, None
 
     source_partition_mode = getattr(packed_seq_params, "cp_partition_mode", None)
     if source_partition_mode is None:
@@ -171,7 +157,7 @@ def convert_module_input_tensors_cp_partition_mode(
             "conversion when context parallelism is active."
         )
     if source_partition_mode == target_partition_mode:
-        return hidden_states, rotary_pos_emb, packed_seq_params, None
+        return hidden_states, packed_seq_params, None
 
     input_to_target_converter = CpPartitionModeConverter(
         cp_group=cp_group,
@@ -195,9 +181,6 @@ def convert_module_input_tensors_cp_partition_mode(
         seq_dim=0,
         sequence_parallel=sequence_parallel,
     )
-    rotary_pos_emb = input_to_target_converter.convert_rank_local_rotary(
-        rotary_pos_emb, seq_dim=0
-    )
 
     local_packed_seq_params = packed_seq_params
     if packed_seq_params is not None:
@@ -212,7 +195,6 @@ def convert_module_input_tensors_cp_partition_mode(
     )
     return (
         hidden_states,
-        rotary_pos_emb,
         local_packed_seq_params,
         target_to_input_converter,
     )

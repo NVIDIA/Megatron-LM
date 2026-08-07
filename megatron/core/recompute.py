@@ -107,9 +107,9 @@ def checkpointed_forward(
                     attention_bias=attention_bias,
                     hidden_states=hidden_states,
                 )
-                rotary_pos_emb = chunk_entry_converter.convert_rank_local_rotary(
-                    rotary_pos_emb, seq_dim=0
-                )
+                # Checkpoint chunks may enter after earlier layers changed the
+                # current CP layout. Re-align batch/token side tensors here, but
+                # keep model-level RoPE in the regular-attention zigzag layout.
                 if padding_mask is not None:
                     padding_mask = chunk_entry_converter.convert(
                         padding_mask,
@@ -129,13 +129,12 @@ def checkpointed_forward(
                     preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
                         layer, getattr(layer, "config", self.config)
                     )
-                    (hidden_states, rotary_pos_emb, padding_mask, local_input_ids) = (
+                    (hidden_states, padding_mask, local_input_ids) = (
                         self._convert_cp_partition_mode_for_layer(
                             local_index=index,
                             current_partition_mode=current_partition_mode,
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
-                            rotary_pos_emb=rotary_pos_emb,
                             packed_seq_params=local_packed_seq_params,
                             padding_mask=padding_mask,
                             input_ids=local_input_ids,

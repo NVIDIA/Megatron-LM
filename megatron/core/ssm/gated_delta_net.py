@@ -386,7 +386,6 @@ class GatedDeltaNet(MegatronModule):
         if self.config.linear_cp_mode == "chunkwise":
             (
                 hidden_states,
-                _,
                 packed_seq_params,
                 back_to_input_converter,
             ) = convert_module_input_tensors_cp_partition_mode(

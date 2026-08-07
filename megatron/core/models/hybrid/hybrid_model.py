@@ -522,7 +522,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             decoder_input = None
 
         rotary_pos_emb = None
-        cp_partition_mode = input_partition_mode
+        # Model-level rotary_pos_emb is only for regular attention. Regular
+        # attention uses the default zigzag CP RoPE layout; MLA/CSA/DSv4-style
+        # variants must ignore this external RoPE and build/apply RoPE internally.
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
@@ -531,7 +533,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
                 cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                cp_partition_mode=cp_partition_mode,
             )
         elif self.position_embedding_type == 'yarn':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
@@ -542,7 +543,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
                 cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                cp_partition_mode=cp_partition_mode,
             )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
@@ -652,9 +652,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 padding_mask = input_to_postprocess_converter.convert(
                     padding_mask, seq_dim=-1, sequence_parallel=self.config.sequence_parallel
                 )
-                rotary_pos_emb = input_to_postprocess_converter.convert_rank_local_rotary(
-                    rotary_pos_emb, seq_dim=0
-                )
+                # Model-level rotary_pos_emb belongs to regular attention, whose
+                # CP layout preference is zigzag. MTP side tensors are aligned
+                # for token/loss semantics, but RoPE is not treated as a batch
+                # side tensor to be converted here.
                 postprocess_to_input_converter = CpPartitionModeConverter(
                     cp_group=cp_group,
                     packed_seq_params=packed_seq_params,

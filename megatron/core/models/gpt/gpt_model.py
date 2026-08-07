@@ -381,9 +381,9 @@ class GPTModel(LanguageModule):
         rotary_pos_sin = None
         # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
         rotary_pos_cos_sin = None
-        cp_partition_mode = input_partition_mode
-        if cp_partition_mode is None:
-            cp_partition_mode = self.decoder.cp_stage_entry_partition_mode
+        # Model-level rotary_pos_emb is only for regular attention. Regular
+        # attention uses the default zigzag CP RoPE layout; MLA/CSA/DSv4-style
+        # variants must ignore this external RoPE and build/apply RoPE internally.
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             use_flash_infer_fused_rope = (
@@ -424,7 +424,6 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                    cp_partition_mode=cp_partition_mode,
                 )
         elif self.position_embedding_type == 'yarn' and not self.config.multi_latent_attention:
             if not InferenceMode.is_active() or not self.config.flash_decode:
@@ -436,7 +435,6 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                    cp_partition_mode=cp_partition_mode,
                 )
             else:
                 raise NotImplementedError(
@@ -465,7 +463,6 @@ class GPTModel(LanguageModule):
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                     return_raw_freqs=use_fused_mrope,
                     packed_seq=packed_seq,
-                    cp_partition_mode=cp_partition_mode,
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
@@ -803,9 +800,10 @@ class GPTModel(LanguageModule):
                 padding_mask = input_to_postprocess_converter.convert(
                     padding_mask, seq_dim=-1, sequence_parallel=self.config.sequence_parallel
                 )
-                rotary_pos_emb = input_to_postprocess_converter.convert_rank_local_rotary(
-                    rotary_pos_emb, seq_dim=0
-                )
+                # Model-level rotary_pos_emb belongs to regular attention, whose
+                # CP layout preference is zigzag. MTP side tensors are aligned
+                # for token/loss semantics, but RoPE is not treated as a batch
+                # side tensor to be converted here.
                 postprocess_to_input_converter = CpPartitionModeConverter(
                     cp_group=cp_group,
                     packed_seq_params=packed_seq_params,

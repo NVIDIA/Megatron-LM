@@ -17,11 +17,9 @@ from megatron.core.context_parallel_layout import (
     get_stage_entry_partition_mode,
     get_thd_context_parallel_rank_indices,
     get_thd_cp_partition_route,
-    is_cp_rank_local_rotary_pos_emb,
     prebuild_thd_cp_partition_routes,
     replace_packed_seq_params_cp_partition_mode,
 )
-from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_stage_input_cp_partition_mode,
 )
@@ -146,15 +144,22 @@ def _get_sequence_parallel_shard(tensor, seq_dim, tp_group):
     return tensor.chunk(tp_size, dim=seq_dim)[tp_rank].contiguous()
 
 
+def _get_sbhd_tensor_on_this_cp_rank(tensor, seq_dim, cp_group, cp_partition_mode):
+    cp_size = cp_group.size()
+    cp_rank = cp_group.rank()
+    cp_idx = get_context_parallel_layout_chunk_indices(
+        cp_size, cp_rank, cp_partition_mode
+    ).to(device=tensor.device)
+    tensor = tensor.view(
+        *tensor.shape[:seq_dim], 2 * cp_size, -1, *tensor.shape[(seq_dim + 1) :]
+    )
+    tensor = tensor.index_select(seq_dim, cp_idx)
+    return tensor.view(*tensor.shape[:seq_dim], -1, *tensor.shape[(seq_dim + 2) :])
+
+
 def test_context_parallel_layout_chunk_indices():
     assert get_context_parallel_layout_chunk_indices(4, 2, "zigzag").tolist() == [2, 5]
     assert get_context_parallel_layout_chunk_indices(4, 2, "contiguous").tolist() == [4, 5]
-
-
-def test_rank_local_rotary_pos_emb_detection():
-    assert is_cp_rank_local_rotary_pos_emb(None)
-    assert is_cp_rank_local_rotary_pos_emb(SimpleNamespace(qkv_format="sbhd"))
-    assert not is_cp_rank_local_rotary_pos_emb(SimpleNamespace(qkv_format="thd"))
 
 
 def test_thd_context_parallel_rank_indices_match_per_sequence_chunk_order():
@@ -300,7 +305,7 @@ def test_sbhd_convert_cp_partition_mode_matches_direct_target_shard(
             seq_dim=seq_dim,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
-        source_shard = get_pos_emb_on_this_cp_rank(
+        source_shard = _get_sbhd_tensor_on_this_cp_rank(
             full_tensor, seq_dim, cp_group, cp_partition_mode=source_layout
         )
 
@@ -311,7 +316,7 @@ def test_sbhd_convert_cp_partition_mode_matches_direct_target_shard(
             target_partition_mode=target_layout,
             seq_dim=seq_dim,
         )
-        expected = get_pos_emb_on_this_cp_rank(
+        expected = _get_sbhd_tensor_on_this_cp_rank(
             full_tensor, seq_dim, cp_group, cp_partition_mode=target_layout
         )
 
@@ -355,7 +360,7 @@ def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
         )
         full_upstream_grad = full_tensor.mul(0.125).add(1.0)
-        source_shard = get_pos_emb_on_this_cp_rank(
+        source_shard = _get_sbhd_tensor_on_this_cp_rank(
             full_tensor, seq_dim, cp_group, cp_partition_mode=source_layout
         )
         if sequence_parallel:
@@ -373,7 +378,7 @@ def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
             seq_dim=seq_dim,
             **convert_kwargs,
         )
-        target_upstream_grad = get_pos_emb_on_this_cp_rank(
+        target_upstream_grad = _get_sbhd_tensor_on_this_cp_rank(
             full_upstream_grad, seq_dim, cp_group, cp_partition_mode=target_layout
         )
         if sequence_parallel:
@@ -381,7 +386,7 @@ def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
                 target_upstream_grad, seq_dim, tp_group
             )
         converted.mul(target_upstream_grad).sum().backward()
-        expected_source_grad = get_pos_emb_on_this_cp_rank(
+        expected_source_grad = _get_sbhd_tensor_on_this_cp_rank(
             full_upstream_grad, seq_dim, cp_group, cp_partition_mode=source_layout
         )
         if sequence_parallel:

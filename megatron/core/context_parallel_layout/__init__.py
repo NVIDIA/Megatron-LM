@@ -26,7 +26,6 @@ from megatron.core.context_parallel_layout.conversion import (
 )
 from megatron.core.context_parallel_layout.metadata import (
     get_packed_seq_params_cp_partition_cu_seqlens,
-    is_cp_rank_local_rotary_pos_emb,
     replace_packed_seq_params_cp_partition_mode,
 )
 from megatron.core.context_parallel_layout.policy import (
@@ -56,7 +55,6 @@ __all__ = [
     "get_stage_entry_partition_mode",
     "get_thd_cp_partition_route",
     "get_thd_context_parallel_rank_indices",
-    "is_cp_rank_local_rotary_pos_emb",
     "prebuild_thd_cp_partition_routes",
     "replace_packed_seq_params_cp_partition_mode",
     "zigzag_to_contiguous_chunks",
