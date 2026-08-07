@@ -1892,12 +1892,21 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # DDP initialization must use the full-iteration capture stream so its retained
             # AccumulateGrad nodes do not reference a different, non-capturing stream.
             ddp_stream = get_shared_capture_stream()
+        elif config.cuda_graph_impl == "none":
+            # Eager forward/backward runs on the current stream. Initialize DDP there as well
+            # so its retained AccumulateGrad nodes do not reference a dedicated side stream.
+            ddp_stream = None
         else:
-            # Preserve a dedicated initialization stream for all other implementations.
+            # Preserve a dedicated initialization stream for local and TE CUDA graphs.
             ddp_stream = torch.cuda.Stream()
-        ddp_stream.wait_stream(torch.cuda.current_stream())
 
-        with torch.cuda.stream(ddp_stream):
+        if ddp_stream is None:
+            ddp_context = nullcontext()
+        else:
+            ddp_stream.wait_stream(torch.cuda.current_stream())
+            ddp_context = torch.cuda.stream(ddp_stream)
+
+        with ddp_context:
             model = wrap_model_chunks_with_ddp(
                 model,
                 config,
@@ -1913,8 +1922,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
-        # Ensure initialization-stream work completes before touching params on the default stream.
-        torch.cuda.current_stream().wait_stream(ddp_stream)
+        # Ensure side-stream work completes before touching params on the current stream.
+        if ddp_stream is not None:
+            torch.cuda.current_stream().wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
