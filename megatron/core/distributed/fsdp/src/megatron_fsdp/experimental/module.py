@@ -156,6 +156,7 @@ class FsdpModule:
                 mesh=mesh,
                 placements=placements,
                 mixed_precision_policy=mixed_precision_policy,
+                reduce_scatter_stream=context.reduce_scatter_stream,
                 use_symm_mem=use_symm_mem,
             )
             for group_parameters in _group_parameters(owned_parameters)
