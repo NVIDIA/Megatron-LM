@@ -946,7 +946,10 @@ def validate_args(args, defaults={}):
             )
 
     # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+    if args.hybrid_layer_pattern and (
+            Symbols.MLA in args.hybrid_layer_pattern
+            or Symbols.DS_ATTENTION in args.hybrid_layer_pattern
+    ):
         args.multi_latent_attention = True
 
     # === End of hybrid layer pattern: deprecation handling and validation ===
@@ -4808,6 +4811,13 @@ def _add_mla_args(parser):
         type=int,
         default=32,
         help="Rank of Key and Value tensors' low rank representation.",
+    )
+    group.add_argument(
+        '--attention-latent-norm-epsilon',
+        type=float,
+        default=None,
+        help="Epsilon for the primary query and key-value latent norms in attention. "
+        "Defaults to --norm-epsilon when unset.",
     )
     group.add_argument(
         '--qk-head-dim',

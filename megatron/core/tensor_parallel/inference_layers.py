@@ -132,6 +132,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        eps: float | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -148,6 +149,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
             name=name,
+            eps=eps,
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
@@ -156,7 +158,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             output_size % self.tp_size == 0
         ), f"output_size ({output_size}) must be divisible by tp_size ({self.tp_size})"
 
-        self.eps = config.layernorm_epsilon
+        self.eps = config.layernorm_epsilon if eps is None else eps
 
         if self.tp_size > 1:
             assert (

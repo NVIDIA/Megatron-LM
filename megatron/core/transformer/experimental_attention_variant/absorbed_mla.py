@@ -36,6 +36,7 @@ from megatron.core.tensor_parallel.mappings import (
 )
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
@@ -170,6 +171,8 @@ class AbsorbedMLASelfAttention(Attention):
             name=name,
         )
 
+        layer_classes = QKNormConfigResolver(self.config, submodules).resolve()
+
         assert not config.add_bias_linear, "add_bias_linear is not supported for AbsorbedMLA"
         assert not (
             config.tensor_model_parallel_size > 1 and not config.sequence_parallel
@@ -269,7 +272,7 @@ class AbsorbedMLASelfAttention(Attention):
         if self.config.q_lora_rank is None:
             # Not projecting query
             self.linear_q_proj = build_module(
-                submodules.linear_q_proj,
+                layer_classes["linear_q_proj"],
                 self.config.hidden_size,
                 self.config.num_attention_heads * self.q_head_dim,
                 config=self.config,
@@ -315,7 +318,7 @@ class AbsorbedMLASelfAttention(Attention):
             )
 
             self.linear_q_up_proj = build_module(
-                submodules.linear_q_up_proj,
+                layer_classes["linear_q_up_proj"],
                 self.config.q_lora_rank,
                 self.config.num_attention_heads * self.q_head_dim,
                 config=self.config,
@@ -376,7 +379,7 @@ class AbsorbedMLASelfAttention(Attention):
 
         if self._uses_combined_kv_up_projection:
             self.linear_kv_up_proj = build_module(
-                submodules.linear_kv_up_proj,
+                layer_classes["linear_kv_up_proj"],
                 self.config.kv_lora_rank,
                 self.config.num_attention_heads
                 * (self.config.qk_head_dim + self.config.v_head_dim),
@@ -422,17 +425,17 @@ class AbsorbedMLASelfAttention(Attention):
 
         if self.config.q_lora_rank is not None:
             self.q_layernorm = build_module(
-                submodules.q_layernorm,
+                layer_classes["q_layernorm"],
                 hidden_size=self.config.q_lora_rank,
                 config=self.config,
-                eps=self.config.layernorm_epsilon,
+                eps=self.config.attention_latent_norm_epsilon,
             )
 
         self.kv_layernorm = build_module(
-            submodules.kv_layernorm,
+            layer_classes["kv_layernorm"],
             hidden_size=self.config.kv_lora_rank,
             config=self.config,
-            eps=self.config.layernorm_epsilon,
+            eps=self.config.attention_latent_norm_epsilon,
         )
 
     def get_query_key_value_tensors(

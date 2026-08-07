@@ -18,6 +18,7 @@ class Symbols:
     GDN = 'G'
     ATTENTION = "*"
     DS_ATTENTION = "D"
+    MLA = "+"
     CSA = "C"  # DSv4 Compressed Sparse Attention (compress_ratio=4)
     HCA = "H"  # DSv4 Heavily Compressed Attention (compress_ratio=128)
     WINDOW = "W"  # DSv4 sliding-window-only attention (compress_ratio=0; no compressor/indexer)
@@ -25,9 +26,9 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, CSA, HCA, WINDOW, MLP, MOE}
+    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLA, CSA, HCA, WINDOW, MLP, MOE}
     # MLA-based attention layers (incompatible with standard '*' attention in one model).
-    MLA_ATTENTION = {DS_ATTENTION, CSA, HCA, WINDOW}
+    MLA_ATTENTION = {DS_ATTENTION, MLA, CSA, HCA, WINDOW}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
