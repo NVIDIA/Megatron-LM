@@ -1,11 +1,20 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from megatron.core.ssm.gated_delta_net import GDNLayerConfig
+from megatron.core.ssm.mamba_layer import MambaLayerConfig
+from megatron.core.ssm.mlp_layer import MLPLayerConfig
+from megatron.core.transformer.attention import AttentionLayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa import DSALayerConfig
+from megatron.core.transformer.moe.moe_layer import MoELayerConfig
+from megatron.core.transformer.multi_latent_attention import MLALayerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -36,6 +45,74 @@ class Symbols:
                 valid_layer_attrs.append((name, value))
         valid_layer_attrs.sort()
         return [value for (_, value) in valid_layer_attrs]
+
+
+HybridLayerConfig = (
+    MambaLayerConfig
+    | GDNLayerConfig
+    | AttentionLayerConfig
+    | DSALayerConfig
+    | MLALayerConfig
+    | MLPLayerConfig
+    | MoELayerConfig
+)
+
+
+LAYER_SYMBOL_TO_CONFIG_CLASS: Dict[str, type[HybridLayerConfig]] = {
+    Symbols.MAMBA: MambaLayerConfig,
+    Symbols.GDN: GDNLayerConfig,
+    Symbols.ATTENTION: AttentionLayerConfig,
+    Symbols.DS_ATTENTION: DSALayerConfig,
+    Symbols.MLA: MLALayerConfig,
+    Symbols.MLP: MLPLayerConfig,
+    Symbols.MOE: MoELayerConfig,
+}
+
+
+class _HybridLayerConfigList(list[HybridLayerConfig]):
+    """Configs cloned from one legacy stack config.
+
+    The marker lets HybridStack preserve constructor-time mutations that previously
+    affected a shared config, without coupling independently supplied config lists.
+    """
+
+    synchronize_shared_config_mutations = True
+
+
+def get_hybrid_layer_configs(
+    layer_type_list: List[str], config: TransformerConfig
+) -> List[HybridLayerConfig]:
+    """Materialize an independent config for each hybrid layer symbol.
+
+    The source config has already been normalized by ``TransformerConfig.__post_init__``.
+    Deep-copying it and changing only its marker class preserves that normalized state and
+    any dynamically added attributes without running ``__post_init__`` a second time.
+
+    Args:
+        layer_type_list: Layer symbols to convert to configs.
+        config: Normalized stack-level config to copy for each layer.
+
+    Returns:
+        One independent layer config per symbol, in the same order.
+
+    Raises:
+        ValueError: If a layer symbol is not supported.
+    """
+    layer_configs = _HybridLayerConfigList()
+    for layer_symbol in layer_type_list:
+        try:
+            config_class = LAYER_SYMBOL_TO_CONFIG_CLASS[layer_symbol]
+        except KeyError as error:
+            raise ValueError(
+                f"Unknown hybrid layer symbol '{layer_symbol}'. "
+                f"Expected one of {set(LAYER_SYMBOL_TO_CONFIG_CLASS)}."
+            ) from error
+
+        layer_config = deepcopy(config)
+        layer_config.__class__ = config_class
+        layer_configs.append(layer_config)
+
+    return layer_configs
 
 
 @dataclass
@@ -298,23 +375,9 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
 
-def validate_segment_layers(segment: str) -> List[str]:
-    """Validate and convert a single pipeline segment pattern to a layer type list.
-
-    This is used after the main pattern has been split by '|' into segments.
-    Each segment should contain only valid layer symbols (no '|').
-
-    Args:
-        segment: A single pipeline segment pattern string (e.g., "M-M*-")
-
-    Returns:
-        List of layer type characters.
-
-    Raises:
-        ValueError: If segment contains invalid layer symbols.
-    """
-    layer_type_list = list(segment)
-    for layer_char in layer_type_list:
+def _validate_segment_layer_symbols(segment: str) -> None:
+    """Validate the layer symbols in a single pipeline segment."""
+    for layer_char in segment:
         if layer_char not in Symbols.VALID_LAYERS:
             raise ValueError(
                 f"In hybrid layer pattern segment, '{layer_char}' is not "
@@ -325,18 +388,37 @@ def validate_segment_layers(segment: str) -> List[str]:
     if Symbols.ATTENTION in segment and (Symbols.DS_ATTENTION in segment or Symbols.MLA in segment):
         raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
-    return layer_type_list
+
+def validate_segment_layers(segment: str, config: TransformerConfig) -> List[HybridLayerConfig]:
+    """Validate and convert a single pipeline segment pattern to layer configs.
+
+    This is used after the main pattern has been split by '|' into segments.
+    Each segment should contain only valid layer symbols (no '|').
+
+    Args:
+        segment: A single pipeline segment pattern string (e.g., "M-M*-")
+        config: Normalized stack-level config to copy for each layer.
+
+    Returns:
+        List of independent per-layer configs.
+
+    Raises:
+        ValueError: If segment contains invalid layer symbols.
+    """
+    _validate_segment_layer_symbols(segment)
+    return get_hybrid_layer_configs(list(segment), config)
 
 
 def select_pipeline_segment(
     main_pattern: str,
+    config: TransformerConfig,
     pp_group: Optional[torch.distributed.ProcessGroup],
     vp_stage: Optional[int],
     first_stage_layers: Optional[int] = None,
     last_stage_layers: Optional[int] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> Tuple[List[str], int]:
+) -> Tuple[List[HybridLayerConfig], int]:
     """Select and validate the pipeline segment for the given PP rank and VP stage.
 
     When the main pattern contains '|' pipe separators, splits by '|' into
@@ -349,6 +431,7 @@ def select_pipeline_segment(
     Args:
         main_pattern: Main decoder pattern (may contain '|' separators).
             Empty string is allowed (produces one empty segment).
+        config: Normalized stack-level config to copy for each selected layer.
         pp_group: Pipeline parallel process group, or None if not using PP.
         vp_stage: Virtual pipeline stage, or None if not using VPP.
         first_stage_layers: Number of layers on the first pipeline stage for
@@ -359,8 +442,8 @@ def select_pipeline_segment(
         dp_cp_group: Optional data/context-parallel process group used for per-stage logging.
 
     Returns:
-        Tuple of (layer_type_list, layer_offset) where layer_type_list is
-        the list of layer type characters for this segment, and layer_offset
+        Tuple of (layer_config_list, layer_offset) where layer_config_list is
+        the list of independent configs for this segment, and layer_offset
         is the sum of layer counts from all preceding segments.
 
     Raises:
@@ -399,8 +482,8 @@ def select_pipeline_segment(
             "Example: 'M*M*M*M*' with pp_size=2 should become 'M*M*|M*M*'.",
         )
         full_pattern = segments[0]
-        layer_type_list = validate_segment_layers(full_pattern)
-        num_layers = len(layer_type_list)
+        _validate_segment_layer_symbols(full_pattern)
+        num_layers = len(full_pattern)
 
         if first_stage_layers is not None or last_stage_layers is not None:
             first = first_stage_layers or 0
@@ -443,12 +526,13 @@ def select_pipeline_segment(
             offset = pp_rank * layers_per_rank
             count = layers_per_rank
 
-        selected = layer_type_list[offset : offset + count]
+        selected_pattern = full_pattern[offset : offset + count]
+        selected = validate_segment_layers(selected_pattern, config)
         log_on_each_pipeline_stage(
             logger,
             logging.INFO,
             f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_stage}, "
-            f"layers='{''.join(selected)}' ({len(selected)} layers), "
+            f"layers='{selected_pattern}' ({len(selected)} layers), "
             f"layer_offset={offset} (auto-split)",
             tp_group=tp_group,
             dp_cp_group=dp_cp_group,
@@ -477,20 +561,20 @@ def select_pipeline_segment(
     layer_offset = sum(len(segments[i]) for i in range(segment_index))
     my_segment = segments[segment_index]
 
-    layer_type_list = validate_segment_layers(my_segment)
+    layer_config_list = validate_segment_layers(my_segment, config)
 
     log_on_each_pipeline_stage(
         logger,
         logging.INFO,
         f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_rel}, "
         f"segment_index={segment_index}/{len(segments)}, "
-        f"layers='{my_segment}' ({len(layer_type_list)} layers), "
+        f"layers='{my_segment}' ({len(layer_config_list)} layers), "
         f"layer_offset={layer_offset}",
         tp_group=tp_group,
         dp_cp_group=dp_cp_group,
     )
 
-    return layer_type_list, layer_offset
+    return layer_config_list, layer_offset
 
 
 def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str, dict[int, int]]:

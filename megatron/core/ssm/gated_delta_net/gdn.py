@@ -24,7 +24,12 @@ from megatron.core.ssm.gated_delta_net.common import (
     tensor_a2a_cp2hp,
     torch_chunk_gated_delta_rule,
 )
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+
+
+class GDNLayerConfig(TransformerConfig):
+    """Configuration for a Gated DeltaNet layer in a hybrid stack."""
 
 
 class GatedDeltaNet(_GDNBase):

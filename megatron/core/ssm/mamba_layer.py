@@ -27,6 +27,10 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params
 
 
+class MambaLayerConfig(TransformerConfig):
+    """Configuration for a Mamba layer in a hybrid stack."""
+
+
 @dataclass
 class MambaLayerSubmodules:
     """

@@ -1,11 +1,13 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import functools
 import operator
 from unittest.mock import patch
 
 import pytest
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    LAYER_SYMBOL_TO_CONFIG_CLASS,
     ParsedHybridPattern,
     Symbols,
     get_hybrid_layer_counts,
@@ -17,6 +19,39 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     select_pipeline_segment,
     validate_segment_layers,
 )
+from megatron.core.ssm.gated_delta_net import GDNLayerConfig
+from megatron.core.ssm.mamba_layer import MambaLayerConfig
+from megatron.core.ssm.mlp_layer import MLPLayerConfig
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.attention import AttentionLayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa import DSALayerConfig
+from megatron.core.transformer.moe.moe_layer import MoELayerConfig
+from megatron.core.transformer.multi_latent_attention import MLALayerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+
+def _make_transformer_config() -> TransformerConfig:
+    return TransformerConfig(num_layers=7, hidden_size=64, num_attention_heads=4)
+
+
+def _symbols_from_configs(layer_config_list) -> list[str]:
+    config_class_to_symbol = {
+        config_class: symbol for symbol, config_class in LAYER_SYMBOL_TO_CONFIG_CLASS.items()
+    }
+    return [config_class_to_symbol[type(config)] for config in layer_config_list]
+
+
+def _assert_config_contents_equal(actual, expected) -> None:
+    assert vars(actual).keys() == vars(expected).keys()
+    for field_name, expected_value in vars(expected).items():
+        actual_value = getattr(actual, field_name)
+        if isinstance(expected_value, functools.partial):
+            assert isinstance(actual_value, functools.partial)
+            assert actual_value.func is expected_value.func
+            assert actual_value.args == expected_value.args
+            assert actual_value.keywords == expected_value.keywords
+        else:
+            assert actual_value == expected_value
 
 
 @pytest.mark.internal
@@ -67,8 +102,11 @@ class TestPatternFromRatios:
 @pytest.mark.internal
 class TestValidateSegmentLayers:
 
+    def setup_method(self):
+        self.config = _make_transformer_config()
+
     def test_valid_patterns(self):
-        """Test that valid segment patterns produce the correct layer type lists."""
+        """Test that valid segment patterns produce configs in the correct order."""
         test_cases = [
             ("M*-M*-M*-", ['M', '*', '-', 'M', '*', '-', 'M', '*', '-']),
             ("MMMMMMMMM", ['M'] * 9),
@@ -81,32 +119,92 @@ class TestValidateSegmentLayers:
             ("M+M+", ['M', '+', 'M', '+']),
         ]
         for pattern, expected in test_cases:
-            result = validate_segment_layers(pattern)
-            assert result == expected, f"Failed for pattern: {pattern}"
+            result = validate_segment_layers(pattern, self.config)
+            assert _symbols_from_configs(result) == expected, f"Failed for pattern: {pattern}"
 
     def test_all_valid_symbols(self):
         """Make sure all returned layers are valid."""
         for pattern in ["M*-M*-M*-", "MMMMMMMMM", "MM*-", "MEME"]:
-            layer_types = validate_segment_layers(pattern)
-            for layer_type in layer_types:
-                assert layer_type in Symbols.VALID_LAYERS
+            layer_config_list = validate_segment_layers(pattern, self.config)
+            for layer_config in layer_config_list:
+                assert _symbols_from_configs([layer_config])[0] in Symbols.VALID_LAYERS
+
+    @pytest.mark.parametrize(
+        ("symbol", "config_class"),
+        [
+            (Symbols.MAMBA, MambaLayerConfig),
+            (Symbols.GDN, GDNLayerConfig),
+            (Symbols.ATTENTION, AttentionLayerConfig),
+            (Symbols.DS_ATTENTION, DSALayerConfig),
+            (Symbols.MLA, MLALayerConfig),
+            (Symbols.MLP, MLPLayerConfig),
+            (Symbols.MOE, MoELayerConfig),
+        ],
+    )
+    def test_all_symbols_map_to_layer_configs(self, symbol, config_class):
+        layer_config_list = validate_segment_layers(symbol, self.config)
+
+        assert len(layer_config_list) == 1
+        assert type(layer_config_list[0]) is config_class
+        assert isinstance(layer_config_list[0], TransformerConfig)
+        assert layer_config_list[0] is not self.config
+        _assert_config_contents_equal(layer_config_list[0], self.config)
+        assert layer_config_list[0].hidden_size == self.config.hidden_size
+        assert _symbols_from_configs(layer_config_list) == [symbol]
+
+    def test_repeated_layers_receive_independent_config_copies(self):
+        self.config.test_mutable_value = {"items": []}
+
+        layer_config_list = validate_segment_layers("MMM", self.config)
+
+        assert len({id(config) for config in layer_config_list}) == 3
+        assert all(config is not self.config for config in layer_config_list)
+        assert all(config.test_mutable_value == {"items": []} for config in layer_config_list)
+        assert len({id(config.test_mutable_value) for config in layer_config_list}) == 3
+
+        layer_config_list[0].test_mutable_value["items"].append("changed")
+        assert layer_config_list[1].test_mutable_value == {"items": []}
+        assert self.config.test_mutable_value == {"items": []}
+
+    def test_mla_configs_preserve_specialized_fields(self):
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=8,
+            q_lora_rank=32,
+            kv_lora_rank=16,
+            qk_head_dim=32,
+            qk_pos_emb_head_dim=16,
+            v_head_dim=32,
+            rope_type="rope",
+        )
+
+        dsa_config, mla_config = validate_segment_layers("D+", config)
+
+        assert type(dsa_config) is DSALayerConfig
+        assert type(mla_config) is MLALayerConfig
+        assert isinstance(dsa_config, MLATransformerConfig)
+        assert isinstance(mla_config, MLATransformerConfig)
+        assert dsa_config.q_lora_rank == config.q_lora_rank
+        assert mla_config.kv_lora_rank == config.kv_lora_rank
+        assert dsa_config is not mla_config
 
     def test_invalid_symbols_cause_failure(self):
         """Test that invalid symbols raise ValueError."""
         with pytest.raises(ValueError):
-            validate_segment_layers("M*X")
+            validate_segment_layers("M*X", self.config)
         with pytest.raises(ValueError):
-            validate_segment_layers("M|M")  # pipe not valid in a segment
+            validate_segment_layers("M|M", self.config)  # pipe not valid in a segment
         with pytest.raises(ValueError):
-            validate_segment_layers("M/M")  # MTP separator not valid in a segment
+            validate_segment_layers("M/M", self.config)  # MTP separator not valid in a segment
         with pytest.raises(ValueError):
             # Not allowed to have both standard Attention and MLA/DSA
-            validate_segment_layers("MDM*-")
+            validate_segment_layers("MDM*-", self.config)
         with pytest.raises(ValueError):
             # Not allowed to have both standard Attention and MLA (same reason
             # as DSA: * uses the model-level rotary_pos_emb while + uses MLA's
             # own decoupled RoPE).
-            validate_segment_layers("M+M*-")
+            validate_segment_layers("M+M*-", self.config)
 
 
 @pytest.mark.internal
@@ -489,25 +587,34 @@ class TestSelectPipelineSegment:
     is simply the vp_stage value.
     """
 
+    def setup_method(self):
+        self.config = _make_transformer_config()
+
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_single_segment_no_vp(self, mock_log):
         """Single segment, no VPP."""
-        layer_types, offset = select_pipeline_segment("M*M*", pp_group=None, vp_stage=None)
-        assert layer_types == ['M', '*', 'M', '*']
+        layer_configs, offset = select_pipeline_segment(
+            "M*M*", self.config, pp_group=None, vp_stage=None
+        )
+        assert _symbols_from_configs(layer_configs) == ['M', '*', 'M', '*']
         assert offset == 0
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_two_segments_vp0(self, mock_log):
         """Two segments, select first (vp_stage=0)."""
-        layer_types, offset = select_pipeline_segment("M-M-|M-M*-", pp_group=None, vp_stage=0)
-        assert layer_types == ['M', '-', 'M', '-']
+        layer_configs, offset = select_pipeline_segment(
+            "M-M-|M-M*-", self.config, pp_group=None, vp_stage=0
+        )
+        assert _symbols_from_configs(layer_configs) == ['M', '-', 'M', '-']
         assert offset == 0
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_two_segments_vp1(self, mock_log):
         """Two segments, select second (vp_stage=1)."""
-        layer_types, offset = select_pipeline_segment("M-M-|M-M*-", pp_group=None, vp_stage=1)
-        assert layer_types == ['M', '-', 'M', '*', '-']
+        layer_configs, offset = select_pipeline_segment(
+            "M-M-|M-M*-", self.config, pp_group=None, vp_stage=1
+        )
+        assert _symbols_from_configs(layer_configs) == ['M', '-', 'M', '*', '-']
         assert offset == 4
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
@@ -516,60 +623,76 @@ class TestSelectPipelineSegment:
         pattern = "MM|M*|M-|ME"
         expected = [(['M', 'M'], 0), (['M', '*'], 2), (['M', '-'], 4), (['M', 'E'], 6)]
         for vp_stage, (expected_layers, expected_offset) in enumerate(expected):
-            layer_types, offset = select_pipeline_segment(pattern, pp_group=None, vp_stage=vp_stage)
-            assert layer_types == expected_layers, f"Failed for vp_stage={vp_stage}"
+            layer_configs, offset = select_pipeline_segment(
+                pattern, self.config, pp_group=None, vp_stage=vp_stage
+            )
+            assert (
+                _symbols_from_configs(layer_configs) == expected_layers
+            ), f"Failed for vp_stage={vp_stage}"
             assert offset == expected_offset, f"Failed for vp_stage={vp_stage}"
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_empty_segment(self, mock_log):
         """Empty segments are allowed for pipeline balancing."""
-        layer_types, offset = select_pipeline_segment("||M*", pp_group=None, vp_stage=0)
-        assert layer_types == []
+        layer_configs, offset = select_pipeline_segment(
+            "||M*", self.config, pp_group=None, vp_stage=0
+        )
+        assert layer_configs == []
         assert offset == 0
 
-        layer_types, offset = select_pipeline_segment("||M*", pp_group=None, vp_stage=2)
-        assert layer_types == ['M', '*']
+        layer_configs, offset = select_pipeline_segment(
+            "||M*", self.config, pp_group=None, vp_stage=2
+        )
+        assert _symbols_from_configs(layer_configs) == ['M', '*']
         assert offset == 0
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_uneven_segments(self, mock_log):
         """Segments of different lengths."""
         pattern = "MMM|M|MMMMM"
-        layer_types, offset = select_pipeline_segment(pattern, pp_group=None, vp_stage=0)
-        assert len(layer_types) == 3
+        layer_configs, offset = select_pipeline_segment(
+            pattern, self.config, pp_group=None, vp_stage=0
+        )
+        assert len(layer_configs) == 3
         assert offset == 0
 
-        layer_types, offset = select_pipeline_segment(pattern, pp_group=None, vp_stage=1)
-        assert len(layer_types) == 1
+        layer_configs, offset = select_pipeline_segment(
+            pattern, self.config, pp_group=None, vp_stage=1
+        )
+        assert len(layer_configs) == 1
         assert offset == 3
 
-        layer_types, offset = select_pipeline_segment(pattern, pp_group=None, vp_stage=2)
-        assert len(layer_types) == 5
+        layer_configs, offset = select_pipeline_segment(
+            pattern, self.config, pp_group=None, vp_stage=2
+        )
+        assert len(layer_configs) == 5
         assert offset == 4
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_empty_main_pattern(self, mock_log):
         """Empty main pattern produces one empty segment."""
-        layer_types, offset = select_pipeline_segment("", pp_group=None, vp_stage=None)
-        assert layer_types == []
+        layer_configs, offset = select_pipeline_segment(
+            "", self.config, pp_group=None, vp_stage=None
+        )
+        assert layer_configs == []
         assert offset == 0
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_invalid_segment_raises(self, mock_log):
         """Invalid layer symbols in a segment should raise ValueError."""
         with pytest.raises(ValueError):
-            select_pipeline_segment("MX|M*", pp_group=None, vp_stage=0)
+            select_pipeline_segment("MX|M*", self.config, pp_group=None, vp_stage=0)
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_out_of_range_segment_raises(self, mock_log):
         """Segment index out of range should raise ValueError."""
         with pytest.raises(ValueError, match="out of range"):
-            select_pipeline_segment("M*|M*", pp_group=None, vp_stage=5)
+            select_pipeline_segment("M*|M*", self.config, pp_group=None, vp_stage=5)
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_logging_is_called(self, mock_log):
         """Verify that log_on_each_pipeline_stage is called."""
-        select_pipeline_segment("M*M*", pp_group=None, vp_stage=None)
+        select_pipeline_segment("M*M*", self.config, pp_group=None, vp_stage=None)
         mock_log.assert_called_once()
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
@@ -577,7 +700,12 @@ class TestSelectPipelineSegment:
         tp_group = object()
         dp_cp_group = object()
         select_pipeline_segment(
-            "M*M*", pp_group=None, vp_stage=None, tp_group=tp_group, dp_cp_group=dp_cp_group
+            "M*M*",
+            self.config,
+            pp_group=None,
+            vp_stage=None,
+            tp_group=tp_group,
+            dp_cp_group=dp_cp_group,
         )
         assert mock_log.call_args.kwargs["tp_group"] is tp_group
         assert mock_log.call_args.kwargs["dp_cp_group"] is dp_cp_group
@@ -586,13 +714,17 @@ class TestSelectPipelineSegment:
     def test_mutual_exclusivity_pipes_with_first_stage(self, mock_log):
         """Pipe separators + first_stage_layers should raise ValueError."""
         with pytest.raises(ValueError, match="Cannot specify"):
-            select_pipeline_segment("M*|M*", pp_group=None, vp_stage=0, first_stage_layers=1)
+            select_pipeline_segment(
+                "M*|M*", self.config, pp_group=None, vp_stage=0, first_stage_layers=1
+            )
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_mutual_exclusivity_pipes_with_last_stage(self, mock_log):
         """Pipe separators + last_stage_layers should raise ValueError."""
         with pytest.raises(ValueError, match="Cannot specify"):
-            select_pipeline_segment("M*|M*", pp_group=None, vp_stage=0, last_stage_layers=1)
+            select_pipeline_segment(
+                "M*|M*", self.config, pp_group=None, vp_stage=0, last_stage_layers=1
+            )
 
     @patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_segment_count_not_divisible_by_pp_size(self, mock_log):
@@ -603,7 +735,7 @@ class TestSelectPipelineSegment:
             patch('torch.distributed.get_world_size', return_value=2),
         ):
             with pytest.raises(ValueError, match="evenly divisible"):
-                select_pipeline_segment("M|M|M", pp_group=mock_group, vp_stage=None)
+                select_pipeline_segment("M|M|M", self.config, pp_group=mock_group, vp_stage=None)
 
 
 @pytest.mark.internal
@@ -613,6 +745,9 @@ class TestSelectPipelineSegmentLegacyFallback:
     These tests exercise the backwards-compatible auto-split logic that
     activates when the pattern has no pipe separators but pp_size > 1.
     """
+
+    def setup_method(self):
+        self.config = _make_transformer_config()
 
     def _call_for_rank(
         self,
@@ -633,6 +768,7 @@ class TestSelectPipelineSegmentLegacyFallback:
         ):
             return select_pipeline_segment(
                 pattern,
+                self.config,
                 pp_group=mock_group,
                 vp_stage=vp_stage,
                 first_stage_layers=first_stage_layers,
@@ -642,11 +778,11 @@ class TestSelectPipelineSegmentLegacyFallback:
     def test_even_split_2_ranks(self):
         """4 layers across 2 ranks -> 2 each."""
         layers0, off0 = self._call_for_rank("M*M-", pp_rank=0, pp_size=2)
-        assert layers0 == ['M', '*']
+        assert _symbols_from_configs(layers0) == ['M', '*']
         assert off0 == 0
 
         layers1, off1 = self._call_for_rank("M*M-", pp_rank=1, pp_size=2)
-        assert layers1 == ['M', '-']
+        assert _symbols_from_configs(layers1) == ['M', '-']
         assert off1 == 2
 
     def test_even_split_4_ranks(self):
@@ -736,7 +872,7 @@ class TestSelectPipelineSegmentLegacyFallback:
                 'megatron.core.models.hybrid.hybrid_layer_allocation.log_single_rank'
             ) as mock_warn,
         ):
-            select_pipeline_segment("M*M*", pp_group=mock_group, vp_stage=None)
+            select_pipeline_segment("M*M*", self.config, pp_group=mock_group, vp_stage=None)
             mock_warn.assert_called_once()
             call_args = mock_warn.call_args
             assert "DEPRECATION" in call_args[0][2]
@@ -750,7 +886,7 @@ class TestSelectPipelineSegmentLegacyFallback:
             layers, offset = self._call_for_rank(pattern, pp_rank=rank, pp_size=pp_size)
             assert offset == len(all_layers)
             all_layers.extend(layers)
-        assert all_layers == ['M', '*', 'M', '*', 'M', '*']
+        assert _symbols_from_configs(all_layers) == ['M', '*', 'M', '*', 'M', '*']
 
 
 @pytest.mark.internal

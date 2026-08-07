@@ -10,6 +10,10 @@ from megatron.core.transformer import (
 )
 
 
+class MLPLayerConfig(TransformerConfig):
+    """Configuration for a dense MLP layer in a hybrid stack."""
+
+
 class MLPLayer(TransformerLayer):
     """Drop-in replacement for TransformerLayer but initializes only an MLP via the spec."""
 
