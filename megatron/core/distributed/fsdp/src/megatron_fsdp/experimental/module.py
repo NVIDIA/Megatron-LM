@@ -16,6 +16,7 @@
 
 from collections.abc import Callable
 from typing import Literal, cast
+from weakref import ref
 
 import torch
 from torch import nn
@@ -28,7 +29,7 @@ from .placement import Placements
 
 
 class FsdpContext:
-    """Runtime stream and prefetch state shared by one FSDP subtree."""
+    """Runtime stream and prefetch state shared by FSDP roots constructed together."""
 
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
@@ -36,27 +37,65 @@ class FsdpContext:
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
-    root_module: "FsdpModule"
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
 
-    def __init__(self, device: torch.device, root_module: "FsdpModule") -> None:
-        """Create rank-local runtime state for a root FSDP subtree.
+    def __init__(self, device: torch.device) -> None:
+        """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
             device: Device on which this context schedules communication.
-            root_module: Outermost module that owns this context.
         """
-        self.root_module = root_module
         self.is_last_microbatch = True
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
+        # Construction-only; empty after finalization.
+        self._registered_modules: list[FsdpModule] = []
+        self._is_finalized = False
         with torch.cuda.device(device):
             self.allgather_stream = torch.cuda.Stream()
             self.reduce_scatter_stream = torch.cuda.Stream()
+
+    def register_module(self, module: "FsdpModule") -> None:
+        """Register a module constructed in this context."""
+        if self._is_finalized:
+            raise RuntimeError("Cannot register an FSDP module after its context is finalized.")
+        self._registered_modules.append(module)
+
+    def finalize(self) -> None:
+        """Finalize roots, names, and cross-root prefetch orders."""
+        if self._is_finalized:
+            raise RuntimeError("FSDP context is already finalized.")
+
+        children: set[FsdpModule] = set()
+        for module in self._registered_modules:
+            _collect_fsdp_children(cast(nn.Module, module), children)
+        # FsdpModules that are not descendants of any other FsdpModule.
+        roots = [module for module in self._registered_modules if module not in children]
+
+        for root in roots:
+            root._is_root = True
+            for name, module in cast(nn.Module, root).named_modules():
+                if not isinstance(module, FsdpModule):
+                    continue
+                module._name = name
+                self.forward_order.append(module)
+
+        for root in reversed(roots):
+            _collect_backward_order(cast(nn.Module, root), self.backward_order)
+
+        self._registered_modules.clear()
+        self._is_finalized = True
+
+    def ensure_finalized(self) -> None:
+        """Raise if construction has not completed for this context."""
+        if not self._is_finalized:
+            raise RuntimeError(
+                "FSDP context is not finalized. Exit fully_shard_context before running forward."
+            )
 
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
@@ -84,8 +123,9 @@ class FsdpModule:
     # Root uses "" and None means uninitialized.
     _name: str | None
     _parameter_groups: tuple[FsdpParameterGroup, ...]
-    _context: FsdpContext | None
+    _context: FsdpContext
     _num_ready_grad_parameters: int
+    _is_root: bool
     _num_trainable_parameters: int
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
@@ -94,13 +134,15 @@ class FsdpModule:
 
     def __init__(
         self,
+        context: FsdpContext,
         mesh: DeviceMesh,
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
         use_symm_mem: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
-        self._context = None
+        self._context = context
+        self._is_root = False
         self._name = None
         self._unshard_event = None
         owned_parameters = _collect_owned_parameters(self)
@@ -114,6 +156,7 @@ class FsdpModule:
                 mesh=mesh,
                 placements=placements,
                 mixed_precision_policy=mixed_precision_policy,
+                reduce_scatter_stream=context.reduce_scatter_stream,
                 use_symm_mem=use_symm_mem,
             )
             for group_parameters in _group_parameters(owned_parameters)
@@ -124,60 +167,11 @@ class FsdpModule:
             len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
         self._register_hooks()
-
-    def _lazy_init_context(self) -> None:
-        """Initialize one shared runtime context for this FSDP root subtree.
-
-        MFSDP v2 requires users to apply ``fully_shard`` bottom-up, so child FSDP
-        modules are constructed before their eventual root module is constructed.
-        This method resolves the root lazily on the first forward through the
-        outermost FSDP module and shares that one context with every FSDP
-        descendant.
-
-        Alternatives considered:
-        - Eagerly initialize contexts during ``fully_shard``. When a parent is
-          sharded, we could create a new root context and reassign it to all
-          descendant FSDP modules. This creates transient child contexts that are
-          never used if the parent is later sharded, and each parent shard must
-          walk its descendants again, making nested sharding quadratic.
-        - Store an ``is_root`` field on each FSDP module. ``fully_shard`` could
-          mark newly sharded modules as roots and clear that flag on descendant
-          FSDP modules when a parent is sharded. This avoids creating unused
-          contexts but moves root tracking onto every FSDP module, adding
-          per-module state that must stay consistent with the final sharded
-          module hierarchy.
-        """
-        if self._context is not None:
-            return
-
-        root_module = cast(nn.Module, self)
-        first_parameter = next(root_module.parameters(), None)
-        if first_parameter is None:
-            raise RuntimeError("FSDP root module requires at least one parameter in its subtree.")
-
-        context = FsdpContext(device=first_parameter.device, root_module=self)
-        # named_modules() yields FsdpModules in registration order, which is the static
-        # forward execution order used to prefetch the next FsdpModule's all-gather.
-        for submodule_name, submodule in root_module.named_modules():
-            if not isinstance(submodule, FsdpModule):
-                continue
-            if submodule._context is not None:
-                raise RuntimeError(
-                    "FSDP context is already initialized for a descendant module. "
-                    "Run forward through the root FSDP module first."
-                )
-            submodule._context = context
-            submodule._name = submodule_name
-            context.forward_order.append(submodule)
-
-        # Backward starts from the root pre-backward hook before visiting child
-        # subtrees in reverse module order.
-        _collect_backward_order(root_module, context.backward_order)
+        context.register_module(self)
 
     @property
     def context(self) -> FsdpContext:
-        """Return the initialized runtime context."""
-        assert self._context is not None
+        """Return the FSDP context."""
         return self._context
 
     @property
@@ -189,17 +183,27 @@ class FsdpModule:
         return name
 
     def is_root(self) -> bool:
-        """Return whether this module is the outermost FsdpModule in its context."""
-        return self.context.root_module is self
+        """Return whether this module is an outermost FsdpModule in its context."""
+        return self._is_root
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
-        module.register_forward_pre_hook(lambda _module, _args: self.pre_forward())
-        module.register_forward_hook(lambda _module, _args, _output: self.post_forward())
-        module.register_full_backward_pre_hook(lambda _module, _grad_output: self.pre_backward())
+        # Use PyTorch's callback module argument instead of capturing self so
+        # these hooks do not retain a deleted FSDP module.
+        module.register_forward_pre_hook(
+            lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
+        )
+        module.register_forward_hook(
+            lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
+        )
+        module.register_full_backward_pre_hook(
+            lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
+        )
         if self._num_trainable_parameters == 0:
             module.register_full_backward_hook(
-                lambda _module, _grad_input, _grad_output: self.post_backward()
+                lambda hooked_module, _grad_input, _grad_output: cast(
+                    FsdpModule, hooked_module
+                ).post_backward()
             )
             return
 
@@ -214,10 +218,15 @@ class FsdpModule:
                 fsdp_parameter.unsharded.register_post_accumulate_grad_hook(self._make_grad_hook())
 
     def _make_grad_hook(self) -> Callable[[nn.Parameter], None]:
+        module_ref = ref(self)
+
         def grad_hook(_parameter: nn.Parameter) -> None:
-            self._num_ready_grad_parameters += 1
-            if self._num_ready_grad_parameters == self._num_trainable_parameters:
-                self.post_backward()
+            module = module_ref()
+            if module is None:
+                return
+            module._num_ready_grad_parameters += 1
+            if module._num_ready_grad_parameters == module._num_trainable_parameters:
+                module.post_backward()
 
         return grad_hook
 
@@ -227,10 +236,10 @@ class FsdpModule:
         While this FsdpModule computes, we issue the next FsdpModule's all-gather
         on the comm stream, so ``AG_{i+1}`` is launched before ``F_i`` finishes.
         """
-        self._lazy_init_context()
+        context = self.context
+        context.ensure_finalized()
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
         self._num_ready_grad_parameters = 0
-        context = self.context
         allgather_stream = context.allgather_stream
         current_stream = context.current_stream()
 
@@ -348,12 +357,21 @@ class FsdpModule:
 
 
 def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]) -> None:
-    """Collect FsdpModules in static backward prefetch order."""
+    """Collect one root's static backward prefetch order."""
     if isinstance(module, FsdpModule):
         order.append(module)
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, order)
+
+
+def _collect_fsdp_children(module: nn.Module, children: set["FsdpModule"]) -> None:
+    """Collect the nearest FSDP descendants of ``module``."""
+    for child in module.children():
+        if isinstance(child, FsdpModule):
+            children.add(child)
+        else:
+            _collect_fsdp_children(child, children)
 
 
 def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:
