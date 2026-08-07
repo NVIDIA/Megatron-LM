@@ -984,15 +984,16 @@ class CheckpointManager:
         if not self._outputs_discarded:
             raise RuntimeError("CheckpointManager.recompute_until() requires discarded outputs.")
         self.mhc_arena.validate_addresses()
+        # NOTE: arena slots are deliberately never released in this method.
+        # Releasing one right after its recompute corrupts training (loss
+        # diverges from the baseline series): this group's consumers include
+        # communication-stream mHC post-processing that runs after the recompute
+        # node, so a later tenant's write can land before those reads. Slot
+        # recycling needs the real W2 end -- the last consumer of the group --
+        # not the recompute point.
         for ckpt in self.checkpoints:
             if ckpt.recompute_phase <= phase:
                 ckpt._recompute(None)
-                # NOTE: releasing the slot here corrupts training (loss
-                # diverges from the baseline series): this group's consumers
-                # include communication-stream mHC post-processing that runs
-                # after the recompute node, so a later tenant's write can land
-                # before those reads. Slot recycling needs the real W2 end
-                # (last consumer of the group), not the recompute point.
         self._recomputed = all(ckpt.ctx is None for ckpt in self.checkpoints)
 
     def recompute_now(self) -> None:

@@ -331,10 +331,13 @@ class OptimizerStateOffloader:
         # step on them -- silently, because waiting on a stream that was never
         # forked succeeds trivially. The scope boundary that rules this out is
         # not enforced anywhere, so check it here rather than assume it.
-        assert not torch.cuda.is_current_stream_capturing(), (
-            "sync_before_step() must run outside CUDA graph capture: reload() defers "
-            "under capture, so optimizer states would still be on the host at step time."
-        )
+        # Raise rather than assert: `python -O` strips assertions, and this is the
+        # only enforcement there is.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "sync_before_step() must run outside CUDA graph capture: reload() defers "
+                "under capture, so optimizer states would still be on the host at step time."
+            )
         if self._offloaded:
             # The early reload was skipped or never ran: either it landed inside
             # a graph capture, or the iteration was a graph replay, which

@@ -544,6 +544,60 @@ class TestMhcA2AOverlapNumerics:
         torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
         _assert_close_grads(overlap_gradients, reference_gradients)
 
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    def test_cuda_graph_replay_receives_padding_mask(self):
+        # The attention-only CUDA-graph split runs the MoE routing tail itself, so
+        # it has to receive the same padding_mask the eager callable reads off
+        # node.chunk_state. The schedule reaches it through _te_cuda_graph_replay
+        # rather than TransformerLayer.__call__, so nothing else puts the mask in
+        # kwargs. Losing it is silent -- the router would take the unpadded branch
+        # for the z-loss mean, dropless gating, and the aux-loss-free load counters
+        # -- so pin the argument at the boundary instead of the numerics.
+        from megatron.core.transformer.enums import CudaGraphModule
+
+        config = _make_mhc_numerical_config()
+        with deterministic_mode():
+            data = build_input_data(seq_len=16)
+            model = build_gpt_model(config)
+            reset_model(model)
+
+            recorded = []
+
+            class _StopAfterRecord(Exception):
+                pass
+
+            for layer in model.decoder.layers:
+                # Make submodule_attn_forward take the CUDA-graph replay branch
+                # without capturing anything: the branch is gated on a truthy
+                # cuda_graphs attribute plus attn in cuda_graph_modules.
+                layer.cuda_graphs = [object()]
+                layer.config.cuda_graph_modules = [CudaGraphModule.attn]
+                layer.set_te_cuda_graph_backward_dw_wrapper = lambda: None
+
+                def _record(*args, **kwargs):
+                    recorded.append(kwargs)
+                    raise _StopAfterRecord
+
+                layer._te_cuda_graph_replay = _record
+
+            padding_mask = torch.ones_like(data["input_ids"], dtype=torch.bool)
+            padding_mask[:, -4:] = False
+            plan = model.build_schedule_plan(**data, padding_mask=padding_mask)
+            with pytest.raises(_StopAfterRecord):
+                TransformerModelChunkSchedulePlan.run(plan, None)
+
+        assert recorded, "the CUDA-graph replay entry point was never reached"
+        assert "padding_mask" in recorded[0], (
+            "the schedule must forward padding_mask to the attention-only CUDA-graph "
+            "replay; without it the graphed routing tail silently drifts from eager "
+            "on padded batches"
+        )
+        forwarded = recorded[0]["padding_mask"]
+        # Compare contents, not identity: the model may reshape the mask for
+        # sequence parallelism before it lands on the chunk state.
+        assert forwarded is not None
+        assert int((~forwarded).sum()) == 4
+
     def test_mtp_builder_tracks_callable_tuple_width(self):
         # The MTP builder wraps build_transformer_layer_callables and re-unpacks its
         # result, so it has to track that tuple's width. When mHC post-processing was

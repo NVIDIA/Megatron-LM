@@ -2734,7 +2734,12 @@ def _get_triton_h_post_bda_bwd():
 def _torch_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tuple[Tensor, Tensor]:
     grad_output_expanded = grad_output.unsqueeze(2)
     grad_x = grad_output_expanded * h_pre.unsqueeze(-1)
-    grad_h = torch.sum(grad_output_expanded * x, dim=-1)
+    # Accumulate grad_h in fp32: the reduction spans the whole hidden dimension,
+    # and a bf16 product makes it ~3x noisier. The cuTile kernel
+    # (_ct_h_agg_bwd_kernel) and NativeHAggregateInto.backward both upcast for
+    # this reason, and this fallback is reachable whenever cuTile is absent --
+    # including Triton-present builds -- so it has to agree with them.
+    grad_h = torch.sum(grad_output_expanded.float() * x.float(), dim=-1)
     return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype)
 
 

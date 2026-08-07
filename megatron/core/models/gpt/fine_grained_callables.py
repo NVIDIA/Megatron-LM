@@ -102,6 +102,11 @@ def should_free_input(name, is_moe, config, num_local_experts):
         # so they cannot be freed.
         "moe_dispatch": not (enable_deepep or enable_hybridep or enable_ncclep)
         and (CudaGraphModule.moe_preprocess not in config.cuda_graph_modules),
+        # The mHC post node feeds the combine output into fused_h_res_h_post_bda,
+        # which saves it for backward, so its storage cannot be released here.
+        # Listed explicitly rather than left to the dict fall-through: this node
+        # is new, and "not freed" is a decision, not an omission.
+        "mhc_post": False,
     }
 
     return free_input_nodes.get(name, False)
@@ -709,6 +714,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             or CudaGraphModule.attn not in layer.config.cuda_graph_modules
         ):
             forward_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
+        elif is_hyper_connection_layer:
+            # The attention-only split replay runs the MoE routing tail itself, so
+            # it needs the padding_mask that the eager branch above reads straight
+            # off node.chunk_state; without it the graphed path routes as if the
+            # batch were unpadded. Threading it here is confined to this path on
+            # purpose: _replay_mhc_attention_consumer forwards only its tensor
+            # allowlist to the captured callable, whereas the generic
+            # _te_cuda_graph_replay_impl hands **kwargs straight to TE, where an
+            # argument absent at capture time would break replay.
+            forward_kwargs["padding_mask"] = node.chunk_state.padding_mask
         forward_outputs = forward_func(**forward_kwargs)
         if is_mhc_layer:
             hidden_states, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post = (

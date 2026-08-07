@@ -21,7 +21,14 @@ from torch import Tensor
 
 
 class MHCRecomputePhase(IntEnum):
-    """Backward consumer barriers in EP 1F1B execution order."""
+    """Backward consumer barriers in EP 1F1B execution order.
+
+    ``BEFORE_MLP_BWD`` has no producer today: the schedule recomputes the whole
+    group at ``BEFORE_COMBINE_BWD``. It is named here so that the phase ordering
+    is the real backward order, which is what a later dependency partitioning
+    would split on (see ``CheckpointManager.recompute_until``); until then
+    nothing constructs it and the middle barrier is intentionally unreachable.
+    """
 
     BEFORE_COMBINE_BWD = 0
     BEFORE_MLP_BWD = 1
@@ -37,28 +44,29 @@ class MHCRecomputeSlotMetadata:
     device: torch.device
     layout: torch.layout
     data_ptr: int
-    storage_offset: int
 
 
 class MHCRecomputeArenaSlot:
     """One fixed-address output view shared by producer and graph consumer."""
 
-    def __init__(self, key: Hashable, tensor: Tensor, ordinal: int):
+    def __init__(self, key: Hashable, tensor: Tensor):
         if not isinstance(tensor, Tensor) or not tensor.is_cuda:
             raise TypeError("mHC recompute arena slots must be CUDA tensors")
         if not tensor.is_contiguous():
             raise ValueError("mHC recompute arena slots must be contiguous")
 
         self.key = key
-        self.ordinal = ordinal
         self.consumer = tensor
+        # storage_offset is deliberately not recorded: data_ptr already equals
+        # storage.data_ptr() + storage_offset * itemsize, so pointer equality is
+        # the offset check. Storing it too would read like a second, independent
+        # invariant that nothing enforces.
         self.metadata = MHCRecomputeSlotMetadata(
             shape=tensor.shape,
             dtype=tensor.dtype,
             device=tensor.device,
             layout=tensor.layout,
             data_ptr=tensor.data_ptr(),
-            storage_offset=tensor.storage_offset(),
         )
 
     @property
@@ -118,7 +126,7 @@ class MHCRecomputeArena:
                 raise RuntimeError(f"mHC arena key {key!r} was rebound to a different tensor")
             return existing
 
-        slot = MHCRecomputeArenaSlot(key, tensor, len(self._order))
+        slot = MHCRecomputeArenaSlot(key, tensor)
         self._slots[key] = slot
         self._order.append(key)
         return slot

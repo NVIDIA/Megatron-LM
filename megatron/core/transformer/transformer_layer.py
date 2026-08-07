@@ -2606,7 +2606,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         dispatch/experts/combine. The return contract matches the eager mHC-MoE
         callable in fine_grained_callables.submodule_attn_forward.
         """
-        hidden_states, _context, mhc_recompute_manager, _kwargs = (
+        hidden_states, _context, mhc_recompute_manager, kwargs = (
             self._replay_mhc_attention_consumer(args, kwargs, context)
         )
         if not self.is_moe_layer:
@@ -2646,16 +2646,16 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             pre_mlp_layernorm_output, _ = pre_mlp_layernorm_output
 
         shared_expert_output = self.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-        # Route with the same arguments the eager callable passes. The router
-        # consumes padding_mask in three places -- the z-loss mean, dropless
+        # Route with exactly the arguments the eager overlap callable passes
+        # (fine_grained_callables.submodule_attn_forward): padding_mask only.
+        # The router consumes it in three places -- the z-loss mean, dropless
         # gating, and the expert-load counters behind the aux-loss-free bias --
-        # so dropping it here would make the graphed path drift from eager on
-        # padded batches without failing anything.
+        # so dropping it would make the graphed path drift from eager on padded
+        # batches without failing anything. input_ids and packed_seq_params are
+        # deliberately not forwarded: the eager callable does not pass them
+        # either, and parity with eager is this method's contract.
         probs, routing_map = self.mlp.route(
-            pre_mlp_layernorm_output,
-            padding_mask=kwargs.get("padding_mask"),
-            input_ids=kwargs.get("input_ids"),
-            packed_seq_params=kwargs.get("packed_seq_params"),
+            pre_mlp_layernorm_output, padding_mask=kwargs.get("padding_mask")
         )
         local_tokens, probs = self.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
         return (residual, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post)

@@ -2321,10 +2321,11 @@ class TransformerConfig(ModelParallelConfig):
         ):
             raise ValueError(
                 "mHC recompute with overlap_moe_expert_parallel_comm requires CUDA graphs "
-                "to be disabled, except for the attention-only Transformer Engine split or "
-                "full-iteration capture "
+                "to be disabled, except for the attention-only Transformer Engine split "
                 "(cuda_graph_impl='transformer_engine', cuda_graph_modules=[attn], "
-                "recompute_modules=[mhc]), because other graph scopes cannot represent the "
+                "recompute_modules=[mhc]) or full-iteration capture "
+                "(cuda_graph_impl='full_iteration', hidden_dropout=0, "
+                "attention_dropout=0), because other graph scopes cannot represent the "
                 "explicit schedule-owned recompute barrier."
             )
 
