@@ -7,6 +7,32 @@ This ledger starts empty. Append every experiment, including failures and
 regressions. Never edit an earlier result after it is recorded — supersede it
 with a new row.
 
+## Accepted changes
+
+**The at-a-glance answer to "what actually landed."** Every accepted experiment
+gets a row here *and* a full row in the experiment index below. This table is a
+duplicate on purpose: the index interleaves accepts with rejections and gated-out
+levers, and detailed records bury PR links hundreds of lines down, so neither is
+readable as a summary. One row per accepted mechanism, newest last.
+
+| ID | Date | Mechanism | Gain | Kill switch | PR | PR state |
+|---|---|---|---:|---|---|---|
+| — | — | _nothing accepted yet_ | — | — | — | — |
+
+Rules for this table:
+
+- A row appears here **only** after the change passed its A/B on distribution
+  separation and its correctness gate. Nothing provisional.
+- `Gain` is the percentage against the same-session OFF arm, not against a
+  historical baseline.
+- `PR` is a markdown link to the draft MR. If a PR is superseded, replace the
+  link and note the superseded number in the detailed record, not here.
+- `PR state` is draft, open, merged, or closed. Refresh it when you touch the
+  ledger; a stale "draft" against a merged PR is the failure mode this column
+  exists to catch.
+- Reverted-after-the-fact changes are struck through here with a pointer to the
+  regression's entry. Do not delete the row.
+
 ## Fixed protocol
 
 | Setting | Value |
@@ -62,6 +88,9 @@ computed, before any code change.
 7. Revert regressions or correctness failures.
 8. Record the result — including rejections, with their root cause — before
    beginning another experiment.
-9. Open a separate draft MR for each accepted change, and link it from its row.
+9. Open a separate draft MR for each accepted change, and link it from **both**
+   the *Accepted changes* table and its experiment-index row. An accepted change
+   that is missing from the *Accepted changes* table is not recorded, however
+   thorough its detailed write-up is.
 10. Stop when mcore meets or exceeds `VLLM-BASELINE`, then rerun both baselines
     once to confirm parity under identical conditions.

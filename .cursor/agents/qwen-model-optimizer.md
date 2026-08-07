@@ -23,17 +23,20 @@ Before acting, read:
 4. `skills/nsight-system-analysis/SKILL.md` — **the** profile analysis skill
 5. `skills/optimize-inference-siddharth/SKILL.md` — **the** optimization skill
 
-There are exactly two performance skills: analysis and optimization. Do not go
-looking for others, and do not invent skill paths.
+There are exactly two performance skills: analysis and optimization. A third,
+`vllm-codebase-reference`, answers questions about the competitor's source and is
+read on demand rather than up front. Do not go looking for others, and do not
+invent skill paths.
 
 Treat `EXPERIMENTS.md` as the sole source of performance history.
 
-## Division of labour between the two skills
+## Division of labour
 
-| Question | Skill |
+| Question | Where it goes |
 |---|---|
 | What does this trace say? Where does one decode step spend its time? | `nsight-system-analysis` |
 | Which lever do I pull, is it worth building, and how do I not break it? | `optimize-inference-siddharth` |
+| How does *vLLM* do this? | the `vllm-codebase-expert` subagent |
 
 `nsight-system-analysis` owns windowing, interval-union arithmetic, per-category
 attribution, and the report format. Its `scripts/forward_pass.py` (Workflow C)
@@ -56,6 +59,39 @@ their mechanism.
 Supporting skills, only when the task calls for them:
 `skills/cog-setup-and-help` (cluster, image, session, sbatch escape hatch),
 `skills/git-credentials-setup` (any GitHub auth failure).
+
+## Asking how vLLM does it
+
+The vLLM source that produces the baseline is checked out at
+`/Users/shanmugamr@nvidia.com/vllm`, at the exact revision the benchmarks run.
+When the differential says vLLM is cheaper and you need to know *how*, read the
+source rather than your recollection of vLLM — recent releases moved and deleted
+enough that remembered layout is routinely wrong.
+
+Delegate that lookup to the **`vllm-codebase-expert`** subagent instead of
+grepping the tree yourself; it is a large tree and the answers are usually a
+paragraph. Send it a specific question and the context it needs (kernel name,
+config, what you are trying to decide). It is read-only and returns cited paths.
+Its knowledge lives in `skills/vllm-codebase-reference/SKILL.md`, which you can
+read directly for a one-off lookup you are already in the middle of.
+
+Four things worth asking it, in rough order of value:
+
+1. **Which library is this trace kernel from, and what calls it?** The
+   differential's first move whenever a bucket shows the same launch count on
+   both sides and more time on ours. Frequently ends with "flashinfer, and it is
+   already in our venv."
+2. **How does vLLM structure this stage** — routing, dispatch, shared-expert
+   overlap, graph capture — and what selects that path by default?
+3. **Which env var or config flag gates it**, and is it on in our baseline
+   command?
+4. **Is the win upstream vLLM code or an external package?** This is the
+   difference between a day of work and a quarter of it.
+
+What comes back is a mechanism and a bound, not a decision. Price it through
+`references/decision-gates.md` before building, exactly as you would any other
+lever — that the competitor fuses something proves the fusion is legal, not that
+yours will be faster.
 
 ## Baseline gate
 
@@ -103,7 +139,11 @@ Repeat until mcore reaches vLLM:
    it identified.
 2. Classify the dominant signal — compute, memory, launch, communication,
    synchronization, or host scheduling — then jump to the matching section via
-   the routing table in `optimize-inference-siddharth` Step 1.
+   the routing table in `optimize-inference-siddharth` Step 1. When the signal is
+   "vLLM does this differently" — same launch count but more time, a role vLLM
+   fuses that we split, or a stage vLLM does not have at all — ask the
+   `vllm-codebase-expert` subagent how vLLM implements it *before* designing the
+   fix.
 3. **Gate the lever before building it.** Share of device time is not headroom.
    Compute the ceiling per `references/decision-gates.md`, subtract what the fix
    itself costs, and write down *proceed* or *gated out*. Skip the gate only for
@@ -120,7 +160,8 @@ Repeat until mcore reaches vLLM:
 10. Append the complete result to `EXPERIMENTS.md` — including rejections, with
     their root cause and date.
 11. Keep improvements; revert regressions and correctness failures.
-12. For each accepted change, open its own MR (next section).
+12. For each accepted change, open its own MR and record it in all three ledger
+    locations, including the pinned *Accepted changes* table (next section).
 13. Promote whatever generalizes into the skills (section after that).
 
 Never optimize from a warmup/capture-only nsys window. `forward_pass.py` already
@@ -159,9 +200,25 @@ The description must let a reviewer judge the change without re-running it:
 - **Scope and risks** — configs where it does not apply or was not measured.
 - **Artifacts** — ledger entry id, run/job paths, `.nsys-rep` / `.sqlite` paths.
 
-Link the PR from its `EXPERIMENTS.md` entry so the ledger and the MR are
-cross-referenced. Rejected experiments do not get a PR — they get a ledger entry
-with the root cause.
+Record every accepted change in `EXPERIMENTS.md` in **three** places, and treat
+the change as unrecorded until all three exist:
+
+1. A row in the pinned **Accepted changes** table at the top — mechanism, gain,
+   kill switch, PR link, PR state. This is the table a human reads months later
+   to answer "what landed"; it is the only view that is not interleaved with
+   rejections or buried in a session write-up.
+2. A complete row in the **Experiment index**, including its `MR` column.
+3. The detailed record, with protocol, attribution, and artifacts.
+
+The duplication is deliberate. Do not "simplify" it by leaving the PR link in only
+one place — a PR recorded only inside a detailed record is effectively lost, and
+that has already happened once in this ledger.
+
+Refresh the `PR state` column whenever you touch the ledger, so a merged PR does
+not sit there reading "draft".
+
+Rejected experiments do not get a PR and do not get an *Accepted changes* row —
+they get an index row and a detailed record with the root cause.
 
 ## Keep the skills learnable
 
@@ -182,6 +239,7 @@ Route by subject:
 |---|---|
 | A profiling technique, anchoring trick, windowing pitfall, taxonomy fix, script improvement | `skills/nsight-system-analysis/` — `SKILL.md` for a workflow or hard rule, `references/pitfalls.md` for a trap, `references/sql_recipes.md` for a query, `references/taxonomy_template.yml` for categories, `scripts/` for tooling |
 | An optimization pattern, decision gate, flag behavior, invariant, A/B methodology, competitor-diff insight | `skills/optimize-inference-siddharth/` — route via the table in `references/updating-this-skill.md`; only new invariants, flag behavior, and routing lines go in its `SKILL.md` |
+| A vLLM path that moved, a stale-layout trap that cost a search, a resolved kernel-to-package mapping | `skills/vllm-codebase-reference/` — `references/navigation-map.md` for paths, the traps section of its `SKILL.md` for stale knowledge. Record the vLLM HEAD sha you verified against. |
 | Cluster, queue, image, or launch failure that cost real time | `skills/run-qwen-model/SKILL.md` or `skills/cog-setup-and-help/SKILL.md` |
 | Everything else about this campaign | `skills/run-qwen-model/EXPERIMENTS.md` |
 
@@ -200,6 +258,9 @@ to its revision log. Apply the same discipline to
 ## Guardrails
 
 - Do not change the vLLM baseline configuration.
+- The vLLM checkout at `/Users/shanmugamr@nvidia.com/vllm` is read-only. Never
+  edit, commit, checkout, or clean it — it defines the baseline, and changing it
+  invalidates every number in `EXPERIMENTS.md` with no error.
 - Do not change batch size, OSL, checkpoint, hardware, or parallelism to claim
   a speedup.
 - Do not stack unmeasured changes; one mechanism per experiment and per PR.

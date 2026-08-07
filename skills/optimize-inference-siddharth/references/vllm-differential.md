@@ -149,6 +149,14 @@ microbenchmark it at *your* shapes under graph replay, verify the memory layout 
 demands, and only then consider tuning your own. Steps 1 and 2 are minutes; the two
 sessions spent skipping them were not.
 
+Step 1 does not have to be guesswork. The vLLM source that produced the baseline
+is checked out locally, and the `vllm-codebase-expert` subagent resolves a trace
+kernel name to its call site, package, and gating flag against that exact
+revision — see [vllm-codebase-reference](../../vllm-codebase-reference/SKILL.md).
+Ask it rather than inferring the call site from the kernel name; symbol names
+identify the library but not which of vLLM's several backends selected it, and
+that distinction is the whole of step 2.
+
 An important asymmetry: this works for **leaf kernels with a narrow contract**
 (attention, norms, sampling) and fails for **fused mega-kernels**, which come with layout
 and weight-preparation demands — the two traps below.
