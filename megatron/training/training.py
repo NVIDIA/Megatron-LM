@@ -1428,6 +1428,59 @@ def pretrain(
     import atexit
     atexit.register(_end_otel_job_spans)
 
+    # atexit does NOT run on SIGTERM (CPython terminates without unwinding), and the
+    # ft_launcher tears down ranks with SIGTERM-then-SIGKILL on a fault/restart -- so
+    # without a SIGTERM handler, megatron.train (and the open span tree) leaks as a
+    # never-exported span in exactly the faulted runs we care about.
+    import signal as _signal
+
+    _otel_prev_sigterm = _signal.getsignal(_signal.SIGTERM)
+    # A2: with --exit-signal-handler, SIGTERM means "finish the current iteration, save a final
+    # checkpoint, then exit" (DistributedSignalHandler drain -> should_exit). We must not end
+    # spans / shut down the provider in that case -- that truncates megatron.train and drops the
+    # final-iteration + final-checkpoint spans; the normal should_exit path runs _end_otel_job_spans.
+    # There we only bounded-flush so nothing already-ended is lost if SIGKILL beats the drain.
+    # For an immediate/hard terminate (SIG_DFL / ft hard kill) we end + export the tree now.
+    _otel_graceful_drain = False
+    try:
+        _otel_graceful_drain = bool(getattr(get_args(), 'exit_signal_handler', False))
+    except Exception:
+        pass
+    _otel_sigterm_fired = [False]  # A3: re-entry guard so a 2nd SIGTERM can't re-enter shutdown()
+
+    def _otel_force_flush():
+        try:
+            from opentelemetry import trace as _ot
+            _prov = _ot.get_tracer_provider()
+            if hasattr(_prov, 'force_flush'):
+                _prov.force_flush()
+        except Exception:
+            pass
+
+    def _otel_sigterm_handler(signum, frame):
+        if not _otel_sigterm_fired[0]:
+            _otel_sigterm_fired[0] = True
+            try:
+                if _otel_graceful_drain:
+                    _otel_force_flush()      # graceful drain: flush only, keep provider alive
+                else:
+                    _end_otel_job_spans()    # hard terminate: end + export the tree now
+            except Exception:
+                pass
+        # chain to whatever handler was already installed (ft/torchelastic drain, or default)
+        if callable(_otel_prev_sigterm):
+            _otel_prev_sigterm(signum, frame)
+        elif _otel_prev_sigterm == _signal.SIG_DFL:
+            _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        # SIG_IGN: previous handler ignored SIGTERM -> nothing more to do.
+
+    try:
+        _signal.signal(_signal.SIGTERM, _otel_sigterm_handler)
+    except (ValueError, OSError):
+        # Not the main thread / platform unsupported -> atexit remains the fallback.
+        pass
+
     # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
     program_start_global = _TRAIN_START_TIME
     if _STARTUP_TIMESTAMPS['program_start'] is not None:
