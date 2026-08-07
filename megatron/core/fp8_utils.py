@@ -347,11 +347,9 @@ def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, F
     try:
         custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
     except AttributeError:
-        raise ValueError(
-            """CustomRecipe recipe is not available in this version of 
-            Transformer Engine. Please make sure you are using TE version 
-            >= 2.9.0.dev0."""
-        )
+        raise ValueError("""CustomRecipe recipe is not available in this version of
+            Transformer Engine. Please make sure you are using TE version
+            >= 2.9.0.dev0.""")
     return custom_recipe
 
 
@@ -809,6 +807,12 @@ if HAVE_TE:
                 fp8_format=fp8_format,
                 override_linear_precision=(False, False, not config.fp8_wgrad),
             )
+
+        # Set recipe attrs
+        if fp8_recipe is not None and config.fp8_recipe_attrs is not None:
+            for key, val in config.fp8_recipe_attrs.items():
+                setattr(fp8_recipe, key, val)
+
         return fp8_recipe
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
