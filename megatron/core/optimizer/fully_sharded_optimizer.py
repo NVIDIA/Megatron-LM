@@ -8,6 +8,9 @@ import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
+from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
+)
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
@@ -120,7 +123,16 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """No-op: MFSDP v2 reduces directly into optimizer-visible sharded grads."""
 
     def _copy_main_params_to_model_params(self) -> None:
-        """No-op: MFSDP v2 currently syncs compute weights in its forward pre-hook."""
+        """Refresh MFSDP V2 compute weights after updating optimizer weights."""
+        # TODO(wujingyue): Reuse experimental.checkpoint.resync_compute_weights after #6024 merges.
+        seen_parameter_groups = set()
+        for parameter in self.get_parameters():
+            if (parameter_group := get_containing_parameter_group(parameter)) is None:
+                continue
+            if parameter_group in seen_parameter_groups:
+                continue
+            seen_parameter_groups.add(parameter_group)
+            parameter_group.sync_model_weight_from_main_weight()
 
     def _copy_model_params_to_main_params(self, state_dict=None) -> None:
         """No-op: model loads already write into MFSDP v2's main weights."""
