@@ -67,8 +67,8 @@ often they paid off:
    identical launch count, the usual cause is that the competitor is calling a
    different *library*, not a better-tuned version of yours — and on a shared image
    that library is often already installed. Switching the decode attention to
-   flashinfer's `trtllm-gen` was +2.6%; the two sessions spent tuning inside the wrong
-   package were worth nothing. See
+   flashinfer's `trtllm-gen` was +2.6%, while the preceding effort spent tuning
+   inside the wrong package was worth nothing. See
    [references/vllm-differential.md](references/vllm-differential.md).
 
 Everything else in this skill is a consequence of these six.
@@ -431,11 +431,12 @@ tuned value, so the useful move is often *checking* rather than changing them.
 | `SamplingParams.return_prompt_tokens` | `False` | Opt in to echoing prompt ids over the wire |
 | `moe_enable_routing_replay` | `False` | Record per-token expert choices for imbalance analysis |
 
-Three further gates exist as environment variables in PR #6064 and are **not merged**,
-so do not expect them in the tree: `MCORE_NVLS_RS_BF16` (bf16 reduce-scatter buffer,
-+2.5%), `MCORE_FLASHINFER_DECODE` (flashinfer `trtllm-gen` decode attention, +2.6%), and
-`MCORE_FLASHINFER_PDL` (Programmatic Dependent Launch for that kernel, +0.3%). If they
-have since landed as config flags, correct this section.
+Three further gates have been measured as environment variables but are **not in the
+tree**, so do not expect to find them: `MCORE_NVLS_RS_BF16` (bf16 reduce-scatter
+buffer, +2.5%), `MCORE_FLASHINFER_DECODE` (flashinfer `trtllm-gen` decode attention,
++2.6%), and `MCORE_FLASHINFER_PDL` (Programmatic Dependent Launch for that kernel,
++0.3%). Each is a mechanism worth rebuilding, with a known target. If they have since
+landed as config flags, correct this section.
 
 ### Flags that look like free wins and are not
 

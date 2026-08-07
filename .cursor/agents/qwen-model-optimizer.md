@@ -28,7 +28,12 @@ There are exactly two performance skills: analysis and optimization. A third,
 read on demand rather than up front. Do not go looking for others, and do not
 invent skill paths.
 
-Treat `EXPERIMENTS.md` as the sole source of performance history.
+`EXPERIMENTS.md` is the sole record of **this campaign's** results — every number
+you measure goes there and nowhere else. It is not the only source of prior
+knowledge: the two performance skills carry measured findings from earlier work on
+this same model, including flags and levers already tried and rejected with their
+mechanism. Trust those to avoid re-deriving dead ends, but never treat a number
+quoted in a skill as a baseline. Re-measure before you compare.
 
 ## Division of labour
 
@@ -115,6 +120,9 @@ Do not modify Megatron-Core until both fresh baselines are recorded:
 
 Use the commands and fixed protocol in `skills/run-qwen-model/SKILL.md`.
 
+These two baselines are the **only** measurements taken at `main`. From the first
+experiment onward every run happens on the stack described below.
+
 ## Optimization loop
 
 Repeat until mcore reaches vLLM:
@@ -127,8 +135,9 @@ Repeat until mcore reaches vLLM:
        <mcore>.sqlite <vllm>.sqlite --label-a mcore --label-b vllm
    ```
 
-   The current baseline trace paths are recorded in `EXPERIMENTS.md`; re-capture
-   rather than hunt for a trace you cannot open. `forward_pass.py` auto-isolates
+   Baseline trace paths live in `EXPERIMENTS.md` once recorded. At the start of a
+   campaign the ledger has none — capture them per the baseline gate rather than
+   hunting for an older trace. `forward_pass.py` auto-isolates
    one decode step per engine and prints wall time, GPU-busy vs idle, launch
    counts,
    and a per-category Δ table. Same µs/kernel with more launches ⇒ the lever is
@@ -149,19 +158,29 @@ Repeat until mcore reaches vLLM:
    itself costs, and write down *proceed* or *gated out*. Skip the gate only for
    cheap reversible changes (flag flips, tile retunes, backend swaps).
 4. State one measurable hypothesis.
-5. Back up or capture the current diff before editing.
+5. Cut a branch from the **stack tip** — every accepted change applied — and never
+   from `main`. Capture the current diff before editing.
 6. Implement one change in the bottleneck's source path, honoring the
    optimization skill's hard rules, and add a kill switch.
 7. Run focused correctness tests.
 8. Run the fixed BS256 mcore benchmark using the same-session, back-to-back,
    alternating-arms A/B protocol (hard rule 10). Cross-session comparisons drift
-   more than most individual wins.
-9. Capture a new profile when the timing composition could have changed.
+   more than most individual wins. **Both arms run on the stack tip**, with every
+   accepted change below this one enabled in both; the only thing that flips
+   between arms is this change's kill switch. The result is a *marginal* gain on
+   top of the stack, which is what the reviewer of this PR will get — not the gain
+   the change would have shown against `MCORE-BASELINE`.
+9. Capture a new profile when the timing composition could have changed. Re-anchor
+   against the current stack tip, not the baseline trace: earlier accepted changes
+   have already moved the composition, so a category that looked dominant at
+   baseline may no longer be.
 10. Append the complete result to `EXPERIMENTS.md` — including rejections, with
-    their root cause and date.
-11. Keep improvements; revert regressions and correctness failures.
-12. For each accepted change, open its own MR and record it in all three ledger
-    locations, including the pinned *Accepted changes* table (next section).
+    their root cause, date, and the stack position they were measured on.
+11. Keep improvements; revert regressions and correctness failures. A reverted
+    change is removed from the stack, and the tip moves back to its parent.
+12. For each accepted change, open its stacked MR and record it in all three ledger
+    locations, including *The merge stack* table (next section). The new branch
+    becomes the stack tip for the next iteration.
 13. Promote whatever generalizes into the skills (section after that).
 
 Never optimize from a warmup/capture-only nsys window. `forward_pass.py` already
@@ -170,25 +189,88 @@ its reported forward-pass period against measured TPOT before acting. Always
 reason in terms of one forward pass: GPU-busy interval union, GPU idle,
 per-category time, launch counts, and critical communication or kernel tails.
 
-## Ship each accepted experiment as its own MR
+## Ship accepted experiments as a stacked chain of MRs
 
-Every experiment that succeeded gets a **separate** draft PR against
-`main` in `NVIDIA/Megatron-LM`. One mechanism per PR, so the measurement
-attributes cleanly and CODEOWNERS review stays narrow (see
+Every experiment that succeeded gets its own draft PR, one mechanism per PR, so
+the measurement attributes cleanly and CODEOWNERS review stays narrow (see
 `skills/mcore-split-pr/SKILL.md` if a change spans several owner groups).
 
-Before opening it, walk `skills/optimize-inference-siddharth/assets/review-checklist.md`.
+**The PRs are stacked, not independent.** `main` is used exactly once — to cut the
+branch for stack position 1. Every accepted change after that branches off the
+previous accepted change, **whether or not the two are logically related**. Do not
+return to `main` between experiments.
 
-Mechanics, per `CLAUDE.md`: branch off `main`, commit with both `-s` and `-S`,
-push to your **personal fork** — never to `NVIDIA/Megatron-LM` — then
-`gh pr create --draft`. `origin` here points at the upstream repo, so confirm a
-fork remote exists and ask the user for it if it does not.
+```
+main ──● (baselines only)
+       └──● 01  ──● 02  ──● 03  ──● …
+```
+
+The reviewer merges in ascending order, rebasing each row as its parent lands, so
+each review sees one mechanism even though the work was cumulative. Your job is to
+make that sequence unambiguous.
+
+**Maintain one local branch that is always the stack tip** — every accepted change
+applied, nothing rejected. Cut each new experiment from the tip, and when the
+experiment is accepted, the tip becomes that new branch. This is also what makes
+the next experiment's measurement correct: you are always measuring on top of what
+has already been accepted, so the marginal gain you report is the marginal gain a
+reviewer will actually get.
+
+Before opening a PR, walk
+`skills/optimize-inference-siddharth/assets/review-checklist.md`.
+
+### Mechanics
+
+Per `CLAUDE.md`: commit with both `-s` and `-S`, push to your **personal fork** —
+never to `NVIDIA/Megatron-LM` — then `gh pr create --draft`. `origin` here points
+at the upstream repo, so confirm a fork remote exists and ask the user for it if it
+does not.
+
+Stack-specific mechanics on top of that:
+
+- **Branch names carry the stack position**: `perf/qwen-NN-<slug>`, zero-padded,
+  ascending. The merge order must be readable from the branch name alone.
+- **Cut from the predecessor**, not `main`:
+  `git checkout -b perf/qwen-02-<slug> perf/qwen-01-<slug>`.
+- **The PR base is still `main`.** Branches cannot be pushed to
+  `NVIDIA/Megatron-LM`, so a PR cannot target a parent branch that only exists on
+  your fork. Consequence: until the parent merges, the PR diff shows the parent's
+  changes too. Say so in the description — see the stack block below — so a
+  reviewer does not read it as scope creep.
+- **When the parent merges, rebase past it** and force-push. A plain
+  `git rebase main` reapplies commits already in `main` and conflicts, especially
+  when the parent was squash-merged:
+
+  ```bash
+  git fetch origin main
+  git rebase --onto origin/main perf/qwen-01-<slug> perf/qwen-02-<slug>
+  git push --force-with-lease <fork> perf/qwen-02-<slug>
+  ```
+
+  Force-push only to your own fork's stack branches.
+- **If a row is rejected upstream** rather than merged, rebase the rows above it
+  past it with the same `--onto` form, strike its ledger row through with the
+  reason, and retire its number. Re-measure the rows that were sitting on it if
+  they touched the same code path — their marginal gains were measured against a
+  baseline that no longer exists.
+
+### Every PR description states its stack position
+
+Add this block at the top of the description, above the usual sections:
+
+```
+Stack position 2 of N. Base: main. Parent: #<parent PR> (perf/qwen-01-<slug>).
+Merge after #<parent PR>. Until then this PR's diff also contains the parent's
+changes; the commit for this mechanism is <sha>.
+```
 
 The description must let a reviewer judge the change without re-running it:
 
 - **What changed and why** — a brief summary of the mechanism, not a file list.
-- **Measured gain** — percentage over baseline, with the baseline it is measured
-  against, and the absolute throughput/latency/TPOT numbers.
+- **Measured gain** — the marginal percentage over the stack level below this
+  change, named explicitly, plus the cumulative absolute
+  throughput/latency/TPOT with the whole stack applied. Never quote a marginal
+  gain against `MCORE-BASELINE`; on a stack that overstates the change.
 - **Protocol** — hardware, model, batch, OSL, parallelism, warmup/timed counts,
   and that the arms ran back to back in the same allocation. State arm
   separation (`min(ON) > max(OFF)`), not just the mean delta.
@@ -200,25 +282,28 @@ The description must let a reviewer judge the change without re-running it:
 - **Scope and risks** — configs where it does not apply or was not measured.
 - **Artifacts** — ledger entry id, run/job paths, `.nsys-rep` / `.sqlite` paths.
 
+### Record it in the ledger
+
 Record every accepted change in `EXPERIMENTS.md` in **three** places, and treat
 the change as unrecorded until all three exist:
 
-1. A row in the pinned **Accepted changes** table at the top — mechanism, gain,
-   kill switch, PR link, PR state. This is the table a human reads months later
-   to answer "what landed"; it is the only view that is not interleaved with
-   rejections or buried in a session write-up.
-2. A complete row in the **Experiment index**, including its `MR` column.
+1. A row in **The merge stack** table at the top, with its `#`, mechanism, branch,
+   `Cut from`, PR link, PR state, marginal gain, cumulative throughput, and kill
+   switch. This table is the merge order; it is the one view a human reads later
+   to answer "what landed, and in what sequence".
+2. A complete row in the **Experiment index**, including `Measured on` and `PR`.
 3. The detailed record, with protocol, attribution, and artifacts.
 
-The duplication is deliberate. Do not "simplify" it by leaving the PR link in only
-one place — a PR recorded only inside a detailed record is effectively lost, and
-that has already happened once in this ledger.
+The duplication is deliberate — do not collapse it. A PR link that exists only
+inside a detailed record is unreachable in practice, and the `#`/`Cut from`
+columns are the only machine-readable record of the stack's shape once the
+branches are gone.
 
-Refresh the `PR state` column whenever you touch the ledger, so a merged PR does
-not sit there reading "draft".
+Assign `#` at creation and never reuse or reorder it. Refresh `PR state` whenever
+you touch the ledger, so a merged PR does not sit there reading "draft".
 
-Rejected experiments do not get a PR and do not get an *Accepted changes* row —
-they get an index row and a detailed record with the root cause.
+Rejected experiments do not get a PR and do not get a merge-stack row — they get
+an index row and a detailed record with the root cause.
 
 ## Keep the skills learnable
 
@@ -263,7 +348,13 @@ to its revision log. Apply the same discipline to
   invalidates every number in `EXPERIMENTS.md` with no error.
 - Do not change batch size, OSL, checkpoint, hardware, or parallelism to claim
   a speedup.
-- Do not stack unmeasured changes; one mechanism per experiment and per PR.
+- One mechanism per experiment and per PR. Accepted changes *are* stacked, each on
+  the last — that is the required workflow. What is forbidden is carrying more than
+  one unmeasured mechanism at a time: never have two changes in flight on the tip
+  whose effects have not been separated by their own A/B.
+- Never measure on `main` after the baselines, and never cut an experiment branch
+  from `main`. A number measured off the stack is not comparable to anything in the
+  ledger.
 - Never invent expected or observed metrics.
 - Do not retain a change that only improves throughput by breaking coherence.
 - Do not use `git reset --hard` or `git clean`.
@@ -284,5 +375,7 @@ Finish only when one of these is true:
   concrete next step.
 
 Return a concise summary containing baseline, best mcore result, remaining gap,
-accepted changes with their MR links, rejected experiments with root causes,
-skill updates made, and artifact paths.
+the merge stack in order with each row's PR link and marginal gain, rejected
+experiments with root causes, skill updates made, and artifact paths. State the
+merge sequence explicitly — the reviewer's first question is which PR to merge
+first.

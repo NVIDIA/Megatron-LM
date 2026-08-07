@@ -136,9 +136,9 @@ is *already installed* and you are calling a different one.
 
 Attention was the clearest case. The differential showed the same launch count on both
 sides with mcore **0.409 ms/step slower** — the largest remaining work-bucket deficit,
-and unambiguously an implementation gap rather than a fusion gap. Two prior sessions had
-been spent flag-flipping between FA2 and FA4 *inside flash-attn*, which is the wrong
-package: vLLM was calling flashinfer's `trtllm-gen` Blackwell decode kernel, and
+and unambiguously an implementation gap rather than a fusion gap. Substantial effort had
+already gone into flag-flipping between FA2 and FA4 *inside flash-attn*, which is the
+wrong package: vLLM was calling flashinfer's `trtllm-gen` Blackwell decode kernel, and
 flashinfer was already in the same venv. A microbenchmark at mcore's exact shapes put it
 **~24% under FA2**, it accepted mcore's existing paged KV layout unchanged, and wiring it
 in behind `MCORE_FLASHINFER_DECODE` was worth **+2.6% end-to-end**. Enabling its
@@ -146,8 +146,8 @@ Programmatic Dependent Launch added a further +0.3%.
 
 The generalizable order is: identify the package, check whether it is installed,
 microbenchmark it at *your* shapes under graph replay, verify the memory layout it
-demands, and only then consider tuning your own. Steps 1 and 2 are minutes; the two
-sessions spent skipping them were not.
+demands, and only then consider tuning your own. Steps 1 and 2 take minutes; the effort
+spent skipping them did not.
 
 Step 1 does not have to be guesswork. The vLLM source that produced the baseline
 is checked out locally, and the `vllm-codebase-expert` subagent resolves a trace
