@@ -41,7 +41,10 @@ class HuggingFaceFastIncrementalDetokenizer:
             )
 
         self._native_tokenizer = huggingface_tokenizer._tokenizer
-        self._skip_special_tokens = not getattr(tokenizer_wrapper, "include_special_tokens", True)
+        # Final inference decoding always strips special tokens. Streaming must
+        # make the same choice or its concatenated deltas can differ from
+        # ``generated_text`` in the non-streaming response.
+        self._skip_special_tokens = True
         self._decode_stream = self._new_decode_stream(prompt_token_ids)
         self._text_fragments: list[str] = []
         self._text_length = 0

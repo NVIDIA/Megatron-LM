@@ -4,24 +4,39 @@
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 
+logger = logging.getLogger(__name__)
 
-def _token_logprobs(tokenizer, token_ids, log_probs, chat, start_offset):
+
+def _top_logprob_entries(top_logprobs):
+    if not isinstance(top_logprobs, dict):
+        return []
+    return [
+        {"token": str(token), "logprob": logprob, "bytes": list(str(token).encode("utf-8"))}
+        for token, logprob in top_logprobs.items()
+    ]
+
+
+def _token_logprobs(tokenizer, token_ids, log_probs, top_log_probs, chat, start_offset):
     entries = []
     offsets = []
     offset = start_offset
     for i, token_id in enumerate(token_ids):
         token = tokenizer.detokenize([token_id])
+        token_top_logprobs = (
+            top_log_probs[i] if top_log_probs is not None and i < len(top_log_probs) else None
+        )
         entries.append(
             {
                 "token": token,
                 "logprob": log_probs[i] if i < len(log_probs) else None,
                 "bytes": list(token.encode("utf-8")),
-                "top_logprobs": [],
+                "top_logprobs": _top_logprob_entries(token_top_logprobs),
             }
         )
         offsets.append(offset)
@@ -31,7 +46,33 @@ def _token_logprobs(tokenizer, token_ids, log_probs, chat, start_offset):
     return {
         "tokens": [entry["token"] for entry in entries],
         "token_logprobs": [entry["logprob"] for entry in entries],
-        "top_logprobs": [None] * len(entries),
+        "top_logprobs": [
+            top_log_probs[i] if top_log_probs is not None and i < len(top_log_probs) else None
+            for i in range(len(entries))
+        ],
+        "text_offset": offsets,
+    }
+
+
+def _prompt_logprobs(tokenizer, token_ids, log_probs, top_log_probs):
+    token_ids = list(token_ids or [])
+    tokens = [tokenizer.detokenize([token_id]) for token_id in token_ids]
+    token_logprobs = [None] + list(log_probs or [])
+    token_logprobs = token_logprobs[: len(tokens)]
+    token_logprobs.extend([None] * (len(tokens) - len(token_logprobs)))
+    prompt_top_logprobs = [None] + list(top_log_probs or [])
+    prompt_top_logprobs = prompt_top_logprobs[: len(tokens)]
+    prompt_top_logprobs.extend([None] * (len(tokens) - len(prompt_top_logprobs)))
+
+    offsets = []
+    offset = 0
+    for token in tokens:
+        offsets.append(offset)
+        offset += len(token)
+    return {
+        "tokens": tokens,
+        "token_logprobs": token_logprobs,
+        "top_logprobs": prompt_top_logprobs,
         "text_offset": offsets,
     }
 
@@ -42,6 +83,183 @@ def _finish_reason(result):
     return "length" if requested is not None and generated >= requested else "stop"
 
 
+def _common_prefix(left, right):
+    end = 0
+    for left_char, right_char in zip(left, right):
+        if left_char != right_char:
+            break
+        end += 1
+    return left[:end]
+
+
+def _safe_argument_prefix(arguments):
+    """Exclude incomplete empty values inserted by tool parsers."""
+    try:
+        parsed_arguments = json.loads(arguments)
+    except (TypeError, ValueError):
+        return arguments
+    if not isinstance(parsed_arguments, dict):
+        return arguments
+
+    prefix_parts = ["{"]
+    for index, (name, value) in enumerate(parsed_arguments.items()):
+        if index:
+            prefix_parts.append(", ")
+        prefix_parts.extend((json.dumps(name, ensure_ascii=False), ": "))
+        if value == "":
+            return "".join(prefix_parts)
+        prefix_parts.append(json.dumps(value, ensure_ascii=False))
+
+    # An empty object may still acquire parameters on a later parse step.
+    return arguments if parsed_arguments else "{"
+
+
+def _safe_content_prefix(content, markers):
+    """Hold text that may still become a parser control marker."""
+    safe_end = len(content)
+    for marker in markers:
+        marker_index = content.find(marker)
+        if marker_index >= 0:
+            safe_end = min(safe_end, marker_index)
+        for prefix_length in range(1, min(len(marker), len(content)) + 1):
+            if content.endswith(marker[:prefix_length]):
+                safe_end = min(safe_end, len(content) - prefix_length)
+    return content[:safe_end]
+
+
+class StreamingChatParser:
+    """Convert accumulated parser output into stable OpenAI chat deltas."""
+
+    def __init__(self, parse, *, marker_prefixes=(), named_tool_choice=False):
+        self._parse = parse
+        self._marker_prefixes = tuple(marker_prefixes)
+        self._named_tool_choice = named_tool_choice
+        self._content_sent = ""
+        self._reasoning_sent = ""
+        self._previous_arguments = []
+        self._streamed_arguments = []
+        self._tool_ids = []
+        self._tool_names_sent = []
+        self.tools_streamed = False
+
+    def _append_state_for_tool(self):
+        self._previous_arguments.append("")
+        self._streamed_arguments.append("")
+        self._tool_ids.append(f"call_{uuid.uuid4().hex[:24]}")
+        self._tool_names_sent.append(False)
+
+    @staticmethod
+    def _function(call):
+        function = call.get("function", {}) if isinstance(call, dict) else {}
+        return function if isinstance(function, dict) else {}
+
+    def parse(self, text, *, finished=False):
+        """Parse accumulated text and return zero or more structured deltas."""
+        try:
+            content, metadata = self._parse(text)
+        except Exception:
+            logger.exception("Failed to parse a streaming chat delta.")
+            return []
+
+        content = content or ""
+        metadata = metadata or {}
+        tool_calls = metadata.get("tool_calls") or []
+        reasoning = metadata.get("reasoning") or ""
+        deltas = []
+
+        if reasoning.startswith(self._reasoning_sent):
+            reasoning_delta = reasoning[len(self._reasoning_sent) :]
+            if reasoning_delta:
+                deltas.append({"reasoning_content": reasoning_delta})
+                self._reasoning_sent = reasoning
+
+        safe_content = (
+            content
+            if finished or tool_calls
+            else _safe_content_prefix(content, self._marker_prefixes)
+        )
+        if safe_content.startswith(self._content_sent):
+            content_delta = safe_content[len(self._content_sent) :]
+            if content_delta:
+                deltas.append({"content": content_delta})
+                self._content_sent = safe_content
+
+        for index, call in enumerate(tool_calls):
+            while len(self._tool_ids) <= index:
+                self._append_state_for_tool()
+
+            function = self._function(call)
+            function_name = function.get("name")
+            current_arguments = function.get("arguments", "")
+            if not isinstance(current_arguments, str):
+                current_arguments = json.dumps(current_arguments, ensure_ascii=False)
+
+            if function_name and not self._tool_names_sent[index]:
+                deltas.append(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": index,
+                                "id": self._tool_ids[index],
+                                "type": "function",
+                                "function": {"name": str(function_name)},
+                            }
+                        ]
+                    }
+                )
+                self._tool_names_sent[index] = True
+                self.tools_streamed = True
+
+            if self._tool_names_sent[index]:
+                previous_arguments = self._previous_arguments[index]
+                call_is_complete = finished or index + 1 < len(tool_calls)
+                stable_arguments = (
+                    current_arguments
+                    if call_is_complete
+                    else _common_prefix(previous_arguments, current_arguments)
+                )
+                if not call_is_complete:
+                    safe_arguments = _safe_argument_prefix(current_arguments)
+                    stable_arguments = stable_arguments[: len(safe_arguments)]
+                already_sent = self._streamed_arguments[index]
+                if stable_arguments.startswith(already_sent):
+                    argument_delta = stable_arguments[len(already_sent) :]
+                    if argument_delta:
+                        deltas.append(
+                            {
+                                "tool_calls": [
+                                    {"index": index, "function": {"arguments": argument_delta}}
+                                ]
+                            }
+                        )
+                        self._streamed_arguments[index] += argument_delta
+
+            self._previous_arguments[index] = current_arguments
+
+        return deltas
+
+    def finish_reason(self, result):
+        """Return the OpenAI finish reason for this parsed choice."""
+        if self.tools_streamed and not self._named_tool_choice:
+            return "tool_calls"
+        return _finish_reason(result)
+
+
+def _status_name(record):
+    status = record.get("status") if isinstance(record, dict) else None
+    return getattr(status, "name", str(status)).upper()
+
+
+def _failure_message(record):
+    events = record.get("events") or []
+    error_events = [
+        event for event in events if event.get("type") in ("ERROR_NONTRANSIENT", "ERROR_TRANSIENT")
+    ]
+    if error_events:
+        return str(error_events[-1].get("payload", "Unknown error"))
+    return "Unknown inference error"
+
+
 async def openai_stream(
     streams,
     tokenizer,
@@ -50,17 +268,37 @@ async def openai_stream(
     chat,
     return_log_probs=False,
     include_usage=False,
+    chat_parsers=None,
+    echo_prompts=None,
+    prompt_token_ids=None,
 ):
     """Yield SSE records for one or more inference streams."""
     if len(streams) != len(incremental_detokenizers):
         raise ValueError("Each inference stream must have an incremental detokenizer.")
+    if chat_parsers is not None and len(streams) != len(chat_parsers):
+        raise ValueError("Each inference stream must have a streaming chat parser.")
+    if echo_prompts is not None and len(streams) != len(echo_prompts):
+        raise ValueError("Each inference stream must have an echo prompt.")
+    if prompt_token_ids is not None and len(streams) != len(prompt_token_ids):
+        raise ValueError("Each inference stream must have prompt token IDs.")
 
     response_id = f"chatcmpl-{uuid.uuid4().hex}" if chat else str(uuid.uuid4())
     created = int(time.time())
     queue = asyncio.Queue()
     states = [
-        dict(tokens=[], log_probs=[], detokenizer=detokenizer, final=None)
-        for detokenizer in incremental_detokenizers
+        dict(
+            tokens=[],
+            log_probs=[],
+            top_log_probs=[],
+            detokenizer=detokenizer,
+            final=None,
+            role_sent=False,
+            echo_sent=False,
+            parser=chat_parsers[index] if chat_parsers is not None else None,
+            echo_prompt=echo_prompts[index] if echo_prompts is not None else None,
+            prompt_token_ids=prompt_token_ids[index] if prompt_token_ids is not None else [],
+        )
+        for index, detokenizer in enumerate(incremental_detokenizers)
     ]
 
     async def pump(index, stream):
@@ -87,8 +325,41 @@ async def openai_stream(
         return f"data: {json.dumps(payload)}\n\n"
 
     try:
-        if chat:
-            for index in range(len(streams)):
+        remaining = len(streams)
+        while remaining:
+            index, item, error = await queue.get()
+            if error is not None:
+                yield f"data: {json.dumps({'error': {'message': str(error)}})}\n\n"
+                return
+            if item is None:
+                remaining -= 1
+                continue
+
+            state = states[index]
+            is_final = "final" in item
+            if "partial" in item:
+                partial = item["partial"]
+                new_tokens = partial.get("new_tokens") or []
+                new_log_probs = partial.get("new_log_probs") or []
+                new_top_log_probs = partial.get("new_top_n_logprobs") or []
+                prompt_log_probs = partial.get("prompt_log_probs") or []
+                prompt_top_log_probs = partial.get("prompt_top_n_logprobs") or []
+            else:
+                final_record = item["final"]
+                if _status_name(final_record) == "FAILED":
+                    error_payload = {"error": {"message": _failure_message(final_record)}}
+                    yield f"data: {json.dumps(error_payload)}\n\n"
+                    return
+                result = unwrap_serialized_tensors(final_record)
+                state["final"] = result
+                already = len(state["tokens"])
+                new_tokens = (result.get("generated_tokens") or [])[already:]
+                new_log_probs = (result.get("generated_log_probs") or [])[already:]
+                new_top_log_probs = (result.get("generated_top_n_logprobs") or [])[already:]
+                prompt_log_probs = result.get("prompt_log_probs") or []
+                prompt_top_log_probs = result.get("prompt_top_n_logprobs") or []
+
+            if chat and not state["role_sent"]:
                 yield sse(
                     [
                         {
@@ -99,46 +370,77 @@ async def openai_stream(
                         }
                     ]
                 )
+                state["role_sent"] = True
 
-        remaining = len(streams)
-        while remaining:
-            index, item, error = await queue.get()
-            if error is not None:
-                yield f"data: {json.dumps({'error': {'message': str(error)}})}\n\n"
-                continue
-            if item is None:
-                remaining -= 1
-                continue
+            if state["echo_prompt"] is not None and not state["echo_sent"]:
+                yield sse(
+                    [
+                        {
+                            "index": index,
+                            "text": state["echo_prompt"],
+                            "logprobs": (
+                                _prompt_logprobs(
+                                    tokenizer,
+                                    state["prompt_token_ids"],
+                                    prompt_log_probs,
+                                    prompt_top_log_probs,
+                                )
+                                if return_log_probs
+                                else None
+                            ),
+                            "finish_reason": None,
+                        }
+                    ]
+                )
+                state["echo_sent"] = True
 
-            state = states[index]
-            if "partial" in item:
-                partial = item["partial"]
-                new_tokens = partial.get("new_tokens") or []
-                new_log_probs = partial.get("new_log_probs") or []
-            else:
-                result = unwrap_serialized_tensors(item["final"])
-                state["final"] = result
-                already = len(state["tokens"])
-                new_tokens = (result.get("generated_tokens") or [])[already:]
-                new_log_probs = (result.get("generated_log_probs") or [])[already:]
-
-            if not new_tokens:
-                continue
-            state["tokens"].extend(new_tokens)
-            state["log_probs"].extend(new_log_probs)
-            start_offset = state["detokenizer"].text_length
-            delta = state["detokenizer"].update(new_tokens)
-            choice = {
-                "index": index,
-                "logprobs": (
-                    _token_logprobs(tokenizer, new_tokens, new_log_probs, chat, start_offset)
+            if new_tokens:
+                state["tokens"].extend(new_tokens)
+                state["log_probs"].extend(new_log_probs)
+                state["top_log_probs"].extend(new_top_log_probs)
+                start_offset = state["detokenizer"].text_length + len(state["echo_prompt"] or "")
+                delta = state["detokenizer"].update(new_tokens)
+                logprobs = (
+                    _token_logprobs(
+                        tokenizer, new_tokens, new_log_probs, new_top_log_probs, chat, start_offset
+                    )
                     if return_log_probs
                     else None
-                ),
-                "finish_reason": None,
-            }
-            choice["delta" if chat else "text"] = {"content": delta} if chat else delta
-            yield sse([choice])
+                )
+            else:
+                delta = ""
+                logprobs = None
+
+            parser = state["parser"]
+            if parser is not None:
+                parsed_deltas = parser.parse(state["detokenizer"].text, finished=is_final)
+                logprobs_attached = False
+                for parsed_delta in parsed_deltas:
+                    parsed_logprobs = None
+                    if (
+                        not logprobs_attached
+                        and logprobs is not None
+                        and (
+                            parsed_delta.get("content") is not None
+                            or parsed_delta.get("reasoning_content") is not None
+                        )
+                    ):
+                        parsed_logprobs = logprobs
+                        logprobs_attached = True
+                    yield sse(
+                        [
+                            {
+                                "index": index,
+                                "delta": parsed_delta,
+                                "logprobs": parsed_logprobs,
+                                "finish_reason": None,
+                            }
+                        ]
+                    )
+            elif new_tokens:
+                choice = {"index": index, "logprobs": logprobs, "finish_reason": None}
+                choice["delta" if chat else "text"] = {"content": delta} if chat else delta
+                yield sse([choice])
 
         prompt_tokens = completion_tokens = cached_token_count = 0
         for index, state in enumerate(states):
@@ -149,10 +451,13 @@ async def openai_stream(
             prompt_tokens = max(prompt_tokens, prompt_len)
             completion_tokens += len(result.get("generated_tokens") or [])
             cached_token_count = max(cached_token_count, result.get("num_cached_tokens", 0))
+            parser = state["parser"]
             choice = {
                 "index": index,
                 "logprobs": None,
-                "finish_reason": _finish_reason(result),
+                "finish_reason": (
+                    parser.finish_reason(result) if parser is not None else _finish_reason(result)
+                ),
                 "generation_token_ids": list(state["tokens"]),
                 "generation_log_probs": list(state["log_probs"]),
                 "generated_text": state["detokenizer"].text,
