@@ -28,6 +28,11 @@ from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Placements
 
 
+def _is_in_backward() -> bool:
+    """Return whether the current thread is executing an autograd GraphTask."""
+    return torch._C._current_graph_task_id() != -1
+
+
 class FsdpContext:
     """Runtime stream and prefetch state shared by one FSDP subtree."""
 
@@ -244,7 +249,10 @@ class FsdpModule:
         # FORWARD phase here means this forward-pre hook ran while the previous
         # forward was still in progress.
         assert self._phase is not FsdpModule.Phase.FORWARD
-        is_recomputing = self._phase is FsdpModule.Phase.BACKWARD
+        # A reentrant checkpoint recomputes before the child module's backward-pre
+        # hook can set its phase. Its forward still runs inside the active autograd
+        # GraphTask, which is the signal PyTorch FSDP2 uses as well.
+        is_recomputing = self._phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
         if not is_recomputing:
             self._phase = FsdpModule.Phase.FORWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
@@ -292,7 +300,8 @@ class FsdpModule:
         # Recomputed parameters are consumed immediately by this module's
         # backward. Keep them materialized to avoid an unnecessary all-gather;
         # post_backward() will reshard them after gradient reduction.
-        if self._phase is not FsdpModule.Phase.BACKWARD:
+        is_recomputing = self._phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
+        if not is_recomputing:
             self._reshard_parameter_groups()
             self._phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
