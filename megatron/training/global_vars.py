@@ -492,7 +492,13 @@ def build_telemetry_resource_attrs(args):
 def _set_telemetry(args):
     """Initialise OTel telemetry handle following the wandb/tensorboard pattern."""
     global _GLOBAL_TELEMETRY_HANDLE
-    from nemo.lens import NemoLensConfig, setup_telemetry
+    try:
+        from nemo.lens import NemoLensConfig, setup_telemetry
+    except ImportError:
+        # D1: nemo-lens absent -> telemetry is a no-op (get_telemetry() handles None); do NOT
+        # crash set_global_variables/startup. Every other telemetry site already degrades this way.
+        _GLOBAL_TELEMETRY_HANDLE = None
+        return
     from megatron.core.telemetry.span_groups import MegatronSpanGroup
 
     # OTel's default RandomIdGenerator draws span/trace IDs from Python's `random`, which Megatron
