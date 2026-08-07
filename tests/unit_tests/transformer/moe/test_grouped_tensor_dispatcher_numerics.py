@@ -2,11 +2,13 @@
 
 """Distributed MoE coverage for the TE grouped-tensor expert path.
 
-The three dispatchers place expert-token padding at different boundaries:
+The dispatchers place expert-token padding at different boundaries:
 
 * All-to-All returns unpadded expert segments and TEGroupedMLP pads them before FC1.
 * DeepEP communicates first, then its local fused permutation pads expert segments.
 * HybridEP fuses communication, permutation, and expert-segment padding.
+* NCCL-EP returns aligned expert segments from fused dispatch, like HybridEP. Its non-op-fuser
+  grouped-tensor integration is not enabled yet, so its parity and lifecycle cases remain skipped.
 
 The numerical tests compare each grouped-tensor configuration with the old discrete-parameter,
 CPU-split path on the same dispatcher. The lifecycle tests inspect the actual expert-compute
@@ -51,6 +53,9 @@ _MOE_FFN_HIDDEN_SIZE = 256
 _NUM_LOCAL_EXPERTS = 2
 _NUM_LOCAL_TOKENS = 128
 _TOLERANCES = {"rtol": 1e-2, "atol": 1e-2}
+_NCCL_EP_GROUPED_TENSOR_UNSUPPORTED_REASON = (
+    "NCCL-EP support for the non-op-fuser grouped-tensor expert path is not implemented yet"
+)
 
 _PARAMETER_LAYOUTS = (
     pytest.param(False, False, False, id="discrete-weight-no-bias"),
@@ -105,6 +110,18 @@ def _dispatcher_options(dispatcher: str) -> Dict[str, object]:
             "moe_token_dispatcher_type": "flex",
             "moe_flex_dispatcher_backend": "hybridep",
             "moe_permute_fusion": True,
+        }
+    if dispatcher == "ncclep":
+        # NCCL-EP dispatch packs aligned expert segments, but the module grouped-tensor path is
+        # intentionally config-rejected until its end-to-end numerics and padding are validated.
+        return {
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "ncclep",
+            "moe_permute_fusion": True,
+            "moe_expert_rank_capacity_factor": 8.0,
+            # The lifecycle assertions inspect the dynamically narrowed expert buffer. Static
+            # NCCL-EP intentionally exposes the full receive-capacity buffer instead.
+            "moe_ncclep_static_shape": False,
         }
     raise ValueError(f"Unknown dispatcher {dispatcher!r}")
 
@@ -544,6 +561,22 @@ class TestGroupedTensorDispatcherNumerics:
             single_grouped_bias=single_grouped_bias,
         )
 
+    @pytest.mark.skip(reason=_NCCL_EP_GROUPED_TENSOR_UNSUPPORTED_REASON)
+    @pytest.mark.parametrize(
+        "single_grouped_weight,use_bias,single_grouped_bias", _PARAMETER_LAYOUTS
+    )
+    @pytest.mark.timeout(180)
+    def test_ncclep_grouped_tensor_moe_parity(
+        self, single_grouped_weight, use_bias, single_grouped_bias
+    ):
+        """NCCL-EP grouped-tensor parity coverage reserved for future enablement."""
+        _run_numerical_parity_case(
+            "ncclep",
+            single_grouped_weight=single_grouped_weight,
+            use_bias=use_bias,
+            single_grouped_bias=single_grouped_bias,
+        )
+
     @pytest.mark.timeout(180)
     def test_alltoall_grouped_tensor_padding_lifecycle(self, monkeypatch):
         """All-to-All explicitly pads in TEGroupedMLP and removes it before combine."""
@@ -558,3 +591,9 @@ class TestGroupedTensorDispatcherNumerics:
     def test_hybridep_grouped_tensor_padding_lifecycle(self, monkeypatch):
         """HybridEP fused dispatch pads, and fused combine returns the original token shape."""
         _run_padding_lifecycle_case("hybridep", monkeypatch)
+
+    @pytest.mark.skip(reason=_NCCL_EP_GROUPED_TENSOR_UNSUPPORTED_REASON)
+    @pytest.mark.timeout(180)
+    def test_ncclep_grouped_tensor_padding_lifecycle(self, monkeypatch):
+        """NCCL-EP padding lifecycle coverage reserved for future enablement."""
+        _run_padding_lifecycle_case("ncclep", monkeypatch)

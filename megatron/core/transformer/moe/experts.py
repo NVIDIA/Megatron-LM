@@ -686,7 +686,7 @@ class TEGroupedMLP(MegatronModule):
         # Some dispatchers have already padded each expert's token segment before the tokens
         # reach this module:
         #   * router padding changes the routing map before dispatch;
-        #   * HybridEP pads as part of its fused dispatch/permute operation;
+        #   * HybridEP/NCCL-EP pad as part of their fused dispatch/permute operation;
         #   * DeepEP can pad in the fused local permutation after communication.
         # Padding those tensors again would insert a second set of dummy tokens and make
         # tokens_per_expert disagree with the already-permuted token buffer, so skip the local
@@ -846,7 +846,7 @@ class TEGroupedMLP(MegatronModule):
         # The token buffer may already contain per-expert padding when padding was performed
         # before expert compute:
         #   * router padding modified the routing map before dispatch;
-        #   * HybridEP fused padding into dispatch/permute;
+        #   * HybridEP/NCCL-EP fused padding into dispatch/permute;
         #   * DeepEP fused padding into its post-communication local permutation.
         # In those cases tokens_per_expert already describes the padded expert segments. Running
         # Fp8Padding again would change the segment lengths without matching the existing token
