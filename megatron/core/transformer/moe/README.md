@@ -436,6 +436,8 @@ EP All-to-All can consume 30-40% of training time without optimization. These fe
 
 > **Requirements for EP A2A Overlap**: `expert_model_parallel_size > 1`, CUDA_DEVICE_MAX_CONNECTIONS > 1.
 
+> **Full activation recompute with EP A2A Overlap**: `--recompute-granularity full` is supported and is applied per layer segment, so `--recompute-method` and `--recompute-num-layers` carry exactly the same meaning as without `--overlap-moe-expert-parallel-comm`. Both flags are required. Earlier releases accepted them being unset (the whole model chunk was recomputed as one unit); such configs now fail validation and must set the two flags explicitly.
+
 ### Compute Optimization
 
 Fine-grained MoE produces many small operations that can underutilize GPU resources. These optimizations reduce kernel launch overhead and improve GPU utilization.

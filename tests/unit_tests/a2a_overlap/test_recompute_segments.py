@@ -1,14 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Segmentation rules for layer-level full activation recompute.
+"""Segmentation rules and config validation for layer-level full activation recompute.
 
-These tests exercise ``TransformerModelChunkSchedulePlan._build_recompute_segments``
-in isolation (no CUDA, no model build) to pin down that the segment boundaries match
-the non-overlap recompute semantics:
-
-* decoder block -> ``megatron.core.recompute.checkpointed_forward``
-* MTP -> ``MultiTokenPredictionLayer._checkpointed_forward``
+Exercises _build_recompute_segments and TransformerConfig.__post_init__ in isolation (no
+CUDA, no model build), pinning the segment boundaries and accepted configs to the
+non-overlap semantics: checkpointed_forward for the decoder, MTP _checkpointed_forward.
 """
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +15,7 @@ from megatron.core.models.common.model_chunk_schedule_plan import (
     ModelChunkState,
     TransformerModelChunkSchedulePlan,
 )
+from tests.unit_tests.a2a_overlap.utils import get_test_config
 
 
 class _StubLayer:
@@ -25,8 +24,6 @@ class _StubLayer:
     def __init__(self, index):
         self.index = index
         self.recompute_segment = None
-        self.is_segment_head = False
-        self.is_segment_tail = False
         self.forward_no_grad = False
 
     def set_forward_no_grad(self, no_grad):
@@ -36,9 +33,7 @@ class _StubLayer:
 def _build(num_decoder_layers, num_mtp_layers, method, num_layers, granularity="full"):
     plan = object.__new__(TransformerModelChunkSchedulePlan)
     plan._model_chunk_state = ModelChunkState()
-    plan._transformer_layers = [
-        _StubLayer(i) for i in range(num_decoder_layers + num_mtp_layers)
-    ]
+    plan._transformer_layers = [_StubLayer(i) for i in range(num_decoder_layers + num_mtp_layers)]
     plan._num_decoder_layers = num_decoder_layers
     plan._recompute_segments = []
     plan.recompute_full = granularity == "full"
@@ -98,10 +93,11 @@ def test_block_wider_than_the_decoder_recomputes_every_decoder_layer():
     assert _segment_indices(plan) == [[0], [1], [2]]
 
 
-def test_segment_head_and_tail_flags():
+def test_segment_head_and_tail_are_the_first_and_last_layer():
+    # Hooks key off layer identity, so they fire on layers 0/2 and 1/3.
     plan = _build(4, 0, "uniform", 2)
-    heads = [layer.index for layer in plan._transformer_layers if layer.is_segment_head]
-    tails = [layer.index for layer in plan._transformer_layers if layer.is_segment_tail]
+    heads = [seg.layers[0].index for seg in plan._recompute_segments]
+    tails = [seg.layers[-1].index for seg in plan._recompute_segments]
     assert heads == [0, 2]
     assert tails == [1, 3]
 
@@ -113,11 +109,68 @@ def test_empty_decoder_with_mtp_only():
 
 @pytest.mark.parametrize("method", [None, "invalid"])
 def test_rejects_unsupported_recompute_method(method):
-    with pytest.raises(AssertionError, match="recompute_method"):
+    with pytest.raises(ValueError, match="Invalid activation recompute method"):
         _build(2, 0, method, 1)
 
 
 @pytest.mark.parametrize("num_layers", [None, 0, -1])
 def test_rejects_invalid_recompute_num_layers(num_layers):
-    with pytest.raises(AssertionError, match="recompute_num_layers"):
+    with pytest.raises(ValueError, match="recompute_num_layers"):
         _build(2, 0, "uniform", num_layers)
+
+
+class TestOverlapFullRecomputeConfigValidation:
+    """The user-facing validation in TransformerConfig.__post_init__ - the entry point a
+    real training run goes through, including the MTP rules the schedule plan cannot check.
+    """
+
+    @staticmethod
+    def _config(**overrides):
+        extra_kwargs = {
+            "moe_token_dispatcher_type": "alltoall",
+            "overlap_moe_expert_parallel_comm": True,
+            "recompute_granularity": "full",
+            "recompute_method": "uniform",
+            "recompute_num_layers": 1,
+            **overrides,
+        }
+        return get_test_config(num_layers=2, extra_kwargs=extra_kwargs)
+
+    @pytest.mark.parametrize("method,num_layers", [("uniform", 2), ("block", 1)])
+    def test_accepts_both_recompute_methods(self, method, num_layers):
+        config = self._config(recompute_method=method, recompute_num_layers=num_layers)
+        assert config.recompute_granularity == "full"
+        assert config.recompute_method == method
+        assert config.recompute_num_layers == num_layers
+
+    @pytest.mark.parametrize(
+        "overrides,expected",
+        [
+            # Both flags are required now; the overlap-path exemptions are gone.
+            ({"recompute_method": None}, 'recompute_method must be "block" or "uniform"'),
+            ({"recompute_num_layers": None}, "recompute_num_layers must be between"),
+        ],
+        ids=["method-unset", "num-layers-unset"],
+    )
+    def test_rejects_unset_recompute_flags(self, overrides, expected):
+        with pytest.raises(ValueError, match=re.escape(expected)):
+            self._config(**overrides)
+
+    def test_mtp_requires_uniform_with_one_layer(self):
+        # Mirrors the assert in MultiTokenPredictionLayer._checkpointed_forward.
+        with pytest.raises(AssertionError, match="recompute_num_layers must be 1 for MTP"):
+            self._config(
+                mtp_num_layers=1,
+                mtp_loss_scaling_factor=1.1,
+                recompute_method="uniform",
+                recompute_num_layers=2,
+            )
+
+    def test_mtp_under_block_warns_and_skips(self):
+        with pytest.warns(UserWarning, match="not supported for MTP"):
+            self._config(
+                mtp_num_layers=1,
+                mtp_loss_scaling_factor=1.1,
+                recompute_method="block",
+                recompute_num_layers=1,
+            )
