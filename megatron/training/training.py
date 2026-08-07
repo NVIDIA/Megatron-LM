@@ -2853,7 +2853,10 @@ def training_log(
     if iteration % args.log_interval == 0 or is_first_iteration:
         should_prof_rank = (args.profile_ranks == [] or safe_get_rank() in args.profile_ranks)  # [] is all ranks
         if args.record_memory_history and (should_prof_rank or torch.distributed.get_backend() == 'fake'):
-            torch.cuda.memory._dump_snapshot(args.memory_snapshot_path)
+            rank = safe_get_rank()
+            base, ext = os.path.splitext(args.memory_snapshot_path)
+            snapshot_filename = f"{base}-{rank}{ext}"
+            torch.cuda.memory._dump_snapshot(snapshot_filename)
 
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
