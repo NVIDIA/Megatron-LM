@@ -154,7 +154,7 @@ class MoEModelTestContainer:
         probs, indices = apply_module(moe_layer.router)(hidden_states)
         probs = torch.ones_like(probs) / moe_layer.router.topk
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
@@ -243,7 +243,7 @@ class MoEModelTestContainer:
         restored_hidden_states_answer = hidden_states * local_probss.sum(dim=1).unsqueeze(1)
         restored_hidden_states_answer = restored_hidden_states_answer.to(dtype=self.test_dtype)
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
@@ -294,7 +294,7 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
-        (permuted_input_1, tokens_per_expert, permuted_probs_1) = token_permutation(
+        permuted_input_1, tokens_per_expert, permuted_probs_1 = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
@@ -312,7 +312,7 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
-        (permuted_input_2, tokens_per_expert, permuted_probs_2) = token_permutation(
+        permuted_input_2, tokens_per_expert, permuted_probs_2 = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         permuted_input_2 = permuted_input_2 * permuted_probs_2.unsqueeze(-1)
@@ -365,7 +365,7 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
-        (permuted_input_1, tokens_per_expert_1, permuted_probs_1) = token_permutation(
+        permuted_input_1, tokens_per_expert_1, permuted_probs_1 = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
@@ -382,7 +382,7 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
-        (permuted_input_2, tokens_per_expert_2, permuted_probs_2) = token_permutation(
+        permuted_input_2, tokens_per_expert_2, permuted_probs_2 = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         assert (
