@@ -195,13 +195,9 @@ class TestMambaMixerCuteDSL:
         # (the SSD scan returns plain state tensors, and cumsum(out=) needs no grad).
         # _ssm_prefill mutates zxBCdt/states in place, so feed fresh copies per backend.
         with torch.no_grad():
+            _md = _prefill_metadata_for_test(cu_seqlens, seq_idx, mixer.chunk_size, batch_indices)
             y = mixer._ssm_prefill(
-                zxBCdt=zxBCdt.clone(),
-                conv_state=conv_state,
-                ssm_state=ssm_state,
-                seq_idx=seq_idx,
-                cu_seqlens=cu_seqlens,
-                batch_indices=batch_indices,
+                zxBCdt=zxBCdt.clone(), conv_state=conv_state, ssm_state=ssm_state, metadata=_md
             )
         return y, ssm_state
 

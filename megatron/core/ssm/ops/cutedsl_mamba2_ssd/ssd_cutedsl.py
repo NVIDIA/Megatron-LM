@@ -1,5 +1,4 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-import collections
 import logging
 
 import cuda.bindings.driver as cuda
@@ -10,6 +9,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from ._bc_repack import repack_bc_chunk_major
 from ._fused_cumsum import fused_softplus_cumsum
+from ._mamba2_ssd_kernel_varlen import MMA_N_GRANULARITY
 from ._mamba2_ssd_kernel_varlen import SSDKernel as SSDKernelVarlen
 from ._y_scatter import scatter_y_ragged
 
@@ -264,239 +264,137 @@ def _current_cute_stream():
     return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
 
-_META_CACHE = collections.OrderedDict()
-_META_CACHE_MAX = 64
+class SSDTiling:
+    """How a varlen batch is tiled, built from what MambaMetadata publishes.
 
+    The device arrays are int32 views into the engine's per-step buffers, so an
+    instance is only valid for the step that produced it. The scalars are host
+    values the op cannot derive from those arrays without a device->host sync.
+    Everything else the launcher needs is arithmetic on these.
 
-def _chunk_meta(cu_chunk_seqlens, last_chunk_indices, kernel_chunk_size):
-    """Derive per-call shape metadata (divisibility, chunk counts, ...) and
-    CACHE it keyed by the metadata tensors' identity.
-
-    Computing this requires a host<->device sync (``.item()`` / ``.all()``),
-    which — if done every call — serializes CPU dispatch against the GPU kernel
-    and erases the kernel's speed advantage. By caching (and holding refs so the
-    ids stay valid), repeated calls with the same chunk metadata (fixed-shape
-    inference/training, or reused metadata buffers) skip the sync entirely and
-    the CPU pipeline overlaps the GPU work.
+    Attributes:
+        seq_chunk_start: Per active sequence, its first chunk in workspace order.
+        seq_chunk_count: Per active sequence, how many chunks it owns.
+        seq_chunk_base: Per active sequence, its first chunk as a GLOBAL index.
+        active_seq_idx: Batch slots that carry tokens.
+        empty_seq_idx: Batch slots that do not.
+        chunk_token_base: Per workspace chunk, its first token.
+        chunk_valid_start: Per workspace chunk, the owner's first real token.
+        chunk_valid_end: Per workspace chunk, one past the owner's last real token.
+        chunk_size: The granularity the arrays were built at. Must equal the
+            kernel's L, or the tiling describes a different grid than the kernel
+            walks.
+        num_slots: Batch slots including the empty ones.
+        num_real_tokens: Tokens actually covered by the sequences.
+        starts_aligned: True when no sequence starts mid-chunk, so no chunk is
+            shared and Y can be written in place.
+        active_is_prefix: True when the active slots come first, so the packed
+            chunk numbering matches the caller's.
     """
-    # kernel_chunk_size must be part of the key: the derived fields (divisible,
-    # chunk counts, cs/nc descriptors) all depend on it, and eligibility checks
-    # may probe the same metadata tensors with a different L than the wrapper.
-    k = (id(cu_chunk_seqlens), id(last_chunk_indices), kernel_chunk_size)
-    m = _META_CACHE.get(k)
-    if m is not None:
-        _META_CACHE.move_to_end(k)
-        return m
-    ccs = cu_chunk_seqlens.to(torch.long)
-    lci = last_chunk_indices.to(torch.long)
-    cu_seqlens = torch.cat([ccs[:1], ccs[lci + 1]])
-    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    S = seq_lens.numel()
-    # Real token count (sum of seq_lens). The caller's ``x`` may be a fixed-size
-    # CUDA-graph buffer with trailing PADDING (T = x.shape[0] > real tokens), so
-    # everything below must key off the real count, never the padded ``T``.
-    n_real_tokens = int(cu_seqlens[-1] - cu_seqlens[0])  # sync (once per metadata)
-    remainders = seq_lens % kernel_chunk_size
-    divisible = bool((remainders == 0).all())  # sync
-    # TAIL-RAGGED: every non-empty sequence except the LAST non-empty one is a
-    # multiple of L. Then sequence starts are still L-aligned, so chunks keep
-    # packing contiguously on the global grid (chunk c == tokens [c*L, (c+1)*L))
-    # and only the final chunk is partially filled. That keeps the zero-copy
-    # chunk-major X/Y views valid; the partial chunk is handled by zeroing
-    # delta (and hence holding cumsum flat) on the pad lanes, which makes the
-    # pad tokens contribute exactly nothing to the scan -- see the wrapper.
-    # Interior-ragged batches would need per-sequence chunk grids AND a
-    # predicated Y store (a TMA store of the tail chunk would clobber the next
-    # sequence's output rows), so they still fall back to Triton.
-    tail_ragged = False
-    if not divisible:
-        nonempty = torch.nonzero(seq_lens > 0, as_tuple=True)[0]  # sync
-        ragged = torch.nonzero((seq_lens > 0) & (remainders != 0), as_tuple=True)[0]
-        tail_ragged = (
-            nonempty.numel() > 0 and ragged.numel() == 1 and int(ragged[0]) == int(nonempty[-1])
-        )
-    chunk_aligned = divisible or tail_ragged
-    n_chunks_dev = chunk_start_dev = total_chunks = None
-    n_padded_tokens = n_real_tokens
-    ragged_meta = None
-    cs_t = nc_t = xs_t = None
-    real_seq_idx = None
-    S_real = S
-    has_empty = False
-    real_is_prefix = True
-    if chunk_aligned:
-        # Varlen tile-scheduler metadata: per-seq chunk count + exclusive-cumsum
-        # start, plus the global chunk index per token (for the dense scatter).
-        # Chunk counts are CEIL so a ragged tail gets its own (partial) chunk;
-        # this is exact for the divisible case (remainder 0).
-        n_chunks_dev = ((seq_lens + kernel_chunk_size - 1) // kernel_chunk_size).to(torch.int32)
-        chunk_start_dev = torch.cumsum(n_chunks_dev, 0, dtype=torch.int32) - n_chunks_dev
-        total_chunks = (n_real_tokens + kernel_chunk_size - 1) // kernel_chunk_size
-        n_padded_tokens = total_chunks * kernel_chunk_size
-        # The dynamic engine pads the batch to a fixed slot count with EMPTY
-        # sequences (seq_len == 0). The varlen tile scheduler makes one work-item
-        # per (seq, head); an empty seq yields a 0-chunk work-item that DEADLOCKS
-        # the persistent pipeline (producer/consumer mbarriers never satisfied).
-        # Compact the empty seqs out: run the kernel over only the non-empty
-        # sequences (chunks pack contiguously, so total_chunks is unchanged), then
-        # the wrapper scatters per-seq final states back to full batch shape.
-        real_seq_idx = torch.nonzero(n_chunks_dev, as_tuple=True)[0]  # sync (cached)
-        S_real = int(real_seq_idx.numel())
-        has_empty = S_real != S
-        # nonzero() returns sorted indices; the real seqs form a contiguous prefix
-        # iff the last real index == S_real - 1 (trailing empties, what the dynamic
-        # engine produces). Only then does the packed real-chunk numbering used by
-        # the emit map match the caller's cu_chunk chunk numbering; interleaved
-        # empties + intermediate emission fall back to Triton (see wrapper guard).
-        real_is_prefix = (not has_empty) or (S_real > 0 and int(real_seq_idx[-1]) == S_real - 1)
-        if has_empty:
-            nc_real = n_chunks_dev[real_seq_idx]
-            cs_real = torch.cumsum(nc_real, 0, dtype=torch.int32) - nc_real
-        else:
-            nc_real, cs_real = n_chunks_dev, chunk_start_dev
-        # These tensors are cached (stable address), so cache their cute
-        # descriptors too — per-call from_dlpack/mark is ~20us each.
-        cs_t = _to_cute(cs_real, [0])
-        nc_t = _to_cute(nc_real, [0])
-        # X reads the same (chunk-aligned) grid as the workspace here.
-        xs_t = cs_t
-    else:
-        # GENERAL RAGGED: sequences start mid-chunk. Anchor each sequence's own
-        # chunk grid at the L-aligned position at or below its start,
-        # ``base_s = floor(cu[s] / L) * L``, so:
-        #   * X still reads the GLOBAL aligned grid (chunk ``base_s / L + c``)
-        #     and stays zero-copy;
-        #   * delta/cumsum/B/C live in an EXPANDED workspace grid
-        #     (``ws_start[s] + c``) so the boundary chunks that two sequences
-        #     share get one masked copy EACH -- delta is zeroed outside
-        #     ``[cu[s], cu[s+1])``, which removes the foreign tokens from the
-        #     scan exactly (both the leading and the trailing ones);
-        #   * Y is written to an expanded scratch on the same workspace grid and
-        #     scattered back afterwards, because the two owners of a shared
-        #     chunk must not write the same output rows.
-        x_start_dev = (cu_seqlens[:-1] // kernel_chunk_size).to(torch.int32)
-        span = cu_seqlens[1:] - x_start_dev.to(torch.long) * kernel_chunk_size
-        n_chunks_dev = ((span + kernel_chunk_size - 1) // kernel_chunk_size).to(torch.int32)
-        n_chunks_dev = torch.where(seq_lens > 0, n_chunks_dev, torch.zeros_like(n_chunks_dev))
-        chunk_start_dev = torch.cumsum(n_chunks_dev, 0, dtype=torch.int32) - n_chunks_dev
-        ws_total_chunks = int(n_chunks_dev.sum())  # sync (once per metadata)
-        total_chunks = (n_real_tokens + kernel_chunk_size - 1) // kernel_chunk_size
-        n_padded_tokens = total_chunks * kernel_chunk_size
-        # Empty sequences own no chunk and are compacted out of the launch.
-        real_seq_idx = torch.nonzero(n_chunks_dev, as_tuple=True)[0]  # sync (cached)
-        S_real = int(real_seq_idx.numel())
-        has_empty = S_real != S
-        real_is_prefix = (not has_empty) or (S_real > 0 and int(real_seq_idx[-1]) == S_real - 1)
-        if has_empty:
-            nc_real = n_chunks_dev[real_seq_idx]
-            cs_real = torch.cumsum(nc_real, 0, dtype=torch.int32) - nc_real
-            xs_real = x_start_dev[real_seq_idx]
-        else:
-            nc_real, cs_real, xs_real = n_chunks_dev, chunk_start_dev, x_start_dev
-        cs_t = _to_cute(cs_real, [0])
-        nc_t = _to_cute(nc_real, [0])
-        xs_t = _to_cute(xs_real, [0])
-        # Per-workspace-chunk descriptors for the masking kernels and the Y
-        # scatter: the first token of the chunk, and the real-token window.
-        seq_of_chunk = torch.repeat_interleave(
-            torch.arange(S, device=seq_lens.device), n_chunks_dev.to(torch.long)
-        )
-        idx_in_seq = (
-            torch.arange(ws_total_chunks, device=seq_lens.device)
-            - chunk_start_dev.to(torch.long)[seq_of_chunk]
-        )
-        ws_token_base = (
-            x_start_dev.to(torch.long)[seq_of_chunk] * kernel_chunk_size
-            + idx_in_seq * kernel_chunk_size
-        ).to(torch.int32)
-        ws_valid_lo = cu_seqlens[:-1][seq_of_chunk].to(torch.int32)
-        ws_valid_hi = cu_seqlens[1:][seq_of_chunk].to(torch.int32)
-        ragged_meta = dict(
-            ws_total_chunks=ws_total_chunks,
-            ws_token_base=ws_token_base,
-            ws_valid_lo=ws_valid_lo,
-            ws_valid_hi=ws_valid_hi,
-        )
-    m = dict(
-        divisible=divisible,
-        tail_ragged=tail_ragged,
-        chunk_aligned=chunk_aligned,
-        general_ragged=not chunk_aligned,
-        ragged_meta=ragged_meta,
-        xs_t=xs_t,
-        n_padded_tokens=n_padded_tokens,
-        n_real_tokens=n_real_tokens,
-        S=S,
-        cu_seqlens=cu_seqlens,
-        seq_lens=seq_lens,
-        n_chunks_dev=n_chunks_dev,
-        chunk_start_dev=chunk_start_dev,
-        total_chunks=total_chunks,
-        cs_t=cs_t,
-        nc_t=nc_t,
-        real_seq_idx=real_seq_idx,
-        S_real=S_real,
-        has_empty=has_empty,
-        real_is_prefix=real_is_prefix,
-        _refs=(cu_chunk_seqlens, last_chunk_indices),
+
+    __slots__ = (
+        "seq_chunk_start",
+        "seq_chunk_count",
+        "seq_chunk_base",
+        "active_seq_idx",
+        "empty_seq_idx",
+        "chunk_token_base",
+        "chunk_valid_start",
+        "chunk_valid_end",
+        "chunk_size",
+        "num_slots",
+        "num_real_tokens",
+        "starts_aligned",
+        "active_is_prefix",
     )
-    _META_CACHE[k] = m
-    if len(_META_CACHE) > _META_CACHE_MAX:
-        _META_CACHE.popitem(last=False)
-    return m
+
+    def __init__(self, metadata):
+        """Read the per-step tiling off the batch metadata.
+
+        Args:
+            metadata: The step's ``MambaMetadata``. Only read through attribute
+                access -- the op library imports nothing from the inference
+                layer, so any object exposing the same ``ssd_*`` fields,
+                ``mamba_chunk_size``, ``cu_seqlens`` and
+                ``real_prefill_token_count`` works (tests pass a stand-in).
+        """
+        self.seq_chunk_start = metadata.ssd_seq_chunk_start
+        self.seq_chunk_count = metadata.ssd_seq_chunk_count
+        self.seq_chunk_base = metadata.ssd_seq_chunk_base
+        self.active_seq_idx = metadata.ssd_active_seq_idx
+        self.empty_seq_idx = metadata.ssd_empty_seq_idx
+        self.chunk_token_base = metadata.ssd_chunk_token_base
+        self.chunk_valid_start = metadata.ssd_chunk_valid_start
+        self.chunk_valid_end = metadata.ssd_chunk_valid_end
+        self.chunk_size = metadata.mamba_chunk_size
+        self.num_slots = metadata.cu_seqlens.shape[0] - 1
+        self.num_real_tokens = metadata.real_prefill_token_count
+        self.starts_aligned = metadata.ssd_starts_aligned
+        self.active_is_prefix = metadata.ssd_active_is_prefix
 
 
 def cutedsl_unsupported_reason(
     x: torch.Tensor,
     chunk_size: int,
-    cu_chunk_seqlens: torch.Tensor,
-    last_chunk_indices: torch.Tensor,
+    tiling: SSDTiling,
     *,
     z: torch.Tensor | None = None,
     return_raw_states: bool = False,
     intermediate_chunk_indices: torch.Tensor | None = None,
     kernel_chunk_size: int = 128,
 ) -> str | None:
-    """Given a inference batch, check whether CuTe DSL is applicable"""
+    """Why this batch cannot run on the CuteDSL SSD kernel, or None if it can.
+
+    Sequence lengths are unconstrained; what is left are the argument
+    combinations the kernel does not implement. Callers must consult this BEFORE
+    calling the wrapper, which assumes eligibility and does not re-check.
+
+    Args:
+        x: Token-packed input, used only for its buffer length.
+        chunk_size: The caller's chunk size.
+        tiling: How this batch is tiled, from ``MambaMetadata``.
+        z: Gating input, if any.
+        return_raw_states: Whether the caller wants every chunk's state.
+        intermediate_chunk_indices: Sparse emission map, if any.
+        kernel_chunk_size: The kernel's L.
+
+    Returns:
+        A human-readable reason, or None when the batch is eligible.
+    """
     if z is not None:
         return "CuteDSL THD SSD: z-gating not supported"
-    has_intermediate = intermediate_chunk_indices is not None
-    # Emitted states are indexed by chunk. The caller chunks at ``chunk_size``
-    # while the kernel chunks at ``kernel_chunk_size``, so the two numberings
-    # line up only when they are equal (the mamba mixer default).
-    if (has_intermediate or return_raw_states) and chunk_size != kernel_chunk_size:
+
+    L = kernel_chunk_size
+    # The kernel walks its own L-sized grid, so the tiling has to describe that
+    # same grid. The CALLER's chunk_size is irrelevant here -- SSD results do not
+    # depend on how the caller chunked -- except for state emission below, which
+    # is numbered per caller chunk.
+    if tiling.chunk_size != L:
+        return "CuteDSL THD SSD: tiling chunk size does not match the kernel L"
+
+    emits_states = return_raw_states or intermediate_chunk_indices is not None
+    if emits_states and chunk_size != L:
         return "CuteDSL THD SSD: emitted states need chunk_size == kernel L"
-    meta = _chunk_meta(cu_chunk_seqlens, last_chunk_indices, kernel_chunk_size)
-    if return_raw_states and not meta["chunk_aligned"]:
-        # Raw states must be the state at the CALLER's chunk boundaries. On the
-        # ragged path each sequence's grid is shifted to the L-aligned position
-        # below its start, so our chunk boundaries fall inside the caller's
-        # chunks and the states it wants are never materialised.
-        return "CuteDSL THD SSD: return_raw_states needs chunk-aligned sequences"
-    if return_raw_states and not meta["real_is_prefix"]:
-        # Zero-length chunks of empty sequences occupy rows in the caller's
-        # numbering; we can only append them when the real sequences form a
-        # contiguous prefix.
-        return "CuteDSL THD SSD: return_raw_states with interleaved empty sequences"
-    if not meta["divisible"]:
-        # Any ragged batch processes pad-masked chunks, so the caller's token
-        # buffers must physically cover the padded chunk grid: the TMA
-        # loads/stores whole L-token chunks, and the trailing rows of `out` are
-        # overwritten (they are outside cu_chunk_seqlens, so undefined anyway).
-        if x.shape[0] < meta["n_padded_tokens"]:
-            return (
-                "CuteDSL THD SSD: ragged batches need the token buffer padded to "
-                "a multiple of the kernel chunk size"
-            )
-    if meta["general_ragged"] and has_intermediate:
-        # Emission indexes the EXPANDED per-sequence chunk grid, which no longer
-        # matches the caller's chunk numbering.
-        return "CuteDSL THD SSD: intermediate states with interior-ragged sequences"
-    # Intermediate emit numbers chunks over the packed real chunks; this matches
-    # the caller's chunk numbering only when the real seqs form a contiguous
-    # prefix (trailing empties, what the dynamic engine produces).
-    if has_intermediate and not meta["real_is_prefix"]:
-        return "CuteDSL THD SSD: intermediate states with interleaved empty sequences"
+
+    # Partial chunks are pad-masked, so the caller's token buffers must
+    # physically cover the padded chunk grid: the TMA moves whole L-token chunks,
+    # and the trailing rows of `out` get overwritten (they are outside the
+    # sequences, hence undefined by the op contract anyway).
+    if x.shape[0] < -(-tiling.num_real_tokens // L) * L:
+        return (
+            "CuteDSL THD SSD: ragged batches need the token buffer padded to "
+            "a multiple of the kernel chunk size"
+        )
+
+    if emits_states:
+        # Emission is numbered over the kernel's own chunk grid. That matches the
+        # caller's numbering only when no sequence starts mid-chunk (else the
+        # grid is expanded per owner) and the active slots form a contiguous
+        # prefix (else the packed numbering skips the empty slots).
+        if not tiling.starts_aligned:
+            return "CuteDSL THD SSD: emitted states need chunk-aligned sequence starts"
+        if not tiling.active_is_prefix:
+            return "CuteDSL THD SSD: emitted states with interleaved empty sequences"
     return None
 
 
@@ -509,6 +407,7 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
     chunk_size: int,
     cu_chunk_seqlens: torch.Tensor,
     last_chunk_indices: torch.Tensor,
+    tiling: SSDTiling,
     seq_idx: torch.Tensor | None,
     out: torch.Tensor,
     D: torch.Tensor | None = None,
@@ -541,7 +440,9 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
     _, G, N = B.shape
     d_has_hdim = D is not None and D.dim() == 2
     L = kernel_chunk_size
-    N_pad = ((N + 127) // 128) * 128
+    # dstate is the MMA M-mode of the kernel's inter1 tile, which tcgen05
+    # only supports at this granularity.
+    N_pad = -(-N // MMA_N_GRANULARITY) * MMA_N_GRANULARITY
     device = x.device
     out_dtype = x.dtype
     io_dtype = x.dtype if x.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
@@ -552,8 +453,11 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
         x = x.to(io_dtype)
     HP = H * P
 
-    meta = _chunk_meta(cu_chunk_seqlens, last_chunk_indices, L)
-    S = meta["S"]
+    S = tiling.num_slots
+    # Advanced indexing needs int64; the engine publishes int32 to keep its
+    # bookkeeping buffer uniform.
+    real_seq_idx = tiling.active_seq_idx.long()
+    empty_seq_idx = tiling.empty_seq_idx.long()
 
     # Dynamic inference hands fixed-size CUDA-graph token buffers with trailing
     # padding (x.shape[0] > real tokens). All CuteDSL paths assume token-packed
@@ -564,8 +468,9 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
     # must span the PADDED chunk boundary (n_padded_tokens >= n_real_tokens);
     # they coincide for the divisible case. The eligibility check guarantees the
     # caller's buffers are large enough.
-    n_real_tokens = meta["n_real_tokens"]
-    n_tokens = meta["n_padded_tokens"]
+    n_real_tokens = tiling.num_real_tokens
+    total_chunks = -(-n_real_tokens // L)
+    n_tokens = total_chunks * L
     if n_tokens != T:
         x = x[:n_tokens]
         B = B[:n_tokens]
@@ -583,25 +488,23 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
         x[n_real_tokens:].zero_()
 
     has_d = D is not None
-    # Varlen tile-scheduler path: every sequence's length is a multiple of L,
-    # so chunks pack contiguously (total_chunks = T/L). x/y are zero-copy
-    # chunk-major THD views; B/C/delta are dense chunk-major (cached
-    # workspace); each (seq,head) work-item processes ONLY its own chunks.
-    total_chunks = meta["total_chunks"]
-    # Ragged batches run on an EXPANDED chunk grid (a chunk shared by two
-    # sequences is materialised once per owner), so the workspace and Y scratch
-    # are sized by ws_chunks while X keeps reading the global grid.
-    ragged = meta["general_ragged"]
-    rmeta = meta["ragged_meta"]
-    ws_chunks = rmeta["ws_total_chunks"] if ragged else total_chunks
+    # Varlen tile-scheduler path: each (seq, head) work-item walks only its own
+    # chunks. X is always a zero-copy chunk-major THD view on the global grid;
+    # B/C/delta live in the (cached) dense workspace on the per-sequence grid,
+    # which is larger than the global one only when a chunk is shared.
+    ws_chunks = tiling.chunk_token_base.numel()
+    # Sharing is exactly what makes an in-place Y store unsafe: both owners
+    # would TMA-store the same output rows, so Y goes via a scratch instead.
+    ragged = not tiling.starts_aligned
     ragged_chunks = (
-        (rmeta["ws_token_base"], rmeta["ws_valid_lo"], rmeta["ws_valid_hi"]) if ragged else None
+        (tiling.chunk_token_base, tiling.chunk_valid_start, tiling.chunk_valid_end)
+        if ragged
+        else None
     )
     # Empty (padded) sequences are compacted out of the kernel launch: run over
     # only the S_real non-empty seqs, then scatter final states back to full S.
-    S_kernel = meta["S_real"]
-    has_empty = meta["has_empty"]
-    real_seq_idx = meta["real_seq_idx"]
+    S_kernel = real_seq_idx.numel()
+    has_empty = S_kernel != S
     stream = _current_cute_stream()
     key = (
         S_kernel,
@@ -709,9 +612,11 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
         y_v = y_target.as_strided((L, P, total_chunks, H, 1), (HP, 1, L * HP, P, T * HP))
         y_t = _to_cute(y_v, [2, 3, 4])
     # cs/nc/xs descriptors are cached in the metadata (stable tensors).
-    cs_t = meta["cs_t"]
-    nc_t = meta["nc_t"]
-    xs_t = meta["xs_t"]
+    # Built per launch: the tiling arrays are views into the engine's per-step
+    # buffers, so a descriptor must not outlive the step that produced them.
+    cs_t = _to_cute(tiling.seq_chunk_start, [0])
+    nc_t = _to_cute(tiling.seq_chunk_count, [0])
+    xs_t = _to_cute(tiling.seq_chunk_base, [0])
 
     compiled_ssd_kernel = ws["compiled"]
     compiled_ssd_kernel(
@@ -736,9 +641,9 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
         scatter_y_ragged(
             ws["y_scratch"],
             out,
-            rmeta["ws_token_base"],
-            rmeta["ws_valid_lo"],
-            rmeta["ws_valid_hi"],
+            tiling.chunk_token_base,
+            tiling.chunk_valid_start,
+            tiling.chunk_valid_end,
             L,
         )
     elif y_target is not out:
@@ -761,7 +666,6 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
         if n_caller_chunks != total_chunks:
             tail = raw[total_chunks:]
             if has_initial:
-                empty_seq_idx = torch.nonzero(meta["n_chunks_dev"] == 0, as_tuple=True)[0]
                 tail.copy_(initial_states[empty_seq_idx].to(io_dtype))
             else:
                 tail.zero_()

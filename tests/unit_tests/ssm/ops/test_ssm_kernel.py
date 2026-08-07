@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -295,11 +296,13 @@ class TestCuteDSLAccuracy:
         else:
             out_ref, final_ref, inter_ref = _torch_reference_varlen(kernel_args, real_num_tokens)
 
+        # The engine derives this once per step; op-level callers build it here.
+        cu_list = list(itertools.accumulate(seq_lens, initial=0))
+        tiling = _ssd_tiling_for_test(cu_list, 128, device)
         reason = cutedsl_unsupported_reason(
             x=kernel_args["x"],
             chunk_size=kernel_args["chunk_size"],
-            cu_chunk_seqlens=kernel_args["cu_chunk_seqlens"],
-            last_chunk_indices=kernel_args["last_chunk_indices"],
+            tiling=tiling,
             z=kernel_args["z"],
             return_raw_states=False,
             intermediate_chunk_indices=kernel_args["intermediate_chunk_indices"],
@@ -307,9 +310,12 @@ class TestCuteDSLAccuracy:
         if params["expect_fallback"]:
             assert reason is not None, "eligibility check should reject this case"
             pytest.skip(reason)
+        assert reason is None, f"unexpected fallback: {reason}"
 
         out_cute = torch.empty_like(common_kernel_args["x"])
-        cute = mamba_chunk_scan_combined_varlen_cutedsl_thd(out=out_cute, **kernel_args)
+        cute = mamba_chunk_scan_combined_varlen_cutedsl_thd(
+            out=out_cute, tiling=tiling, **kernel_args
+        )
 
         if idx is not None:
             final_cute, inter_cute = cute
@@ -450,11 +456,11 @@ class TestCuteDSLRawStates:
             out=out_tri, return_raw_states=True, **call
         )
 
+        tiling = _ssd_tiling_for_test(list(itertools.accumulate(seq_lens, initial=0)), 128, device)
         reason = cutedsl_unsupported_reason(
             x=call["x"],
             chunk_size=call["chunk_size"],
-            cu_chunk_seqlens=call["cu_chunk_seqlens"],
-            last_chunk_indices=call["last_chunk_indices"],
+            tiling=tiling,
             z=None,
             return_raw_states=True,
         )
@@ -462,7 +468,7 @@ class TestCuteDSLRawStates:
 
         out_cute = torch.empty_like(common["x"])
         final_cute, raw_cute = mamba_chunk_scan_combined_varlen_cutedsl_thd(
-            out=out_cute, return_raw_states=True, **call
+            out=out_cute, return_raw_states=True, tiling=tiling, **call
         )
 
         # One row per caller chunk, in the caller's numbering.
@@ -664,13 +670,9 @@ class TestMambaDynamicInference(unittest.TestCase):
 
         # Run
         self.mixer.norm = MagicMock(side_effect=lambda x, z: x * z)
+        _md = _prefill_metadata_for_test(cu_seqlens, seq_idx, self.mixer.chunk_size, batch_indices)
         output = self.mixer._ssm_prefill(
-            zxBCdt=zxBCdt,
-            conv_state=conv_state,
-            ssm_state=ssm_state,
-            seq_idx=seq_idx,
-            cu_seqlens=cu_seqlens,
-            batch_indices=batch_indices,
+            zxBCdt=zxBCdt, conv_state=conv_state, ssm_state=ssm_state, metadata=_md
         )
 
         # Output should have real_seq_len tokens

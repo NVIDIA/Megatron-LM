@@ -273,9 +273,10 @@ def mamba_chunk_scan_combined_varlen(
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
     return_raw_states=False,
+    ssd_tiling=None,
     state_dtype=None,
 ):
-    """Dispatch the varlen SSD scan to the CuteDSL (Blackwell) or Triton backend.
+    """Dispatch the varlen SSD scan to the CuteDSL (Blackwell) or Triton backend fallback.
 
     CuteDSL is the default backend on Blackwell (SM 10.0+): a faster drop-in
     covering the production prefill cases (arbitrary sequence lengths, chunked
@@ -285,29 +286,20 @@ def mamba_chunk_scan_combined_varlen(
     and for the argument combinations the CuteDSL kernel does not support
     (gating ``z``, and ``return_raw_states`` on a ragged batch, whose per-
     sequence chunk grid does not materialise the caller's chunk boundaries).
-    See :func:`_mamba_chunk_scan_combined_varlen_triton` for the argument
-    contract.
     """
-    if _cutedsl_ssd_enabled():
-        # Kept local: this is the graceful-degradation boundary (the cutlass-
-        # dependent package must only be imported once the backend is enabled).
+
+    # Without a tiling there is nothing to run the kernel on: callers that hold
+    # no per-step metadata (op-level tests, benchmarks) simply get Triton.
+    if _cutedsl_ssd_enabled() and ssd_tiling is not None:
         from .cutedsl_mamba2_ssd import (
             cutedsl_unsupported_reason,
             mamba_chunk_scan_combined_varlen_cutedsl_thd,
         )
 
-        supported = (
-            cutedsl_unsupported_reason(
-                x,
-                chunk_size,
-                cu_chunk_seqlens,
-                last_chunk_indices,
-                z=z,
-                return_raw_states=return_raw_states,
-            )
-            is None
+        reason = cutedsl_unsupported_reason(
+            x, chunk_size, ssd_tiling, z=z, return_raw_states=return_raw_states
         )
-        if supported:
+        if not reason:
             return mamba_chunk_scan_combined_varlen_cutedsl_thd(
                 x=x,
                 dt=dt,
@@ -317,6 +309,7 @@ def mamba_chunk_scan_combined_varlen(
                 chunk_size=chunk_size,
                 cu_chunk_seqlens=cu_chunk_seqlens,
                 last_chunk_indices=last_chunk_indices,
+                tiling=ssd_tiling,
                 seq_idx=seq_idx,
                 out=out,
                 D=D,

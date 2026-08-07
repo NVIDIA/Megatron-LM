@@ -986,6 +986,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                     "seq_idx_for_varlen": self._cpu_mamba_seq_idx_for_varlen,
                     "conv_seq_idx": self._cpu_mamba_conv_seq_idx,
                     "conv_seq_start": self._cpu_mamba_conv_seq_start,
+                    "ssd_seq_chunk_start": self._cpu_mamba_ssd_seq_chunk_start,
+                    "ssd_seq_chunk_count": self._cpu_mamba_ssd_seq_chunk_count,
+                    "ssd_seq_chunk_base": self._cpu_mamba_ssd_seq_chunk_base,
+                    "ssd_active_seq_idx": self._cpu_mamba_ssd_active_seq_idx,
+                    "ssd_empty_seq_idx": self._cpu_mamba_ssd_empty_seq_idx,
+                    "ssd_chunk_token_base": self._cpu_mamba_ssd_chunk_token_base,
+                    "ssd_chunk_valid_start": self._cpu_mamba_ssd_chunk_valid_start,
+                    "ssd_chunk_valid_end": self._cpu_mamba_ssd_chunk_valid_end,
                 }
             )
             self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
@@ -1190,6 +1198,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_batch_indices_prefill_bytes = self.max_requests * 4
             _mamba_seq_idx_bytes = self.max_tokens * 4
             _mamba_cu_seqlens_bytes = (self.max_requests + 1) * 4
+            # SSD ragged tiling: per active sequence, or per workspace chunk
+            # (a sequence starting mid-chunk adds one).
+            _max_ssd_chunks = self._max_mamba_chunks + self.max_requests
+            _mamba_ssd_seq_chunk_start_bytes = self.max_requests * 4
+            _mamba_ssd_seq_chunk_count_bytes = self.max_requests * 4
+            _mamba_ssd_seq_chunk_base_bytes = self.max_requests * 4
+            _mamba_ssd_active_seq_idx_bytes = self.max_requests * 4
+            _mamba_ssd_empty_seq_idx_bytes = self.max_requests * 4
+            _mamba_ssd_chunk_token_base_bytes = _max_ssd_chunks * 4
+            _mamba_ssd_chunk_valid_start_bytes = _max_ssd_chunks * 4
+            _mamba_ssd_chunk_valid_end_bytes = _max_ssd_chunks * 4
             _mamba_cu_chunk_seqlens_bytes = (self._max_mamba_chunks + 1) * 4
             _mamba_last_chunk_indices_bytes = self.max_requests * 4
             _mamba_seq_idx_for_varlen_bytes = self._max_mamba_chunks * 4
@@ -1202,6 +1221,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_batch_indices_prefill_bytes = 0
             _mamba_seq_idx_bytes = 0
             _mamba_cu_seqlens_bytes = 0
+            _mamba_ssd_seq_chunk_start_bytes = 0
+            _mamba_ssd_seq_chunk_count_bytes = 0
+            _mamba_ssd_seq_chunk_base_bytes = 0
+            _mamba_ssd_active_seq_idx_bytes = 0
+            _mamba_ssd_empty_seq_idx_bytes = 0
+            _mamba_ssd_chunk_token_base_bytes = 0
+            _mamba_ssd_chunk_valid_start_bytes = 0
+            _mamba_ssd_chunk_valid_end_bytes = 0
             _mamba_cu_chunk_seqlens_bytes = 0
             _mamba_last_chunk_indices_bytes = 0
             _mamba_seq_idx_for_varlen_bytes = 0
@@ -1214,6 +1241,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             + _mamba_batch_indices_prefill_bytes
             + _mamba_seq_idx_bytes
             + _mamba_cu_seqlens_bytes
+            + _mamba_ssd_seq_chunk_start_bytes
+            + _mamba_ssd_seq_chunk_count_bytes
+            + _mamba_ssd_seq_chunk_base_bytes
+            + _mamba_ssd_active_seq_idx_bytes
+            + _mamba_ssd_empty_seq_idx_bytes
+            + _mamba_ssd_chunk_token_base_bytes
+            + _mamba_ssd_chunk_valid_start_bytes
+            + _mamba_ssd_chunk_valid_end_bytes
             + _mamba_cu_chunk_seqlens_bytes
             + _mamba_last_chunk_indices_bytes
             + _mamba_seq_idx_for_varlen_bytes
@@ -1386,6 +1421,38 @@ class DynamicInferenceContext(BaseInferenceContext):
                 _off : _off + _mamba_conv_seq_start_bytes
             ].view(torch.int32)
             _off += _mamba_conv_seq_start_bytes
+            self._cpu_mamba_ssd_seq_chunk_start = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_seq_chunk_start_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_seq_chunk_start_bytes
+            self._cpu_mamba_ssd_seq_chunk_count = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_seq_chunk_count_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_seq_chunk_count_bytes
+            self._cpu_mamba_ssd_seq_chunk_base = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_seq_chunk_base_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_seq_chunk_base_bytes
+            self._cpu_mamba_ssd_active_seq_idx = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_active_seq_idx_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_active_seq_idx_bytes
+            self._cpu_mamba_ssd_empty_seq_idx = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_empty_seq_idx_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_empty_seq_idx_bytes
+            self._cpu_mamba_ssd_chunk_token_base = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_chunk_token_base_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_chunk_token_base_bytes
+            self._cpu_mamba_ssd_chunk_valid_start = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_chunk_valid_start_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_chunk_valid_start_bytes
+            self._cpu_mamba_ssd_chunk_valid_end = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_chunk_valid_end_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_chunk_valid_end_bytes
 
         assert _off == _total_bytes, f"layout bug: wrote {_off} of {_total_bytes} bytes"
 

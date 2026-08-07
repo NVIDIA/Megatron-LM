@@ -41,6 +41,11 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from ._mamba2_ssd_tile_scheduler import Mamba2SSDTileScheduler, Mamba2SSDTileSchedulerParams
 
+# The dstate (N) mode is the MMA M-mode of the inter1 tile below, and
+# tcgen05 only supports M in {64, 128}. Callers must pad dstate up to this
+# granularity. Unrelated to the chunk size L, which happens to share the value.
+MMA_N_GRANULARITY = 128
+
 
 class SSDKernel:
     def __init__(
