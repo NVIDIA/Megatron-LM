@@ -27,7 +27,7 @@ RUN bash -ex <<"EOF"
       *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
     esac 
     wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/local/bin/yq
-    echo "\${YQ_SHA256}  /usr/local/bin/yq" | sha256sum --check -
+    echo "${YQ_SHA256}  /usr/local/bin/yq" | sha256sum --check -
     chmod a+x /usr/local/bin/yq
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF

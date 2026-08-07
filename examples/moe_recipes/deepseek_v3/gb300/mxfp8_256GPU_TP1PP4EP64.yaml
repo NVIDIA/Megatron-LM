@@ -28,7 +28,7 @@ DEPENDENCIES:
           *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;;
         esac
         wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/bin/yq
-        echo "\${YQ_SHA256}  /usr/bin/yq" | sha256sum --check -
+        echo "${YQ_SHA256}  /usr/bin/yq" | sha256sum --check -
         chmod +x /usr/bin/yq
         apt-get clean
         rm -rf /var/lib/apt/lists/*
