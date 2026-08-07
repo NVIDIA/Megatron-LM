@@ -3,7 +3,7 @@
 import torch
 from torch import nn
 
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_parallel_duplicated,
@@ -114,10 +114,10 @@ def _make_fsdp_for_unit_tests():
     and only setting the attributes that _detect_parallelism_type
     and _annotate_tensor_parallelism actually use.
     """
-    fsdp = FullyShardedDataParallel.__new__(FullyShardedDataParallel)
+    fsdp = FullyShardedDataParallelV1.__new__(FullyShardedDataParallelV1)
 
     # Copy the registry from the real class.
-    fsdp._MODULE_TYPE_REGISTRY = FullyShardedDataParallel._MODULE_TYPE_REGISTRY
+    fsdp._MODULE_TYPE_REGISTRY = FullyShardedDataParallelV1._MODULE_TYPE_REGISTRY
 
     return fsdp
 

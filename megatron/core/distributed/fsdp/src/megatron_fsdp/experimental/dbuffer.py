@@ -201,15 +201,17 @@ class DBuffer:
     def distribute_tensors(
         cls, tensors: Iterable[torch.Tensor], mesh: DeviceMesh, placements: Iterable[Placement]
     ) -> "DBuffer":
-        """Distribute full local tensor values into a DBuffer.
+        """Distribute full local tensors into a DBuffer.
 
         Args:
-            tensors: Full tensor values available on this rank.
+            tensors: Full tensors available on this rank. Meta tensors contribute
+                shape and dtype metadata but no values.
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
 
         Returns:
-            A DBuffer whose local storage matches ``placements``.
+            A DBuffer whose real local storage matches ``placements``. Ranges
+            corresponding to meta tensors are left uninitialized.
         """
         tensors = tuple(tensor.detach().contiguous() for tensor in tensors)
         if not tensors:
@@ -232,7 +234,7 @@ class DBuffer:
         # observable through get_local_tensor() and can remain unspecified.
         for index, tensor in enumerate(tensors):
             owned_range = buffer._get_owned_range(index)
-            if owned_range is None:
+            if owned_range is None or tensor.is_meta:
                 continue
 
             source_slice = tensor.view(-1).narrow(

@@ -1,19 +1,17 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-
-
-logger = logging.getLogger(__name__)
-
 from typing import Any, Callable
 
 import torch
+
 from megatron.core import tensor_parallel
 from megatron.core.distributed import (
     DistributedDataParallel,
     DistributedDataParallelConfig,
     FullyShardedDataParallel,
 )
+from megatron.core.full_cuda_graph import get_shared_capture_stream
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
 try:
@@ -35,6 +33,8 @@ try:
 except ImportError:
     correct_amax_history_if_needed = None
 
+
+logger = logging.getLogger(__name__)
 
 
 def unimodal_build_distributed_models(
@@ -294,11 +294,15 @@ def _ddp_wrap(
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
 
-    # DDP initialization is required to be on a side-stream for the full-iteration CUDA graph.
-    #  this side-stream may be nested if being called from within the get_model function, but it
-    #  is here in case someone wants to use this directly outside of get_model.
-    ddp_stream = torch.cuda.Stream()
+    if get_model_config(model[0]).cuda_graph_impl == "full_iteration":
+        # DDP initialization must use the full-iteration capture stream so its retained
+        # AccumulateGrad nodes do not reference a different, non-capturing stream.
+        ddp_stream = get_shared_capture_stream()
+    else:
+        # Preserve a dedicated initialization stream for all other implementations.
+        ddp_stream = torch.cuda.Stream()
     ddp_stream.wait_stream(torch.cuda.current_stream())
+
     with torch.cuda.stream(ddp_stream):
         dp_init_kwargs = {}
         if not use_torch_fsdp2:
@@ -324,13 +328,27 @@ def _ddp_wrap(
                     if disable_bucketing or pp_rank > 0
                     else ddp_config.bucket_size
                 )
+                # Size the layout by the group the optimizer actually shards over, which is
+                # the intra-instance group when there are several optimizer instances. Using
+                # the full dp_cp would report more shards than the reduce-scatter uses and
+                # leave the trailing shard of every bucket owned by no rank.
+                intra_dp_cp_group = getattr(pg_collection, "intra_dp_cp", None)
+                intra_expt_dp_group = getattr(pg_collection, "intra_expt_dp", None)
                 chunk_kwargs["full_param_layout"] = (
                     DistributedOptimizer.compute_full_param_layout(
                         all_params,
                         effective_bucket_size,
-                        pg_collection.dp_cp.size(),
+                        (
+                            intra_dp_cp_group
+                            if intra_dp_cp_group is not None
+                            else pg_collection.dp_cp
+                        ).size(),
                         ddp_config,
-                        expert_data_parallel_world_size=pg_collection.expt_dp.size(),
+                        expert_data_parallel_world_size=(
+                            intra_expt_dp_group
+                            if intra_expt_dp_group is not None
+                            else pg_collection.expt_dp
+                        ).size(),
                     )
                 )
 
@@ -344,7 +362,7 @@ def _ddp_wrap(
             wrapped_model.append(wrapped_chunk)
         model = wrapped_model
 
-    # Critical: ensure side-stream work completes before touching params on default stream
+    # Ensure initialization-stream work completes before touching params on the default stream.
     torch.cuda.current_stream().wait_stream(ddp_stream)
 
     # Broadcast params from data parallel src rank to other data parallel ranks.
