@@ -44,27 +44,31 @@ DEPENDENCIES:
         "git+https://github.com/NVIDIA/TransformerEngine.git@${TE_COMMIT}"
 
     # HybridEP
+    ARG DEEP_EP_COMMIT="1b8f467965bb818bf2f6511e06993f5607e1721f"
     WORKDIR /home/
     RUN git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git && \
-        cd DeepEP && git checkout 1b8f467965bb818bf2f6511e06993f5607e1721f && \
+        cd DeepEP && git checkout "${DEEP_EP_COMMIT}" && \
         TORCH_CUDA_ARCH_LIST="10.0" pip install --no-build-isolation .
 
     # Fast Hadamard Transform (used by DSA indexer)
+    ARG FHT_COMMIT="e7706faf8d1c3b9f241e36860640ad1dac644ede"
     WORKDIR /home/
     RUN git clone https://github.com/Dao-AILab/fast-hadamard-transform.git && \
-        cd fast-hadamard-transform && \
+        cd fast-hadamard-transform && git checkout "${FHT_COMMIT}" && \
         pip install --no-build-isolation .
 
     # Emerging-Optimizers (Muon)
+    ARG EMERGING_OPTIMIZERS_COMMIT="170d1b864049ab58fab134941eb6f268b3e64dee"
     WORKDIR /home/
     RUN git clone https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git && \
-        cd Emerging-Optimizers && \
+        cd Emerging-Optimizers && git checkout "${EMERGING_OPTIMIZERS_COMMIT}" && \
         pip install --no-build-isolation .
 
     # FlashMLA (DSA kernels)
+    ARG FLASH_MLA_COMMIT="b7643bd54521f563b839b98289b5cd048c062ba2"
     WORKDIR /opt/
     RUN git clone --branch nv_dev https://github.com/deepseek-ai/FlashMLA.git && \
-        cd FlashMLA && \
+        cd FlashMLA && git checkout "${FLASH_MLA_COMMIT}" && \
         FLASH_MLA_DISABLE_SM90=1 \
         NVCC_THREADS=16 \
         CFLAGS="-I/usr/local/cuda/include/cccl" \
@@ -72,8 +76,10 @@ DEPENDENCIES:
         pip install --no-build-isolation .
 
     # cudnn_frontend
+    ARG CUDNN_FRONTEND_COMMIT="6d01e3c53f1e27d6e8994a45bfa85a0b4786dfe4"
     RUN pip install apache-tvm-ffi && \
-        pip install --force-reinstall --no-deps --no-build-isolation git+https://github.com/NVIDIA/cudnn-frontend.git && \
+        pip install --force-reinstall --no-deps --no-build-isolation \
+        "git+https://github.com/NVIDIA/cudnn-frontend.git@${CUDNN_FRONTEND_COMMIT}" && \
         pip install --force-reinstall 'nvidia-cutlass-dsl[cu13]==4.5.2'
 
     RUN unset PIP_CONSTRAINT && \
