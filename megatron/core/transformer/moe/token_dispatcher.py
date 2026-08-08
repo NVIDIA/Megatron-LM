@@ -115,11 +115,9 @@ class MoETokenDispatcher:
         """Release the transient per-forward routing state held on the dispatcher
         (probs / routing map / permutation mappings, etc.).
 
-        Used by the EP A2A overlap VPP-stage full recompute path: after the initial
-        no-grad forward, this state is no longer needed until the backward-time
-        recompute, which re-runs ``dispatch_preprocess`` and unconditionally
-        repopulates all of it. Freeing it here is therefore correctness-neutral and
-        only reduces the metadata retained across the forward->backward gap. The base
+        Used by the EP A2A overlap full recompute path: the backward-time replay re-runs
+        ``dispatch_preprocess`` and repopulates all of it, so freeing it here only
+        reduces the metadata retained across the forward->backward gap. The base
         implementation is a no-op; dispatchers that cache such state override it.
         """
 
@@ -1025,12 +1023,10 @@ class _DispatchManager(ABC):
     def reset_transient_forward_state(self) -> None:
         """Release the transient per-forward routing metadata cached on the manager.
 
-        Used by the EP A2A overlap VPP-stage full recompute path: the backward-time
-        recompute re-runs setup_metadata / dispatch / get_permuted, which repopulate
-        all of this before combine, and the backward reads autograd-saved tensors
-        rather than these attributes. Clearing them after the initial forward is
-        therefore correctness-neutral and only frees the metadata retained across the
-        forward->backward gap (persistent comm buffers / bootstrap state are kept)."""
+        Used by the EP A2A overlap full recompute path: the backward-time replay re-runs
+        setup_metadata / dispatch / get_permuted before combine, and the backward reads
+        autograd-saved tensors rather than these attributes, so clearing them only frees
+        metadata retained across the gap (persistent comm buffers / bootstrap state stay)."""
         for attr in self._TRANSIENT_FORWARD_ATTRS:
             if getattr(self, attr, None) is not None:
                 setattr(self, attr, None)

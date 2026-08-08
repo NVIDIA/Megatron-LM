@@ -94,6 +94,9 @@ class _RecordingLayer:
         self.moe_combine = _RecordingNode(calls, f"{prefix}.moe_combine")
         self.mhc_recompute = None
         self.mtp_post_process = _RecordingNode(calls, f"{prefix}.mtp_post_process")
+        # This layer exercises mHC selective recompute, not full recompute, so it
+        # belongs to no RecomputeSegment and the segment hooks are skipped.
+        self.recompute_segment = None
 
     def get_fp8_context(self):
         return nullcontext()
@@ -109,6 +112,8 @@ class _RecordingChunk:
         self.pre_process = _RecordingNode(calls, "chunk.pre_process")
         self.post_process = None
         self.vp_stage = 0
+        # Read by run() only on the post_process path, which this chunk does not take.
+        self.recompute_full = False
 
     def record_current_stream(self):
         self.calls.append("chunk.record_current_stream")
@@ -125,13 +130,9 @@ class _RecordingChunk:
     def release_state(self):
         self.calls.append("chunk.release_state")
 
-    def snapshot_rng_for_recompute(self):
-        # This chunk exercises mHC selective recompute, not VPP-stage full recompute,
-        # so the real method short-circuits to a no-op (recompute_vpp_stage is off).
-        pass
-
-    def recompute_model_chunk_schedule_plan(self):
-        # No-op for the same reason as snapshot_rng_for_recompute above.
+    def release_layer_activations(self):
+        # This chunk exercises mHC selective recompute, not full recompute, so it has
+        # no RecomputeSegments and the real method iterates an empty list.
         pass
 
 
@@ -262,8 +263,11 @@ def test_checkpoint_manager_explicit_recompute_is_idempotent_and_restores_gradie
     torch.testing.assert_close(input_tensor.grad, reference_input.grad)
 
 
-def _run_schedule_and_capture(model, data):
+def _run_schedule_and_capture(model, data, on_plan_built=None):
     schedule_plan = model.build_schedule_plan(**data)
+    if on_plan_built is not None:
+        # The plan is released during the backward below, so assert on it here.
+        on_plan_built(schedule_plan)
     output = TransformerModelChunkSchedulePlan.run(schedule_plan, None)
     output_value = output.detach().clone()
     TransformerModelChunkSchedulePlan.run(None, schedule_plan, b_grad=torch.ones_like(output))
@@ -344,6 +348,25 @@ def _make_mhc_numerical_config(overlap=True, recompute=True, extra_config=None):
     return get_test_config(num_layers=2, extra_kwargs=extra_kwargs)
 
 
+def _make_mhc_full_recompute_config(overlap=True):
+    """mHC + MTP + full recompute: the only config that exercises the mHC bridge across
+    a segment replay. Without MTP or hyper-connections mhc_multistream stays None and
+    RecomputeSegment's grad-carrier code never runs.
+    """
+    return _make_mhc_numerical_config(
+        overlap=overlap,
+        # Not selective mHC recompute; the extra_config below switches on full recompute.
+        recompute=False,
+        extra_config={
+            "recompute_granularity": "full",
+            "recompute_method": "uniform",
+            "recompute_num_layers": 1,
+            "mtp_num_layers": 1,
+            "mtp_loss_scaling_factor": 1.1,
+        },
+    )
+
+
 def _assert_close_grads(overlap_gradients, reference_gradients, rtol=5e-3, atol=5e-3):
     assert overlap_gradients.keys() == reference_gradients.keys()
     for name in reference_gradients:
@@ -367,6 +390,40 @@ class TestMhcA2AOverlapNumerics:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    def test_full_recompute_carries_the_mhc_bridge_gradient(self):
+        """mHC + MTP under full recompute matches the eager reference.
+
+        The MTP segment is replayed and backwarded before the producer segment installs a
+        new bridge leaf, so the gradient has to be carried across. Dropping it yields a
+        wrong decoder-side grad rather than an error, hence a numerical parity test.
+        """
+        reference_config = _make_mhc_full_recompute_config(overlap=False)
+        overlap_config = _make_mhc_full_recompute_config()
+        assert overlap_config.enable_hyper_connections, "the mHC bridge must be enabled"
+        assert overlap_config.mtp_num_layers == 1, "the mHC bridge needs an MTP consumer"
+
+        def assert_every_layer_is_its_own_segment(schedule_plan):
+            # 2 decoder + 1 MTP layer, uniform/1. Puts the MTP consumer and the decoder
+            # producer in different segments; coarser segmentation would stop testing it.
+            assert [len(s.layers) for s in schedule_plan._recompute_segments] == [1, 1, 1]
+
+        with deterministic_mode():
+            data = build_input_data(seq_len=16)
+            reference_model = build_gpt_model(reference_config)
+            initial_parameters = reset_model(reference_model)
+            reference_output, reference_gradients = _run_eager_and_capture(reference_model, data)
+            del reference_model
+
+            overlap_model = build_gpt_model(overlap_config)
+            reset_model(overlap_model, initial_parameters)
+            overlap_output, overlap_gradients = _run_schedule_and_capture(
+                overlap_model, data, on_plan_built=assert_every_layer_is_its_own_segment
+            )
+
+        torch.testing.assert_close(overlap_output, reference_output, rtol=5e-3, atol=5e-3)
+        _assert_close_grads(overlap_gradients, reference_gradients)
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("recompute", (False, True), ids=("without-recompute", "recompute"))
