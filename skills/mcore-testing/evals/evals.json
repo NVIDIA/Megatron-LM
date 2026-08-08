@@ -1,1 +1,33 @@
-[]
+{
+  "skill": "mcore-testing",
+  "cases": [
+    {
+      "id": "mcore-testing-run-single-distributed-test",
+      "question": "Run tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_constructor locally the same way Megatron-LM unit tests expect to run.",
+      "expected_skill": "mcore-testing",
+      "expected_script": null,
+      "ground_truth": "Launch pytest through uv run python -m torch.distributed.run with eight processes and the exact pytest node ID.",
+      "expected_behavior": [
+        "Routes to mcore-testing",
+        "Uses uv run python -m torch.distributed.run",
+        "Uses --nproc-per-node 8",
+        "Runs pytest with the exact requested node ID"
+      ]
+    },
+    {
+      "id": "mcore-testing-add-functional-test",
+      "question": "Add a new GPT functional test to Megatron-LM and describe everything needed to get it validated in CI, including golden values.",
+      "expected_skill": "mcore-testing",
+      "expected_script": null,
+      "ground_truth": "Create the test-case directory and model_config.yaml, add appropriate H100 and optionally GB200 recipe entries, trigger a full functional run with the Run functional tests label, then download and commit golden values from the successful run.",
+      "expected_behavior": [
+        "Routes to mcore-testing",
+        "Creates tests/functional_tests/test_cases/<model>/<test_name>/model_config.yaml",
+        "Adds a recipe under tests/test_utils/recipes/h100 and GB200 when needed",
+        "Uses the Run functional tests label for a full run",
+        "Downloads golden values with download_golden_values.py after success",
+        "Commits the resulting golden-value files"
+      ]
+    }
+  ]
+}

@@ -1,1 +1,32 @@
-[]
+{
+  "skill": "mcore-create-issue",
+  "cases": [
+    {
+      "id": "mcore-create-issue-triage-job-url",
+      "question": "Walk me through how you would investigate a failing NVIDIA/Megatron-LM GitHub Actions job URL and file a useful bug for it.",
+      "expected_skill": "mcore-create-issue",
+      "expected_script": null,
+      "ground_truth": "Parse the run and job IDs, inspect the job logs, identify the failed pytest node and concise root error, resolve the triggering PR and test-file author, search for duplicates, and only then create a linked and assigned bug issue.",
+      "expected_behavior": [
+        "Routes to mcore-create-issue",
+        "Extracts the run and job identifiers and inspects the actual failure logs",
+        "Resolves the triggering PR and the failing test file's most recent author",
+        "Searches open issues for a duplicate before creating anything",
+        "Uses a concise issue body with PR, run, job, failed test, and no more than 30 lines of error output"
+      ]
+    },
+    {
+      "id": "mcore-create-issue-duplicate-found",
+      "question": "The failing test is tests/unit_tests/models/test_gpt_model.py::TestGPTModel::test_constructor, and an open issue already tracks that exact failure. Please file another bug from the CI run.",
+      "expected_skill": "mcore-create-issue",
+      "expected_script": null,
+      "ground_truth": "Do not create a duplicate. Return the existing issue to the user and stop.",
+      "expected_behavior": [
+        "Routes to mcore-create-issue",
+        "Recognizes the matching open issue as a duplicate",
+        "Does not create a new issue",
+        "Reports the existing issue URL"
+      ]
+    }
+  ]
+}
