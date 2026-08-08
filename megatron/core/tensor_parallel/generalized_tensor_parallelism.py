@@ -925,6 +925,8 @@ class GTPShardedParam(torch.nn.Parameter):
     # Recompute-forward prefetch cursor, keyed by chain_id; also cleared by reset_gtp_state().
     _recompute_chain_state: Dict[str, dict] = {}
 
+    _link_tables_flushed: bool = False
+
     @classmethod
     def _get_chain_state(cls, chain_id: str) -> dict:
         if chain_id not in cls._chain_state:
@@ -932,7 +934,6 @@ class GTPShardedParam(torch.nn.Parameter):
                 "last_weight": None,
                 "link_node_count": 0,
                 "link_table_buffer": [],
-                "link_table_flushed": False,
             }
         return cls._chain_state[chain_id]
 
@@ -941,6 +942,18 @@ class GTPShardedParam(torch.nn.Parameter):
         if chain_id not in cls._recompute_chain_state:
             cls._recompute_chain_state[chain_id] = {"last_weight": None}
         return cls._recompute_chain_state[chain_id]
+
+    @classmethod
+    def flush_link_tables(cls) -> None:
+        """Log every chain's buffered prefetch-link table once, atomically.
+
+        Call only where the chains are complete -- NOT on "this weight is already linked", which
+        MTP hits mid-forward while later links are still being created.
+        """
+        for chain in cls._chain_state.values():
+            if chain["link_table_buffer"]:
+                log_single_rank(logger, logging.INFO, "\n".join(chain["link_table_buffer"]) + "\n")
+        cls._link_tables_flushed = True
 
     @classmethod
     def _buffer_link_table_row(
@@ -1342,6 +1355,20 @@ class GTPShardedParam(torch.nn.Parameter):
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
+    def _prefetch_available(self) -> bool:
+        """True when an all-gather was actually issued for THIS consume (either direction).
+
+        A weight is prefetched by its chain neighbour -- predecessor in forward, successor in
+        backward -- so one pass of the chain issues one AG per weight. MTP with
+        --mtp-use-repeated-layer replays the MTP block once per depth while those neighbours run
+        only once, so the second consume has no AG of its own. Taking the prefetched path there
+        would cache.get() the previous AG's buffer: stale weights, silently, since the state
+        guard is compiled out unless check_param_states is on.
+
+        Falling back to an on-demand AG costs the overlap for that consume but keeps it correct.
+        """
+        return self._prefetch_handle is not None or getattr(self, "_already_ag_drained", False)
+
     def _get_prefetched_weight(self, fwd):
         # Stale-read guard: state must reflect an AG issued for this cycle;
         # otherwise cache.get() would return the prior iter's AG buffer.
@@ -1428,8 +1455,13 @@ class GTPShardedParam(torch.nn.Parameter):
         Returns:
             weight_total
         """
+        # Links are only created during forward, so every chain is complete by the first
+        # backward all-gather. Logging here rather than at the end of the iteration means the
+        # tables are still emitted if backward then fails, which is when they are most useful.
+        if not type(self)._link_tables_flushed:
+            type(self).flush_link_tables()
 
-        if GTP_CONFIG.weight_prefetch and self.next_w is not None:
+        if GTP_CONFIG.weight_prefetch and self.next_w is not None and self._prefetch_available():
             result = self._get_prefetched_weight(False)
         else:
             result = self._all_gather_weight_on_demand(False)
@@ -1479,7 +1511,12 @@ class GTPShardedParam(torch.nn.Parameter):
         # Consume current weight.
         if use_recompute_chain and self._recompute_prev is not None:
             result = self._get_recompute_prefetched_weight()
-        elif not in_recompute and GTP_CONFIG.weight_prefetch and self.prev_w is not None:
+        elif (
+            not in_recompute
+            and GTP_CONFIG.weight_prefetch
+            and self.prev_w is not None
+            and self._prefetch_available()
+        ):
             result = self._get_prefetched_weight(True)
         else:
             # On-demand: chain head (fwd or recompute global-first) or first-iter build.
@@ -1553,10 +1590,6 @@ class GTPShardedParam(torch.nn.Parameter):
 
             self.prefetch_initialized = True
             chain["last_weight"] = self
-        elif not chain["link_table_flushed"] and chain["link_table_buffer"]:
-            # Second forward pass: flush the complete table atomically to avoid interleaving
-            chain["link_table_flushed"] = True
-            log_single_rank(logger, logging.INFO, "\n".join(chain["link_table_buffer"]) + "\n")
 
         return result
 
@@ -1612,17 +1645,27 @@ class GTPShardedParam(torch.nn.Parameter):
         param._set_rs_state(GTPWeightState.NONE)
         return dummy_grad
 
-    def _wait_reduce_scatter(self, finalize_grad=False):
-        # Enter rs_stream context so handle.wait() + rs_event.record() land on rs_stream
-        # (mirrors _wait_param_gather). With finalize_grad=True, main_grad.add_ also runs on
-        # rs_stream right after the NCCL RS — starts during AG drain, not after, avoiding
-        # SM-saturation that blocks cross-graph overlap.
+    def _wait_reduce_scatter(self, finalize_grad=False) -> bool:
+        """Wait on this weight's in-flight wgrad reduce-scatter, optionally accumulating it.
+
+        Enters the rs_stream context so handle.wait() + rs_event.record() land on rs_stream
+        (mirrors _wait_param_gather). With finalize_grad=True, main_grad.add_ also runs on
+        rs_stream right after the NCCL RS — starts during AG drain, not after, avoiding
+        SM-saturation that blocks cross-graph overlap.
+
+        Returns:
+            True if this weight had a reduce-scatter in flight and it was waited on, False if
+            there was nothing to wait for. wgrad_reduce_scatter needs to tell those apart
+            before it reads the result buffer.
+        """
+        waited = False
         rs_stream = self._cached_rs_stream
         if rs_stream is None:
             rs_stream = get_rs_stream(self.chain_id, self.group)
             self._cached_rs_stream = rs_stream
         with torch.cuda.stream(rs_stream):
             if self._wgrad_rs_handle is not None:
+                waited = True
                 self._wgrad_rs_handle.wait()
                 self._record_graph_wgrad_ring_slots_ready()
                 self._wgrad_rs_handle = None
@@ -1641,6 +1684,7 @@ class GTPShardedParam(torch.nn.Parameter):
                         self._handle_megatron_grad_accum(w)
                     self._already_finalized = True
         self._release_comm_scratch()
+        return waited
 
     def _release_comm_scratch(self, attrs=("_wgrad_input_bufs", "_rs_a2a_bufs")):
         """Release the buffers a finished RS was reading.
@@ -1857,6 +1901,15 @@ class GTPShardedParam(torch.nn.Parameter):
         wgrads = list(wgrad) if batched else [wgrad]
         weights = self._weights
 
+        # MTP feeds embedding and output_layer into more than one GEMM per forward, so they get
+        # more than one backward. The previous reduce-scatter may still be running: starting
+        # another would reuse this weight's ticket, i.e. the same output buffer, and overwrite
+        # the one handle we track -- discarding that gradient with no error. Finish it first.
+        if GTP_CONFIG.async_reduction and self._wgrad_rs_handle is not None:
+            self._wait_reduce_scatter(finalize_grad=True)
+            # Accounted for here, so the cascade below must not skip the next one.
+            self._already_finalized = False
+
         # UNGRAPHED wgrads recycle via the standalone pool (_wgrad_pool_put); GRAPHED wgrads
         # cannot, since CUDA graphs require stable buffer addresses across replay.
         poolable = not _chain_is_graphed(self.chain_id)
@@ -1889,9 +1942,15 @@ class GTPShardedParam(torch.nn.Parameter):
         # Wait for last reduce scatter if it was async
         # Currently only support reduce scattering in reverse order
         if GTP_CONFIG.async_reduction and self.next_w is not None:
-            self.next_w._wait_reduce_scatter()
+            # Backward normally walks the chain in reverse, so next_w has already started its
+            # reduce-scatter by now. That only holds while each weight is used once per forward.
+            # MTP's second embedding lookup sits late in the forward, so the embedding's backward
+            # runs before decoder layer 0 has reduce-scattered anything -- check first.
+            waited = self.next_w._wait_reduce_scatter()
 
-            if getattr(self.next_w, "_already_finalized", False):
+            if not waited:
+                pass  # next_w has not reduce-scattered yet, or something already finalized it
+            elif getattr(self.next_w, "_already_finalized", False):
                 self.next_w._already_finalized = False
             else:
                 self.next_w.rs_event.wait()
@@ -2313,6 +2372,7 @@ def reset_gtp_state():
     """
     GTPShardedParam._chain_state.clear()
     GTPShardedParam._recompute_chain_state.clear()
+    GTPShardedParam._link_tables_flushed = False
     _GTP_GROUPED_BUF_PARITY_COUNTER.clear()
 
 
