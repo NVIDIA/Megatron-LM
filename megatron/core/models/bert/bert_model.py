@@ -14,6 +14,7 @@ from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import (
@@ -25,7 +26,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.utils import get_linear_layer
-from megatron.core.utils import deprecate_inference_params, is_te_min_version
+from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
 
 class BertModel(LanguageModule):
@@ -86,7 +87,7 @@ class BertModel(LanguageModule):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         if return_embeddings:
-            assert self.post_process and self.add_binary_head
+            assert post_process and add_binary_head
 
         self.config: TransformerConfig = config
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
@@ -280,14 +281,170 @@ class BertModel(LanguageModule):
 
         return extended_attention_mask
 
-    def bert_position_ids(self, token_ids):
+    def bert_position_ids(
+        self, token_ids: Tensor, packed_seq_params: PackedSeqParams | None = None
+    ) -> Tensor:
         """Position ids for bert model"""
+        if packed_seq_params is not None:
+            _, physical_cu_seqlens = self._get_packed_cu_seqlens(token_ids, packed_seq_params)
+            if self._get_packed_cp_size(packed_seq_params) > 1:
+                raise ValueError(
+                    'position_ids must be provided for packed BERT input with context parallelism'
+                )
+
+            total_tokens = token_ids.size(1)
+            segment_lengths = self._get_packed_segment_lengths(physical_cu_seqlens, total_tokens)
+            seq_starts = torch.repeat_interleave(
+                physical_cu_seqlens, segment_lengths, output_size=total_tokens
+            )
+            token_positions = torch.arange(total_tokens, dtype=torch.long, device=token_ids.device)
+            return (token_positions - seq_starts).unsqueeze(0)
+
         # Create position ids
         seq_length = token_ids.size(1)
         position_ids = torch.arange(seq_length, dtype=torch.long, device=token_ids.device)
         position_ids = position_ids.unsqueeze(0).expand_as(token_ids)
 
         return position_ids
+
+    def _get_packed_cu_seqlens(
+        self, token_ids: Tensor, packed_seq_params: PackedSeqParams
+    ) -> tuple[Tensor, Tensor]:
+        """Validate packed input metadata and return logical and physical boundaries."""
+        if token_ids.size(0) != 1:
+            raise ValueError('Packed BERT input should use dummy batch size 1')
+        if packed_seq_params.cu_seqlens_q is None:
+            raise ValueError(
+                'packed_seq_params.cu_seqlens_q must be provided for packed BERT input'
+            )
+
+        cu_seqlens = packed_seq_params.cu_seqlens_q.to(device=token_ids.device, dtype=torch.long)
+        physical_cu_seqlens = self._get_packed_physical_cu_seqlens(
+            packed_seq_params, token_ids.device
+        )
+        if cu_seqlens.dim() != 1 or cu_seqlens.numel() < 2:
+            raise ValueError('packed_seq_params.cu_seqlens_q must be a 1D tensor')
+        if physical_cu_seqlens.dim() != 1 or physical_cu_seqlens.numel() != cu_seqlens.numel():
+            raise ValueError('packed_seq_params.cu_seqlens_q_padded must match cu_seqlens_q')
+
+        # Reading cumulative lengths that live on the accelerator would force a
+        # device-to-host synchronization on every forward and is illegal during CUDA graph
+        # capture, so metadata is only validated while it is still on the host.
+        if physical_cu_seqlens.device.type == 'cpu':
+            cu_seqlens_values = cu_seqlens.tolist()
+            physical_cu_seqlens_values = physical_cu_seqlens.tolist()
+            if cu_seqlens_values[0] != 0 or physical_cu_seqlens_values[0] != 0:
+                raise ValueError('packed sequence cumulative lengths must start at 0')
+            if any(
+                end < start for start, end in zip(cu_seqlens_values[:-1], cu_seqlens_values[1:])
+            ) or any(
+                end < start
+                for start, end in zip(
+                    physical_cu_seqlens_values[:-1], physical_cu_seqlens_values[1:]
+                )
+            ):
+                raise ValueError(
+                    'packed sequence cumulative lengths must be monotonically increasing'
+                )
+            if self._get_packed_cp_size(packed_seq_params) == 1 and physical_cu_seqlens_values[
+                -1
+            ] > token_ids.size(1):
+                raise ValueError(
+                    'packed physical cumulative lengths must not exceed the packed sequence length'
+                )
+
+        return cu_seqlens, physical_cu_seqlens
+
+    @staticmethod
+    def _get_packed_physical_cu_seqlens(
+        packed_seq_params: PackedSeqParams, device: torch.device
+    ) -> Tensor:
+        """Return the boundaries of the physical (padded) packed token buffer."""
+        cu_seqlens = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        return cu_seqlens.to(device=device, dtype=torch.long)
+
+    @staticmethod
+    def _get_packed_segment_lengths(physical_cu_seqlens: Tensor, total_tokens: int) -> Tensor:
+        """Split the physical token buffer into per-sequence segments.
+
+        Tokens beyond the last padded sequence are returned as one extra trailing segment,
+        matching :meth:`PackedSeqParams.__post_init__`. The trailing segment is empty when
+        the buffer ends exactly at the last padded boundary.
+        """
+        boundaries = torch.cat(
+            [
+                physical_cu_seqlens,
+                torch.tensor(
+                    [total_tokens],
+                    dtype=physical_cu_seqlens.dtype,
+                    device=physical_cu_seqlens.device,
+                ),
+            ]
+        )
+        return (boundaries[1:] - boundaries[:-1]).clamp(min=0)
+
+    def _packed_mean_pooled_embeddings(
+        self, hidden_states: Tensor, packed_seq_params: PackedSeqParams
+    ) -> Tensor:
+        """Mean-pool the interior tokens of every sequence in a packed buffer.
+
+        Mirrors the dense ``return_embeddings`` path, which averages ``embedding[1 : mask - 1]``
+        per sample, but derives the per-sequence spans from the cumulative sequence lengths.
+        Padding tokens are excluded because the logical lengths bound the interior mask.
+        """
+        physical_cu_seqlens = self._get_packed_physical_cu_seqlens(
+            packed_seq_params, hidden_states.device
+        )
+        total_tokens = hidden_states.size(0)
+        num_sequences = physical_cu_seqlens.numel() - 1
+        segment_lengths = self._get_packed_segment_lengths(physical_cu_seqlens, total_tokens)
+        segment_ids = torch.repeat_interleave(
+            torch.arange(segment_lengths.numel(), device=hidden_states.device),
+            segment_lengths,
+            output_size=total_tokens,
+        )
+        positions = torch.arange(
+            total_tokens, device=hidden_states.device
+        ) - physical_cu_seqlens.index_select(0, segment_ids)
+
+        cu_seqlens = packed_seq_params.cu_seqlens_q.to(
+            device=hidden_states.device, dtype=torch.long
+        )
+        # The trailing segment holds tokens past the last sequence, so its length is zero.
+        sequence_lengths = torch.cat(
+            [
+                cu_seqlens[1:] - cu_seqlens[:-1],
+                torch.zeros(1, dtype=torch.long, device=hidden_states.device),
+            ]
+        )
+        interior_mask = (positions > 0) & (
+            positions < sequence_lengths.index_select(0, segment_ids) - 1
+        )
+
+        embeddings = hidden_states[:, 0, :].float()
+        output = torch.zeros(
+            (segment_lengths.numel(), embeddings.size(1)),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        output.index_add_(0, segment_ids, embeddings * interior_mask.unsqueeze(1))
+        counts = torch.zeros(
+            segment_lengths.numel(), dtype=torch.float32, device=hidden_states.device
+        )
+        counts.index_add_(0, segment_ids, interior_mask.float())
+        return (output / counts.clamp_min(1).unsqueeze(1))[:num_sequences]
+
+    def _get_packed_cp_size(self, packed_seq_params: PackedSeqParams) -> int:
+        """Return the effective context-parallel size for packed input."""
+        if packed_seq_params.cp_group is not None:
+            return get_pg_size(packed_seq_params.cp_group)
+        if packed_seq_params.local_cp_size is not None:
+            return packed_seq_params.local_cp_size
+        return get_pg_size(self.cp_group)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -308,11 +465,13 @@ class BertModel(LanguageModule):
     def forward(
         self,
         input_ids: Tensor,
-        attention_mask: Tensor,
+        attention_mask: Tensor | None,
         tokentype_ids: Tensor = None,
         lm_labels: Tensor = None,
         inference_context=None,
+        packed_seq_params: PackedSeqParams | None = None,
         *,
+        position_ids: Tensor = None,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
         """Forward function of BERT model
@@ -326,11 +485,39 @@ class BertModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        extended_attention_mask = self.bert_extended_attention_mask(attention_mask)
+        if packed_seq_params is None:
+            if attention_mask is None:
+                raise ValueError('attention_mask must be provided when packed_seq_params is None')
+            extended_attention_mask = self.bert_extended_attention_mask(attention_mask)
+        else:
+            if packed_seq_params.qkv_format != 'thd':
+                raise ValueError("BERT packed sequence support requires qkv_format='thd'")
+            if attention_mask is not None:
+                raise ValueError('attention_mask must be None when using packed BERT input')
+            if (
+                self.post_process
+                and (self.add_binary_head or self.return_embeddings)
+                and self._get_packed_cp_size(packed_seq_params) > 1
+            ):
+                raise ValueError(
+                    'Packed BERT binary-head and embedding post-processing do not support '
+                    'context parallelism'
+                )
+            if self.post_process and self.return_embeddings and self.config.sequence_parallel:
+                raise ValueError(
+                    'Packed BERT embedding post-processing does not support sequence parallelism'
+                )
+            extended_attention_mask = None
 
         if parallel_state.is_pipeline_first_stage():
             input_ids = input_ids
-            position_ids = self.bert_position_ids(input_ids)
+            if position_ids is None:
+                position_ids = self.bert_position_ids(input_ids, packed_seq_params)
+            else:
+                if packed_seq_params is not None:
+                    self._get_packed_cu_seqlens(input_ids, packed_seq_params)
+                if position_ids.shape != input_ids.shape:
+                    raise ValueError('position_ids must have the same shape as input_ids')
         else:
             position_ids = None
             input_ids = None
@@ -349,9 +536,13 @@ class BertModel(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.encoder, encoder_input, self.config
+                inference_context, self.encoder, encoder_input, self.config, packed_seq_params
             )
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+            )
 
         # Run encoder.
         hidden_states = self.encoder(
@@ -359,16 +550,26 @@ class BertModel(LanguageModule):
             attention_mask=extended_attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
         )
         if not self.post_process:
             return hidden_states
 
         if self.add_binary_head:
-            pooled_output = self.pooler(hidden_states, 0)
+            if packed_seq_params is None:
+                pooled_output = self.pooler(hidden_states, 0)
+            else:
+                sequence_starts = self._get_packed_physical_cu_seqlens(
+                    packed_seq_params, hidden_states.device
+                )[:-1]
+                pooled_output = self.pooler(hidden_states, sequence_starts).squeeze(1)
         else:
             pooled_output = None  # for pylint.
 
         if self.return_embeddings:
+            if packed_seq_params is not None:
+                return self._packed_mean_pooled_embeddings(hidden_states, packed_seq_params)
+
             embeddings = torch.transpose(hidden_states, 0, 1)
             masks = torch.sum(attention_mask, dim=1)
             # Collect masked embeddings.
