@@ -137,19 +137,21 @@ class PRReviewTracker:
             members.update(self._get_team_members(slug))
         return members
 
-    def _get_latest_reviews(self, pr_number):
-        """Get the active review state per reviewer using GraphQL latestReviews.
+    def _get_latest_opinionated_reviews(self, pr_number):
+        """Get the active approval/change-request state per reviewer.
 
-        Unlike the REST API's get_reviews(), this returns only the current
-        review per reviewer — matching the green/red checkmarks in the UI.
-        Dismissed or removed approvals are not included.
+        GitHub's latestReviews includes COMMENTED reviews, so a reviewer who
+        approves and later leaves a comment appears as COMMENTED. Use
+        latestOpinionatedReviews instead so comments do not erase active
+        approvals, while dismissed approvals and changes requested remain
+        reflected in the active review state.
         """
         owner, name = self.repo.full_name.split("/")
         query = """
         query($owner: String!, $name: String!, $number: Int!) {
           repository(owner: $owner, name: $name) {
             pullRequest(number: $number) {
-              latestReviews(first: 100) {
+              latestOpinionatedReviews(first: 100) {
                 nodes {
                   author { login }
                   state
@@ -170,13 +172,15 @@ class PRReviewTracker:
                 headers={"Authorization": f"Bearer {self.token}"},
             )
             resp.raise_for_status()
-            nodes = resp.json()["data"]["repository"]["pullRequest"]["latestReviews"]["nodes"]
+            nodes = resp.json()["data"]["repository"]["pullRequest"]["latestOpinionatedReviews"][
+                "nodes"
+            ]
             for node in nodes:
                 if node["author"]:
                     reviews[node["author"]["login"]] = node["state"]
         except Exception as e:
-            logger.warning(f"Could not get latest reviews for PR #{pr_number}: {e}")
-        logger.info(f"Active reviews: {reviews}")
+            logger.warning(f"Could not get latest opinionated reviews for PR #{pr_number}: {e}")
+        logger.info(f"Active opinionated reviews: {reviews}")
         return reviews
 
     def swap_labels(self):
@@ -186,9 +190,9 @@ class PRReviewTracker:
             logger.info(f"PR #{pr.number} is a draft. Skipping label swap.")
             return
 
-        # 1. Get the active review state per reviewer via GraphQL latestReviews,
-        #    which reflects dismissed/removed approvals the same way the GitHub UI does.
-        latest_reviews = self._get_latest_reviews(pr.number)
+        # 1. Get the active approval/change-request state per reviewer. Plain
+        #    review comments should not override an otherwise active approval.
+        latest_reviews = self._get_latest_opinionated_reviews(pr.number)
 
         approvers = {user for user, state in latest_reviews.items() if state == "APPROVED"}
         non_approvers = {
