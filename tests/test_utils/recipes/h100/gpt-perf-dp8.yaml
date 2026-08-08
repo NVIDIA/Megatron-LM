@@ -16,7 +16,9 @@ spec:
   time_limit: 3600
   script_setup: |
     unset https_proxy
-    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> /root/.netrc
+    trap 'rm -f /root/.netrc; unset RO_API_TOKEN' EXIT
 
     cd /opt
     rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
@@ -26,7 +28,11 @@ spec:
     git fetch origin $MCORE_MR_COMMIT
     git checkout $MCORE_MR_COMMIT
     git rev-parse HEAD
+    rm -f /root/.netrc
+    unset RO_API_TOKEN
   script: |-
+    rm -f /root/.netrc
+    unset RO_API_TOKEN
     cd /opt/megatron-lm
 
     ARGUMENTS=(

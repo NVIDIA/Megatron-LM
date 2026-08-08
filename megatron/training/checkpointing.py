@@ -1740,10 +1740,16 @@ def _load_base_checkpoint(
             print_rank_0('    will not load any checkpoints and will start from random')
         # Conditionally exit if checkpoint not found.
         if args.exit_on_missing_checkpoint:
-            print_rank_0(">> '--exit-on-missing-checkpoint' set ... exiting. <<")
+            print_rank_0(
+                ">> '--exit-on-missing-checkpoint' is set but no checkpoint was found under "
+                f"load directory '{load_dir}' (missing metadata/tracker file "
+                f"'{tracker_filename}'). Exiting with a non-zero status. <<"
+            )
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
-            sys.exit()
+            # Exit non-zero so that callers (e.g. CI harnesses) detect the missing
+            # checkpoint as a failure instead of silently treating exit code 0 as success.
+            sys.exit(1)
 
         return None, '', False, None
 
