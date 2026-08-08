@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import inspect
+import sys
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -12,6 +13,8 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.argument_utils import gpt_config_from_args
+from megatron.training.arguments import parse_args, validate_args
 from megatron.training.models.gpt import (
     GPTModelBuilder,
     GPTModelConfig,
@@ -898,3 +901,38 @@ class TestMtpBlockSpec:
             mtp_block_spec(config, spec)
 
         assert mock_get_mtp.call_args.kwargs["use_transformer_engine"] is False
+
+
+# =============================================================================
+# Section 5 — gpt_config_from_args
+# =============================================================================
+
+
+class TestGPTConfigFromArgs:
+    """Tests for argument propagation through ``gpt_config_from_args``."""
+
+    def _make_args(self, **overrides):
+        sys.argv = ['test_gpt_builder.py']
+        args = parse_args()
+        args.num_layers = 2
+        args.hidden_size = 128
+        args.num_attention_heads = 8
+        args.micro_batch_size = 1
+        args.seq_length = 128
+        args.max_position_embeddings = 131072
+        args.padded_vocab_size = 32000
+        args.position_embedding_type = 'rope'
+        args.apply_rope_fusion = False
+        for name, value in overrides.items():
+            setattr(args, name, value)
+        validate_args(args)
+        return args
+
+    def test_forwards_rope_scaling_factor_from_args(self):
+        """--rope-scaling-factor must reach the model config instead of the default."""
+        args = self._make_args(use_rope_scaling=True, rope_scaling_factor=32.0)
+
+        config = gpt_config_from_args(args)
+
+        assert config.rope_scaling is True
+        assert config.rope_scaling_factor == 32.0
