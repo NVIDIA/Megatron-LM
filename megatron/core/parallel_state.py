@@ -266,6 +266,34 @@ def create_group(
     return group
 
 
+def _create_local_sync_group_for_rank(
+    rank_groups,
+    rank,
+    timeout=None,
+    backend=None,
+    pg_options=None,
+    group_desc=None,
+):
+    """Create one local-sync group per rank for a disjoint group family.
+
+    Non-members create an unused singleton group so that later local-sync group
+    names are derived from the same process-group count on every rank.
+    """
+    local_rank_groups = [ranks for ranks in rank_groups if rank in ranks]
+    assert len(local_rank_groups) <= 1, f"{group_desc} rank groups must be disjoint"
+    is_member = bool(local_rank_groups)
+    local_ranks = local_rank_groups[0] if is_member else [rank]
+    group = create_group(
+        local_ranks,
+        timeout=timeout,
+        backend=backend,
+        pg_options=pg_options,
+        use_local_synchronization=True,
+        group_desc=group_desc if is_member else f"{group_desc}_LOCAL_SYNC_PADDING",
+    )
+    return (group, local_ranks) if is_member else (None, None)
+
+
 def generate_masked_orthogonal_rank_groups(
     world_size: int, parallel_size: List[int], mask: List[bool]
 ) -> List[List[int]]:
@@ -413,12 +441,14 @@ def create_hierarchical_groups(
             l=int(np.prod(hierarchical_group_sizes[level + 1 :])),
         ).tolist()
         for sub_ranks in rearranged_ranks:
-            sub_group = create_group(
-                sub_ranks,
-                timeout=timeout,
-                pg_options=pg_options[level],
-                group_desc=f"HIERARCHICAL_{group_desc}_L{level}",
-            )
+            if rank in sub_ranks:
+                sub_group = create_group(
+                    sub_ranks,
+                    timeout=timeout,
+                    pg_options=pg_options[level],
+                    use_local_synchronization=True,
+                    group_desc=f"HIERARCHICAL_{group_desc}_L{level}",
+                )
             if create_gloo_process_groups:
                 sub_group_gloo = create_group(
                     sub_ranks,
@@ -449,12 +479,14 @@ def create_hybrid_dp_cp_groups(rank, ranks, pg_options):
     group_sizes = [2**i for i in range(int(log2(len(ranks))))][1:]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
-            group = create_group(
-                ranks[i : i + group_size],
-                pg_options=pg_options,
-                group_desc=f"HYBRID_DP_CP_GROUP_{group_size}",
-            )
-            if rank in ranks[i : i + group_size]:
+            sub_ranks = ranks[i : i + group_size]
+            if rank in sub_ranks:
+                group = create_group(
+                    sub_ranks,
+                    pg_options=pg_options,
+                    use_local_synchronization=True,
+                    group_desc=f"HYBRID_DP_CP_GROUP_{group_size}",
+                )
                 assert (
                     group_size not in hybrid_dp_cp_groups
                 ), f"Rank {rank} appears in multiple Hybrid DP CP groups of size {group_size}"
@@ -961,12 +993,14 @@ def initialize_model_parallel(
     # Therefore, dp-cp group, which potentially requires SHARP-enablement,
     # need to be created before all the other groups
     for ranks_with_cp in decoder_rank_generator.get_ranks("dp-cp"):
-        group_with_cp = create_group(
-            ranks_with_cp,
-            timeout=timeout,
-            pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
-            group_desc="DATA_PARALLEL_GROUP_WITH_CP",
-        )
+        if rank in ranks_with_cp:
+            group_with_cp = create_group(
+                ranks_with_cp,
+                timeout=timeout,
+                pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="DATA_PARALLEL_GROUP_WITH_CP",
+            )
         if create_gloo_process_groups:
             group_with_cp_gloo = create_group(
                 ranks_with_cp,
@@ -989,12 +1023,14 @@ def initialize_model_parallel(
                         (i + 1) * intra_partial_data_parallel_size
                     )
                 ]
-                intra_partial_dp_group_with_cp = create_group(
-                    intra_partial_dp_ranks_with_cp,
-                    timeout=timeout,
-                    pg_options=get_nccl_options("intra_dp_cp", nccl_comm_cfgs),
-                    group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
-                )
+                if rank in intra_partial_dp_ranks_with_cp:
+                    intra_partial_dp_group_with_cp = create_group(
+                        intra_partial_dp_ranks_with_cp,
+                        timeout=timeout,
+                        pg_options=get_nccl_options("intra_dp_cp", nccl_comm_cfgs),
+                        use_local_synchronization=True,
+                        group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
+                    )
                 if create_gloo_process_groups:
                     intra_partial_dp_group_with_cp_gloo = create_group(
                         intra_partial_dp_ranks_with_cp,
@@ -1051,12 +1087,14 @@ def initialize_model_parallel(
         # TODO: Are gloo groups needed for hybrid cp?
 
     for ranks in decoder_rank_generator.get_ranks("dp"):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("dp", nccl_comm_cfgs),
-            group_desc="DATA_PARALLEL_GROUP",
-        )
+        if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("dp", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="DATA_PARALLEL_GROUP",
+            )
         if create_gloo_process_groups:
             group_gloo = create_group(
                 ranks, timeout=timeout, backend="gloo", group_desc="DATA_PARALLEL_GROUP_GLOO"
@@ -1115,28 +1153,29 @@ def initialize_model_parallel(
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
     for ranks in decoder_rank_generator.get_ranks('cp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("cp", nccl_comm_cfgs),
-            group_desc="CONTEXT_PARALLEL_GROUP",
-        )
         if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("cp", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="CONTEXT_PARALLEL_GROUP",
+            )
             _CONTEXT_PARALLEL_GROUP = group
             _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks
         if hierarchical_context_parallel_sizes:
             assert np.prod(hierarchical_context_parallel_sizes) == context_parallel_size
-            global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
-            hierarchical_groups, _ = create_hierarchical_groups(
-                rank,
-                ranks,
-                hierarchical_context_parallel_sizes,
-                create_gloo_process_groups=False,
-                pg_options=get_nccl_options("hcp", nccl_comm_cfgs),
-                timeout=timeout,
-                group_desc="CONTEXT_PARALLEL_GROUP",
-            )
             if rank in ranks:
+                global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+                hierarchical_groups, _ = create_hierarchical_groups(
+                    rank,
+                    ranks,
+                    hierarchical_context_parallel_sizes,
+                    create_gloo_process_groups=False,
+                    pg_options=get_nccl_options("hcp", nccl_comm_cfgs),
+                    timeout=timeout,
+                    group_desc="CONTEXT_PARALLEL_GROUP",
+                )
                 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = hierarchical_groups
 
     # Model-parallel groups (TP × GTP_remat × PP). gtp_remat is a RankGenerator axis, so the
@@ -1145,13 +1184,14 @@ def initialize_model_parallel(
     global _MODEL_PARALLEL_GLOBAL_RANKS
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
     for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-pp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("mp", nccl_comm_cfgs),
-            group_desc="MODEL_PARALLEL_GROUP",
-        )
         if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("mp", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="MODEL_PARALLEL_GROUP",
+            )
             _MODEL_PARALLEL_GROUP = group
             _MODEL_PARALLEL_GLOBAL_RANKS = ranks
 
@@ -1162,13 +1202,14 @@ def initialize_model_parallel(
         _TENSOR_MODEL_PARALLEL_GROUP is None
     ), 'tensor model parallel group is already initialized'
     for ranks in decoder_rank_generator.get_ranks('tp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp", nccl_comm_cfgs),
-            group_desc="TENSOR_MODEL_PARALLEL_GROUP",
-        )
         if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("tp", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="TENSOR_MODEL_PARALLEL_GROUP",
+            )
             _TENSOR_MODEL_PARALLEL_GROUP = group
             _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = ranks
 
@@ -1237,18 +1278,8 @@ def initialize_model_parallel(
         os.environ["UCX_NET_DEVICES"] = "all"
         os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
-    for ranks in decoder_rank_generator.get_ranks('pp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            backend=pipeline_model_parallel_comm_backend,
-            pg_options=(
-                None
-                if pipeline_model_parallel_comm_backend == "ucc"
-                else get_nccl_options("pp", nccl_comm_cfgs)
-            ),
-            group_desc="PIPELINE_MODEL_PARALLEL_GROUP",
-        )
+    pipeline_rank_groups = decoder_rank_generator.get_ranks('pp')
+    for ranks in pipeline_rank_groups:
         assert (
             pipeline_model_parallel_comm_backend == None
             or pipeline_model_parallel_comm_backend == "nccl"
@@ -1256,6 +1287,18 @@ def initialize_model_parallel(
         ), f'"{pipeline_model_parallel_comm_backend}" backend for PP communication is currently not supported'
 
         if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                backend=pipeline_model_parallel_comm_backend,
+                pg_options=(
+                    None
+                    if pipeline_model_parallel_comm_backend == "ucc"
+                    else get_nccl_options("pp", nccl_comm_cfgs)
+                ),
+                use_local_synchronization=True,
+                group_desc="PIPELINE_MODEL_PARALLEL_GROUP",
+            )
             if _PIPELINE_MODEL_PARALLEL_GROUP is None:
                 _PIPELINE_MODEL_PARALLEL_GROUP = group
                 _PIPELINE_GLOBAL_RANKS = ranks
@@ -1266,27 +1309,31 @@ def initialize_model_parallel(
                 _PIPELINE_MODEL_PARALLEL_GROUP = [_PIPELINE_MODEL_PARALLEL_GROUP, group]
                 _PIPELINE_GLOBAL_RANKS = [_PIPELINE_GLOBAL_RANKS, ranks]
 
-        embedding_ranks = get_embedding_ranks(ranks)
-        group = create_group(
-            embedding_ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("embd", nccl_comm_cfgs),
-            group_desc="EMBEDDING_GROUP",
-        )
-        if rank in embedding_ranks:
-            _EMBEDDING_GROUP = group
-            _EMBEDDING_GLOBAL_RANKS = embedding_ranks
+    embedding_rank_groups = [get_embedding_ranks(ranks) for ranks in pipeline_rank_groups]
+    group, embedding_ranks = _create_local_sync_group_for_rank(
+        embedding_rank_groups,
+        rank,
+        timeout=timeout,
+        pg_options=get_nccl_options("embd", nccl_comm_cfgs),
+        group_desc="EMBEDDING_GROUP",
+    )
+    if group is not None:
+        _EMBEDDING_GROUP = group
+        _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
-        position_embedding_ranks = get_position_embedding_ranks(ranks)
-        group = create_group(
-            position_embedding_ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("pos_embd", nccl_comm_cfgs),
-            group_desc="POSITION_EMBEDDING_GROUP",
-        )
-        if rank in position_embedding_ranks:
-            _POSITION_EMBEDDING_GROUP = group
-            _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
+    position_embedding_rank_groups = [
+        get_position_embedding_ranks(ranks) for ranks in pipeline_rank_groups
+    ]
+    group, position_embedding_ranks = _create_local_sync_group_for_rank(
+        position_embedding_rank_groups,
+        rank,
+        timeout=timeout,
+        pg_options=get_nccl_options("pos_embd", nccl_comm_cfgs),
+        group_desc="POSITION_EMBEDDING_GROUP",
+    )
+    if group is not None:
+        _POSITION_EMBEDDING_GROUP = group
+        _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
 
     # Build the tensor + data parallel groups.
     global _TENSOR_AND_DATA_PARALLEL_GROUP
@@ -1298,22 +1345,24 @@ def initialize_model_parallel(
     # FP8 amax reduction and the MoE router's expert-bias / load-balancing token reduction. The
     # gtp_remat axis is a no-op when its size is 1.
     for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-dp-cp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp_dp_cp", nccl_comm_cfgs),
-            group_desc="TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP",
-        )
         if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("tp_dp_cp", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP",
+            )
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
     for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-dp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp_dp", nccl_comm_cfgs),
-            group_desc="TENSOR_AND_DATA_PARALLEL_GROUP",
-        )
         if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("tp_dp", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="TENSOR_AND_DATA_PARALLEL_GROUP",
+            )
             _TENSOR_AND_DATA_PARALLEL_GROUP = group
 
     global _TENSOR_AND_CONTEXT_PARALLEL_GROUP
@@ -1321,13 +1370,14 @@ def initialize_model_parallel(
         _TENSOR_AND_CONTEXT_PARALLEL_GROUP is None
     ), 'Tensor + context parallel group is already initialized'
     for ranks in decoder_rank_generator.get_ranks('tp-cp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
-            group_desc="TENSOR_AND_CONTEXT_PARALLEL_GROUP",
-        )
         if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("tp_cp", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="TENSOR_AND_CONTEXT_PARALLEL_GROUP",
+            )
             _TENSOR_AND_CONTEXT_PARALLEL_GROUP = group
 
     ### Expert-related parallel groups initialization
@@ -1355,15 +1405,19 @@ def initialize_model_parallel(
     global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
     assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
     for ranks in expert_decoder_rank_generator.get_ranks('ep'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("ep", nccl_comm_cfgs),
-            group_desc="EXPERT_MODEL_PARALLEL_GROUP",
-        )
         if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("ep", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="EXPERT_MODEL_PARALLEL_GROUP",
+            )
             _EXPERT_MODEL_PARALLEL_GROUP = group
             _EXPERT_MODEL_PARALLEL_RANKS = ranks
+    # These expert group families overlap differently.  With local synchronization,
+    # keep all ranks on the same family before constructing the next one.
+    torch.distributed.barrier()
 
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP
@@ -1371,14 +1425,16 @@ def initialize_model_parallel(
         _EXPERT_TENSOR_PARALLEL_GROUP is None
     ), 'Expert tensor model parallel group is already initialized'
     for ranks in expert_decoder_rank_generator.get_ranks('tp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("ep_tp", nccl_comm_cfgs),
-            group_desc="EXPERT_TENSOR_PARALLEL_GROUP",
-        )
         if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("ep_tp", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="EXPERT_TENSOR_PARALLEL_GROUP",
+            )
             _EXPERT_TENSOR_PARALLEL_GROUP = group
+    torch.distributed.barrier()
 
     # Build the tensor + expert parallel groups
     global _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP
@@ -1386,14 +1442,16 @@ def initialize_model_parallel(
         _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP is None
     ), 'Expert tensor + model parallel group is already initialized'
     for ranks in expert_decoder_rank_generator.get_ranks('tp-ep'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp_ep_mp", nccl_comm_cfgs),
-            group_desc="EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP",
-        )
         if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("tp_ep_mp", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP",
+            )
             _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = group
+    torch.distributed.barrier()
 
     # Build the expert+tensor+pipeline parallel groups
     global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
@@ -1401,13 +1459,14 @@ def initialize_model_parallel(
         _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is None
     ), 'The expert_tensor_model_pipeline parallel group is already initialized'
     for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("tp_ep_pp", nccl_comm_cfgs),
-            group_desc="EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP",
-        )
         if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("tp_ep_pp", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP",
+            )
             _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = group
 
     # Expert+tensor+pipeline group merged across EGTP peers — expert analog of the dense
@@ -1455,12 +1514,14 @@ def initialize_model_parallel(
     if expert_gtp_remat_size > 1:
         create_gloo_process_groups = False
     for ranks in expert_decoder_rank_generator.get_ranks("dp"):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
-            group_desc="EXPERT_DATA_PARALLEL_GROUP",
-        )
+        if rank in ranks:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs),
+                use_local_synchronization=True,
+                group_desc="EXPERT_DATA_PARALLEL_GROUP",
+            )
         if create_gloo_process_groups:
             group_gloo = create_group(
                 ranks, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
@@ -1566,13 +1627,14 @@ def initialize_model_parallel(
             model_parallel_group_id += 1
             intra_dist_opt_ranks.extend(ranks)
             if model_parallel_group_id % intra_partial_expert_data_parallel_size == 0:
-                intra_dist_opt_instance_group = create_group(
-                    intra_dist_opt_ranks,
-                    timeout=timeout,
-                    pg_options=get_nccl_options("intra_dist_opt_instance", nccl_comm_cfgs),
-                    group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP",
-                )
                 if rank in intra_dist_opt_ranks:
+                    intra_dist_opt_instance_group = create_group(
+                        intra_dist_opt_ranks,
+                        timeout=timeout,
+                        pg_options=get_nccl_options("intra_dist_opt_instance", nccl_comm_cfgs),
+                        use_local_synchronization=True,
+                        group_desc="INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP",
+                    )
                     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
                 intra_dist_opt_ranks = []
 
@@ -1638,13 +1700,14 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     )
 
     for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
-        group_with_cp_ag = create_group(
-            ranks_with_cp,
-            timeout=timeout,
-            pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
-            group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
-        )
         if rank in ranks_with_cp:
+            group_with_cp_ag = create_group(
+                ranks_with_cp,
+                timeout=timeout,
+                pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
+                use_local_synchronization=True,
+                group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
+            )
             dp_cp_ag_group = group_with_cp_ag
 
     # Create expert DP all-gather group if requested
@@ -1666,13 +1729,14 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
         )
 
         for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
-            expert_dp_ag = create_group(
-                expert_dp_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
-                group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
-            )
             if rank in expert_dp_ranks:
+                expert_dp_ag = create_group(
+                    expert_dp_ranks,
+                    timeout=timeout,
+                    pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
+                    use_local_synchronization=True,
+                    group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+                )
                 expt_dp_ag_group = expert_dp_ag
 
     return dp_cp_ag_group, expt_dp_ag_group
