@@ -43,12 +43,14 @@ from megatron.core.transformer.experimental_attention_variant.csa_kernels import
     _kl_loss_from_target_predict,
     batch_of_row,
     build_flat_topk_idxs,
-    can_use_fused_csa_teacher_lse,
     csa_sparse_attn,
     fused_csa_indexer_sparse_attn,
-    fused_csa_teacher_lse,
     indexer_topk,
     local_to_global_flat,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_teacher_lse import (
+    can_use_fused_csa_teacher_lse,
+    fused_csa_teacher_lse,
 )
 
 # ---------------------------------------------------------------------------
