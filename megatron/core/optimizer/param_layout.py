@@ -79,12 +79,16 @@ class PerBufferParamLayout:
         param_indices: The index of each param among same-dtype params (using the "fake"
             high-precision dtype for FP8/NVFP4 params). Needed for loading non-native-fp8
             checkpoints in native-fp8 mode. Order matches param_index_map iteration order.
+        layerwise_fallback: Whether a LayerWise-managed buffer uses a byte-level
+            layout plus legacy whole-parameter optimizer sharding/all-gather because
+            the shard-aligned layout would require excessive padding.
     """
 
     param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(default_factory=dict)
     bucket_indices: List[Tuple[int, int]] = field(default_factory=list)
     per_bucket_numel_unpadded: List[int] = field(default_factory=list)
     param_indices: List[int] = field(default_factory=list)
+    layerwise_fallback: bool = False
 
 
 @dataclass
