@@ -19,7 +19,7 @@ from typing import Any, NamedTuple
 import torch
 from torch import nn
 
-from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
+from .parameter_group import get_containing_parameter_group
 
 
 def fully_shard_optimizer(
@@ -109,16 +109,16 @@ def fully_shard_optimizer(
             set_grad(parameter, original_grad)
         casted_grads.clear()
 
-        fsdp_parameter_groups: set[FsdpParameterGroup] = set()
+        seen_parameter_groups = set()
         for optimizer_group in hooked_optimizer.param_groups:
             for parameter in optimizer_group["params"]:
                 parameter_group = get_containing_parameter_group(parameter)
                 if parameter_group is None:
                     continue
-                fsdp_parameter_groups.add(parameter_group)
-
-        for parameter_group in fsdp_parameter_groups:
-            parameter_group.sync_model_weight_from_main_weight()
+                if parameter_group in seen_parameter_groups:
+                    continue
+                seen_parameter_groups.add(parameter_group)
+                parameter_group.sync_model_weight_from_main_weight()
 
     optimizer.register_step_pre_hook(step_pre_hook)
     optimizer.register_step_post_hook(step_post_hook)

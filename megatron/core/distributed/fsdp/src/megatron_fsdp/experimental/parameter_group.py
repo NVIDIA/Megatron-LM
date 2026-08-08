@@ -269,12 +269,10 @@ class FsdpParameterGroup:
         gather_axis = changed_mesh_axis(
             self.model_weight.placements, self._unsharded_model_weight.placements
         )
-        if gather_axis is None:
-            raise RuntimeError("FSDP parameter unshard requires a changed placement axis.")
         with torch.autograd._unsafe_preserve_version_counter(
             self._unsharded_model_weight.local_buffer
         ):
-            if self._symm_mem_pool is not None:
+            if self._symm_mem_pool is not None and gather_axis is not None:
                 self._unsharded_model_weight.rendezvous(gather_axis)
             self.model_weight.redistribute(
                 self._unsharded_model_weight.placements, out=self._unsharded_model_weight
@@ -354,33 +352,33 @@ class FsdpParameterGroup:
         has_sharded_grads = self._has_sharded_grads()
 
         # A non-accumulation main_grad means the previous step finalized it; this
-        # only happens on the first microbatch. Redistribute it back to the
-        # DP-outer-Partial accumulation placement -- a metadata relabel for HSDP,
-        # and a fresh reduce-scattered buffer for HFSDP in the future.
+        # only happens on the first microbatch. Start with fresh accumulation storage
+        # rather than trying to redistribute a Flat optimizer shard back to Partial.
         if self.main_grad.placements != self._accumulation_placements:
-            self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
+            self.main_grad = DBuffer(
+                mesh=self.mesh,
+                placements=self._accumulation_placements,
+                tensor_shapes=self.main_weight.layout.tensor_shapes,
+                dtype=self.main_grad.dtype,
+                device=self.main_weight.device,
+            )
+            has_sharded_grads = False
 
         can_reduce_into_main_grad = (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
         )
-        reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
-        if reduce_axis is None:
-            raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
-        if self._symm_mem_pool is not None:
-            partial_grad.rendezvous(reduce_axis)
-        # Divide this backward's contribution, not the accumulated total: with plain
-        # all-Flat DP every backward is a last microbatch, so main_grad accumulates
-        # across microbatches below and a scale applied to the running sum would
-        # compound. Dividing before the deferred DP-outer reduction is equivalent because
-        # both that reduction and this scale are linear.
         if can_reduce_into_main_grad:
             partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
-            if self.grad_divisor != 1:
-                self.main_grad.local_buffer.div_(self.grad_divisor)
+            reduced_grad = self.main_grad
         else:
             reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-            if self.grad_divisor != 1:
-                reduced_grad.local_buffer.div_(self.grad_divisor)
+
+        # Scale this backward's contribution before accumulating it so repeated
+        # backwards do not repeatedly scale the running total.
+        if self.grad_divisor != 1:
+            reduced_grad.local_buffer.div_(self.grad_divisor)
+
+        if reduced_grad is not self.main_grad:
             if has_sharded_grads:
                 self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
             else:
