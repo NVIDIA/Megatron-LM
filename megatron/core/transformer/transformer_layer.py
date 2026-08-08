@@ -847,10 +847,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
+        is_prefill = (inference_context is None and not self.training) or (
+            inference_context is not None and not inference_context.is_decode_only()
+        )
         should_chunk_mlp_for_prefill = (
             self.config.mlp_chunks_for_prefill > 1
-            and inference_context is not None
-            and not inference_context.is_decode_only()
+            and is_prefill
             and not isinstance(self.mlp, IdentityOp)
             and not self.config.transformer_impl == "inference_optimized"
         )
