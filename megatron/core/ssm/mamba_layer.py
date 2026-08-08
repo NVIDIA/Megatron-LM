@@ -5,12 +5,14 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
 
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -80,6 +82,7 @@ class MambaLayer(GraphableMegatronModule):
         self.config = config
         self.submodules_config = submodules
         self.layer_number = layer_number
+        self.pg_collection = pg_collection
         self.hidden_dropout = config.hidden_dropout
         self.mixer = build_module(
             submodules.mixer,
@@ -97,6 +100,16 @@ class MambaLayer(GraphableMegatronModule):
         )
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
+        # Selective activation recomputation of the Mamba mixer (the conv + selective
+        # SSM/SSD compute, which dominates activation memory in Mamba-hybrid models at
+        # long context). Enabled via recompute_granularity="selective" with "mamba" in
+        # recompute_modules. Unlike "full" recompute, this lets users recompute only the
+        # memory-heavy mixer while keeping the cheaper norm/bda activations.
+        self.recompute_mamba_mixer = (
+            self.config.recompute_granularity == "selective"
+            and self.config.recompute_modules is not None
+            and "mamba" in self.config.recompute_modules
+        )
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the mamba layer for cudagraphs."""
@@ -151,9 +164,41 @@ class MambaLayer(GraphableMegatronModule):
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.norm)(hidden_states)
 
-        mixer_out_with_bias = self.mixer(
-            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
-        )
+        if self.recompute_mamba_mixer and self.training and inference_context is None:
+            # Recompute the mixer during the backward pass to save activation memory.
+            # Guarded to training only (inference_context is None) so the stateful SSM
+            # update is never re-executed during inference.
+            if self.config.fp8 or self.config.fp4:
+                # te_checkpoint enters TE's activation-recompute phase so fp8/fp4
+                # amax/scaling state is not updated a second time by the recompute.
+                # import here to avoid circular import
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                mixer_out_with_bias = te_checkpoint(
+                    self.mixer,
+                    False,  # distribute_saved_activations
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                )
+            else:
+                mixer_out_with_bias = tensor_parallel.checkpoint(
+                    functools.partial(
+                        self.mixer,
+                        inference_context=inference_context,
+                        packed_seq_params=packed_seq_params,
+                    ),
+                    False,  # distribute_saved_activations
+                    hidden_states,
+                )
+        else:
+            mixer_out_with_bias = self.mixer(
+                hidden_states,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
 
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mamba_bda(
