@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
 from typing import Any, Callable, Optional
@@ -219,6 +219,39 @@ class TransformerLayerSchedulePlan:
         # After the last forward op, release forward-pass params.
         last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(hook_module))
 
+    def _iter_schedule_nodes(self):
+        """Yield the real ScheduleNode instances of this layer (skips NoopScheduleNode)."""
+        from megatron.core.pipeline_parallel.utils import ScheduleNode
+
+        for node in (
+            self.pre_dispatch_computation,
+            self.moe_dispatch,
+            self.mlp,
+            self.moe_combine,
+            self.mtp_post_process,
+        ):
+            if isinstance(node, ScheduleNode):
+                yield node
+
+    def set_forward_no_grad(self, no_grad: bool):
+        """Toggle no-grad forward for all layer nodes (VPP-stage full recompute).
+
+        The initial forward runs with ``no_grad=True`` (no autograd graph retained);
+        the backward-time recompute runs with ``no_grad=False`` to rebuild the graph.
+        """
+        for node in self._iter_schedule_nodes():
+            node.forward_no_grad = no_grad
+
+    def reset_for_recompute(self):
+        """Free the retained forward activations of this layer, keeping the nodes
+        reusable for a recompute forward. Also clears the per-layer shared state."""
+        for node in self._iter_schedule_nodes():
+            node.reset_for_recompute()
+        if getattr(self, 'layer_state', None) is not None:
+            # Nodes hold a reference to this same layer_state object, so clear it
+            # in place rather than replacing it.
+            self.layer_state.__dict__.clear()
+
     def get_fp8_context(self):
         """
         Get the fp8 context for the transformer layer.
@@ -390,6 +423,20 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self.post_process = None
         self.vp_stage = model.vp_stage
 
+        # VPP-stage full recompute (EP A2A overlap): retain only the stage input
+        # tensor across the forward->backward gap and recompute the whole stage
+        # forward at backward time. See recompute_model_chunk_schedule_plan().
+        self.recompute_vpp_stage = (
+            model.config.recompute_granularity == 'full'
+            and model.config.overlap_moe_expert_parallel_comm
+        )
+        # RNG states captured at the start of the stage forward, replayed by the
+        # recompute so dropout / rng-forked ops reproduce the forward pass.
+        self._rng_states = None
+        # Snapshot of the mutable chunk-state fields (input_ids/position_ids/
+        # padding_mask) captured before the forward and restored before recompute.
+        self._recompute_state_snapshot = None
+
         # save the inputs of model.forward() to ModelChunkState
         self._model_chunk_state.input_ids = input_ids
         self._model_chunk_state.position_ids = position_ids
@@ -427,6 +474,13 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self.post_process = post_process_cls(
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
+
+        # For VPP-stage full recompute, the initial forward of every transformer
+        # layer runs under no_grad (no activation retained); pre_process and
+        # post_process keep their graphs (they are not recomputed).
+        if self.recompute_vpp_stage:
+            for layer_plan in self._transformer_layers:
+                layer_plan.set_forward_no_grad(True)
 
     def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
         if module is None:
@@ -496,6 +550,92 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self.post_process.model_chunk_state = None
             self.post_process = None
 
+    def snapshot_rng_for_recompute(self):
+        """Capture the RNG states and the mutable chunk-state fields at the start of
+        the stage forward so the backward-time recompute can replay an identical
+        forward.
+
+        The MTP path mutates ``chunk_state.input_ids`` / ``position_ids`` /
+        ``padding_mask`` in place (it rolls the tokens by one and writes them back),
+        so these must be restored to their pre-forward values before recompute,
+        otherwise the recompute would roll them a second time.
+        """
+        if not self.recompute_vpp_stage:
+            return
+        from megatron.core.tensor_parallel.random import _get_all_rng_states
+
+        self._rng_states = _get_all_rng_states()
+        cs = self._model_chunk_state
+        self._recompute_state_snapshot = {
+            'input_ids': cs.input_ids,
+            'position_ids': cs.position_ids,
+            'padding_mask': cs.padding_mask,
+        }
+
+    def release_layer_activations(self):
+        """Free every transformer layer's retained forward activations after the
+        initial forward, keeping only the stage input tensor (pre_process output).
+
+        The layer nodes remain reusable; recompute_model_chunk_schedule_plan() rebuilds
+        their forward state before the backward pass.
+        """
+        if not self.recompute_vpp_stage:
+            return
+        for layer_plan in self._transformer_layers:
+            layer_plan.reset_for_recompute()
+
+    def recompute_model_chunk_schedule_plan(self):
+        """Recompute the whole VPP-stage (model chunk) forward from the retained
+        stage input tensor, rebuilding every layer ScheduleNode's forward state so
+        the subsequent backward can run.
+
+        This is called at the start of the stage backward. The A2A communications
+        issued here are exposed (not overlapped) by design; the normal forward and
+        normal backward A2A overlap is preserved elsewhere in the schedule.
+
+        The mapping from the recomputed activations back to the per-submodule
+        ScheduleNodes is implicit: the same node objects are re-run in the same
+        forward order, so each node repopulates its own ``inputs`` / ``output`` /
+        ``detached`` / ``layer_state`` slots exactly as in the initial forward.
+        """
+        if not self.recompute_vpp_stage:
+            return
+        from megatron.core.tensor_parallel.random import _fork_rng, _set_all_rng_states
+
+        assert self.pre_process is not None and self.pre_process.output is not None, (
+            "VPP-stage full recompute requires the retained stage input tensor "
+            "(pre_process output), but it is missing."
+        )
+        stage_input = self.pre_process.output
+
+        # Restore the mutable chunk-state fields (MTP rolls input_ids/position_ids/
+        # padding_mask in place during the forward) so the recompute starts from the
+        # same inputs as the initial forward.
+        if self._recompute_state_snapshot is not None:
+            cs = self._model_chunk_state
+            cs.input_ids = self._recompute_state_snapshot['input_ids']
+            cs.position_ids = self._recompute_state_snapshot['position_ids']
+            cs.padding_mask = self._recompute_state_snapshot['padding_mask']
+            cs.mtp_hidden_states = None
+            self._recompute_state_snapshot = None
+
+        # Enable grad on the layer nodes' forward so the recompute builds the graph.
+        for layer_plan in self._transformer_layers:
+            layer_plan.set_forward_no_grad(False)
+
+        # Replay the forward RNG stream so dropout / rng-forked ops reproduce the
+        # initial forward. _fork_rng() restores the ambient RNG state on exit.
+        with _fork_rng():
+            if self._rng_states is not None:
+                _set_all_rng_states(*self._rng_states)
+            f_input = stage_input
+            for i, layer_plan in enumerate(self._transformer_layers):
+                nvtx_msg = f"recompute_layer_{i}"
+                nvtx_range_push(nvtx_msg)
+                f_input, _ = TransformerLayerSchedulePlan.run(layer_plan, None, f_input=f_input)
+                nvtx_range_pop(nvtx_msg)
+        self._rng_states = None
+
     @staticmethod
     def run(
         f_schedule_plan,
@@ -540,6 +680,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 pre_forward(f_schedule_plan.vp_stage)
             f_schedule_plan.record_current_stream()
             f_input = f_schedule_plan.pre_process.forward()
+            # Capture RNG right after pre_process so the stage recompute (at backward
+            # time) replays the same forward random stream. No-op unless recompute is on.
+            f_schedule_plan.snapshot_rng_for_recompute()
 
         if b_schedule_plan:
             b_schedule_plan.record_current_stream()
@@ -547,6 +690,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             if pre_backward is not None:
                 pre_backward(b_schedule_plan.vp_stage)
                 b_schedule_plan.record_current_stream()
+
+            # VPP-stage full recompute: rebuild the whole stage's layer forward
+            # graphs from the retained stage input before any layer backward runs.
+            # The A2A issued here is exposed (not overlapped) by design. No-op unless
+            # recompute is on.
+            b_schedule_plan.recompute_model_chunk_schedule_plan()
 
             if b_schedule_plan.post_process is not None:
                 b_grad = b_schedule_plan.post_process.backward(b_grad)
@@ -615,10 +764,25 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # post process forward
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
+            if (
+                f_schedule_plan.recompute_vpp_stage
+                and f_input is not None
+                and not f_input.requires_grad
+            ):
+                # The stage forward ran under no_grad, so the stage output is a plain
+                # value tensor. post_process needs a grad-requiring leaf so its backward
+                # produces the grad seed that feeds the recomputed last-layer backward.
+                f_input.requires_grad_(True)
             f_input = f_schedule_plan.post_process.forward(f_input)
         # pre process backward
         if b_schedule_plan is not None:
             b_schedule_plan.pre_process.backward(b_grad)
+
+        # Free the forward stage's layer activations now that its forward output has
+        # been consumed (PP send / post_process). Only the stage input tensor is kept
+        # for the backward-time recompute. No-op unless recompute is on.
+        if f_schedule_plan is not None:
+            f_schedule_plan.release_layer_activations()
 
         if f_schedule_plan:
             f_schedule_plan.wait_current_stream()
