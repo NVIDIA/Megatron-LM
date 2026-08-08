@@ -264,9 +264,11 @@ class _GDNBase(MegatronModule):
             eps=self.config.layernorm_epsilon,
         )
         self.recompute_norm_out = False
+        self.recompute_in_proj_conv = False
         self.norm_out_checkpoint = None
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_in_proj_conv = "gdn_in_proj_conv" in self.config.recompute_modules
 
         self.out_proj = build_module(
             submodules.out_proj,

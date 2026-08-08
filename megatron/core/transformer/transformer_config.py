@@ -553,7 +553,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out".
+    "shared_experts", "gdn_norm_out", "gdn_in_proj_conv".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -563,6 +563,8 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
+    "gdn_in_proj_conv": recompute the GatedDeltaNet input projection, CP all-to-all,
+        split, convolution, and pre-GDR epilogue.
     "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
@@ -1834,6 +1836,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "gdn_norm_out",
+                    "gdn_in_proj_conv",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1858,6 +1861,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "gdn_norm_out in recompute_modules is only supported with "
                     "experimental_attention_variant='gated_delta_net' or 'gdn2'."
+                )
+
+            if (
+                "gdn_in_proj_conv" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_in_proj_conv in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
                 )
 
             if "core_attn" in self.recompute_modules:

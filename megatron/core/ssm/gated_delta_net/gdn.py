@@ -217,92 +217,117 @@ class GatedDeltaNet(_GDNBase):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
-        # Input projection
-        nvtx_range_push(suffix="in_proj")
-        qkvzba, _ = self.in_proj(hidden_states)
-        nvtx_range_pop(suffix="in_proj")
+        def _in_proj_conv(hs):
+            # W3 checkpoint boundary from MCore PR #5982, adapted to the refactored GDN.
+            nvtx_range_push(suffix="in_proj")
+            qkvzba, _ = self.in_proj(hs)
+            nvtx_range_pop(suffix="in_proj")
 
-        qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
-            qkvzba,
-            self.in_proj_split_sections,
-            self.cp_size,
-            self.pg_collection.cp,
-            cu_seqlens_q,
-            seq_len,
-            packed_seq_params,
-        )
+            qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
+                qkvzba,
+                self.in_proj_split_sections,
+                self.cp_size,
+                self.pg_collection.cp,
+                cu_seqlens_q,
+                seq_len,
+                packed_seq_params,
+            )
 
-        # Transpose: s b x --> b s x
-        # From sbhd to bshd format
-        qkvzba = qkvzba.transpose(0, 1)
+            qkvzba = qkvzba.transpose(0, 1)
+            qkv, gate, beta, alpha = torch.split(qkvzba, self.feat_dim_split, dim=-1)
+            local_seq_len = qkv.shape[1]
+            gate = gate.reshape(batch, local_seq_len, -1, self.value_head_dim)
 
-        # Split the tensor into q, k, v, gate (z), and the variant-specific gate features
-        # (beta, alpha for GDN; f, b, w for GDN2)
-        qkv, gate, beta, alpha = torch.split(qkvzba, self.feat_dim_split, dim=-1)
-        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-
-        # Convolution on qkv
-        nvtx_range_push(suffix="conv1d")
-        seq_len = qkv.shape[1]
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-        ]
-        conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
-        )
-        conv1d_bias = (
-            get_parameter_local_cp(
-                self.conv1d.bias,
+            nvtx_range_push(suffix="conv1d")
+            qkv_channels_split_sections = [
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+            ]
+            conv1d_weight = get_parameter_local_cp(
+                self.conv1d.weight,
                 dim=0,
                 cp_group=self.pg_collection.cp,
                 split_sections=qkv_channels_split_sections,
             )
-            if self.conv_bias
-            else None
-        )
-        if self.config.deterministic_mode:
-            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
-            conv_out = F.conv1d(
-                input=qkv,  # Torch-native only accept [b, d, s] format input
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
+            conv1d_bias = (
+                get_parameter_local_cp(
+                    self.conv1d.bias,
+                    dim=0,
+                    cp_group=self.pg_collection.cp,
+                    split_sections=qkv_channels_split_sections,
+                )
+                if self.conv_bias
+                else None
             )
-            qkv = self.act_fn(conv_out[..., :seq_len])
-            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+            if self.config.deterministic_mode:
+                qkv = qkv.transpose(1, 2).contiguous()
+                conv_out = F.conv1d(
+                    input=qkv,
+                    weight=conv1d_weight,
+                    bias=conv1d_bias,
+                    stride=self.conv1d.stride,
+                    padding=self.conv1d.padding,
+                    dilation=self.conv1d.dilation,
+                    groups=self.conv_dim_local_tp // self.cp_size,
+                )
+                qkv = self.act_fn(conv_out[..., :local_seq_len])
+                qkv = qkv.transpose(1, 2)
+            else:
+                assert self.activation in ["silu", "swish"]
+                qkv, _ = causal_conv1d(
+                    x=qkv,
+                    weight=conv1d_weight.squeeze(1),
+                    bias=conv1d_bias,
+                    activation=self.activation,
+                    initial_state=None,
+                    output_final_state=False,
+                    cu_seqlens=cu_seqlens_q,
+                )
+            nvtx_range_pop(suffix="conv1d")
+
+            A_log_local_cp = get_parameter_local_cp(
+                self.A_log, dim=0, cp_group=self.pg_collection.cp
+            )
+            dt_bias_local_cp = get_parameter_local_cp(
+                self.dt_bias, dim=0, cp_group=self.pg_collection.cp
+            )
+
+            nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
+            kernel_inputs = self._prepare_input_for_gated_delta_rule(
+                qkv,
+                gate,
+                A_log_local_cp,
+                dt_bias_local_cp,
+                batch,
+                local_seq_len,
+                beta,
+                alpha,
+            )
+            gate = kernel_inputs.pop("gate")
+            nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
+
+            if thd_cp_a2a_inv is None:
+                thd_cp_a2a_inv = hs.new_empty((0,), dtype=torch.int64)
+            return (
+                kernel_inputs["q"],
+                kernel_inputs["k"],
+                kernel_inputs["v"],
+                kernel_inputs["g"],
+                kernel_inputs["beta"],
+                gate,
+                thd_cp_a2a_inv,
+            )
+
+        if self.recompute_in_proj_conv and self.training:
+            query, key, value, g, beta, gate, thd_cp_a2a_inv = tensor_parallel.checkpoint(
+                _in_proj_conv, False, hidden_states
+            )
         else:
-            assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-                cu_seqlens=cu_seqlens_q,
-            )
-        nvtx_range_pop(suffix="conv1d")
-
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-        dt_bias_local_cp = get_parameter_local_cp(
-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
-        )
-
-        # Prepare all kernel inputs (split, reshape, L2 norm, gates, contiguous)
-        nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
-        kernel_inputs = self._prepare_input_for_gated_delta_rule(
-            qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, seq_len, beta, alpha
-        )
-        gate = kernel_inputs.pop("gate")
-        nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
+            query, key, value, g, beta, gate, thd_cp_a2a_inv = _in_proj_conv(hidden_states)
+        if thd_cp_a2a_inv.numel() == 0:
+            thd_cp_a2a_inv = None
+        kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(
