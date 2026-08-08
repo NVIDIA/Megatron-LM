@@ -495,7 +495,7 @@ def _set_telemetry(args):
     try:
         from nemo.lens import NemoLensConfig, setup_telemetry
     except ImportError:
-        # D1: nemo-lens absent -> telemetry is a no-op (get_telemetry() handles None); do NOT
+        # nemo-lens absent -> telemetry is a no-op (get_telemetry() handles None); do NOT
         # crash set_global_variables/startup. Every other telemetry site already degrades this way.
         _GLOBAL_TELEMETRY_HANDLE = None
         return

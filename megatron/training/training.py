@@ -324,12 +324,22 @@ _otel_slurm_job_span = None
 _otel_slurm_job_ctx_token = None
 _otel_pretrain_span = None
 _otel_startup_span = None
-_otel_train_span = None
 _otel_ctx_module = None
 _otel_pretrain_ctx_token = None
 _otel_startup_ctx_token = None
-_otel_train_ctx_token = None
 _otel_shutdown_done = False
+# Trace segmentation: the steady-state loop is emitted as a series of megatron.train
+# spans -- one per checkpoint interval -- instead of one run-long umbrella. Each is a
+# compact [N iterations + checkpoint (+eval/sniff)] unit in its own trace, so it stays
+# short and survives a fault-kill (it .end()s at the next boundary; a single umbrella
+# only ends at loop exit, which a SIGKILL'd cycle never reaches). _otel_interval_span
+# is the current block's root (a fresh trace_id, linked back to megatron.pretrain + the
+# prior block); _otel_trace_interval_step is a dedicated per-loop counter (not
+# `iteration`, which carries the resume offset) driving the save_interval-boundary
+# re-root. Iterations/checkpoint/eval/sniff nest under it via _otel_managed_span.
+_otel_interval_span = None
+_otel_interval_ctx_token = None
+_otel_trace_interval_step = 0
 
 
 def _start_otel_job_spans(model_type, program_start):
@@ -464,42 +474,107 @@ def _end_otel_startup_span():
 
 
 def _start_otel_train_span():
-    """Start megatron.train (the steady-state training loop), a child of
-    megatron.pretrain and sibling of megatron.startup.
+    """Prepare the steady-state training loop's tracing.
 
-    Explicit module-managed span, not the @_otel_trace_fn decorator train() used
-    to carry, for two reasons: (1) the decorator made megatron.train the current
-    span for the *whole* function, so the preamble (weight-hash check, sniff
-    test, cuda-graph setup) parented to it -- but that work is init, not the
-    loop, and now correctly parents to megatron.startup, which stays open through
-    the preamble and is ended right before this call. (2) On the exit-interval/
-    duration/signal path, train() calls sys.exit() and _end_otel_job_spans()
-    shuts telemetry down first; the decorator's span-end then unwound *after*
-    shutdown and was dropped ("Shutdown called, ignoring Span"). As a module span
-    it's ended by _end_otel_job_spans() *before* the shutdown, so it survives.
+    The loop is emitted as one megatron.train span per checkpoint interval rather
+    than a single umbrella span; see the trace-segmentation note at the top of this
+    module for why. This just resets the per-interval counter; the first loop pass
+    opens the first megatron.train interval.
 
-    Called after _end_otel_startup_span() (so startup's context is detached and
-    the current span reverts to megatron.pretrain -> correct parent).
+    Called after _end_otel_startup_span() (so startup's context is detached and the
+    current span reverts to megatron.pretrain -> the interval links' anchor).
     """
-    global _otel_train_span, _otel_train_ctx_token
+    global _otel_trace_interval_step
     if not _otel_sg_enabled('job'):
         return
-    from opentelemetry import context as _otel_ctx, trace as _otel_trace
+    _otel_trace_interval_step = 0  # restart the per-interval trace counter for this loop
 
-    _otel_train_span = get_telemetry().tracer.start_span('megatron.train')
-    _otel_tag_span(_otel_train_span, 'job')
-    _otel_train_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_otel_train_span))
+
+def _reroot_otel_interval():
+    """Close the current interval span and open the next as a new megatron.train
+    span in a new trace (empty context -> fresh trace_id). See the trace-segmentation
+    note at the top of this module for why the loop is segmented this way.
+
+    Each interval is linked back to megatron.pretrain (the run) and the prior
+    interval (a chain), so a backend can walk run <-> block <-> block even though
+    they are separate traces; run identity (run_uuid/sluid) rides the resource attrs
+    on every span. Iterations/checkpoint/eval/sniff nest under it because they use
+    _otel_managed_span, which attaches to the current context."""
+    global _otel_interval_span, _otel_interval_ctx_token
+    if get_telemetry() is None or not _otel_sg_enabled('job'):
+        return
+    from opentelemetry import context as _octx, trace as _otr
+    from opentelemetry.context import Context
+    from opentelemetry.trace import Link
+    prev = _otel_interval_span
+    links = []
+    try:
+        if _otel_pretrain_span is not None:
+            links.append(Link(_otel_pretrain_span.get_span_context()))
+        if prev is not None:
+            links.append(Link(prev.get_span_context()))
+    except Exception:  # noqa: BLE001
+        links = []
+    # Close the prior interval (detach its context, end the span) before opening the next.
+    if prev is not None:
+        try:
+            if _otel_interval_ctx_token is not None:
+                _octx.detach(_otel_interval_ctx_token)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            prev.end()
+        except Exception:  # noqa: BLE001
+            pass
+        _otel_interval_span = None
+        _otel_interval_ctx_token = None
+    try:
+        sp = get_telemetry().tracer.start_span(
+            'megatron.train', context=Context(), links=links
+        )
+        _otel_tag_span(sp, 'job')
+        _otel_interval_span = sp
+        _otel_interval_ctx_token = _octx.attach(_otr.set_span_in_context(sp))
+    except Exception:  # noqa: BLE001
+        _otel_interval_span = None
+        _otel_interval_ctx_token = None
+
+
+def _maybe_reroot_otel_interval():
+    """Called once at the top of each training-loop pass. Re-roots the trace at each
+    checkpoint-frequency boundary using a dedicated counter (so groups are clean
+    save_interval-sized chunks regardless of the resume offset in `iteration`).
+    save_interval<=0 (no checkpointing) -> never re-roots (single trace, as before)."""
+    global _otel_trace_interval_step
+    freq = getattr(get_args(), 'save_interval', None) or 0
+    if freq > 0 and (_otel_trace_interval_step % freq == 0):
+        _reroot_otel_interval()
+    _otel_trace_interval_step += 1
+
+
+def _end_otel_interval_span():
+    """Close the final interval root (loop exit / teardown). Idempotent."""
+    global _otel_interval_span, _otel_interval_ctx_token
+    if _otel_interval_span is not None:
+        try:
+            from opentelemetry import context as _octx
+            if _otel_interval_ctx_token is not None:
+                _octx.detach(_otel_interval_ctx_token)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _otel_interval_span.end()
+        except Exception:  # noqa: BLE001
+            pass
+        _otel_interval_span = None
+        _otel_interval_ctx_token = None
 
 
 def _end_otel_train_span():
-    """End megatron.train and detach its token. Idempotent -- ended on train()'s
-    normal return, or via _end_otel_job_spans() on the sys.exit() path."""
-    global _otel_train_span
-    if _otel_train_span is not None:
-        if _otel_ctx_module is not None and _otel_train_ctx_token is not None:
-            _otel_ctx_module.detach(_otel_train_ctx_token)
-        _otel_train_span.end()
-        _otel_train_span = None
+    """Close the final megatron.train interval span. Idempotent -- called on
+    train()'s normal return and via _end_otel_job_spans() on the sys.exit() path
+    (before the telemetry shutdown, so the last block survives)."""
+    _end_otel_interval_span()
 
 
 def _end_otel_job_spans():
@@ -1435,7 +1510,7 @@ def pretrain(
     import signal as _signal
 
     _otel_prev_sigterm = _signal.getsignal(_signal.SIGTERM)
-    # A2: with --exit-signal-handler, SIGTERM means "finish the current iteration, save a final
+    # with --exit-signal-handler, SIGTERM means "finish the current iteration, save a final
     # checkpoint, then exit" (DistributedSignalHandler drain -> should_exit). We must not end
     # spans / shut down the provider in that case -- that truncates megatron.train and drops the
     # final-iteration + final-checkpoint spans; the normal should_exit path runs _end_otel_job_spans.
@@ -1446,7 +1521,7 @@ def pretrain(
         _otel_graceful_drain = bool(getattr(get_args(), 'exit_signal_handler', False))
     except Exception:
         pass
-    _otel_sigterm_fired = [False]  # A3: re-entry guard so a 2nd SIGTERM can't re-enter shutdown()
+    _otel_sigterm_fired = [False]  # re-entry guard so a 2nd SIGTERM can't re-enter shutdown()
 
     def _otel_force_flush():
         try:
@@ -4240,17 +4315,21 @@ def train(
 
     # OTel: everything above in train() (the preamble: weight-hash check, sniff
     # test, cuda-graph helper init) was init and parented to megatron.startup, which
-    # stayed open through it. Close startup and open megatron.train now -- the
-    # steady-state loop is its own span, a sibling of megatron.startup under
-    # megatron.pretrain. (Previously train() carried an @_otel_trace_fn
-    # decorator, which both mis-parented the preamble and dropped its own span
-    # on the sys.exit() exit path -- see _start_otel_train_span's docstring.)
+    # stayed open through it. Close startup now; the steady-state loop below is
+    # emitted as one megatron.train span per interval (see
+    # _reroot_otel_interval), not one umbrella. _start_otel_train_span just arms the
+    # per-interval counter; the first loop pass opens the first block.
     _end_otel_startup_span()
     _start_otel_train_span()
 
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
+        # At each checkpoint-interval boundary, re-root into a new trace so this
+        # pass's iteration + (this interval's) checkpoint/eval/sniff form one compact
+        # trace instead of accreting into a run-long one. Must be the first thing in
+        # the pass so everything below nests under the current interval root.
+        _maybe_reroot_otel_interval()
         # Test-only deliberate fault injection (gated by env; a no-op in normal
         # runs). Raises on ONE named rank after N seconds of training to exercise
         # the goodput lost-work / recovery path. Only that rank fails; the others
