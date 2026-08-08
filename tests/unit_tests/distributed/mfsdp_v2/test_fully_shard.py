@@ -208,7 +208,7 @@ def test_fully_shard_sgd_losses_match_baseline(
     model.load_state_dict(baseline.state_dict())
 
     placements = _strategy_placements(sharding_strategy)
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device) as context:
         fully_shard(model.fc1, mesh=mesh, placements=placements)
         fully_shard(model.fc2, mesh=mesh, placements=placements)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
@@ -226,7 +226,7 @@ def test_fully_shard_sgd_losses_match_baseline(
             optimizer.zero_grad()
 
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                with microbatch(model, is_last=microbatch_index == num_microbatches - 1):
+                with microbatch(context, is_last=microbatch_index == num_microbatches - 1):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     losses.append(loss.detach())
                     logger.debug(
@@ -803,11 +803,11 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     with torch.no_grad():
         model.weight.fill_(1.0)
 
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device) as context:
         fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     x = torch.full((1, 1), float(rank + 1), device=device)
-    with microbatch(model, is_last=False):
+    with microbatch(context, is_last=False):
         model(x).sum().backward()
         model(x).sum().backward()
 
