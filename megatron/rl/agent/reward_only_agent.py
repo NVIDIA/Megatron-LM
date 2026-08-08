@@ -202,9 +202,6 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 ],
                 env_id=self.env_id,
                 problem_id=problem_id,
-                policy_epoch=[r.policy_epoch for r in responses],
-                kv_cache_epoch=[r.kv_cache_epoch for r in responses],
-                num_evictions=[r.num_evictions for r in responses],
             )
         else:
             return Rollout(
@@ -212,9 +209,6 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 reward=reward,
                 env_id=self.env_id,
                 problem_id=problem_id,
-                policy_epoch=[r.policy_epoch for r in responses],
-                kv_cache_epoch=[r.kv_cache_epoch for r in responses],
-                num_evictions=[r.num_evictions for r in responses],
             )
 
     async def get_rollout_response(

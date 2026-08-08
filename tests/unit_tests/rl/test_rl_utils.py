@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import hashlib
 import itertools
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ import torch
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -36,7 +38,7 @@ from megatron.core.transformer.cuda_graphs import (
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
-from megatron.rl.agent.api import TokenRollout
+from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
@@ -93,8 +95,6 @@ class MockTokenizer:
 
 
 def make_token_rollout(trajectory, logprobs, generation_mask=None, reward=1.0, problem_id="p"):
-    """TokenRollout with the per-turn staleness boilerplate derived from the turn count."""
-    turns = len(trajectory)
     return TokenRollout(
         trajectory=trajectory,
         reward=reward,
@@ -102,9 +102,6 @@ def make_token_rollout(trajectory, logprobs, generation_mask=None, reward=1.0, p
         logprobs=logprobs,
         env_id='MEGAENV',
         problem_id=problem_id,
-        policy_epoch=[[(0, 0)]] * turns,
-        kv_cache_epoch=[[(0, 0)]] * turns,
-        num_evictions=[0] * turns,
     )
 
 
@@ -524,6 +521,7 @@ class TestRLUtils:
 
         # A single-turn rollout whose only turn is short and lacks eod must be rejected:
         # a single-turn completion has no tool-call boundary to justify stopping early.
+        # (The eod tripwire fires before the ledger join, so no record is needed.)
         bad = make_token_rollout(
             [[1, 2, 3]], [[0.1, 0.2, 0.3]], [[False, True, True]], reward=3.14, problem_id="2"
         )
@@ -535,6 +533,7 @@ class TestRLUtils:
                 tokenizer,
                 sequence_packing=False,
                 is_correction=False,
+                request_ledger={},
             )
 
         # Multi-turn rollouts with uneven turn counts: a turn may stop on a tool-call
@@ -555,6 +554,15 @@ class TestRLUtils:
             reward=0.0,
             problem_id="3",
         )
+        # Every TokenRollout turn joins a finished-request record; the same rollout
+        # recurs once per dp group, so supply that many records per token stream.
+        mt_ledger = {
+            _token_stream_key([1], [2, 3]): [_ledger_record(0) for _ in range(dp)],
+            _token_stream_key([1, 2], [3, 4]): [_ledger_record(0) for _ in range(dp)],
+            _token_stream_key([1], [2]): [_ledger_record(0) for _ in range(dp)],
+            _token_stream_key([1, 2], [3]): [_ledger_record(0) for _ in range(dp)],
+            _token_stream_key([1, 2, 3], [4]): [_ledger_record(0) for _ in range(dp)],
+        }
         rl_utils.prepare_data_for_update(
             [model],
             {},
@@ -562,6 +570,7 @@ class TestRLUtils:
             tokenizer,
             sequence_packing=False,
             is_correction=False,
+            request_ledger=mt_ledger,
         )
         # 5*dp turns padded to 6*dp; 6*dp / (micro_batch_size 2 * dp) = 3 microbatches.
         assert get_num_microbatches() == 3
@@ -581,8 +590,21 @@ class TestRLUtils:
             problem_id="2",
         )
         rollouts = [[r1, r2] for _ in range(dp)]
+        # Every TokenRollout turn must join a finished-request record; each rollout
+        # recurs once per dp group, so supply that many records per token stream.
+        eod = tokenizer.eod
+        request_ledger = {
+            _token_stream_key([1], [2, 3, eod]): [_ledger_record(0) for _ in range(dp)],
+            _token_stream_key([1], [2, 234, eod]): [_ledger_record(0) for _ in range(dp)],
+        }
         data_iter, _, _ = rl_utils.prepare_data_for_update(
-            [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
+            [model],
+            {},
+            rollouts,
+            tokenizer,
+            sequence_packing=False,
+            is_correction=False,
+            request_ledger=request_ledger,
         )
 
         _, _, old_logprobs, _, _, _, _ = next(data_iter)
@@ -746,6 +768,11 @@ class TestRLUtils:
 
         if scenario == "single_turn_only":
             group = [single([1, 2, 3, eod], 1.0), single([1, 2, eod], 0.0)]
+            # All-False masks make the whole turn the prompt stream.
+            request_ledger = {
+                _token_stream_key([1, 2, 3, eod], []): [_ledger_record(0)],
+                _token_stream_key([1, 2, eod], []): [_ledger_record(0)],
+            }
         else:
             # Cumulative per-turn lengths 4 then 7 -> turn 1 adds 3 tokens; trajectory length is
             # the full conversation (7), not 4 + 7 = 11.
@@ -756,8 +783,15 @@ class TestRLUtils:
                 problem_id="m",
             )
             group = [multi, single([1, 2, 3, eod], 0.0)]
+            request_ledger = {
+                _token_stream_key([1, 2], [3, eod]): [_ledger_record(0)],
+                _token_stream_key([1, 2, 3, eod, 9], [8, eod]): [_ledger_record(0)],
+                _token_stream_key([1, 2, 3, eod], []): [_ledger_record(0)],
+            }
 
-        stats = rl_utils.compute_group_stats([group], tokenizer, seq_len=8)
+        stats = rl_utils.compute_group_stats(
+            [group], tokenizer, seq_len=8, request_ledger=request_ledger
+        )
         assert stats.turn_lens == expected_turn_lens
         assert stats.traj_lens == expected_traj_lens
         assert stats.num_turns == expected_num_turns
@@ -1260,7 +1294,7 @@ class TestRLUtils:
         assert metrics["mean_completion_gap"] == 2.5
 
     def test_compute_group_stats_excludes_placeholders_from_metric_fields(self):
-        def real_rollout(tokens, epoch, problem_id):
+        def real_rollout(tokens, problem_id):
             return TokenRollout(
                 trajectory=[tokens],
                 generation_mask=[[True] * len(tokens)],
@@ -1268,9 +1302,6 @@ class TestRLUtils:
                 logprobs=[[0.0] * len(tokens)],
                 env_id="swe",
                 problem_id=problem_id,
-                policy_epoch=[[(0, epoch)]],
-                kv_cache_epoch=[[(0, epoch)]],
-                num_evictions=[0],
             )
 
         def placeholder():
@@ -1281,26 +1312,32 @@ class TestRLUtils:
                 logprobs=[],
                 env_id="swe",
                 problem_id="placeholder",
-                policy_epoch=[[(0, 0)]],
-                kv_cache_epoch=[[(0, 0)]],
-                num_evictions=[0],
             )
 
         eod = MockTokenizer().eod
         rollouts = [
             [
-                real_rollout([1, 2, eod], epoch=5, problem_id="p0"),
-                real_rollout([1, 2, 3, eod], epoch=6, problem_id="p0"),
+                real_rollout([1, 2, eod], problem_id="p0"),
+                real_rollout([1, 2, 3, eod], problem_id="p0"),
                 placeholder(),
             ],
             [placeholder(), placeholder(), placeholder()],
         ]
-        stats = rl_utils.compute_group_stats(rollouts, MockTokenizer(), seq_len=16)
+        # All-True generation masks make the prompt stream empty; placeholders
+        # have no turns and therefore pop no records.
+        ledger = {
+            _token_stream_key([], [1, 2, eod]): [_ledger_record(5)],
+            _token_stream_key([], [1, 2, 3, eod]): [_ledger_record(6)],
+        }
+        stats = rl_utils.compute_group_stats(
+            rollouts, MockTokenizer(), seq_len=16, request_ledger=ledger
+        )
 
         # Per-rollout lists keep the placeholder entries: alignment with rewards
         # and num_turns is what lets prep_wandb_metrics mask them downstream.
+        # Placeholders join no records, so their epoch rows are empty.
         assert stats.num_turns == [[1, 1, 0], [0, 0, 0]]
-        assert stats.policy_epoch == [[[5], [6], [0]], [[0], [0], [0]]]
+        assert stats.policy_epoch == [[[5], [6], []], [[], [], []]]
         assert stats.traj_lens == [[3, 4, 0], [0, 0, 0]]
         # Per-turn lists exclude placeholders entirely: no sentinel epoch-0 stamp
         # in completed_epochs, no fake 0-length turn for all-placeholder groups.
@@ -1309,7 +1346,7 @@ class TestRLUtils:
         # Rewards keep the placeholder zeros (they shape the GRPO baseline).
         assert stats.rewards == [[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]]
 
-        # End to end: the sentinel epochs never reach the staleness metrics.
+        # End to end: the placeholder rows never reach the staleness metrics.
         metrics = rl_utils.prep_wandb_metrics(
             MagicMock(),
             stats.traj_lens,
@@ -1323,9 +1360,154 @@ class TestRLUtils:
             num_evictions=stats.num_evictions,
             current_iteration=7,
         )
-        assert metrics["max_policy_staleness"] == 2  # 7 - 5, not 7 - 0
+        assert metrics["max_policy_staleness"] == 2  # 7 - 5, not a placeholder sentinel
         assert metrics["min_traj_length"] == 3
         assert metrics["min_num_turns"] == 1
         assert metrics["mean_completion_gap"] == np.mean([2, 1])
         assert metrics["failed_rollouts/count"] == 4
         assert np.isclose(metrics["failed_rollouts/ratio"], 4 / 6)
+
+    def test_prep_wandb_metrics_skips_unjoined_rollouts(self):
+        # Text (non-token) rollouts join no finished-request records and yield
+        # empty epoch rows; staleness/eviction telemetry filters them out while
+        # keeping the rollout table row-aligned.
+        writer = MagicMock()
+        metrics = rl_utils.prep_wandb_metrics(
+            writer,
+            traj_lens=[[3, 7]],
+            turn_lens=[[3, 7]],
+            rewards=[[1.0, -1.0]],
+            num_turns=[[1, 1]],
+            advantages=[0.5],
+            policy_epoch=[[[4, 5], []]],
+            kv_cache_epoch=[[[4, 5], []]],
+            completed_epochs=[[5]],
+            num_evictions=[[2, 0]],
+            current_iteration=6,
+        )
+        # Only the joined rollout counts: staleness [6-4], evictions [2].
+        assert metrics["mean_policy_staleness"] == 2
+        assert metrics["max_policy_staleness"] == 2
+        assert metrics["total_eviction_count"] == 2
+        assert metrics["max_num_evictions"] == 2
+        rollout_table = next(
+            c for c in writer.Table.call_args_list if "traj_length" in c.kwargs.get("columns", [])
+        )
+        assert rollout_table.kwargs["data"] == [(1.0, 3, 2, 2, 2, 1, 1)]
+
+        # A window where nothing joined emits no staleness/eviction metrics at all.
+        metrics = rl_utils.prep_wandb_metrics(
+            MagicMock(),
+            traj_lens=[[3]],
+            turn_lens=[[3]],
+            rewards=[[1.0]],
+            num_turns=[[1]],
+            advantages=[0.5],
+            policy_epoch=[[[]]],
+            kv_cache_epoch=[[[]]],
+            completed_epochs=[[]],
+            num_evictions=[[0]],
+            current_iteration=6,
+        )
+        assert metrics["mean_reward"] == 1.0
+        assert "mean_policy_staleness" not in metrics
+        assert "total_eviction_count" not in metrics
+        assert "rollout_table" not in metrics
+        assert "per_token_table" not in metrics
+
+    def test_request_ledger_join(self):
+        """compute_group_stats joins finished-request records to rollouts by token
+        content: records pop per turn (identical streams in finish order, text
+        rollouts join nothing), malformed turns are hard errors, and unconsumed
+        records carry across windows only under partial rollouts."""
+        eod = MockTokenizer().eod
+
+        def token_rollout(turns, masks):
+            return TokenRollout(
+                trajectory=turns,
+                reward=1.0,
+                generation_mask=masks,
+                logprobs=[[0.1] * len(t) for t in turns],
+                env_id='MEGAENV',
+            )
+
+        # Multi-turn: each turn's stream is the full conversation prefix plus that
+        # turn's generation; the mask's False-prefix marks the prompt.
+        multi_turn = token_rollout(
+            [[1, 2, 3, eod], [1, 2, 3, eod, 4, 5, eod]],
+            [[False, True, True, True], [False] * 5 + [True, True]],
+        )
+        # Identical sampled streams must pop distinct records, in rank/finish order.
+        twin_a = token_rollout([[8, 9, eod]], [[False, True, True]])
+        twin_b = twin_a.model_copy(deep=True)
+        other = token_rollout([[4, 4, eod]], [[False, True, True]])
+        # Text rollouts carry no token ids: they join nothing and need no records.
+        # (Groups are kept the same size: the advantage calculation the stats now
+        # run rejects ragged group shapes.)
+        text = Rollout(trajectory=["hello"], reward=1.0, env_id='MEGAENV')
+        text2 = Rollout(trajectory=["world"], reward=1.0, env_id='MEGAENV')
+
+        key = _token_stream_key
+        ledger = {
+            key([1], [2, 3, eod]): [_ledger_record(7, num_evictions=1)],
+            key([1, 2, 3, eod, 4], [5, eod]): [_ledger_record(8)],
+            key([8], [9, eod]): [_ledger_record(5), _ledger_record(6)],
+            key([4], [4, eod]): [_ledger_record(9)],
+        }
+        rollouts = [
+            RolloutGroup(rollouts=[multi_turn, twin_a, text]),
+            RolloutGroup(rollouts=[twin_b, other, text2]),
+        ]
+        stats = rl_utils.compute_group_stats(rollouts, MockTokenizer(), 8, ledger)
+
+        assert stats.policy_epoch == [[[7, 8], [5], []], [[6], [9], []]]
+        assert stats.kv_cache_epoch == [[[7, 8], [5], []], [[6], [9], []]]
+        assert stats.completed_epochs == [[7, 8, 5], [6, 9]]
+        assert stats.num_evictions == [[1, 0, 0], [0, 0, 0]]
+        assert all(not bucket for bucket in ledger.values())  # all records consumed
+
+        # Bad inputs are hard errors with distinct messages: a well-formed turn
+        # matching no record (trajectory mutated between engine and training), a
+        # trajectory/mask row-count mismatch, and an interleaved mask that cannot
+        # recover the engine's key.
+        # Trajectories end in eod so they get past the single-turn eod tripwire
+        # (which runs before the join) to the join errors under test.
+        for turns, masks, match in (
+            ([[6, 6, eod]], [[False, True, True]], "no finished-request record"),
+            ([[1, 2, 3], [1, 2, 3, 4, 5]], [[False, True, True]], "mask rows"),
+            ([[1, 2, 3, eod]], [[False, True, False, True]], "False-prefix"),
+        ):
+            with pytest.raises(AssertionError, match=match):
+                rl_utils.compute_group_stats(
+                    [RolloutGroup(rollouts=[token_rollout(turns, masks)])], MockTokenizer(), 8, {}
+                )
+
+        # Window carry-over: unconsumed records persist in finish order until their
+        # group arrives (the ledger is exact — nothing ages out), fully-consumed
+        # keys are pruned, and without partial rollouts nothing carries over.
+        carry_key = (b"p", b"g")
+        old, fresh = _ledger_record(1), _ledger_record(2)
+        merged = rl_utils._merge_request_ledger(
+            {carry_key: [old]}, {carry_key: [fresh]}, partial_rollouts=True
+        )
+        assert merged[carry_key] == [old, fresh]  # retained records pop first
+        assert rl_utils._merge_request_ledger({carry_key: []}, {}, partial_rollouts=True) == {}
+        merged = rl_utils._merge_request_ledger(
+            {carry_key: [old]}, {carry_key: [fresh]}, partial_rollouts=False
+        )
+        assert merged == {carry_key: [fresh]}  # non-partial: only this window's records
+
+
+def _token_stream_key(prompt, generated):
+    """Fixture mirror of the key inlined in FinishedRequestRecord.from_request /
+    _pop_request_records: SHA-256 digest pair of the streams as int64-LE bytes."""
+    return (
+        hashlib.sha256(np.asarray(prompt, dtype=np.int64).tobytes()).digest(),
+        hashlib.sha256(np.asarray(generated, dtype=np.int64).tobytes()).digest(),
+    )
+
+
+def _ledger_record(epoch, num_evictions=0):
+    return FinishedRequestRecord(
+        policy_epoch=[(0, epoch)], kv_cache_epoch=[(0, epoch)], num_evictions=num_evictions
+    )

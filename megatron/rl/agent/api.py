@@ -55,9 +55,6 @@ class Rollout(AgentBaseModel):
     reward: float = None
     env_id: str = ''
     problem_id: str | None = None
-    policy_epoch: list[list[tuple[int, int]]]
-    kv_cache_epoch: list[list[tuple[int, int]]]
-    num_evictions: list[int]
 
 
 class TokenRollout(AgentBaseModel):
@@ -69,9 +66,6 @@ class TokenRollout(AgentBaseModel):
     logprobs: list[list[float]] | None = None
     env_id: str = ''
     problem_id: str | None = None
-    policy_epoch: list[list[tuple[int, int]]]
-    kv_cache_epoch: list[list[tuple[int, int]]]
-    num_evictions: list[int]
 
 
 Rollouts = list[TokenRollout | Rollout]

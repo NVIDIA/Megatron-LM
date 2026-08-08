@@ -802,6 +802,44 @@ class DynamicInferenceRequestRecord:
         return request
 
 
+@dataclass
+class FinishedRequestRecord:
+    """Stores per-request metadata that is not meant to be passed through the RESTful server."""
+
+    policy_epoch: Optional[list[tuple[int, int]]]
+    kv_cache_epoch: Optional[list[tuple[int, int]]]
+    num_evictions: int
+
+    @classmethod
+    def from_request(
+        cls, request: "DynamicInferenceRequest"
+    ) -> tuple[tuple[bytes, bytes], "FinishedRequestRecord"]:
+        """Build the request's non-RESTful metadata from a finished request."""
+        prompt = request.prompt_tokens
+        if torch.is_tensor(prompt):
+            prompt = prompt.cpu()
+            request.prompt_tokens = prompt
+        key = (
+            hashlib.sha256(np.asarray(prompt, dtype=np.int64).tobytes()).digest(),
+            hashlib.sha256(np.asarray(request.generated_tokens, dtype=np.int64).tobytes()).digest(),
+        )
+        # Epoch stamps exist only while the engine has a generation epoch set.
+        record = cls(
+            policy_epoch=(
+                None if request.policy_epoch is None else [tuple(b) for b in request.policy_epoch]
+            ),
+            kv_cache_epoch=(
+                None
+                if request.kv_cache_epoch is None
+                else [tuple(b) for b in request.kv_cache_epoch]
+            ),
+            num_evictions=sum(
+                1 for event in request.events if event.type is DynamicInferenceEventType.EVICT
+            ),
+        )
+        return key, record
+
+
 @dataclass(kw_only=True)
 class VLMInferenceRequest(InferenceRequest):
     """Class for a VLM inference request"""

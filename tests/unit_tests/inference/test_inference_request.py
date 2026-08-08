@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import hashlib
 import warnings
 
 import msgpack
@@ -11,7 +12,9 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    FinishedRequestRecord,
     InferenceRequest,
+    Status,
     compute_block_hashes_batched,
     deserialize_ndarray,
     deserialize_tensor,
@@ -346,3 +349,62 @@ def test_dynamic_inference_request_serialize_prompt_length_absent():
 
     assert obj["prompt_length"] is None
     assert obj["prompt_tokens"] is None
+
+
+def _token_stream_key(prompt, generated):
+    """Fixture mirror of the key inlined in FinishedRequestRecord.from_request:
+    SHA-256 digest pair of the prompt and generated streams as int64-LE bytes."""
+    return (
+        hashlib.sha256(np.asarray(prompt, dtype=np.int64).tobytes()).digest(),
+        hashlib.sha256(np.asarray(generated, dtype=np.int64).tobytes()).digest(),
+    )
+
+
+def _finished_record(record):
+    """The (key, FinishedRequestRecord) the engine indexes from a finished record:
+    built from the merged client-view request, before serialization."""
+    return FinishedRequestRecord.from_request(record.merge())
+
+
+@pytest.mark.parametrize("stamped", [True, False])
+def test_from_request_builds_content_key_and_record(stamped):
+    """Key = digest pair of the (prompt, generated) streams; the epoch fields mirror
+    the request's stamps, staying None when the engine never stamped them (no
+    generation epoch set, non-RL serving)."""
+    request = _make_dynamic_request(prompt_tokens=torch.tensor([1, 2, 3]))
+    if stamped:
+        request.policy_epoch = [(0, 3)]
+        request.kv_cache_epoch = [(0, 3)]
+    request.generated_tokens.extend([10, 11])
+    request.add_event_evict()
+    request.add_event_finish()
+    request.status = Status.COMPLETED
+
+    key, record = _finished_record(DynamicInferenceRequestRecord.from_request(request))
+    assert key == _token_stream_key([1, 2, 3], [10, 11])
+    assert record.policy_epoch == ([(0, 3)] if stamped else None)
+    assert record.kv_cache_epoch == ([(0, 3)] if stamped else None)
+    assert record.num_evictions == 1  # only EVICT events count, not FINISH
+
+
+def test_checkpointed_request_keyed_by_client_view():
+    """A request suspended mid-generation checkpoints (the next checkpoint's prompt
+    swallows the generated prefix) and finishes later; the merged record must key by
+    the client view — original prompt plus full concatenated generation — and carry
+    every accumulated epoch boundary in one record."""
+    request = _make_dynamic_request(prompt_tokens=torch.tensor([1, 2]))
+    request.policy_epoch = [(0, 0)]
+    request.kv_cache_epoch = [(0, 0)]
+    request.generated_tokens.append(5)
+    record = DynamicInferenceRequestRecord.from_request(request)
+    record.checkpoint()  # suspend: the new checkpoint's prompt becomes [1, 2, 5]
+    resumed = record[-1]
+    resumed.kv_cache_epoch = [(0, 1)]  # engine re-stamps the recompute at scheduling
+    resumed.policy_epoch.append((3, 1))  # engine appends a boundary on epoch bump
+    resumed.generated_tokens.extend([6, 7])
+    resumed.status = Status.COMPLETED
+
+    key, payload = _finished_record(record)
+    assert key == _token_stream_key([1, 2], [5, 6, 7])
+    assert payload.policy_epoch == [(0, 0), (3, 1)]
+    assert payload.kv_cache_epoch == [(0, 1)]

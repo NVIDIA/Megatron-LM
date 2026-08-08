@@ -17,6 +17,7 @@ except ImportError:
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
@@ -84,9 +85,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             logprobs=choice.message.generation_log_probs,
             finish_reason=choice.finish_reason,
             prompt_length=len(choice.message.prompt_token_ids),
-            policy_epoch=choice.message.policy_epoch,
-            kv_cache_epoch=choice.message.kv_cache_epoch,
-            num_evictions=choice.message.num_evictions,
         )
 
     @classmethod
@@ -109,6 +107,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         args.skip_prompt_log_probs = True
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
+        inference_engine.local_metadata_ledger_enabled = True
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
@@ -193,6 +192,17 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             self._client.suspend_engines()
         await self._inference_engine.wait_until(EngineState.SUSPENDED)
+
+    def merge_global_request_ledgers(self) -> dict[tuple[bytes, bytes], list[FinishedRequestRecord]]:
+        """Union every engine's local-metadata ledger and clear them."""
+        local = self._inference_engine.consume_local_metadata_ledger()
+        shards = [None] * dist.get_world_size()
+        dist.all_gather_object(shards, local)
+        merged: dict[tuple[bytes, bytes], list[FinishedRequestRecord]] = {}
+        for shard in shards:
+            for key, records in shard.items():
+                merged.setdefault(key, []).extend(records)
+        return merged
 
     async def resume(self):
         if self._inference_engine._state_events[EngineState.RUNNING].is_set():
