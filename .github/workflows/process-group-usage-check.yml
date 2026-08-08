@@ -1,0 +1,49 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Process group usage check
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+      - "deploy-release/*"
+  merge_group:
+    types: [checks_requested]
+
+jobs:
+  pre-flight:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v1.0.0
+    if: github.repository == 'NVIDIA/Megatron-LM'
+
+  process-group-usage-check:
+    needs: [pre-flight]
+    if: |
+      !(needs.pre-flight.outputs.docs_only == 'true'
+      || needs.pre-flight.outputs.is_merge_group == 'true'
+      || needs.pre-flight.outputs.is_deployment_workflow == 'true')
+      && github.repository == 'NVIDIA/Megatron-LM'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # No third-party dependencies: the checker is stdlib-only (ast + json).
+      - name: Check for new global process-group reads in megatron/core
+        run: python tools/check_process_group_usage.py
