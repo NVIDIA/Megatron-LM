@@ -183,6 +183,78 @@ class TestParallelAttention:
         assert bias.shape[0] == config.hidden_size
 
 
+class TestFp32ResidualTELayerNormLinear:
+    """Regression test for fp32_residual_connection + TE backend.
+
+    With ``fp32_residual_connection=True`` the residual stream is kept in fp32
+    and propagates that dtype through ``bias_dropout_add`` to ``hidden_states``.
+    In the TE GPT layer spec ``input_layernorm`` is ``IdentityOp`` (folded into
+    the fused ``TELayerNormColumnParallelLinear``) and ``pre_mlp_layernorm`` is
+    likewise ``IdentityOp`` in dense models, so nothing casts hidden_states
+    back to ``params_dtype`` before the fused LN+GEMM. TE's
+    ``set_activation_dtype`` strictly rejects input dtype != param dtype
+    outside an autocast region, which used to surface as a hard failure.
+
+    This test feeds an fp32 input into a SelfAttention built from the TE
+    submodules with bf16 params -- the very situation produced by
+    ``fp32_residual_connection`` -- and asserts that forward succeeds and
+    returns an output in params_dtype. Without the cast inside
+    ``TELayerNormColumnParallelLinear.forward`` this raises in TE.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp32_residual_connection=True,
+        )
+        self.parallel_attention = SelfAttention(
+            self.transformer_config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_fp32_input_does_not_trip_te_dtype_check(self):
+        # Sanity: the spec under test is the fused LN+GEMM path.
+        from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
+
+        assert isinstance(self.parallel_attention.linear_qkv, TELayerNormColumnParallelLinear)
+
+        sequence_length = 32
+        micro_batch_size = 2
+
+        self.parallel_attention.cuda()
+
+        # fp32 hidden_states -- this is what bias_dropout_add hands to the next
+        # layer when fp32_residual_connection=True. Params remain bf16.
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.transformer_config.hidden_size),
+            dtype=torch.float32,
+        ).cuda()
+        attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
+
+        output, bias = self.parallel_attention(hidden_states, attention_mask)
+
+        # Output should follow params_dtype (the residual upcast happens in
+        # bias_dropout_add upstream of this op, not inside attention itself).
+        assert output.dtype == torch.bfloat16
+        assert output.shape == (
+            sequence_length,
+            micro_batch_size,
+            self.transformer_config.hidden_size,
+        )
+        assert bias.shape[0] == self.transformer_config.hidden_size
+
+
 @pytest.mark.skipif(not is_te_min_version("2.9.0"), reason="QK clipping requires TE >= 2.9.0")
 class TestClipQK:
 
