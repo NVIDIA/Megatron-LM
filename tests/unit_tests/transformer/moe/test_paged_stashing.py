@@ -1,4 +1,6 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,9 +10,12 @@ from megatron.core import config
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.paged_stash import (
+    PagedStashManager,
+    PagedStashRunner,
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
@@ -25,6 +30,134 @@ from tests.unit_tests.test_utilities import Utils
 # whole module for the GB200 CI bucket (selection there is marker-driven; see
 # tests/unit_tests/find_test_cases.py and recipes/gb200/unit-tests.yaml).
 pytestmark = pytest.mark.launch_on_gb200
+
+
+def _make_schedule_manager(recorded_schedule, vp_size=1):
+    manager = PagedStashManager.__new__(PagedStashManager)
+    manager.enabled = True
+    manager.status = 'captured'
+    manager.vp_size = vp_size
+    manager._pp_schedule = recorded_schedule
+    manager.current_layer = [99] * vp_size
+    manager.current_microbatch = [99] * vp_size
+    manager.current_vp_stage = 0
+    manager.current_schedule_index = len(manager._pp_schedule)
+    manager._te_graph_capture = False
+    return manager
+
+
+def test_te_graph_capture_uses_capture_order_then_restores_runtime_schedule():
+    runtime_schedule = [
+        1_001_000,
+        1_002_000,
+        1_001_001,
+        1_002_001,
+        -1_002_000,
+        -1_001_000,
+        -1_002_001,
+        -1_001_001,
+    ]
+    manager = _make_schedule_manager(runtime_schedule)
+
+    runtime_state = manager.start_te_graph_capture([1, 1, 1, -1, -1, -1])
+
+    assert manager._pp_schedule != runtime_schedule
+    assert len(manager._pp_schedule) == 12
+    assert manager.current_schedule_index == 0
+    manager.prepare_te_graph_capture_forward()
+    assert manager.current_layer == [1]
+    assert manager.current_microbatch == [0]
+
+    # TE repeats the complete order for warmup and capture. The first forward naturally
+    # wraps a fully consumed schedule without any per-callable cursor hook.
+    manager.current_schedule_index = len(manager._pp_schedule)
+    manager.prepare_te_graph_capture_forward()
+    assert manager.current_schedule_index == 0
+
+    manager.finish_te_graph_capture(runtime_state)
+    assert not manager._te_graph_capture
+    assert manager._pp_schedule is runtime_schedule
+    assert manager.current_schedule_index == len(runtime_schedule)
+    assert manager.current_layer == [99]
+    assert manager.current_microbatch == [99]
+
+
+def test_paged_stash_schedule_supports_distinct_vp_layer_templates():
+    manager = _make_schedule_manager(
+        [
+            1_001_000,
+            1_002_000,
+            2_001_000,
+            -2_001_000,
+            1_001_001,
+            1_002_001,
+            -1_002_000,
+            -1_001_000,
+            2_001_001,
+            -1_002_001,
+            -1_001_001,
+            -2_001_001,
+        ],
+        vp_size=2,
+    )
+
+    rebuilt = manager._build_te_graph_capture_schedule([1, 2, -2, 1, -1, 2, -1, -2])
+
+    assert rebuilt == manager._pp_schedule
+
+
+def test_paged_stash_schedule_rejects_invalid_recording_or_order():
+    manager = _make_schedule_manager([1_001_000, -1_002_000])
+    with pytest.raises(RuntimeError, match="backward layer order"):
+        manager._build_te_graph_capture_schedule([1, -1])
+
+    manager = _make_schedule_manager([1_001_000, -1_001_000])
+    with pytest.raises(RuntimeError, match="unbalanced forward/backward"):
+        manager._build_te_graph_capture_schedule([1, 1, -1])
+    with pytest.raises(RuntimeError, match="chunk-level integer PP order"):
+        manager._build_te_graph_capture_schedule([1.0, -1.0])
+
+
+def test_te_graph_capture_joins_auxiliary_streams_per_layer(monkeypatch):
+    manager = PagedStashManager.__new__(PagedStashManager)
+    manager._te_graph_capture = True
+    manager._unpack_stream_status = 'reloading'
+    manager._unpack_stream = object()
+
+    calls = []
+    manager.wait_for_stash_to_complete = lambda: calls.append("stash")
+
+    class FakeCurrentStream:
+        def wait_stream(self, stream):
+            calls.append(("reload", stream))
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: FakeCurrentStream())
+
+    manager.finish_te_graph_capture_group_io()
+
+    assert calls == ["stash", ("reload", manager.unpack_stream)]
+    assert manager._unpack_stream_status == 'idle'
+
+    manager._te_graph_capture = False
+    manager._unpack_stream_status = 'reloading'
+    calls.clear()
+    manager.finish_te_graph_capture_group_io()
+    assert calls == []
+    assert manager._unpack_stream_status == 'reloading'
+
+
+def test_te_whole_moe_graph_overflow_fails_instead_of_dynamic_fallback():
+    runner = PagedStashRunner.__new__(PagedStashRunner)
+    runner.config = SimpleNamespace(
+        cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.moe]
+    )
+
+    with pytest.raises(RuntimeError, match="Dynamic fallback is not supported"):
+        runner._raise_if_te_whole_moe_graph_overflow(stash_overflow_ranks=1, overbudget_ranks=0)
+    with pytest.raises(RuntimeError, match="expert-rank token budget overflow on 2 rank"):
+        runner._raise_if_te_whole_moe_graph_overflow(stash_overflow_ranks=0, overbudget_ranks=2)
+
+    runner._raise_if_te_whole_moe_graph_overflow(stash_overflow_ranks=0, overbudget_ranks=0)
 
 
 def _global_tokens_per_expert_from_local_routing_map(routing_map: torch.Tensor) -> torch.Tensor:
