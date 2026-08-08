@@ -10,6 +10,7 @@ Run with:
     torchrun --nproc_per_node=1 -m pytest tests/unit_tests/elastification/test_hybrid_flex_router.py
 """
 
+import random
 from argparse import Namespace
 
 import pytest
@@ -157,16 +158,9 @@ class TestFlextronRouter:
         assert logits.numel() == len(config.emb_int_list)
         assert choice in config.emb_int_list
 
-    @pytest.mark.flaky_in_dev
     def test_gumbel_determinism(self):
         """Two routers at the same config + iteration + fwd_pass_count should
         produce identical Gumbel-softmax samples.
-
-        Quarantined as flaky_in_dev (#5155): ``FlextronRouter.forward`` draws
-        ``hard_sample`` from Python's un-seeded global ``random``, which is not
-        covered by the Gumbel ``torch.manual_seed``, so the two routers
-        intermittently disagree on the hard/soft branch and the bit-exact
-        ``assert_close`` fails.
         """
         config = _router_config()
         config.curr_iteration = 0
@@ -177,8 +171,15 @@ class TestFlextronRouter:
         # determinism check is about the Gumbel RNG, not init noise.
         router_b.load_state_dict(router_a.state_dict())
 
-        out_a = router_a(1.0)
-        out_b = router_b(1.0)
+        random_state = random.getstate()
+        try:
+            # forward() samples hard_sample from Python random outside the torch-seeded Gumbel path.
+            random.seed(0)
+            out_a = router_a(1.0)
+            random.seed(0)
+            out_b = router_b(1.0)
+        finally:
+            random.setstate(random_state)
         for axis_a, axis_b in zip(out_a, out_b):
             if axis_a is None:
                 assert axis_b is None
