@@ -134,6 +134,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fused_residual_rmsnorm": False,
     "fused_single_qkv_rope": False,
     "gated_linear_unit": False,
+    "gdp_num_householder": 3,
     "gtp_weight_remat_size": 1,
     "glu_linear_offset": 0.0,
     "grad_scale_func": None,
