@@ -22,7 +22,11 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch impor
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import (
     verify_speculative_tokens as verify_speculative_tokens_pytorch,
 )
+from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import (
+    mamba_state_factorized_rollback as mamba_state_factorized_rollback_pytorch,
+)
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
+    mamba_state_factorized_rollback,
     mamba_state_selective_copy,
     prepare_next_forward_pass,
     rewind_kv_cache,
@@ -622,6 +626,81 @@ class TestMambaStateSelectiveCopy:
 
         torch.testing.assert_close(current, current_before)
 
+    @pytest.mark.parametrize("num_requests", [1, 4, 8])
+    @pytest.mark.parametrize("num_layers", [1, 3])
+    def test_immediate_state_update(self, num_requests, num_layers):
+        """Immediate-free-token-update mode (Triton vs PyTorch parity).
+
+        In this mode the intermediate buffer holds only the drafted tokens
+        (num_spec slots); the copy targets intermediate[accepted_count - 1] and
+        is skipped when accepted_count == 0.
+        """
+        N = num_requests
+        M = N
+        num_spec = 4
+        state_shape = (16, 32)
+
+        # Intermediate has num_spec (drafted) slots, not num_spec + 1.
+        intermediate = torch.randn(num_layers, M, num_spec, *state_shape, device=DEVICE)
+        current_ref = torch.randn(num_layers, M, *state_shape, device=DEVICE)
+        current_tri = current_ref.clone()
+
+        prefill_status = torch.zeros(N, dtype=torch.int32, device=DEVICE)
+        state_idx = torch.arange(N, device=DEVICE, dtype=torch.int64)
+        accepted_counts = torch.randint(0, num_spec + 1, (N,), device=DEVICE, dtype=torch.int64)
+
+        mamba_state_selective_copy_pytorch(
+            intermediate,
+            current_ref,
+            prefill_status,
+            state_idx,
+            accepted_counts,
+            num_layers,
+            immediate_state_update=True,
+        )
+        mamba_state_selective_copy(
+            intermediate,
+            current_tri,
+            prefill_status,
+            state_idx,
+            accepted_counts,
+            num_layers,
+            immediate_state_update=True,
+        )
+
+        torch.testing.assert_close(current_tri, current_ref)
+
+    def test_immediate_state_update_semantics(self):
+        """accepted_count == 0 is a no-op; accepted_count == k copies intermediate[k - 1]."""
+        N, num_layers, M, num_spec = 3, 2, 3, 4
+        state_shape = (8,)
+
+        intermediate = torch.randn(num_layers, M, num_spec, *state_shape, device=DEVICE)
+        current = torch.randn(num_layers, M, *state_shape, device=DEVICE)
+        current_before = current.clone()
+
+        prefill_status = torch.zeros(N, dtype=torch.int32, device=DEVICE)
+        state_idx = torch.arange(N, device=DEVICE, dtype=torch.int64)
+        accepted_counts = torch.tensor([0, 1, 4], device=DEVICE, dtype=torch.int64)
+
+        mamba_state_selective_copy(
+            intermediate,
+            current,
+            prefill_status,
+            state_idx,
+            accepted_counts,
+            num_layers,
+            immediate_state_update=True,
+        )
+
+        for layer in range(num_layers):
+            # Request 0: no drafted token accepted -> live state unchanged.
+            torch.testing.assert_close(current[layer, 0], current_before[layer, 0])
+            # Request 1: 1 accepted -> intermediate[..., 0].
+            torch.testing.assert_close(current[layer, 1], intermediate[layer, 1, 0])
+            # Request 2: 4 accepted -> intermediate[..., 3].
+            torch.testing.assert_close(current[layer, 2], intermediate[layer, 2, 3])
+
 
 class TestStressRandom:
     """Randomized stress tests running all four kernels with varied inputs."""
@@ -692,3 +771,109 @@ class TestStressRandom:
 
         torch.testing.assert_close(tri_mask, ref_mask)
         torch.testing.assert_close(tri_last, ref_last)
+
+
+class TestMambaStateFactorizedRollback:
+    """Tests for the fused rank-1 factorized SSM rollback kernel."""
+
+    def _reference_recurrence(
+        self, dx, factor_B, alpha, S0, prefill_status, state_idx, accepted, num_layers, npg
+    ):
+        """Ground truth: apply the per-step rank-1 recurrence sequentially."""
+        out = S0.clone()
+        nheads = S0.shape[2]
+        N = prefill_status.shape[0]
+        for i in range(N):
+            if int(prefill_status[i].item()) == 1:
+                continue
+            slot = int(state_idx[i].item())
+            m = int(accepted[i].item())
+            for layer in range(num_layers):
+                for h in range(nheads):
+                    g = h // npg
+                    s = out[layer, slot, h].to(torch.float32).clone()
+                    for t in range(m + 1):
+                        a = alpha[layer, slot, t, h].to(torch.float32)
+                        s = a * s + torch.outer(
+                            dx[layer, slot, t, h].to(torch.float32),
+                            factor_B[layer, slot, t, g].to(torch.float32),
+                        )
+                    out[layer, slot, h] = s.to(out.dtype)
+        return out
+
+    @pytest.mark.parametrize("num_requests", [1, 4, 8])
+    @pytest.mark.parametrize("num_layers", [1, 3])
+    @pytest.mark.parametrize("num_spec", [1, 2, 4])
+    def test_parity_and_recurrence(self, num_requests, num_layers, num_spec):
+        torch.manual_seed(123)
+        N = num_requests
+        M = N
+        W = num_spec + 1
+        nheads, headdim, dstate, ngroups = 4, 16, 32, 2
+        npg = nheads // ngroups
+
+        dx = torch.randn(num_layers, M, W, nheads, headdim, device=DEVICE, dtype=torch.float32)
+        factor_B = torch.randn(
+            num_layers, M, W, ngroups, dstate, device=DEVICE, dtype=torch.float32
+        )
+        alpha = torch.rand(num_layers, M, W, nheads, device=DEVICE, dtype=torch.float32) * 0.5 + 0.4
+        S0 = torch.randn(num_layers, M, nheads, headdim, dstate, device=DEVICE, dtype=torch.float32)
+
+        prefill_status = torch.zeros(N, dtype=torch.int32, device=DEVICE)
+        state_idx = torch.arange(N, device=DEVICE, dtype=torch.int64)
+        accepted = torch.randint(0, num_spec + 1, (N,), device=DEVICE, dtype=torch.int64)
+
+        gt = self._reference_recurrence(
+            dx, factor_B, alpha, S0, prefill_status, state_idx, accepted, num_layers, npg
+        )
+
+        cur_ref = S0.clone()
+        mamba_state_factorized_rollback_pytorch(
+            dx, factor_B, alpha, cur_ref, prefill_status, state_idx, accepted, num_layers, npg
+        )
+        cur_tri = S0.clone()
+        mamba_state_factorized_rollback(
+            dx, factor_B, alpha, cur_tri, prefill_status, state_idx, accepted, num_layers, npg
+        )
+
+        # Closed-form reconstruction matches the sequential recurrence...
+        torch.testing.assert_close(cur_ref, gt, atol=1e-4, rtol=1e-4)
+        # ...and the Triton kernel matches both the reference and the recurrence.
+        torch.testing.assert_close(cur_tri, cur_ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(cur_tri, gt, atol=1e-4, rtol=1e-4)
+
+    def test_prefill_skipped_and_zero_accept(self):
+        """Prefill requests are untouched; accepted==0 applies only the free token."""
+        torch.manual_seed(1)
+        num_layers, nheads, headdim, dstate, ngroups, num_spec = 2, 4, 8, 16, 1, 3
+        npg = nheads // ngroups
+        N = 4
+        M = N
+        W = num_spec + 1
+
+        dx = torch.randn(num_layers, M, W, nheads, headdim, device=DEVICE, dtype=torch.float32)
+        factor_B = torch.randn(
+            num_layers, M, W, ngroups, dstate, device=DEVICE, dtype=torch.float32
+        )
+        alpha = torch.rand(num_layers, M, W, nheads, device=DEVICE, dtype=torch.float32) * 0.5 + 0.4
+        S0 = torch.randn(num_layers, M, nheads, headdim, dstate, device=DEVICE, dtype=torch.float32)
+
+        prefill_status = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device=DEVICE)
+        state_idx = torch.arange(N, device=DEVICE, dtype=torch.int64)
+        accepted = torch.tensor([0, 2, 3, 0], device=DEVICE, dtype=torch.int64)
+
+        cur = S0.clone()
+        mamba_state_factorized_rollback(
+            dx, factor_B, alpha, cur, prefill_status, state_idx, accepted, num_layers, npg
+        )
+
+        # Prefill slots (1, 3) are untouched.
+        for slot in (1, 3):
+            torch.testing.assert_close(cur[:, slot], S0[:, slot])
+        # Decode request 0 (accepted == 0): only the free token's rank-1 update applied.
+        for layer in range(num_layers):
+            for h in range(nheads):
+                expect = alpha[layer, 0, 0, h] * S0[layer, 0, h] + torch.outer(
+                    dx[layer, 0, 0, h], factor_B[layer, 0, 0, 0]
+                )
+                torch.testing.assert_close(cur[layer, 0, h], expect, atol=1e-4, rtol=1e-4)

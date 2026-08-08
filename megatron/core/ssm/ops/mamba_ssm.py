@@ -123,6 +123,21 @@ def _selective_scan_update_kernel(
     stride_int_head,
     stride_int_dim,
     stride_int_dstate,
+    # Factor output buffers (rank-1 factorized rollback store)
+    dx_out_ptr,
+    b_out_ptr,
+    alpha_out_ptr,
+    stride_dx_out_batch,
+    stride_dx_out_seq,
+    stride_dx_out_head,
+    stride_dx_out_dim,
+    stride_b_out_batch,
+    stride_b_out_seq,
+    stride_b_out_group,
+    stride_b_out_dstate,
+    stride_alpha_out_batch,
+    stride_alpha_out_seq,
+    stride_alpha_out_head,
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     TIE_HDIM: tl.constexpr,
@@ -132,6 +147,9 @@ def _selective_scan_update_kernel(
     HAS_Z: tl.constexpr,
     HAS_STATE_BATCH_INDICES: tl.constexpr,
     HAS_INT_STATE: tl.constexpr,
+    IMMEDIATE_STATE_UPDATE: tl.constexpr,
+    SKIP_STATE_WRITE: tl.constexpr,
+    FACTORIZED_STORE: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
@@ -158,6 +176,7 @@ def _selective_scan_update_kernel(
         if HAS_INT_STATE:
             int_state_ptr += state_batch_idx * stride_int_batch + pid_h * stride_int_head
     else:
+        state_batch_idx = pid_b
         state_ptr += pid_b * stride_state_batch + pid_h * stride_state_head
         if HAS_INT_STATE:
             int_state_ptr += pid_b * stride_int_batch + pid_h * stride_int_head
@@ -249,6 +268,41 @@ def _selective_scan_update_kernel(
         if HAS_Z:
             z = tl.load(z_s_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
 
+        # ----------------------------------------------------
+        # Store rank-1 factors for the factorized speculative rollback.
+        # FACTORIZED_STORE is only launched with TIE_HDIM=True (per-head scalar A
+        # and broadcast dt/dt_bias), so dt (delta) and dA (alpha) are scalars here.
+        # Scatter this step's update factors to the request's Mamba state slot
+        # (state_batch_idx): dx = delta * x (per head, this dim-tile), alpha = dA
+        # (scalar/head, written once), and B (per group, written by the group leader).
+        # ----------------------------------------------------
+        if FACTORIZED_STORE:
+            dx_out_ptrs = (
+                dx_out_ptr
+                + state_batch_idx * stride_dx_out_batch
+                + s * stride_dx_out_seq
+                + pid_h * stride_dx_out_head
+                + offs_m * stride_dx_out_dim
+            )
+            tl.store(dx_out_ptrs, (dt * x).to(dx_out_ptr.dtype.element_ty), mask=offs_m < dim)
+            if pid_m == 0:
+                tl.store(
+                    alpha_out_ptr
+                    + state_batch_idx * stride_alpha_out_batch
+                    + s * stride_alpha_out_seq
+                    + pid_h * stride_alpha_out_head,
+                    dA,
+                )
+                if (pid_h % nheads_ngroups_ratio) == 0:
+                    b_out_ptrs = (
+                        b_out_ptr
+                        + state_batch_idx * stride_b_out_batch
+                        + s * stride_b_out_seq
+                        + (pid_h // nheads_ngroups_ratio) * stride_b_out_group
+                        + offs_n * stride_b_out_dstate
+                    )
+                    tl.store(b_out_ptrs, B.to(b_out_ptr.dtype.element_ty), mask=offs_n < dstate)
+
         if not TIE_HDIM:
             dB = B[None, :] * dt[:, None]
         else:
@@ -263,10 +317,33 @@ def _selective_scan_update_kernel(
         # Dump Intermediate Speculative State Snapshot
         # ----------------------------------------------------
         if HAS_INT_STATE:
-            int_state_s_ptrs = int_state_ptrs + s * stride_int_seq
-            tl.store(
-                int_state_s_ptrs, state, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
-            )
+            if IMMEDIATE_STATE_UPDATE:
+                # Speculative position 0 is the "free" token sampled from the
+                # target model in the previous step; it is guaranteed to be
+                # accepted. Persist its state straight into the live state
+                # buffer instead of checkpointing it, and checkpoint only the
+                # drafted tokens (positions 1..seq_len-1) at intermediate index
+                # s - 1.
+                if s == 0:
+                    tl.store(
+                        state_ptrs,
+                        state,
+                        mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate),
+                    )
+                else:
+                    int_state_s_ptrs = int_state_ptrs + (s - 1) * stride_int_seq
+                    tl.store(
+                        int_state_s_ptrs,
+                        state,
+                        mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate),
+                    )
+            else:
+                int_state_s_ptrs = int_state_ptrs + s * stride_int_seq
+                tl.store(
+                    int_state_s_ptrs,
+                    state,
+                    mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate),
+                )
 
         # Calculate Output
         out = tl.sum(state * C[None, :], axis=1)
@@ -278,8 +355,14 @@ def _selective_scan_update_kernel(
         out_s_ptrs = out_ptrs + s * stride_out_seq
         tl.store(out_s_ptrs, out, mask=offs_m < dim)
 
-    # After processing all sequence steps, persist the final state back to HBM
-    tl.store(state_ptrs, state, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate))
+    # After processing all sequence steps, persist the final state back to HBM.
+    # In the immediate-free-token-update path the live state was already written
+    # at s == 0 (the guaranteed-accepted free token), so we must not clobber it
+    # here with the post-speculation state. In the factorized-rollback path
+    # (SKIP_STATE_WRITE) the live state is left untouched entirely; the accepted
+    # state is reconstructed later from the stored rank-1 factors.
+    if not (HAS_INT_STATE and IMMEDIATE_STATE_UPDATE) and not SKIP_STATE_WRITE:
+        tl.store(state_ptrs, state, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate))
 
 
 def selective_state_update(
@@ -295,6 +378,11 @@ def selective_state_update(
     dt_softplus=False,
     state_batch_indices=None,
     intermediate_ssm_states=None,
+    immediate_state_update=False,
+    skip_state_write=False,
+    factor_dx=None,
+    factor_B=None,
+    factor_alpha=None,
 ):
     """
     Argument:
@@ -310,6 +398,13 @@ def selective_state_update(
         dt_bias: (dim,) or (nheads, dim)
         intermediate_ssm_states: Optional buffer of shape (batch, seqlen, nheads, dim, dstate)
                                  or (batch, seqlen, dim, dstate)
+        immediate_state_update: If True, treat sequence position 0 as the
+            guaranteed-accepted "free" token from the previous speculative step:
+            write its state directly into ``state`` and checkpoint only positions
+            1..seqlen-1 into ``intermediate_ssm_states`` at index s-1. Requires
+            ``intermediate_ssm_states`` to be provided (with ``seqlen - 1`` slots
+            along the sequence axis). The post-sequence state is not written back
+            to ``state`` in this mode.
     Return:
         out: shape matches x
     """
@@ -352,6 +447,11 @@ def selective_state_update(
     if dt_bias is not None and dt_bias.dim() == 1:
         dt_bias = dt_bias.unsqueeze(0)
 
+    if immediate_state_update:
+        assert (
+            intermediate_ssm_states is not None
+        ), "immediate_state_update=True requires intermediate_ssm_states to be provided"
+
     # Set up Intermediate State standardization
     if intermediate_ssm_states is not None:
         if not has_heads and intermediate_ssm_states.dim() == 4:
@@ -368,6 +468,39 @@ def selective_state_update(
     else:
         intermediate_ssm_states = x  # Dummy pointer
         int_state_strides = (0, 0, 0, 0, 0)
+
+    # Factorized rollback factor-store buffers: dx (b,s,nheads,headdim),
+    # B (b-slot,s,ngroups,dstate), alpha (slot,s,nheads). dx/B are typically a
+    # reduced precision (e.g. bf16); alpha is fp32.
+    factorized_store = factor_dx is not None
+    if factorized_store:
+        assert (
+            factor_B is not None and factor_alpha is not None
+        ), "factor_dx, factor_B, factor_alpha must all be provided for the factorized store"
+        dx_out_strides = (
+            factor_dx.stride(0),
+            factor_dx.stride(1),
+            factor_dx.stride(2),
+            factor_dx.stride(3),
+        )
+        b_out_strides = (
+            factor_B.stride(0),
+            factor_B.stride(1),
+            factor_B.stride(2),
+            factor_B.stride(3),
+        )
+        alpha_out_strides = (
+            factor_alpha.stride(0),
+            factor_alpha.stride(1),
+            factor_alpha.stride(2),
+        )
+    else:
+        factor_dx = x  # Dummy pointers
+        factor_B = x
+        factor_alpha = x
+        dx_out_strides = (0, 0, 0, 0)
+        b_out_strides = (0, 0, 0, 0)
+        alpha_out_strides = (0, 0, 0)
 
     batch, seq_len, nheads, dim = x.shape
     dstate = state.shape[-1]
@@ -458,9 +591,18 @@ def selective_state_update(
             out.stride(2),
             out.stride(3),
             *int_state_strides,
+            factor_dx,
+            factor_B,
+            factor_alpha,
+            *dx_out_strides,
+            *b_out_strides,
+            *alpha_out_strides,
             dt_softplus,
             tie_hdim,
             BLOCK_SIZE_M,
+            IMMEDIATE_STATE_UPDATE=immediate_state_update,
+            SKIP_STATE_WRITE=skip_state_write,
+            FACTORIZED_STORE=factorized_store,
             num_warps=num_warps,
         )
 
