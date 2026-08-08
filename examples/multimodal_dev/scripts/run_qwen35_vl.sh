@@ -6,13 +6,17 @@
 #   ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
 #
 # Environment variables:
-#   MODEL_VARIANT: proxy (default), 0.8b, 2b, 4b, 9b, 27b, 35b_a3b, 122b_a10b, 397b_a17b, 35b_a3b_light
+#   MODEL_VARIANT: proxy (default), pp_proxy, 0.8b, 2b, 4b, 9b, 27b, 35b_a3b, 122b_a10b, 397b_a17b, 35b_a3b_light
 #   CKPT_LOAD: path to a pre-converted checkpoint to load (enables --load + --finetune)
 #   CKPT_FORMAT: checkpoint format override (e.g. torch_dist); auto-detected when empty
-#   TP, EP, PP: parallelism sizes (PP must stay 1; multimodal_dev does not
-#               support pipeline parallelism)
+#   TP, EP, PP: parallelism sizes (PP>1 forces USE_FSDP=0)
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
+#   DATASET_PROVIDER: cord_v2 (default) or mock
+#   TOKENIZER_TYPE: HuggingFaceTokenizer (default) or NullTokenizer
+#   VOCAB_SIZE: required for NullTokenizer
+#   MTP_NUM_LAYERS: set to 0 to disable MTP (default 1)
+#   SAVE_CHECKPOINT: set to 0 to skip --save/--save-interval
 #   FORCE_LOAD_BALANCING: set to 1 to enable --moe-router-force-load-balancing
 #                         (perf / mock-data only; OFF for real finetuning)
 #   LAUNCHER: torchrun (default) or python
@@ -44,6 +48,16 @@ LAUNCHER=${LAUNCHER:-torchrun}
 
 MODEL_VARIANT=${MODEL_VARIANT:-proxy}
 VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
+
+# PP proxy-run knobs: let a tiny PP job run offline against mock data
+# without a HF tokenizer/processor download, and without MTP or
+# checkpoint writes.
+DATASET_PROVIDER=${DATASET_PROVIDER:-cord_v2}
+TOKENIZER_TYPE=${TOKENIZER_TYPE:-HuggingFaceTokenizer}
+VOCAB_SIZE=${VOCAB_SIZE:-}
+MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-1}
+MTP_LOSS_SCALING_FACTOR=${MTP_LOSS_SCALING_FACTOR:-0.1}
+SAVE_CHECKPOINT=${SAVE_CHECKPOINT:-1}
 
 # Batch sizes
 MBS=${MBS:-2}
@@ -105,6 +119,18 @@ case "$MODEL_VARIANT" in
         NUM_QUERY_GROUPS=2
         LINEAR_NUM_VALUE_HEADS=64
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-2}
+        ;;
+    pp_proxy)
+        # Minimal variant for pipeline-parallel smoke / parity runs.
+        NUM_LAYERS=${NUM_LAYERS:-4}
+        NUM_EXPERTS=${NUM_EXPERTS:-4}
+        HIDDEN_SIZE=${HIDDEN_SIZE:-512}
+        FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-2048}
+        NUM_ATTN_HEADS=${NUM_ATTN_HEADS:-2}
+        NUM_QUERY_GROUPS=${NUM_QUERY_GROUPS:-1}
+        LINEAR_NUM_KEY_HEADS=${LINEAR_NUM_KEY_HEADS:-2}
+        LINEAR_NUM_VALUE_HEADS=${LINEAR_NUM_VALUE_HEADS:-4}
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-1}
         ;;
     9b)
         NUM_LAYERS=${NUM_LAYERS:-32}
@@ -177,6 +203,8 @@ case "$MODEL_VARIANT" in
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
 esac
+# Upstream default for every variant except the PP proxy, which shrinks it.
+LINEAR_NUM_KEY_HEADS=${LINEAR_NUM_KEY_HEADS:-16}
 
 # Fail fast on inconsistent expert-parallelism configuration. Dense variants
 # (NUM_EXPERTS=0) do not emit any --num-experts / MoE args, so forwarding
@@ -260,13 +288,18 @@ TRAINING_ARGS=(
     --enable-experimental
     --manual-gc
     --manual-gc-interval 50
-    --mtp-num-layers 1
-    --mtp-loss-scaling-factor 0.1
     --sft
     --use-flash-attn
     # --attention-backend flash
     --calculate-per-token-loss
 )
+# MTP_NUM_LAYERS=0 disables MTP (useful to isolate PP from MTP behaviour).
+if [ "$MTP_NUM_LAYERS" -gt 0 ]; then
+    TRAINING_ARGS+=(
+        --mtp-num-layers "$MTP_NUM_LAYERS"
+        --mtp-loss-scaling-factor "$MTP_LOSS_SCALING_FACTOR"
+    )
+fi
 
 PROFILE_ARGS=()
 NSYS_CMD=()
@@ -296,9 +329,7 @@ fi
 SAVE_INTERVAL=${SAVE_INTERVAL:-500}
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
-    --save-interval "$SAVE_INTERVAL"
     --eval-interval 500
-    --save "$CHECKPOINT_STORE_PATH"
     --eval-iters 10
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
     --wandb-project "$WANDB_PROJECT"
@@ -308,20 +339,30 @@ EVAL_AND_LOGGING_ARGS=(
     --log-timers-to-tensorboard
     --log-params-norm
 )
+if [ "$SAVE_CHECKPOINT" -eq 1 ]; then
+    EVAL_AND_LOGGING_ARGS+=(
+        --save-interval "$SAVE_INTERVAL"
+        --save "$CHECKPOINT_STORE_PATH"
+    )
+fi
 
 # --- Tokenizer ---
 TOKENIZER_MODEL=${TOKENIZER_MODEL:-Qwen/Qwen3.5-397B-A17B}
 TOKENIZER_ARGS=(
-    --tokenizer-type HuggingFaceTokenizer
-    --tokenizer-model "$TOKENIZER_MODEL"
+    --tokenizer-type "$TOKENIZER_TYPE"
 )
+if [ "$TOKENIZER_TYPE" = "NullTokenizer" ] || [ "$TOKENIZER_TYPE" = "NullMultimodalTokenizer" ]; then
+    : "${VOCAB_SIZE:?VOCAB_SIZE must be set when TOKENIZER_TYPE=$TOKENIZER_TYPE}"
+    TOKENIZER_ARGS+=( --vocab-size "$VOCAB_SIZE" )
+else
+    TOKENIZER_ARGS+=( --tokenizer-model "$TOKENIZER_MODEL" )
+fi
 
 # --- Multimodal-specific ---
 MULTIMODAL_ARGS=(
     --model-arch qwen35_vl
     --model-variant "$MODEL_VARIANT"
-    --dataset-provider cord_v2
-    --hf-processor-path Qwen/Qwen3.5-397B-A17B
+    --dataset-provider "$DATASET_PROVIDER"
     --use-vanilla-collate-fn
     --image-token-id 248056
     --image-size 224
@@ -329,6 +370,15 @@ MULTIMODAL_ARGS=(
     --image-seq-length 256
     --vision-num-layers "$VISION_NUM_LAYERS"
 )
+# The HF processor is only needed by the real (cord_v2) dataset path;
+# the mock provider generates tensors directly.
+HF_PROCESSOR_PATH=${HF_PROCESSOR_PATH:-}
+if [ -z "$HF_PROCESSOR_PATH" ] && [ "$DATASET_PROVIDER" = "cord_v2" ]; then
+    HF_PROCESSOR_PATH=Qwen/Qwen3.5-397B-A17B
+fi
+if [ -n "$HF_PROCESSOR_PATH" ]; then
+    MULTIMODAL_ARGS+=( --hf-processor-path "$HF_PROCESSOR_PATH" )
+fi
 
 if [ "$USE_PACKED_SEQUENCE" -eq 1 ]; then
     MULTIMODAL_ARGS+=( --use-packed-sequence )
@@ -364,7 +414,7 @@ GPT_MODEL_ARGS=(
     --linear-conv-kernel-dim 4
     --linear-key-head-dim 128
     --linear-value-head-dim 128
-    --linear-num-key-heads 16
+    --linear-num-key-heads "$LINEAR_NUM_KEY_HEADS"
     --linear-num-value-heads "$LINEAR_NUM_VALUE_HEADS"
     --make-vocab-size-divisible-by 485
 )
@@ -381,6 +431,11 @@ MOE_ARGS=()
 case "$MODEL_VARIANT" in
     proxy)
         MOE_TOPK=2; MOE_FFN_HIDDEN=1024; MOE_SHARED_HIDDEN=1024
+        ;;
+    pp_proxy)
+        MOE_TOPK=${MOE_TOPK:-2}
+        MOE_FFN_HIDDEN=${MOE_FFN_HIDDEN:-256}
+        MOE_SHARED_HIDDEN=${MOE_SHARED_HIDDEN:-256}
         ;;
     35b_a3b|35b_a3b_light)
         MOE_TOPK=8; MOE_FFN_HIDDEN=512;  MOE_SHARED_HIDDEN=512
@@ -459,6 +514,11 @@ fi
 
 # --- FSDP ---
 USE_FSDP=${USE_FSDP:-1}
+# FSDP and PP are mutually exclusive in Megatron's standard path.
+if [ "$PP" -gt 1 ] && [ "$USE_FSDP" -eq 1 ]; then
+    echo "[run_qwen35_vl] PP=${PP} > 1 -> forcing USE_FSDP=0"
+    USE_FSDP=0
+fi
 if [ "$USE_FSDP" -eq 1 ]; then
     FSDP_ARGS=(
         --use-megatron-fsdp
