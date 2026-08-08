@@ -53,7 +53,22 @@ except ImportError:
 
     HAVE_FLA = False
 
+try:
+    from fla.modules.fused_norm_gate import rms_norm_gated
+except ImportError:
+    rms_norm_gated = None
+
 logger = logging.getLogger(__name__)
+
+
+def _gated_norm_rmsnorm_compatible(config, out_norm) -> bool:
+    """Return whether FLA can fuse this RMSNorm and SiLU gate."""
+    return (
+        rms_norm_gated is not None
+        and getattr(config, "normalization", None) == "RMSNorm"
+        and getattr(out_norm, "weight", None) is not None
+        and getattr(out_norm, "bias", None) is None
+    )
 
 
 @dataclass
@@ -269,6 +284,21 @@ class _GDNBase(MegatronModule):
             hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
         )
+        self._fused_gated_norm = None
+        if self.activation in ("silu", "swish") and _gated_norm_rmsnorm_compatible(
+            self.config, self.out_norm
+        ):
+            self._fused_gated_norm = rms_norm_gated
+            self._fused_gated_norm_eps = getattr(
+                self.out_norm, "eps", self.config.layernorm_epsilon
+            )
+            self._fused_gated_norm_zero_centered = bool(
+                getattr(
+                    self.out_norm,
+                    "zero_centered_gamma",
+                    getattr(self.config, "layernorm_zero_centered_gamma", False),
+                )
+            )
         self.recompute_norm_out = False
         self.recompute_in_proj_conv = False
         self.norm_out_checkpoint = None
@@ -373,7 +403,7 @@ class _GDNBase(MegatronModule):
         )
 
     @jit_fuser
-    def _apply_gated_norm(self, x, gate):
+    def _apply_gated_norm_ref(self, x, gate):
         # Output Norm
         x_dtype = x.dtype
         x = x.reshape(-1, x.shape[-1])
@@ -383,6 +413,25 @@ class _GDNBase(MegatronModule):
         y = y * self.act_fn(gate.float())
         y = y.to(x_dtype)
         return y
+
+    _FUSED_GATED_NORM_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+    def _apply_gated_norm(self, x, gate):
+        if self._fused_gated_norm is None or x.dtype not in self._FUSED_GATED_NORM_DTYPES:
+            return self._apply_gated_norm_ref(x, gate)
+        x = x.reshape(-1, x.shape[-1])
+        gate = gate.reshape(-1, gate.shape[-1])
+        weight = self.out_norm.weight
+        if self._fused_gated_norm_zero_centered:
+            weight = weight + 1.0
+        return self._fused_gated_norm(
+            x,
+            gate,
+            weight,
+            None,
+            activation="swish",
+            eps=self._fused_gated_norm_eps,
+        )
 
     @jit_fuser
     def _prepare_input_for_gated_delta_rule(
