@@ -372,6 +372,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    gated_delta_rule_backend: Literal["fla", "flash_qla", "torch"] = "fla"
+    """Backend for the GatedDeltaNet gated delta rule."""
+
     ####################
     # initialization
     ####################
@@ -1348,7 +1351,30 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
+        valid_gdr_backends = ("fla", "flash_qla", "torch")
+        if self.gated_delta_rule_backend not in valid_gdr_backends:
+            raise ValueError(
+                "gated_delta_rule_backend must be one of "
+                f"{valid_gdr_backends}, got {self.gated_delta_rule_backend!r}."
+            )
+        if (
+            self.gated_delta_rule_backend != "fla"
+            and self.experimental_attention_variant != "gated_delta_net"
+        ):
+            raise ValueError(
+                "A non-default gated_delta_rule_backend requires "
+                "experimental_attention_variant='gated_delta_net'."
+            )
+
         if self.experimental_attention_variant in ("gated_delta_net", "gdn2"):
+            if (
+                self.deterministic_mode
+                and self.experimental_attention_variant == "gated_delta_net"
+                and self.gated_delta_rule_backend != "torch"
+            ):
+                raise ValueError(
+                    "deterministic_mode=True requires gated_delta_rule_backend='torch'."
+                )
             # gdn2 may also be enabled for GDN layers built via the hybrid layer pattern
             # symbol 'G', where linear_attention_freq is unused; the GPT experimental
             # attention route raises a clear error downstream if it is missing.

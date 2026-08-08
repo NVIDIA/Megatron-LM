@@ -26,6 +26,79 @@ from megatron.core.ssm.gated_delta_net.common import (
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 
+_GATED_DELTA_RULE_BACKEND_SUPPORTS_DETERMINISTIC_MODE = {
+    "fla": False,
+    "flash_qla": False,
+    "torch": True,
+}
+_FLASH_QLA_SUPPORTED_CUDA_CAPABILITIES = ((9, 0), (10, 0), (12, 0))
+
+
+def _current_cuda_device_capability() -> tuple[int, int] | None:
+    """Return the active CUDA device capability, or None without CUDA."""
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_capability(torch.cuda.current_device())
+
+
+def _load_flash_qla_chunk_gated_delta_rule():
+    """Import FlashQLA lazily and adapt its callable to the FLA interface."""
+    try:
+        from flash_qla import chunk_gated_delta_rule as flash_qla_chunk_gated_delta_rule
+    except (ImportError, RuntimeError, ValueError) as exc:
+        raise ImportError(
+            "FlashQLA requires the `flash_qla` package on a supported CUDA device."
+        ) from exc
+
+    def _flash_qla_chunk_gated_delta_rule_adapter(*args, cp_context=None, **kwargs):
+        cu_seqlens_cpu = kwargs.pop("cu_seqlens_cpu", None)
+        if cp_context is not None:
+            raise ValueError("FlashQLA does not support chunkwise inter-card context parallelism.")
+        if cu_seqlens_cpu is not None:
+            raise ValueError("FlashQLA does not use cu_seqlens_cpu.")
+        return flash_qla_chunk_gated_delta_rule(*args, **kwargs)
+
+    return _flash_qla_chunk_gated_delta_rule_adapter
+
+
+def _select_gated_delta_rule_backend(
+    backend: str,
+    *,
+    deterministic_mode: bool,
+    cp_size: int,
+    key_head_dim: int,
+    value_head_dim: int,
+):
+    """Return the callable implementing the requested GDN backend."""
+    if backend not in _GATED_DELTA_RULE_BACKEND_SUPPORTS_DETERMINISTIC_MODE:
+        raise ValueError(f"Unsupported gated_delta_rule_backend: {backend!r}.")
+    if deterministic_mode and not _GATED_DELTA_RULE_BACKEND_SUPPORTS_DETERMINISTIC_MODE[backend]:
+        raise ValueError(
+            "deterministic_mode=True requires gated_delta_rule_backend='torch', "
+            f"not {backend!r}."
+        )
+    if backend == "torch":
+        return torch_chunk_gated_delta_rule
+    if backend == "fla":
+        if chunk_gated_delta_rule is None:
+            raise ImportError("The FLA backend requires `flash-linear-attention`.")
+        return chunk_gated_delta_rule
+    if cp_size != 1:
+        raise ValueError("FlashQLA currently requires context_parallel_size=1.")
+    if key_head_dim != 128 or value_head_dim != 128:
+        raise ValueError(
+            "FlashQLA requires linear_key_head_dim=128 and linear_value_head_dim=128, "
+            f"got {key_head_dim=} and {value_head_dim=}."
+        )
+    capability = _current_cuda_device_capability()
+    if capability not in _FLASH_QLA_SUPPORTED_CUDA_CAPABILITIES:
+        raise ValueError(
+            "FlashQLA supports SM90/SM100/SM120, "
+            f"got {capability}."
+        )
+    return _load_flash_qla_chunk_gated_delta_rule()
+
+
 class GatedDeltaNet(_GDNBase):
     # pylint: disable=missing-class-docstring
     def _setup_variant_attrs(self):
@@ -55,10 +128,13 @@ class GatedDeltaNet(_GDNBase):
         self.dt_bias_dim = self.num_v_heads_local_tp
         self.a_log_dim = self.num_v_heads_local_tp
 
-        if self.config.deterministic_mode:
-            self.gated_delta_rule = torch_chunk_gated_delta_rule
-        else:
-            self.gated_delta_rule = chunk_gated_delta_rule
+        self.gated_delta_rule = _select_gated_delta_rule_backend(
+            self.config.gated_delta_rule_backend,
+            deterministic_mode=self.config.deterministic_mode,
+            cp_size=self.cp_size,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+        )
 
     @jit_fuser
     def _compute_gates(
