@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from typing import Optional, Union
+import warnings
 
 import torch
 
@@ -28,6 +29,7 @@ from megatron.core.transformer.moe.moe_utils import (
     z_loss_func,
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
+from megatron.core.transformer.moe.seq_topk import seqtopk_routing
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -174,6 +176,11 @@ class TopKRouter(Router):
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
+        # SeqTopK (sequence-level TopK, arXiv 2511.06494) routing mode and per-token cap U.
+        self.topk_mode = getattr(self.config, "moe_router_topk_mode", "topk")
+        self.seq_topk_upper_bound = getattr(self.config, "moe_router_seq_topk_upper_bound", None)
+        if self.topk_mode == "seq_topk" and self.seq_topk_upper_bound is None:
+            self.seq_topk_upper_bound = 2 * self.topk
         self.input_jitter = None
         self.frozen_expert_bias = False
 
@@ -741,7 +748,7 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, seq_idx: Optional[torch.Tensor] = None):
         """Top-k routing function
 
         Args:
@@ -749,6 +756,9 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            seq_idx (torch.Tensor, optional): Per-token contiguous sequence id, shape [num_tokens].
+                Used when ``moe_router_topk_mode="seq_topk"`` to restrict expert-budget competition
+                to within each sequence. Ignored otherwise.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -765,8 +775,25 @@ class TopKRouter(Router):
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
+        # SeqTopK: sequence-level budget selection (only when seq_idx is available).
+        seq_topk_active = self.topk_mode == "seq_topk" and seq_idx is not None
+
         # Calculate probs and routing_map for token dispatching
-        if self.routing_type == "sinkhorn":
+        if seq_topk_active:
+            probs, routing_map = seqtopk_routing(
+                logits,
+                self.topk,
+                self.seq_topk_upper_bound,
+                seq_idx,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
+                padding_mask=padding_mask,
+            )
+        elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         elif self.routing_type == "quantile_balancing":
             assert (
@@ -800,14 +827,31 @@ class TopKRouter(Router):
 
         # Apply each aux loss type and attach aux loss autograd function to probs
         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
-            # Calculate scores and routing_map for aux loss
-            routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
-                logits,
-                self.topk,
-                self.score_function,
-                fused=self.config.moe_router_fusion,
-                padding_mask=padding_mask,
-            )
+            # For SeqTopK, the aux loss uses the *actual* SeqTopK routing_map (variable per-token
+            # counts) for per-expert token counts, with the standard full-N normalized scores for
+            # the prob-mean term. Total selected budget is preserved (T*K), so the existing
+            # load-balancing loss expectation (T*K/N per expert) is unchanged.
+            if seq_topk_active:
+                _, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+                    logits,
+                    self.topk,
+                    self.score_function,
+                    fused=self.config.moe_router_fusion,
+                    padding_mask=padding_mask,
+                )
+                routing_map_for_aux_loss = routing_map
+                if padding_mask is not None:
+                    routing_map_for_aux_loss = routing_map_for_aux_loss & (
+                        ~padding_mask
+                    ).unsqueeze(-1)
+            else:
+                routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+                    logits,
+                    self.topk,
+                    self.score_function,
+                    fused=self.config.moe_router_fusion,
+                    padding_mask=padding_mask,
+                )
             probs = self._apply_aux_loss(
                 probs,
                 scores_for_aux_loss,
@@ -840,7 +884,7 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None, seq_idx: Optional[torch.Tensor] = None):
         """
         Forward pass of the router.
 
@@ -849,6 +893,9 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            seq_idx (torch.Tensor, optional): Per-token contiguous sequence id, shape [num_tokens].
+                Required for SeqTopK routing (``moe_router_topk_mode="seq_topk"``); ignored
+                otherwise. Derived from ``packed_seq_params.cu_seqlens_q`` upstream.
         """
         self._maintain_float32_expert_bias()
 
@@ -866,7 +913,16 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        # SeqTopK requires a per-token sequence id; if unavailable (e.g. decode, or uniform
+        # tokens_per_sample packing path), fall back to standard per-token topk.
+        if self.topk_mode == "seq_topk" and seq_idx is None:
+            warnings.warn(
+                "SeqTopK routing requested but seq_idx is not available (decode-only or "
+                "non-THD packing); falling back to standard topk for this iteration."
+            )
+            probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        else:
+            probs, routing_map = self.routing(logits, padding_mask=padding_mask, seq_idx=seq_idx)
 
         return probs, routing_map
 
@@ -977,12 +1033,21 @@ class InferenceTopKRouter(TopKRouter):
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
+    ):
         """Simplified forward pass for inference - returns dense tensors only.
 
         Args:
             input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Not used in inference.
+            seq_idx (torch.Tensor, optional): Per-token contiguous sequence id, shape
+                [num_tokens]. Only threaded through to the training/non-inference
+                fallback path (``TopKRouter.forward``, e.g. for SeqTopK routing); the
+                compiled inference path always applies standard per-token top-k.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -991,6 +1056,16 @@ class InferenceTopKRouter(TopKRouter):
         """
 
         if not InferenceMode.is_active():
-            return super().forward(input, padding_mask)
+            return super().forward(input, padding_mask, seq_idx=seq_idx)
 
+        # The inference path always uses standard per-token top-k; a provided seq_idx (a
+        # SeqTopK request) is intentionally ignored here. Warn once so callers do not
+        # silently assume SeqTopK ran during inference.
+        if seq_idx is not None and self.topk_mode == "seq_topk":
+            warnings.warn(
+                "SeqTopK routing was requested (seq_idx provided), but the inference "
+                "TopKRouter path uses standard per-token top-k and ignores seq_idx. "
+                "Online SeqTopK for inference (prefill/decode) is not yet implemented; "
+                "falling back to standard top-k for this iteration."
+            )
         return self._forward(input, padding_mask)
