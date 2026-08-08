@@ -7,8 +7,10 @@ import torch
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.experimental_attention_variant import csa_cp_utils
-from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_utils as csa_cp_utils,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
     apply_thd_cp_local_rope_fused,
     apply_thd_cp_local_rope_unfused,
     compute_cp_indexer_topk,
@@ -184,7 +186,7 @@ def test_prepare_cp_compressor_input_builds_rank_row_map(monkeypatch):
         return hidden_compact, comp_ids
 
     monkeypatch.setattr(
-        csa_cp_utils.csa_cp_layout_kernels.CompressorInputCompact, "apply", staticmethod(fake_apply)
+        csa_cp_utils.cp_layout_kernels.CompressorInputCompact, "apply", staticmethod(fake_apply)
     )
     hidden = torch.arange(16, dtype=torch.float32).reshape(16, 1)
     boundary = torch.arange(2, dtype=torch.float32).reshape(2, 1)

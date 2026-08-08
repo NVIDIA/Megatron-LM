@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for ``megatron.core.transformer.experimental_attention_variant.csa_kernels``.
+"""Unit tests for the compressed sparse attention kernel utilities.
 
 Coverage:
 
@@ -28,8 +28,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant import csa_kernels as dk
-from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils import kernels as dk
+from megatron.core.transformer.experimental_attention_variant.csa_utils.kernels import (
     CSASparseAttnFunc,
     FusedCSAIndexerSparseAttnFromTopkFunc,
     FusedCSAIndexerSparseAttnFunc,
@@ -1533,9 +1533,9 @@ class TestDenseFusedIndexerSparseAttn:
 #
 # Everything above this banner stubs ``cudnn.DSA`` and ``flash_mla`` with
 # ``MagicMock``-based fakes; that exercises the Python plumbing of
-# ``csa_kernels.py`` (shape transforms, autograd wiring, KL composition)
+# ``csa_utils/kernels.py`` (shape transforms, autograd wiring, KL composition)
 # but does NOT verify that the cuDNN kernels themselves compute what
-# ``csa_kernels.py`` expects them to compute.
+# ``csa_utils/kernels.py`` expects them to compute.
 #
 # The tests below close that gap by running each helper / public function
 # end-to-end against a small PyTorch reference implementation. Numeric
@@ -1859,7 +1859,9 @@ class TestRealKernelScoreHelpers:
             with_topk=case.startswith('sparse_'),
         )
 
-        from megatron.core.transformer.experimental_attention_variant import csa_kernels as _dk
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+            kernels as _dk,
+        )
 
         if case == 'sparse_indexer_predict':
             # The kernel takes sm_scale=1.0; scale is applied via weights
@@ -1993,7 +1995,7 @@ class TestRealKernelKLLossDense:
     @pytest.mark.parametrize("dummy", [None])
     def test_real_dense_kl_loss_matches_reference(self, dummy, reset_lazy_kernel_state):
         _skip_if_real_kernels_unavailable()
-        from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.kernels import (
             _compute_dense_attn_score,
             _compute_dense_indexer_score,
             _kl_loss_from_dense_scores,
@@ -2055,7 +2057,7 @@ class TestRealKernelIndexerTopk:
     @pytest.mark.parametrize("dummy", [None])
     def test_real_indexer_topk_set_matches_reference(self, dummy, reset_lazy_kernel_state):
         _skip_if_real_kernels_unavailable()
-        from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.kernels import (
             indexer_topk,
         )
 
@@ -2320,7 +2322,7 @@ class TestRealKernelFusedIndexerSparseAttn:
 
         # The reference uses FlashMLA's actual normalization because it
         # includes the selected top-k positions and the per-head sink term.
-        from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.kernels import (
             _csa_fwd_flash_mla,
             _indexer_topk_core,
         )
@@ -3312,7 +3314,7 @@ class TestRealKernelDenseIndexerBackward:
 
         # ---- Reference: capture the kernel's attn-side / lse_indexer (treated
         # as constants) and run autograd through the analytical dense KL.
-        from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.kernels import (
             _compute_dense_attn_score,
             _csa_fwd_flash_mla,
             _indexer_topk_core,
