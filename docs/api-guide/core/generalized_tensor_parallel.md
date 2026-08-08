@@ -46,6 +46,7 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
     - [2.2 High-priority streams (Blackwell and later)](#22-high-priority-streams-blackwell-and-later)
     - [2.3 Minimal end-to-end example](#23-minimal-end-to-end-example)
     - [2.4 Tuning knobs](#24-tuning-knobs)
+    - [2.5 FP32-accumulation wgrad reduce-scatter (optional)](#25-fp32-accumulation-wgrad-reduce-scatter-optional)
   - [3. Implementation details](#3-implementation-details)
     - [3.1 GTP\_remat architecture (Mcore ↔ TE integration)](#31-gtp_remat-architecture-mcore--te-integration)
       - [What the flags do under the hood](#what-the-flags-do-under-the-hood)
@@ -58,7 +59,11 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
     - [3.3 Distributed checkpointing (DCP)](#33-distributed-checkpointing-dcp)
     - [3.4 Prefetch-chain construction and its design assumptions](#34-prefetch-chain-construction-and-its-design-assumptions)
       - [Grouped-expert chains (one-block-ahead)](#grouped-expert-chains-one-block-ahead)
-    - [3.5 CUDA graph integration](#35-cuda-graph-integration)
+    - [3.5 GTP\_remat + Multi-Token Prediction (MTP)](#35-gtp_remat--multi-token-prediction-mtp)
+      - [What MTP does to the chain](#what-mtp-does-to-the-chain)
+      - [How the chain supports it](#how-the-chain-supports-it)
+      - [Configuration traps](#configuration-traps)
+    - [3.6 CUDA graph integration](#36-cuda-graph-integration)
       - [Cross-graph backward reduce-scatter overlap](#cross-graph-backward-reduce-scatter-overlap)
   - [4. Testing](#4-testing)
 
@@ -529,7 +534,7 @@ The prefetch chains (§3.1) are **not configured — they are observed at runtim
 
 2. **Linking (lazily, on the first forward).** The doubly-linked list (`prev_w` / `next_w`) is built the **first time each weight is materialized** inside `all_gather_and_prefetch`: a class-level per-chain cursor (`GTPShardedParam._chain_state[chain_id]["last_weight"]`) records the previously-seen weight, and the current weight links itself after it. The chain therefore **encodes the forward execution order of the first step** and replays it every step after to predict the next weight to prefetch. The recompute chain (`_recompute_next`) self-populates the same way, from the weights re-gathered while `in_fp8_activation_recompute_phase()` is true.
 
-Weights that must **not** join a chain (embedding, output_layer — they all-gather synchronously and run outside the CUDA-graph boundary) are excluded by setting `weight.prefetch_initialized = True` (and `_need_weight_prefetch = False`) at construction, which skips registration entirely.
+A weight can be kept **out** of a chain by setting `weight.prefetch_initialized = True` (and `_need_weight_prefetch = False`) before its first materialization, which skips registration entirely. Nothing does this today: `embedding` and `output_layer` are ordinary `UNGRAPHED` chain members (they are the head and the tail — see the link table GTP logs on the first backward), and only run outside the CUDA-graph boundary. The hook remains available as the fallback for any weight that cannot satisfy the assumptions below.
 
 **Why this needs careful consideration.** Because `_chain_state` is a *class attribute* and `prev_w`/`next_w` are strong references between `GTPShardedParam` instances, the chain **holds the weights alive for the life of the process** and **assumes the first step's behavior is representative of every step**. Neither is free:
 
@@ -539,8 +544,9 @@ Weights that must **not** join a chain (embedding, output_layer — they all-gat
 | **Deterministic, fixed forward order** — the observed order is replayed every step | Data-dependent control flow: conditional layers, early exit, MoE routing that skips experts, reordered visitation | Predicted `next_w` is wrong → stale-buffer read or missed prefetch |
 | **Single, non-reentrant pass** — one global `last_weight` cursor + per-weight in-flight handles | Two models in one process, an extra autograd graph, unexpected microbatch interleaving | Corrupted cursor / async handles |
 | **Fixed, single membership** — `chain_id` and graphed-vs-eager decided once | A weight whose CG scope or dense/expert context changes between steps | Unrepresentable in one linear slot |
-| **No parameter sharing/tying** — a linear list gives each weight one slot | A tied/shared param used in two positions (e.g. tied I/O embeddings) | One identity cannot occupy two chain positions; must be excluded |
+| **One consume per weight per step** — a linear list gives each weight one slot, so one pass of the chain issues one all-gather and expects one backward per weight | A weight used at two points in one forward (MTP's shared embedding / output_layer and its replayed layer, tied I/O embeddings) | Forward: the extra consumes get no all-gather of their own. Backward: the weight is reached out of chain order and its reduce-scatters overlap. Both supported since §3.5 — anything else in this shape must be checked against it |
 | **Build-once, run-forever lifetime** — strong refs never released | Building/tearing down GTP models in-process (successive UTs, model re-init, multi-model drivers) | Leaks all GTP params/buffers; a new model's chain can cross-link onto a previous model's stale params |
+| **The prefetched weight is already updated** — the chain gathers a weight before the module that owns it runs | DDP's `overlap_param_gather`: `_make_forward_pre_hook` waits `finish_param_sync` only for the module about to execute, and GTP never calls it, so a prefetch reaching into a bucket whose all-gather has not landed is unordered against it | Gathers the pre-update weight. Widens with prefetch depth — one-block-ahead grouped chains reach furthest. `overlap_param_gather=False` removes it, at the cost of that overlap |
 
 **Mitigations.**
 
@@ -580,7 +586,45 @@ Three consequences:
   - why it must: `cuda_graphs.py` drains with `wait_async_comms(GTPChain.GRAPHED.value)`, matching the id **literally**, so a weight in `GTP_remat_grouped_fc1_ungraphed` would never be joined at the graph boundary — a **correctness** hazard, not just a lost overlap;
   - lifting it would mean draining by chain-id *prefix* (`_chain_is_grouped`) or registering the grouped streams before capture — neither is done today.
 
-### 3.5 CUDA graph integration
+### 3.5 GTP_remat + Multi-Token Prediction (MTP)
+
+**The one thing to know:** MTP consumes `embedding` and `output_layer` **`1 + mtp_num_layers` times per forward**, not once. Everything below follows from that.
+
+#### What MTP does to the chain
+
+Two independent violations of the *one consume per weight per step* assumption in §3.4:
+
+- **Shared weights.** Each MTP layer re-embeds its shifted input with the main `embedding`, and every prediction head (main + one per depth) runs the main `output_layer`.
+- **A replayed layer.** With `--mtp-use-repeated-layer` a *single* MTP layer object is built and applied `mtp_num_layers` times (`MultiTokenPredictionBlock.forward` indexes `self.layers[0]` every iteration), so its weights — grouped experts included — are consumed once per depth.
+
+**The chain has one node per weight, but the model has several consumes.** Linking happens on a weight's *first* materialization, so a re-consumed weight is skipped rather than relinked. An L6 + 2-depth chain reads `embedding → decoder.0..5 → mtp.0.eh_proj → mtp.0 attn/shared-experts → mtp.1 … → output_layer`, with MTP's routed experts on the grouped `fc1`/`fc2` chains — 19 nodes, but 36 consumption events.
+
+**Both directions follow consumption events, not chain nodes.** `embedding` and `output_layer` each contribute `mtp_num_layers` extra events; under `--mtp-use-repeated-layer` every weight of the replayed layer does too. A weight is therefore reached far from its chain position, and anything that assumed "one visit per weight, in chain order" fails.
+
+#### How the chain supports it
+
+The chain stays a plain linear list — one slot per weight, no branching. MTP is absorbed by three rules:
+
+- **Every consume needs its own all-gather.** A weight is gathered by its chain *neighbour* — predecessor in forward, successor in backward — so one pass of the chain issues exactly one gather per node. Consumes past the first have none of their own, and the prefetched path would hand the GEMM whatever the shared buffer last held. They fall back to an on-demand gather instead: correct, at the cost of that consume's comm/compute overlap.
+
+- **Per-consume gradients accumulate.** Every consume produces its own wgrad and its own reduce-scatter, and the weight's `main_grad` ends up holding their sum — which is its true gradient. A weight keeps only one reduce-scatter in flight at a time, so an outstanding one is completed and accumulated before the next begins.
+
+- **The deferred finalize is conditional.** Normally a weight finalizes its chain *successor's* reduce-scatter, hiding that latency behind the next backward. Once backward stops following chain order, the successor may not have started one yet, so the finalize runs only when something is actually in flight.
+
+The first rule always applies. The other two apply only under `async_reduction`; with it off, every wgrad reduce-scatters and accumulates inline.
+
+> Both hazards are **silent**. A stale gather keeps the loss finite and merely wrong, and a dropped reduce-scatter trains on an incomplete gradient — neither raises. The state guard that would catch the first (`check_param_states`) is off outside debug builds.
+
+Link tables are logged from the first backward all-gather — the earliest point at which every chain is complete, and one that is still reached if backward later fails.
+
+#### Configuration traps
+
+- **One `/` segment per depth, all identical.** `MEM*EM/*E/*E` = 6-layer decoder + 2 MTP depths. `MEM*EM/*E*E` = *one* depth whose MTP layer is 4 layers deep — a different model.
+- **The pattern silently overrides `--mtp-num-layers`** to the number of `/`-separated segments (`arguments.py`, warning `"conflicts with MTP depth count"`). If a run appears to execute fewer MTP layers than requested, this is almost always why — **trust the arg dump, not the flag**.
+- `--mtp-use-repeated-layer` is generated from the `TransformerConfig` dataclass, so it never appears as a literal string in `arguments.py`. At `mtp_num_layers=1` it is a no-op: the loop runs once either way and the parameter set is identical.
+
+
+### 3.6 CUDA graph integration
 
 GTP supports both **full-iteration CUDA graphs** and **local/partial CUDA graphs**. The common integration keeps graph and eager chains separate, builds lazy prefetch links during warmup, materializes side streams before capture, and preserves stable addresses for captured communication buffers. Full-iteration capture has no boundary between individual layer graphs. Local capture divides the model into independently replayed graph runners, so communication at a runner boundary requires an explicit completion protocol. The features below describe CUDA-graph-specific GTP optimizations and the ownership rules required to make them safe.
 
@@ -670,6 +714,7 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_gtp_partial_cg.py` | Four-layer partial-CG loss and eager-vs-replay grad-norm parity with two-slot ring reuse across independently replayed graphs (§3.5). |
 | `test_gtp_dcp.py` | DCP sharding metadata (§3.3): TP×GTP_remat offsets, pad reshard, `replica_id`, native-FP8 save/load. |
 | `test_gtp_muon_dcp.py` | Muon optimizer-state DCP roundtrip (§1.6): `replica_id` fold + native-FP8 backfill matching. |
+| `test_gtp_mtp.py` | GTP_remat + MTP shared weights (§3.5), 14 cases over `mtp_use_repeated_layer` × dense/MoE. Both MTP hazards are silent, so each needs its own guard: the async reduce-scatter path is compared numerically against the sync path on an identical model/sharding/batch, and all-gathers issued are tallied against consumes to catch a consume reading a buffer nothing gathered into. |
 | `test_gtp_fp8_param_gather.py` | Native-FP8 GTP_remat (§1.3): fp8-vs-BF16 loss parity (TP1/TP2, MoE), post-save-spike guard. |
 | `test_gtp_custom_pgs.py` | `pg_collection` plumbing: a custom `gtp_remat` group (permuted ranks, same size) must give the same fwd/bwd results as the MPU groups — catches modules reading `parallel_state` instead of the collection passed to them. |
 
