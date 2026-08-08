@@ -123,6 +123,14 @@ class MimoOptimizer(MegatronOptimizer):
         for opt in self._active_optimizers:
             opt.zero_grad(set_to_none)
 
+    @property
+    def chained_optimizers(self) -> List[MegatronOptimizer]:
+        """Expose direct inner optimizers to stock optimizer lifecycle hooks."""
+        optimizers = []
+        for opt in self._active_optimizers:
+            optimizers.extend(getattr(opt, 'chained_optimizers', [opt]))
+        return optimizers
+
     def prepare_model_params_for_param_sync(self) -> None:
         """Stage parameters for explicit synchronization in all active module optimizers."""
         for opt in self._active_optimizers:

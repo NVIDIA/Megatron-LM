@@ -81,6 +81,15 @@ def test_ddp_overlap_config_is_selected_per_module_role():
     assert not disabled.overlap_param_gather
 
 
+def test_mxfp8_param_gather_config_reaches_ddp():
+    args = _args(fp8_param_gather=True, reuse_grad_buf_for_mxfp8_param_ag=True)
+
+    config = _ddp_config_from_args(args, enable_overlap=True)
+
+    assert config.fp8_param_gather
+    assert config.reuse_grad_buf_for_mxfp8_param_ag
+
+
 def test_encoder_overlap_opt_in_reaches_encoder_ddp_config(mocker):
     encoder = mocker.MagicMock()
     wrapped_encoder = mocker.MagicMock()

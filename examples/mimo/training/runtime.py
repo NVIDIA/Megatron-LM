@@ -88,6 +88,10 @@ def _ddp_config_from_args(
         pad_buckets_for_high_nccl_busbw=getattr(args, "ddp_pad_buckets_for_high_nccl_busbw", False),
         use_distributed_optimizer=True,
         grad_reduce_in_fp32=getattr(args, "accumulate_allreduce_grads_in_fp32", True),
+        fp8_param_gather=getattr(args, "fp8_param_gather", False),
+        reuse_grad_buf_for_mxfp8_param_ag=getattr(
+            args, "reuse_grad_buf_for_mxfp8_param_ag", False
+        ),
     )
 
 

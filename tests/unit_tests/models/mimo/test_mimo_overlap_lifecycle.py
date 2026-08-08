@@ -74,6 +74,32 @@ def test_nested_overlap_lifecycle_routes_only_to_enabled_modules():
     inactive.start_grad_sync.assert_not_called()
 
 
+def test_nested_forward_pre_hook_handles_are_visible_to_stock_train_loop():
+    language = MagicMock()
+    encoder = MagicMock()
+    language.remove_forward_pre_hook_handles = {object(): object()}
+    encoder.remove_forward_pre_hook_handles = {}
+    model = _overlap_stub([language, encoder])
+
+    handles = MimoModel.remove_forward_pre_hook_handles.fget(model)
+
+    assert handles == language.remove_forward_pre_hook_handles
+
+
+def test_mimo_optimizer_exposes_inner_optimizers_to_stock_train_loop():
+    dense = object()
+    expert = object()
+    module_optimizer = SimpleNamespace(chained_optimizers=[dense, expert])
+    standalone_optimizer = object()
+    optimizer = SimpleNamespace(
+        _active_optimizers=[module_optimizer, standalone_optimizer]
+    )
+
+    optimizers = MimoOptimizer.chained_optimizers.fget(optimizer)
+
+    assert optimizers == [dense, expert, standalone_optimizer]
+
+
 def test_mimo_optimizer_stages_each_active_optimizer_before_param_sync():
     language_optimizer = MagicMock()
     encoder_optimizer = MagicMock()
