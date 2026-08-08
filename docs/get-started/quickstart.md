@@ -11,6 +11,13 @@
 
 This guide walks you through two training examples and then covers data preparation for your own datasets. You start with a minimal distributed loop to validate your environment, then run a full LLaMA-3 training job. Make sure you have completed [installation](install.md) before proceeding.
 
+## Prerequisites
+
+- **Python**: 3.10 or later
+- **CUDA**: 12.0 or later
+- **GPU**: NVIDIA GPU with Tensor Core support (A100, H100, and similar)
+- **NCCL**: 2.18 or later (installed automatically with PyTorch)
+
 ## Minimal Training Example
 
 Start with the simplest possible setup, a distributed training loop using mock data on two GPUs. This verifies that your environment is configured correctly before moving to real models.
@@ -57,9 +64,9 @@ python tools/preprocess_data.py \
 ### Key Arguments
 
 - `--input`: Path to input JSON/JSONL file
-- `--output-prefix`: Prefix for output binary files (`.bin` and `.idx`)
-- `--tokenizer-type`: Tokenizer type (`HuggingFaceTokenizer`, `GPT2BPETokenizer`, and so on)
-- `--tokenizer-model`: Path to tokenizer model file
+- `--output-prefix`: Prefix for output binary files (`.bin` and `.idx`). The `.bin` file contains the tokenized data in binary format, and the `.idx` file contains the index for efficient random access.
+- `--tokenizer-type`: Tokenizer type (for example, `HuggingFaceTokenizer`, `GPT2BPETokenizer`, `SentencePieceTokenizer`, `Llama2Tokenizer`)
+- `--tokenizer-model`: Path to tokenizer model file (for `SentencePieceTokenizer`/`Llama2Tokenizer`, this is a `.model` file; for `HuggingFaceTokenizer`, this is the tokenizer directory path)
 - `--workers`: Number of parallel workers for processing
 - `--append-eod`: Add end-of-document token
 
