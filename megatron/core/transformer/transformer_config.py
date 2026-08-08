@@ -372,6 +372,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    gdn_pre_gated_delta_rule_fusion: bool = False
+    """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+
     gated_delta_rule_backend: Literal["fla", "flash_qla", "torch"] = "fla"
     """Backend for the GatedDeltaNet gated delta rule."""
 
@@ -1365,6 +1368,15 @@ class TransformerConfig(ModelParallelConfig):
         ):
             raise ValueError(
                 "A non-default gated_delta_rule_backend requires "
+                "experimental_attention_variant='gated_delta_net'."
+            )
+
+        if (
+            self.gdn_pre_gated_delta_rule_fusion
+            and self.experimental_attention_variant != "gated_delta_net"
+        ):
+            raise ValueError(
+                "gdn_pre_gated_delta_rule_fusion is only supported with "
                 "experimental_attention_variant='gated_delta_net'."
             )
 

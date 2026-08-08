@@ -152,6 +152,33 @@ class GatedDeltaNet(_GDNBase):
         beta = beta.sigmoid()
         return g, {"beta": beta.contiguous()}
 
+    def _fused_streamed_pre_gated_delta_rule(self, qkvzba, cu_seqlens_q=None, seq_idx=None):
+        """Call the streamed fused pre-GDR wrapper."""
+        try:
+            from megatron.core.fusions.fused_pre_gated_delta_rule import (
+                fused_streamed_pre_gated_delta_rule,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "gdn_pre_gated_delta_rule_fusion requires the streamed pre-GDR fusion "
+                "dependencies, including causal-conv1d."
+            ) from exc
+
+        return fused_streamed_pre_gated_delta_rule(
+            qkvzba,
+            self.conv1d.weight,
+            self.conv1d.bias if self.conv_bias else None,
+            self.A_log,
+            self.dt_bias,
+            num_key_heads=self.qk_dim_local_tp // self.key_head_dim,
+            num_value_heads=self.v_dim_local_tp // self.value_head_dim,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+            use_qk_l2norm=self.use_qk_l2norm,
+            cu_seqlens=cu_seqlens_q,
+            seq_idx=seq_idx,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -232,6 +259,26 @@ class GatedDeltaNet(_GDNBase):
                 seq_len,
                 packed_seq_params,
             )
+
+            if self.gdn_pre_gated_delta_rule_fusion:
+                if self.cp_size != 1:
+                    raise ValueError(
+                        "gdn_pre_gated_delta_rule_fusion currently requires "
+                        "context_parallel_size=1."
+                    )
+                nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
+                seq_idx = (
+                    packed_seq_params.seq_idx
+                    if packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+                    else None
+                )
+                query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
+                    qkvzba, cu_seqlens_q=cu_seqlens_q, seq_idx=seq_idx
+                )
+                nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
+                if thd_cp_a2a_inv is None:
+                    thd_cp_a2a_inv = hs.new_empty((0,), dtype=torch.int64)
+                return query, key, value, g, beta, gate, thd_cp_a2a_inv
 
             qkvzba = qkvzba.transpose(0, 1)
             qkv, gate, beta, alpha = torch.split(qkvzba, self.feat_dim_split, dim=-1)
