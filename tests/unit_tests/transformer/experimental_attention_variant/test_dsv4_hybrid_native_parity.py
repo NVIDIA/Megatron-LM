@@ -355,80 +355,38 @@ def _native_fused_sparse_indexer_loss(
     index_scores: torch.Tensor,
     topk_indices: torch.Tensor,
     query: torch.Tensor,
-    compressed_kv: torch.Tensor,
+    kv_full: torch.Tensor,
     attn_sink: torch.Tensor,
+    window_indices: torch.Tensor,
+    compressed_kv_offset: int,
     softmax_scale: float,
     loss_coeff: float,
     sparse_loss: bool,
     calculate_per_token_loss: bool,
 ) -> torch.Tensor:
-    batch_size, seqlen, _ = topk_indices.size()
-    num_heads, head_dim = query.size(2), query.size(3)
-    n_compressed = compressed_kv.size(0)
-
-    sink = attn_sink.detach().view(1, num_heads, 1, 1).float()
-    q = query.detach().permute(1, 2, 0, 3).float()
-    compressed_kv_t = compressed_kv.detach().permute(1, 0, 2)
-
-    if sparse_loss:
-        safe_indices = topk_indices.clamp(min=0).long()
-        valid = topk_indices >= 0
-        row_valid = valid.any(dim=-1, keepdim=True)
-
-        predict_logits = torch.gather(index_scores, dim=-1, index=safe_indices)
-        predict_logits = predict_logits.masked_fill(~valid, float("-inf"))
-        predict_logits = predict_logits.masked_fill(~row_valid, 0.0)
-        predict = F.softmax(predict_logits, dim=-1, dtype=torch.float32)
-        predict = predict * row_valid.float()
-
-        selected_kv = torch.gather(
-            compressed_kv_t.unsqueeze(1).expand(-1, seqlen, -1, -1),
-            dim=2,
-            index=safe_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim),
-        )
-        attn_scores = torch.einsum("bhsd,bskd->bhsk", q, selected_kv.float())
-        attn_scores = attn_scores * softmax_scale
-        attn_scores = attn_scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
-    else:
-        # Dense loss: KL is computed over the FULL compressed-KV axis (not
-        # just topk). Index-side and attention-side both use the kernel's
-        # ratio-causal mask, which we derive analytically from the
-        # compress_ratio (= seqlen / n_compressed): position k of the
-        # compressed-KV is valid for query row q iff k < (q + 1) // ratio.
-        compress_ratio = seqlen // n_compressed
-        k_idx = torch.arange(n_compressed, device=index_scores.device)
-        valid_per_q = (
-            torch.arange(1, seqlen + 1, device=index_scores.device) // compress_ratio
-        ).clamp(max=n_compressed)
-        finite_pos = k_idx.view(1, 1, -1) < valid_per_q.view(1, -1, 1)  # (1, sq, n_compressed)
-        finite_pos = finite_pos.expand(batch_size, -1, -1)
-        row_valid = finite_pos.any(dim=-1, keepdim=True)
-
-        predict_logits = index_scores.masked_fill(~finite_pos, float("-inf"))
-        predict_logits = predict_logits.masked_fill(~row_valid, 0.0)
-        predict = F.softmax(predict_logits, dim=-1, dtype=torch.float32)
-        predict = predict * row_valid.float()
-
-        attn_scores = torch.einsum("bhsd,bkd->bhsk", q, compressed_kv_t.float())
-        attn_scores = attn_scores * softmax_scale
-        attn_mask = finite_pos.unsqueeze(1).expand(-1, num_heads, -1, -1)
-        attn_scores = attn_scores.masked_fill(~attn_mask, float("-inf"))
-
-    score_max = torch.max(attn_scores.max(dim=-1, keepdim=True).values, sink)
-    exp_scores = torch.exp(attn_scores - score_max)
-    exp_sink = torch.exp(sink - score_max)
-    attn_probs = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
-    target = attn_probs.sum(dim=1)
-    target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
-    target = target * row_valid.float()
-
-    eps = torch.finfo(torch.float32).tiny
-    target = target.clamp(min=eps)
-    predict = predict.clamp(min=eps)
-    kl_per_row = (target * (torch.log(target) - torch.log(predict))).sum(dim=-1)
-    kl_per_row = torch.where(row_valid.squeeze(-1), kl_per_row, torch.zeros_like(kl_per_row))
-    loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
-    return loss_coeff * loss
+    seqlen = query.shape[0]
+    n_compressed = index_scores.shape[-1]
+    compress_ratio = seqlen // n_compressed
+    compressed_positions = torch.arange(n_compressed, device=query.device).view(1, -1)
+    visible_compressed = torch.arange(1, seqlen + 1, device=query.device).view(-1, 1)
+    causal_mask = torch.where(
+        compressed_positions < visible_compressed // compress_ratio, 0.0, float("-inf")
+    )
+    causal_mask = causal_mask.unsqueeze(0).expand(query.shape[1], -1, -1)
+    return _native_unfused_sparse_indexer_loss(
+        index_scores,
+        topk_indices,
+        query,
+        kv_full,
+        attn_sink,
+        window_indices,
+        compressed_kv_offset,
+        softmax_scale,
+        loss_coeff,
+        sparse_loss,
+        causal_mask,
+        calculate_per_token_loss,
+    )
 
 
 def _native_unfused_sparse_indexer_loss(
@@ -749,8 +707,10 @@ class NativeCompressedSparseAttention(nn.Module):
                         index_scores,
                         topk_compressed,
                         query,
-                        compressed_kv,
+                        kv_full,
                         self.attn_sink,
+                        window_idxs,
+                        offset,
                         self.softmax_scale,
                         self.indexer_loss_coeff,
                         self.indexer_use_sparse_loss,
