@@ -1674,6 +1674,42 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
 
+    if args.use_layer_wise_distributed_optimizer:
+        if not args.use_layer_wise_param_layout:
+            # Decoupled compact LayerWise: fp8 parameter gather is supported via the FP8-aware
+            # whole-param all-gather. Only mxfp8/blockwise (fp4 out of scope); mxfp8 needs
+            # reuse_grad_buf. fp4 is rejected unconditionally -- the LayerWise gather routes
+            # buckets by is_float8tensor, so an NVFP4 param would silently take the raw
+            # flatten path.
+            assert not getattr(args, 'fp4_param_gather', False), (
+                "Decoupled compact LayerWise DDP layout supports fp8 parameter gather only "
+                "(mxfp8 or blockwise); fp4_param_gather is out of scope."
+            )
+            if args.fp8_param_gather:
+                assert args.fp8_recipe in ('mxfp8', 'blockwise'), (
+                    "fp8 parameter gather on the decoupled compact LayerWise DDP layout requires "
+                    f"fp8_recipe in {{'mxfp8', 'blockwise'}}; got {args.fp8_recipe!r}."
+                )
+                if args.fp8_recipe == 'mxfp8':
+                    assert args.reuse_grad_buf_for_mxfp8_param_ag, (
+                        "mxfp8 + --fp8-param-gather on the decoupled compact LayerWise DDP layout "
+                        "requires --reuse-grad-buf-for-mxfp8-param-ag (or use fp8_recipe='blockwise')."
+                    )
+            assert args.num_distributed_optimizer_instances == 1, (
+                "the decoupled compact LayerWise DDP layout (the default; pass "
+                "--use-layer-wise-param-layout for the padded layout) requires "
+                "num_distributed_optimizer_instances == 1: the non-DistOpt LayerWise (Muon) buffers "
+                "only all-reduce within a single optimizer instance, so partial DistOpt (>1 "
+                "instance) would under-reduce Muon gradients across the full data-parallel domain."
+            )
+        else:
+            # Padded LayerWise param layout: fp8/fp4 parameter gather is not supported here.
+            assert not args.fp8_param_gather and not getattr(args, 'fp4_param_gather', False), (
+                "Layer-wise (Muon) distributed optimizer with the padded param layout does not "
+                "support FP8/FP4 parameter gather. Drop --use-layer-wise-param-layout to get the "
+                "default decoupled compact layout, or set fp8_param_gather=False."
+            )
+
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
         if args.use_distributed_optimizer:
@@ -3001,17 +3037,6 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--megatron-fsdp-version', type=int, default=1, choices=[1, 2],
                        help='Megatron-FSDP implementation version. Defaults to 1.')
-    group.add_argument('--no-use-layer-wise-param-layout',
-                       action='store_false',
-                       dest='use_layer_wise_param_layout',
-                       help='Opt out of the precomputed LayerWise param layout. When set, '
-                       'falls back to the legacy LayerWise ping-pong path: all params '
-                       '(including non-Muon embeddings, biases, layernorm) live in a single '
-                       'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
-                       'The default (precomputed layout) routes non-Muon params through a '
-                       'separate DistributedOptimizer with byte-level sharding, which is faster '
-                       'and uses less padding but produces different bf16 reduction ordering '
-                       'and so will not match legacy-path loss curves bit-for-bit.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'
@@ -3066,6 +3091,16 @@ def _add_distributed_args(parser):
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
                        Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.')
+    group.add_argument(
+        '--use-layer-wise-param-layout',
+        action='store_true',
+        help='Opt INTO the padded shard-aligned LayerWise param layout. The default is the compact '
+        'decoupled layout, where LayerWise (Muon 2D) buffers use a no-padding DDP layout and locally '
+        'disable DistributedOptimizer (all-reduce grads + whole-param ping-pong + allgather_params), '
+        'while sibling buffers keep the byte-level DistributedOptimizer; this avoids the persistent '
+        'dp_size * max(shard_load) padding. Pass this flag to restore the padded layout (e.g. for '
+        'bit-for-bit comparison; it uses a different bf16 reduction ordering).',
+    )
     return parser
 
 
