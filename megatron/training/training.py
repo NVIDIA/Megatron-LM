@@ -2744,28 +2744,54 @@ def train_step(
     timers = get_timers()
     num_microbatches = get_num_microbatches()
 
-    offload_optimizer_states = getattr(args, 'offload_optimizer_states', False)
-    if offload_optimizer_states:
-        # Reload optimizer states as late as possible so the H2D transfer can overlap
-        # with gradient finalization. Preserve custom finalize hooks installed by a
-        # model builder, and avoid wrapping the hook again on every training step.
+    optimizer_config = getattr(optimizer, 'config', None)
+    chunked_optimizer_state_offload = bool(
+        optimizer_config is not None
+        and getattr(optimizer_config, 'chunked_optimizer_state_offload', False)
+        and getattr(optimizer_config, 'optimizer_state_offload_fraction', 1.0) > 0.0
+    )
+    pre_forward_param_sync_before_master_offload = (
+        chunked_optimizer_state_offload
+        and optimizer.optimizer_state_offload_requires_pre_forward_param_sync()
+    )
+    delay_master_offload_for_param_buffer = (
+        chunked_optimizer_state_offload
+        and args.reuse_grad_buf_for_mxfp8_param_ag
+        and args.overlap_param_gather
+    )
+    if chunked_optimizer_state_offload:
+        # Prefetch masters and the first state chunk as late as possible so H2D overlaps
+        # gradient finalization. Preserve custom hooks and avoid wrapping more than once.
         finalize_model_grads_func = getattr(config, 'finalize_model_grads_func', None)
         if (
-            getattr(finalize_model_grads_func, '_optimizer_state_offload_wrapped_optimizer', None)
+            getattr(
+                finalize_model_grads_func,
+                '_chunked_optimizer_state_offload_wrapped_optimizer',
+                None,
+            )
             is not optimizer
         ):
-            base_finalize_model_grads_func = finalize_model_grads_func or finalize_model_grads
+            base_finalize_model_grads_func = getattr(
+                finalize_model_grads_func,
+                '_chunked_optimizer_state_offload_base_finalize_model_grads_func',
+                None,
+            )
+            if base_finalize_model_grads_func is None:
+                base_finalize_model_grads_func = finalize_model_grads_func or finalize_model_grads
 
             def finalize_model_grads_with_state_reload(*fmg_args, **fmg_kwargs):
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        optim_instance.reload_offloaded_states()
+                optimizer.prefetch_optimizer_state_for_gradient_finalization()
                 return base_finalize_model_grads_func(*fmg_args, **fmg_kwargs)
 
             setattr(
                 finalize_model_grads_with_state_reload,
-                '_optimizer_state_offload_wrapped_optimizer',
+                '_chunked_optimizer_state_offload_wrapped_optimizer',
                 optimizer,
+            )
+            setattr(
+                finalize_model_grads_with_state_reload,
+                '_chunked_optimizer_state_offload_base_finalize_model_grads_func',
+                base_finalize_model_grads_func,
             )
             config.finalize_model_grads_func = finalize_model_grads_with_state_reload
 
@@ -2791,11 +2817,12 @@ def train_step(
         args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
     )
     while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
-        # Start the D2H transfer before zeroing gradients to maximize overlap.
-        if offload_optimizer_states:
-            for optim_instance in optimizer.chained_optimizers:
-                if isinstance(optim_instance, DistributedOptimizer):
-                    optim_instance.offload_states()
+        # Start D2H before zeroing gradients. In the MXFP8 staging path, updated masters
+        # remain readable until their delayed D2H after the main-param copy below.
+        if chunked_optimizer_state_offload and not pre_forward_param_sync_before_master_offload:
+            optimizer.offload_optimizer_state_for_forward(
+                offload_master=not delay_master_offload_for_param_buffer
+            )
 
         # Set grad to zero.
         for model_chunk in model:
@@ -2803,6 +2830,16 @@ def train_step(
             # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
+
+        if pre_forward_param_sync_before_master_offload:
+            # Compact LayerWise FP8 gather consumes fp32 masters. Finish the normally
+            # overlapped gather after grad-buffer reset. If a sibling DistOpt still needs
+            # MXFP8 staging, keep masters until that copy below completes.
+            optimizer.ensure_master_weights_for_pre_forward_param_sync()
+            optimizer.start_param_sync_for_bucket_group_subset(force_sync=True)
+            optimizer.offload_optimizer_state_for_forward(
+                offload_master=not delay_master_offload_for_param_buffer
+            )
 
         if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
@@ -2836,14 +2873,15 @@ def train_step(
             if forward_pre_hook_enabled or full_cg_captured:
                 for optim_instance in optimizer.chained_optimizers:
                     if isinstance(optim_instance, DistributedOptimizer):
+                        # Only this DistOpt sibling consumes masters in the MXFP8 param-buffer
+                        # staging pass. The staging entry restores its own offloaded masters;
+                        # do not perturb the LayerWise/Muon master lifecycle here.
                         optim_instance._copy_main_params_to_param_buffer()
 
-        # Master weights must remain resident until any main-param copy above is
-        # complete. Releasing here keeps optimizer memory out of forward/backward.
-        if offload_optimizer_states:
-            for optim_instance in optimizer.chained_optimizers:
-                if isinstance(optim_instance, DistributedOptimizer):
-                    optim_instance.release_offloaded_gpu_states()
+        # In the delayed MXFP8 path, optimizer state was offloaded above while masters
+        # remained resident for main-param staging. Start master D2H after that copy.
+        if delay_master_offload_for_param_buffer:
+            optimizer.offload_optimizer_state_for_forward()
 
         # Forward pass.
         if save_activations_in_this_iteration:
