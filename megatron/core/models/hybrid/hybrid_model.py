@@ -1,19 +1,25 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import warnings
 from typing import Literal, Optional
 
 from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.context_parallel_layout import (
+    CpPartitionModeConverter,
+    get_stage_entry_partition_mode,
+    replace_packed_seq_params_cp_partition_mode,
+)
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -98,6 +104,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
              Defaults to None.
         pg_collection (ProcessGroupCollection, optional): Model communication process groups.
         vp_stage (Optional[int], optional): Virtual pipeline stage index. Defaults to None.
+        cp_stage_entry_partition_mode (str, optional): CP partition mode expected at this
+            stage input. Required when context parallelism is enabled. Defaults to None.
     """
 
     def __init__(
@@ -115,6 +123,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
+        # TODO(yuzhongw): re-audit Mamba-specific comments in Hybrid
+        # model paths and keep only comments that are truly Mamba-layer specific.
         # Mamba with no attention has no need for position embeddings, so none is default
         position_embedding_type: Literal['learned_absolute', 'rope', 'yarn', 'none'] = 'none',
         rotary_percent: float = 1.0,
@@ -123,6 +133,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seq_len_interpolation_factor: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        cp_stage_entry_partition_mode: Optional[str] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -210,7 +221,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
             **logging_pg_kwargs,
         )
-
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
             self.mtp_pattern is not None
@@ -282,6 +292,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
             name="decoder",
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
         )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
@@ -444,6 +455,40 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        if cp_group is not None and cp_group.size() > 1 and packed_seq_params is None:
+            warnings.warn(
+                "HybridModel received no PackedSeqParams while running under context "
+                "parallelism. Megatron-LM will temporarily assume SBHD tensors and "
+                "create layout metadata for this forward pass. In a future release, "
+                "callers must pass PackedSeqParams with qkv_format and cp_partition_mode "
+                "set explicitly.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            packed_seq_params = PackedSeqParams(
+                qkv_format="sbhd", cp_partition_mode=self.decoder.cp_stage_entry_partition_mode
+            )
+        input_partition_mode = get_stage_entry_partition_mode(
+            packed_seq_params,
+            self.decoder.cp_stage_entry_partition_mode,
+            owner_name=type(self).__name__,
+            cp_group=cp_group,
+        )
+
+        thd_cp_full_iter_cuda_graph = (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and self.config.context_parallel_size > 1
+            and self.config.cuda_graph_impl == "full_iteration"
+        )
+        # TODO: Use GIN to make A2A CP layout routing compatible with full-iteration CUDA graph
+        # capture.
+        assert not thd_cp_full_iter_cuda_graph, (
+            "Full-iteration CUDA graph is not supported with THD context parallelism "
+            "for HybridModel."
+        )
+
         in_inference_mode = InferenceMode.is_active()
 
         if in_inference_mode:
@@ -477,6 +522,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             decoder_input = None
 
         rotary_pos_emb = None
+        # Model-level rotary_pos_emb is only for regular attention. Regular
+        # attention uses the default zigzag CP RoPE layout; MLA/CSA/DSv4-style
+        # variants must ignore this external RoPE and build/apply RoPE internally.
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
@@ -484,6 +532,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
             )
         elif self.position_embedding_type == 'yarn':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
@@ -493,6 +542,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb, _ = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
             )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
@@ -538,10 +588,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hidden_states = decoder_output
             mhc_multistream = None
 
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
-
         # Check if speculative decoding is active. When it is, MTP must be
         # computed *after* verification so that it is conditioned on verified
         # tokens rather than stale speculative tokens from the previous step.
@@ -552,7 +598,74 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and inference_context.num_speculative_tokens > 0
         )
 
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        postprocess_to_input_converter = None
         mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        cp_size = cp_group.size() if cp_group is not None else 1
+
+        needs_batch_layout = (
+            cp_size > 1
+            and self.config.cp_partition_mode == "auto"
+            and (self.post_process or mtp_forward_ran)
+        )
+        if needs_batch_layout:
+            block_output_partition_mode = getattr(
+                packed_seq_params, "cp_partition_mode", input_partition_mode
+            )
+            postprocess_partition_mode = (
+                block_output_partition_mode if mtp_forward_ran else input_partition_mode
+            )
+            block_to_postprocess_converter = CpPartitionModeConverter(
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                source_partition_mode=block_output_partition_mode,
+                target_partition_mode=postprocess_partition_mode,
+                tp_group=self.pg_collection.tp,
+            )
+            hidden_states = block_to_postprocess_converter.convert(
+                hidden_states, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
+            if mhc_multistream is not None:
+                mhc_multistream = block_to_postprocess_converter.convert(
+                    mhc_multistream, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+                )
+            if input_partition_mode != postprocess_partition_mode:
+                input_to_postprocess_converter = CpPartitionModeConverter(
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                    source_partition_mode=input_partition_mode,
+                    target_partition_mode=postprocess_partition_mode,
+                    tp_group=self.pg_collection.tp,
+                )
+                input_to_postprocess_converter.assert_no_dense_attention_inputs(
+                    attention_mask=attention_mask,
+                    hidden_states=hidden_states,
+                )
+                input_ids = input_to_postprocess_converter.convert(input_ids, seq_dim=-1)
+                position_ids = input_to_postprocess_converter.convert(position_ids, seq_dim=-1)
+                labels = input_to_postprocess_converter.convert(labels, seq_dim=-1)
+                loss_mask = input_to_postprocess_converter.convert(loss_mask, seq_dim=-1)
+                padding_mask = input_to_postprocess_converter.convert(
+                    padding_mask, seq_dim=-1, sequence_parallel=self.config.sequence_parallel
+                )
+                # Model-level rotary_pos_emb belongs to regular attention, whose
+                # CP layout preference is zigzag. MTP side tensors are aligned
+                # for token/loss semantics, but RoPE is not treated as a batch
+                # side tensor to be converted here.
+                postprocess_to_input_converter = CpPartitionModeConverter(
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                    source_partition_mode=postprocess_partition_mode,
+                    target_partition_mode=input_partition_mode,
+                )
+            packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                packed_seq_params, postprocess_partition_mode
+            )
+
         if mtp_forward_ran:
             hidden_states = self.mtp(
                 input_ids=input_ids,
@@ -577,6 +690,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             else:
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
+                mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
                     labels=labels,
@@ -587,7 +701,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=mtp_cp_group,
                     tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
@@ -633,8 +747,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if labels is None:
             # [s b h] => [b s h]
+            if postprocess_to_input_converter is not None:
+                logits = postprocess_to_input_converter.convert(logits, seq_dim=0)
             return logits.transpose(0, 1).contiguous()
 
         loss = self.compute_language_model_loss(labels, logits)
+
+        if postprocess_to_input_converter is not None:
+            loss = postprocess_to_input_converter.convert(loss, seq_dim=-1)
 
         return loss

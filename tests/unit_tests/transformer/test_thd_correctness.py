@@ -217,6 +217,7 @@ def make_packed_seq_params(
         max_seqlen_q=max(padded),
         max_seqlen_kv=max(padded),
         qkv_format='thd',
+        cp_partition_mode="zigzag" if cp_size > 1 else None,
     )
 
 

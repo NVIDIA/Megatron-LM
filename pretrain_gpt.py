@@ -25,6 +25,10 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
+from megatron.core.context_parallel_layout import (
+    get_stage_entry_partition_mode,
+    prebuild_thd_cp_partition_routes,
+)
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -34,6 +38,7 @@ from megatron.core.packed_seq_params import (
     PackedSeqParams,
     get_thd_padding_kwargs,
     pad_sequence_for_thd,
+    resolve_cp_group,
     resolve_thd_tail_padding_policy,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -76,7 +81,11 @@ except ImportError:
 stimer = StragglerDetector()
 
 
-def get_batch(data_iterator, vp_stage: Optional[int] = None):
+def get_batch(
+    data_iterator,
+    vp_stage: Optional[int] = None,
+    cp_partition_mode="zigzag",
+):
     """Generate a batch.
 
     Packed sequence support (SFT / ``--sft`` flag):
@@ -105,6 +114,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             regardless of pipeline stage.
 
         Difference from ``pretrain_hybrid.py``:
+          - TODO(yuzhongw): this comparison still uses historical
+            Mamba wording. Re-audit and rename to Hybrid where the behavior is
+            no longer Mamba-specific outside this PR.
           - Return format: GPT returns a 6-tuple
             ``(tokens, labels, loss_mask, attention_mask, position_ids,
             packed_seq_params)`` where ``packed_seq_params`` is a
@@ -132,14 +144,31 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     if args.sequence_packing_scheduler is not None:
         # `get_batch_on_this_rank_for_sequence_packing` owns scheduler THD metadata
         # and returns a 7-tuple including `padding_mask`.
-        return get_batch_on_this_rank_for_sequence_packing(
+        batch = get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
             vp_stage=vp_stage,
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
+            cp_partition_mode=cp_partition_mode,
         )
+        packed_seq_params = batch[5]
+        if packed_seq_params is not None:
+            packed_seq_params.cp_group = resolve_cp_group(
+                mpu.get_context_parallel_group(), packed_seq_params
+            )
+            packed_seq_params.cp_partition_mode = get_stage_entry_partition_mode(
+                packed_seq_params,
+                cp_partition_mode,
+                owner_name="pretrain_gpt.get_batch",
+                cp_group=packed_seq_params.cp_group,
+            )
+        # TODO(yuzhongw): prebuild routes only when this model chunk needs internal layout
+        # conversion.
+        if config.cp_partition_mode == "auto":
+            prebuild_thd_cp_partition_routes(packed_seq_params)
+        return batch
 
     # TODO: this is pretty hacky, find a better way
     is_packed_sequence = args.sft or (args.use_varlen_dataset and not args.varlen_sbhd_validation)
@@ -174,30 +203,52 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # For middle pipeline stages with packed sequences, only cu_seqlens and
     # max_seqlen are needed (for attention masking); skip the full batch.
     if not is_first_or_last_pipeline_stage(vp_stage) and is_packed_sequence:
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=int(max_seqlen[0].item()),
+            max_seqlen_kv=int(max_seqlen[0].item()),
+            qkv_format='thd',
+            cp_partition_mode=cp_partition_mode,
+        )
+        if packed_seq_params is not None:
+            packed_seq_params.cp_group = resolve_cp_group(
+                mpu.get_context_parallel_group(), packed_seq_params
+            )
+            packed_seq_params.cp_partition_mode = get_stage_entry_partition_mode(
+                packed_seq_params,
+                cp_partition_mode,
+                owner_name="pretrain_gpt.get_batch",
+                cp_group=packed_seq_params.cp_group,
+            )
+        # TODO(yuzhongw): prebuild routes only when this model chunk needs internal layout
+        # conversion.
+        if config.cp_partition_mode == "auto":
+            prebuild_thd_cp_partition_routes(packed_seq_params)
         return (
             None,
             None,
             None,
             None,
             None,
-            PackedSeqParams(
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=int(max_seqlen[0].item()),
-                max_seqlen_kv=int(max_seqlen[0].item()),
-                qkv_format='thd',
-            ),
+            packed_seq_params,
             None,
         )
 
     thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
+        batch = get_batch_on_this_cp_rank(  # The implementation of this function is in MCore
+            batch, cp_partition_mode=cp_partition_mode
+        )
         packed_seq_params = None
     else:  # Packed THD format
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
-            batch, cu_seqlens, cu_seqlens_padded, max_seqlen
+            batch,
+            cu_seqlens,
+            cu_seqlens_padded,
+            max_seqlen,
+            cp_partition_mode=cp_partition_mode,
         )
 
     # Pad the already-packed THD tensors at the end when requested. A configured
@@ -238,6 +289,20 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch['loss_mask'] = loss_mask
         if 'position_ids' in batch:
             batch['position_ids'] = position_ids
+
+    if packed_seq_params is not None:
+        packed_seq_params.cp_group = resolve_cp_group(
+            mpu.get_context_parallel_group(), packed_seq_params
+        )
+        packed_seq_params.cp_partition_mode = get_stage_entry_partition_mode(
+            packed_seq_params,
+            cp_partition_mode,
+            owner_name="pretrain_gpt.get_batch",
+            cp_group=packed_seq_params.cp_group,
+        )
+    # TODO(yuzhongw): prebuild routes only when this model chunk needs internal layout conversion.
+    if config.cp_partition_mode == "auto":
+        prebuild_thd_cp_partition_routes(packed_seq_params)
 
     # Unpack explicitly to avoid relying on dict insertion order.
     return (
@@ -365,8 +430,10 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        decoder = get_attr_wrapped_model(model, "decoder")
+        cp_partition_mode = decoder.cp_stage_entry_partition_mode
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
-            get_batch(data_iterator, vp_stage)
+            get_batch(data_iterator, vp_stage, cp_partition_mode=cp_partition_mode)
         )
     timers('batch-generator').stop()
 

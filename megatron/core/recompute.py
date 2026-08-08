@@ -5,10 +5,16 @@ from typing import List, Optional, Set, Tuple, Union
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import (
+    CpPartitionModeConverter,
+    get_preferred_cp_partition_mode_for_layer,
+    get_stage_entry_partition_mode,
+    replace_packed_seq_params_cp_partition_mode,
+)
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -50,15 +56,100 @@ def checkpointed_forward(
     if extract_layer_indices is None:
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
+    cp_group = resolve_cp_group(getattr(self.pg_collection, "cp", None), packed_seq_params)
+    cp_layout_needed = (
+        cp_group is not None
+        and cp_group.size() > 1
+        and self.config.cp_partition_mode == "auto"
+    )
+    stage_entry_partition_mode = (
+        get_stage_entry_partition_mode(
+            packed_seq_params,
+            getattr(self, "cp_stage_entry_partition_mode", None),
+            owner_name=type(self).__name__,
+            cp_group=cp_group,
+        )
+        if cp_layout_needed
+        else None
+    )
 
     def custom(start: int, end: int):
         def custom_forward(
             hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask=None
         ):
+            current_partition_mode = stage_entry_partition_mode
+            if current_partition_mode is not None:
+                for index in range(start):
+                    # Use self.layers[index] (not self._get_layer) so this
+                    # function works for both TransformerBlock and HybridStack.
+                    layer = self.layers[index]
+                    preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
+                        layer, getattr(layer, "config", self.config)
+                    )
+                    if preferred_partition_mode is not None:
+                        current_partition_mode = preferred_partition_mode
+            local_packed_seq_params = packed_seq_params
+            local_input_ids = input_ids
+            if current_partition_mode is not None:
+                local_packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                    packed_seq_params, current_partition_mode
+                )
+            if cp_layout_needed and current_partition_mode != stage_entry_partition_mode:
+                chunk_entry_converter = CpPartitionModeConverter(
+                    cp_group=cp_group,
+                    packed_seq_params=local_packed_seq_params,
+                    source_partition_mode=stage_entry_partition_mode,
+                    target_partition_mode=current_partition_mode,
+                    tp_group=self.pg_collection.tp,
+                )
+                chunk_entry_converter.assert_no_dense_attention_inputs(
+                    attention_mask=attention_mask,
+                    attention_bias=attention_bias,
+                    hidden_states=hidden_states,
+                )
+                # Checkpoint chunks may enter after earlier layers changed the
+                # current CP layout. Re-align batch/token side tensors here, but
+                # keep model-level RoPE in the regular-attention zigzag layout.
+                if padding_mask is not None:
+                    padding_mask = chunk_entry_converter.convert(
+                        padding_mask,
+                        seq_dim=1,
+                        sequence_parallel=self.config.sequence_parallel,
+                    )
+                if local_input_ids is not None:
+                    local_input_ids = chunk_entry_converter.convert(
+                        local_input_ids,
+                        seq_dim=1,
+                    )
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
                 layer = self.layers[index]
+                if cp_layout_needed:
+                    preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
+                        layer, getattr(layer, "config", self.config)
+                    )
+                    (hidden_states, padding_mask, local_input_ids) = (
+                        self._convert_cp_partition_mode_for_layer(
+                            local_index=index,
+                            current_partition_mode=current_partition_mode,
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            packed_seq_params=local_packed_seq_params,
+                            padding_mask=padding_mask,
+                            input_ids=local_input_ids,
+                            preferred_partition_mode=preferred_partition_mode,
+                        )
+                    )
+                    if preferred_partition_mode is not None:
+                        local_packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                            local_packed_seq_params, preferred_partition_mode
+                        )
+                    current_partition_mode = getattr(
+                        local_packed_seq_params,
+                        "cp_partition_mode",
+                        preferred_partition_mode or current_partition_mode,
+                    )
 
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
@@ -87,12 +178,16 @@ def checkpointed_forward(
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
                     inference_context=None,
-                    packed_seq_params=packed_seq_params,
+                    packed_seq_params=local_packed_seq_params,
                     padding_mask=padding_mask,
-                    input_ids=input_ids,
+                    input_ids=local_input_ids,
                 )
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
+                        hidden_states, context = layer(**layer_kwargs)
+                    elif layer.__class__.__name__ == "HyperConnectionHybridLayer":
+                        for k in ("context", "context_mask", "attention_bias"):
+                            layer_kwargs.pop(k, None)
                         hidden_states, context = layer(**layer_kwargs)
                     else:  # MambaLayer (HybridStack `M` slot)
                         for k in (

@@ -10,6 +10,13 @@ import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.context_parallel_layout import (
+    CpPartitionMode,
+    CpPartitionModeConverter,
+    get_preferred_cp_partition_mode_for_layer,
+    get_stage_entry_partition_mode,
+    replace_packed_seq_params_cp_partition_mode,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -19,7 +26,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import CheckpointManager
@@ -288,6 +295,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_process: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        cp_stage_entry_partition_mode: Optional[str] = None,
     ):
         super().__init__(config=config)
 
@@ -304,6 +312,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.vp_stage = vp_stage
+        self.cp_stage_entry_partition_mode = cp_stage_entry_partition_mode
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -578,6 +587,64 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
 
+    def _convert_cp_partition_mode_for_layer(
+        self,
+        *,
+        local_index: int,
+        current_partition_mode: CpPartitionMode,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor],
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask: Optional[Tensor],
+        input_ids: Optional[Tensor],
+        preferred_partition_mode: Optional[CpPartitionMode],
+    ):
+        """Convert per-token tensors to the layout preferred by one local layer."""
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        if cp_group is None or cp_group.size() <= 1:
+            return hidden_states, padding_mask, input_ids
+        if preferred_partition_mode is None or preferred_partition_mode == current_partition_mode:
+            return hidden_states, padding_mask, input_ids
+
+        current_to_preferred_converter = CpPartitionModeConverter(
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            source_partition_mode=current_partition_mode,
+            target_partition_mode=preferred_partition_mode,
+            tp_group=self.pg_collection.tp,
+        )
+        if not current_to_preferred_converter.conversion_needed:
+            return hidden_states, padding_mask, input_ids
+
+        current_to_preferred_converter.assert_no_dense_attention_inputs(
+            attention_mask=attention_mask,
+            attention_bias=attention_bias,
+            hidden_states=hidden_states,
+        )
+        hidden_states = current_to_preferred_converter.convert(
+            hidden_states,
+            seq_dim=0,
+            sequence_parallel=self.config.sequence_parallel,
+        )
+        # Model-level rotary_pos_emb is only consumed by regular attention, whose
+        # CP layout preference is zigzag. MLA/CSA/DSv4-style variants must ignore
+        # external RoPE and manage any RoPE positions internally, so this layout
+        # edge intentionally does not convert rotary_pos_emb.
+        if padding_mask is not None:
+            padding_mask = current_to_preferred_converter.convert(
+                padding_mask,
+                seq_dim=1,
+                sequence_parallel=self.config.sequence_parallel,
+            )
+        if input_ids is not None:
+            input_ids = current_to_preferred_converter.convert(
+                input_ids,
+                seq_dim=1,
+            )
+
+        return hidden_states, padding_mask, input_ids
+
     def _checkpointed_forward(
         self,
         hidden_states: Tensor,
@@ -610,6 +677,22 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if extract_layer_indices is None:
             extract_layer_indices = set()
         intermediate_hidden_states: List[Tensor] = []
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        cp_layout_needed = (
+            cp_group is not None
+            and cp_group.size() > 1
+            and self.config.cp_partition_mode == "auto"
+        )
+        stage_entry_partition_mode = (
+            get_stage_entry_partition_mode(
+                packed_seq_params,
+                self.cp_stage_entry_partition_mode,
+                owner_name=type(self).__name__,
+                cp_group=cp_group,
+            )
+            if cp_layout_needed
+            else None
+        )
 
         def custom(start: int, end: int):
             def custom_forward(
@@ -620,8 +703,76 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 rotary_pos_emb,
                 padding_mask=None,
             ):
+                current_partition_mode = stage_entry_partition_mode
+                if cp_layout_needed:
+                    for index in range(start):
+                        layer = self._get_layer(index)
+                        preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
+                            layer, getattr(layer, "config", self.config)
+                        )
+                        if preferred_partition_mode is not None:
+                            current_partition_mode = preferred_partition_mode
+                local_packed_seq_params = packed_seq_params
+                if cp_layout_needed:
+                    local_packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                        packed_seq_params, current_partition_mode
+                    )
+                local_input_ids = input_ids
+                if cp_layout_needed and current_partition_mode != stage_entry_partition_mode:
+                    chunk_entry_converter = CpPartitionModeConverter(
+                        cp_group=cp_group,
+                        packed_seq_params=local_packed_seq_params,
+                        source_partition_mode=stage_entry_partition_mode,
+                        target_partition_mode=current_partition_mode,
+                        tp_group=self.pg_collection.tp,
+                    )
+                    chunk_entry_converter.assert_no_dense_attention_inputs(
+                        attention_mask=attention_mask,
+                        attention_bias=attention_bias,
+                        hidden_states=hidden_states,
+                    )
+                    # Checkpoint chunks may enter after earlier layers changed the
+                    # current CP layout. Re-align batch/token side tensors here, but
+                    # keep model-level RoPE in the regular-attention zigzag layout.
+                    if padding_mask is not None:
+                        padding_mask = chunk_entry_converter.convert(
+                            padding_mask,
+                            seq_dim=1,
+                            sequence_parallel=self.config.sequence_parallel,
+                        )
+                    if local_input_ids is not None:
+                        local_input_ids = chunk_entry_converter.convert(
+                            local_input_ids,
+                            seq_dim=1,
+                        )
                 for index in range(start, end):
                     layer = self._get_layer(index)
+                    if cp_layout_needed:
+                        preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
+                            layer, getattr(layer, "config", self.config)
+                        )
+                        (hidden_states, padding_mask, local_input_ids) = (
+                            self._convert_cp_partition_mode_for_layer(
+                                local_index=index,
+                                current_partition_mode=current_partition_mode,
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                attention_bias=attention_bias,
+                                packed_seq_params=local_packed_seq_params,
+                                padding_mask=padding_mask,
+                                input_ids=local_input_ids,
+                                preferred_partition_mode=preferred_partition_mode,
+                            )
+                        )
+                        if preferred_partition_mode is not None:
+                            local_packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                                local_packed_seq_params, preferred_partition_mode
+                            )
+                        current_partition_mode = getattr(
+                            local_packed_seq_params,
+                            "cp_partition_mode",
+                            preferred_partition_mode or current_partition_mode,
+                        )
 
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
@@ -648,9 +799,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             rotary_pos_emb=rotary_pos_emb,
                             attention_bias=attention_bias,
                             inference_context=None,
-                            packed_seq_params=packed_seq_params,
+                            packed_seq_params=local_packed_seq_params,
                             padding_mask=padding_mask,
-                            input_ids=input_ids,
+                            input_ids=local_input_ids,
                         )
                 return hidden_states, context
 
@@ -950,6 +1101,23 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
 
         with rng_context, outer_quantization_context:
+            cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            cp_layout_needed = (
+                cp_group is not None
+                and cp_group.size() > 1
+                and self.config.cp_partition_mode == "auto"
+            )
+            current_partition_mode = None
+            if cp_layout_needed:
+                current_partition_mode = get_stage_entry_partition_mode(
+                    packed_seq_params,
+                    self.cp_stage_entry_partition_mode,
+                    owner_name=type(self).__name__,
+                    cp_group=cp_group,
+                )
+                packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                    packed_seq_params, current_partition_mode
+                )
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
                 checkpointed_result = self._checkpointed_forward(
@@ -975,6 +1143,33 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states = checkpointed_result
             else:
                 for l_no, layer in enumerate(self.layers):
+                    if cp_layout_needed:
+                        preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
+                            layer, getattr(layer, "config", self.config)
+                        )
+                        (hidden_states, padding_mask, input_ids) = (
+                            self._convert_cp_partition_mode_for_layer(
+                                local_index=l_no,
+                                current_partition_mode=current_partition_mode,
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                attention_bias=attention_bias,
+                                packed_seq_params=packed_seq_params,
+                                padding_mask=padding_mask,
+                                input_ids=input_ids,
+                                preferred_partition_mode=preferred_partition_mode,
+                            )
+                        )
+                        if preferred_partition_mode is not None:
+                            packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                                packed_seq_params, preferred_partition_mode
+                            )
+                        current_partition_mode = getattr(
+                            packed_seq_params,
+                            "cp_partition_mode",
+                            preferred_partition_mode or current_partition_mode,
+                        )
+
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
                         if self.config.fp8:

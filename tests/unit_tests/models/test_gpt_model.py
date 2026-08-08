@@ -3,6 +3,7 @@
 import inspect
 import os
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,6 +13,7 @@ from packaging import version
 from pytest import approx
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
+import megatron.core.models.gpt.gpt_model as gpt_model_module
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference.config import InferenceConfig
@@ -24,12 +26,29 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+class _FakeCpGroup:
+    def size(self):
+        return 2
+
+
+class _RecordingOutputLayer:
+    sequence_parallel = False
+
+    def __init__(self):
+        self.hidden_states = None
+
+    def __call__(self, hidden_states, **_kwargs):
+        self.hidden_states = hidden_states
+        return hidden_states, None
 
 
 class TestGPTModel:
@@ -228,6 +247,69 @@ class TestGPTModel:
         assert seen["context"] is context
         assert seen["labels"] is labels
         assert seen["output_layer"] is self.gpt_model.output_layer
+
+
+def test_gpt_postprocess_restores_output_layout_to_input_layout(monkeypatch):
+    cp_group = _FakeCpGroup()
+    block_output_hidden = torch.arange(24, dtype=torch.float32).view(4, 2, 3)
+    input_layout_hidden = block_output_hidden + 1000.0
+    output_layer = _RecordingOutputLayer()
+    calls = []
+
+    class FakeCpPartitionModeConverter:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def convert(self, value, *, seq_dim=0, sequence_parallel=False):
+            calls.append((value, self.kwargs, seq_dim, sequence_parallel))
+            assert value is block_output_hidden
+            assert self.kwargs["cp_group"] is cp_group
+            return input_layout_hidden
+
+    monkeypatch.setattr(
+        gpt_model_module, "CpPartitionModeConverter", FakeCpPartitionModeConverter
+    )
+
+    model = object.__new__(GPTModel)
+    model.config = SimpleNamespace(
+        config_logger_dir="",
+        mtp_num_layers=0,
+        sequence_parallel=False,
+        use_mup=False,
+    )
+    model.decoder = SimpleNamespace(
+        cp_stage_entry_partition_mode="zigzag",
+    )
+    model.pg_collection = SimpleNamespace(cp=cp_group, tp=None)
+    model.share_embeddings_and_output_weights = False
+    model.post_process = True
+    model.output_layer = output_layer
+    model._scale_logits = lambda logits: logits
+
+    output = GPTModel._postprocess(
+        model,
+        hidden_states=block_output_hidden,
+        input_ids=None,
+        position_ids=None,
+        labels=None,
+        rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        mtp_in_postprocess=False,
+        packed_seq_params=PackedSeqParams(
+            qkv_format="sbhd",
+            cp_group=cp_group,
+            cp_partition_mode="contiguous",
+        ),
+    )
+
+    assert output_layer.hidden_states is input_layout_hidden
+    assert torch.equal(output, input_layout_hidden.transpose(0, 1).contiguous())
+    assert len(calls) == 1
+    _, kwargs, seq_dim, _ = calls[0]
+    assert kwargs["source_partition_mode"] == "contiguous"
+    assert kwargs["target_partition_mode"] == "zigzag"
+    assert seq_dim == 0
 
 
 def test_get_mlp_module_spec_interface():

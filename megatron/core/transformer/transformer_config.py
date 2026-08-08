@@ -309,8 +309,13 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
-    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
-    """How THD sequence rows are partitioned across context-parallel ranks."""
+    cp_partition_mode: Literal["zigzag", "contiguous", "auto"] = "zigzag"
+    """Context-parallel sequence partition mode.
+
+    ``"zigzag"`` and ``"contiguous"`` preserve the configured fixed layout.
+    ``"auto"`` enables model-level per-layer layout transitions in supported
+    training entry points.
+    """
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
@@ -1553,22 +1558,20 @@ class TransformerConfig(ModelParallelConfig):
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
 
-        if self.cp_partition_mode not in ("zigzag", "contiguous"):
+        if self.cp_partition_mode not in ("zigzag", "contiguous", "auto"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+        if self.cp_partition_mode == "auto" and self.overlap_moe_expert_parallel_comm:
+            raise ValueError(
+                'cp_partition_mode="auto" is not supported with '
+                "overlap_moe_expert_parallel_comm in this rollout."
+            )
 
-        if self.context_parallel_size > 1:
-            if (
-                self.experimental_attention_variant == "dsv4_hybrid"
-                and self.cp_partition_mode != "contiguous"
-            ):
-                raise ValueError("DSv4 Hybrid with CP requires cp_partition_mode='contiguous'.")
-            if (
-                self.experimental_attention_variant != "dsv4_hybrid"
-                and self.cp_partition_mode != "zigzag"
-            ):
-                raise ValueError(
-                    "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
-                )
+        if self.experimental_attention_variant == "dsv4_hybrid" and (
+            self.context_parallel_size > 1 or self.dynamic_context_parallel
+        ):
+            assert (
+                self.sequence_packing_scheduler is not None
+            ), "DSv4 Hybrid with CP requires a sequence_packing_scheduler for THD inputs."
 
         # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
         # selectors have been folded into experimental_attention_variant, and immediately

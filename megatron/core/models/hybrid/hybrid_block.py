@@ -12,6 +12,13 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
+from megatron.core.context_parallel_layout import (
+    CpPartitionMode,
+    CpPartitionModeConverter,
+    get_preferred_cp_partition_mode_for_layer,
+    get_stage_entry_partition_mode,
+    replace_packed_seq_params_cp_partition_mode,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -21,7 +28,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_parallel.random import CheckpointManager
@@ -160,9 +167,17 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         if 'cu_seqlens_q' not in kwargs:
             return
         max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        cp_partition_mode = get_preferred_cp_partition_mode_for_layer(self, self.config)
+        if cp_partition_mode is None:
+            if self.config.context_parallel_size > 1 or self.config.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot reconstruct THD PackedSeqParams for a layout-agnostic Hybrid layer "
+                    "under context parallelism. The CP partition mode must be provided by the "
+                    "model-level layout plan."
+                )
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
-            cp_partition_mode=self.config.cp_partition_mode,
+            cp_partition_mode=cp_partition_mode,
             cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
             cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
             cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
@@ -412,6 +427,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             inference_context=inference_context,
             padding_mask=padding_mask,
             input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
         )
         if layer.mlp_norm_manager is not None:
             output_with_bias = layer._group_offload_output_with_bias(
@@ -546,6 +562,8 @@ class HybridStack(MegatronModule):
             process groups to use.
         is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
         mtp_layer_number (int, optional): enclosing MTP depth for logging nested MTP metrics.
+        cp_stage_entry_partition_mode (str, optional): CP partition mode expected at this
+            stage input. Required when context parallelism is enabled.
     """
 
     def __init__(
@@ -562,6 +580,7 @@ class HybridStack(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
         mtp_layer_number: Optional[int] = None,
+        cp_stage_entry_partition_mode: Optional[str] = None,
         name: str | None = None,
     ) -> None:
         """
@@ -574,6 +593,7 @@ class HybridStack(MegatronModule):
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
         self.mtp_layer_number = mtp_layer_number
+        self.cp_stage_entry_partition_mode = cp_stage_entry_partition_mode
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -746,6 +766,62 @@ class HybridStack(MegatronModule):
             router = getattr(module, "router", None)
             if router is not None and getattr(router, "is_mtp_layer", False):
                 router.mtp_layer_number = mtp_layer_number
+
+    def _convert_cp_partition_mode_for_layer(
+        self,
+        *,
+        local_index: int,
+        current_partition_mode: CpPartitionMode,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask: Optional[Tensor],
+        input_ids: Optional[Tensor],
+        preferred_partition_mode: Optional[CpPartitionMode],
+    ):
+        """Convert per-token tensors to the layout preferred by one local hybrid layer."""
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        if cp_group is None or cp_group.size() <= 1:
+            return hidden_states, padding_mask, input_ids
+        if preferred_partition_mode is None or preferred_partition_mode == current_partition_mode:
+            return hidden_states, padding_mask, input_ids
+
+        current_to_preferred_converter = CpPartitionModeConverter(
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            source_partition_mode=current_partition_mode,
+            target_partition_mode=preferred_partition_mode,
+            tp_group=self.pg_collection.tp,
+        )
+        if not current_to_preferred_converter.conversion_needed:
+            return hidden_states, padding_mask, input_ids
+
+        current_to_preferred_converter.assert_no_dense_attention_inputs(
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+        )
+        hidden_states = current_to_preferred_converter.convert(
+            hidden_states,
+            seq_dim=0,
+            sequence_parallel=self.config.sequence_parallel,
+        )
+        # Model-level rotary_pos_emb is only consumed by regular attention, whose
+        # CP layout preference is zigzag. MLA/CSA/DSv4-style variants must ignore
+        # external RoPE and manage any RoPE positions internally, so this layout
+        # edge intentionally does not convert rotary_pos_emb.
+        if padding_mask is not None:
+            padding_mask = current_to_preferred_converter.convert(
+                padding_mask,
+                seq_dim=1,
+                sequence_parallel=self.config.sequence_parallel,
+            )
+        if input_ids is not None:
+            input_ids = current_to_preferred_converter.convert(
+                input_ids,
+                seq_dim=1,
+            )
+
+        return hidden_states, padding_mask, input_ids
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -931,6 +1007,23 @@ class HybridStack(MegatronModule):
         )
 
         with outer_fp8_context:
+            cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            cp_layout_needed = (
+                cp_group is not None
+                and cp_group.size() > 1
+                and self.config.cp_partition_mode == "auto"
+            )
+            current_partition_mode = None
+            if cp_layout_needed:
+                current_partition_mode = get_stage_entry_partition_mode(
+                    packed_seq_params,
+                    self.cp_stage_entry_partition_mode,
+                    owner_name=type(self).__name__,
+                    cp_group=cp_group,
+                )
+                packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                    packed_seq_params, current_partition_mode
+                )
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
                     self,
@@ -947,6 +1040,32 @@ class HybridStack(MegatronModule):
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
+                    if cp_layout_needed:
+                        preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
+                            layer, getattr(layer, "config", self.config)
+                        )
+                        (hidden_states, padding_mask, input_ids) = (
+                            self._convert_cp_partition_mode_for_layer(
+                                local_index=l_no,
+                                current_partition_mode=current_partition_mode,
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                packed_seq_params=packed_seq_params,
+                                padding_mask=padding_mask,
+                                input_ids=input_ids,
+                                preferred_partition_mode=preferred_partition_mode,
+                            )
+                        )
+                        if preferred_partition_mode is not None:
+                            packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                                packed_seq_params, preferred_partition_mode
+                            )
+                        current_partition_mode = getattr(
+                            packed_seq_params,
+                            "cp_partition_mode",
+                            preferred_partition_mode or current_partition_mode,
+                        )
+
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
                         self.config, layer.layer_number - 1

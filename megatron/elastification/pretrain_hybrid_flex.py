@@ -26,7 +26,6 @@ from megatron.core.parallel_state import (
     get_dynamic_data_context_parallel_groups,
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
-    get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -115,6 +114,12 @@ def model_provider(
         HybridModel: The returned model
     """
     args = get_args()
+    if getattr(args, "cp_partition_mode", "zigzag") == "auto":
+        raise ValueError(
+            'megatron/elastification/pretrain_hybrid_flex.py does not support '
+            'cp_partition_mode="auto"; use pretrain_hybrid.py for the CP layout '
+            'refactor path.'
+        )
     if has_nvidia_modelopt:
 
         model = model_provider_modelopt(

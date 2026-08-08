@@ -24,12 +24,16 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
+from megatron.core.context_parallel_layout import (
+    get_stage_entry_partition_mode,
+    prebuild_thd_cp_partition_routes,
+)
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_dynamic_data_context_parallel_groups,
@@ -76,7 +80,55 @@ except ImportError:
 stimer = StragglerDetector()
 
 
-def get_batch(data_iterator, vp_stage=None):
+def _build_packed_seq_params_for_batch(batch, args, cp_partition_mode):
+    cu_seqlens = batch.get('cu_seqlens', None)
+    if cu_seqlens is None:
+        return None
+
+    if cu_seqlens.dim() == 2:
+        cu_seqlens = cu_seqlens.squeeze(0)
+    cu_seqlens_padded = batch.get('cu_seqlens_padded', None)
+    if cu_seqlens_padded is not None and cu_seqlens_padded.dim() == 2:
+        cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
+    max_seqlen = batch.get('max_seqlen')
+    if max_seqlen is not None and max_seqlen.dim() > 0:
+        max_seqlen = max_seqlen.squeeze(0)
+
+    cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens_for_params,
+        cu_seqlens_kv=cu_seqlens_for_params,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=int(max_seqlen.item()),
+        max_seqlen_kv=int(max_seqlen.item()),
+        local_cp_size=(
+            int(batch['local_cp_size'].item())
+            if batch.get('local_cp_size', None) is not None
+            else None
+        ),
+        cp_group=batch.get('hybrid_cp_group', None),
+        total_tokens=int(cu_seqlens_for_params[-1].item()),
+        tokens_per_sample=args.seq_length,
+        cp_partition_mode=cp_partition_mode,
+    )
+    packed_seq_params.cp_group = resolve_cp_group(
+        get_context_parallel_group(), packed_seq_params
+    )
+    packed_seq_params.cp_partition_mode = get_stage_entry_partition_mode(
+        packed_seq_params,
+        cp_partition_mode,
+        owner_name="pretrain_hybrid.get_batch",
+        cp_group=packed_seq_params.cp_group,
+    )
+    # TODO(yuzhongw): prebuild routes only when this model chunk needs internal layout conversion.
+    if getattr(args, "cp_partition_mode", "zigzag") == "auto":
+        prebuild_thd_cp_partition_routes(packed_seq_params)
+    return packed_seq_params
+
+
+def get_batch(data_iterator, vp_stage=None, cp_partition_mode="zigzag"):
     """Generate a batch."""
 
     batch_keys = [
@@ -124,7 +176,22 @@ def get_batch(data_iterator, vp_stage=None):
             vp_stage=vp_stage,
             dynamic_cp=is_dynamic_cp,
             config=config,
+            cp_partition_mode=cp_partition_mode,
         )
+        if packed_seq_params is not None:
+            packed_seq_params.cp_group = resolve_cp_group(
+                get_context_parallel_group(), packed_seq_params
+            )
+            packed_seq_params.cp_partition_mode = get_stage_entry_partition_mode(
+                packed_seq_params,
+                cp_partition_mode,
+                owner_name="pretrain_hybrid.get_batch",
+                cp_group=packed_seq_params.cp_group,
+            )
+        # TODO(yuzhongw): prebuild routes only when this model chunk needs internal layout
+        # conversion.
+        if config.cp_partition_mode == "auto":
+            prebuild_thd_cp_partition_routes(packed_seq_params)
         return (
             attention_mask,
             None,
@@ -178,6 +245,7 @@ def get_batch(data_iterator, vp_stage=None):
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         assert has_cu_seqlens
+        packed_seq_params = _build_packed_seq_params_for_batch(batch, args, cp_partition_mode)
         return (
             None,
             batch['cu_seqlens'],
@@ -190,7 +258,7 @@ def get_batch(data_iterator, vp_stage=None):
             None,
             None,
             None,
-            None,
+            packed_seq_params,
         )
 
     batch = get_batch_on_this_cp_rank(
@@ -199,11 +267,13 @@ def get_batch(data_iterator, vp_stage=None):
         cp_group=get_context_parallel_group(),
         hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        cp_partition_mode=cp_partition_mode,
     )
+    packed_seq_params = _build_packed_seq_params_for_batch(batch, args, cp_partition_mode)
 
     # Return values in a fixed order so callers can unpack them even when
     # dataset wrappers add provenance fields like "dataset_id".
-    return [batch[key] for key in batch_keys] + [None, None]
+    return [batch[key] for key in batch_keys] + [None, packed_seq_params]
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -287,6 +357,8 @@ def forward_step(data_iterator, model: HybridModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        decoder = get_attr_wrapped_model(model, "decoder")
+        cp_partition_mode = decoder.cp_stage_entry_partition_mode
         (
             attention_mask,
             cu_seqlens,
@@ -300,34 +372,14 @@ def forward_step(data_iterator, model: HybridModel):
             tokens,
             padding_mask,
             packed_seq_params,
-        ) = get_batch(data_iterator, vp_stage)
+        ) = get_batch(data_iterator, vp_stage, cp_partition_mode=cp_partition_mode)
 
-    if packed_seq_params is not None:
-        if packed_seq_params.cu_seqlens_q is not None:
-            update_seqlen_stats_from_cu_seqlens(packed_seq_params.cu_seqlens_q)
-    elif cu_seqlens is not None:
-        # Squeeze the batch dim: the batch dict keeps cu_seqlens as (1, N)
-        # for consistency, but PackedSeqParams and TE expect 1-D.
-        cu_seqlens = cu_seqlens.squeeze(0)
-        if cu_seqlens_padded is not None:
-            cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
-        # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
-        # attention only computes work for real tokens within each chunk.
+    if cu_seqlens is not None:
+        if cu_seqlens.dim() == 2:
+            cu_seqlens = cu_seqlens.squeeze(0)
         update_seqlen_stats_from_cu_seqlens(cu_seqlens)
-        cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_for_params,
-            cu_seqlens_kv=cu_seqlens_for_params,
-            cu_seqlens_q_padded=cu_seqlens_padded,
-            cu_seqlens_kv_padded=cu_seqlens_padded,
-            max_seqlen_q=int(max_seqlen.item()),
-            max_seqlen_kv=int(max_seqlen.item()),
-            local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
-            cp_group=hybrid_cp_group,
-            total_tokens=int(cu_seqlens_for_params[-1].item()),
-            tokens_per_sample=args.seq_length,
-        )
+    elif packed_seq_params is not None and packed_seq_params.cu_seqlens_q is not None:
+        update_seqlen_stats_from_cu_seqlens(packed_seq_params.cu_seqlens_q)
 
     timers('batch-generator').stop()
 

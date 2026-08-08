@@ -59,6 +59,10 @@ class DSv4HybridSelfAttentionSubmodules:
 class DSv4HybridAttention(Attention):
     """DeepSeek-v4 Hybrid Attention layer."""
 
+    def get_preferred_cp_partition_mode(self):
+        """Return this variant's CP layout preference for ``cp_partition_mode="auto"`` rollout."""
+        return "contiguous"
+
     def __init__(
         self,
         config: MLATransformerConfig,
@@ -267,8 +271,21 @@ class DSv4HybridAttention(Attention):
         if cp_size > 1 and qkv_format != 'thd':
             raise ValueError("DSv4 Hybrid with CP requires qkv_format='thd'.")
         use_thd_cp = cp_size > 1 and qkv_format == 'thd'
-        if use_thd_cp and packed_seq_params.cp_partition_mode != "contiguous":
-            raise ValueError("DSv4 THD CP requires a contiguous CP partition.")
+        if use_thd_cp:
+            preferred_cp_partition_mode = self.get_preferred_cp_partition_mode()
+            actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+            if actual_cp_partition_mode is None:
+                raise ValueError(
+                    "DSv4HybridAttention requires PackedSeqParams.cp_partition_mode "
+                    "when context parallelism is active."
+                )
+            if actual_cp_partition_mode != preferred_cp_partition_mode:
+                raise ValueError(
+                    "DSv4HybridAttention prefers "
+                    f"cp_partition_mode={preferred_cp_partition_mode!r}, but "
+                    f"packed_seq_params has {actual_cp_partition_mode!r}. CP partition "
+                    "conversion must be handled before entering DSv4HybridAttention."
+                )
         self.pg_collection.cp = cp_group
 
         boundary_hidden = None

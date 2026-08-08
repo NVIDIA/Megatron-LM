@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -313,6 +314,7 @@ class Attention(MegatronModule, ABC):
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+        self.cp_comm_type = cp_comm_type
         self.batch_invariant_mode = config.batch_invariant_mode
 
         # Cache the YaRN concentration factor (a.k.a. attention factor / mscale),
@@ -443,6 +445,10 @@ class Attention(MegatronModule, ABC):
         if getattr(self.config, 'rotary_base_per_layer', None):
             rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
             self._build_per_layer_rotary_pos_emb(rotary_base)
+
+    def get_preferred_cp_partition_mode(self):
+        """Return Attention's CP layout preference for ``cp_partition_mode="auto"`` rollout."""
+        return "zigzag"
 
     def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
         """Build self.rotary_pos_emb using a layer-specific rotary base."""
@@ -1361,6 +1367,41 @@ class Attention(MegatronModule, ABC):
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             self.pg_collection.cp = packed_seq_params.cp_group
+        (
+            hidden_states,
+            packed_seq_params,
+            back_to_input_converter,
+        ) = convert_module_input_tensors_cp_partition_mode(
+            hidden_states=hidden_states,
+            key_value_states=key_value_states,
+            packed_seq_params=packed_seq_params,
+            cp_group=self.pg_collection.cp,
+            tp_group=self.pg_collection.tp,
+            target_partition_mode=self.get_preferred_cp_partition_mode(),
+            sequence_parallel=self.config.sequence_parallel,
+            attention_mask=attention_mask,
+            attention_bias=attention_bias,
+        )
+        preferred_cp_partition_mode = self.get_preferred_cp_partition_mode()
+        if packed_seq_params is not None and preferred_cp_partition_mode is not None:
+            cp_group = packed_seq_params.cp_group
+            if cp_group is None and hasattr(self.pg_collection, 'cp'):
+                cp_group = self.pg_collection.cp
+            if cp_group is not None and get_pg_size(cp_group) > 1:
+                actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+                if actual_cp_partition_mode is None:
+                    raise ValueError(
+                        f"{self.__class__.__name__} requires "
+                        "PackedSeqParams.cp_partition_mode when context parallelism is active."
+                    )
+                if actual_cp_partition_mode != preferred_cp_partition_mode:
+                    raise ValueError(
+                        f"{self.__class__.__name__} prefers "
+                        f"cp_partition_mode={preferred_cp_partition_mode!r}, but "
+                        f"packed_seq_params has {actual_cp_partition_mode!r}. CP partition "
+                        "conversion must be handled by TransformerBlock before entering "
+                        "attention."
+                    )
 
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
@@ -1699,6 +1740,13 @@ class Attention(MegatronModule, ABC):
             output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
+
+        if back_to_input_converter is not None:
+            output = back_to_input_converter.convert(
+                output,
+                seq_dim=0,
+                sequence_parallel=self.config.sequence_parallel,
+            )
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias

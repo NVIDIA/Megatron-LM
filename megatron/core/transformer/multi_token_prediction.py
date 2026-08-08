@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.context_parallel_layout import get_preferred_cp_partition_mode_for_layer
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -156,8 +157,9 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
         dims (int): The dimension to roll (typically -1 for sequence dimension).
         cp_group (ProcessGroup): The context parallelism process group. If None or size=1,
                                falls back to standard rolling behavior.
-        packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
-                                            If provided, respects sequence boundaries.
+        packed_seq_params (PackedSeqParams): Parameters for sequence metadata. With
+                    ``qkv_format='thd'``, rolling respects packed sequence boundaries.
+                    Under CP>1, it must provide the current ``cp_partition_mode``.
         fill_value: Value to fill at boundary positions where the original sequence has
                     no data (default 0). For most tensors (input_ids, loss_mask, labels)
                     zero is correct.  For a padding_mask with True=padded convention,
@@ -168,8 +170,8 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     if tensor is None:
         return None, None
 
-    # Handle packed sequences cases
-    if packed_seq_params is not None:
+    # Packed THD needs sequence-boundary-aware rolling even without CP.
+    if getattr(packed_seq_params, 'qkv_format', None) == 'thd':
         return _roll_tensor_packed_seq(
             tensor, shifts, dims, packed_seq_params, cp_group, fill_value=fill_value
         )
@@ -179,6 +181,14 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
         rolled_tensor.select(dims, shifts).fill_(fill_value)
         return rolled_tensor, rolled_tensor.sum()
+
+    cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', None)
+    if cp_partition_mode != "zigzag":
+        raise NotImplementedError(
+            "MTP rolling with non-packed CP currently supports only zigzag layout; "
+            f"got {cp_partition_mode!r}. Contiguous layout for non-packed/SBHD MTP is "
+            "not supported yet."
+        )
 
     # CP-enabled rolling: Split tensor into chunks and handle boundary communication
     # This matches the batch splitting logic in get_batch_on_this_cp_rank() function
@@ -277,7 +287,12 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
             rolled_tensor[..., start_idx:end_idx] = rolled_seq
         return rolled_tensor, rolled_tensor.sum()
 
-    cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', 'zigzag')
+    cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', None)
+    if cp_partition_mode is None:
+        raise ValueError(
+            "PackedSeqParams.cp_partition_mode must be set when rolling packed sequences "
+            "under context parallelism."
+        )
     if cp_partition_mode == 'zigzag':
         rolled_tensor = _roll_tensor_packed_seq_zigzag_cp(
             tensor, shifts, dims, cu_seqlens, cp_group, fill_value=fill_value
@@ -293,6 +308,10 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
 
 def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group, fill_value=0):
     """Roll a zigzag-CP THD shard without crossing packed sequence boundaries."""
+    # TODO(yuzhongw): replace the per-sequence boundary exchange
+    # with a route/boundary helper that batches communication across packed
+    # sequences. Keep this path as the reference until the optimized path has
+    # randomized packed-sequence parity coverage.
     cp_size = cp_group.size()
     rolled_tensor = tensor.clone()
 
@@ -1302,6 +1321,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
                 mtp_layer_number=self.layer_number,
+                cp_stage_entry_partition_mode="zigzag",
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
@@ -1818,8 +1838,18 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
-        _orig_cp_group = self.cp_group
-        self.cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+        cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', None)
+        if cp_partition_mode is not None:
+            preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
+                self.mtp_model_layer, self.config
+            )
+            if preferred_partition_mode is not None and preferred_partition_mode != cp_partition_mode:
+                raise NotImplementedError(
+                    "MTP inner layer CP partition mode preference does not match the current "
+                    "MTP input layout: "
+                    f"preferred {preferred_partition_mode!r}, got {cp_partition_mode!r}."
+                )
+
         input_ids, position_ids, padding_mask, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -1863,8 +1893,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
             )
-
-        self.cp_group = _orig_cp_group
         return hidden_states, input_ids, position_ids, padding_mask
 
     def sharded_state_dict(
@@ -1884,6 +1912,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
+        # TODO(yuzhongw): audit remaining Mamba-only wording in
+        # MTP comments once legacy ``mamba_submodules`` compatibility is removed.
         # Backward compatibility: GPT MTP checkpoints were saved with the submodule
         # named 'transformer_layer'. Remap checkpoint keys so old checkpoints load
         # correctly. Mamba MTP models keep 'mtp_model_layer' as their native format

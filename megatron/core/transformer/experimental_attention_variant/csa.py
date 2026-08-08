@@ -1706,6 +1706,10 @@ class CompressedSparseAttention(MegatronModule):
     * ``ratio == 128``: window + 128x compressed, attend to all (compressor built only)
     """
 
+    def get_preferred_cp_partition_mode(self):
+        """Return CSA's CP layout preference for ``cp_partition_mode="auto"`` rollout."""
+        return "contiguous"
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -2087,8 +2091,29 @@ class CompressedSparseAttention(MegatronModule):
         """
         nvtx_range_push("compressed_sparse_attn")
 
+        cp_group = None
+        if packed_seq_params is not None:
+            cp_group = packed_seq_params.cp_group
+            if cp_group is None:
+                cp_group = self.pg_collection.cp
+            if cp_group is not None and cp_group.size() > 1:
+                preferred_cp_partition_mode = self.get_preferred_cp_partition_mode()
+                actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+                if actual_cp_partition_mode is None:
+                    raise ValueError(
+                        "CompressedSparseAttention requires PackedSeqParams.cp_partition_mode "
+                        "when context parallelism is active."
+                    )
+                if actual_cp_partition_mode != preferred_cp_partition_mode:
+                    raise ValueError(
+                        "CompressedSparseAttention prefers "
+                        f"cp_partition_mode={preferred_cp_partition_mode!r}, but "
+                        f"packed_seq_params has {actual_cp_partition_mode!r}. CP partition "
+                        "conversion must be handled before entering CSA."
+                    )
+
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
+            if cp_group is not None and cp_group.size() > 1:
                 output = self._forward_thd_cp(
                     query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params
                 )

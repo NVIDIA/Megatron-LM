@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -8,6 +9,11 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.context_parallel_layout import (
+    CpPartitionModeConverter,
+    get_stage_entry_partition_mode,
+    replace_packed_seq_params_cp_partition_mode,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
 from megatron.core.fp8_utils import is_mxfp8_output_proj_active
@@ -111,6 +117,7 @@ class GPTModel(LanguageModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        cp_stage_entry_partition_mode: Optional[str] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -235,6 +242,7 @@ class GPTModel(LanguageModule):
             post_process=self.post_process,
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
         )
 
         if self.mtp_process:
@@ -325,6 +333,7 @@ class GPTModel(LanguageModule):
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
         padding_mask: Optional[Tensor] = None,
+        input_partition_mode=None,
     ):
         """Preprocesses inputs for the transformer decoder.
 
@@ -372,6 +381,9 @@ class GPTModel(LanguageModule):
         rotary_pos_sin = None
         # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
         rotary_pos_cos_sin = None
+        # Model-level rotary_pos_emb is only for regular attention. Regular
+        # attention uses the default zigzag CP RoPE layout; MLA/CSA/DSv4-style
+        # variants must ignore this external RoPE and build/apply RoPE internally.
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             use_flash_infer_fused_rope = (
@@ -579,6 +591,41 @@ class GPTModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        if cp_group is not None and cp_group.size() > 1 and packed_seq_params is None:
+            warnings.warn(
+                "GPTModel received no PackedSeqParams while running under context "
+                "parallelism. Megatron-LM will temporarily assume SBHD tensors and "
+                "create layout metadata for this forward pass. In a future release, "
+                "callers must pass PackedSeqParams with qkv_format and cp_partition_mode "
+                "set explicitly.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            packed_seq_params = PackedSeqParams(
+                qkv_format="sbhd", cp_partition_mode=self.decoder.cp_stage_entry_partition_mode
+            )
+        input_partition_mode = get_stage_entry_partition_mode(
+            packed_seq_params,
+            self.decoder.cp_stage_entry_partition_mode,
+            owner_name=type(self).__name__,
+            cp_group=cp_group,
+        )
+
+        experimental_thd_cp_full_iter_cuda_graph = (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and self.config.context_parallel_size > 1
+            and self.config.cuda_graph_impl == "full_iteration"
+            and self.config.experimental_attention_variant is not None
+        )
+        # TODO: Use GIN to make experimental-attention A2A CP layout routing compatible
+        # with full-iteration CUDA graph capture.
+        assert not experimental_thd_cp_full_iter_cuda_graph, (
+            "Full-iteration CUDA graph is not supported with THD context parallelism "
+            "for experimental attention variants."
+        )
+
         preproc_output = self._preprocess(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -586,6 +633,7 @@ class GPTModel(LanguageModule):
             inference_context=inference_context,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            input_partition_mode=input_partition_mode,
         )
 
         (
@@ -642,6 +690,7 @@ class GPTModel(LanguageModule):
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            input_partition_mode=input_partition_mode,
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
@@ -667,6 +716,7 @@ class GPTModel(LanguageModule):
         inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
+        input_partition_mode=None,
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
@@ -697,7 +747,74 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
+
+        postprocess_to_input_converter = None
+        mtp_forward_ran = mtp_in_postprocess and not (in_inference_mode or is_spec_decode)
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        cp_size = cp_group.size() if cp_group is not None else 1
+
+        needs_batch_layout = (
+            cp_size > 1
+            and self.config.cp_partition_mode == "auto"
+            and (self.post_process or mtp_forward_ran)
+        )
+        if needs_batch_layout:
+            if input_partition_mode is None:
+                input_partition_mode = self.decoder.cp_stage_entry_partition_mode
+            block_output_partition_mode = getattr(
+                packed_seq_params, "cp_partition_mode", input_partition_mode
+            )
+            postprocess_partition_mode = (
+                block_output_partition_mode if mtp_forward_ran else input_partition_mode
+            )
+            block_to_postprocess_converter = CpPartitionModeConverter(
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                source_partition_mode=block_output_partition_mode,
+                target_partition_mode=postprocess_partition_mode,
+                tp_group=self.pg_collection.tp,
+            )
+            hidden_states = block_to_postprocess_converter.convert(
+                hidden_states, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
+            if mhc_multistream is not None:
+                mhc_multistream = block_to_postprocess_converter.convert(
+                    mhc_multistream, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+                )
+            if input_partition_mode != postprocess_partition_mode:
+                input_to_postprocess_converter = CpPartitionModeConverter(
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                    source_partition_mode=input_partition_mode,
+                    target_partition_mode=postprocess_partition_mode,
+                    tp_group=self.pg_collection.tp,
+                )
+                input_to_postprocess_converter.assert_no_dense_attention_inputs(
+                    attention_mask=attention_mask,
+                    hidden_states=hidden_states,
+                )
+                input_ids = input_to_postprocess_converter.convert(input_ids, seq_dim=-1)
+                position_ids = input_to_postprocess_converter.convert(position_ids, seq_dim=-1)
+                labels = input_to_postprocess_converter.convert(labels, seq_dim=-1)
+                loss_mask = input_to_postprocess_converter.convert(loss_mask, seq_dim=-1)
+                padding_mask = input_to_postprocess_converter.convert(
+                    padding_mask, seq_dim=-1, sequence_parallel=self.config.sequence_parallel
+                )
+                # Model-level rotary_pos_emb belongs to regular attention, whose
+                # CP layout preference is zigzag. MTP side tensors are aligned
+                # for token/loss semantics, but RoPE is not treated as a batch
+                # side tensor to be converted here.
+                postprocess_to_input_converter = CpPartitionModeConverter(
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                    source_partition_mode=postprocess_partition_mode,
+                    target_partition_mode=input_partition_mode,
+                )
+            packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                packed_seq_params, postprocess_partition_mode
+            )
+
+        if mtp_forward_ran:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -821,6 +938,8 @@ class GPTModel(LanguageModule):
 
         if labels is None:
             # [s b h] => [b s h]
+            if postprocess_to_input_converter is not None:
+                logits = postprocess_to_input_converter.convert(logits, seq_dim=0)
             return logits.transpose(0, 1).contiguous()
 
         output_layer_kwargs = dict(
@@ -835,6 +954,11 @@ class GPTModel(LanguageModule):
         else:
             logits, _ = self.output_layer(**output_layer_kwargs)
             loss = self.compute_language_model_loss(labels, logits)
+
+        if postprocess_to_input_converter is not None:
+            # The training loss function masks this returned per-token loss with the
+            # original batch loss_mask, so preserve the model input layout at the boundary.
+            loss = postprocess_to_input_converter.convert(loss, seq_dim=-1)
 
         return loss
 

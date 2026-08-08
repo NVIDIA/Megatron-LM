@@ -26,6 +26,7 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybri
     _SEED,
     _build_attention,
     _make_config,
+    patch_hadamard_if_needed,  # noqa: F401
 )
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_native_parity import (
     _DSV4_VARIANTS,
@@ -293,7 +294,6 @@ def _make_dsv4_cp_config(
         dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
         dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         context_parallel_size=context_parallel_size,
-        cp_partition_mode="contiguous" if context_parallel_size > 1 else "zigzag",
         sequence_packing_scheduler="dp_balanced" if context_parallel_size > 1 else None,
         csa_dense_mode=False,
         csa_compress_rotary_base=shape["csa_compress_rotary_base"],
