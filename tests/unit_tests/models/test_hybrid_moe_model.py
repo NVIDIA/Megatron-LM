@@ -68,6 +68,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cpu_offloading_weights": False,
     "cross_entropy_fusion_impl": "native",
     "cross_entropy_loss_fusion": True,
+    "create_attention_mask_in_dataloader": True,
     "cuda_graph_impl": "none",
     "cuda_graph_retain_backward_graph": False,
     "cuda_graph_modules": [],
