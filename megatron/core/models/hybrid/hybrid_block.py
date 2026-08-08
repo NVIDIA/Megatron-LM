@@ -13,6 +13,13 @@ from typing import Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
+from megatron.core.context_parallel_layout import (
+    CpPartitionMode,
+    CpPartitionModeConverter,
+    get_required_cp_partition_mode_for_layer,
+    get_stage_entry_partition_mode,
+    replace_packed_seq_params_cp_partition_mode,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -22,7 +29,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
@@ -91,6 +98,7 @@ class HybridStack(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
         name: str | None = None,
+        cp_stage_entry_partition_mode: Optional[str] = None,
     ) -> None:
         """
         Args:
@@ -101,6 +109,7 @@ class HybridStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        self.cp_stage_entry_partition_mode = cp_stage_entry_partition_mode
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -258,6 +267,60 @@ class HybridStack(MegatronModule):
                 return layer.mamba_state_shapes_per_request()
         return None
 
+    def _convert_cp_partition_mode_for_layer(
+        self,
+        *,
+        local_index: int,
+        current_partition_mode: CpPartitionMode,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor],
+        rotary_pos_emb,
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask: Optional[Tensor],
+        input_ids: Optional[Tensor],
+        required_partition_mode: Optional[CpPartitionMode],
+    ):
+        """Convert per-token tensors to the layout required by one local hybrid layer."""
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        if cp_group is None or cp_group.size() <= 1:
+            return hidden_states, rotary_pos_emb, padding_mask, input_ids
+        if required_partition_mode is None or required_partition_mode == current_partition_mode:
+            return hidden_states, rotary_pos_emb, padding_mask, input_ids
+
+        current_to_required_converter = CpPartitionModeConverter(
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            source_partition_mode=current_partition_mode,
+            target_partition_mode=required_partition_mode,
+            tp_group=self.pg_collection.tp,
+        )
+        if not current_to_required_converter.conversion_needed:
+            return hidden_states, rotary_pos_emb, padding_mask, input_ids
+
+        current_to_required_converter.assert_no_dense_attention_inputs(
+            attention_mask=attention_mask,
+            context=f"{type(self).__name__}: local_index={local_index}",
+            hidden_states=hidden_states,
+        )
+        hidden_states = current_to_required_converter.convert(
+            hidden_states,
+            seq_dim=0,
+            sequence_parallel=self.config.sequence_parallel,
+        )
+        rotary_pos_emb = current_to_required_converter.convert_rank_local_rotary(
+            rotary_pos_emb, seq_dim=0
+        )
+        if padding_mask is not None:
+            padding_mask = current_to_required_converter.convert(
+                padding_mask,
+                seq_dim=1,
+                sequence_parallel=self.config.sequence_parallel,
+            )
+        if input_ids is not None:
+            input_ids = current_to_required_converter.convert(input_ids, seq_dim=1)
+
+        return hidden_states, rotary_pos_emb, padding_mask, input_ids
+
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -268,6 +331,7 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
+        input_ids: Optional[Tensor] = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -345,6 +409,20 @@ class HybridStack(MegatronModule):
                 return nullcontext()
 
         with outer_fp8_context:
+            cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            cp_layout_needed = cp_group is not None and cp_group.size() > 1
+            current_partition_mode = None
+            if cp_layout_needed:
+                current_partition_mode = get_stage_entry_partition_mode(
+                    packed_seq_params,
+                    self.cp_stage_entry_partition_mode,
+                    owner_name=type(self).__name__,
+                    cp_group=cp_group,
+                )
+                packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                    packed_seq_params, current_partition_mode
+                )
+
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
                     self,
@@ -357,9 +435,37 @@ class HybridStack(MegatronModule):
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                    input_ids=input_ids,
                 )
             else:
-                for layer in self.layers:
+                for l_no, layer in enumerate(self.layers):
+                    if cp_layout_needed:
+                        required_partition_mode = get_required_cp_partition_mode_for_layer(
+                            layer, getattr(layer, "config", self.config)
+                        )
+                        (hidden_states, rotary_pos_emb, padding_mask, input_ids) = (
+                            self._convert_cp_partition_mode_for_layer(
+                                local_index=l_no,
+                                current_partition_mode=current_partition_mode,
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                rotary_pos_emb=rotary_pos_emb,
+                                packed_seq_params=packed_seq_params,
+                                padding_mask=padding_mask,
+                                input_ids=input_ids,
+                                required_partition_mode=required_partition_mode,
+                            )
+                        )
+                        if required_partition_mode is not None:
+                            packed_seq_params = replace_packed_seq_params_cp_partition_mode(
+                                packed_seq_params, required_partition_mode
+                            )
+                        current_partition_mode = getattr(
+                            packed_seq_params,
+                            "cp_partition_mode",
+                            required_partition_mode or current_partition_mode,
+                        )
+
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
                         self.config, layer.layer_number - 1

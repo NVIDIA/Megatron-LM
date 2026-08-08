@@ -11,6 +11,8 @@ class IdentityOp(torch.nn.Module):
     This is a placeholder for IdentityOp(x) -> x
     """
 
+    required_cp_partition_mode = None
+
     def __init__(self, *args: object, **kwargs: object):
         super().__init__()
 

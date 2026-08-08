@@ -13,6 +13,7 @@ import torch.distributed
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.context_parallel_layout import get_required_cp_partition_mode_for_layer
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
@@ -1135,6 +1136,65 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 submodules += [self.mlp.shared_experts]
         return submodules
 
+    @staticmethod
+    def _decompose_packed_seq_params_to_kwargs(kwargs):
+        """Decompose PackedSeqParams into individual tensor kwargs for CUDA graph.
+
+        CUDA graph requires all inputs to be tensors. This extracts the cu_seqlens
+        tensor fields from PackedSeqParams into individual kwargs. max_seqlen_q/kv
+        are omitted because they are static and reading them from a CUDA tensor is
+        forbidden during graph capture. They are restored from config in
+        _reconstruct_packed_seq_params_from_kwargs.
+        """
+        packed_seq_params = kwargs.pop('packed_seq_params', None)
+        if packed_seq_params is None:
+            return
+        kwargs['cu_seqlens_q'] = packed_seq_params.cu_seqlens_q
+        kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
+        kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
+        kwargs['cu_seqlens_kv_padded'] = packed_seq_params.cu_seqlens_kv_padded
+
+    def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
+        """Reconstruct PackedSeqParams from individual tensor kwargs (CUDA graph path).
+
+        During CUDA graph capture/replay, PackedSeqParams fields are decomposed into
+        individual cu_seqlens tensor kwargs. This method reassembles them into a
+        PackedSeqParams. max_seqlen_q/kv are taken from config since they are always
+        the padded static value and cannot be read from CUDA tensors during graph capture.
+        pad_between_seqs is conservatively enabled because its Python value is not a
+        graph input and inferring it from CUDA tensors would synchronize during capture.
+        cp_partition_mode is inferred from this layer's layout requirement instead
+        of the deprecated TransformerConfig.cp_partition_mode global field.
+        """
+        if 'cu_seqlens_q' not in kwargs:
+            return
+        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        cp_partition_mode = get_required_cp_partition_mode_for_layer(self, self.config)
+        if cp_partition_mode is None:
+            if self.config.context_parallel_size > 1 or self.config.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot reconstruct THD PackedSeqParams for a layout-agnostic transformer "
+                    "layer under context parallelism. The CP partition mode must be provided "
+                    "by the model-level layout plan."
+                )
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cp_partition_mode=cp_partition_mode,
+            cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
+            cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
+            cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
+            cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            # CUDA graph inputs do not carry this Python bool. Sequence-packing
+            # metadata may contain valid/physical gaps, so use the conservative
+            # graph-static value instead of asking TE to infer it with a CUDA
+            # tensor comparison during capture. This restricts TE backend
+            # selection for THD to cuDNN fused attention.
+            pad_between_seqs=True,
+        )
+        kwargs['packed_seq_params'] = packed_seq_params
+
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """
         CUDA Graph capture for this layer using TE interface.
@@ -1142,7 +1202,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         1. In some conditions CUDA graph cannot cover the entire layer. The `cuda_graph_modules`
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
+        For THD format, PackedSeqParams is reconstructed from tensor kwargs.
         """
+        self._reconstruct_packed_seq_params_from_kwargs(kwargs)
+
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
@@ -1178,7 +1241,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
             )
         ):
-            hidden_states = self._forward_mlp(hidden_states)
+            hidden_states = self._forward_mlp(
+                hidden_states,
+                padding_mask=kwargs.get("padding_mask", None),
+                packed_seq_params=kwargs.get("packed_seq_params", None),
+            )
         if not isinstance(hidden_states, list) and not isinstance(hidden_states, tuple):
             cuda_graph_outputs = [hidden_states]
         else:
@@ -1198,8 +1265,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         interface. TransformerEngine versions>=1.10 allow keyword arguments with CUDA graph.
         However, CUDA graph accepts only Tensor inputs.
         Hence, `inference_context` and `packed_seq_params` are excluded from input list.
+        For THD format, PackedSeqParams is decomposed into individual tensor kwargs.
         """
         context = None
+        padding_mask = kwargs.get("padding_mask", None)
         if (
             self.config.cuda_graph_modules
             and CudaGraphModule.attn not in self.config.cuda_graph_modules
@@ -1207,6 +1276,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states, context = self._forward_attention(*args, **kwargs)
             args = (hidden_states,)
             kwargs = {}
+            if padding_mask is not None:
+                kwargs["padding_mask"] = padding_mask
+        else:
+            self._decompose_packed_seq_params_to_kwargs(kwargs)
 
         assert (kwargs.get('inference_context') is None) and (
             kwargs.get('packed_seq_params') is None

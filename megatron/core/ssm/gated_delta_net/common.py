@@ -8,6 +8,7 @@
 # pylint: disable=unused-import
 
 import logging
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable, Optional, Protocol, Union
@@ -220,16 +221,19 @@ class _GDNBase(MegatronModule):
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
 
-        self.conv1d = nn.Conv1d(
-            in_channels=self.conv_dim_local_tp,
-            out_channels=self.conv_dim_local_tp,
-            bias=conv_bias,
-            kernel_size=self.conv_kernel_dim,
-            groups=self.conv_dim_local_tp,
-            padding=self.conv_kernel_dim - 1,
-            device=torch.cuda.current_device(),
-            dtype=config.params_dtype,
-        )
+        # Conv1d performs implicit CUDA RNG initialization in its constructor.
+        # Isolate it; reset_parameters below owns the final Megatron-tracked init.
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            self.conv1d = nn.Conv1d(
+                in_channels=self.conv_dim_local_tp,
+                out_channels=self.conv_dim_local_tp,
+                bias=conv_bias,
+                kernel_size=self.conv_kernel_dim,
+                groups=self.conv_dim_local_tp,
+                padding=self.conv_kernel_dim - 1,
+                device=torch.cuda.current_device(),
+                dtype=config.params_dtype,
+            )
         setattr(self.conv1d.weight, "tensor_model_parallel", True)
         setattr(self.conv1d.weight, "partition_dim", 0)
         if conv_bias:
@@ -302,6 +306,12 @@ class _GDNBase(MegatronModule):
             with get_cuda_rng_tracker().fork():
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+                else:
+                    nn.init.kaiming_uniform_(self.conv1d.weight, a=math.sqrt(5))
+                if self.conv1d.bias is not None:
+                    fan_in = self.conv1d.weight.size(1) * self.conv1d.weight.size(2)
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(self.conv1d.bias, -bound, bound)
                 torch.ones(
                     self.dt_bias_dim,
                     dtype=self.config.params_dtype,

@@ -42,7 +42,12 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
+from megatron.core.context_parallel_layout import (
+    get_context_parallel_layout_chunk_indices,
+    get_thd_context_parallel_rank_indices,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
     from packaging.version import Version as PkgVersion
@@ -2404,11 +2409,13 @@ def get_batch_on_this_tp_rank(
 
 
 def _get_batch_on_this_cp_rank_per_document_balancing(
-    batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
+    batch: dict[str, torch.Tensor],
+    cp_group: torch.distributed.ProcessGroup,
+    cp_partition_mode: Optional[str] = None,
 ):
     """Partition a batch across CP ranks with per-document zigzag load balancing.
 
-    Applies zigzag load-balanced chunking independently within each
+    Applies context-parallel chunking independently within each
     sub-sequence (document) using Transformer Engine's
     ``thd_get_partitioned_indices``. Each document length must be
     divisible by ``2 * cp_size``. Sequence-dimension tensors (tokens,
@@ -2421,6 +2428,8 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
             ``[micro_batch_size, seq_length, ...]``.
         cp_group (torch.distributed.ProcessGroup): The context-parallel
             process group.
+        cp_partition_mode (str, optional): Context-parallel partition layout
+            to apply when ``cp_size > 1``.
 
     Returns:
         dict[str, torch.Tensor]: The batch with sequence-dimension tensors
@@ -2430,6 +2439,11 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
     cp_rank = torch.distributed.get_rank(cp_group)
 
     if cp_size > 1:
+        if cp_partition_mode is None:
+            raise ValueError(
+                "cp_partition_mode must be provided when partitioning a batch "
+                "across context-parallel ranks."
+            )
         # cu_seqlens / cu_seqlens_padded carry a leading batch dim (1, n).
         # tex.thd_get_partitioned_indices expects a 1-D tensor, so squeeze
         # the batch dim inline without mutating the batch dict.
@@ -2438,14 +2452,20 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
             if batch["cu_seqlens_padded"] is not None
             else batch["cu_seqlens"]
         )[0]
-        index = tex.thd_get_partitioned_indices(
-            cu_seqlens_for_te,
-            (
-                batch["tokens"].size(1) if batch["tokens"] is not None else batch["labels"].size(1)
-            ),  # NOTE(asolergi-nv): Labels to enable PP!
-            cp_size,
-            cp_rank,
-        )
+        seq_length = batch["tokens"].size(1) if batch["tokens"] is not None else batch["labels"].size(1)
+        if cp_partition_mode == "zigzag":
+            index = tex.thd_get_partitioned_indices(
+                cu_seqlens_for_te,
+                seq_length,  # NOTE(asolergi-nv): Labels to enable PP!
+                cp_size,
+                cp_rank,
+            )
+        elif cp_partition_mode == "contiguous":
+            index = get_thd_context_parallel_rank_indices(
+                cu_seqlens_for_te, cp_size, cp_rank, cp_partition_mode
+            )
+        else:
+            raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
         SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids')
         for key in SEQUENCE_KEYS:
             if batch.get(key) is not None:
@@ -2454,7 +2474,9 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
 
 
 def _get_batch_on_this_cp_rank_per_sequence_balancing(
-    batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
+    batch: dict[str, torch.Tensor],
+    cp_group: torch.distributed.ProcessGroup,
+    cp_partition_mode: Optional[str] = None,
 ):
     """Partition a batch across CP ranks with per-sequence zigzag load balancing.
 
@@ -2474,6 +2496,8 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
             ``[micro_batch_size, seq_length, ...]``.
         cp_group (torch.distributed.ProcessGroup): The context-parallel
             process group.
+        cp_partition_mode (str, optional): Context-parallel partition layout
+            to apply when ``cp_size > 1``.
 
     Returns:
         dict[str, torch.Tensor]: The batch with sequence-dimension tensors
@@ -2494,6 +2518,11 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
     )
 
     if cp_size > 1:
+        if cp_partition_mode is None:
+            raise ValueError(
+                "cp_partition_mode must be provided when partitioning a batch "
+                "across context-parallel ranks."
+            )
         for key, val in batch.items():
             if key in METADATA_KEYS or val is None:
                 continue
@@ -2504,9 +2533,9 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
                 val.shape[seq_dim] // (2 * cp_size),
                 *val.shape[(seq_dim + 1) :],
             )
-            index = torch.zeros(2, dtype=torch.int64, device=val.device)
-            index[0].fill_(cp_rank)
-            index[1].fill_(2 * cp_size - cp_rank - 1)
+            index = get_context_parallel_layout_chunk_indices(
+                cp_size, cp_rank, cp_partition_mode
+            ).to(device=val.device)
             val = val.index_select(seq_dim, index)
             val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
             batch[key] = val
@@ -2615,6 +2644,7 @@ def get_batch_on_this_cp_rank(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
     use_per_sequence_balancing: bool = False,
+    cp_partition_mode: Optional[str] = None,
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
@@ -2643,6 +2673,8 @@ def get_batch_on_this_cp_rank(
             even when ``cu_seqlens`` is present (e.g., for inter-document
             masking where document lengths are not divisible by
             ``2 * cp_size``).
+        cp_partition_mode (str, optional): Context-parallel partition layout
+            to apply when ``cp_size > 1``.
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
@@ -2650,7 +2682,9 @@ def get_batch_on_this_cp_rank(
     """
 
     if use_per_sequence_balancing or batch.get("cu_seqlens") is None:
-        batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
+        batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
+            batch, cp_group=cp_group, cp_partition_mode=cp_partition_mode
+        )
     elif is_hybrid_cp:
         assert (
             batch['local_cp_size'] is not None
@@ -2658,12 +2692,65 @@ def get_batch_on_this_cp_rank(
         if batch['local_cp_size'].item() > 1:
             hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
             batch = _get_batch_on_this_cp_rank_per_sequence_balancing(
-                batch, cp_group=hybrid_cp_group
+                batch, cp_group=hybrid_cp_group, cp_partition_mode=cp_partition_mode
             )
             batch["hybrid_cp_group"] = hybrid_cp_group
     else:
-        batch = _get_batch_on_this_cp_rank_per_document_balancing(batch, cp_group=cp_group)
+        batch = _get_batch_on_this_cp_rank_per_document_balancing(
+            batch, cp_group=cp_group, cp_partition_mode=cp_partition_mode
+        )
     return batch
+
+
+def get_thd_batch_on_this_cp_rank(
+    batch: Dict[str, Any],
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    max_seqlen: torch.Tensor,
+    cp_size: Optional[int] = None,
+    cp_rank: Optional[int] = None,
+    cp_partition_mode: Optional[str] = None,
+):
+    """Partition THD-format batch tensors across context-parallel ranks."""
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=int(max_seqlen[0].item()),
+        max_seqlen_kv=int(max_seqlen[0].item()),
+        cp_partition_mode=cp_partition_mode,
+    )
+
+    cp_size = parallel_state.get_context_parallel_world_size() if cp_size is None else cp_size
+    cp_rank = parallel_state.get_context_parallel_rank() if cp_rank is None else cp_rank
+    if cp_size > 1:
+        if cp_partition_mode is None:
+            raise ValueError(
+                "cp_partition_mode must be provided when partitioning a THD batch "
+                "across context-parallel ranks."
+            )
+        assert tex is not None and is_te_min_version("1.10.0"), (
+            "Please update Transformer Engine to >= 1.10 to use "
+            "Context Parallel with THD format data"
+        )
+        if cp_partition_mode == "zigzag":
+            index = tex.thd_get_partitioned_indices(
+                cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
+            )
+        elif cp_partition_mode == "contiguous":
+            index = get_thd_context_parallel_rank_indices(
+                cu_seqlens_padded, cp_size, cp_rank, cp_partition_mode
+            )
+        else:
+            raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
+        for key, data in batch.items():
+            if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
+                continue
+            batch[key] = data.index_select(1, index)
+
+    return batch, packed_seq_params
 
 
 ######################

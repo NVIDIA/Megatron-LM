@@ -13,6 +13,8 @@ from megatron.core.transformer import (
 class MLPLayer(TransformerLayer):
     """Drop-in replacement for TransformerLayer but initializes only an MLP via the spec."""
 
+    required_cp_partition_mode = None
+
     def __init__(
         self,
         config: TransformerConfig,

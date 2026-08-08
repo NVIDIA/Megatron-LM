@@ -4,12 +4,18 @@ import inspect
 import logging
 from typing import Any, Callable, ClassVar, Literal, override
 
-from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import get_gpt_heterogeneous_layer_spec
-from megatron.core.transformer.heterogeneous.heterogeneous_config import HeterogeneousTransformerConfig
 import torch
+
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_experimental_attention_variant_stage_input_cp_partition_mode,
+    get_transformer_block_with_experimental_attention_variant_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
+    get_gpt_heterogeneous_layer_spec,
+)
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -18,19 +24,20 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.module import Float16Module, MegatronModule
-from megatron.core.transformer.dot_product_attention import DotProductAttention as MCoreDotProductAttention
-from megatron.core.transformer.enums import AttnBackend
-from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    get_transformer_block_with_experimental_attention_variant_spec,
+from megatron.core.transformer.dot_product_attention import (
+    DotProductAttention as MCoreDotProductAttention,
 )
-
-from megatron.training.models.base import ModelConfig, ModelBuilder, compose_hooks
-from megatron.training.vocab_utils import calculate_padded_vocab_size
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+    HeterogeneousTransformerConfig,
+)
+from megatron.core.transformer.module import Float16Module, MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_pg_rank
+from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
-
-from megatron.core.transformer.transformer_config import  TransformerConfig
+from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 
 logger = logging.getLogger(__name__)
@@ -309,6 +316,14 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         if post_process is None:
             post_process = is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size) and is_pp_last_stage(pg_collection.pp)
 
+        cp_stage_entry_partition_mode = (
+            get_experimental_attention_variant_stage_input_cp_partition_mode(
+                self._model_config.transformer,
+                vp_stage=vp_stage,
+                pp_rank=get_pg_rank(pg_collection.pp),
+            )
+        )
+
         model = GPTModel(
             config=self._model_config.transformer,
             transformer_layer_spec=transformer_layer_spec,
@@ -329,6 +344,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             post_process=post_process,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
         )
 
         return model

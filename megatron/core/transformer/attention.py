@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import get_required_cp_partition_mode_for_layer
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -293,6 +294,8 @@ class Attention(MegatronModule, ABC):
     "cross attn" specializations.
     """
 
+    required_cp_partition_mode = "zigzag"
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -317,6 +320,7 @@ class Attention(MegatronModule, ABC):
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+        self.cp_comm_type = cp_comm_type
         self.batch_invariant_mode = config.batch_invariant_mode
         self.flash_attention_version = config.flash_attention_version
 
@@ -442,6 +446,45 @@ class Attention(MegatronModule, ABC):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
+
+    def _get_cp_partition_mode(self):
+        """Return the concrete CP partition mode this attention module expects."""
+        cp_partition_mode = get_required_cp_partition_mode_for_layer(
+            self, self.config, cp_comm_type=self.cp_comm_type
+        )
+        if cp_partition_mode is None:
+            raise ValueError(
+                f"{self.__class__.__name__} must declare a concrete CP partition mode."
+            )
+        return cp_partition_mode
+
+    def _validate_packed_seq_params_cp_partition_mode(
+        self, packed_seq_params: Optional[PackedSeqParams], expected_cp_partition_mode: str
+    ) -> None:
+        """Validate block-provided THD CP partition metadata against this attention."""
+        if packed_seq_params is None or packed_seq_params.qkv_format != 'thd':
+            return
+        cp_group = packed_seq_params.cp_group if packed_seq_params.cp_group is not None else None
+        if cp_group is None:
+            cp_group = self.pg_collection.cp if hasattr(self.pg_collection, 'cp') else None
+        if cp_group is None or get_pg_size(cp_group) <= 1:
+            return
+
+        actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+        if actual_cp_partition_mode is None:
+            # Direct attention-module callers may construct THD PackedSeqParams
+            # without the block-level layout annotation. In that legacy path,
+            # assume the caller provided inputs in the attention module's native
+            # layout and record it for downstream RoPE/attention helpers.
+            packed_seq_params.cp_partition_mode = expected_cp_partition_mode
+            return
+        if actual_cp_partition_mode != expected_cp_partition_mode:
+            raise ValueError(
+                f"{self.__class__.__name__} requires cp_partition_mode="
+                f"{expected_cp_partition_mode!r}, but packed_seq_params has "
+                f"{actual_cp_partition_mode!r}. CP partition conversion must be handled "
+                "by TransformerBlock before entering attention."
+            )
 
     def _checkpointed_attention_forward(
         self,
@@ -1316,6 +1359,11 @@ class Attention(MegatronModule, ABC):
             (Tuple[Tensor, Tensor]) Attention output and bias.
 
         """
+        expected_cp_partition_mode = self._get_cp_partition_mode()
+        self._validate_packed_seq_params_cp_partition_mode(
+            packed_seq_params, expected_cp_partition_mode
+        )
+
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
         no_rope = (
@@ -1480,8 +1528,10 @@ class Attention(MegatronModule, ABC):
             not self.config.flash_decode or inference_context is None
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
+            cp_partition_mode = expected_cp_partition_mode
 
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                cp_partition_mode = packed_seq_params.cp_partition_mode
                 if packed_seq_params.cu_seqlens_q_padded is not None:
                     cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
                 else:
@@ -1490,8 +1540,11 @@ class Attention(MegatronModule, ABC):
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
                 else:
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+                rope_max_seqlen_q = packed_seq_params.max_seqlen_q
+                rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
+                rope_max_seqlen_q = rope_max_seqlen_kv = None
 
             if split_qkv:
                 if q_pos_emb is not None:
@@ -1504,6 +1557,8 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
                             cp_group=self.pg_collection.cp,
+                            cp_partition_mode=cp_partition_mode,
+                            max_seqlen=rope_max_seqlen_q,
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
@@ -1522,6 +1577,8 @@ class Attention(MegatronModule, ABC):
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
                         cp_group=self.pg_collection.cp,
+                        cp_partition_mode=cp_partition_mode,
+                        max_seqlen=rope_max_seqlen_kv,
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
