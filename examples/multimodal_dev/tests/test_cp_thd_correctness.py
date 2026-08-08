@@ -42,7 +42,7 @@ from examples.multimodal_dev.models.base import (
     _cp_split_tensor,
     _thd_cp_partition_index,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.parallel_state import get_context_parallel_group, get_context_parallel_rank
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import MegatronModule
@@ -76,11 +76,11 @@ class _StubVisionEncoder(MegatronModule):
 
 
 def _build_model(config, vocab_size, max_seq_len, image_token_id):
-    spec = get_gpt_layer_with_transformer_engine_spec()
     vision = _StubVisionEncoder(config)
     model = MultimodalModel(
         language_config=config,
-        language_spec=spec,
+        hybrid_stack_spec=hybrid_stack_spec,
+        hybrid_layer_pattern="*-" * (config.num_layers // 2),
         vision_encoder=vision,
         vocab_size=vocab_size,
         max_sequence_length=max_seq_len,
@@ -96,7 +96,7 @@ def _make_config(
     num_layers, hidden_size, ffn_hidden_size, num_heads, num_kv_heads, context_parallel_size
 ):
     return TransformerConfig(
-        num_layers=num_layers,
+        num_layers=2 * num_layers,
         hidden_size=hidden_size,
         ffn_hidden_size=ffn_hidden_size,
         num_attention_heads=num_heads,

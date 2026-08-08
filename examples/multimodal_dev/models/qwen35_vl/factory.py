@@ -41,8 +41,8 @@ def set_vision_flops_metadata(args, language_config, vision_config):
 def build_model(args, language_config, vision_config, **kwargs):
     """Build a complete Qwen3.5-VL model instance.
 
-    Handles language spec construction, optional MTP block spec, and
-    model instantiation with Qwen3.5-VL-specific parameters.
+    Selects the HybridModel stack spec and instantiates the model with the
+    unified decoder/MTP layer pattern parsed from the CLI.
 
     Args:
         args: Megatron parsed arguments.
@@ -54,32 +54,17 @@ def build_model(args, language_config, vision_config, **kwargs):
     Returns:
         A :class:`Qwen35VLModel` instance.
     """
-    from megatron.core.models.gpt.gpt_layer_specs import (
-        get_gpt_mtp_block_spec,
-    )
+    hybrid_layer_pattern = getattr(args, "hybrid_layer_pattern", None)
+    if hybrid_layer_pattern is None:
+        raise ValueError(
+            "Qwen3.5-VL uses HybridModel and requires --hybrid-layer-pattern. "
+            "Use GEGEGE*E per four MoE blocks (or G-G-G-*- for dense blocks), "
+            "and append /*E or /*- for each MTP depth."
+        )
+
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 
     from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
-    from examples.multimodal_dev.models.qwen35_vl.specs import (
-        get_qwen35_vl_language_spec,
-    )
-
-    language_spec = get_qwen35_vl_language_spec(
-        config=language_config,
-        vp_stage=kwargs.get("vp_stage", None),
-        pp_rank=None,
-    )
-
-    mtp_block_spec = None
-    if getattr(args, "mtp_num_layers", None):
-        mtp_block_spec = get_gpt_mtp_block_spec(
-            config=language_config,
-            spec=language_spec,
-            use_transformer_engine=(
-                args.transformer_impl == "transformer_engine"
-            ),
-            vp_stage=kwargs.get("vp_stage", None),
-            pp_rank=None,
-        )
 
     # When --untie-embeddings-and-output-weights is NOT passed, Megatron
     # defaults to tied embeddings (share_embeddings_and_output_weights=True).
@@ -90,12 +75,12 @@ def build_model(args, language_config, vision_config, **kwargs):
 
     return Qwen35VLModel(
         language_config=language_config,
-        language_spec=language_spec,
+        hybrid_stack_spec=hybrid_stack_spec,
+        hybrid_layer_pattern=hybrid_layer_pattern,
         vision_config=vision_config,
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         image_token_id=getattr(args, "image_token_id", 248056),
-        mtp_block_spec=mtp_block_spec,
         parallel_output=True,
         share_embeddings_and_output_weights=share_embeddings,
     )
