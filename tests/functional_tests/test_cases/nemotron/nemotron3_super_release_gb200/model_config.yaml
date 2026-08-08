@@ -142,6 +142,7 @@ MODEL_ARGS:
   --dist-ckpt-strictness: log_all
   --save-interval: 200
   --save-retain-interval: 2000
+  --async-ckpt-use-cpu-shm: true
 
   # Validation args
   --eval-interval: 100
