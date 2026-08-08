@@ -286,6 +286,32 @@ torchrun --nproc_per_node=8 --nnodes=1 \
 
 > ℹ️ For multi-node conversion tasks, please refer to the DeepSeek-V3 example script (`sbatch_checkpoint_convert.sh`) in [Megatron-LM/examples/megatron_fsdp](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/megatron_fsdp).
 
+#### Converting Megatron-FSDP (`fsdp_dtensor`) to N-D Parallel (`torch_dist`) Checkpoints
+
+The reverse direction converts a Megatron-FSDP `fsdp_dtensor` checkpoint back into a native `torch_dist` checkpoint, so a classic N-D-parallel (DDP, TP, PP, and/or EP) job can resume from a model trained with Megatron-FSDP:
+
+```bash
+python tools/checkpoint/checkpoint_inspector.py \
+    convert-fsdp-dtensor-to-torch-dist \
+    /path/to/input_fsdp_dtensor_checkpoint/ \
+    /path/to/output_torch_dist_checkpoint/
+```
+
+This tool is the inverse of `convert-torch-dist-to-fsdp-dtensor`: it merges the SwiGLU `_w`/`_v` fc1 pairs, re-stacks per-expert (and, for dense/homogeneous models, per-layer) tensors into mcore's native stacked layout, renames Multi-Token-Prediction keys back to `transformer_layer`, strips the Megatron-FSDP wrapper prefixes, and writes bare `torch_dist` keys plus `common.pt` / `metadata.json`. It runs CPU-only (no GPU required) — PyTorch DCP stores each tensor's full global shape, so the source parallelism is transparent, and mcore re-shards the output into any TP/PP/EP/VPP on load.
+
+By default the converter is a single process that holds the whole checkpoint in host RAM (≈ 14 bytes/parameter with optimizer state; `--no-optimizer` cuts this to ≈ 2). For checkpoints that exceed one host's memory, launch it under `torchrun --nproc_per_node N` (or `torch.distributed.run`): the tensor items are sharded across the N processes by output-group — each transform group (SwiGLU halves, a layer's experts, a stacked param's layers, a parameter and its optimizer state) stays whole on one process — so peak host memory scales ≈ 1/N, and the processes cooperatively write a single `torch_dist` store identical to the one-process output.
+
+> ⚠️ **Resume flags.** Because the converted checkpoint drops information that a native `torch_dist` checkpoint normally carries, the resuming N-D-parallel job must set:
+> - `--dist-ckpt-optim-fully-reshardable` — required *only if resuming with optimizer state*. It selects the one distributed-optimizer format whose on-disk layout is per-parameter and model-shaped, exactly what the `fsdp_dtensor` checkpoint holds and what this tool emits. (Convert model weights only with `--no-optimizer` if you do not need optimizer resume.)
+> - `--dist-ckpt-strictness log_all` — the converted checkpoint omits TransformerEngine `_extra_state` blobs (bf16-safe); a non-`assume_ok_unexpected` strictness removes those "unexpected" keys from the load template instead of erroring.
+> - `--no-load-rng` — RNG state is not round-tripped, so skip loading it.
+
+> ℹ️ SwiGLU is auto-detected from the `_w`/`_v` keys (no `--swiglu` needed); pass `--swiglu-modules language_model` to restrict merging to specific modules (e.g. VLMs where only the language model uses SwiGLU). Layer stacking is auto-detected — dense/homogeneous models are stacked, while MoE / Gated-DeltaNet / MTP models stay per-layer — and can be overridden with `--stack-layers` / `--non-homogeneous-layers`. FP8 `_extra_state` is not round-tripped (it is already discarded in the `fsdp_dtensor` checkpoint), so this path targets bf16/fp32 checkpoints.
+
+> ℹ️ **Supported architectures.** Dense, SwiGLU, MoE (both grouped-GEMM and SequentialMLP experts — including aux-loss-free routing, whose fp32 `router.expert_bias` buffer is preserved rather than downcast), Multi-Latent Attention, Multi-Token Prediction, Gated-DeltaNet, and Mamba-2 hybrids are handled. For Gated-DeltaNet and Mamba-2 the fused `in_proj`/`conv1d` projections are split into the per-component sub-keys (`z`/`x`/`B`/`C`/`dt`, etc.) the classic checkpoint stores. An un-indexed stacked-layer buffer the converter cannot map to a per-layer output raises `NotImplementedError` rather than silently emitting an incorrect checkpoint.
+
+> ⚠️ **Optimizer state and expert parallelism.** Model weights reshard into any target layout (validated for TP, PP, and EP). Optimizer state also reshards under tensor and pipeline parallelism, but it **cannot** be loaded into a job whose expert-parallel size introduces a different number of chained optimizers: expert parallelism splits the distributed optimizer into a second `ChainedOptimizer`, whereas the converter (like the source `fsdp_dtensor` checkpoint) emits a single optimizer grouping — a `ChainedOptimizer` entry-count mismatch results (a general Megatron distributed-optimizer constraint, not specific to this converter). Resume with optimizer state at `EP=1`, or resume weights-only (`--finetune --no-load-optim`) under `EP>1`.
+
 ## Megatron-FSDP Feature Guide & API
 
 | Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
