@@ -88,6 +88,7 @@ def fully_shard_model(
     keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
+    fsdp_buffer_count: int = 2,
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
@@ -238,6 +239,10 @@ def fully_shard_model(
         fsdp_double_buffer (bool):
             Whether to use double buffer for FSDP. Defaults to False.
 
+        fsdp_buffer_count (int):
+            Number of persistent buffers allocated for each FSDP communication pool.
+            Defaults to two.
+
         fsdp_db_use_persist_buf_on_alloc_fail (bool):
             Whether to fall back to persistent buffer allocator when a bucket does not
             fit FSDP double buffer size.
@@ -386,6 +391,7 @@ def fully_shard_model(
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
+        fsdp_buffer_count=fsdp_buffer_count,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
         megatron_fsdp_prefetch_recompute_forward_weights=prefetch_recompute_forward_weights,
@@ -695,6 +701,7 @@ def fully_shard(
     keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
+    fsdp_buffer_count: int = 2,
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
@@ -750,6 +757,7 @@ def fully_shard(
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
+        fsdp_buffer_count=fsdp_buffer_count,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
         enable_fine_grained_param_gather=enable_fine_grained_param_gather,

@@ -6,6 +6,9 @@ import torch
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
     BucketingPolicy,
+    FixedPoolAllocator,
+    MaxPoolAllocator,
+    ParameterGroup,
     _get_parameter_groups,
 )
 
@@ -37,6 +40,37 @@ def _get_bucket_signatures(module):
         }
         for group in bucket_groups
     ]
+
+
+def _make_uniform_parameter_groups(count=4):
+    return [
+        ParameterGroup(
+            [torch.nn.Parameter(torch.empty(8, dtype=torch.bfloat16))],
+            dtype=torch.bfloat16,
+            fsdp_unit_id=unit_id,
+        )
+        for unit_id in range(count)
+    ]
+
+
+def test_fixed_pool_capacity_includes_live_and_releasable_buffers():
+    allocator = FixedPoolAllocator("fixed", _make_uniform_parameter_groups(), size=2)
+    allocator.idle_buffer = []
+    allocator.using_buffer = {0: (0, 0), 1: (1, 0)}
+
+    assert allocator.can_allocate([0])
+    assert not allocator.can_allocate([2])
+    assert allocator.can_allocate([2], releasable_bucket_ids={0})
+
+
+def test_max_pool_capacity_includes_live_and_releasable_buffers():
+    allocator = MaxPoolAllocator("max", _make_uniform_parameter_groups(), size=2)
+    allocator.idle_buffer = []
+    allocator.using_buffer = {0: (0, torch.bfloat16, 0), 1: (1, torch.bfloat16, 0)}
+
+    assert allocator.can_allocate([0])
+    assert not allocator.can_allocate([2])
+    assert allocator.can_allocate([2], releasable_bucket_ids={0})
 
 
 def test_grouped_expert_weights_split_when_chunk_size_factors_differ():
