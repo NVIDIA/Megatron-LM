@@ -1298,6 +1298,18 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
 
+        # Apply the Triton autotune policy here rather than from any one layer.
+        # Kernel autotuning is not a property of the model: Mamba's SSD kernels
+        # and Transformer Engine's MoE permutation kernels both select a config
+        # by wall-clock timing, so wiring this into a single module type leaves
+        # every other model unprotected. The patch replaces a method on Triton's
+        # Autotuner class, so it only has to be installed before the first kernel
+        # call, not before the decorators are evaluated; every model goes through
+        # a config, and install() is idempotent.
+        from megatron.core.tuning import install_from_env
+
+        install_from_env()
+
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
