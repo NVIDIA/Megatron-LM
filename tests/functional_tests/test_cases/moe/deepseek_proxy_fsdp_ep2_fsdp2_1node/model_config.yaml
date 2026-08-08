@@ -6,6 +6,7 @@ ENV_VARS:
   NCCL_NVLS_ENABLE: 0
   NCCL_DEBUG: VERSION
   NCCL_ALGO: Ring
+  NVTE_CPU_OFFLOAD_V1: 1
 
 MODEL_ARGS:
   # Distributed args
@@ -49,6 +50,14 @@ MODEL_ARGS:
   --manual-gc: true
   --manual-gc-interval: 100
   --transformer-impl: transformer_engine
+
+  # Recompute args
+  --recompute-granularity: selective
+  --recompute-modules: "layernorm,mla_up_proj,moe_act"
+
+  # CPU Offloading
+  --fine-grained-activation-offloading: true
+  --offload-modules: "core_attn,attn_proj"
 
   # Data args
   --seq-length: 1024
