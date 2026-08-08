@@ -494,6 +494,8 @@ def fully_shard_optimizer(
             "before initializing the optimizer on the MegatronFSDP model. "
         )
     mfsdp_model = first_mfsdp_param._megatron_fsdp_model
+    mfsdp_model._raise_if_parameter_reconciliation_failed("fully_shard_optimizer()")
+    mfsdp_model._fsdp_optimizer_initialization_attempted = True
 
     # Save a reference to the optimizer.step() and optimizer.zero_grad() methods.
     optimizer_step_base_func = type(optimizer).step
