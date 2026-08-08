@@ -257,6 +257,17 @@ stimer = StragglerDetector()
 _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
 
+# Gate for ``update_seqlen_stats_from_cu_seqlens``. Interleaved (virtual)
+# pipelining re-runs the user ``forward_step`` once per virtual model chunk on
+# the SAME micro-batch, and every chunk observes identical ``cu_seqlens``; since
+# the FLOPs formula already spans all ``args.num_layers``, letting each chunk
+# record would multiply the reported FLOPs by the virtual-pipeline size.
+# ``_gate_seqlen_stats_by_vp_stage`` flips this to ``False`` for the duration of
+# a non-primary chunk's forward step and restores it afterwards, so the gate is
+# strictly scoped: outside a wrapped forward step it is always ``True`` and
+# ``update_*`` behaves exactly as an ungated call would.
+_seqlen_stats_recording_enabled: bool = True
+
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
 MAX_NUM_CHECKPOINTS_MEMORY_REPORTED = 3
@@ -310,6 +321,17 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
             metric reports useful work only, not work on CP-alignment or
             end-of-sequence padding tokens.
 
+    This records ONCE per logical micro-batch. Callers do not have to arrange
+    that themselves: under interleaved (virtual) pipeline parallelism the
+    forward step runs once per virtual model chunk for the same micro-batch and
+    every chunk observes identical ``cu_seqlens``, and
+    ``_gate_seqlen_stats_by_vp_stage`` -- installed by ``train_step`` and
+    ``evaluate`` around the user ``forward_step`` -- turns this function into a
+    no-op for every chunk but the primary one. The whole-model FLOPs formula
+    already covers all ``args.num_layers``, so recording per chunk would
+    multiply the estimate by the virtual-pipeline size. Outside a wrapped
+    forward step the gate is open, so a direct call always records.
+
     Every rank in the same data-parallel group sees the same ``cu_seqlens`` (it is
     broadcast across TP/CP/PP). The per-micro-batch reduction stays on device --
     no ``.item()`` -- so this is a fused kernel launch with no host sync. The
@@ -318,6 +340,9 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     flag at ``False`` and pay zero collective cost.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active
+    if not _seqlen_stats_recording_enabled:
+        # Non-primary virtual pipeline chunk replaying the same micro-batch.
+        return
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
     # Pin the accumulator to the current CUDA device when available so the
@@ -356,12 +381,22 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
         fuse onto one device tensor and consume issues a single 2-element
         all-reduce.
 
-    Sync cost: exactly ONE all-reduce of a 2-element ``float64`` tensor and ONE
-    host sync (``tolist()``). Skipped entirely when the flag is ``False``.
+    Sync cost: at most ONE all-reduce of a 2-element ``float64`` tensor and ONE
+    host sync (``tolist()``). Skipped entirely when the flag is ``False`` -- the
+    BSHD path costs zero -- and the collective is skipped when the reduction
+    group holds a single rank.
 
-    All ranks within one DP group accumulated identical values (``cu_seqlens`` is
-    replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
-    factor of ``TP * CP * PP``, which we divide out.
+    Reduction scope: the SUM runs over the PURE data-parallel group, context
+    parallelism EXCLUDED (``get_data_parallel_group(with_context_parallel=False)``).
+    Every rank inside one DP group accumulated identical values (``cu_seqlens``
+    is replicated across TP/CP/PP), so a pure-DP sum visits each distinct
+    micro-batch exactly once and is the global-batch total directly -- no
+    divisor. CP must stay excluded: CP ranks split one sequence and share the
+    same ``cu_seqlens``, so folding them in would double-count. GTP-remat peers
+    stay INCLUDED (the getter's default) because they hold distinct
+    micro-batches, matching how ``_dp_world_size`` sizes the BSHD batch this sum
+    replaces. Megatron-Bridge's ``resolve_global_flops_seqlen_stats`` documents
+    the same pure-DP contract.
     """
     global _seqlen_stats_in_iteration, _seqlen_stats_active
     if not _seqlen_stats_active:
@@ -369,23 +404,74 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
         # closed-form defaults.
         return None, None
     t = _seqlen_stats_in_iteration
+    # Without distributed / model-parallel state there is a single rank and
+    # nothing to reduce. That is the standalone unit-test path; production
+    # always initializes mpu.
     if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
-        torch.distributed.all_reduce(t)
-        tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
-        cp_size = max(mpu.get_context_parallel_world_size(), 1)
-        pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
-        dedup = tp_size * cp_size * pp_size
-    else:
-        # No model-parallel state -> treat as a single rank, no reduction.
-        # This is the standalone unit-test path; production always initializes mpu.
-        dedup = 1
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+        # The group size is a global topology property, so every rank takes the
+        # same branch -- the skip can never leave a peer waiting in a collective.
+        if dp_group.size() > 1:
+            torch.distributed.all_reduce(t, group=dp_group)
     # Single host sync drains both stats at once.
     total_real_tokens, seqlen_squared_sum = t.tolist()
     # Reset for the next iteration. Keep the tensor allocated so subsequent
     # iterations reuse it without reallocating.
     t.zero_()
     _seqlen_stats_active = False
-    return total_real_tokens / dedup, seqlen_squared_sum / dedup
+    return total_real_tokens, seqlen_squared_sum
+
+
+def _get_vp_stage_or_none(model):
+    """Return a model chunk's ``vp_stage``, or ``None`` when it has none.
+
+    ``get_attr_wrapped_model`` walks the ``.module`` chain and RAISES when no
+    object in it defines the attribute. ``vp_stage`` is not universal -- e.g.
+    ``MimoModel`` defines none and is only rescued by ``Float16Module``, which
+    exists solely for fp16/bf16 runs -- so an unguarded read would turn an
+    fp32 model without ``vp_stage`` into a hard training failure over a
+    reporting metric. Absent ``vp_stage`` means "not interleaved".
+    """
+    try:
+        return get_attr_wrapped_model(model, "vp_stage")
+    except RuntimeError:
+        return None
+
+
+def _gate_seqlen_stats_by_vp_stage(forward_step_func):
+    """Wrap a user ``forward_step`` so only the primary virtual chunk records stats.
+
+    The interleaved pipeline schedule invokes ``forward_step_func`` once per
+    (micro-batch, virtual model chunk) pair, always with a SINGLE model chunk as
+    the second positional argument, and every chunk sees identical
+    ``cu_seqlens`` for a given micro-batch. Since ``num_floating_point_operations``
+    already accounts for all ``args.num_layers``, an ungated
+    ``update_seqlen_stats_from_cu_seqlens`` inside ``forward_step`` would inflate
+    the reported THD FLOPs by exactly the virtual-pipeline size. Gating here
+    rather than at the ``forward_step`` call sites keeps entry points free of
+    this concern.
+
+    The override is scoped to the wrapped call and restored in a ``finally``,
+    so it cannot leak: a raising forward step (the rerun state machine retries
+    on failures) cannot strand the gate closed, and any ``update_*`` issued
+    outside a wrapped forward step still records unconditionally.
+    """
+    if getattr(forward_step_func, "_gates_seqlen_stats", False):
+        return forward_step_func
+
+    @functools.wraps(forward_step_func)
+    def wrapper(data_iterator, model, *args, **kwargs):
+        global _seqlen_stats_recording_enabled
+        previous = _seqlen_stats_recording_enabled
+        # ``vp_stage`` is None without interleaving and the chunk index with it.
+        _seqlen_stats_recording_enabled = _get_vp_stage_or_none(model) in (None, 0)
+        try:
+            return forward_step_func(data_iterator, model, *args, **kwargs)
+        finally:
+            _seqlen_stats_recording_enabled = previous
+
+    wrapper._gates_seqlen_stats = True
+    return wrapper
 
 
 def num_floating_point_operations(
@@ -2380,6 +2466,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     args = get_args()
     timers = get_timers()
 
+    # Interleaved pipelining replays each micro-batch on every virtual chunk;
+    # gate the packed-sequence FLOPs stats so only the primary chunk records.
+    forward_step_func = _gate_seqlen_stats_by_vp_stage(forward_step_func)
+
     rerun_state_machine = get_rerun_state_machine()
     save_params_in_this_iteration = (args.save_params_interval is not None and
                                      (iteration + 1) % args.save_params_interval == 0)
@@ -4214,6 +4304,9 @@ def evaluate(
     """Evaluation."""
     args = get_args()
     timers = get_timers()
+
+    # Same gate as in ``train_step``; covers both schedule hand-offs below.
+    forward_step_func = _gate_seqlen_stats_by_vp_stage(forward_step_func)
 
     timers('evaluate', log_level=0).start(barrier=True)
 
