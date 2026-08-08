@@ -359,6 +359,24 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
+    dsa_cp_balance_indexer: bool = False
+    """Enable the load-balanced context-parallel DSA indexer path. The contiguous CP split makes the
+    causal indexer's per-query cost grow with rank, so later CP ranks become stragglers. When True,
+    the indexer instead processes a head chunk and a tail chunk per rank (two launches of the
+    existing indexer kernel) so every rank does ~constant work, then combines the top-k back to
+    contiguous order. When False, the indexer uses the contiguous CP split."""
+
+    dsa_cp_balance_min_seqlen: int = 0
+    """Minimum ``max_seqlen_q`` required to use the balanced CP indexer. Below this length the
+    indexer falls back to the contiguous CP split, since the redistribute overhead outweighs the
+    savings for short sequences. 0 means no lower bound (always balance when enabled)."""
+
+    dsa_cp_balance_dispatch: Literal['alltoall', 'hybridep'] = 'alltoall'
+    """Dispatch backend for the balanced CP indexer. 'alltoall' moves only the two chunks each rank
+    needs via an NCCL all_to_all_single over the fixed chunk permutation (static splits, CUDA-graph
+    capturable); 'hybridep' uses the DeepEP all-to-all instead. 'hybridep' is not CUDA-graph
+    capturable and automatically falls back to 'alltoall' under any graph capture."""
+
     ####################
     # DeepSeek-v4 hybrid attention
     ####################

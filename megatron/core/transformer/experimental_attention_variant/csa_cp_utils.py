@@ -312,12 +312,26 @@ def compute_cp_indexer_topk(
     indexer_softmax_scale: float,
     max_seqlen_q: int,
     use_fused: bool,
+    max_seqlen_kv: Optional[int] = None,
+    prebuilt_layout: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
-    """Return local top-k and its local-Q/full-K packed layout."""
+    """Return local top-k and its local-Q/full-K packed layout.
+
+    ``max_seqlen_kv`` optionally overrides the score-matrix width capacity (default
+    ``max_seqlen_q // ratio``). The fused kernel materializes an fp32 ``(rows, max_seqlen_kv)``
+    score buffer, so callers whose rows can only see a bounded causal prefix (e.g. the balanced
+    CP indexer scoring one chunk at global offset ``gs``: visible width <= ``(gs + rows) //
+    ratio``) should pass the tight bound to avoid allocating and masking the full-sequence width.
+
+    ``prebuilt_layout`` optionally supplies a ``(cu_q, cu_k, q_causal_offsets)`` tuple from a
+    previous ``_build_cp_indexer_layout(cu_seqlens_q, cu_seqlens_compressed, global_start,
+    rows)`` call with identical arguments, skipping the rebuild (the layout is constant across
+    layers within a microbatch).
+    """
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
         return None, None
-    max_seqlen_kv = int(max_seqlen_q) // int(ratio)
+    max_seqlen_kv = int(max_seqlen_q) // int(ratio) if max_seqlen_kv is None else int(max_seqlen_kv)
     if max_seqlen_kv == 0:
         return None, None
 
@@ -329,9 +343,12 @@ def compute_cp_indexer_topk(
             f"{l_local}, got {weights_indexer_local.shape[0]}."
         )
 
-    cu_q_topk, cu_k_topk, q_causal_offsets = _build_cp_indexer_layout(
-        cu_seqlens_q, cu_seqlens_compressed, global_start, l_local
-    )
+    if prebuilt_layout is not None:
+        cu_q_topk, cu_k_topk, q_causal_offsets = prebuilt_layout
+    else:
+        cu_q_topk, cu_k_topk, q_causal_offsets = _build_cp_indexer_layout(
+            cu_seqlens_q, cu_seqlens_compressed, global_start, l_local
+        )
 
     if not use_fused:
         global_rows = torch.arange(
