@@ -127,7 +127,11 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
 
 def _is_nonlinear_or_embedding(param):
     """True for parameters that should NOT use the emerging optimizer."""
-    return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) != 2
+    return (
+        getattr(param, 'is_embedding_or_output_parameter', False)
+        or getattr(param, 'skip_orthogonalization', False)
+        or len(param.shape) != 2
+    )
 
 
 def _get_qkv_split_shapes(model_cfg) -> list[int]:
