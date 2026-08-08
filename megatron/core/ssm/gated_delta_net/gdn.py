@@ -381,7 +381,9 @@ class GatedDeltaNet(_GDNBase):
             **kernel_inputs,
             initial_state=None,
             output_final_state=False,
-            use_qk_l2norm_in_kernel=self.use_qk_l2norm,
+            use_qk_l2norm_in_kernel=(
+                self.use_qk_l2norm and not self.gdn_pre_gated_delta_rule_fusion
+            ),
             cu_seqlens=cu_seqlens_q,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
