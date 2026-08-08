@@ -425,12 +425,7 @@ class _GDNBase(MegatronModule):
         if self._fused_gated_norm_zero_centered:
             weight = weight + 1.0
         return self._fused_gated_norm(
-            x,
-            gate,
-            weight,
-            None,
-            activation="swish",
-            eps=self._fused_gated_norm_eps,
+            x, gate, weight, None, activation="swish", eps=self._fused_gated_norm_eps
         )
 
     @jit_fuser
