@@ -49,14 +49,20 @@ jobs:
       issues: write
       pull-requests: write
     env:
-      GITHUB_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
       DISABLE_EXTERNAL_CONTRIBUTOR: ${{ vars.DISABLE_EXTERNAL_CONTRIBUTOR }}
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          token: ${{ env.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Get PR info
         id: get-pr-info
@@ -74,6 +80,7 @@ jobs:
       - name: Set maintainer status
         id: check-membership
         env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
@@ -177,11 +184,18 @@ jobs:
           fi
           echo "sha=${SHA}" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: Configure
         id: configure
         shell: bash -x -e -u -o pipefail {0}
         env:
-          GH_TOKEN: ${{ secrets.PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           EVENT_NAME: ${{ github.event_name }}
@@ -470,13 +484,22 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
         uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          owner: NVIDIA-NeMo
+          repositories: Megatron-Bridge
+
       - name: Checkout MBridge and create testing branch
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: main
           repository: NVIDIA-NeMo/Megatron-Bridge
           path: megatron-bridge
-          token: ${{ secrets.PAT }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Create testing branch
         env:
@@ -495,7 +518,7 @@ jobs:
           owner: NVIDIA-NeMo
           repo: Megatron-Bridge
           workflow_file_name: cicd-main.yml
-          github_token: ${{ secrets.PAT }}
+          github_token: ${{ steps.app-token.outputs.token }}
           ref: ${{ env.MBRIDGE_BRANCH_NAME }}
           wait_interval: 60
           propagate_failure: true
@@ -696,6 +719,13 @@ jobs:
           fi
           echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: Build and push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
@@ -713,7 +743,7 @@ jobs:
             ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-${{ matrix.cloud }}
             ${{ matrix.registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-${{ matrix.cloud }}
           secrets: |
-            GH_TOKEN=${{ secrets.PAT }}
+            GH_TOKEN=${{ steps.app-token.outputs.token }}
 
   cicd-parse-unit-tests:
     runs-on: ubuntu-latest
@@ -787,6 +817,13 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: main
         uses: ./.github/actions
         with:
@@ -794,7 +831,7 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
-          PAT: ${{ secrets.PAT }}
+          PAT: ${{ steps.app-token.outputs.token }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           sha: ${{ needs.configure.outputs.sha }}
 
@@ -875,6 +912,13 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: main
         uses: ./.github/actions
         with:
@@ -882,7 +926,7 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
-          PAT: ${{ secrets.PAT }}
+          PAT: ${{ steps.app-token.outputs.token }}
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           platform: dgx_gb200
           sha: ${{ needs.configure.outputs.sha }}
@@ -1031,6 +1075,13 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: main
         uses: ./.github/actions
         with:
@@ -1039,7 +1090,7 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
-          PAT: ${{ secrets.PAT }}
+          PAT: ${{ steps.app-token.outputs.token }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
@@ -1132,6 +1183,13 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: main
         uses: ./.github/actions
         with:
@@ -1140,7 +1198,7 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
-          PAT: ${{ secrets.PAT }}
+          PAT: ${{ steps.app-token.outputs.token }}
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
@@ -1280,10 +1338,17 @@ jobs:
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: Generate fake coverage report
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
-          github-token: ${{ secrets.PAT }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
@@ -1367,10 +1432,17 @@ jobs:
           PR_NUMBER=$(echo "${{ github.event.merge_group.head_ref }}" | sed -n 's/.*\/pr-\([0-9]*\)-.*/\1/p')
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
 
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+
       - name: Comment on PR with action run URL
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
-          github-token: ${{ secrets.PAT }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const prNumber = ${{ steps.get-pr-number.outputs.pr_number }};
             const runUrl = `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
