@@ -25,6 +25,7 @@ Test groups
 - TestGTPDDPGradReadyWiring  - GTP params drive DDP grad-ready via the manual hook, not autograd
 - TestGTPWeightCacheSchedulingDomain - cache reuse stays within one chain/process-group domain
 - TestGTPGraphWgradRing       - partial-CG wgrad ring ownership and RS-input correctness
+- TestGTPDDPParamSync         - DDP parameter readiness for eager reads and graph replay
 
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` != the required world size (4).
 """
@@ -1439,3 +1440,58 @@ class TestGTPGraphWgradRing:
         assert rs_input is weights[1]._gtp_graph_wgrad_ring_slot.tensor
         torch.testing.assert_close(rs_input[:4], wgrad)
         assert torch.count_nonzero(rs_input[4:]) == 0
+
+
+class TestGTPDDPParamSync:
+    def test_weight_read_finishes_each_bucket_sync_once(self):
+        class Handle:
+            def __init__(self, name, calls):
+                self.name = name
+                self.calls = calls
+
+            def ensure_ready(self):
+                self.calls.append(self.name)
+
+        first = nn.Parameter(torch.zeros(1))
+        second = nn.Parameter(torch.zeros(1))
+        third = nn.Parameter(torch.zeros(1))
+        calls = []
+        shared_handle = Handle("shared", calls)
+        third_handle = Handle("third", calls)
+        first._gtp_ddp_param_sync_handle = shared_handle
+        second._gtp_ddp_param_sync_handle = shared_handle
+        third._gtp_ddp_param_sync_handle = third_handle
+
+        gtp_module.finish_param_sync_for_gtp_weight_read((first, second, first, third))
+
+        assert calls == ["shared", "third"]
+
+    def test_capture_records_each_bucket_sync_once(self):
+        class Handle:
+            def ensure_ready(self):
+                pass
+
+        first = nn.Parameter(torch.zeros(1))
+        second = nn.Parameter(torch.zeros(1))
+        first_handle = Handle()
+        second_handle = Handle()
+        first._gtp_ddp_param_sync_handle = first_handle
+        second._gtp_ddp_param_sync_handle = second_handle
+
+        with gtp_cuda_graphs.track_gtp_capture_comms() as capture_comms:
+            gtp_module.finish_param_sync_for_gtp_weight_read((first, second, first))
+            gtp_module.finish_param_sync_for_gtp_weight_read((second, first))
+
+        assert capture_comms.gtp_param_sync_handles == [first_handle, second_handle]
+
+    def test_capture_state_is_isolated_per_graph(self):
+        handle = object()
+
+        with gtp_cuda_graphs.track_gtp_capture_comms() as first_graph:
+            gtp_cuda_graphs.register_capture_gtp_param_sync((handle,))
+        with gtp_cuda_graphs.track_gtp_capture_comms() as second_graph:
+            gtp_cuda_graphs.register_capture_gtp_param_sync((handle,))
+
+        assert first_graph is not second_graph
+        assert first_graph.gtp_param_sync_handles == [handle]
+        assert second_graph.gtp_param_sync_handles == [handle]

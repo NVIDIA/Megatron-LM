@@ -36,16 +36,18 @@ class GraphWgradRingSlot:
 
 @dataclass
 class GTPCaptureCommState:
-    """Asynchronous GTP work issued while capturing one CUDA graph."""
+    """GTP work and readiness dependencies issued while capturing one CUDA graph."""
 
     params: list = field(default_factory=list)
     ag_streams: list = field(default_factory=list)
     rs_streams: list = field(default_factory=list)
     wgrad_ring_slots: list = field(default_factory=list)
+    gtp_param_sync_handles: list = field(default_factory=list)
     _param_ids: set = field(default_factory=set)
     _ag_stream_ids: set = field(default_factory=set)
     _rs_stream_ids: set = field(default_factory=set)
     _wgrad_ring_slot_params: dict = field(default_factory=dict)
+    _gtp_param_sync_handle_ids: set = field(default_factory=set)
 
     def register_comm(self, param, stream: torch.cuda.Stream, *, reduce_scatter: bool) -> None:
         """Record a parameter and side stream owned by this graph capture."""
@@ -75,6 +77,19 @@ class GTPCaptureCommState:
             self._wgrad_ring_slot_params[slot_id] = param_id
             self.wgrad_ring_slots.append(slot)
 
+    def register_gtp_param_sync(self, handles: Iterable) -> None:
+        """Record each DDP parameter-sync dependency once for this graph."""
+        for handle in handles:
+            handle_id = id(handle)
+            if handle_id not in self._gtp_param_sync_handle_ids:
+                self._gtp_param_sync_handle_ids.add(handle_id)
+                self.gtp_param_sync_handles.append(handle)
+
+    def ensure_param_sync_ready(self) -> None:
+        """Finish DDP parameter gathers required before replaying this graph."""
+        for handle in self.gtp_param_sync_handles:
+            handle.ensure_ready()
+
 
 _ACTIVE_CAPTURE_COMM_STATE: Optional[GTPCaptureCommState] = None
 
@@ -89,6 +104,12 @@ def register_capture_wgrad_ring_slot(slot: GraphWgradRingSlot, param) -> None:
     """Register a ring slot with the active capture, if one exists."""
     if _ACTIVE_CAPTURE_COMM_STATE is not None:
         _ACTIVE_CAPTURE_COMM_STATE.register_wgrad_ring_slot(slot, param)
+
+
+def register_capture_gtp_param_sync(handles: Iterable) -> None:
+    """Register DDP parameter-sync dependencies with the active graph capture."""
+    if _ACTIVE_CAPTURE_COMM_STATE is not None:
+        _ACTIVE_CAPTURE_COMM_STATE.register_gtp_param_sync(handles)
 
 
 @contextmanager

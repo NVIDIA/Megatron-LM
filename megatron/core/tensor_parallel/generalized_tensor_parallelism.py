@@ -31,7 +31,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 import torch
 from packaging.version import Version
@@ -40,11 +40,37 @@ from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     allocate_graph_wgrad_rings,
     cuda_graph_pool_allocation,
     register_capture_comm,
+    register_capture_gtp_param_sync,
     register_capture_wgrad_ring_slot,
 )
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
+
+
+def finish_param_sync_for_gtp_weight_read(params: Iterable) -> None:
+    """Finish DDP parameter gathers before GTP reads local weight shards.
+
+    GTP may read a weight before its owning module executes, so the normal DDP module pre-hook
+    can run too late. During CUDA graph capture, record the dependency so replay can finish it
+    before launching the graph. Parameters in the same DDP bucket share a readiness handle.
+    """
+    handles = []
+    handle_ids = set()
+    for param in params:
+        handle = getattr(param, "_gtp_ddp_param_sync_handle", None)
+        if handle is None:
+            continue
+        handle_id = id(handle)
+        if handle_id in handle_ids:
+            continue
+        handle_ids.add(handle_id)
+        handles.append(handle)
+
+    register_capture_gtp_param_sync(handles)
+    for handle in handles:
+        handle.ensure_ready()
+
 
 _GTP_TE_MIN_VERSION = Version("2.19.0.dev0")
 
@@ -1222,6 +1248,8 @@ class GTPShardedParam(torch.nn.Parameter):
         nvtx_range_push(f"{nvtx_label}.all_gather_weight")
 
         weights = self._weights
+        if fwd:
+            finish_param_sync_for_gtp_weight_read(weights)
 
         # 1. Transition state for async gathers. Skip during recompute-forward: it gathers
         #    rowwise (_ag_ticket_fwd) while a bwd-chain prefetch may hold an in-flight columnwise
