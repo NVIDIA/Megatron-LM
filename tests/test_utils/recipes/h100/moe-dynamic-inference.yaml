@@ -87,3 +87,15 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
+  # Regression guard for the MTP + sequence-parallel all-gather fixes in
+  # https://github.com/NVIDIA/Megatron-LM/pull/5748 (under block-scope CUDA
+  # graphs, MTP slices each rank's valid local SP shard before the all-gather).
+  # Loads the small proxy MoE+MTP checkpoint staged at model/mtp_proxy_moe_pyt
+  # in the CI artifacts tree -- a tiny arch saved with --mtp-num-layers so the
+  # mtp.* ShardedTensorFactory entries apply_factory_merges requires are present.
+  # golden_values_dev_dgx_h100.json was recorded from that checkpoint.
+  - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_mtp_sp_block_cudagraphs]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]

@@ -979,6 +979,17 @@ class TextGenerationController:
             # Get decoder hidden states at last accepted positions.
             hidden_states = context.mtp_decoder_hidden_states
 
+            # Block-scope CUDA graphs write into a persistent max_tokens-sized
+            # buffer. Only the prefix for this step is valid. Slice each rank's
+            # local SP shard before gathering; gathering the oversized buffer
+            # would place rank 0's stale tail between the valid rank shards.
+            if context.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                local_token_count = context.padded_active_token_count
+                if self._sp_enabled:
+                    assert local_token_count % self._tp_size == 0
+                    local_token_count //= self._tp_size
+                hidden_states = hidden_states[:local_token_count]
+
             # When SP is active the decoder output is in scattered format
             # [S/TP, B, H], but _last_accepted_seq_indices are indices into
             # the full (gathered) sequence.
@@ -3639,7 +3650,7 @@ class TextGenerationController:
                 if sampling_params.num_tokens_to_generate > 0:
                     # Check end of generation status for each tensor
                     # and update generated sequence lengths
-                    (is_generation_done_tensor, generated_sequence_lengths) = (
+                    is_generation_done_tensor, generated_sequence_lengths = (
                         self.update_generation_status(
                             updated_prompts_tokens=batch_prompt_tokens,
                             generation_started=generation_started,
