@@ -263,6 +263,11 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_qkv_per_head: bool = False
+    """Whether to orthogonalize each Q, gate, K, and V head independently. Requires
+    ``muon_split_qkv``. By default, Muon orthogonalizes the Q, gate, K, and V
+    projection matrices separately."""
+
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
