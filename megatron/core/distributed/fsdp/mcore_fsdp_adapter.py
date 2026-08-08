@@ -168,7 +168,11 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         if fsdp_unit_modules is not None:
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
-            if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+            # FSDP unit modules control the granularity of FSDP communications.
+            # "optim": Reduce-scatter communication groups on the final microbatch.
+            # "optim_grads": Additionally, RS communication groups on all microbatches.
+            # "optim_grads_params": RS & AG communication groups on all microbatches.
+            if self.ddp_config.data_parallel_sharding_strategy != "no_shard":
                 self.fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
             else:
                 self.fsdp_unit_modules = []
