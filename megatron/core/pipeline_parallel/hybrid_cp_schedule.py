@@ -7,7 +7,6 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 
@@ -490,6 +489,7 @@ def hybrid_context_parallel_forward_backward(
     total_num_tokens,
     check_first_val_step,
     model_type,
+    pg_collection,
 ):
     """
     Scheduler for Hybrid Context Parallel.
@@ -509,12 +509,13 @@ def hybrid_context_parallel_forward_backward(
     """
     from .schedules import backward_step, forward_step
 
+    tp_group = pg_collection.tp
+    dp_cp_group = pg_collection.dp_cp
+
     def _broadcast(item):
         if item is not None:
             torch.distributed.broadcast(
-                item,
-                parallel_state.get_tensor_model_parallel_src_rank(),
-                group=parallel_state.get_tensor_model_parallel_group(),
+                item, torch.distributed.get_global_rank(tp_group, 0), group=tp_group
             )
 
     def _broadcast_num_samples_this_group(num_samples_this_group):
@@ -559,8 +560,8 @@ def hybrid_context_parallel_forward_backward(
 
     # We get data once per global batch and schedule the sub-samples.
     # TODO(pmannan): Should we wrap the data_iterator here instead of the training.py file?
-    hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    is_first_tp_rank = parallel_state.get_tensor_model_parallel_rank() == 0
+    hdp_rank = dp_cp_group.rank()
+    is_first_tp_rank = tp_group.rank() == 0
 
     if is_first_tp_rank:
         data = next(data_iterator)
@@ -613,9 +614,7 @@ def hybrid_context_parallel_forward_backward(
             # Create a barrier at end of each group.
             # This barrier ensures that all ranks are prepared to change assigned CP group sizes and
             # no rank is starting a sub-sample ahead of it's partner ranks.
-            torch.distributed.barrier(
-                parallel_state.get_data_parallel_group(with_context_parallel=True)
-            )
+            torch.distributed.barrier(dp_cp_group)
 
     # For the last group, we need to run the last sub-sample out of the context handler.
     with no_sync_func():

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings import rope_utils as rope_utils_module
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
@@ -101,7 +102,11 @@ def _test_fused_apply_mla_rope_for_q(input_format):
         cu_seqlens = None
         seqlen = 1024
         batch_size = 2
-        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+        yarn_rope = YarnRotaryEmbedding(
+            emb_dim,
+            original_max_position_embeddings=seqlen,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+        )
         freqs, mscale = yarn_rope(seqlen, 0)
         cos = (torch.cos(freqs) * mscale).to(dtype)
         sin = (torch.sin(freqs) * mscale).to(dtype)
@@ -119,7 +124,11 @@ def _test_fused_apply_mla_rope_for_q(input_format):
         for i in range(len(cu_seqlens) - 1):
             max_seqlen = max(max_seqlen, cu_seqlens[i + 1] - cu_seqlens[i])
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device='cuda')
-        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=max_seqlen)
+        yarn_rope = YarnRotaryEmbedding(
+            emb_dim,
+            original_max_position_embeddings=max_seqlen,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+        )
         freqs, mscale = yarn_rope(max_seqlen, 0)
         cos = (torch.cos(freqs) * mscale).to(dtype)
         sin = (torch.sin(freqs) * mscale).to(dtype)
@@ -187,7 +196,11 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
         cu_seqlens = None
         seqlen = 1024
         batch_size = 2
-        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+        yarn_rope = YarnRotaryEmbedding(
+            emb_dim,
+            original_max_position_embeddings=seqlen,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+        )
         freqs, mscale = yarn_rope(seqlen, 0)
         cos = (torch.cos(freqs) * mscale).to(dtype)
         sin = (torch.sin(freqs) * mscale).to(dtype)
@@ -211,7 +224,11 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
         for i in range(len(cu_seqlens) - 1):
             max_seqlen = max(max_seqlen, cu_seqlens[i + 1] - cu_seqlens[i])
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device='cuda')
-        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=max_seqlen)
+        yarn_rope = YarnRotaryEmbedding(
+            emb_dim,
+            original_max_position_embeddings=max_seqlen,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+        )
         freqs, mscale = yarn_rope(max_seqlen, 0)
         cos = (torch.cos(freqs) * mscale).to(dtype)
         sin = (torch.sin(freqs) * mscale).to(dtype)

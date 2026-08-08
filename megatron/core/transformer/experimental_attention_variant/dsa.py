@@ -312,16 +312,19 @@ class DSAIndexerLossLoggingHelper:
         tracker["avg_group"] = None
 
     @staticmethod
-    def reduce_loss_in_tracker():
-        """Collect and reduce the indexer losses across ranks."""
+    def reduce_loss_in_tracker(pp_group, dp_group):
+        """Collect and reduce the indexer losses across ranks.
+
+        Args:
+            pp_group: Pipeline-parallel group to sum indexer losses over.
+            dp_group: Data-parallel group (without context parallel) to average over.
+        """
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             return
         values = tracker["values"]
 
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        torch.distributed.all_reduce(values, group=pp_group)
         # Reduce indexer losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
@@ -329,11 +332,7 @@ class DSAIndexerLossLoggingHelper:
             torch.distributed.all_reduce(
                 values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
-        torch.distributed.all_reduce(
-            values,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-            op=torch.distributed.ReduceOp.AVG,
-        )
+        torch.distributed.all_reduce(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
 
     @staticmethod
     def track_indexer_metrics(
@@ -343,6 +342,9 @@ class DSAIndexerLossLoggingHelper:
         wandb_writer=None,
         total_loss_dict=None,
         per_layer_logging: bool = False,
+        *,
+        pp_group,
+        dp_group,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -353,8 +355,10 @@ class DSAIndexerLossLoggingHelper:
             wandb_writer: Weights & Biases writer.
             total_loss_dict: Dictionary to accumulate total losses.
             per_layer_logging: Whether to log per-layer losses.
+            pp_group: Pipeline-parallel group used to reduce indexer losses.
+            dp_group: Data-parallel group used to average indexer losses.
         """
-        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(pp_group, dp_group)
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             return
@@ -1126,8 +1130,10 @@ class DSAIndexer(MegatronModule):
 
         self.softmax_scale: float = self.index_head_dim**-0.5
 
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        assert pg_collection is not None, (
+            "DSAIndexer requires an explicit pg_collection with tp/cp; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
         self.pg_collection = pg_collection
 
         # Initialize Position Embedding.

@@ -224,6 +224,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_num_layers=self.config.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=self.vp_stage,
+                pp_group=self.pp_group,
             )
         )
 

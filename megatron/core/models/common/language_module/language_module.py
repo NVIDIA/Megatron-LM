@@ -28,6 +28,7 @@ from megatron.core.transformer.multi_token_prediction import tie_word_embeddings
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import (
+    get_pg_rank,
     get_tensor_model_parallel_group_if_none,
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
@@ -509,7 +510,9 @@ class LanguageModule(MegatronModule):
         last_stage_word_emb_replica_id = (
             1,  # copy of first stage embedding
             0,
-            parallel_state.get_data_parallel_rank(with_context_parallel=True),
+            # Same group the sharded tensor below is built against, so the replica id and the
+            # sharding always agree -- including when the caller supplies its own grid.
+            get_pg_rank(metadata['dp_cp_group']),
         )
 
         sharded_state_dict[output_layer_weight_key] = make_tp_sharded_tensor_for_checkpoint(

@@ -486,8 +486,10 @@ class MLASelfAttention(MultiLatentAttention):
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
     ):
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        assert pg_collection is not None, (
+            "MultiLatentAttention requires an explicit pg_collection; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
 
         super().__init__(
             config=config,
@@ -1242,8 +1244,10 @@ class FusedMLASelfAttention(MLASelfAttention):
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
     ):
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        assert pg_collection is not None, (
+            "MultiLatentAttention requires an explicit pg_collection; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
 
         MultiLatentAttention.__init__(
             self,

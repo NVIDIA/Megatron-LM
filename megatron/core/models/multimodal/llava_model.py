@@ -178,8 +178,11 @@ class LLaVAModel(MegatronModule):
         self.separate_video_embedder = separate_video_embedder
         self.temporal_ckpt_compat = temporal_ckpt_compat
 
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        assert pg_collection is not None, (
+            "LLaVAModel requires an explicit pg_collection. A vision encoder and an LLM may run "
+            "on independent parallel grids, so the global grid is not a safe default; "
+            "see docs/developer/parallel-state-deprecation.md"
+        )
         self.pg_collection = pg_collection
 
         language_model_type = getattr(language_transformer_config, "language_model_type", "")
@@ -858,9 +861,7 @@ class LLaVAModel(MegatronModule):
                 from megatron.core.parallel_state import get_context_parallel_group
                 from megatron.core.utils import get_batch_on_this_cp_rank
 
-                batch = get_batch_on_this_cp_rank(
-                    batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
-                )
+                batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=self.cp_group)
             else:
                 assert HAVE_TEX and is_te_min_version(
                     "1.10.0"
@@ -1019,6 +1020,7 @@ class LLaVAModel(MegatronModule):
                         images,
                         imgs_sizes,
                         vision_packed_seq_params,
+                        cp_group=self.cp_group,
                         fp8_enabled=False,
                         fp8_recipe=getattr(self.config, "fp8_recipe", None),
                         patch_dim=self.vision_model.patch_dim,
@@ -1064,7 +1066,7 @@ class LLaVAModel(MegatronModule):
                 # matching number of tiles on every rank.
                 if self.context_parallel_lm > 1 and vision_packed_seq_params is not None:
                     image_embeddings = gather_from_context_parallel_ranks_dynamic_res(
-                        image_embeddings, num_padded_imgs
+                        image_embeddings, self.cp_group, num_padded_imgs
                     )
 
                 # After temporal grouping each tubelet is one "tile" for LLaVAModel's

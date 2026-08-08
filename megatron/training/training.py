@@ -2848,6 +2848,8 @@ def training_log(
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            pp_group=mpu.get_pipeline_model_parallel_group(),
+            dp_group=mpu.get_data_parallel_group(with_context_parallel=False),
         )
 
     # Dump memory snapshot and print metrics to stdout.

@@ -10,7 +10,6 @@ import torch
 
 import megatron
 from megatron.core import mpu, tensor_parallel
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.t5_dataset import (
     T5MaskedWordPieceDataset,
@@ -25,9 +24,11 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_local_block_spec,
     get_t5_encoder_with_transformer_engine_block_spec,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from pretrain_gpt import loss_func
 
 """
@@ -87,7 +88,7 @@ def model_provider(
     """
 
     args = get_args()
-    
+
     if config is None:
         config = core_transformer_config_from_args(args)
 
@@ -132,6 +133,9 @@ def model_provider(
         relative_attention_max_distance=args.relative_attention_max_distance,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'cp', 'pp']
+        ),
     )
 
     return model

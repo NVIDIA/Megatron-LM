@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.multimodal.context_parallel import (
     GatherFromContextParallelRanks,
     _compute_tubelet_aware_split_points,
@@ -168,7 +169,9 @@ class TestSplitToContextParallelRanks:
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
         global_t = torch.arange(12, dtype=torch.float32, device="cuda").reshape(4, 3)
 
-        local_t, global_pad = split_to_context_parallel_ranks(global_t)
+        local_t, global_pad = split_to_context_parallel_ranks(
+            global_t, parallel_state.get_context_parallel_group()
+        )
 
         assert torch.equal(local_t, global_t)
         assert global_pad == 0
@@ -213,7 +216,9 @@ class TestDynamicResCPDistributed:
             device="cuda",
         )
 
-        gathered = gather_from_context_parallel_ranks_dynamic_res(local_t)
+        gathered = gather_from_context_parallel_ranks_dynamic_res(
+            local_t, parallel_state.get_context_parallel_group()
+        )
 
         total_tubelets = sum(r + 1 for r in range(cp_size))
         assert gathered.shape == (total_tubelets, patches, hidden)
@@ -235,7 +240,9 @@ class TestDynamicResCPDistributed:
         cp_rank = get_context_parallel_rank()
         local_t = torch.full((1, 2, 4), float(cp_rank), dtype=torch.float32, device="cuda")
 
-        gathered = gather_from_context_parallel_ranks_dynamic_res(local_t, num_padded_imgs=1)
+        gathered = gather_from_context_parallel_ranks_dynamic_res(
+            local_t, parallel_state.get_context_parallel_group(), num_padded_imgs=1
+        )
 
         # With cp_size=2 and one padded rank, only rank 0's tensor survives.
         assert gathered.shape == (1, 2, 4)
@@ -293,6 +300,7 @@ class TestDynamicResCPDistributed:
             global_t,
             global_imgs_sizes,
             global_packed_seq_params,
+            cp_group=parallel_state.get_context_parallel_group(),
             fp8_enabled=False,
             patch_dim=patch_dim,
             temporal_patch_size=1,
@@ -360,6 +368,7 @@ class TestDynamicResCPDistributed:
                 global_t,
                 global_imgs_sizes,
                 global_packed_seq_params,
+                cp_group=parallel_state.get_context_parallel_group(),
                 patch_dim=patch_dim,
                 num_frames=num_frames,
                 temporal_patch_size=temporal_patch_size,
@@ -402,6 +411,7 @@ class TestDynamicResCPDistributed:
                 global_t,
                 global_imgs_sizes,
                 global_packed_seq_params,
+                cp_group=parallel_state.get_context_parallel_group(),
                 patch_dim=patch_dim,
                 temporal_patch_size=1,
             )
@@ -441,6 +451,7 @@ class TestDynamicResCPDistributed:
                 global_t,
                 global_imgs_sizes,
                 global_packed_seq_params,
+                cp_group=parallel_state.get_context_parallel_group(),
                 patch_dim=patch_dim,
                 temporal_patch_size=1,
             )
@@ -457,7 +468,9 @@ class TestDynamicResCPDistributed:
         local_t = torch.full((1, 3, 4), float(cp_rank), dtype=torch.float32, device="cuda")
 
         # Simulate global_pad=2 ⇒ trailing 2 columns of the gathered tensor get dropped.
-        out = gather_from_context_parallel_ranks(local_t, global_pad=2)
+        out = gather_from_context_parallel_ranks(
+            local_t, global_pad=2, cp_group=parallel_state.get_context_parallel_group()
+        )
 
         # cp_size * seq - global_pad = 2*3 - 2 = 4 effective columns.
         assert out.shape == (1, 4, 4)
@@ -479,7 +492,9 @@ class TestDynamicResCPDistributed:
             (1, 4, 8), float(cp_rank + 1), dtype=torch.float32, device="cuda", requires_grad=True
         )
 
-        gathered = GatherFromContextParallelRanks.apply(local_t)
+        gathered = GatherFromContextParallelRanks.apply(
+            local_t, parallel_state.get_context_parallel_group()
+        )
         loss = gathered.sum()
         loss.backward()
 
