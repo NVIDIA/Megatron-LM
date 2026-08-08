@@ -597,6 +597,51 @@ def _require_cute(message: str, *tensors: Optional[torch.Tensor]) -> None:
 _COMPILED_LAUNCH_CACHE = {}
 
 
+
+def _compute_compact_src_indices(
+    cu_seqlens,
+    global_start: int,
+    l_local: int,
+    ratio: int,
+    d_comp: int,
+    d_window: int,
+    compact_len: int,
+):
+    """Map each compact row to its source row in cat(boundary_hidden, hidden_local).
+    PyTorch fallback for _compressor_input_compact_bwd when CuTe DSL fails.
+    Returns int64 CUDA tensor of shape (compact_len,); -1 means no source.
+    """
+    cu_cpu = cu_seqlens.cpu().tolist()
+    n_seq = len(cu_cpu) - 1
+    range_start = global_start
+    range_end = global_start + l_local
+    first_range_group_start = range_start - d_comp
+    src_indices = [-1] * compact_len
+    running_tokens = 0
+    for seq in range(n_seq):
+        seq_start = cu_cpu[seq]
+        seq_end = cu_cpu[seq + 1]
+        local_seq_end = min(seq_end, range_end)
+        if seq_start < local_seq_end and range_start < local_seq_end:
+            first_visible_numer = max(0, first_range_group_start - seq_start)
+            first_visible_group = (first_visible_numer + ratio - 1) // ratio
+            stop_visible_group = (local_seq_end - seq_start) // ratio
+            visible_group_count = max(0, stop_visible_group - first_visible_group)
+            visible_token_count = visible_group_count * ratio
+            for local_tok in range(visible_token_count):
+                comp_id = first_visible_group + local_tok // ratio
+                tok_in_group = local_tok % ratio
+                src_global = seq_start + comp_id * ratio + tok_in_group
+                compact_row = running_tokens + local_tok
+                if compact_row < compact_len:
+                    if src_global < range_start:
+                        src_indices[compact_row] = src_global - (range_start - d_window)
+                    else:
+                        src_indices[compact_row] = d_window + (src_global - range_start)
+            running_tokens += visible_token_count
+    return torch.tensor(src_indices, dtype=torch.int64, device=cu_seqlens.device)
+
+
 def _run_compiled_launch(
     launch_fn,
     tensor_args: Tuple[torch.Tensor, ...],
@@ -688,30 +733,74 @@ class CompressorInputCompact(torch.autograd.Function):
         ctx.save_for_backward(cu_seqlens)
 
         compact_len = int(c_cap) * int(ratio)
-        hidden_compact = hidden_local.new_empty((compact_len,) + tuple(hidden_local.shape[1:]))
-        comp_ids = torch.empty((int(c_cap),), dtype=torch.int32, device=hidden_local.device)
+        hidden_compact = hidden_local.new_zeros((compact_len,) + tuple(hidden_local.shape[1:]))
+        comp_ids = torch.zeros((int(c_cap),), dtype=torch.int32, device=hidden_local.device)
         row_width = math.prod(hidden_local.shape[1:])
-        _run_compiled_launch(
-            _compressor_input_compact_fwd_launch,
-            (
-                hidden_local.reshape(int(l_local), row_width),
-                boundary_hidden.reshape(int(d_window), row_width),
-                hidden_compact.reshape(compact_len, row_width),
-                cu_seqlens,
-                comp_ids,
-            ),
-            (
-                cu_seqlens.shape[0] - 1,
-                int(global_start),
-                int(l_local),
-                int(ratio),
-                int(d_comp),
-                int(d_window),
-                compact_len,
-                row_width,
-            ),
-            static_arg_indices=(3, 4, 5, 7),
-        )
+        try:
+            _run_compiled_launch(
+                _compressor_input_compact_fwd_launch,
+                (
+                    hidden_local.reshape(int(l_local), row_width),
+                    boundary_hidden.reshape(int(d_window), row_width),
+                    hidden_compact.reshape(compact_len, row_width),
+                    cu_seqlens,
+                    comp_ids,
+                ),
+                (
+                    cu_seqlens.shape[0] - 1,
+                    int(global_start),
+                    int(l_local),
+                    int(ratio),
+                    int(d_comp),
+                    int(d_window),
+                    compact_len,
+                    row_width,
+                ),
+                static_arg_indices=(3, 4, 5, 7),
+            )
+            if hidden_compact.isnan().any():
+                raise RuntimeError(
+                    "CompressorInputCompact fwd: CuTe kernel produced NaN in hidden_compact"
+                )
+        except Exception:
+            # PyTorch fallback: reconstruct hidden_compact and comp_ids without CuTe DSL.
+            # Used when the CuTe kernel fails or produces NaN (e.g. fw-final container).
+            src_indices = _compute_compact_src_indices(
+                cu_seqlens, int(global_start), int(l_local), int(ratio), int(d_comp),
+                int(d_window), compact_len,
+            )
+            combined = torch.cat(
+                [
+                    boundary_hidden.reshape(int(d_window), row_width),
+                    hidden_local.reshape(int(l_local), row_width),
+                ],
+                dim=0,
+            )
+            valid_mask = src_indices >= 0
+            if valid_mask.any():
+                hidden_compact.reshape(compact_len, row_width)[valid_mask] = (
+                    combined[src_indices[valid_mask]]
+                )
+            # Derive comp_ids (per-sequence compressed group id for each compact group)
+            # from the group-leader src_indices by recovering src_global and seq_start.
+            cu_cpu = cu_seqlens.cpu().tolist()
+            n_seq = len(cu_cpu) - 1
+            range_start = int(global_start)
+            comp_ids_cpu = [0] * int(c_cap)
+            for g in range(int(c_cap)):
+                leader = g * int(ratio)
+                if leader < compact_len:
+                    si = int(src_indices[leader].item())
+                    if si >= 0:
+                        if si < int(d_window):
+                            src_global = range_start - int(d_window) + si
+                        else:
+                            src_global = range_start + si - int(d_window)
+                        for s in range(n_seq):
+                            if cu_cpu[s] <= src_global < cu_cpu[s + 1]:
+                                comp_ids_cpu[g] = (src_global - cu_cpu[s]) // int(ratio)
+                                break
+            comp_ids.copy_(torch.tensor(comp_ids_cpu, dtype=torch.int32))
         return hidden_compact, comp_ids
 
     @staticmethod
@@ -720,31 +809,50 @@ class CompressorInputCompact(torch.autograd.Function):
         (cu_seqlens,) = ctx.saved_tensors
         global_start, l_local, ratio, d_comp, d_window = ctx.compact_args
         grad_hidden_compact = grad_hidden_compact.contiguous()
-        grad_hidden = grad_hidden_compact.new_empty(ctx.hidden_shape)
-        grad_boundary = grad_hidden_compact.new_empty(ctx.boundary_shape)
+        grad_hidden = grad_hidden_compact.new_zeros(ctx.hidden_shape)
+        grad_boundary = grad_hidden_compact.new_zeros(ctx.boundary_shape)
         compact_len = grad_hidden_compact.shape[0]
         row_width = math.prod(ctx.hidden_shape[1:])
-        _run_compiled_launch(
-            _compressor_input_compact_bwd_launch,
-            (
-                grad_hidden_compact.reshape(compact_len, row_width),
-                grad_hidden.reshape(l_local, row_width),
-                grad_boundary.reshape(d_window, row_width),
-                cu_seqlens,
-            ),
-            (
-                cu_seqlens.shape[0] - 1,
-                global_start,
-                l_local,
-                ratio,
-                d_comp,
-                d_window,
-                compact_len,
-                row_width,
-                l_local + d_window,
-            ),
-            static_arg_indices=(3, 4, 5, 7),
-        )
+        try:
+            _run_compiled_launch(
+                _compressor_input_compact_bwd_launch,
+                (
+                    grad_hidden_compact.reshape(compact_len, row_width),
+                    grad_hidden.reshape(l_local, row_width),
+                    grad_boundary.reshape(d_window, row_width),
+                    cu_seqlens,
+                ),
+                (
+                    cu_seqlens.shape[0] - 1,
+                    global_start,
+                    l_local,
+                    ratio,
+                    d_comp,
+                    d_window,
+                    compact_len,
+                    row_width,
+                    l_local + d_window,
+                ),
+                static_arg_indices=(3, 4, 5, 7),
+            )
+        except Exception:
+            # PyTorch fallback: scatter grad_hidden_compact back to boundary/local
+            # using the same forward mapping logic, recomputed on CPU.
+            src_indices = _compute_compact_src_indices(
+                cu_seqlens, global_start, l_local, ratio, d_comp, d_window, compact_len
+            )
+            combined_grad = torch.zeros(
+                (d_window + l_local,) + tuple(grad_hidden_compact.shape[1:]),
+                dtype=grad_hidden_compact.dtype,
+                device=grad_hidden_compact.device,
+            )
+            valid_mask = src_indices >= 0
+            if valid_mask.any():
+                combined_grad.index_add_(
+                    0, src_indices[valid_mask], grad_hidden_compact[valid_mask]
+                )
+            grad_boundary.copy_(combined_grad[:d_window])
+            grad_hidden.copy_(combined_grad[d_window:])
         return (grad_hidden, grad_boundary, *([None] * 5))
 
 
