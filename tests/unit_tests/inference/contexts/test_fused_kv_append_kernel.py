@@ -6,6 +6,7 @@ import torch
 from megatron.core.inference.contexts.fused_kv_append_kernel import (
     HAVE_TRITON,
     triton_append_key_value_cache,
+    triton_append_mla_latent_cache,
 )
 from megatron.core.inference.contexts.gpu_view import ContextGPUView
 
@@ -108,3 +109,161 @@ class TestKVAppendLargeBlockIdx:
         assert torch.equal(
             actual_value, expected_value
         ), f"Value not at expected cache position (block {target_block})."
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not HAVE_TRITON, reason="Triton required")
+class TestMLALatentAppend:
+    """Tests for Triton MLA latent cache append kernel."""
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize("n_tokens", [1, 4, 16])
+    def test_mla_latent_append_numerical_parity(self, dtype, n_tokens):
+        """Verify bitwise parity between Triton MLA append kernel and PyTorch reference."""
+        device = "cuda"
+        num_layers = 2
+        layer = 0
+        total_blocks = 16
+        block_size = 64
+        kv_reduced_dim = 512
+
+        memory_buffer_triton = torch.zeros(
+            num_layers, total_blocks, block_size, kv_reduced_dim, dtype=dtype, device=device
+        )
+        memory_buffer_ref = torch.zeros(
+            num_layers, total_blocks, block_size, kv_reduced_dim, dtype=dtype, device=device
+        )
+
+        kv_concat = torch.randn(n_tokens, 1, kv_reduced_dim, dtype=dtype, device=device)
+        block_idx = (torch.arange(n_tokens, dtype=torch.int32, device=device) * 2) % total_blocks
+        local_pos = (torch.arange(n_tokens, dtype=torch.int32, device=device) * 3) % block_size
+
+        # PyTorch reference
+        memory_buffer_ref[layer, block_idx[:n_tokens], local_pos[:n_tokens]] = kv_concat.squeeze(1)[
+            :n_tokens
+        ]
+
+        # Triton kernel
+        triton_append_mla_latent_cache(
+            layer_number=layer,
+            kv_concat=kv_concat,
+            memory_buffer=memory_buffer_triton,
+            padded_active_token_count=n_tokens,
+            token_to_block_idx=block_idx,
+            token_to_local_position_within_kv_block=local_pos,
+        )
+
+        assert torch.equal(memory_buffer_triton, memory_buffer_ref)
+
+    def test_mla_latent_append_cuda_graph_capture(self):
+        """Verify Triton MLA append works cleanly inside CUDA Graph capture & replay."""
+        device = "cuda"
+        num_layers = 1
+        layer = 0
+        total_blocks = 8
+        block_size = 32
+        kv_reduced_dim = 256
+        n_tokens = 2
+        dtype = torch.bfloat16
+
+        memory_buffer = torch.zeros(
+            num_layers, total_blocks, block_size, kv_reduced_dim, dtype=dtype, device=device
+        )
+        kv_concat = torch.randn(n_tokens, 1, kv_reduced_dim, dtype=dtype, device=device)
+        block_idx = torch.tensor([1, 3], dtype=torch.int32, device=device)
+        local_pos = torch.tensor([4, 12], dtype=torch.int32, device=device)
+
+        # Warmup
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                triton_append_mla_latent_cache(
+                    layer_number=layer,
+                    kv_concat=kv_concat,
+                    memory_buffer=memory_buffer,
+                    padded_active_token_count=n_tokens,
+                    token_to_block_idx=block_idx,
+                    token_to_local_position_within_kv_block=local_pos,
+                )
+        torch.cuda.current_stream().wait_stream(s)
+
+        # Capture
+        g = torch.cuda.CUDAGraph()
+        memory_buffer.zero_()
+        with torch.cuda.graph(g):
+            triton_append_mla_latent_cache(
+                layer_number=layer,
+                kv_concat=kv_concat,
+                memory_buffer=memory_buffer,
+                padded_active_token_count=n_tokens,
+                token_to_block_idx=block_idx,
+                token_to_local_position_within_kv_block=local_pos,
+            )
+
+        # Replay
+        g.replay()
+        torch.cuda.synchronize()
+
+        expected = torch.zeros_like(memory_buffer)
+        expected[layer, block_idx, local_pos] = kv_concat.squeeze(1)
+
+        assert torch.equal(memory_buffer, expected)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or _gpu_memory_gb() < 10.0,
+        reason="Needs >= 10 GiB free GPU memory to allocate the overflow-sized cache",
+    )
+    def test_mla_latent_append_block_idx_overflow(self):
+        """Trigger the int32 overflow boundary for MLA latent append kernel.
+
+        stride_cache_block = 64 × 512 = 32,768 = 2^15.
+        block_idx = 2^16 -> offset = 2**31 (overflows signed int32).
+        """
+        device = "cuda"
+        total_blocks = 65_537
+        block_size = 64
+        kv_reduced_dim = 512
+        target_block = 65_536
+        n_tokens = 1
+        layer = 0
+
+        view = ContextGPUView(max_requests=4, max_tokens=32, max_kv_blocks=4, device=device)
+        block_idx_dtype = view.token_to_block_idx.dtype
+
+        memory_buffer = torch.zeros(
+            1, total_blocks, block_size, kv_reduced_dim, dtype=torch.bfloat16, device=device
+        )
+        kv_concat = torch.randn(n_tokens, 1, kv_reduced_dim, dtype=torch.bfloat16, device=device)
+
+        block_indices = torch.tensor([target_block], dtype=block_idx_dtype, device=device)
+        local_positions = torch.zeros(n_tokens, dtype=torch.int32, device=device)
+
+        triton_append_mla_latent_cache(
+            layer_number=layer,
+            kv_concat=kv_concat,
+            memory_buffer=memory_buffer,
+            padded_active_token_count=n_tokens,
+            token_to_block_idx=block_indices,
+            token_to_local_position_within_kv_block=local_positions,
+        )
+
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError as e:
+            pytest.fail(
+                f"CUDA error during MLA KV append — likely int32 offset overflow "
+                f"(token_to_block_idx dtype is {block_idx_dtype}): {e}"
+            )
+
+        expected = kv_concat.squeeze(1)[0]
+        actual = memory_buffer[layer, target_block, 0]
+
+        assert torch.equal(actual, expected), (
+            f"MLA latent vector not at expected cache position (block {target_block}). "
+            f"token_to_block_idx dtype is {block_idx_dtype}; "
+            f"stride_cache_block = {block_size * kv_reduced_dim}, "
+            f"block_idx * stride = {target_block * block_size * kv_reduced_dim} "
+            f"(overflows int32 at 2**31 = {2**31})."
+        )
