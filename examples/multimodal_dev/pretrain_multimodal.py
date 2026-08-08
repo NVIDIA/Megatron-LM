@@ -38,6 +38,7 @@ from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.utils import start_memory_history_recording
 
 
 def model_provider(
@@ -160,6 +161,10 @@ if __name__ == "__main__":
             "not wired through. Run with --pipeline-model-parallel-size 1."
         )
     full_config = pretrain_cfg_container_from_args(args)
+    # training.py enables allocator history only on the config-container MODEL
+    # flow; this entry uses model_provider, so it enables recording itself, and
+    # must stay ahead of pretrain(), which constructs the model.
+    start_memory_history_recording(getattr(full_config, "profiling", None))
     pretrain(
         full_config,
         datasets_provider,
