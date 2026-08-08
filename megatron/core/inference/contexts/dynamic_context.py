@@ -3171,11 +3171,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         (
             matched_block_ids,
             num_blocks_from_pool,
-            already_allocated_blocks,
+            chunk_start_block,
             overall_required_blocks,
             prefix_skip_tokens,
             effective_prefill_chunk_length,
         ) = self._compute_prefix_match(req, prefill_chunk_length, record_mamba_match=True)
+        # _compute_prefix_match calls this already_allocated_blocks, which describes
+        # the state on entry. Below, this chunk's own blocks have been allocated by
+        # the time it is read, so what it denotes here is the block position where
+        # this chunk's blocks begin -- i.e. ceil(finished_chunk_token_count / block).
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
@@ -3257,8 +3261,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Assign blocks: matched blocks at [already_allocated, already_allocated + num_matched),
         # then newly allocated blocks after that.
-        match_start = already_allocated_blocks
-        new_block_start = already_allocated_blocks + num_matched_blocks
+        match_start = chunk_start_block
+        new_block_start = chunk_start_block + num_matched_blocks
         if num_matched_blocks > 0:
             self.request_to_kv_block_ids[current_id][
                 match_start : match_start + num_matched_blocks
@@ -3303,9 +3307,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Register hashes for completely filled blocks (skip matched blocks).
         # Two disjoint ranges may need registration:
-        #   Range 1: [previously_complete, min(already_allocated_blocks, num_complete_blocks))
+        #   Range 1: [previously_complete, min(chunk_start_block, num_complete_blocks))
         #       — the partial block from a prior chunk that this chunk's tokens completed
-        #   Range 2: [already_allocated_blocks + num_matched_blocks, num_complete_blocks)
+        #   Range 2: [chunk_start_block + num_matched_blocks, num_complete_blocks)
         #       — newly allocated blocks that are now complete
         if self.enable_prefix_caching and req.precomputed_block_hashes:
             total_tokens_after = req.finished_chunk_token_count + prefill_chunk_length
@@ -3342,9 +3346,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     )
 
             # Range 1: prior-chunk partial block that this chunk just completed
-            _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))
+            _register_range(previously_complete, min(chunk_start_block, num_complete_blocks))
             # Range 2: newly allocated (non-matched) blocks that are now complete
-            _register_range(already_allocated_blocks + num_matched_blocks, num_complete_blocks)
+            _register_range(chunk_start_block + num_matched_blocks, num_complete_blocks)
 
         if self.is_hybrid_model and req.finished_chunk_token_count == 0:
             # Allocate a slot for Mamba states
