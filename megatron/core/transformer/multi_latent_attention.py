@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn, Optional, Union
 
@@ -82,6 +83,31 @@ if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
 
 
+_WARNED_NATIVE_V_BELOW_SM90 = False
+
+
+def _warn_native_v_below_sm90():
+    """Warn once when the native V width is in use on a device with no kernel for it.
+
+    Below compute capability 9.0 neither cuDNN nor FlashAttention accepts unequal QK and V
+    widths, so the attention call falls back to the unfused path. That is two orders of
+    magnitude slower and produces no error of its own, so it is worth saying out loud.
+    """
+    global _WARNED_NATIVE_V_BELOW_SM90
+    if _WARNED_NATIVE_V_BELOW_SM90 or not torch.cuda.is_available():
+        return
+    if torch.cuda.get_device_capability() >= (9, 0):
+        return
+    _WARNED_NATIVE_V_BELOW_SM90 = True
+    major, minor = torch.cuda.get_device_capability()
+    warnings.warn(
+        f"mla_native_v_head_dim is enabled on compute capability {major}.{minor}, where no "
+        "attention backend has a kernel for unequal QK and V head dims. Attention will fall "
+        "back to the unfused path. Set mla_native_v_head_dim=False on this device.",
+        stacklevel=2,
+    )
+
+
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
     """Prepare value tensor for MLA core attention THD execution."""
     orig_v_dim = value.shape[-1] if value is not None else None
@@ -90,12 +116,21 @@ def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_s
         packed_seq_params is not None
         and packed_seq_params.qkv_format == "thd"
         and parallel_attention.config.experimental_attention_variant is None
+        and not parallel_attention.config.mla_native_v_head_dim
         and value is not None
         and query.shape[-1] != orig_v_dim
     )
     if need_v_pad:
         value = F.pad(value, [0, query.shape[-1] - orig_v_dim])
         padded_v_dim = value.shape[-1]
+    elif (
+        packed_seq_params is not None
+        and packed_seq_params.qkv_format == "thd"
+        and parallel_attention.config.mla_native_v_head_dim
+        and value is not None
+        and query.shape[-1] != orig_v_dim
+    ):
+        _warn_native_v_below_sm90()
     return value, need_v_pad, orig_v_dim, padded_v_dim
 
 

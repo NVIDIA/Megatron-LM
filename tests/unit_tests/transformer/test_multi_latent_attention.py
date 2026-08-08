@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import os
+import warnings
 from inspect import signature
 from unittest import mock
 
@@ -388,6 +389,8 @@ class TestParallelMLAAttention:
                 qk_head_dim=128,
                 v_head_dim=64,
                 qk_pos_emb_head_dim=64,
+                # Pinned: this test covers the padded path, which is no longer the default.
+                mla_native_v_head_dim=False,
                 rope_type=self.transformer_config.rope_type,
                 rotary_base=self.transformer_config.rotary_base,
                 original_max_position_embeddings=self.transformer_config.original_max_position_embeddings,
@@ -437,6 +440,92 @@ class TestParallelMLAAttention:
                 assert output.shape[1] == micro_batch_size
                 assert output.shape[2] == transformer_config.hidden_size
                 assert bias.shape[0] == transformer_config.hidden_size
+
+    @pytest.mark.parametrize("mla_native_v_head_dim", [False, True])
+    def test_gpu_forward_thd_native_v_head_dim(self, mla_native_v_head_dim):
+        """Test that mla_native_v_head_dim controls the thd V pad without changing the output."""
+        if is_te_min_version("1.10.0"):
+            transformer_config = MLATransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                q_lora_rank=32,
+                kv_lora_rank=32,
+                qk_head_dim=128,
+                v_head_dim=64,
+                qk_pos_emb_head_dim=64,
+                mla_native_v_head_dim=mla_native_v_head_dim,
+                rope_type=self.transformer_config.rope_type,
+                rotary_base=self.transformer_config.rotary_base,
+                original_max_position_embeddings=self.transformer_config.original_max_position_embeddings,
+            )
+            attention = MLASelfAttention(
+                transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+            sequence_length = 32
+            micro_batch_size = 1
+
+            attention.cuda().bfloat16()
+
+            hidden_states = torch.ones(
+                (sequence_length, micro_batch_size, transformer_config.hidden_size)
+            )
+            hidden_states = hidden_states.cuda().bfloat16()
+
+            with mock.patch.dict(
+                os.environ, {"NVTE_FUSED_ATTN": "1", "NVTE_FLASH_ATTN": "0"}, clear=False
+            ):
+                packed_seq_params = make_test_packed_seq_params(sequence_length=sequence_length)
+                query, _, value, _, _ = attention.get_query_key_value_tensors(
+                    hidden_states, None, None, packed_seq_params, None
+                )
+                assert query.shape[-1] != value.shape[-1]
+
+                prepared, need_v_pad, orig_v_dim, _ = mla_module._prepare_mla_core_attention_value(
+                    attention, query, value, packed_seq_params
+                )
+                assert need_v_pad is not mla_native_v_head_dim
+                assert prepared.shape[-1] == (
+                    orig_v_dim if mla_native_v_head_dim else query.shape[-1]
+                )
+
+                output, bias = attention(hidden_states, None, packed_seq_params=packed_seq_params)
+
+                assert output.shape[0] == sequence_length
+                assert output.shape[1] == micro_batch_size
+                assert output.shape[2] == transformer_config.hidden_size
+                assert bias.shape[0] == transformer_config.hidden_size
+
+    @pytest.mark.parametrize("capability,expect_warning", [((8, 0), True), ((9, 0), False)])
+    def test_native_v_warns_only_below_sm90(self, capability, expect_warning):
+        """The default is fast from sm90 on and a large regression below it, so warn there."""
+        mla_module._WARNED_NATIVE_V_BELOW_SM90 = False
+        with mock.patch("torch.cuda.is_available", return_value=True), mock.patch(
+            "torch.cuda.get_device_capability", return_value=capability
+        ):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                mla_module._warn_native_v_below_sm90()
+        assert bool(caught) is expect_warning
+        if expect_warning:
+            assert "mla_native_v_head_dim" in str(caught[0].message)
+
+    def test_native_v_warns_once(self):
+        """It sits on the per-layer path, so warning every call would flood the log."""
+        mla_module._WARNED_NATIVE_V_BELOW_SM90 = False
+        with mock.patch("torch.cuda.is_available", return_value=True), mock.patch(
+            "torch.cuda.get_device_capability", return_value=(8, 0)
+        ):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                for _ in range(5):
+                    mla_module._warn_native_v_below_sm90()
+        assert len(caught) == 1
 
     def test_checkpointed_gpu_forward(self):
         if is_te_min_version("1.10.0"):
