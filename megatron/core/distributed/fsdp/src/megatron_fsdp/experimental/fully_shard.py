@@ -24,7 +24,8 @@ from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .module import FsdpContext, FsdpModule
+from .context import FsdpContext
+from .module import FsdpModule
 from .placement import MeshAxis, Placements
 
 _FSDP_CONTEXT = ContextVar[FsdpContext | None]("megatron_fsdp_context", default=None)
