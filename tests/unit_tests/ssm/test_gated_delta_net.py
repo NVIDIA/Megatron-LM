@@ -2,6 +2,8 @@
 
 import copy
 import os
+import sys
+from types import ModuleType
 
 import pytest
 import torch
@@ -28,6 +30,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
 )
+from megatron.core.ssm.gated_delta_net.gdn import _load_flash_qla_chunk_gated_delta_rule
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -40,6 +43,29 @@ from tests.unit_tests.transformer.test_multi_latent_attention import (
 # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-multi-rank-gpu-enable
 # NVLS doesn't support one single GPU to be shared by multiple ranks, so disable this in test
 os.environ.update({"NCCL_NVLS_ENABLE": "0"})
+
+
+def test_flash_qla_backend_requires_frozen_version(monkeypatch: pytest.MonkeyPatch):
+    """Reject FlashQLA versions outside the Qwen3.5 H100 contract."""
+    flash_qla = ModuleType("flash_qla")
+    flash_qla.__version__ = "0.1.1"
+    flash_qla.chunk_gated_delta_rule = object()
+    monkeypatch.setitem(sys.modules, "flash_qla", flash_qla)
+
+    with pytest.raises(ImportError, match=r"requires flash-qla==0\.1\.2; found 0\.1\.1"):
+        _load_flash_qla_chunk_gated_delta_rule()
+
+
+def test_flash_qla_backend_accepts_frozen_version(monkeypatch: pytest.MonkeyPatch):
+    """Load the exact FlashQLA version used by the frozen H100 result."""
+    flash_qla = ModuleType("flash_qla")
+    flash_qla.__version__ = "0.1.2"
+    flash_qla.chunk_gated_delta_rule = lambda *args, **kwargs: (args, kwargs)
+    monkeypatch.setitem(sys.modules, "flash_qla", flash_qla)
+
+    backend = _load_flash_qla_chunk_gated_delta_rule()
+
+    assert backend("input", cp_context=None, cu_seqlens_cpu=None) == (("input",), {})
 
 
 def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[torch.Tensor]:

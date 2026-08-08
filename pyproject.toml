@@ -97,7 +97,7 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "multi-storage-client~=0.50",
     "opentelemetry-api~=1.33.1",
-    "flash-linear-attention~=0.5.1",
+    "flash-linear-attention==0.4.2",
     "megatron-energon[av_decode]~=7.0",
     "av",
     "flashinfer-python>=0.5.0,<0.7.0",
@@ -129,6 +129,11 @@ te = [
 ssm = [
     "mamba-ssm",
     "causal-conv1d~=1.5",
+]
+
+qwen35-h100-perf = [
+    "flash-linear-attention==0.4.2",
+    "flash-qla==0.1.2",
 ]
 
 [dependency-groups]
@@ -180,6 +185,12 @@ no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm"]
 [tool.uv]
 managed = true
 default-groups = ["linting", "build", "test"]
+conflicts = [
+    [
+        { extra = "qwen35-h100-perf" },
+        { extra = "ssm" },
+    ],
+]
 no-build-isolation-package = [
     "causal-conv1d",
     "flash_mla",

@@ -25,13 +25,13 @@ from megatron.core.ssm.gated_delta_net.common import (
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
-
 _GATED_DELTA_RULE_BACKEND_SUPPORTS_DETERMINISTIC_MODE = {
     "fla": False,
     "flash_qla": False,
     "torch": True,
 }
 _FLASH_QLA_SUPPORTED_CUDA_CAPABILITIES = ((9, 0), (10, 0), (12, 0))
+_FLASH_QLA_REQUIRED_VERSION = "0.1.2"
 
 
 def _current_cuda_device_capability() -> tuple[int, int] | None:
@@ -44,11 +44,19 @@ def _current_cuda_device_capability() -> tuple[int, int] | None:
 def _load_flash_qla_chunk_gated_delta_rule():
     """Import FlashQLA lazily and adapt its callable to the FLA interface."""
     try:
-        from flash_qla import chunk_gated_delta_rule as flash_qla_chunk_gated_delta_rule
+        import flash_qla
     except (ImportError, RuntimeError, ValueError) as exc:
         raise ImportError(
             "FlashQLA requires the `flash_qla` package on a supported CUDA device."
         ) from exc
+
+    installed_version = getattr(flash_qla, "__version__", None)
+    if installed_version != _FLASH_QLA_REQUIRED_VERSION:
+        raise ImportError(
+            f"FlashQLA requires flash-qla=={_FLASH_QLA_REQUIRED_VERSION}; "
+            f"found {installed_version or 'an unknown version'}."
+        )
+    flash_qla_chunk_gated_delta_rule = flash_qla.chunk_gated_delta_rule
 
     def _flash_qla_chunk_gated_delta_rule_adapter(*args, cp_context=None, **kwargs):
         cu_seqlens_cpu = kwargs.pop("cu_seqlens_cpu", None)
@@ -62,12 +70,7 @@ def _load_flash_qla_chunk_gated_delta_rule():
 
 
 def _select_gated_delta_rule_backend(
-    backend: str,
-    *,
-    deterministic_mode: bool,
-    cp_size: int,
-    key_head_dim: int,
-    value_head_dim: int,
+    backend: str, *, deterministic_mode: bool, cp_size: int, key_head_dim: int, value_head_dim: int
 ):
     """Return the callable implementing the requested GDN backend."""
     if backend not in _GATED_DELTA_RULE_BACKEND_SUPPORTS_DETERMINISTIC_MODE:
@@ -92,10 +95,7 @@ def _select_gated_delta_rule_backend(
         )
     capability = _current_cuda_device_capability()
     if capability not in _FLASH_QLA_SUPPORTED_CUDA_CAPABILITIES:
-        raise ValueError(
-            "FlashQLA supports SM90/SM100/SM120, "
-            f"got {capability}."
-        )
+        raise ValueError("FlashQLA supports SM90/SM100/SM120, " f"got {capability}.")
     return _load_flash_qla_chunk_gated_delta_rule()
 
 
@@ -342,14 +342,7 @@ class GatedDeltaNet(_GDNBase):
 
             nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
             kernel_inputs = self._prepare_input_for_gated_delta_rule(
-                qkv,
-                gate,
-                A_log_local_cp,
-                dt_bias_local_cp,
-                batch,
-                local_seq_len,
-                beta,
-                alpha,
+                qkv, gate, A_log_local_cp, dt_bias_local_cp, batch, local_seq_len, beta, alpha
             )
             gate = kernel_inputs.pop("gate")
             nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
