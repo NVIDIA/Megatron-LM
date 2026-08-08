@@ -1038,3 +1038,130 @@ class TestDSv4HybridMatchesStandard:
         std_flops = num_floating_point_operations(standard, batch_size)
         hyb_flops = num_floating_point_operations(hybrid, batch_size)
         assert hyb_flops == std_flops
+
+
+def _make_dsa_args():
+    """Minimal MLA + DSA args (GLM-5.2 style, small scale).
+
+    Uses ``dsa_indexer_topk_freq=1`` and ``dsa_indexer_skip_topk_offset=0``
+    so every layer computes its own top-k index -- the golden reference can
+    set ``num_indexer_layers = num_layers`` without importing the skip-layer
+    predicate from megatron.core.
+    """
+    args = _make_gpt_args(
+        num_layers=4,
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
+    )
+    args.multi_latent_attention = True
+    args.group_query_attention = False
+    args.q_lora_rank = 128
+    args.kv_lora_rank = 64
+    args.qk_head_dim = 48
+    args.qk_pos_emb_head_dim = 16
+    args.v_head_dim = 64
+    args.experimental_attention_variant = "dsa"
+    args.dsa_indexer_n_heads = 4
+    args.dsa_indexer_head_dim = 32
+    args.dsa_indexer_topk = 16
+    args.dsa_indexer_topk_freq = 1
+    args.dsa_indexer_skip_topk_offset = 0
+    return args
+
+
+def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum):
+    """Independent golden calculator for DSA FLOPs.
+
+    Reimplements the formula from ``num_floating_point_operations`` so that
+    the test does not just call the same code twice. Assumes no MoE / MTP,
+    ``dsa_indexer_topk_freq=1``, and ``dsa_indexer_skip_topk_offset=0``
+    (every layer computes its own index).
+    """
+    fwd_bwd = 3
+    fma = 2
+    ffn_exp = 3 if args.swiglu else 2
+    num_layers = args.num_layers
+    nh = args.num_attention_heads
+
+    # ---- MLA projections (token-linear, per layer) ----
+    q_term = args.q_lora_rank * (
+        args.hidden_size + nh * (args.qk_head_dim + args.qk_pos_emb_head_dim) + 1
+    )
+    kv_term = (
+        args.kv_lora_rank * (args.hidden_size + nh * (args.qk_head_dim + args.v_head_dim) + 1)
+        + args.hidden_size * args.qk_pos_emb_head_dim
+    )
+    o_term = nh * args.v_head_dim * args.hidden_size
+    mla_proj_per_layer = fwd_bwd * fma * (q_term + kv_term + o_term)
+
+    # ---- Core attention: MLA cost scaled down to top-k sparse pairs ----
+    raw_core = nh * (args.qk_head_dim + args.qk_pos_emb_head_dim) / 2 + nh * args.v_head_dim / 2
+    mean_seqlen = seqlen_squared_sum / total_tokens
+    topk = args.dsa_indexer_topk
+    if mean_seqlen <= topk:
+        sparse_scale = 1.0
+    else:
+        dense_pairs = mean_seqlen * mean_seqlen / 2
+        topk_pairs = topk * mean_seqlen - topk * topk / 2
+        sparse_scale = topk_pairs / dense_pairs
+    sparse_core_per_layer = fwd_bwd * fma * raw_core * sparse_scale
+
+    # ---- DSA indexer: every layer is a computing layer (topk_freq=1, skip_offset=0) ----
+    num_indexer_layers = num_layers
+    idx_dim = args.dsa_indexer_n_heads * args.dsa_indexer_head_dim
+    idx_token = num_indexer_layers * (
+        args.q_lora_rank * idx_dim  # wq_b
+        + args.hidden_size * args.dsa_indexer_head_dim  # wk
+        + args.hidden_size * args.dsa_indexer_n_heads  # weights_proj
+    )
+    idx_core = num_indexer_layers * idx_dim / 2
+    dsa_extra_token = fwd_bwd * fma * idx_token
+    dsa_extra_core = fwd_bwd * fma * idx_core
+
+    # ---- Aggregation ----
+    mlp = fwd_bwd * fma * args.hidden_size * (args.ffn_hidden_size * ffn_exp * num_layers)
+    logit = fwd_bwd * fma * args.hidden_size * args.padded_vocab_size
+    self_attn_term = mla_proj_per_layer * num_layers + dsa_extra_token
+    self_attn_core_term = sparse_core_per_layer * num_layers + dsa_extra_core
+
+    return total_tokens * (mlp + self_attn_term + logit) + seqlen_squared_sum * self_attn_core_term
+
+
+class TestDSA:
+    """DSA sparse-attention FLOPs against an independent golden calculator."""
+
+    def test_bshd(self):
+        """BSHD (uniform sequences) must match the golden calculator."""
+        args = _make_dsa_args()
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        flops = num_floating_point_operations(args, batch_size)
+        expected = _dsa_golden_flops(args, total_tokens, sum_sq)
+        assert flops == expected
+
+    def test_thd(self):
+        """THD (packed variable-length subsequences) must match the golden
+        calculator and be strictly less than BSHD due to the L^2 terms
+        (indexer scoring and sparse core attention)."""
+        args = _make_dsa_args()
+        batch_size = 2
+        packed_lengths = [64, 64, 128, 256]
+        total_tokens = sum(packed_lengths)
+        thd_sum_sq = sum(L**2 for L in packed_lengths)
+
+        flops = num_floating_point_operations(
+            args,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=total_tokens,
+        )
+        expected = _dsa_golden_flops(args, total_tokens, thd_sum_sq)
+        assert flops == expected
+        # THD must be strictly less than BSHD.
+        bshd_flops = num_floating_point_operations(args, batch_size)
+        assert flops < bshd_flops
