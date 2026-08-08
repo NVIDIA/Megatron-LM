@@ -36,6 +36,9 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
+from megatron.core.extensions.transformer_engine import (
+    add_ptq_calibration_metadata_to_state_dict,
+)
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
@@ -782,6 +785,11 @@ def save_checkpoint(
             model_sd_kwargs=dict(metadata=sharded_sd_metadata),
             rerun_state=rerun_state,
         )
+
+        # If exporting post-training quantization calibration metadata for inference,
+        # add the metadata to the checkpoint state dictionary.
+        if args.buffer_quantized_scaling_factors:
+            add_ptq_calibration_metadata_to_state_dict(state_dict, model)
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':

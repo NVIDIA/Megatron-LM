@@ -28,7 +28,11 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_amax_reduction_group,
     get_context_parallel_group,
+    get_expert_data_parallel_group,
+    get_expert_tensor_parallel_group,
     get_hierarchical_context_parallel_groups,
+    get_pipeline_model_parallel_group,
+    get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
@@ -206,6 +210,186 @@ class TEQuantizationRecipe:
     def get_config_keys(cls) -> Set[str]:
         """Get expected keys from the dataclass fields."""
         return {field.name for field in dataclasses.fields(cls)}
+
+
+def _get_ptq_scale_reduction_groups(
+    module: torch.nn.Module,
+) -> Tuple[torch.distributed.ProcessGroup, ...]:
+    """Get PTQ scale reduction groups for a dense or expert module."""
+    if not torch.distributed.is_initialized() or not model_parallel_is_initialized():
+        return ()
+
+    is_expert = any(
+        not getattr(param, "allreduce", True) for param in module.parameters(recurse=False)
+    )
+    if not is_expert:
+        # Not an MoE module. Reduce over TP-DP-CP.
+        return (get_amax_reduction_group(with_context_parallel=True),)
+
+    pg_collection = getattr(module, "_pg_collection", None)
+    if pg_collection is None:
+        expert_groups = (
+            get_expert_tensor_parallel_group(),
+            get_expert_data_parallel_group(with_gtp_remat=True),
+        )
+    else:
+        expert_groups = (pg_collection.expt_tp, pg_collection.expt_dp_gtp_remat)
+
+    groups = []
+    for group in expert_groups:
+        if all(group is not existing_group for existing_group in groups):
+            groups.append(group)
+    return tuple(groups)
+
+
+def _get_grouped_linear_expert_fqn(module_name: str, global_expert_idx: int) -> str:
+    """Insert a global expert index into a grouped-linear module FQN."""
+    expert_marker = ".experts."
+    if expert_marker in module_name:
+        prefix, suffix = module_name.split(expert_marker, maxsplit=1)
+        return f"{prefix}{expert_marker}{global_expert_idx}.{suffix}"
+    prefix, leaf_name = module_name.rsplit(".", maxsplit=1)
+    return f"{prefix}.experts.{global_expert_idx}.{leaf_name}"
+
+
+def _get_global_layer_fqn(module_name: str, named_modules: Dict[str, torch.nn.Module]) -> str:
+    """Replace a PP-local layer index with its global layer index."""
+    for match in re.finditer(r"(?:^|\.)layers\.(\d+)", module_name):
+        layer_module = named_modules.get(module_name[: match.end()])
+        layer_number = getattr(layer_module, "layer_number", None)
+        if layer_number is not None:
+            index_start, index_end = match.span(1)
+            return f"{module_name[:index_start]}{layer_number - 1}{module_name[index_end:]}"
+    return module_name
+
+
+def add_ptq_calibration_metadata_to_state_dict(
+    state_dict: Dict[str, Any], model: List[torch.nn.Module]
+) -> None:
+    """
+    Add buffered TE post-training calibration metadata to a checkpoint state dictionary.
+
+    Currently, only supports FP32 global / per-Tensor scaling factors. Blockwise
+    scaling factors are not exported or checkpointed.
+    """
+    model_sd_keys = [f"model{i}" for i in range(len(model))] if len(model) > 1 else ["model"]
+    for model_idx, model_sd_key in enumerate(model_sd_keys):
+        model_sd = state_dict[model_sd_key]
+        local_calibration_state = {}
+        named_modules = dict(model[model_idx].named_modules())
+        for name, module in named_modules.items():
+            export_name = _get_global_layer_fqn(name, named_modules)
+            calibration_buffers = [
+                (key, data)
+                for key, data in module._buffers.items()
+                if key.endswith("_te_ptq_calibrated") and data is not None
+            ]
+            if not calibration_buffers:
+                # Either TransformerEngine does not yet support PTQ calibration data,
+                # or no such data exists in the TEModule buffers.
+                continue
+            processed_buffers = []
+            for key, data in sorted(calibration_buffers):
+                metadata = data.detach()
+                if metadata.numel() > 1:
+                    # Only global FP32 per-tensor scales are checkpointed.
+                    metadata = metadata.amax().reshape(1)
+
+                if "_scale_inv_" in key:
+                    scale_inv = metadata
+                else:
+                    # Convert amax to a dequantization scaling factor.
+                    if "nvfp4" in key:
+                        # E2M1_MAX * E4M3_MAX
+                        quant_max = 6.0 * 448.0
+                    elif any(
+                        recipe in key for recipe in ("fp8_delayed_scaling", "fp8_current_scaling")
+                    ):
+                        quant_max = 448.0
+                    else:
+                        raise ValueError(f"Unsupported amax calibration buffer {key!r}")
+                    scale_inv = metadata / quant_max
+
+                # Dense scales reduce over TP x DP x CP. Expert scales reduce over
+                # ETP and EDP / EGTP. Redundant replica reductions guarantee that
+                # every rank contributes identical common-state values.
+                for reduction_group in _get_ptq_scale_reduction_groups(module):
+                    torch.distributed.all_reduce(
+                        scale_inv, op=torch.distributed.ReduceOp.MAX, group=reduction_group
+                    )
+
+                tensor_name = re.split(
+                    r"_tensor_(?:amax(?:_rowwise)?|scale_inv)_", key, maxsplit=1
+                )[0]
+                gemm_match = re.fullmatch(r"(input|weight)_gemm(\d+)", tensor_name)
+                processed_buffers.append((key, scale_inv, gemm_match))
+
+            expert_buffers = [
+                entry
+                for entry in processed_buffers
+                if hasattr(module, "_pg_collection") and entry[2] is not None
+            ]
+            non_expert_buffers = [
+                entry
+                for entry in processed_buffers
+                if not (hasattr(module, "_pg_collection") and entry[2] is not None)
+            ]
+            if expert_buffers:
+                # Gather every local GEMM's input and weight scales in one EP collective.
+                local_scales = torch.cat([scale for _, scale, _ in expert_buffers])
+                ep_group = module._pg_collection.ep
+                ep_size = get_pg_size(ep_group)
+                num_local_scales = local_scales.numel()
+                gathered_scales = torch.empty(
+                    ep_size * num_local_scales, dtype=local_scales.dtype, device=local_scales.device
+                )
+                torch.distributed.all_gather_into_tensor(
+                    gathered_scales, local_scales, group=ep_group
+                )
+                gathered_scales = gathered_scales.cpu()
+
+                for ep_rank in range(ep_size):
+                    for scale_idx, (key, _, gemm_match) in enumerate(expert_buffers):
+                        tensor_kind = gemm_match.group(1)
+                        local_gemm_idx = int(gemm_match.group(2))
+                        global_expert_idx = ep_rank * module.num_gemms + local_gemm_idx
+                        expert_fqn = _get_grouped_linear_expert_fqn(export_name, global_expert_idx)
+                        scale_suffix = "_2" if tensor_kind == "weight" and "nvfp4" in key else ""
+                        local_calibration_state[
+                            f"{expert_fqn}.{tensor_kind}_scale{scale_suffix}"
+                        ] = gathered_scales[ep_rank * num_local_scales + scale_idx]
+
+            for key, scale_inv, _ in non_expert_buffers:
+                # Rename dense keys to match vLLM, TensorRT-LLM, and other PTQ formats.
+                scale_prefix = "input_" if "input" in key else "weight_"
+                scale_suffix = "_2" if "weight" in key and "nvfp4" in key else ""
+                local_calibration_state[f"{export_name}.{scale_prefix}scale{scale_suffix}"] = (
+                    scale_inv.cpu()
+                )
+
+        calibration_states = [local_calibration_state]
+        if get_pipeline_model_parallel_world_size() > 1:
+            pg_collection = getattr(model[model_idx], "pg_collection", None)
+            pp_group = (
+                pg_collection.pp
+                if pg_collection is not None and hasattr(pg_collection, "pp")
+                else get_pipeline_model_parallel_group()
+            )
+            pp_size = get_pg_size(pp_group)
+            calibration_states = [None] * pp_size
+            torch.distributed.all_gather_object(
+                calibration_states, local_calibration_state, group=pp_group
+            )
+
+        for calibration_state in calibration_states:
+            for key, value in calibration_state.items():
+                existing_value = local_calibration_state.get(key)
+                if existing_value is not None and not torch.equal(existing_value, value):
+                    raise RuntimeError(
+                        f"Conflicting PTQ calibration values for {key!r} across PP ranks!"
+                    )
+                local_calibration_state[key] = value
+        model_sd.update(local_calibration_state)
 
 
 @dataclasses.dataclass
@@ -1268,6 +1452,10 @@ class TELinear(te.pytorch.Linear):
                 bias=bias,
                 return_bias=self.te_return_bias,
                 parallel_mode=te_parallel_mode,
+                buffer_quantized_scaling_factors=self.config.buffer_quantized_scaling_factors,
+                quantized_scaling_factor_buffering_decay=(
+                    self.config.quantized_scaling_factor_buffering_decay
+                ),
                 **extra_kwargs,
             )
 
@@ -1503,6 +1691,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 parallel_mode="column",
                 return_layernorm_output=False,
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                buffer_quantized_scaling_factors=self.config.buffer_quantized_scaling_factors,
+                quantized_scaling_factor_buffering_decay=(
+                    self.config.quantized_scaling_factor_buffering_decay
+                ),
                 **extra_kwargs,
             )
 
@@ -2463,6 +2655,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     bias=bias,
                     return_bias=self.te_return_bias,
                     parallel_mode=parallel_mode,
+                    buffer_quantized_scaling_factors=self.config.buffer_quantized_scaling_factors,
+                    quantized_scaling_factor_buffering_decay=(
+                        self.config.quantized_scaling_factor_buffering_decay
+                    ),
                     **extra_kwargs,
                 )
 
