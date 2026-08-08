@@ -27,9 +27,10 @@ from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.sft_dataset import IGNORE_INDEX, SFTDataset, SFTDatasetConfig
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -37,7 +38,9 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
+from megatron.core.transformer.multi_token_prediction import (
+    get_mtp_ranks,
+)
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -49,10 +52,12 @@ from megatron.core.utils import (
     get_batch_on_this_tp_rank,
     get_te_version,
     get_torch_version,
+    preprocess_sft_batch,
 )
 from megatron.training import (
     get_args,
     get_timers,
+    get_tokenizer,
     inprocess_restart,
     pretrain,
     print_rank_0,
@@ -61,7 +66,6 @@ from megatron.training import (
 from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
-from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -101,7 +105,10 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     config = core_transformer_config_from_args(args)
 
     cp_size = args.context_parallel_size
+    tp_size = args.tensor_model_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
+    sp = args.sequence_parallel
+    max_seq_len = args.seq_length
     is_sft = args.sft
     has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
@@ -123,6 +130,17 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
+        if is_sft:
+            batch = preprocess_sft_batch(
+                batch,
+                tp_rank=tp_rank,
+                cp_size=cp_size,
+                tp_size=tp_size,
+                sp=sp,
+                padding_token_id=get_tokenizer().pad,
+                padding_label_id=IGNORE_INDEX,
+                max_seq_len=max_seq_len,
+            )
         for key in BATCH_KEYS:
             batch[key] = (
                 batch[key].cuda(non_blocking=True)
@@ -437,6 +455,9 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
             }
         )
         return GPTFIMDatasetConfig(**data_args)
+
+    if args.sft:
+        return SFTDatasetConfig(**data_args)
 
     return GPTDatasetConfig(**data_args)
 
