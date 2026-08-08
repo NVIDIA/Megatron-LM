@@ -1680,7 +1680,6 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
-            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if self.context_parallel_size > 1:
                 cp_comm_types = (
                     self.cp_comm_type
@@ -3591,13 +3590,6 @@ class MLATransformerConfig(TransformerConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if (
-            self.multi_latent_attention
-            and self.apply_rope_fusion
-            and self.rope_type != "yarn"
-            and self.experimental_attention_variant != "dsv4_hybrid"
-        ):
-            raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
 
         if self.attention_output_gate:
             raise NotImplementedError("Output gate is not supported for MLA yet.")
