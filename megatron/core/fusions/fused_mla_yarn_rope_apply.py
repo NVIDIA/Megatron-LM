@@ -50,22 +50,8 @@ def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
     return token_idx
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_H": 1}),
-        triton.Config({"BLOCK_H": 2}),
-        triton.Config({"BLOCK_H": 4}),
-        triton.Config({"BLOCK_H": 8}),
-        triton.Config({"BLOCK_H": 16}),
-        triton.Config({"BLOCK_H": 32}),
-        triton.Config({"BLOCK_H": 64}),
-        triton.Config({"BLOCK_H": 128}),
-    ],
-    key=["emb_dim", "head_num"],
-    restore_value=["Q"],
-)
 @triton.jit
-def rotary_fwd_q_kernel(
+def _rotary_fwd_q_kernel(
     Q,
     COS,
     SIN,
@@ -124,13 +110,15 @@ def rotary_fwd_q_kernel(
     x_left = x_1 * cos_left - x_2 * sin_left
     x_right = x_2 * cos_right + x_1 * sin_right
 
+    # The input and output layouts alias. Finish all loads before any warp stores.
+    tl.debug_barrier()
     x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
     x_right_off = x_left_off + emb_dim // 2
     tl.store(Q + x_left_off, x_left, mask=mask)
     tl.store(Q + x_right_off, x_right, mask=mask)
 
 
-@triton.autotune(
+rotary_fwd_q_kernel = triton.autotune(
     configs=[
         triton.Config({"BLOCK_H": 1}),
         triton.Config({"BLOCK_H": 2}),
@@ -142,10 +130,12 @@ def rotary_fwd_q_kernel(
         triton.Config({"BLOCK_H": 128}),
     ],
     key=["emb_dim", "head_num"],
-    restore_value=["DO"],
-)
+    restore_value=["Q"],
+)(_rotary_fwd_q_kernel)
+
+
 @triton.jit
-def rotary_bwd_q_kernel(
+def _rotary_bwd_q_kernel(
     DO,
     COS,
     SIN,
@@ -201,10 +191,28 @@ def rotary_bwd_q_kernel(
     x_1 = x_left * cos_left + x_right * sin_right
     x_2 = -x_left * sin_left + x_right * cos_right
 
+    # The input and output layouts alias. Finish all loads before any warp stores.
+    tl.debug_barrier()
     x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
     x_2_off = x_1_off + 1
     tl.store(DO + x_1_off, x_1, mask=mask)
     tl.store(DO + x_2_off, x_2, mask=mask)
+
+
+rotary_bwd_q_kernel = triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_H": 1}),
+        triton.Config({"BLOCK_H": 2}),
+        triton.Config({"BLOCK_H": 4}),
+        triton.Config({"BLOCK_H": 8}),
+        triton.Config({"BLOCK_H": 16}),
+        triton.Config({"BLOCK_H": 32}),
+        triton.Config({"BLOCK_H": 64}),
+        triton.Config({"BLOCK_H": 128}),
+    ],
+    key=["emb_dim", "head_num"],
+    restore_value=["DO"],
+)(_rotary_bwd_q_kernel)
 
 
 class ApplyMLARotaryEmbQ(torch.autograd.Function):
