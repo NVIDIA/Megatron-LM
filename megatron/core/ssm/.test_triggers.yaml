@@ -1,0 +1,13 @@
+# SSM/Mamba module (mamba_block, mamba_mixer, mamba_layer).
+#
+# Test imports traced:
+#   transformer*  → ssm.mamba_block.MambaStack
+#   ckpt          → ssm.mamba_mixer.MambaMixer (in models/test_mamba.py)
+#   ckpt_models   → ssm.mamba_mixer.MambaMixer
+#   ssm           → ssm.* (test suite)
+test_buckets:
+  - transformer
+  - transformer_moe
+  - ckpt
+  - ckpt_models
+  - ssm

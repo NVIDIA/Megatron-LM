@@ -1,0 +1,6 @@
+# megatron/rl/ -- reinforcement learning module.
+#
+# Test imports traced:
+#   rl → megatron.rl.* (test suite)
+test_buckets:
+  - rl

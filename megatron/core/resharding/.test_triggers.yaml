@@ -1,0 +1,6 @@
+# Resharding module (refit, communication_scheduler, workload_packer).
+#
+# Test imports traced:
+#   resharding → resharding.* (test suite)
+test_buckets:
+  - resharding
