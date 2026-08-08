@@ -1,11 +1,11 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -53,6 +53,9 @@ from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
+
+# These callbacks are currently consumed only by the Dynamo frontend.
+KVEventListener = Callable[[str, dict[str, Any]], None]
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -224,6 +227,69 @@ def get_mem_size_str(n_bytes: int) -> str:
         if round(n_bytes / nquery) >= 1:
             return "%.3g %s" % (n_bytes / nquery, suffix)
     raise Exception(f"something went wrong, n_bytes={n_bytes}.")
+
+
+class DynamoHelper:
+    """Manage KV-cache lifecycle events consumed by the Dynamo frontend."""
+
+    def __init__(self) -> None:
+        self._kv_event_listeners: list[KVEventListener] = []
+        self._pending_kv_stored_events: list[dict[str, Any]] = []
+
+    @property
+    def has_kv_event_listeners(self) -> bool:
+        """Return whether any KV-event listeners are registered."""
+        return bool(self._kv_event_listeners)
+
+    def add_kv_event_listener(self, listener: KVEventListener) -> None:
+        """Register a KV-cache lifecycle listener.
+
+        Args:
+            listener: Callback invoked with the event kind and payload.
+        """
+        self._kv_event_listeners.append(listener)
+
+    def queue_kv_stored_event(self, payload: dict[str, Any]) -> None:
+        """Queue a stored event for publication after a successful forward pass.
+
+        Args:
+            payload: Stored-event payload.
+        """
+        self._pending_kv_stored_events.append(payload)
+
+    def publish_pending_kv_stored_events(self) -> None:
+        """Publish blocks whose KV contents were produced by a successful forward pass."""
+        pending, self._pending_kv_stored_events = self._pending_kv_stored_events, []
+        for payload in pending:
+            self._emit_kv_event("stored", payload)
+
+    def discard_pending_kv_stored_events(self) -> None:
+        """Discard registrations left by an interrupted or failed forward pass."""
+        self._pending_kv_stored_events.clear()
+
+    def on_kv_blocks_deregistered(self, _block_ids: list[int], hashes: set[int]) -> None:
+        """Publish removal events for deregistered KV blocks.
+
+        Args:
+            _block_ids: Deregistered block IDs, unused by Dynamo.
+            hashes: Hashes of the deregistered blocks.
+        """
+        if hashes:
+            self._emit_kv_event("removed", {"block_hashes": list(hashes)})
+
+    def notify_kv_cache_cleared(self) -> None:
+        """Notify listeners that no previously advertised block is routable."""
+        self.discard_pending_kv_stored_events()
+        if self._kv_event_listeners:
+            self._emit_kv_event("cleared", {})
+
+    def _emit_kv_event(self, kind: str, payload: dict[str, Any]) -> None:
+        """Notify Dynamo listeners without allowing frontend failures to stop inference."""
+        for listener in tuple(self._kv_event_listeners):
+            try:
+                listener(kind, payload)
+            except Exception:  # pylint: disable=broad-exception-caught
+                logging.exception("KV-event listener failed while handling %r", kind)
 
 
 @internal_api
@@ -409,7 +475,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 model_config, vp_stage=None, pp_rank=pp_rank
             )
             self.num_mamba_layers = 0
-            (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
+            self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
         if self.num_attention_layers == 0:
@@ -572,6 +638,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_limit=paused_block_count,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
+        )
+        self.dynamo_helper = DynamoHelper()
+        self.kv_block_allocator.add_blocks_deregistered_observer(
+            self.dynamo_helper.on_kv_blocks_deregistered
         )
 
         # Track request metadata.
@@ -2759,6 +2829,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         # There is no prefix-cache state to preserve when caching is disabled.
         preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
+        self.dynamo_helper.discard_pending_kv_stored_events()
         self.reset_tensors()
         self.reset_metadata(
             preserve_prefix_cache=preserve_prefix_cache, preserve_counters=preserve_counters
@@ -2771,6 +2842,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset Mamba cache state.
         if not preserve_prefix_cache and self.mamba_slot_allocator is not None:
             self.mamba_slot_allocator.reset()
+        if not preserve_prefix_cache:
+            self.dynamo_helper.notify_kv_cache_cleared()
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
@@ -2997,7 +3070,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
 
-        (matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length) = (
+        matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
             self._compute_prefix_match(req, req.remaining_prompt_length)
         )
 
@@ -3253,6 +3326,20 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.kv_block_allocator.register_kv_block_hashes(
                     block_ids_to_hash, block_hashes_slice, parent_hashes_slice
                 )
+                if self.dynamo_helper.has_kv_event_listeners:
+                    token_start = start * self.block_size_tokens
+                    token_end = end * self.block_size_tokens
+                    token_ids = req.prompt_tokens[token_start:token_end].tolist()
+                    self.dynamo_helper.queue_kv_stored_event(
+                        {
+                            "block_hashes": list(block_hashes_slice),
+                            "token_ids": token_ids,
+                            "num_block_tokens": [self.block_size_tokens] * (end - start),
+                            "parent_hash": (
+                                int(req.precomputed_block_hashes[start - 1]) if start > 0 else None
+                            ),
+                        }
+                    )
 
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))
