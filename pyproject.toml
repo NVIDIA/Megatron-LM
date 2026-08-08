@@ -129,6 +129,7 @@ te = [
 ssm = [
     "mamba-ssm",
     "causal-conv1d~=1.5",
+    "nvidia-cutlass-dsl[cu13]~=4.5.0",
 ]
 
 [dependency-groups]

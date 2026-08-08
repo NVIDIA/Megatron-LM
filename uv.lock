@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -2223,6 +2223,7 @@ mlm = [
 ssm = [
     { name = "causal-conv1d" },
     { name = "mamba-ssm" },
+    { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
 ]
 te = [
     { name = "transformer-engine" },
@@ -2314,6 +2315,7 @@ requires-dist = [
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "numpy" },
     { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = "==1.26.0" },
+    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'ssm'", specifier = "~=4.5.0" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.44" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.6.0" },
     { name = "omegaconf", marker = "extra == 'mlm'" },
