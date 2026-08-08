@@ -31,6 +31,10 @@ import torch
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     fused_sparse_attention as dk,
 )
+from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
+    can_use_fused_csa_teacher_lse,
+    fused_csa_teacher_lse,
+)
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
     CSASparseAttnFunc,
     FusedCSAIndexerSparseAttnFromTopkFunc,
@@ -45,10 +49,8 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sp
     _kl_loss_from_target_predict,
     batch_of_row,
     build_flat_topk_idxs,
-    can_use_fused_csa_teacher_lse,
     csa_sparse_attn,
     fused_csa_indexer_sparse_attn,
-    fused_csa_teacher_lse,
     indexer_topk,
     local_to_global_flat,
 )
