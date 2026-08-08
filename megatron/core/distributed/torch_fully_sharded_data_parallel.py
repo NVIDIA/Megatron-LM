@@ -96,6 +96,8 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
                     # micro-batch id, thus removing unnecessary memory stores
                     attrs['_fp8_attrs']['transpose_invalid'] = False
                     del attrs['_fp8_attrs']['transpose']
+                # Mark this parameter as an FSDP2 parameter.
+                attrs["is_torch_fsdp2_param"] = True
                 custom_attrs[name] = {k: v for k, v in attrs.items()}
             return custom_attrs
 
@@ -146,6 +148,17 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         fully_shard(self.module, **kwargs)
 
         restore_custom_attrs(self.module, attrs)
+
+    def finish_grad_sync(self, force_all_reduce=False):
+        """
+        Finishes grad sync (all-reduce or reduce-scatter) communication operations
+        for all model gradients.
+
+        When overlap_grad_reduce is set to True, waits for asynchronous communication
+        calls to complete. When overlap_grad_reduce is set to False, calls synchronous
+        communication ops.
+        """
+        super().finish_grad_sync()
 
     def load_state_dict(self, state_dict, strict=True):
         """

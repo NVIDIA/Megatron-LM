@@ -50,6 +50,8 @@ def collect_train_test_metrics(
             "lm loss",
             "num-zeros",
             "mtp_1 loss",
+            "mtp_2 loss",
+            "total loss",
         ]
     }
 

@@ -62,8 +62,11 @@ def get_bert_layer_with_transformer_engine_submodules() -> TransformerLayerSubmo
                 linear_qkv=not_none(TELayerNormColumnParallelLinear),
                 core_attention=not_none(TEDotProductAttention),
                 linear_proj=not_none(TERowParallelLinear),
-                q_layernorm=IdentityOp,
-                k_layernorm=IdentityOp,
+                # Leave q_layernorm/k_layernorm unset (None) rather than IdentityOp so that
+                # TransformerConfig.qk_layernorm can select the default TENorm through the
+                # shared SelfAttention fallback (`submodules.q_layernorm or TENorm`).
+                q_layernorm=None,
+                k_layernorm=None,
             ),
         ),
         self_attn_bda=get_bias_dropout_add,

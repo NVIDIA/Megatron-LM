@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Module."""
 from functools import partial
@@ -106,11 +106,13 @@ class MegatronModule(torch.nn.Module):
         """Sets the is_first_microbatch flag if it exists and config.fp8==True.
         When this flag is set, TE modules will update their fp8 parameter cache.
         If kitchen is being used, kitchen controls quantization level.
+        A quant_recipe (e.g. from --te-precision-config-file) also enables the flag.
         """
         if (
             self.config.fp8 is not None
             or self.config.fp4 is not None
             or getattr(self.config, 'use_kitchen', False)
+            or getattr(self.config, 'quant_recipe', None) is not None
         ):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []
@@ -195,12 +197,22 @@ class GraphableMegatronModule(MegatronModule):
             self.cuda_graph_backward_dw_wrapper = None
 
     def init_backward_dw_wrapper(self):
-        """Initialize the backward_dw_wrapper."""
-        from megatron.core.models.gpt.fine_grained_callables import _BackwardDWWrapper
+        """Initialize ``self.backward_dw_wrapper`` for delayed-wgrad scheduling.
+
+        The wrapper coordinates the per-layer wgrad callables (attention
+        wgrad, optional shared-expert wgrad) with cuda-graph replay scope so
+        captured components are not re-run eagerly. The method is defined on
+        ``GraphableMegatronModule`` so any graphable subclass can opt in;
+        ``_BackwardDWWrapper`` itself currently asserts the underlying layer
+        is a ``TransformerLayer``, so MambaLayer-derived modules implement
+        ``backward_dw`` directly and skip this helper.
+        """
+        from megatron.core.models.common.utils import _BackwardDWWrapper
 
         config = getattr(self, 'config', None)
         assert config is not None, (
-            "TransformerLayer must be initialized before calling " "`init_backward_dw_wrapper`."
+            "Module must be fully constructed (config set) before calling "
+            "`init_backward_dw_wrapper`."
         )
         self.backward_dw_wrapper = _BackwardDWWrapper(self)
 
@@ -318,6 +330,18 @@ class GraphableMegatronModule(MegatronModule):
 
         cudagraph_kwargs = kwargs.copy()
         cudagraph_kwargs['is_first_microbatch'] = getattr(self, 'current_microbatch', 0) == 0
+        if self.config.fine_grained_activation_offloading and getattr(
+            self, 'offload_module_in_cuda_graph', False
+        ):
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+
+            # TE captures/replays the module on its own graph stream. Passing the
+            # offload stream/event in lets TE order graph compute with D2H/H2D
+            # transfers managed by the fine-grained offload manager.
+            cudagraph_kwargs['cuda_graph_stream'] = off_interface.cuda_graph_stream()
+            cudagraph_kwargs['cuda_graph_event'] = off_interface.cuda_graph_event()
         return cudagraph_args, cudagraph_kwargs
 
     def _should_call_local_cudagraph(self, *args, **kwargs):

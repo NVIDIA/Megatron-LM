@@ -45,7 +45,11 @@ from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 Shape = Union[List[int], torch.Size]
 
 
-def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
+def get_forward_backward_func(
+    pp_size: Optional[int] = None,
+    vp_size: Optional[int] = None,
+    schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
 
@@ -138,8 +142,13 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
         vp_size (Optional[int]): Virtual pipeline model parallel size to use.
             If both pp_size and vp_size are None, both values fall back to parallel_state.
             Otherwise, provided values are used as-is and None is treated as an explicit input.
+        schedule_pg_collection (Optional[MultiModuleProcessGroupCollection]): When a
+            multi-module (cross-grid) collection is passed, select the bridge schedule.
 
     """
+    if isinstance(schedule_pg_collection, MultiModuleProcessGroupCollection):
+        return forward_backward_pipelining_without_interleaving
+
     if pp_size is None and vp_size is None:
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
@@ -226,26 +235,56 @@ def get_tensor_device(tensor: Union[torch.Tensor, Dict[str, torch.Tensor]]):
     return tensor.device
 
 
-def _get_mtp_loss_scale(config, device: torch.device) -> torch.Tensor:
-    """Get the MTP loss scale on the output tensor device."""
+def _normalize_loss_scale(loss_scale, device: torch.device, scale_func_name: str) -> torch.Tensor:
+    """Normalize loss scale outputs to a size-1 tensor on the output tensor device."""
+    loss_scale = torch.as_tensor(loss_scale, device=device)
+    if loss_scale.numel() != 1:
+        raise ValueError(
+            f"{scale_func_name} must return a scalar or size-1 tensor for loss scaling, "
+            f"but returned a tensor with {loss_scale.numel()} elements."
+        )
+    return loss_scale
 
-    def _normalize_loss_scale(loss_scale, scale_func_name: str) -> torch.Tensor:
-        loss_scale = torch.as_tensor(loss_scale, device=device)
-        if loss_scale.numel() != 1:
-            raise ValueError(
-                f"{scale_func_name} must return a scalar or size-1 tensor for MTP loss scaling, "
-                f"but returned a tensor with {loss_scale.numel()} elements."
-            )
-        return loss_scale
 
-    mtp_grad_scale_func = getattr(config, 'mtp_grad_scale_func', None)
-    if mtp_grad_scale_func is not None:
-        return _normalize_loss_scale(mtp_grad_scale_func(), "mtp_grad_scale_func")
+def _compute_loss_scale(config, device: torch.device) -> torch.Tensor:
+    """Calculate the loss scale from grad_scale_func or default to 1."""
     if config.grad_scale_func is not None:
         return _normalize_loss_scale(
-            config.grad_scale_func(torch.ones(1, device=device)), "grad_scale_func"
+            config.grad_scale_func(torch.ones(1, device=device)), device, "grad_scale_func"
         )
     return torch.ones(1, device=device)
+
+
+def _get_moe_loss_scale(config, device: torch.device) -> torch.Tensor:
+    """Get the MoE loss scale on the output tensor device."""
+    moe_grad_scale_func = getattr(config, 'moe_grad_scale_func', None)
+    if moe_grad_scale_func is not None:
+        return _normalize_loss_scale(moe_grad_scale_func(), device, "moe_grad_scale_func")
+    return _compute_loss_scale(config, device)
+
+
+def _get_mtp_loss_scale(config, device: torch.device) -> torch.Tensor:
+    """Get the MTP loss scale on the output tensor device."""
+    mtp_grad_scale_func = getattr(config, 'mtp_grad_scale_func', None)
+    if mtp_grad_scale_func is not None:
+        return _normalize_loss_scale(mtp_grad_scale_func(), device, "mtp_grad_scale_func")
+    return _compute_loss_scale(config, device)
+
+
+def _get_experimental_attention_variant_loss_scale_func(config):
+    """Get the loss scale hook for experimental attention variants."""
+    loss_scale_func = getattr(config, 'experimental_attention_variant_loss_scale_func', None)
+    if loss_scale_func is not None:
+        return loss_scale_func
+
+    if getattr(config, 'experimental_attention_variant', None) == 'dsa':
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+        )
+
+        return DSAIndexerLossAutoScaler.set_loss_scale
+
+    return None
 
 
 def forward_step_calc_loss(
@@ -262,9 +301,6 @@ def forward_step_calc_loss(
 ):
     """Calculate the loss and number of tokens for forward_step()"""
 
-    from megatron.core.transformer.experimental_attention_variant.dsa import (
-        DSAIndexerLossAutoScaler,
-    )
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     model_vp_stage = getattr(model, "vp_stage", None)
@@ -315,16 +351,8 @@ def forward_step_calc_loss(
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
-        # Calculate the loss scale based on moe_grad_scale_func (preferred),
-        # grad_scale_func (fallback), or default to 1.
         device = get_tensor_device(output_tensor)
-        moe_grad_scale_func = getattr(config, 'moe_grad_scale_func', None)
-        if moe_grad_scale_func is not None:
-            loss_scale = moe_grad_scale_func()
-        elif config.grad_scale_func is not None:
-            loss_scale = config.grad_scale_func(torch.ones(1, device=device))
-        else:
-            loss_scale = torch.ones(1, device=device)
+        loss_scale = _get_moe_loss_scale(config, device)
         # Set the loss scale
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
@@ -344,17 +372,24 @@ def forward_step_calc_loss(
         else:
             MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
-    # Set the loss scale for DSA (Dynamic Sparse Attention) indexer loss.
-    if getattr(config, 'experimental_attention_variant', None) == 'dsa':
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
-        )
+    # Set the loss scale for any experimental attention-variant auxiliary loss.
+    experimental_attention_variant_loss_scale_func = (
+        _get_experimental_attention_variant_loss_scale_func(config)
+    )
+    if experimental_attention_variant_loss_scale_func is not None:
+        device = get_tensor_device(output_tensor)
+        loss_scale = _compute_loss_scale(config, device)
         if config.calculate_per_token_loss:
-            DSAIndexerLossAutoScaler.set_loss_scale(loss_scale)
+            experimental_attention_variant_loss_scale_func(loss_scale)
         else:
-            DSAIndexerLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+            # TODO: This path assumes static CP across outstanding pipeline microbatches.
+            # Hybrid/dynamic CP currently requires per-token loss and no PP; if that
+            # changes, carry the scale per autograd context instead of via a
+            # process-wide scaler hook.
+            cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
+            experimental_attention_variant_loss_scale_func(
+                loss_scale * cp_size_for_scaling / num_microbatches
+            )
 
     return output_tensor, num_tokens
 
@@ -634,6 +669,39 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
+def _build_default_pg_collection() -> ProcessGroupCollection:
+    """Build a ``ProcessGroupCollection`` from the global ``parallel_state`` defaults.
+
+    Used by the schedule entry points as the fallback when the caller does not
+    supply a ``pg_collection`` explicitly.
+    """
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = parallel_state.get_tensor_model_parallel_group()
+    pg_collection.cp = parallel_state.get_context_parallel_group()
+    pg_collection.embd = parallel_state.get_embedding_group(check_initialized=False)
+    pg_collection.pos_embd = parallel_state.get_position_embedding_group(check_initialized=False)
+    pg_collection.pp = parallel_state.get_pipeline_model_parallel_group()
+    pg_collection.dp_cp = parallel_state.get_data_parallel_group(
+        with_context_parallel=True, partial_data_parallel=False
+    )
+    pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
+        with_context_parallel=True
+    )
+    pg_collection.dp = parallel_state.get_data_parallel_group(
+        with_context_parallel=False, partial_data_parallel=False
+    )
+    # gtp_remat axis: consumers read these with getattr and silently skip the gtp_remat
+    # reduction when absent, so populate them even when GTP_remat is inactive.
+    pg_collection.gtp_remat = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+    pg_collection.expt_gtp_remat = parallel_state.get_expert_gtp_weight_remat_group(
+        check_initialized=False
+    )
+    pg_collection.dp_cp_gtp_remat = parallel_state.get_data_parallel_group(
+        with_context_parallel=True, partial_data_parallel=False
+    )
+    return pg_collection
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -654,23 +722,7 @@ def forward_backward_no_pipelining(
     """Run forward and backward passes with no pipeline parallelism"""
 
     if pg_collection is None:
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
-        embd_group = parallel_state.get_embedding_group(check_initialized=False)
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-        pg_collection = ProcessGroupCollection()
-        pg_collection.tp = tp_group
-        pg_collection.cp = cp_group
-        pg_collection.embd = embd_group
-        pg_collection.pos_embd = pos_emb_group
-        pg_collection.pp = pp_group
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
-            with_context_parallel=True, partial_data_parallel=False
-        )
-        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
-            with_context_parallel=True
-        )
+        pg_collection = _build_default_pg_collection()
 
     elif pg_collection is not None:
         assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
@@ -982,25 +1034,10 @@ def forward_backward_pipelining_with_interleaving(
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
         )
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = _build_default_pg_collection()
+        tp_group = pg_collection.tp
+        cp_group = pg_collection.cp
         cp_size = cp_group.size()
-        embd_group = parallel_state.get_embedding_group(check_initialized=False)
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-
-        pg_collection = ProcessGroupCollection()
-        pg_collection.tp = tp_group
-        pg_collection.cp = cp_group
-        pg_collection.embd = embd_group
-        pg_collection.pos_embd = pos_emb_group
-        pg_collection.pp = pp_group
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
-            with_context_parallel=True, partial_data_parallel=False
-        )
-        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
-            with_context_parallel=True
-        )
 
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model[0])
@@ -1586,7 +1623,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_next = True
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
-                (input_tensor, output_tensor_grad) = (
+                input_tensor, output_tensor_grad = (
                     p2p_communicator.send_forward_backward_recv_forward_backward(
                         output_tensor,
                         input_tensor_grad,
@@ -1650,7 +1687,7 @@ def forward_backward_pipelining_with_interleaving(
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
 
-                (bwd_recv_buffer[-1], bwd_wait_handles) = (
+                bwd_recv_buffer[-1], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -1803,7 +1840,7 @@ def forward_backward_pipelining_with_interleaving(
                     backward_k, forward=False
                 )
 
-                (bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles) = (
+                bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -1876,7 +1913,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_prev = False
 
             # Communicate tensors.
-            (input_tensor, output_tensor_grad) = (
+            input_tensor, output_tensor_grad = (
                 p2p_communicator.send_forward_backward_recv_forward_backward(
                     output_tensor,
                     input_tensor_grad,
@@ -2141,25 +2178,10 @@ def forward_backward_pipelining_without_interleaving(
         p2p_communicator = P2PCommunicator(
             pp_group=parallel_state.get_pipeline_model_parallel_group(), config=config
         )
-        tp_group = parallel_state.get_tensor_model_parallel_group()
-        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = _build_default_pg_collection()
+        tp_group = pg_collection.tp
+        cp_group = pg_collection.cp
         cp_size = cp_group.size()
-        embd_group = parallel_state.get_embedding_group(check_initialized=False)
-        pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-
-        pg_collection = ProcessGroupCollection()
-        pg_collection.tp = tp_group
-        pg_collection.pp = pp_group
-        pg_collection.embd = embd_group
-        pg_collection.pos_embd = pos_emb_group
-        pg_collection.cp = cp_group
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(
-            with_context_parallel=True, partial_data_parallel=False
-        )
-        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
-            with_context_parallel=True
-        )
 
     elif p2p_communicator is not None and pg_collection is not None:
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"

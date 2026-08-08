@@ -1,0 +1,41 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "determinism_perf_{environment}_{platforms}"
+  model: gpt
+  nodes: 1
+  build: mcore-pyt-{environment}
+  gpus: 8
+  platforms: dgx_h100
+  script_setup: |
+    unset https_proxy
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+  script: |-
+    set -euo pipefail
+    cd /opt/megatron-lm
+    bash tests/performance_tests/shell_test_utils/determinism/perf_breakdown.sh \
+      "{assets_dir}/logs/perf-leaderboards" \
+      "{assets_dir}/logs"
+
+products:
+  # Routed through the integration-tests matrix (scope: mr-github) — picked
+  # up automatically by ``generate_jet_trigger_job.py``'s recipe glob, no
+  # changes needed in ``.github/workflows/cicd-main.yml``.
+  - test_case: [determinism_perf]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_h100]
+        n_repeat: [1]
+        time_limit: [3600]

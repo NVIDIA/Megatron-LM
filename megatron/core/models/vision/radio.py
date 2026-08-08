@@ -17,6 +17,7 @@ from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 # RADIO reference code: https://github.com/NVlabs/RADIO
 
@@ -211,6 +212,9 @@ class RADIOViTModel(VisionModule):
         self.ln_pre = None
         self.ln_post = None
         self.pg_collection = pg_collection
+        self.tp_group = get_tensor_model_parallel_group_if_none(
+            pg_collection.tp if pg_collection is not None else None
+        )
         self.vp_stage = vp_stage
         if ln_pre_impl is not None:
             self.ln_pre = build_module(
@@ -606,11 +610,11 @@ class RADIOViTModel(VisionModule):
             return pos_embed
 
         def aspect_ratio_select(pos_embed):
-            (pos_H, pos_W) = pos_embed.shape[-2:]
-            (input_H, input_W) = input_dims
+            pos_H, pos_W = pos_embed.shape[-2:]
+            input_H, input_W = input_dims
             if input_H == input_W:
                 return pos_embed
-            (crop_H, crop_W) = (pos_H, pos_W)
+            crop_H, crop_W = (pos_H, pos_W)
             if input_W < input_H:
                 crop_W = min(pos_W, math.ceil(pos_W * (input_W / input_H)))
             else:
@@ -672,7 +676,7 @@ class RADIOViTModel(VisionModule):
             else:
                 max_dim = max(input_dims)
 
-                (B, C, _H, _W) = pos_embed.shape
+                B, C, _H, _W = pos_embed.shape
                 aspect_ratio_select_required = B * C * max_dim**2 >= torch.iinfo(torch.int32).max
                 if aspect_ratio_select_required or self.cpe_aspect_ratio_select:
                     pos_embed = aspect_ratio_select(pos_embed)
