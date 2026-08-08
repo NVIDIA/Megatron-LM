@@ -364,23 +364,25 @@ class FsdpParameterGroup:
             )
             has_sharded_grads = False
 
-        # Without an installed gradient, main_grad can be overwritten directly.
-        if not has_sharded_grads:
-            if partial_grad.dtype == self.main_grad.dtype:
-                # Write directly into main_grad without an intermediate buffer.
-                partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
-            else:
-                # Materialize separately, then copy to convert to main_grad's dtype.
-                # No-shard/ZeRO-1 remains Partial with no communication;
-                # ZeRO-2/3 changes Partial to Flat with reduce-scatter.
-                reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-                self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
+        can_reduce_into_main_grad = (
+            not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
+        )
+        if can_reduce_into_main_grad:
+            partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
+            reduced_grad = self.main_grad
         else:
-            # Preserve installed-gradient semantics by accumulating the reduced result.
-            # No-shard/ZeRO-1 remains Partial with no communication;
-            # ZeRO-2/3 changes Partial to Flat with reduce-scatter.
             reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-            self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
+
+        # Scale this backward's contribution before accumulating it so repeated
+        # backwards do not repeatedly scale the running total.
+        if self.grad_divisor != 1:
+            reduced_grad.local_buffer.div_(self.grad_divisor)
+
+        if reduced_grad is not self.main_grad:
+            if has_sharded_grads:
+                self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
+            else:
+                self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
         if is_last_microbatch:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
