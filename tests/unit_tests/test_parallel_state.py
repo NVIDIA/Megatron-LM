@@ -533,9 +533,10 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     Utils.destroy_model_parallel()
 
 
-def test_separate_all_gather_group():
+@pytest.mark.parametrize('order', test_parallel_order)
+def test_separate_all_gather_group(order):
     """AG/RS overlap communicators live on ProcessGroupCollection (via create_all_gather_groups)."""
-    Utils.initialize_model_parallel(context_parallel_size=world_size)
+    Utils.initialize_model_parallel(context_parallel_size=world_size, order=order)
 
     dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
     dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
@@ -553,12 +554,14 @@ def test_separate_all_gather_group():
     Utils.destroy_model_parallel()
 
 
-def test_expert_all_gather_group():
+@pytest.mark.parametrize('order', test_parallel_order)
+def test_expert_all_gather_group(order):
     """Test expert AG groups for MoE models with AG/RS overlap."""
     # Initialize model parallel with expert parallelism
     Utils.initialize_model_parallel(
         expert_model_parallel_size=min(2, world_size),
         context_parallel_size=max(1, world_size // 2) if world_size > 1 else 1,
+        order=order,
     )
 
     # Get ranks for both regular and expert AG groups
@@ -567,32 +570,94 @@ def test_expert_all_gather_group():
     expt_dp_group = ps.get_expert_data_parallel_group()
     expt_dp_ranks = torch.distributed.get_process_group_ranks(expt_dp_group)
 
-    # Create AG groups for both regular and expert parameters
-    dp_cp_ag_group = torch.distributed.new_group(ranks=dp_cp_ranks, backend='nccl')
-    expt_dp_ag_group = torch.distributed.new_group(ranks=expt_dp_ranks, backend='nccl')
+    # Create AG groups for both regular and expert parameters via the production helper
+    dp_cp_ag_group, expt_dp_ag_group = ps.create_all_gather_groups(for_expert_parallelism=True)
 
     # Create ProcessGroupCollection with AG groups
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     pg_collection.dp_cp_ag = dp_cp_ag_group
     pg_collection.expt_dp_ag = expt_dp_ag_group
 
-    # Verify both AG groups are set
+    # Verify the regular AG group is set and matches the real dp-cp group
     assert pg_collection.dp_cp_ag is not None
-    assert pg_collection.expt_dp_ag is not None
+    ag_ranks = torch.distributed.get_process_group_ranks(dp_cp_ag_group)
+    assert ag_ranks == dp_cp_ranks, "AG group should have same ranks as dp-cp group"
 
     # Verify expert AG group has same ranks as expert dp group
-    expt_dp_group = pg_collection.expt_dp
-    if expt_dp_group is not None:
+    if expt_dp_ag_group is not None:
+        assert pg_collection.expt_dp_ag is not None
         expt_ag_ranks = torch.distributed.get_process_group_ranks(expt_dp_ag_group)
-        expt_dp_ranks_actual = torch.distributed.get_process_group_ranks(expt_dp_group)
         assert (
-            expt_ag_ranks == expt_dp_ranks_actual
+            expt_ag_ranks == expt_dp_ranks
         ), "Expert AG group should have same ranks as expert dp group"
         assert (
             expt_dp_ag_group != expt_dp_group
         ), "Expert AG group should be a different communicator"
 
     Utils.destroy_model_parallel()
+
+
+def test_create_all_gather_groups_uses_cached_rank_generators(monkeypatch):
+    """create_all_gather_groups() must reuse the RankGenerator instances cached by
+    initialize_model_parallel(), not rebuild ones with hardcoded order/rank_offset."""
+    order = 'tp-cp-pp-ep-dp'
+    decoder_rank_generator = ps.RankGenerator(
+        tp=2, ep=1, dp=4, pp=2, cp=1, order=order, rank_offset=4
+    )
+    expert_decoder_rank_generator = ps.RankGenerator(
+        tp=2, ep=2, dp=2, pp=2, cp=1, order=order, rank_offset=4
+    )
+    current_rank = decoder_rank_generator.get_ranks('dp-cp')[0][0]
+
+    monkeypatch.setattr(ps, '_DATA_PARALLEL_GROUP', object())
+    monkeypatch.setattr(ps, '_DECODER_RANK_GENERATOR', decoder_rank_generator)
+    monkeypatch.setattr(ps, '_EXPERT_DECODER_RANK_GENERATOR', expert_decoder_rank_generator)
+    monkeypatch.setattr(ps, '_MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE', 2)
+    # Match the fake generators so a reverted (pre-fix) implementation still runs to
+    # completion and fails by rank mismatch rather than by uninitialized state.
+    monkeypatch.setattr(ps, 'get_pipeline_model_parallel_world_size', lambda: 2)
+    monkeypatch.setattr(ps, 'get_context_parallel_world_size', lambda: 1)
+    monkeypatch.setattr(ps, 'get_tensor_model_parallel_world_size', lambda: 2)
+    monkeypatch.setattr(ps, 'get_data_parallel_world_size', lambda: 4)
+    monkeypatch.setattr(ps, 'get_expert_tensor_parallel_world_size', lambda: 2)
+    monkeypatch.setattr(ps, 'get_expert_data_parallel_world_size', lambda: 2)
+    monkeypatch.setattr(torch.distributed, 'get_rank', lambda: current_rank)
+
+    captured_groups = {}
+
+    def fake_new_group(**kwargs):
+        ranks = tuple(kwargs['ranks'])
+        group = object()
+        captured_groups[ranks] = group
+        return group
+
+    monkeypatch.setattr(torch.distributed, 'new_group', fake_new_group)
+
+    dp_cp_ag_group, expt_dp_ag_group = ps.create_all_gather_groups(for_expert_parallelism=True)
+
+    expected_dp_cp_ranks = tuple(
+        next(ranks for ranks in decoder_rank_generator.get_ranks('dp-cp') if current_rank in ranks)
+    )
+    expected_expert_dp_ranks = tuple(
+        next(
+            ranks
+            for ranks in expert_decoder_rank_generator.get_ranks('dp')
+            if current_rank in ranks
+        )
+    )
+    assert expected_dp_cp_ranks in captured_groups
+    assert expected_expert_dp_ranks in captured_groups
+    assert dp_cp_ag_group is captured_groups[expected_dp_cp_ranks]
+    assert expt_dp_ag_group is captured_groups[expected_expert_dp_ranks]
+
+    default_decoder_rank_generator = ps.RankGenerator(
+        tp=2, ep=1, dp=4, pp=2, cp=1, order='tp-cp-ep-dp-pp', rank_offset=0
+    )
+    default_expert_rank_generator = ps.RankGenerator(
+        tp=2, ep=2, dp=2, pp=2, cp=1, order='tp-cp-ep-dp-pp', rank_offset=0
+    )
+    assert list(expected_dp_cp_ranks) not in default_decoder_rank_generator.get_ranks('dp-cp')
+    assert list(expected_expert_dp_ranks) not in default_expert_rank_generator.get_ranks('dp')
 
 
 def test_process_group_collection_defaults():
