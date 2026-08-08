@@ -4,6 +4,7 @@ import gc
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -62,7 +63,9 @@ def build_model(config, use_padding_mask=False):
         pre_process=True,
         post_process=True,
         max_sequence_length=max_seq_len,
-    )
+    
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
     f_schedule_plan = gpt_model.build_schedule_plan(**data)
     return gpt_model, f_schedule_plan, data
 

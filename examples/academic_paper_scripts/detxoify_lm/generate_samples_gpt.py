@@ -13,6 +13,7 @@ from megatron.training import get_args
 from megatron.training import get_tokenizer
 from megatron.training import print_rank_0
 from megatron.training.checkpointing import load_checkpoint
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import mpu
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
@@ -74,7 +75,9 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent
-    )
+    ,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
 
     return model
 

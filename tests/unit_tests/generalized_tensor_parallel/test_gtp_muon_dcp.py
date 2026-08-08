@@ -10,6 +10,7 @@ by ``replica_id`` so DCP does not see multiple writers for the same shard.
 
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.dist_checkpointing import load, save
 from tests.unit_tests.dist_checkpointing import TempNamedDir, setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
@@ -90,7 +91,9 @@ def _initialize_native_fp8_moe_model(
         max_sequence_length=4,
         pre_process=pre_process,
         post_process=post_process,
-    )
+    
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
     with torch.no_grad():
         for p in model.parameters():
             if not is_float8tensor(p):

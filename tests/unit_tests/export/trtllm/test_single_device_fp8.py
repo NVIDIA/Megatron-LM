@@ -8,6 +8,7 @@ from pytest_mock import mocker
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.utils import compile_helpers
@@ -47,7 +48,9 @@ def _model_provider():
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
         vocab_size=100,
         max_sequence_length=SEQUENCE_LENGTH,
-    )
+    
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
 
     return gpt_model
 

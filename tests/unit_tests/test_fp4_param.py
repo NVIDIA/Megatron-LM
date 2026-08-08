@@ -9,6 +9,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_nvfp4_support
 
 import megatron.core.parallel_state as ps
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.enums import ModelType
 from megatron.core.fp4_utils import is_nvfp4tensor
@@ -100,7 +101,9 @@ class TestFP4Param:
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
-        )
+        
+                   pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+               )
 
     def create_test_args(
         self, tp, sequence_length, micro_batch_size, inference, fp4_param_gather, **kwargs

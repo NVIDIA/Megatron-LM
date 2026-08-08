@@ -5,6 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -304,7 +305,9 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
-            )
+            
+                            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                        )
 
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
@@ -347,7 +350,9 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
-            )
+            
+                            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                        )
 
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
@@ -366,7 +371,9 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
-            )
+            
+                            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                        )
             reset_model(gpt_model, params)
             capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
                 gpt_model, input_tensors, microbatches
@@ -399,7 +406,9 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
-            )
+            
+                            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                        )
 
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
@@ -418,7 +427,9 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
-            )
+            
+                            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                        )
             reset_model(gpt_model, params)
             capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
                 gpt_model, input_tensors, microbatches
@@ -452,7 +463,9 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
-            )
+            
+                            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                        )
 
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
@@ -512,7 +525,9 @@ class TestA2AOverlap:
                     pre_process=True,
                     post_process=True,
                     max_sequence_length=300,
-                )
+                
+                                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                            )
                 params = reset_model(gpt_model)
                 input_tensors = [build_data() for _ in range(microbatches)]
 
@@ -584,7 +599,9 @@ class TestA2AOverlap:
                 pre_process=True,
                 post_process=True,
                 max_sequence_length=300,
-            )
+            
+                            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                        )
             gpt_model.decoder.final_layernorm = None
             gpt_model.cuda()
             params = reset_model(gpt_model)

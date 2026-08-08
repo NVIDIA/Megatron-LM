@@ -185,7 +185,9 @@ def _build_gpt_model(
         post_process=post_process,
         parallel_output=False,  # Gather logits across TP for easy comparison
         position_embedding_type='rope',
-    )
+    
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
     return model.cuda()
 
 
@@ -210,7 +212,9 @@ def _build_mamba_model(
         parallel_output=False,
         hybrid_layer_pattern=layer_pattern,
         position_embedding_type='rope',
-    )
+    
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
     return model.cuda()
 
 

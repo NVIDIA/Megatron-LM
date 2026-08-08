@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.validation import StrictHandling
@@ -64,7 +65,9 @@ def initialize_t5_model(seed, encoder_decoder_spec_fn, num_layers=8, **config_kw
         post_process=post_process,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
-    )
+    
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
 
     with torch.no_grad():
         for p in model.parameters():

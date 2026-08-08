@@ -110,7 +110,9 @@ def initialize_real_model(
         pre_process=pre_process,
         post_process=post_process,
         vp_stage=vp_stage,
-    )
+    
+                     pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                 )
 
     return this_model
 

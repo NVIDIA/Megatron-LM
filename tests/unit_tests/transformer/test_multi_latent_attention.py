@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import megatron.core.transformer.multi_latent_attention as mla_module
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -1488,7 +1489,9 @@ def test_parallel_multi_latent_attention_correctness(
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=vp_stage,
-        )
+        
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    )
         return gpt_model
 
     # Initialize baseline parallel state

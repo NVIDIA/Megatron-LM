@@ -18,6 +18,7 @@ import torch
 from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
     AsyncScheduleMode,
@@ -430,7 +431,9 @@ class DynamicInferenceEngineTestBase:
                 post_process=parallel_state.is_pipeline_last_stage(),
                 mtp_block_spec=mtp_block_spec,
                 position_embedding_type=test_config.position_embedding_type,
-            ).cuda()
+            
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
         elif test_config.model_provider == "hybrid":
             pp_size = test_config.pipeline_model_parallel_size
             # Transformer config.
@@ -497,7 +500,9 @@ class DynamicInferenceEngineTestBase:
                 hybrid_layer_pattern=mamba_pattern,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
-            ).cuda()
+            
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
         else:
             raise ValueError(f"Invalid model provider {test_config.model_provider}")
 
@@ -5854,7 +5859,9 @@ class TestChunkedPrefillCudaGraphs:
                 parallel_output=True,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
-            ).cuda()
+            
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
         elif model_provider == "hybrid":
             config = TransformerConfig(
                 params_dtype=torch.bfloat16,
@@ -5880,7 +5887,9 @@ class TestChunkedPrefillCudaGraphs:
                 hybrid_layer_pattern="M*-",
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
-            ).cuda()
+            
+                        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                    ).cuda()
         else:
             raise ValueError(f"Invalid model_provider {model_provider}")
 

@@ -746,7 +746,9 @@ def test_cuda_graph_determine_first_last_layer_logic(
             max_sequence_length=1024,
             position_embedding_type="rope",
             vp_stage=i,
-        ).cuda()
+        
+                         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                     ).cuda()
         model.append(this_model)
 
     # create runner by running a fake forward pass
@@ -1136,7 +1138,9 @@ class TestTECudaGraphHelper:
                 parallel_output=True,
                 position_embedding_type="rope",
                 vp_stage=i if vpp_size else None,
-            ).cuda()
+            
+                             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                         ).cuda()
             model.append(this_model)
 
         # Initialize TECudaGraphHelper
@@ -1399,7 +1403,9 @@ class TestPartialCudaGraph:
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
             mtp_block_spec=mtp_block_spec,
-        )
+        
+                   pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+               )
 
     def create_test_args(
         self, cuda_graph_impl, cuda_graph_modules, cuda_graph_warmup_steps, ep_size, **kwargs
