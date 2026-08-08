@@ -2491,6 +2491,7 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
         'max_seqlen',
         'local_cp_size',
         'hybrid_cp_group',
+        'dataset_id',
     )
 
     if cp_size > 1:
