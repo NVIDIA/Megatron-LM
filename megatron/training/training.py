@@ -1863,21 +1863,33 @@ def pretrain(
         iteration = 0
         args.curr_iteration = iteration
         if args.do_train and (args.train_iters or 0) > 0:
-            iteration, num_floating_point_operations_so_far = train(
-                forward_step_func,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                train_data_iterator,
-                valid_data_iterator,
-                process_non_loss_data_func,
-                model_cfg,
-                checkpointing_context,
-                non_loss_data_func,
-                inference_model,
-                p2p_communicator=p2p_communicator,
-                pg_collection=pg_collection,
-            )
+            try:
+                iteration, num_floating_point_operations_so_far = train(
+                    forward_step_func,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    train_data_iterator,
+                    valid_data_iterator,
+                    process_non_loss_data_func,
+                    model_cfg,
+                    checkpointing_context,
+                    non_loss_data_func,
+                    inference_model,
+                    p2p_communicator=p2p_communicator,
+                    pg_collection=pg_collection,
+                )
+            except Exception:
+                # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
+                # fault, or the injected test fault) would skip the _end_otel_job_spans()
+                # at the bottom of pretrain(), leaving workload/megatron.pretrain unended
+                # -> unexported (only the graceful-SIGTERM and normal-exit paths flush
+                # them today). End + flush the job spans here, then re-raise so the
+                # process still dies exactly as before. Idempotent -> no double-flush.
+                # (SystemExit from the exit-interval path is NOT caught here; it already
+                # flushed before sys.exit(). SIGKILL is unrecoverable regardless.)
+                _end_otel_job_spans()
+                raise
 
         print_datetime('after training is done')
 
