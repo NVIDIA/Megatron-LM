@@ -77,6 +77,10 @@ def should_free_input(name, is_moe, config, num_local_experts):
         config.moe_token_dispatcher_type == "flex"
         and config.moe_flex_dispatcher_backend == "ncclep"
     )
+    enable_moonep = (
+        config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "moonep"
+    )
     # Define which nodes should free input memory.
     # Since we split the computing graph into multiple nodes, we can manually control
     # when and how to free the input memory.
@@ -87,22 +91,22 @@ def should_free_input(name, is_moe, config, num_local_experts):
     # original bf16 tensors are safe to be freed.
     free_mlp = config.fp8 is not None or config.fp4 is not None
     if not free_mlp:
-        # AlltoAll dispatcher with local_num_experts=1, HybridEP, and NCCL EP all use
+        # AlltoAll dispatcher with local_num_experts=1, HybridEP, MoonEP, and NCCL EP all use
         # identity operation for `dispatch_postprocess`, hence the mlp inputs will be
         # directly passed to GroupedGemm and should be saved for backward pass.
         free_mlp = num_local_experts > 1 or config.moe_token_dispatcher_type != "alltoall"
-        free_mlp = free_mlp and not (enable_hybridep or enable_ncclep)
+        free_mlp = free_mlp and not (enable_hybridep or enable_moonep or enable_ncclep)
 
     free_input_nodes = {
         "mlp": free_mlp,
         "moe_combine": True,
-        # For non-DeepEP/HybridEP/NCCL-EP dispatcher mode, the input is the un-dispatched
+        # For non-DeepEP/HybridEP/MoonEP/NCCL-EP dispatcher mode, the input is the un-dispatched
         # tokens and probs before dispatch A2A and it's not needed anymore after the
-        # forward pass. For DeepEP, HybridEP, and NCCL EP dispatcher mode, they are all
+        # forward pass. For DeepEP, HybridEP, MoonEP, and NCCL EP dispatcher mode, they are all
         # needed in backward pass and cannot be freed.
         # If moe_preprocess is in cuda graph scope, tokens and probs are fixed size
         # tensors, so they cannot be freed.
-        "moe_dispatch": not (enable_deepep or enable_hybridep or enable_ncclep)
+        "moe_dispatch": not (enable_deepep or enable_hybridep or enable_moonep or enable_ncclep)
         and (CudaGraphModule.moe_preprocess not in config.cuda_graph_modules),
     }
 

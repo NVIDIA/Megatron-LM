@@ -244,12 +244,12 @@ class MoELayer(BaseMoELayer):
         )
         # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
         self.moe_layer_recompute = (
-            config.recompute_granularity == 'selective'
+            config.recompute_granularity == "selective"
             and "moe" in config.recompute_modules
-            and config.cuda_graph_impl != 'local'
+            and config.cuda_graph_impl != "local"
         )
         self.shared_experts_recompute = (
-            config.recompute_granularity == 'selective'
+            config.recompute_granularity == "selective"
             and "shared_experts" in config.recompute_modules
         )
 
@@ -329,6 +329,7 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
             name=(name + ".experts") if name is not None else None,
         )
+        self.token_dispatcher.set_experts(self.experts)
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -346,7 +347,7 @@ class MoELayer(BaseMoELayer):
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
-            if config.inference_grouped_gemm_backend == 'auto':
+            if config.inference_grouped_gemm_backend == "auto":
                 assert HAVE_FLASHINFER, (
                     "inference_grouped_gemm_backend='auto'"
                     "requires flashinfer-python. "
@@ -361,14 +362,14 @@ class MoELayer(BaseMoELayer):
                 from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
 
                 check_flashinfer_jit_cache_installed()
-            elif config.inference_grouped_gemm_backend == 'torch':
-                assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
-                    torch, '_grouped_mm'
+            elif config.inference_grouped_gemm_backend == "torch":
+                assert hasattr(torch.nn.functional, "grouped_mm") or hasattr(
+                    torch, "_grouped_mm"
                 ), (
                     "inference_grouped_gemm_backend='torch' requires "
                     "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
                 )
-            elif config.inference_grouped_gemm_backend == 'vllm':
+            elif config.inference_grouped_gemm_backend == "vllm":
                 assert HAVE_TRITON, (
                     "inference_grouped_gemm_backend='vllm' requires Triton. "
                     "Install triton (pip install triton)."
@@ -393,7 +394,7 @@ class MoELayer(BaseMoELayer):
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
         dispatcher_cls = (
-            NVLSAllGatherVDispatcher if dispatcher_type == 'nvls' else NCCLAllGatherDispatcher
+            NVLSAllGatherVDispatcher if dispatcher_type == "nvls" else NCCLAllGatherDispatcher
         )
 
         self._training_token_dispatcher = self.token_dispatcher
@@ -408,7 +409,7 @@ class MoELayer(BaseMoELayer):
         # The dispatcher launches the shared-expert forward on SharedExpertMLP.stream
         # concurrently with AGV+experts+RSV and adds it back in combine_postprocess.
         if (
-            dispatcher_type == 'nvls'
+            dispatcher_type == "nvls"
             and self.use_shared_expert
             and self.config.moe_shared_expert_overlap
         ):
@@ -546,7 +547,7 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
         else:
-            # NCCL-EP zero-copy: experts write fc2 output and fc1 dgrad straight into the combine /
+            # Backend zero-copy: experts write fc2 output and fc1 dgrad straight into the combine /
             # dispatch symm buffers. Passed only when set (non-TEGroupedMLP experts don't accept
             # these kwargs).
             output_buffer, grad_input_buffer = self.token_dispatcher.get_expert_zero_copy_buffers()

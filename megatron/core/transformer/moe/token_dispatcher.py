@@ -2,6 +2,7 @@
 
 import logging
 import os
+import socket
 import warnings
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
@@ -21,14 +22,21 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
     HYBRIDEP_TOKEN_ALIGNMENT,
+    MoonEPDispatchBufferPool,
+    MoonEPWeightBridge,
     alloc_ep_symm_buffer,
     ensure_nccl_ep_bootstrapped,
     fused_combine,
     fused_dispatch,
+    get_moonep_zero_copy_token_buffers,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
+    is_moonep_available,
+    moonep_combine,
+    moonep_dispatch,
     nccl_ep_combine,
     nccl_ep_dispatch,
+    new_moonep_buffer,
     new_nccl_ep_buffer,
     set_deepep_num_sms,
 )
@@ -216,6 +224,10 @@ class MoETokenDispatcher:
         self.shared_experts = shared_experts
         self.use_nccl_stream = True
 
+    def set_experts(self, experts):
+        """Bind routed experts when a dispatcher backend needs their runtime state."""
+        del experts
+
     def get_expert_zero_copy_buffers(self):
         """Buffers the experts should write their output / grad input into, if any.
 
@@ -263,7 +275,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_modules contains moe_preprocess.
-        self.cudagraph_attrs = ['routing_map']
+        self.cudagraph_attrs = ["routing_map"]
 
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
@@ -316,7 +328,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
         tokens_per_expert = self.local_map.sum(dim=0).long().cpu()
 
-        permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping, _, _ = (
+        (permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping, _, _) = (
             permute(
                 hidden_states,
                 self.local_map,
@@ -471,16 +483,16 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_modules contains moe_preprocess.
         self.cudagraph_attrs = [
-            'tokens_per_expert',
-            'input_splits',
-            'output_splits',
-            'output_splits_tp',
-            'num_out_tokens',
-            'num_global_tokens_per_local_expert',
-            'reversed_local_input_permutation_mapping',
-            'routing_map',
-            'hidden_shape',
-            'probs',
+            "tokens_per_expert",
+            "input_splits",
+            "output_splits",
+            "output_splits_tp",
+            "num_out_tokens",
+            "num_global_tokens_per_local_expert",
+            "reversed_local_input_permutation_mapping",
+            "routing_map",
+            "hidden_shape",
+            "probs",
         ]
         self.batch_invariant_inverse_permutation_mapping = None
         if self.config.batch_invariant_mode:
@@ -492,8 +504,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """Set shared expert to the dispatcher."""
         super().set_shared_experts(shared_experts)
         if shared_experts.use_shared_expert_gate:
-            self.cudagraph_attrs.append('shared_experts.gate_score')
-        self.cudagraph_attrs.append('shared_experts.cached_fc1_input')
+            self.cudagraph_attrs.append("shared_experts.gate_score")
+        self.cudagraph_attrs.append("shared_experts.cached_fc1_input")
 
     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
         """
@@ -1056,7 +1068,7 @@ class _HybridEPManager(_DispatchManager):
             )
 
         self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
-        self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
+        self.over_budget = torch.zeros(1, dtype=torch.bool, device="cuda")
         # HybridEP dispatch expects equal per-rank input sizes. When requested,
         # variable token counts are padded to the group-wide max and trimmed in combine.
         self._original_num_tokens: Optional[int] = None
@@ -1212,9 +1224,9 @@ class _HybridEPManager(_DispatchManager):
         return hidden_states
 
     def get_number_of_tokens_per_expert(self) -> torch.Tensor:
-        '''
+        """
         Get the number of tokens per expert.
-        '''
+        """
         return self.tokens_per_expert
 
 
@@ -1312,7 +1324,7 @@ class _DeepepManager(_DispatchManager):
                     "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
-        hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
+        (hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle) = (
             fused_dispatch(
                 hidden_states,
                 self.token_indices,
@@ -1462,6 +1474,190 @@ class _DeepepManager(_DispatchManager):
             pad_offsets=self.pad_offsets,
         )
         return hidden_states
+
+
+class _MoonEPManager(_DispatchManager):
+    """MoonEP dispatch manager for fixed-shape, single-node BF16 training."""
+
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        router_topk: int,
+        num_experts: int,
+        config: TransformerConfig,
+    ):
+        self.group = group
+        self.num_local_experts = int(num_local_experts)
+        self.router_topk = int(router_topk)
+        self.num_experts = int(num_experts)
+        self.config = config
+        # Latent MoE projects tokens before dispatch and combines them before
+        # projecting back to hidden_size in MoELayer.postprocess().
+        self.hidden_dim = getattr(config, "moe_latent_size", None) or config.hidden_size
+        if not is_moonep_available():
+            raise ImportError(
+                "MoonEP is not installed. Install the optional 'moonep' package before using "
+                "moe_flex_dispatcher_backend='moonep'."
+            )
+
+        self.token_probs: Optional[torch.Tensor] = None
+        self.token_indices: Optional[torch.Tensor] = None
+        self.tokens_per_expert: Optional[torch.Tensor] = None
+        self.dispatched_probs: Optional[torch.Tensor] = None
+        self.handle = None
+        self._buffer = None
+        self._bridge: Optional[MoonEPWeightBridge] = None
+        self._num_local_tokens: Optional[int] = None
+        self._buffer_num_tokens: Optional[int] = None
+        self._dispatch_capacity: Optional[int] = None
+        self._dispatch_hidden_buffer_pool = None
+        self._zero_copy_token_buffers = None
+
+    def bind_experts(self, experts) -> None:
+        """Bind the registered grouped expert parameters to MoonEP runtime storage."""
+        self._bridge = MoonEPWeightBridge(
+            experts=experts,
+            group=self.group,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            num_sms=self.config.moe_flex_dispatcher_num_sms,
+        )
+        experts.set_moonep_weight_bridge(self._bridge)
+
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+        num_tokens = int(routing_map.shape[0])
+        routing_map = routing_map.reshape(num_tokens, self.num_experts)
+        probs = probs.reshape(num_tokens, self.num_experts)
+        self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
+        self.token_indices = self.token_indices.to(torch.int32)
+        # torch.bincount performs D2H scalar reads of the input min/max even
+        # when minlength is fixed. MoonEP knows E statically, so build the
+        # fixed-size histogram entirely on the GPU instead.
+        flat_indices = self.token_indices.reshape(-1).long()
+        self.tokens_per_expert = torch.zeros(
+            self.num_experts, dtype=torch.int32, device=flat_indices.device
+        )
+        self.tokens_per_expert.scatter_add_(
+            0, flat_indices, torch.ones_like(flat_indices, dtype=torch.int32)
+        )
+        self._num_local_tokens = num_tokens
+
+    def _ensure_buffer(self, hidden_states: torch.Tensor) -> None:
+        if self._bridge is None:
+            raise RuntimeError("MoonEP experts must be bound before the first dispatch.")
+        num_tokens = int(hidden_states.shape[0])
+        if self._buffer is not None:
+            if num_tokens != self._buffer_num_tokens:
+                raise ValueError(
+                    "MoonEP v1 requires a fixed local token count while a layer buffer is live: "
+                    f"initialized with {self._buffer_num_tokens}, got {num_tokens}."
+                )
+            return
+        rank_metadata = [None] * torch.distributed.get_world_size(group=self.group)
+        torch.distributed.all_gather_object(
+            rank_metadata,
+            (socket.gethostname(), num_tokens, int(hidden_states.shape[1])),
+            group=self.group,
+        )
+        hostnames = {metadata[0] for metadata in rank_metadata}
+        if len(hostnames) != 1:
+            raise ValueError(
+                "MoonEP v1 requires all communication ranks on one NVLink-connected host, "
+                f"got hosts={sorted(hostnames)}."
+            )
+        token_counts = {metadata[1] for metadata in rank_metadata}
+        if len(token_counts) != 1:
+            raise ValueError(
+                "MoonEP requires equal local token counts across its communication group, "
+                f"got counts={sorted(token_counts)}."
+            )
+        hidden_dims = {metadata[2] for metadata in rank_metadata}
+        if len(hidden_dims) != 1:
+            raise ValueError(
+                "MoonEP requires equal dispatched hidden dimensions across its communication "
+                f"group, got dimensions={sorted(hidden_dims)}."
+            )
+        self._buffer_num_tokens = num_tokens
+        self._buffer = new_moonep_buffer(
+            S=num_tokens,
+            H=int(hidden_states.shape[1]),
+            K=self.router_topk,
+            E=self.num_experts,
+            num_ep_ranks=torch.distributed.get_world_size(group=self.group),
+            num_sms=self.config.moe_flex_dispatcher_num_sms,
+            B=self.num_local_experts,
+            group=self.group,
+        )
+        self._bridge.attach_buffer(self._buffer)
+        self._dispatch_hidden_buffer_pool = MoonEPDispatchBufferPool(self._buffer)
+        self._zero_copy_token_buffers = get_moonep_zero_copy_token_buffers(self._buffer)
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ) -> torch.Tensor:
+        del async_finish, allocate_on_comm_stream
+        self._ensure_buffer(hidden_states)
+        dispatched_hidden, self.dispatched_probs, self.tokens_per_expert = moonep_dispatch(
+            hidden_states,
+            self.token_probs,
+            self.token_indices,
+            self.tokens_per_expert,
+            self._buffer,
+            self._bridge,
+            self._dispatch_hidden_buffer_pool,
+            self._zero_copy_token_buffers.backward,
+        )
+        self.handle = self._bridge.last_plan
+        self._dispatch_capacity = int(dispatched_hidden.shape[0])
+        return dispatched_hidden
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ) -> torch.Tensor:
+        del async_finish, allocate_on_comm_stream
+        hidden_states = moonep_combine(
+            hidden_states,
+            self._buffer,
+            self.handle,
+            self._bridge,
+            self._zero_copy_token_buffers.forward,
+        )
+        self.handle = None
+        self.dispatched_probs = None
+        self._dispatch_capacity = None
+        return hidden_states
+
+    def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # MoonEP dispatch returns a fixed-capacity [NvS, H] tensor. As in the
+        # NCCL-EP static-shape path, TE consumes the whole storage allocation
+        # and uses the device-side E+B counts to delimit valid expert rows.
+        # Rows beyond sum(counts) are ignored by grouped GEMM and combine.
+        return hidden_states, self.dispatched_probs
+
+    def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        pad_rows = self._dispatch_capacity - int(hidden_states.shape[0])
+        if pad_rows > 0:
+            hidden_states = torch.cat(
+                [hidden_states, hidden_states.new_zeros(pad_rows, hidden_states.shape[-1])], dim=0
+            )
+        return hidden_states
+
+    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+        """Return the padded ``E+B`` expert-group token counts."""
+        return self.tokens_per_expert
+
+    def get_expert_zero_copy_buffers(self):
+        """Return local FC2-output and FC1-dgrad symmetric buffer views."""
+        if self._zero_copy_token_buffers is None:
+            return None, None
+        return (self._zero_copy_token_buffers.forward[1], self._zero_copy_token_buffers.backward[1])
 
 
 class _NCCLEPManager(_DispatchManager):
@@ -1706,9 +1902,9 @@ class _NCCLEPManager(_DispatchManager):
         return permuted_hidden, permuted_probs
 
     def get_number_of_tokens_per_expert(self) -> torch.Tensor:
-        '''
+        """
         Get the number of tokens per expert.
-        '''
+        """
         return self.tokens_per_expert
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1780,7 +1976,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
-            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
+            self.cudagraph_attrs = ["_comm_manager.token_probs", "_comm_manager.token_indices"]
         elif self.config.moe_flex_dispatcher_backend == "hybridep":
             self._comm_manager = _HybridEPManager(
                 group=self.tp_ep_group,
@@ -1788,7 +1984,17 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
-            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
+            self.cudagraph_attrs = ["_comm_manager.token_probs", "_comm_manager.routing_map"]
+        elif self.config.moe_flex_dispatcher_backend == "moonep":
+            assert self.tp_size == 1, "MoonEP dispatcher requires expert tensor parallel size 1"
+            self._comm_manager = _MoonEPManager(
+                group=self.tp_ep_group,
+                num_local_experts=self.num_local_experts,
+                router_topk=self.config.moe_router_topk,
+                num_experts=self.config.num_moe_experts,
+                config=self.config,
+            )
+            self.cudagraph_attrs = []
         elif self.config.moe_flex_dispatcher_backend == "ncclep":
             assert self.tp_size * self.ep_size > 1, "NCCL EP dispatcher requires TPxEP > 1"
             self._comm_manager = _NCCLEPManager(
@@ -1798,22 +2004,37 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
-            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
+            self.cudagraph_attrs = ["_comm_manager.token_probs", "_comm_manager.token_indices"]
         else:
             raise ValueError(
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
-                "Please set --moe-flex-dispatcher-backend to deepep, hybridep, or ncclep"
+                "Please set --moe-flex-dispatcher-backend to deepep, hybridep, moonep, or ncclep"
             )
 
+    def set_experts(self, experts) -> None:
+        """Bind backend-specific expert runtime state after expert construction."""
+        bind_experts = getattr(self._comm_manager, "bind_experts", None)
+        if bind_experts is not None:
+            bind_experts(experts)
+
     def get_expert_zero_copy_buffers(self):
-        """NCCL-EP zero-copy: ``(output_buffer, grad_input_buffer)`` — the shared symm buffers the
-        experts write the fc2 output / fc1 dgrad into, so combine (fwd) and dispatch (bwd) read and
-        scatter them one-sided. ``(None, None)`` for every other backend/mode.
+        """Return backend buffers that experts write FC2 output / FC1 dgrad into directly.
+
+        MoonEP and NCCL-EP then consume these symmetric buffers in combine
+        (forward) and dispatch (backward), eliminating the large activation
+        boundary copies. ``(None, None)`` for other backends/modes.
 
         Returned detached: the op-fuser calls requires_grad_() on its output and returns it,
         so handing it the persistent buffer would permanently mark the shared classvar as requiring
         grad and break the next layer's reuse. The detached view shares storage (zero-copy intact).
         """
+
+        if self.config.moe_flex_dispatcher_backend == "moonep":
+            output_buffer, grad_input_buffer = self._comm_manager.get_expert_zero_copy_buffers()
+            return (
+                output_buffer.detach() if output_buffer is not None else None,
+                grad_input_buffer.detach() if grad_input_buffer is not None else None,
+            )
 
         def _detached(name):
             buf = getattr(self._comm_manager, name, None)
@@ -1992,12 +2213,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
     def check_over_budget(self):
         """Check if the dispatcher has exceeded its budget."""
-        if hasattr(self._comm_manager, 'over_budget'):
+        if hasattr(self._comm_manager, "over_budget"):
             return self._comm_manager.over_budget
         else:
             return None
 
     def reset_over_budget(self):
         """Reset the accumulated over-budget flag on the communication manager."""
-        if hasattr(self._comm_manager, 'over_budget'):
+        if hasattr(self._comm_manager, "over_budget"):
             self._comm_manager.over_budget.fill_(0)
