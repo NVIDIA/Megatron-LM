@@ -310,6 +310,35 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 | **FlexDispatcher with [DeepEP](https://github.com/deepseek-ai/DeepEP) backend** | Removes redundant tokens during cross-node communication, fuses intra/inter-node communication into single kernel | Cross-node EP, fine-grained MoE (DeepSeek-V3) | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep` |
 | **FlexDispatcher with [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) backend** | NVIDIA's optimized dispatcher using TMA and IBGDA, fewer SMs, native MNNVL support | GB200 NVL72, Multi-Node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
+| **[MoonEP](https://github.com/MoonshotAI/MoonEP)** | Plans redundant experts online so every rank receives exactly `S x K` tokens, prefetches the duplicated experts' weights over NVLink, and writes tokens directly into their expert-grouped slots | Skewed routing, single-node NVLink EP | `--moe-token-dispatcher-type moonep` |
+
+#### MoonEP Balanced Dispatch
+
+[MoonEP](https://github.com/MoonshotAI/MoonEP) removes the load imbalance of expert parallelism
+instead of tolerating it. Each microbatch is planned on the GPU from the current router output: a
+small number of hot experts are duplicated onto the ranks that have spare capacity, their weights
+are prefetched over NVLink, and every rank ends up computing exactly `S x K` tokens with statically
+known shapes. Duplicated experts' weight gradients are reduced back to their home rank in the
+backward pass.
+
+Install MoonEP and a matching `nvidia-cutlass-dsl` in the training container, then enable it with:
+
+```bash
+--moe-token-dispatcher-type moonep
+--moe-grouped-gemm
+--accumulate-allreduce-grads-in-fp32
+```
+
+Each EP rank reserves `num_experts / EP` prefetch slots, so its grouped GEMM runs over twice as
+many physical experts as it owns. The slot parameters alias MoonEP's process-global prefetch pool
+and gradient reduce buffer and are excluded from DDP, optimizer state, and distributed checkpoints.
+
+The current integration supports BF16 training with MCore DDP, TE per-expert GroupedLinear weights,
+ETP1, dropless routing, and DP/PP/VPP. The configuration validator rejects unsupported
+combinations, including FP8/FP4 experts, FSDP, expert TP, single grouped expert weights, latent
+MoE, CUDA graphs, the TE operation fuser, batch-level EP overlap, delayed expert wgrad, and
+inference-optimized layers. MoonEP requires an NVLink domain (expert parallelism must stay inside
+one node) and expert weight dimensions that are multiples of 128.
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
@@ -548,7 +577,9 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 ### Token Dispatching
 | Argument | Description | Default |
 |----------|-------------|---------|
-| --moe-token-dispatcher-type | Dispatcher: allgather, alltoall, flex | allgather |
+| --moe-token-dispatcher-type | Dispatcher: allgather, alltoall, flex, moonep | allgather |
+| --moe-moonep-num-sms | SMs for MoonEP's communication kernels | 32 |
+| --moe-moonep-token-padding | Token multiple each MoonEP expert group is padded to | 128 |
 | --moe-enable-deepep | Enable DeepEP (with flex) | False |
 | --moe-expert-capacity-factor | Capacity factor | None |
 | --moe-pad-expert-input-to-capacity | Pad to capacity | False |

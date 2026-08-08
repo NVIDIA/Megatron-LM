@@ -6,7 +6,7 @@ import logging
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import chain
 from math import ceil
 from typing import Optional, Protocol, Tuple
@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.activations import squared_relu
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, ShardedTensor
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -168,6 +168,21 @@ class GroupedMLPSubmodules:
     """
     Builder for an activation function module; only used if config.use_te_activation_func is True.
     """
+
+
+def _parse_te_expert_idx(key: str, module_name: str) -> Optional[int]:
+    """Extract a local expert index from a TE GroupedLinear state-dict key."""
+    prefix = f'{module_name}.'
+    if not key.startswith(prefix):
+        return None
+
+    suffix = key[len(prefix) :]
+    for kind in ('weight', 'bias'):
+        index = suffix.removeprefix(kind)
+        if index != suffix and index.isdigit():
+            return int(index)
+    # GroupedLinear owns one module-level extra state, replicated across EP ranks.
+    return None
 
 
 class TEGroupedMLP(MegatronModule):
@@ -918,15 +933,21 @@ class TEGroupedMLP(MegatronModule):
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
+        # MoonEP appends prefetch-slot experts to the local expert axis; checkpoints
+        # only describe the master experts.
+        num_local_checkpoint_experts = getattr(
+            self, 'num_local_master_experts', self.num_local_experts
+        )
+        has_replica_experts = num_local_checkpoint_experts < self.num_local_experts
         for name, module in self._modules.items():
             sub_sd = sharded_state_dict_default(
                 module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
             )
             if name == 'linear_fc1' and self.config.gated_linear_unit:
-                num_global_experts = self.ep_group.size() * self.num_local_experts
-                local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
+                num_global_experts = self.ep_group.size() * num_local_checkpoint_experts
+                local_expert_indices_offset = self.ep_group.rank() * num_local_checkpoint_experts
                 ep_axis = len(sharded_offsets)
-                for i in range(self.num_local_experts):
+                for i in range(num_local_checkpoint_experts):
                     if singleton_local_shards:
                         new_sharded_offsets = sharded_offsets
                     else:
@@ -939,6 +960,14 @@ class TEGroupedMLP(MegatronModule):
                             sub_sd[k] = apply_swiglu_sharded_factory(
                                 sub_sd[k], new_sharded_offsets, singleton_local_shards
                             )
+            if has_replica_experts:
+                sub_sd = self._filter_replica_checkpoint_entries(
+                    sub_sd,
+                    name,
+                    len(sharded_offsets),
+                    num_local_checkpoint_experts,
+                    fix_metadata=not singleton_local_shards,
+                )
             if singleton_local_shards:
                 replace_prefix_for_sharding(sub_sd, '', f'{prefix}experts.')
             else:
@@ -946,6 +975,63 @@ class TEGroupedMLP(MegatronModule):
                 replace_prefix_for_sharding(sub_sd, f'{name}.', f'{prefix}experts.{name}.')
             sharded_state_dict.update({f"{prefix}{k}": v for k, v in sub_sd.items()})
         return sharded_state_dict
+
+    def _filter_replica_checkpoint_entries(
+        self,
+        sub_sd: dict,
+        module_name: str,
+        ep_axis: int,
+        num_local_master_experts: int,
+        *,
+        fix_metadata: bool,
+    ) -> dict:
+        """Drop ephemeral replica experts and restore master-expert checkpoint metadata."""
+        num_global_master_experts = self.ep_group.size() * num_local_master_experts
+        local_master_offset = self.ep_group.rank() * num_local_master_experts
+        filtered = {}
+
+        for key, value in sub_sd.items():
+            local_expert_idx = _parse_te_expert_idx(key, module_name)
+            if local_expert_idx is None:
+                filtered[key] = value
+                continue
+            if local_expert_idx >= num_local_master_experts:
+                continue
+            if not fix_metadata:
+                filtered[key] = value
+                continue
+
+            global_expert_idx = local_master_offset + local_expert_idx
+            if isinstance(value, ShardedTensor):
+                global_shape = list(value.global_shape)
+                global_offset = list(value.global_offset)
+                axis_fragmentations = (
+                    list(value.axis_fragmentations)
+                    if value.axis_fragmentations is not None
+                    else None
+                )
+                global_shape[ep_axis] = num_global_master_experts
+                global_offset[ep_axis] = global_expert_idx
+                if axis_fragmentations is not None:
+                    axis_fragmentations[ep_axis] = num_global_master_experts
+                value = replace(
+                    value,
+                    global_shape=tuple(global_shape),
+                    global_offset=tuple(global_offset),
+                    axis_fragmentations=(
+                        tuple(axis_fragmentations) if axis_fragmentations is not None else None
+                    ),
+                )
+            elif isinstance(value, ShardedObject):
+                global_shape = list(value.global_shape)
+                global_offset = list(value.global_offset)
+                global_shape[ep_axis] = num_global_master_experts
+                global_offset[ep_axis] = global_expert_idx
+                value = replace(
+                    value, global_shape=tuple(global_shape), global_offset=tuple(global_offset)
+                )
+            filtered[key] = value
+        return filtered
 
     def backward_dw(self):
         """Performs backward pass for weight gradients in TEGroupedMLP.

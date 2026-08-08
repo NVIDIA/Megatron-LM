@@ -969,6 +969,10 @@ def group_params_for_buffers(
 
     for param in params:
         assert param.requires_grad
+        # Filter MoonEP prefetch-slot params here as well as in DDP so precomputed
+        # distributed-optimizer layouts match the buffers DDP actually constructs.
+        if getattr(param, '_moonep_is_replica', False):
+            continue
 
         param_dtype = param.dtype
         if _param_uses_quantized_storage(param):

@@ -1078,6 +1078,17 @@ def validate_args(args, defaults={}):
             args.overlap_grad_reduce
         ), 'Must use --overlap-param-gather with --overlap-grad-reduce'
 
+    if args.moe_token_dispatcher_type == "moonep":
+        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
+            raise ValueError(
+                "MoonEP currently supports MCore DDP only; disable FSDP for this integration."
+            )
+        if not args.accumulate_allreduce_grads_in_fp32:
+            raise ValueError(
+                "MoonEP requires --accumulate-allreduce-grads-in-fp32 so master and replica "
+                "gradients use the same FP32 dtype."
+            )
+
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), 'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
         assert (

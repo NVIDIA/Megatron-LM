@@ -15,6 +15,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -23,6 +24,7 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
     record_dispatch_token_counts,
 )
+from megatron.core.transformer.moe.moonep_dispatcher import MoEMoonEPTokenDispatcher
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
@@ -197,6 +199,14 @@ class BaseMoELayer(MegatronModule, ABC):
             local_expert_indices_offset + i for i in range(self.num_local_experts)
         ]
         assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
+
+        # MoonEP reserves one prefetch slot per local expert; those slots are extra
+        # physical experts in the grouped GEMM but not extra logical experts.
+        self.moonep_enabled = config.moe_token_dispatcher_type == "moonep"
+        self.num_local_physical_experts = (
+            2 * self.num_local_experts if self.moonep_enabled else self.num_local_experts
+        )
+
         self.router: RouterInterface = None
         self.experts = None
         self.shared_experts = None
@@ -325,6 +335,14 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 pg_collection=pg_collection,
             )
+        elif config.moe_token_dispatcher_type == "moonep":
+            self.token_dispatcher = MoEMoonEPTokenDispatcher(
+                self.num_local_physical_experts,
+                self.local_expert_indices,
+                config=self.config,
+                pg_collection=pg_collection,
+                layer_number=layer_number,
+            )
         else:
             raise ValueError(
                 f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
@@ -332,11 +350,21 @@ class MoELayer(BaseMoELayer):
 
         # Initialize experts
         self.experts = self.submodules.experts(
-            self.num_local_experts,
+            self.num_local_physical_experts,
             self.config,
             pg_collection=pg_collection,
             name=(name + ".experts") if name is not None else None,
         )
+        if self.moonep_enabled:
+            if not isinstance(self.experts, TEGroupedMLP):
+                raise TypeError(
+                    f"MoonEP requires TEGroupedMLP experts, got {type(self.experts).__name__}."
+                )
+            self.experts.num_local_master_experts = self.num_local_experts
+            self.token_dispatcher.manager.bind_replica_parameters(
+                self.token_dispatcher.layer_buffers,
+                (self.experts.linear_fc1, self.experts.linear_fc2),
+            )
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -696,6 +724,14 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+        if self.moonep_enabled:
+            if intermediate_tensors is not None:
+                raise RuntimeError("MoonEP requires the unsplit MoE forward path.")
+            self.token_dispatcher.manager.bind_master_parameters(
+                self.token_dispatcher.layer_buffers,
+                (self.experts.linear_fc1, self.experts.linear_fc2),
+            )
+
         # Select the active token dispatcher based on whether the inference engine
         # is currently using the model. Only applies when the inference dispatcher
         # was set up (config.transformer_impl == "inference_optimized").

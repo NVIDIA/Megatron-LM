@@ -330,6 +330,10 @@ def _get_param_groups(
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
+            # MoonEP prefetch slots are ephemeral copies of remote master experts. Their
+            # storage is owned by MoonEP and must not receive optimizer state or updates.
+            if getattr(param, '_moonep_is_replica', False):
+                continue
 
             uses_default_config = False
             # Get optimizer config overrides for this parameter.

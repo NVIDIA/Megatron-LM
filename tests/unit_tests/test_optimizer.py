@@ -73,6 +73,21 @@ class Net(nn.Module):
 @patch(
     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
 )
+def test_get_param_groups_excludes_moonep_replicas(mock_get_world_size):
+    net = Net()
+    net.fc3.weight._moonep_is_replica = True
+
+    param_groups = _get_param_groups([net], OptimizerConfig(optimizer='adam', lr=0.01), {})
+    optimizer_params = {param for group in param_groups for param in group['params']}
+
+    assert net.fc3.weight not in optimizer_params
+    assert optimizer_params == set(net.parameters()) - {net.fc3.weight}
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
 def test_get_param_groups_no_overrides(mock_get_world_size):
     net = Net()
     # NOTE: to get no overrides, supply an empty dictionary rather than None.

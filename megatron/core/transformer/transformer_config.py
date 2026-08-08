@@ -924,9 +924,15 @@ class TransformerConfig(ModelParallelConfig):
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
 
-    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
+    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex', 'moonep'] = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
-    Options are 'allgather','alltoall' and 'flex'."""
+    Options are 'allgather','alltoall', 'flex' and 'moonep'."""
+
+    moe_moonep_num_sms: int = 32
+    """Number of SMs for MoonEP's dispatch/combine/prefetch/grad-reduce kernels."""
+
+    moe_moonep_token_padding: int = 128
+    """Token multiple each non-empty MoonEP expert group is padded up to."""
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
@@ -1996,6 +2002,9 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_flex_dispatcher_backend='ncclep' requires "
                     "moe_token_dispatcher_type='flex'."
                 )
+
+        if self.moe_token_dispatcher_type == "moonep":
+            self._validate_moonep()
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
         # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit
@@ -3512,6 +3521,45 @@ class TransformerConfig(ModelParallelConfig):
                     f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
                     f"Available schedulers: {supported_schedulers}"
                 )
+
+    def _validate_moonep(self):
+        """Reject configurations the MoonEP token dispatcher does not implement yet."""
+        if self.num_moe_experts is None or self.moe_ffn_hidden_size is None:
+            raise ValueError("MoonEP requires num_moe_experts and moe_ffn_hidden_size.")
+        if not self.moe_grouped_gemm:
+            raise ValueError("MoonEP requires moe_grouped_gemm=True (TEGroupedMLP).")
+        if self.expert_tensor_parallel_size not in (None, 1):
+            raise ValueError("MoonEP currently requires expert_tensor_parallel_size=1.")
+        if self.mtp_num_layers not in (None, 0):
+            raise ValueError("MoonEP does not currently support MTP layers.")
+        # MoonEP's dispatch/combine and prefetch kernels assert bf16 activations and
+        # bf16 expert weights; there is no FP8/FP4 path in the library.
+        if self.params_dtype != torch.bfloat16 or self.fp8 or self.fp4:
+            raise ValueError("MoonEP supports BF16 expert weights and activations only.")
+        if not self.gated_linear_unit:
+            raise ValueError("MoonEP currently requires a gated expert MLP (for example SwiGLU).")
+        if self.add_bias_linear:
+            raise ValueError("MoonEP currently requires add_bias_linear=False.")
+        if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
+            raise ValueError("MoonEP does not support single grouped expert parameters.")
+        if self.moe_latent_size is not None:
+            raise ValueError("MoonEP does not currently support latent MoE projections.")
+        if self.use_transformer_engine_op_fuser:
+            raise ValueError("MoonEP does not currently support the TE operation fuser.")
+        if self.cuda_graph_impl != "none":
+            raise ValueError("MoonEP does not currently support CUDA graph capture.")
+        if self.overlap_moe_expert_parallel_comm:
+            raise ValueError("MoonEP does not currently support batch-level EP overlap.")
+        if self.overlap_dispatch_backward_with_experts_wgrad:
+            raise ValueError("MoonEP does not currently support delayed expert wgrad overlap.")
+        if self.delay_wgrad_compute:
+            raise ValueError("MoonEP does not currently support delay_wgrad_compute.")
+        if self.transformer_impl == "inference_optimized":
+            raise ValueError("MoonEP integration currently supports training mode only.")
+        if self.moe_expert_capacity_factor is not None or self.moe_pad_expert_input_to_capacity:
+            raise ValueError("MoonEP supports dropless MoE routing only.")
+        if self.moe_shared_expert_overlap:
+            raise ValueError("MoonEP does not currently support moe_shared_expert_overlap.")
 
 
 @dataclass
