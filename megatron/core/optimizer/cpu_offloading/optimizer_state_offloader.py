@@ -291,6 +291,20 @@ class OptimizerStateOffloader:
         if not self._offloaded:
             return
 
+        if torch.cuda.is_current_stream_capturing():
+            # The early reload forks the H2D stream, and CUDA requires every
+            # stream forked during a capture to rejoin before capture_end. The
+            # join lives in sync_before_step(), which runs in the optimizer
+            # step -- outside a full-iteration graph, whose scope is the
+            # iteration minus that step. Forking here would therefore end the
+            # capture with unjoined work.
+            #
+            # Nothing is lost by deferring: a replayed graph runs no Python, so
+            # this early reload cannot fire on a replay iteration anyway, and
+            # the states it would have moved are needed only by the eager
+            # optimizer step. sync_before_step() reloads them there.
+            return
+
         # Allocate GPU memory on the current stream to avoid fragmentation.
         self._reload_states(is_allocate_stage=True)
 
@@ -312,4 +326,22 @@ class OptimizerStateOffloader:
 
         This is separated from reload() to make it possible to move the reload ahead of time.
         """
+        # reload() defers while capturing, so if this join were ever itself
+        # captured the states would stay on the host and the optimizer would
+        # step on them -- silently, because waiting on a stream that was never
+        # forked succeeds trivially. The scope boundary that rules this out is
+        # not enforced anywhere, so check it here rather than assume it.
+        # Raise rather than assert: `python -O` strips assertions, and this is the
+        # only enforcement there is.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "sync_before_step() must run outside CUDA graph capture: reload() defers "
+                "under capture, so optimizer states would still be on the host at step time."
+            )
+        if self._offloaded:
+            # The early reload was skipped or never ran: either it landed inside
+            # a graph capture, or the iteration was a graph replay, which
+            # executes no Python. Both fork and join are eager here, so the
+            # states can be brought back safely.
+            self.reload()
         torch.cuda.current_stream().wait_stream(self._h2d_stream)

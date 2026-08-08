@@ -364,6 +364,14 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
+  # Parked in the -broken scopes until golden values land: the case ships none
+  # yet, so in the MR scopes it would occupy a blocking slot while validating
+  # nothing. Move back to [mr, mr-github] in the commit that adds the values.
+  - test_case: [gpt3_mcore_te_tp2_pp2_mhc_attn_cudagraph]
+    products:
+      - environment: [dev]
+        scope: [mr-broken, mr-github-broken]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_gdn_no_nvrx_sync]
     products:
       - environment: [dev]

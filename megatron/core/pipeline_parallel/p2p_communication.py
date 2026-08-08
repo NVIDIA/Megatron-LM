@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 from typing import List, Optional, Tuple, Union
@@ -413,9 +413,21 @@ class P2PCommunicator:
                 req.wait()
             reqs = None
 
-        if config.batch_p2p_comm and config.batch_p2p_sync:
+        if (
+            config.batch_p2p_comm
+            and config.batch_p2p_sync
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             # To protect against race condition when using batch_isend_irecv().
-            # User should assert that we have a modern enough PyTorch to not need this
+            # User should assert that we have a modern enough PyTorch to not need this.
+            # Skipped during CUDA graph capture (cuda_graph_impl="full_iteration"
+            # records the whole pipeline schedule), because host-side
+            # synchronization is illegal while a stream is capturing. The race this
+            # guards is cross-rank, so local stream ordering does not stand in for
+            # it; what does is that every rank replays one fixed op sequence, so the
+            # nondeterministic interleaving of group calls the flag protects against
+            # cannot arise inside a replay. Do not carry this skip over to a
+            # non-captured path on the strength of stream ordering alone.
             torch.cuda.synchronize()
 
         return tensor_recv_prev, tensor_recv_next, reqs

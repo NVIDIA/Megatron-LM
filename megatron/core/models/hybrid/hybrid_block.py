@@ -115,6 +115,23 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
     def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:
         super().__init__(config=config)
+        if (
+            config.cuda_graph_impl in ("transformer_engine", "full_iteration")
+            and config.recompute_granularity == "selective"
+            and "mhc" in (config.recompute_modules or [])
+        ):
+            raise ValueError(
+                "mHC selective recompute with CUDA Graphs (cuda_graph_impl="
+                f"{config.cuda_graph_impl!r}) is not supported for HybridStack mHC "
+                "layers. For per-layer Transformer Engine capture, the hybrid wrapper "
+                "captures the mHC producer inside the graph, so per-microbatch "
+                "checkpoint registration cannot run; the guarded attention-only split "
+                "exists only on the GPT HyperConnectionTransformerLayer path. "
+                "Full-iteration capture is rejected here because it has only been "
+                "validated on that same GPT path -- the config-level gate that admits "
+                "it is not model-family aware. Disable CUDA graphs or remove 'mhc' "
+                "from recompute_modules."
+            )
         self.inner_layer = layer
         self.layer_number = layer.layer_number
         self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)

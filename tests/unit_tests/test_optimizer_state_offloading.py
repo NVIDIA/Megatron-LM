@@ -335,3 +335,59 @@ def test_training_correctness_with_offloading():
             msg=f"Parameter {n1} mismatch between offloaded and non-offloaded training",
         )
     Utils.destroy_model_parallel()
+
+
+# =============================================================================
+# Test: reload must not fork the H2D stream inside a CUDA graph capture
+# =============================================================================
+@pytest.mark.skipif(not TE_FUSED_ADAM_AVAILABLE, reason="Requires TE FusedAdam")
+def test_reload_defers_out_of_graph_capture():
+    """A capture that calls reload() must still close, with the states reloaded later.
+
+    reload() forks the H2D stream and sync_before_step() joins it. CUDA requires
+    every stream forked during a capture to rejoin before capture_end, but the
+    join runs in the optimizer step, which a full-iteration graph deliberately
+    excludes. reload() therefore has to defer while capturing, and
+    sync_before_step() has to notice the states are still on the host.
+    """
+    Utils.initialize_model_parallel()
+    model, optim = create_model_and_optimizer()
+    dist_optim = optim.chained_optimizers[0]
+
+    for _ in range(3):
+        run_forward_backward_step(model, optim)
+
+    offloader = dist_optim._state_offloader
+    original_states = {
+        param: {k: v.clone() for k, v in state.items() if isinstance(v, torch.Tensor)}
+        for param, state in offloader.adam_optimizer.state.items()
+    }
+
+    offloader.offload()
+    offloader.release_gpu_memory()
+    torch.cuda.synchronize()
+    assert offloader._offloaded is True
+
+    # Capturing with a reload() inside is exactly the shape that raised
+    # cudaErrorStreamCaptureUnjoined; the capture closing is the assertion.
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        offloader.reload()
+
+    # Deferred, not performed: the states are still offloaded.
+    assert offloader._offloaded is True, "reload() must defer while capturing"
+
+    # The step-time hook brings them back.
+    offloader.sync_before_step()
+    torch.cuda.synchronize()
+    assert offloader._offloaded is False, "sync_before_step() must reload deferred states"
+
+    for param, state in offloader.adam_optimizer.state.items():
+        for key, original_tensor in original_states.get(param, {}).items():
+            if key in state and isinstance(state[key], torch.Tensor):
+                assert state[key].device.type == 'cuda'
+                torch.testing.assert_close(
+                    state[key], original_tensor, msg=f"State {key} mismatch after deferred reload"
+                )
+    Utils.destroy_model_parallel()
