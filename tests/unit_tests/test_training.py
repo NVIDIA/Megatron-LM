@@ -9,7 +9,10 @@ import torch
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
-from megatron.training.training import build_train_valid_test_data_iterators
+from megatron.training.training import (
+    _should_save_final_checkpoint,
+    build_train_valid_test_data_iterators,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -56,6 +59,31 @@ def create_test_args():
     args.phase_transition_iterations = None
 
     return args
+
+
+class TestShouldSaveFinalCheckpoint:
+    @staticmethod
+    def _config(save='/tmp/checkpoints', save_interval=8, skip_train=False):
+        return SimpleNamespace(
+            checkpoint=SimpleNamespace(save=save, save_interval=save_interval),
+            validation=SimpleNamespace(skip_train=skip_train),
+        )
+
+    def test_skips_save_when_training_does_not_advance(self):
+        assert not _should_save_final_checkpoint(self._config(), 10, 10)
+
+    def test_skips_save_before_first_iteration(self):
+        assert not _should_save_final_checkpoint(self._config(), 0, 0)
+
+    def test_saves_after_training_advances_past_resume_iteration(self):
+        assert _should_save_final_checkpoint(self._config(), 9, 10)
+
+    def test_skips_save_at_checkpoint_interval(self):
+        assert not _should_save_final_checkpoint(self._config(), 8, 16)
+
+    def test_skips_save_when_checkpointing_or_training_is_disabled(self):
+        assert not _should_save_final_checkpoint(self._config(save=None), 9, 10)
+        assert not _should_save_final_checkpoint(self._config(skip_train=True), 9, 10)
 
 
 class TestTraining:
