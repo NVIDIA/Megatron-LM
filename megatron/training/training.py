@@ -1412,7 +1412,7 @@ def pretrain(
         )
         print_rank_0(f'[RLProfiler] Profiling enabled, output: {profile_dir}')
 
-    if not cfg_container.validation.skip_train or args.perform_rl_step:
+    if not cfg_container.validation.skip_train or (args.perform_rl_step and args.do_train):
         if cfg_container.validation.skip_train:
             print_rank_0('RL inference-only mode (--skip-train --perform-rl-step) ...')
         else:
@@ -1458,6 +1458,7 @@ def pretrain(
         print_rank_0('skipping training (--skip-train is on) ...')
 
         iteration = args.iteration
+        args.curr_iteration = iteration
 
     if args.do_valid:
         prefix = f'iteration {iteration} on validation set'
@@ -4599,7 +4600,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             test_dataloader = None
             do_train = (args.train_iters or 0) > 0
             do_valid = (args.full_validation or args.eval_iters > 0)
-            do_test = (args.full_validation or args.eval_iters > 0)
+            do_test = False
 
         else:
             # Build datasets.
