@@ -1,3 +1,6 @@
+# All files directly in the repository root (later matches must retain this owner).
+/* @NVIDIA/core-nemo
+
 megatron/core/ @NVIDIA/core-adlr @NVIDIA/core-nemo
 megatron/core/tensor_parallel/generalized_tensor_parallelism.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gtp
 
@@ -65,7 +68,7 @@ megatron/training/arguments.py
 .gitlab/ @NVIDIA/ci
 .github/ @NVIDIA/ci
 .github/oncall_schedule.json @NVIDIA/mcore-oncall-rotation
-.gitlab-ci.yml @NVIDIA/ci
+.gitlab-ci.yml @NVIDIA/core-nemo @NVIDIA/ci
 docker/  @NVIDIA/ci
 tests/functional_tests/python_test_utils/ @NVIDIA/ci
 tests/functional_tests/shell_test_utils/ @NVIDIA/ci
@@ -82,4 +85,4 @@ tests/unit_tests/test_api_backwards_compat_setup.py @NVIDIA/ci
 megatron/rl/ @NVIDIA/reinforcement-learning
 examples/rl/ @NVIDIA/reinforcement-learning
 test/unit_tests/test_rl_utils.py @NVIDIA/reinforcement-learning
-train_rl.py @NVIDIA/reinforcement-learning
+train_rl.py @NVIDIA/core-nemo @NVIDIA/reinforcement-learning
