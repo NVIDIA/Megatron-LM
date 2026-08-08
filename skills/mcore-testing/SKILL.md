@@ -179,6 +179,12 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 5. If the test needs a dedicated CI bucket, add an entry to
    `tests/test_utils/recipes/h100/unit-tests.yaml`.
 
+Prefer assertions on observable behavior and public interfaces over private
+methods, class selection, or incidental internal state. A behavior-preserving
+refactor should not require changing a test. Test implementation details only
+when the detail is itself an intentional requirement, such as a performance or
+cache contract. See [Google Testing Blog: Test Behavior, Not Implementation](https://testing.googleblog.com/2013/08/testing-on-toilet-test-behavior-not.html).
+
 ---
 
 ## Adding a Functional / Integration Test
