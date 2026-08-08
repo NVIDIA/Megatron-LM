@@ -2592,6 +2592,17 @@ def _add_rl_args(parser):
                             'G consumes groups as they complete. '
                             'B consumes complete trainer batches in submission order. '
                             'R is not currently supported.')
+    group.add_argument('--rl-durable-rollout-bank', action='store_true',
+                       help='Persist completed rollout groups to a durable, write-through '
+                            'ledger so they survive a SIGKILL (the SLURM time limit) and are '
+                            'restored at restart instead of regenerated. No-op when unset.')
+    group.add_argument('--rl-rollout-bank-dir', type=str, default=None,
+                       help='Directory for the durable rollout bank (on Lustre). Defaults to '
+                            '<save>/rollout_bank so the bank stays coupled to the checkpoint.')
+    group.add_argument('--rl-rollout-bank-max-bytes', type=int, default=0,
+                       help='Soft cap (bytes) on the rollout bank size; 0 = unbounded. On '
+                            'exceed, a warning is logged and compaction is nudged at the next '
+                            'checkpoint. Never blocks generation.')
     group.add_argument('--grpo-iterations', type=int, default=2,
                        help="Number of iterations per a GRPO implementation.")
     # As in DAPO, we keep upper/lower eps different.

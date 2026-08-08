@@ -253,6 +253,8 @@ class TestRLUtils:
             return Agent()
 
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_AGENT", None)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_BANK", None)
         monkeypatch.setattr(rl_utils, "get_agent", get_agent)
 
         args = SimpleNamespace(

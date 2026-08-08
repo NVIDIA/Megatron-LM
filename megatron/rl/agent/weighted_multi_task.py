@@ -6,7 +6,7 @@ from typing import Any, Optional, Type
 
 import numpy as np
 
-from .registry import get_agent_class
+from ..types import GroupsPerEnv
 from .api import (
     AgentBaseModel,
     ContrastiveRollout,
@@ -21,6 +21,7 @@ from .api import (
     RolloutGenerator,
     RolloutRequest,
 )
+from .registry import get_agent_class
 
 logger = logging.getLogger(__name__)
 
@@ -189,9 +190,53 @@ class WeightedMultiTask(
         all_rollouts_lists = await asyncio.gather(*tasks)
         return [rollout for rollouts in all_rollouts_lists for rollout in rollouts]
 
+    def _env_ids(self) -> list[str]:
+        """Per-agent env_ids (aligned with ``self.agents``)."""
+        env_ids = []
+        for i, (a, config) in enumerate(zip(self.agents, self.agent_configs)):
+            env_id = getattr(a, "env_id", None)
+            if not env_id and not config.evaluation_only:
+                raise ValueError(
+                    f"Active agent {i} ({type(a).__name__}) has no env_id; it is "
+                    f"required to weight-balance restored rollout-bank groups by env. "
+                    f"Set env_id for every non-evaluation agent in the environment config."
+                )
+            env_ids.append(env_id or f"agent_{i}")
+        return env_ids
+
+    def env_group_targets(self, total_count: int) -> GroupsPerEnv:
+        """Per-env group counts for a full batch of ``total_count`` groups.
+
+        The weight split (``_distribute_counts``) keyed by env_id and summed over
+        any agents that share an env_id — the whole-batch target used to
+        weight-balance injected restored rollout-bank groups. Living here, beside
+        ``_distribute_counts``/``_env_ids``, keeps this target and the generator's
+        actual split identical. Counts always sum to ``total_count``
+        (weight-proportional, remainder to the largest fractional parts), and
+        agents that share an env_id are merged into one entry.
+        """
+        target: GroupsPerEnv = {}
+        for eid, c in zip(self._env_ids(), self._distribute_counts(total_count)):
+            target[eid] = target.get(eid, 0) + c
+        return target
+
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         """Distribute grouped rollouts across sub-agents according to weights."""
-        agent_groups = self._distribute_counts(request.num_groups)
+        override: GroupsPerEnv | None = request.num_groups_per_env
+        if override is not None:
+            # Explicit per-env counts (e.g. the residual after injecting restored
+            # rollout-bank groups). Route each env's count to its agent(s).
+            env_ids = self._env_ids()
+            unknown = set[Any](override) - set(env_ids)
+            if unknown:
+                raise ValueError(
+                    f"num_groups_per_env references unknown env_id(s) {sorted(unknown)}; "
+                    f"known env_ids: {sorted(set(env_ids))}. Check that the envs defined "
+                    f"in this run are consistent with the restored rollouts."
+                )
+            agent_groups = [override.get(eid, 0) for eid in env_ids]
+        else:
+            agent_groups = self._distribute_counts(request.num_groups)
         if request.submission_granularity == "B":
             # In BATCH mode, pgt counts local batches in flight. agent_groups already
             # splits each batch by weight, so copy pgt to every active agent.
@@ -202,8 +247,13 @@ class WeightedMultiTask(
         else:
             # In GROUP/ROLLOUT mode, pgt counts fine-grained work units, so split it by weight.
             agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
-        agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
-        agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
+        if override is not None:
+            # With an explicit per-env override, slots must follow the residual
+            # shape, not a weight split of num_groups.
+            raw_slots = list(agent_groups)
+        else:
+            raw_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
+        agent_slots = np.array(raw_slots) / np.gcd.reduce(raw_slots)
 
         # Snapshot the distribution for observability. Read back by rl_utils
         # during per-iteration metric logging.
@@ -242,6 +292,7 @@ class WeightedMultiTask(
                         f"Agent of type {type(agent)} does not support grouped rollouts"
                     )
                 agent.parallel_generation_tasks = pgt
+                agent._rollout_bank = self._rollout_bank
                 agent_request = GroupedRolloutRequest(
                     num_groups=num_groups,
                     streaming=request.streaming,
