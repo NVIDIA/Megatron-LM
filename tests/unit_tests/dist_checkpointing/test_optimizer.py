@@ -193,6 +193,20 @@ class Model1dFlattenTensor(torch.nn.Module):
         return sharded_state_dict
 
 
+class SharedEmbeddingBoundaryModel(torch.nn.Module):
+    """Small model whose shared embedding split leaves bucket-end padding."""
+
+    def __init__(self):
+        super().__init__()
+        self.shared_weight = torch.nn.Parameter(torch.randn(1024, dtype=torch.bfloat16))
+        self.shared_weight.shared_embedding = True
+        self.tail_weight = torch.nn.Parameter(torch.randn(100, dtype=torch.bfloat16))
+        self.body_weight = torch.nn.Parameter(torch.randn(900, dtype=torch.bfloat16))
+        self.config = TransformerConfig(
+            hidden_size=8, num_attention_heads=1, num_layers=1, bf16=True
+        )
+
+
 def get_param_state_dp_zero(optimizer):
     if isinstance(optimizer, ChainedOptimizer):
         assert len(optimizer.chained_optimizers) == 1
@@ -266,6 +280,15 @@ def initialize_1d_flatten_tensor_model(
     model_parallel_cuda_manual_seed(seed)
 
     return Model1dFlattenTensor()
+
+
+def initialize_shared_embedding_boundary_model(
+    pre_process=True, post_process=True, seed=0, **config_kwargs
+):
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+
+    return SharedEmbeddingBoundaryModel()
 
 
 def initialize_real_model(
@@ -346,6 +369,48 @@ class TestDistributedOptimizer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
+    )
+    def test_dp_reshardable_excludes_bucket_end_padding(self, tmp_path_dist_ckpt):
+        """Test that shared-embedding bucket splits exclude DP bucket-end padding."""
+        Utils.initialize_model_parallel(1, 1)
+        _, optimizer = setup_model_and_optimizer(
+            seed=2,
+            tp=1,
+            pp=1,
+            bf16=True,
+            dist_opt=True,
+            initialize_fn=initialize_shared_embedding_boundary_model,
+        )
+
+        optimizer_state = optimizer.sharded_state_dict(
+            {}, metadata={'distrib_optim_sharding_type': 'dp_reshardable'}
+        )
+        param_state = optimizer_state['param_state']
+        per_bucket_numel = next(iter(param_state['per_bucket_numel'].data[0].values()))
+        per_bucket_numel_unpadded = next(
+            iter(param_state['per_bucket_numel_unpadded'].data[0].values())
+        )
+        assert per_bucket_numel == [1152, 1024]
+        assert per_bucket_numel_unpadded == [1088, 1024]
+
+        assert parallel_state.get_data_parallel_world_size(with_context_parallel=True) == 8
+        if parallel_state.get_data_parallel_rank(with_context_parallel=True) == 7:
+            sharded_tensors = nested_values(extract_sharded_tensors(optimizer_state)[0])
+            terminal_padding = [
+                sharded_tensor
+                for sharded_tensor in sharded_tensors
+                if '.bucket_idx_0.' in sharded_tensor.key
+                and sharded_tensor.global_offset == (1060,)
+            ]
+            assert len(terminal_padding) == 3
+            assert all(tensor.local_shape == (28,) for tensor in terminal_padding)
+            assert all(tensor.global_shape == (1088,) for tensor in terminal_padding)
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_bucket_end_padding', sync=True) as ckpt_dir:
+            save(optimizer_state, ckpt_dir)
 
     @pytest.mark.parametrize("fully_parallel", [False, True])
     @pytest.mark.parametrize(
