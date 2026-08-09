@@ -2,6 +2,8 @@
 
 import torch
 
+from megatron.core.utils import round_up_to_nearest_multiple
+
 
 class ContextGPUView:
     """GPU-resident snapshot of context bookkeeping data for the forward pass.
@@ -130,14 +132,14 @@ class ContextGPUView:
                     + mamba_conv_seq_start_bytes
                 )
             ) % 16
-            mamba_ssd_seq_chunk_start_bytes = -(-max_bs * 4 // 16) * 16
-            mamba_ssd_seq_chunk_count_bytes = -(-max_bs * 4 // 16) * 16
-            mamba_ssd_seq_chunk_base_bytes = -(-max_bs * 4 // 16) * 16
-            mamba_ssd_active_seq_idx_bytes = -(-max_bs * 4 // 16) * 16
-            mamba_ssd_empty_seq_idx_bytes = -(-max_bs * 4 // 16) * 16
-            mamba_ssd_chunk_token_base_bytes = -(-max_ssd_chunks * 4 // 16) * 16
-            mamba_ssd_chunk_valid_start_bytes = -(-max_ssd_chunks * 4 // 16) * 16
-            mamba_ssd_chunk_valid_end_bytes = -(-max_ssd_chunks * 4 // 16) * 16
+            mamba_ssd_seq_chunk_start_bytes = round_up_to_nearest_multiple(max_bs * 4, 16)
+            mamba_ssd_seq_chunk_count_bytes = round_up_to_nearest_multiple(max_bs * 4, 16)
+            mamba_ssd_seq_chunk_base_bytes = round_up_to_nearest_multiple(max_bs * 4, 16)
+            mamba_ssd_active_seq_idx_bytes = round_up_to_nearest_multiple(max_bs * 4, 16)
+            mamba_ssd_empty_seq_idx_bytes = round_up_to_nearest_multiple(max_bs * 4, 16)
+            mamba_ssd_chunk_token_base_bytes = round_up_to_nearest_multiple(max_ssd_chunks * 4, 16)
+            mamba_ssd_chunk_valid_start_bytes = round_up_to_nearest_multiple(max_ssd_chunks * 4, 16)
+            mamba_ssd_chunk_valid_end_bytes = round_up_to_nearest_multiple(max_ssd_chunks * 4, 16)
         else:
             mamba_align_pad = 0
             mamba_batch_indices_decode_bytes = 0
