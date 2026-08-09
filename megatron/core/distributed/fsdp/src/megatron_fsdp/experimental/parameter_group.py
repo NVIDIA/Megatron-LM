@@ -314,7 +314,7 @@ class FsdpParameterGroup:
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            grads.append(get_values(fsdp_parameter.unsharded.grad))
+            grads.append(fsdp_parameter.unsharded.grad)
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
@@ -328,7 +328,7 @@ class FsdpParameterGroup:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
         # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_local_tensor(index).copy_(get_values(fsdp_parameter.unsharded.grad))
+            partial_grad.get_local_tensor(index).copy_(fsdp_parameter.unsharded.grad)
             fsdp_parameter.unsharded.grad = None
 
     def _has_sharded_grads(self) -> bool:
