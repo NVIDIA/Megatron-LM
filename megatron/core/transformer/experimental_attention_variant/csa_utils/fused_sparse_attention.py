@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""
-CSA kernel wrappers for Megatron's DSv4 sparse attention.
+"""Fused CSA sparse-attention wrappers and Python integration utilities.
 
 Mirrors the three integration paths of the old standalone ``dsa_kernels``
 package, but built on top of

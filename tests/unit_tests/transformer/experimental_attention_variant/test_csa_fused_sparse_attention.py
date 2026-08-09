@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for the compressed sparse attention kernel utilities.
+"""Unit tests for fused compressed sparse attention integration.
 
 Coverage:
 
@@ -28,8 +28,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant.csa_utils import kernels as dk
-from megatron.core.transformer.experimental_attention_variant.csa_utils.kernels import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    fused_sparse_attention as dk,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
     CSASparseAttnFunc,
     FusedCSAIndexerSparseAttnFromTopkFunc,
     FusedCSAIndexerSparseAttnFunc,
@@ -1533,9 +1535,9 @@ class TestDenseFusedIndexerSparseAttn:
 #
 # Everything above this banner stubs ``cudnn.DSA`` and ``flash_mla`` with
 # ``MagicMock``-based fakes; that exercises the Python plumbing of
-# ``csa_utils/kernels.py`` (shape transforms, autograd wiring, KL composition)
+# ``fused_sparse_attention.py`` (shape transforms, autograd wiring, KL composition)
 # but does NOT verify that the cuDNN kernels themselves compute what
-# ``csa_utils/kernels.py`` expects them to compute.
+# ``fused_sparse_attention.py`` expects them to compute.
 #
 # The tests below close that gap by running each helper / public function
 # end-to-end against a small PyTorch reference implementation. Numeric
@@ -1860,7 +1862,7 @@ class TestRealKernelScoreHelpers:
         )
 
         from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-            kernels as _dk,
+            fused_sparse_attention as _dk,
         )
 
         if case == 'sparse_indexer_predict':
@@ -1995,7 +1997,7 @@ class TestRealKernelKLLossDense:
     @pytest.mark.parametrize("dummy", [None])
     def test_real_dense_kl_loss_matches_reference(self, dummy, reset_lazy_kernel_state):
         _skip_if_real_kernels_unavailable()
-        from megatron.core.transformer.experimental_attention_variant.csa_utils.kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
             _compute_dense_attn_score,
             _compute_dense_indexer_score,
             _kl_loss_from_dense_scores,
@@ -2057,7 +2059,7 @@ class TestRealKernelIndexerTopk:
     @pytest.mark.parametrize("dummy", [None])
     def test_real_indexer_topk_set_matches_reference(self, dummy, reset_lazy_kernel_state):
         _skip_if_real_kernels_unavailable()
-        from megatron.core.transformer.experimental_attention_variant.csa_utils.kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
             indexer_topk,
         )
 
@@ -2322,7 +2324,7 @@ class TestRealKernelFusedIndexerSparseAttn:
 
         # The reference uses FlashMLA's actual normalization because it
         # includes the selected top-k positions and the per-head sink term.
-        from megatron.core.transformer.experimental_attention_variant.csa_utils.kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
             _csa_fwd_flash_mla,
             _indexer_topk_core,
         )
@@ -3314,7 +3316,7 @@ class TestRealKernelDenseIndexerBackward:
 
         # ---- Reference: capture the kernel's attn-side / lse_indexer (treated
         # as constants) and run autograd through the analytical dense KL.
-        from megatron.core.transformer.experimental_attention_variant.csa_utils.kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
             _compute_dense_attn_score,
             _csa_fwd_flash_mla,
             _indexer_topk_core,
@@ -3451,10 +3453,14 @@ class TestPublicApi:
     """
 
     def test_public_surface(self):
-        from megatron.core.transformer.experimental_attention_variant import csa_kernels
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+            fused_sparse_attention,
+        )
 
-        for name in csa_kernels.__all__:
-            assert hasattr(csa_kernels, name), f"__all__ lists {name!r} but it is missing"
+        for name in fused_sparse_attention.__all__:
+            assert hasattr(
+                fused_sparse_attention, name
+            ), f"__all__ lists {name!r} but it is missing"
 
         for fn in (
             _csa_fwd_flash_mla,

@@ -16,7 +16,7 @@ from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inpla
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 
 from . import cp_layout_kernels
-from .kernels import indexer_topk
+from .fused_sparse_attention import indexer_topk
 
 # =============================================================================
 # RoPE Wrappers

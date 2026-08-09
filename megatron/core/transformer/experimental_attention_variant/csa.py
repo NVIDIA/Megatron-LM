@@ -22,7 +22,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils import c
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_compressor import (
     maybe_compress_thd_fused,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_utils.kernels import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
     FusedCSAIndexerSparseAttnFromTopkFunc,
     batch_of_row,
     build_flat_topk_idxs,
@@ -205,7 +205,7 @@ def _compressed_thd_topk_to_local(
 # THD (packed) variants of the index helpers above.
 #
 # Both produce per-row local-to-segment indices in the SAME index space that
-# ``csa_utils.kernels.local_to_global_flat(..., cu_seqlens_q=..., cu_seqlens_kv=...)``
+# ``csa_utils.fused_sparse_attention.local_to_global_flat(...)``
 # expects: each row is one query token in the packed layout, each value is
 # either ``-1`` (invalid / future position) or a non-negative local KV id in
 # ``[0, seqlen_kv_full[batch_of_row])`` where ``seqlen_kv_full[b] =
