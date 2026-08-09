@@ -197,6 +197,28 @@ def _torch_reference_varlen(kernel_args: dict, real_num_tokens: int):
     return out, final, inter
 
 
+def _dt_preprocess_reference(dt, A, dt_bias, dt_softplus, dt_limit):
+    """Token-major ``(T, H)`` fp32 delta: bias, softplus and clamp, in that order."""
+    dt_f = dt.float()
+    if dt_bias is not None:
+        dt_f = dt_f + dt_bias.float()
+    if dt_softplus:
+        dt_f = torch.nn.functional.softplus(dt_f)
+    lo, hi = dt_limit
+    if lo != 0.0 or hi != float("inf"):
+        dt_f = torch.clamp(dt_f, lo, hi)
+    return dt_f
+
+
+def _repack_reference(src, N, N_pad, TC, L):
+    """The strided view copy the tiled B/C repack kernel replaces."""
+    G = src.shape[1]
+    GN = G * N
+    dst = torch.zeros(1, G, N_pad, TC, L, device=src.device, dtype=src.dtype)
+    dst[:, :, :N].copy_(src.as_strided((1, G, N, TC, L), (0, N, 1, L * GN, GN)))
+    return dst
+
+
 @pytest.mark.skipif(
     not _cutedsl_ssd_enabled(),
     reason="CuteDSL SSD backend requires Blackwell (SM 10.0+) and the cutlass DSL runtime",
@@ -208,7 +230,13 @@ class TestCuteDSLAccuracy:
     feature (chunked prefill, prefix caching, padded/empty engine batches), so
     all three implementations are pinned to the same op contract. Unsupported
     shapes must be rejected by cutedsl_unsupported_reason so the dispatcher
-    falls back to Triton. All scenarios share one skeleton (_PARITY_CASES)."""
+    falls back to Triton. All scenarios share one skeleton (_PARITY_CASES).
+
+    The two Triton helpers the CuteDSL path launches before its own kernel —
+    the fused dt preprocessing and the tiled B/C repack — are pinned here too,
+    each against its own torch reference. Testing them next to the kernel they
+    feed keeps a failure attributable: a helper test failing alongside the
+    parity cases says the input staging broke, not the SSD math."""
 
     @pytest.mark.parametrize("ref_backend", ["triton", "pytorch"])
     @pytest.mark.parametrize("params", _PARITY_CASES)
@@ -337,41 +365,12 @@ class TestCuteDSLAccuracy:
         )
         torch.testing.assert_close(final_cute, final_ref.to(final_cute.dtype), rtol=3e-2, atol=3e-2)
 
-
-def _fused_cumsum_available() -> bool:
-    """True if the standalone fused softplus+cumsum Triton kernel can run here."""
-    if not torch.cuda.is_available():
-        return False
-    try:
-        import megatron.core.ssm.ops.cutedsl_mamba2_ssd._fused_cumsum  # noqa: F401
-
-        return True
-    except Exception:
-        return False
-
-
-@pytest.mark.skipif(
-    not _fused_cumsum_available(), reason="fused cumsum kernel requires CUDA + Triton"
-)
-class TestFusedSoftplusCumsum:
-    """The standalone Triton kernel that fuses dt preprocessing (softplus + bias +
-    clamp + cumsum) for the CuteDSL hot paths must match the torch reference in both
-    the divisible (B=1, C=total_chunks) and aligned (B=S, C=Cmax) output layouts."""
-
-    def _reference(self, dt, A, dt_bias, dt_softplus, dt_limit):
-        dt_f = dt.float()
-        if dt_bias is not None:
-            dt_f = dt_f + dt_bias.float()
-        if dt_softplus:
-            dt_f = torch.nn.functional.softplus(dt_f)
-        lo, hi = dt_limit
-        if lo != 0.0 or hi != float("inf"):
-            dt_f = torch.clamp(dt_f, lo, hi)
-        return dt_f  # (T, H)
-
     @pytest.mark.parametrize("use_bias", [True, False])
     @pytest.mark.parametrize("layout", ["divisible", "aligned"])
-    def test_matches_torch(self, layout, use_bias):
+    def test_fused_softplus_cumsum_matches_torch(self, layout, use_bias):
+        """The Triton kernel that fuses dt preprocessing (bias + softplus + clamp +
+        cumsum) must match the torch reference in both the divisible
+        (B=1, C=total_chunks) and aligned (B=S, C=Cmax) output layouts."""
         from megatron.core.ssm.ops.cutedsl_mamba2_ssd._fused_cumsum import fused_softplus_cumsum
 
         torch.manual_seed(0)
@@ -391,12 +390,43 @@ class TestFusedSoftplusCumsum:
         cumsum = torch.zeros(B, H, C, L, device=device, dtype=torch.float32)
         fused_softplus_cumsum(dt, A, dt_bias, True, (0.0, float("inf")), delta, cumsum, B, H, C)
 
-        dt_f = self._reference(dt, A, dt_bias, True, (0.0, float("inf")))
+        dt_f = _dt_preprocess_reference(dt, A, dt_bias, True, (0.0, float("inf")))
         ref_delta = dt_f.view(B, C, L, H).permute(0, 3, 1, 2)  # (B, H, C, L)
         ref_cumsum = torch.cumsum(ref_delta.float() * A.view(1, H, 1, 1), dim=-1)
 
         torch.testing.assert_close(delta.float(), ref_delta, rtol=5e-3, atol=5e-3)
         torch.testing.assert_close(cumsum, ref_cumsum, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize(
+        "G,N,N_pad,trim",
+        [
+            # production dims, reading a trimmed slice of a padded token buffer
+            (8, 128, 128, True),
+            # small dstate: the padding rows n >= 16 must stay zero
+            (2, 16, 128, False),
+        ],
+    )
+    def test_bc_repack_matches_strided_copy(self, G, N, N_pad, trim):
+        """The tiled B/C repack (token-major -> dense chunk-major) must be bitwise
+        identical to the strided copy_ it replaces, and must leave the N_pad
+        zero-padding rows of the destination untouched."""
+        from megatron.core.ssm.ops.cutedsl_mamba2_ssd._bc_repack import repack_bc_chunk_major
+
+        torch.manual_seed(0)
+        device, L, TC = "cuda", 128, 6
+        real = TC * L
+        # trim=True mirrors dynamic inference: B[:real] slices a padded token
+        # buffer, keeping the original strides — the kernel must honor them.
+        rows = real + 300 if trim else real
+        B = torch.randn(rows, G, N, device=device, dtype=torch.bfloat16)[:real]
+        C = torch.randn(rows, G, N, device=device, dtype=torch.bfloat16)[:real]
+
+        B_dst = torch.zeros(1, G, N_pad, TC, L, device=device, dtype=torch.bfloat16)
+        C_dst = torch.zeros(1, G, N_pad, TC, L, device=device, dtype=torch.bfloat16)
+        repack_bc_chunk_major(B, C, B_dst, C_dst, N, TC, L)
+
+        torch.testing.assert_close(B_dst, _repack_reference(B, N, N_pad, TC, L), rtol=0, atol=0)
+        torch.testing.assert_close(C_dst, _repack_reference(C, N, N_pad, TC, L), rtol=0, atol=0)
 
 
 @pytest.mark.skipif(
@@ -482,51 +512,6 @@ class TestCuteDSLRawStates:
         torch.testing.assert_close(
             final_cute, raw_cute[call["last_chunk_indices"]], rtol=3e-2, atol=3e-2
         )
-
-
-@pytest.mark.skipif(
-    not _fused_cumsum_available(), reason="B/C repack kernel requires CUDA + Triton"
-)
-class TestBCRepack:
-    """The tiled B/C repack (token-major -> dense chunk-major) must be bitwise
-    identical to the strided copy_ it replaces, and must leave the N_pad
-    zero-padding rows of the destination untouched."""
-
-    @staticmethod
-    def _ref(src, N, N_pad, TC, L):
-        G = src.shape[1]
-        GN = G * N
-        dst = torch.zeros(1, G, N_pad, TC, L, device=src.device, dtype=src.dtype)
-        dst[:, :, :N].copy_(src.as_strided((1, G, N, TC, L), (0, N, 1, L * GN, GN)))
-        return dst
-
-    @pytest.mark.parametrize(
-        "G,N,N_pad,trim",
-        [
-            # production dims, reading a trimmed slice of a padded token buffer
-            (8, 128, 128, True),
-            # small dstate: the padding rows n >= 16 must stay zero
-            (2, 16, 128, False),
-        ],
-    )
-    def test_matches_strided_copy(self, G, N, N_pad, trim):
-        from megatron.core.ssm.ops.cutedsl_mamba2_ssd._bc_repack import repack_bc_chunk_major
-
-        torch.manual_seed(0)
-        device, L, TC = "cuda", 128, 6
-        real = TC * L
-        # trim=True mirrors dynamic inference: B[:real] slices a padded token
-        # buffer, keeping the original strides — the kernel must honor them.
-        rows = real + 300 if trim else real
-        B = torch.randn(rows, G, N, device=device, dtype=torch.bfloat16)[:real]
-        C = torch.randn(rows, G, N, device=device, dtype=torch.bfloat16)[:real]
-
-        B_dst = torch.zeros(1, G, N_pad, TC, L, device=device, dtype=torch.bfloat16)
-        C_dst = torch.zeros(1, G, N_pad, TC, L, device=device, dtype=torch.bfloat16)
-        repack_bc_chunk_major(B, C, B_dst, C_dst, N, TC, L)
-
-        torch.testing.assert_close(B_dst, self._ref(B, N, N_pad, TC, L), rtol=0, atol=0)
-        torch.testing.assert_close(C_dst, self._ref(C, N, N_pad, TC, L), rtol=0, atol=0)
 
 
 class MockContextParallel:
