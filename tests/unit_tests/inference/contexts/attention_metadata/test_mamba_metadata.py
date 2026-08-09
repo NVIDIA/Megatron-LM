@@ -514,3 +514,87 @@ class TestMambaMetadata:
         expected_seq_idx = torch.cat([expected_seq_idx_0, expected_seq_idx_1], dim=1)
 
         assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+
+class TestComputeMambaChunkMeta:
+    """Pure-host derivation of the varlen SSD chunk tiling.
+
+    This is the only place the tiling is derived -- the op layer and the test
+    stand-ins all consume its output -- so the invariants are checked here
+    rather than inferred from downstream kernel parity.
+    """
+
+    # Aligned, ragged, empty slots, single tokens, all-empty, interleaved gaps.
+    CU_CASES = [
+        [0, 128, 256],
+        [0, 256],
+        [0, 200, 328],
+        [0, 1, 2, 3],
+        [0, 127],
+        [0, 129],
+        [0, 100, 100, 300],
+        [0, 0, 0],
+        [0, 512, 512, 512],
+        [0, 130, 260, 390, 520],
+        [0, 8192],
+        [0, 2000, 4000, 6000, 8000],
+        [0],
+        [0, 384, 384],
+        [0, 63, 190, 190, 500],
+        [0, 0, 512],
+    ]
+
+    @pytest.mark.parametrize("chunk_size", [64, 128, 256])
+    @pytest.mark.parametrize("cu", CU_CASES)
+    def test_every_real_token_covered_exactly_once(self, cu, chunk_size):
+        """The load-bearing invariant: the per-owner windows tile the tokens.
+
+        A sequence starting mid-chunk shares that chunk with its predecessor, so
+        the chunk is materialised once per owner with a different valid window.
+        Together those windows must cover every real token exactly once -- if
+        they overlap the scan double-counts, if they gap it drops tokens.
+        """
+        _, _, _, _, token_base, valid_start, valid_end, _, _, _ = (
+            MambaMetadata._compute_mamba_chunk_meta(cu, len(cu) - 1, chunk_size)
+        )
+        covered = {}
+        for base, lo, hi in zip(token_base, valid_start, valid_end):
+            for tok in range(base, base + chunk_size):
+                if lo <= tok < hi:
+                    covered[tok] = covered.get(tok, 0) + 1
+        assert covered.keys() == set(range(cu[0], cu[-1])), f"coverage gap/extra for cu={cu}"
+        assert all(n == 1 for n in covered.values()), f"double-covered tokens for cu={cu}"
+
+    @pytest.mark.parametrize("chunk_size", [64, 128, 256])
+    @pytest.mark.parametrize("cu", CU_CASES)
+    def test_structural_invariants(self, cu, chunk_size):
+        """Per-sequence and per-chunk arrays stay mutually consistent."""
+        (
+            active,
+            chunk_base,
+            chunk_count,
+            chunk_start,
+            token_base,
+            valid_start,
+            valid_end,
+            empty,
+            starts_aligned,
+            active_is_prefix,
+        ) = MambaMetadata._compute_mamba_chunk_meta(cu, len(cu) - 1, chunk_size)
+
+        num_slots = len(cu) - 1
+        # active and empty partition the slots, and active holds exactly the
+        # slots that carry tokens.
+        assert sorted(active + empty) == list(range(num_slots))
+        assert active == [i for i in range(num_slots) if cu[i + 1] > cu[i]]
+        # per-sequence arrays are all one entry per active sequence
+        assert len(chunk_base) == len(chunk_count) == len(chunk_start) == len(active)
+        # per-chunk arrays are all one entry per workspace chunk
+        assert len(token_base) == len(valid_start) == len(valid_end) == sum(chunk_count)
+        # chunk_start is the exclusive prefix sum of chunk_count
+        assert chunk_start == [sum(chunk_count[:i]) for i in range(len(chunk_count))]
+        # each sequence is anchored at the chunk-aligned position at or below it
+        assert chunk_base == [cu[i] // chunk_size for i in active]
+        # the host flags agree with the arrays they summarise
+        assert starts_aligned == all(cu[i] % chunk_size == 0 for i in active)
+        assert active_is_prefix == (active == list(range(len(active))))

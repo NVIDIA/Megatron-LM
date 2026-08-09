@@ -155,7 +155,7 @@ def _mamba_chunk_scan_combined_fwd(
     return final_states
 
 
-def mamba_chunk_scan_combined_varlen(
+def _mamba_chunk_scan_combined_varlen_triton(
     x,
     dt,
     A,
@@ -225,3 +225,120 @@ def mamba_chunk_scan_combined_varlen(
     )
 
     return varlen_states
+
+
+_CUTEDSL_SSD_ENABLED = None
+
+
+def _cutedsl_ssd_enabled():
+    """Whether the CuteDSL SSD backend is usable on this system.
+
+    CuteDSL is the default varlen-SSD backend: it is used whenever the GPU is
+    Blackwell (SM 10.0+) and the CuteDSL runtime imports; Triton is the fallback
+    for other platforms and for argument combinations the CuteDSL kernel does
+    not support. The decision is cached in ``_CUTEDSL_SSD_ENABLED`` (tests may
+    override that global directly to force a backend).
+    """
+    global _CUTEDSL_SSD_ENABLED
+    if _CUTEDSL_SSD_ENABLED is not None:
+        return _CUTEDSL_SSD_ENABLED
+
+    enabled = False
+    try:
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
+            from .cutedsl_mamba2_ssd import is_cutedsl_ssd_available
+
+            enabled = is_cutedsl_ssd_available()
+    except Exception:
+        enabled = False
+    _CUTEDSL_SSD_ENABLED = enabled
+    return enabled
+
+
+def mamba_chunk_scan_combined_varlen(
+    x,
+    dt,
+    A,
+    B,
+    C,
+    chunk_size,
+    cu_chunk_seqlens,
+    last_chunk_indices,
+    seq_idx,
+    out,
+    D=None,
+    z=None,
+    dt_bias=None,
+    initial_states=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    return_raw_states=False,
+    ssd_tiling=None,
+    state_dtype=None,
+):
+    """Dispatch the varlen SSD scan to the CuteDSL (Blackwell) or Triton backend fallback.
+
+    CuteDSL is the default backend on Blackwell (SM 10.0+): a faster drop-in
+    covering the production prefill cases (arbitrary sequence lengths, chunked
+    prefill via ``initial_states``, empty padded sequences, and
+    ``return_raw_states`` for prefix caching). Eligibility is decided up front
+    via :func:`cutedsl_unsupported_reason`; Triton is used on other platforms
+    and for the argument combinations the CuteDSL kernel does not support
+    (gating ``z``, and ``return_raw_states`` on a ragged batch, whose per-
+    sequence chunk grid does not materialise the caller's chunk boundaries).
+    """
+
+    # Without a tiling there is nothing to run the kernel on: callers that hold
+    # no per-step metadata (op-level tests, benchmarks) simply get Triton.
+    if _cutedsl_ssd_enabled() and ssd_tiling is not None:
+        from .cutedsl_mamba2_ssd import (
+            cutedsl_unsupported_reason,
+            mamba_chunk_scan_combined_varlen_cutedsl_thd,
+        )
+
+        reason = cutedsl_unsupported_reason(
+            x, chunk_size, ssd_tiling, z=z, return_raw_states=return_raw_states
+        )
+        if not reason:
+            return mamba_chunk_scan_combined_varlen_cutedsl_thd(
+                x=x,
+                dt=dt,
+                A=A,
+                B=B,
+                C=C,
+                chunk_size=chunk_size,
+                cu_chunk_seqlens=cu_chunk_seqlens,
+                last_chunk_indices=last_chunk_indices,
+                tiling=ssd_tiling,
+                seq_idx=seq_idx,
+                out=out,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                initial_states=initial_states,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                return_raw_states=return_raw_states,
+                state_dtype=state_dtype,
+            )
+
+    return _mamba_chunk_scan_combined_varlen_triton(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        cu_chunk_seqlens,
+        last_chunk_indices,
+        seq_idx,
+        out,
+        D=D,
+        z=z,
+        dt_bias=dt_bias,
+        initial_states=initial_states,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+        return_raw_states=return_raw_states,
+        state_dtype=state_dtype,
+    )

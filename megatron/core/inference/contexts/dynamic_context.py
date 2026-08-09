@@ -44,7 +44,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 )
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
-from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
+from megatron.core.utils import get_pg_rank, get_pg_size, internal_api, round_up_to_nearest_multiple
 
 from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -986,6 +986,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                     "seq_idx_for_varlen": self._cpu_mamba_seq_idx_for_varlen,
                     "conv_seq_idx": self._cpu_mamba_conv_seq_idx,
                     "conv_seq_start": self._cpu_mamba_conv_seq_start,
+                    "ssd_seq_chunk_start": self._cpu_mamba_ssd_seq_chunk_start,
+                    "ssd_seq_chunk_count": self._cpu_mamba_ssd_seq_chunk_count,
+                    "ssd_seq_chunk_base": self._cpu_mamba_ssd_seq_chunk_base,
+                    "ssd_active_seq_idx": self._cpu_mamba_ssd_active_seq_idx,
+                    "ssd_empty_seq_idx": self._cpu_mamba_ssd_empty_seq_idx,
+                    "ssd_chunk_token_base": self._cpu_mamba_ssd_chunk_token_base,
+                    "ssd_chunk_valid_start": self._cpu_mamba_ssd_chunk_valid_start,
+                    "ssd_chunk_valid_end": self._cpu_mamba_ssd_chunk_valid_end,
                 }
             )
             self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
@@ -1195,6 +1203,47 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_seq_idx_for_varlen_bytes = self._max_mamba_chunks * 4
             _mamba_conv_seq_idx_bytes = self.max_tokens * 4
             _mamba_conv_seq_start_bytes = self.max_tokens * 4
+            # SSD ragged tiling: per active sequence, or per workspace chunk
+            # (a sequence starting mid-chunk adds one).
+            _max_ssd_chunks = self._max_mamba_chunks + self.max_requests
+            # SSD arrays back CuteDSL descriptors, which require 16-byte aligned
+            # data pointers; pad so the block starts aligned (each field size is
+            # already rounded to 16, so every field within it stays aligned).
+            _mamba_ssd_align_pad = (
+                -(
+                    _pre_mamba_bytes
+                    + _mamba_align_pad
+                    + _mamba_batch_indices_decode_bytes
+                    + _mamba_batch_indices_prefill_bytes
+                    + _mamba_seq_idx_bytes
+                    + _mamba_cu_seqlens_bytes
+                    + _mamba_cu_chunk_seqlens_bytes
+                    + _mamba_last_chunk_indices_bytes
+                    + _mamba_seq_idx_for_varlen_bytes
+                    + _mamba_conv_seq_idx_bytes
+                    + _mamba_conv_seq_start_bytes
+                )
+            ) % 16
+            _mamba_ssd_seq_chunk_start_bytes = round_up_to_nearest_multiple(
+                self.max_requests * 4, 16
+            )
+            _mamba_ssd_seq_chunk_count_bytes = round_up_to_nearest_multiple(
+                self.max_requests * 4, 16
+            )
+            _mamba_ssd_seq_chunk_base_bytes = round_up_to_nearest_multiple(
+                self.max_requests * 4, 16
+            )
+            _mamba_ssd_active_seq_idx_bytes = round_up_to_nearest_multiple(
+                self.max_requests * 4, 16
+            )
+            _mamba_ssd_empty_seq_idx_bytes = round_up_to_nearest_multiple(self.max_requests * 4, 16)
+            _mamba_ssd_chunk_token_base_bytes = round_up_to_nearest_multiple(
+                _max_ssd_chunks * 4, 16
+            )
+            _mamba_ssd_chunk_valid_start_bytes = round_up_to_nearest_multiple(
+                _max_ssd_chunks * 4, 16
+            )
+            _mamba_ssd_chunk_valid_end_bytes = round_up_to_nearest_multiple(_max_ssd_chunks * 4, 16)
         else:
             _mamba_align_pad = 0
             self._max_mamba_chunks = 0
@@ -1202,6 +1251,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_batch_indices_prefill_bytes = 0
             _mamba_seq_idx_bytes = 0
             _mamba_cu_seqlens_bytes = 0
+            _mamba_ssd_align_pad = 0
+            _mamba_ssd_seq_chunk_start_bytes = 0
+            _mamba_ssd_seq_chunk_count_bytes = 0
+            _mamba_ssd_seq_chunk_base_bytes = 0
+            _mamba_ssd_active_seq_idx_bytes = 0
+            _mamba_ssd_empty_seq_idx_bytes = 0
+            _mamba_ssd_chunk_token_base_bytes = 0
+            _mamba_ssd_chunk_valid_start_bytes = 0
+            _mamba_ssd_chunk_valid_end_bytes = 0
             _mamba_cu_chunk_seqlens_bytes = 0
             _mamba_last_chunk_indices_bytes = 0
             _mamba_seq_idx_for_varlen_bytes = 0
@@ -1214,6 +1272,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             + _mamba_batch_indices_prefill_bytes
             + _mamba_seq_idx_bytes
             + _mamba_cu_seqlens_bytes
+            + _mamba_ssd_align_pad
+            + _mamba_ssd_seq_chunk_start_bytes
+            + _mamba_ssd_seq_chunk_count_bytes
+            + _mamba_ssd_seq_chunk_base_bytes
+            + _mamba_ssd_active_seq_idx_bytes
+            + _mamba_ssd_empty_seq_idx_bytes
+            + _mamba_ssd_chunk_token_base_bytes
+            + _mamba_ssd_chunk_valid_start_bytes
+            + _mamba_ssd_chunk_valid_end_bytes
             + _mamba_cu_chunk_seqlens_bytes
             + _mamba_last_chunk_indices_bytes
             + _mamba_seq_idx_for_varlen_bytes
@@ -1386,6 +1453,39 @@ class DynamicInferenceContext(BaseInferenceContext):
                 _off : _off + _mamba_conv_seq_start_bytes
             ].view(torch.int32)
             _off += _mamba_conv_seq_start_bytes
+            _off += _mamba_ssd_align_pad
+            self._cpu_mamba_ssd_seq_chunk_start = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_seq_chunk_start_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_seq_chunk_start_bytes
+            self._cpu_mamba_ssd_seq_chunk_count = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_seq_chunk_count_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_seq_chunk_count_bytes
+            self._cpu_mamba_ssd_seq_chunk_base = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_seq_chunk_base_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_seq_chunk_base_bytes
+            self._cpu_mamba_ssd_active_seq_idx = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_active_seq_idx_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_active_seq_idx_bytes
+            self._cpu_mamba_ssd_empty_seq_idx = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_empty_seq_idx_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_empty_seq_idx_bytes
+            self._cpu_mamba_ssd_chunk_token_base = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_chunk_token_base_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_chunk_token_base_bytes
+            self._cpu_mamba_ssd_chunk_valid_start = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_chunk_valid_start_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_chunk_valid_start_bytes
+            self._cpu_mamba_ssd_chunk_valid_end = self._cpu_bookkeeping_buf[
+                _off : _off + _mamba_ssd_chunk_valid_end_bytes
+            ].view(torch.int32)
+            _off += _mamba_ssd_chunk_valid_end_bytes
 
         assert _off == _total_bytes, f"layout bug: wrote {_off} of {_total_bytes} bytes"
 
@@ -2369,6 +2469,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 padded_prefill_req_count = 0
             else:
                 padded_token_count = self.round_up_tokens(self.active_token_count)
+                if self.is_hybrid_model:
+                    # The Mamba SSD kernels tile the token buffer into
+                    # mamba_chunk_size chunks and move whole chunks, so the
+                    # padded buffer has to cover the last partial one.
+                    # TOKEN_ROUNDER (64) is finer than the chunk size (128), so
+                    # without this roughly half of all prefill steps land on a
+                    # buffer that is 64 tokens short and fall back to Triton.
+                    padded_token_count = min(
+                        self.max_tokens,
+                        round_up_to_nearest_multiple(padded_token_count, self.mamba_chunk_size),
+                    )
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
