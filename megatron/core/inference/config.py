@@ -3,16 +3,14 @@
 import warnings
 from dataclasses import InitVar, dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import torch
 
+from megatron.core.models.hybrid.hybrid_layer_allocation import HybridLayerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
-
-if TYPE_CHECKING:
-    from megatron.core.models.hybrid.hybrid_layer_allocation import HybridLayerConfig
 
 
 @dataclass
@@ -25,7 +23,7 @@ class MambaInferenceStateConfig:
     these. Once the kernels have been updated we can simplify this code.
     """
 
-    layer_config_list: List["HybridLayerConfig"]
+    layer_config_list: List[HybridLayerConfig]
     """
     Per-layer configs used to derive dynamic inference cache indexing.
     """

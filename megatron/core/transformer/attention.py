@@ -5,14 +5,13 @@ import copy
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -55,6 +54,9 @@ from ..models.common.embeddings.yarn_rotary_pos_embedding import (
 )
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
+
+if TYPE_CHECKING:
+    from megatron.core.inference.contexts import BaseInferenceContext
 
 try:
     from einops import rearrange

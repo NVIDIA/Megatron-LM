@@ -6,14 +6,13 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -25,6 +24,9 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params
+
+if TYPE_CHECKING:
+    from megatron.core.inference.contexts import BaseInferenceContext
 
 
 class MambaLayerConfig(TransformerConfig):
@@ -122,10 +124,10 @@ class MambaLayer(GraphableMegatronModule):
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
-        inference_context: Optional[BaseInferenceContext] = None,
+        inference_context: Optional["BaseInferenceContext"] = None,
         rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
         *,
-        inference_params: Optional[BaseInferenceContext] = None,
+        inference_params: Optional["BaseInferenceContext"] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
