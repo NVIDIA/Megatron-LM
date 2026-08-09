@@ -99,7 +99,7 @@ def _ssd_tiling_from(metadata):
         An ``SSDTiling``, or None when the CuteDSL backend is not importable or
         the batch has no prefill tiling yet.
     """
-    if SSDTiling is None or metadata.ssd_active_seq_idx is None:
+    if SSDTiling is None or getattr(metadata, "ssd_active_seq_idx", None) is None:
         return None
     return SSDTiling(metadata)
 
