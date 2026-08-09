@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
@@ -50,6 +51,17 @@ try:
     HAVE_KITCHEN = True
 except ImportError:
     HAVE_KITCHEN = False
+
+
+##########
+# Experimental Attention Variant Names
+##########
+
+# Canonical ``experimental_attention_variant`` names served by the gated delta net family.
+GDN_ATTENTION_VARIANTS = ("gdn", "gdn2")
+
+# Deprecated ``experimental_attention_variant`` spellings mapped to their canonical name.
+_DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
 
 
 ##########
@@ -142,7 +154,7 @@ def get_experimental_attention_variant_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    if config.experimental_attention_variant in ("gated_delta_net", "gdn2"):
+    if is_gated_delta_net_variant(config.experimental_attention_variant):
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
@@ -334,10 +346,50 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 ##########
 
 
+def normalize_experimental_attention_variant(
+    experimental_attention_variant: Optional[str],
+) -> Optional[str]:
+    """Resolve a deprecated ``experimental_attention_variant`` spelling to its canonical name.
+
+    ``gated_delta_net`` is the deprecated spelling of ``gdn``. Passing it emits a
+    ``DeprecationWarning`` and returns the canonical name so that every downstream
+    consumer only has to handle ``gdn``.
+
+    Args:
+        experimental_attention_variant: The configured variant name, possibly a
+            deprecated alias.
+
+    Returns:
+        The canonical variant name, or the argument unchanged when it is not an alias.
+    """
+    canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(experimental_attention_variant)
+    if canonical is None:
+        return experimental_attention_variant
+
+    warnings.warn(
+        f"experimental_attention_variant='{experimental_attention_variant}' is deprecated "
+        f"and will be removed in a future release. Use '{canonical}' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return canonical
+
+
+def is_gated_delta_net_variant(experimental_attention_variant: Optional[str]) -> bool:
+    """Check if the experimental attention variant is served by a gated delta net layer.
+
+    Accepts the deprecated ``gated_delta_net`` spelling without warning; use
+    :func:`normalize_experimental_attention_variant` to emit the deprecation notice.
+    """
+    canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(
+        experimental_attention_variant, experimental_attention_variant
+    )
+    return canonical in GDN_ATTENTION_VARIANTS
+
+
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net", "gdn2"]
-    return experimental_attention_variant in linear_attention_variants
+    return is_gated_delta_net_variant(experimental_attention_variant)
 
 
 def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_layer_ids) -> None:

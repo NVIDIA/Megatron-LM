@@ -69,7 +69,7 @@ class GatedDeltaNetSubmodules:
 
 class GatedDeltaRuleInterface(Protocol):
     """
-    Unified typing protocol for linear attention interfaces, comliant to upstream FLA interfaces.
+    Unified typing protocol for linear attention interfaces, compliant to upstream FLA interfaces.
 
     Only ``q``/``k``/``v``/``g`` are common to every kernel, and only as keywords: each
     variant inserts its own gates after ``g`` (e.g., ``beta`` for GDN, ``b``/``w`` for GDN2).
