@@ -119,9 +119,7 @@ def gpt_compatible_layer_maps(hybrid_layer_pattern: str) -> GPTCompatLayerMaps:
     if not main_pattern:
         raise ValueError("Hybrid layer pattern is empty; set --hybrid-layer-pattern.")
 
-    translatable = set(_GPT_SOURCED_PATTERN_CHARACTERS) | set(
-        _FRESH_INIT_PATTERN_CHARACTERS
-    )
+    translatable = set(_GPT_SOURCED_PATTERN_CHARACTERS) | set(_FRESH_INIT_PATTERN_CHARACTERS)
     unknown = sorted(set(main_pattern) - translatable)
     if unknown:
         raise ValueError(

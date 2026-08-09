@@ -109,10 +109,7 @@ class TestDynamicContext:
         if is_hybrid_model:
             if layer_config_list is None:
                 layer_config_list = make_layer_configs(
-                    MambaLayerConfig,
-                    MLPLayerConfig,
-                    AttentionLayerConfig,
-                    MLPLayerConfig,
+                    MambaLayerConfig, MLPLayerConfig, AttentionLayerConfig, MLPLayerConfig
                 )
             mamba_conv_states_shape = (544, 4)
             mamba_ssm_states_shape = (8, 64, 16)
@@ -207,9 +204,7 @@ class TestDynamicContext:
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=True,
-            layer_config_list=make_layer_configs(
-                MambaLayerConfig, DSALayerConfig, MoELayerConfig
-            ),
+            layer_config_list=make_layer_configs(MambaLayerConfig, DSALayerConfig, MoELayerConfig),
         )
 
         assert dynamic_context.num_attention_layers == 1
@@ -829,10 +824,7 @@ class TestDynamicContext:
             max_tokens=None,
             is_hybrid_model=True,
             layer_config_list=make_layer_configs(
-                MambaLayerConfig,
-                AttentionLayerConfig,
-                MLPLayerConfig,
-                AttentionLayerConfig,
+                MambaLayerConfig, AttentionLayerConfig, MLPLayerConfig, AttentionLayerConfig
             ),
         )
 
@@ -1668,10 +1660,7 @@ class TestDynamicContext:
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
             layer_config_list=make_layer_configs(
-                MambaLayerConfig,
-                AttentionLayerConfig,
-                MambaLayerConfig,
-                AttentionLayerConfig,
+                MambaLayerConfig, AttentionLayerConfig, MambaLayerConfig, AttentionLayerConfig
             ),
         )
 
@@ -2349,10 +2338,7 @@ class TestDynamicContext:
             is_hybrid_model=is_hybrid_model,
             layer_config_list=(
                 make_layer_configs(
-                    MambaLayerConfig,
-                    AttentionLayerConfig,
-                    MLPLayerConfig,
-                    AttentionLayerConfig,
+                    MambaLayerConfig, AttentionLayerConfig, MLPLayerConfig, AttentionLayerConfig
                 )
                 if is_hybrid_model
                 else None
@@ -3399,7 +3385,7 @@ class TestDynamicContext:
         prefix_skip = 2 * bs - 1
         eff_chunk = chunk_length - prefix_skip
 
-        (_, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, chunk_length)
+        _, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, chunk_length)
         expected_active = tokens_before_chunk_2 + eff_chunk
         assert ctx.active_token_count == expected_active
 

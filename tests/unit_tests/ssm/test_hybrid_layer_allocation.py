@@ -119,9 +119,7 @@ class TestValidateSegmentLayers:
             for layer_config in layer_config_list:
                 assert type(layer_config) in LAYER_CONFIG_BY_PATTERN_CHAR.values()
 
-    @pytest.mark.parametrize(
-        ("pattern_char", "config_class"), LAYER_CONFIG_BY_PATTERN_CHAR.items()
-    )
+    @pytest.mark.parametrize(("pattern_char", "config_class"), LAYER_CONFIG_BY_PATTERN_CHAR.items())
     def test_all_pattern_characters_map_to_layer_configs(self, pattern_char, config_class):
         layer_config_list = validate_segment_layers(pattern_char, self.config)
 

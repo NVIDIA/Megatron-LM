@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
+
 import gc
 import logging
 from operator import itemgetter
@@ -218,7 +219,7 @@ def make_sharded_object_for_checkpoint(
 
 
 def _get_extra_state_offsets(
-    sharded_offsets: Iterable[Tuple[int, int, int]]
+    sharded_offsets: Iterable[Tuple[int, int, int]],
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
     """Turns ShardedTensor offsets into offsets suitable for ShardedObject."""
     if sharded_offsets:

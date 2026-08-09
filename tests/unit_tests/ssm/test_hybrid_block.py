@@ -38,9 +38,7 @@ from tests.unit_tests.test_utilities import Utils
         ("D+", ["dsa_layer", "mla_layer"]),
     ],
 )
-def test_all_layer_configs_route_to_matching_specs(
-    monkeypatch, layer_pattern, expected_spec_names
-):
+def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, expected_spec_names):
     """Each config marker selects its matching layer spec and config instance."""
 
     class BuiltLayer(torch.nn.Module):
@@ -330,16 +328,7 @@ class TestHybridBlock:
         ],
         ids=["full_block", "full_uniform", "selective"],
     )
-    @pytest.mark.parametrize(
-        "layer_pattern",
-        [
-            "MMMMM",
-            "*****",
-            "-----",
-            "*-M*-",
-            "M*-",
-        ],
-    )
+    @pytest.mark.parametrize("layer_pattern", ["MMMMM", "*****", "-----", "*-M*-", "M*-"])
     def test_recompute(self, recompute_kwargs: dict, layer_pattern: str):
         seed = 123
         sequence_length, micro_batch_size = 32, 2

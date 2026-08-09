@@ -263,8 +263,7 @@ class TestHybridModel:
                 config.tp_comm_overlap = False
 
         monkeypatch.setattr(
-            "megatron.core.models.hybrid.hybrid_model.MultiTokenPredictionBlock",
-            MutatingMTPBlock,
+            "megatron.core.models.hybrid.hybrid_model.MultiTokenPredictionBlock", MutatingMTPBlock
         )
 
         model_config = TransformerConfig(
