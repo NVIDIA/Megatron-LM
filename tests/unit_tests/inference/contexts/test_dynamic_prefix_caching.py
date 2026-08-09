@@ -22,7 +22,9 @@ from megatron.core.inference.inference_request import (
     compute_block_hashes_batched,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.ssm.mamba_layer import MambaLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -46,7 +48,12 @@ class PrefixCachingTestBase:
         from megatron.core.inference.config import MambaInferenceStateConfig
 
         return MambaInferenceStateConfig(
-            layer_type_list=["*", "M", "*", "M"],
+            layer_config_list=[
+                object.__new__(AttentionLayerConfig),
+                object.__new__(MambaLayerConfig),
+                object.__new__(AttentionLayerConfig),
+                object.__new__(MambaLayerConfig),
+            ],
             conv_states_shape=(4, 8),
             ssm_states_shape=(4, 16),
             conv_states_dtype=torch.float32,

@@ -12,7 +12,6 @@ from megatron.core.inference.config import (
     InferenceConfig,
     MambaInferenceStateConfig,
 )
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.ssm.mamba_layer import MambaLayerConfig
 from megatron.core.transformer.attention import AttentionLayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -136,7 +135,8 @@ class TestInferenceConfig:
         mamba_state_config = MambaInferenceStateConfig.from_model(model)
 
         assert mamba_state_config is not None
-        assert mamba_state_config.layer_type_list == [Symbols.ATTENTION, Symbols.MAMBA]
+        assert mamba_state_config.layer_config_list[0] is attention_config
+        assert mamba_state_config.layer_config_list[1] is mamba_layer_config
         assert mamba_state_config.conv_states_shape == (4, 8)
         assert mamba_state_config.ssm_states_shape == (8, 32, 16)
         assert mamba_state_config.conv_states_dtype is torch.bfloat16

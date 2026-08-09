@@ -3,13 +3,16 @@
 import warnings
 from dataclasses import InitVar, dataclass
 from enum import Enum
-from typing import List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
 
 import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
+
+if TYPE_CHECKING:
+    from megatron.core.models.hybrid.hybrid_layer_allocation import HybridLayerConfig
 
 
 @dataclass
@@ -22,10 +25,9 @@ class MambaInferenceStateConfig:
     these. Once the kernels have been updated we can simplify this code.
     """
 
-    layer_type_list: List[str]
+    layer_config_list: List["HybridLayerConfig"]
     """
-    Derived layer symbols used by legacy dynamic inference cache indexing. See
-    `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
+    Per-layer configs used to derive dynamic inference cache indexing.
     """
 
     conv_states_shape: Tuple[int]
@@ -51,7 +53,6 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Returns Mamba inference state config from the model if it is a hybrid model."""
-        from megatron.core.models.hybrid.hybrid_layer_allocation import LAYER_SYMBOL_TO_CONFIG_CLASS
         from megatron.core.ssm.mamba_layer import MambaLayerConfig
 
         decoder = get_attr_wrapped_model(model, "decoder")
@@ -80,16 +81,8 @@ class MambaInferenceStateConfig:
                 if type(layer_config) is MambaLayerConfig and hasattr(layer, 'mixer'):
                     mamba_chunk_size = layer.mixer.chunk_size
                     break
-            # Legacy dynamic inference still indexes state caches by layer symbol.
-            config_class_to_symbol = {
-                config_class: symbol
-                for symbol, config_class in LAYER_SYMBOL_TO_CONFIG_CLASS.items()
-            }
-            layer_type_list = [
-                config_class_to_symbol[type(layer_config)] for layer_config in layer_config_list
-            ]
             return cls(
-                layer_type_list=layer_type_list,
+                layer_config_list=list(layer_config_list),
                 conv_states_shape=mamba_conv_states_shape,
                 ssm_states_shape=mamba_ssm_states_shape,
                 conv_states_dtype=conv_states_dtype,

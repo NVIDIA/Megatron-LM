@@ -2,7 +2,6 @@
 
 import logging
 import math
-import operator
 import warnings
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -434,22 +433,40 @@ class DynamicInferenceContext(BaseInferenceContext):
                     "boundaries are not rounded between decode chunks."
                 )
 
-            # For hybrid models, the layer map converts the global layer index to the
-            # corresponding attention layer index or Mamba layer index depending on the
-            # layer type.
-            from megatron.core.models.hybrid.hybrid_layer_allocation import (
-                Symbols,
-                get_layer_maps_from_layer_type_list,
-            )
+            # Convert each global layer index to the corresponding attention or
+            # Mamba cache index. Keep the attention variants in separate maps to
+            # preserve the legacy cache-indexing behavior.
+            from megatron.core.ssm.gated_delta_net import GDNLayerConfig
+            from megatron.core.ssm.mamba_layer import MambaLayerConfig
+            from megatron.core.ssm.mlp_layer import MLPLayerConfig
+            from megatron.core.transformer.attention import AttentionLayerConfig
+            from megatron.core.transformer.experimental_attention_variant.dsa import DSALayerConfig
+            from megatron.core.transformer.moe.moe_layer import MoELayerConfig
+            from megatron.core.transformer.multi_latent_attention import MLALayerConfig
 
-            attention_layer_map, dsa_layer_map, gdn_layer_map, mamba_layer_map = (
-                operator.itemgetter(
-                    Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.MAMBA
-                )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
-            )
-
-            if len(gdn_layer_map) > 0:
-                raise NotImplementedError("GDN layers are not supported for inference.")
+            attention_layer_map = {}
+            dsa_layer_map = {}
+            mamba_layer_map = {}
+            for global_layer_idx, layer_config in enumerate(
+                mamba_inference_state_config.layer_config_list
+            ):
+                if type(layer_config) is AttentionLayerConfig:
+                    attention_layer_map[global_layer_idx] = len(attention_layer_map)
+                elif type(layer_config) is DSALayerConfig:
+                    dsa_layer_map[global_layer_idx] = len(dsa_layer_map)
+                elif type(layer_config) is MambaLayerConfig:
+                    mamba_layer_map[global_layer_idx] = len(mamba_layer_map)
+                elif type(layer_config) is GDNLayerConfig:
+                    raise NotImplementedError("GDN layers are not supported for inference.")
+                elif type(layer_config) is MLALayerConfig:
+                    # Hybrid MLA cache mapping was not supported by the legacy path.
+                    continue
+                elif type(layer_config) in (MLPLayerConfig, MoELayerConfig):
+                    continue
+                else:
+                    raise ValueError(
+                        f"Unexpected hybrid layer config type: {type(layer_config).__name__}"
+                    )
 
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)

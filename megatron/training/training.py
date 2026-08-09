@@ -851,12 +851,9 @@ def num_floating_point_operations(
         # Calculate the number of each type of layer.
         from operator import itemgetter
 
-        from megatron.core.models.hybrid.hybrid_layer_allocation import (
-            Symbols,
-            get_hybrid_layer_counts,
-        )
+        from megatron.core.models.hybrid.hybrid_layer_allocation import get_hybrid_layer_counts
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
-            itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
+            itemgetter('M', 'G', '*', '-', 'E')(
                 get_hybrid_layer_counts(args.hybrid_layer_pattern)
             )
         )
@@ -2805,13 +2802,8 @@ def training_log(
             track_names.append("z_loss")
 
         if is_hybrid_model(args):
-            from operator import itemgetter
-
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-                Symbols,
-                get_hybrid_layer_counts,
-            )
-            layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+            from megatron.core.models.hybrid.hybrid_layer_allocation import get_hybrid_layer_counts
+            layers = get_hybrid_layer_counts(args.hybrid_layer_pattern)['E']
         else:
             layers = args.num_layers
 
