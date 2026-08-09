@@ -267,6 +267,7 @@ class TestGatedDeltaNet:
 
         det_config = copy.deepcopy(self.transformer_config)
         det_config.deterministic_mode = True
+        det_config.gated_delta_rule_backend = "torch"
 
         gdn_spec = get_experimental_attention_variant_module_spec(config=det_config)
 
