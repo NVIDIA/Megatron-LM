@@ -399,7 +399,7 @@ def _start_otel_job_spans(model_type, program_start):
         # in-process spans must not masquerade as slurm.*. The prolog is deliberately
         # excluded from this span (it lives in pre_startup above).
         _otel_slurm_job_span = _otel_tracer.start_span('workload', start_time=int(launch_script_start * 1e9))
-        _otel_tag_span(_otel_slurm_job_span, 'job', is_goodput=True)
+        _otel_mark_goodput(_otel_slurm_job_span)
         _otel_slurm_job_ctx_token = _otel_ctx.attach(
             _otel_trace.set_span_in_context(_otel_slurm_job_span)
         )
@@ -409,7 +409,7 @@ def _start_otel_job_spans(model_type, program_start):
         _slurm_startup_span = _otel_tracer.start_span(
             'workload.startup', start_time=int(launch_script_start * 1e9)
         )
-        _otel_tag_span(_slurm_startup_span, 'job', is_goodput=True)
+        _otel_mark_goodput(_slurm_startup_span)
         _slurm_startup_ctx_token = _otel_ctx.attach(
             _otel_trace.set_span_in_context(_slurm_startup_span)
         )
@@ -419,28 +419,26 @@ def _start_otel_job_spans(model_type, program_start):
         _slurm_startup_span.end(end_time=_program_start_ns)
 
     _otel_pretrain_span = _otel_tracer.start_span("megatron.pretrain", start_time=_program_start_ns)
-    _otel_tag_span(_otel_pretrain_span, 'job', is_goodput=True)
+    _otel_mark_goodput(_otel_pretrain_span)
     _otel_set_attrs(_otel_pretrain_span, {'megatron.model_type': str(model_type)})
     _otel_pretrain_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_otel_pretrain_span))
 
     _otel_startup_span = _otel_tracer.start_span("megatron.startup", start_time=_program_start_ns)
-    _otel_tag_span(_otel_startup_span, 'job', is_goodput=True)
+    _otel_mark_goodput(_otel_startup_span)
     _otel_startup_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_otel_startup_span))
 
 
-def _otel_tag_span(span, group, is_goodput=False):
-    """Stamp lens.group on a manually created span.
+def _otel_mark_goodput(span):
+    """Mark a manually created span as a goodput boundary.
 
     The job/startup structural spans are created via the explicit start_span API
-    (they must outlive the function that opens them), so they need lens.group
-    stamped by hand. Pass is_goodput=True on spans that are goodput boundaries;
-    absent the attribute a span is profiling-only, which is the default for
+    (they must outlive the function that opens them), so they cannot pass
+    attributes through a managed_span call and are stamped by hand instead.
+    Absent this attribute a span is profiling-only, which is the default for
     everything except the resiliency-accounting boundaries.
     """
     try:
-        span.set_attribute('lens.group', group)
-        if is_goodput:
-            span.set_attribute('is_goodput_span', True)
+        span.set_attribute('is_goodput_span', True)
     except Exception:  # noqa: BLE001 -- telemetry must never break training
         pass
 
@@ -451,7 +449,7 @@ def _backdated_otel_span(name, start, end):
         return
     _otel_tracer = get_telemetry().tracer
     _s = _otel_tracer.start_span(name, start_time=int(start * 1e9))
-    _otel_tag_span(_s, 'job', is_goodput=True)
+    _otel_mark_goodput(_s)
     _s.end(end_time=int(end * 1e9))
 
 
@@ -530,7 +528,7 @@ def _reroot_otel_interval():
         sp = get_telemetry().tracer.start_span(
             'megatron.train', context=Context(), links=links
         )
-        _otel_tag_span(sp, 'job', is_goodput=True)
+        _otel_mark_goodput(sp)
         _otel_interval_span = sp
         _otel_interval_ctx_token = _octx.attach(_otr.set_span_in_context(sp))
     except Exception:  # noqa: BLE001
@@ -2909,7 +2907,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_dgrad_logging(model, args.save)
         grad_context, forward_only = _forward_backward_grad_context(args)
         _fb_cm = (
-            span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, **{'lens.group': 'forward_backward'}, num_microbatches=get_num_microbatches())
+            span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=get_num_microbatches())
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
         )
         with grad_context, _fb_cm:
@@ -2981,7 +2979,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     _opt_cm = (
-        span_cm("megatron.train.iteration.optimizer", tracer=_otel_step_tracer, **{'lens.group': 'optimizer'})
+        span_cm("megatron.train.iteration.optimizer", tracer=_otel_step_tracer)
         if _otel_sg_enabled('optimizer') and _otel_step_tracer is not None else nullcontext()
     )
     with _opt_cm as _opt_span:
@@ -3600,7 +3598,7 @@ def save_checkpoint_and_time(
     if _otel_sg_enabled('checkpoint'):
         from opentelemetry import context as _octx, trace as _otr
         _exposed_save_span = get_telemetry().tracer.start_span('megatron.checkpoint.exposed_save')
-        _otel_tag_span(_exposed_save_span, 'checkpoint', is_goodput=True)
+        _otel_mark_goodput(_exposed_save_span)
         _exposed_save_span.set_attribute('megatron.iteration', iteration)
         _exposed_save_token = _octx.attach(_otr.set_span_in_context(_exposed_save_span))
     try:
@@ -4659,7 +4657,7 @@ def train(
         if _otel_sg_enabled('step'):
             from opentelemetry import context as _octx, trace as _otr
             _report_span = get_telemetry().tracer.start_span('megatron.train.iteration_report')
-            _otel_tag_span(_report_span, 'step', is_goodput=True)
+            _otel_mark_goodput(_report_span)
             _report_token = _octx.attach(_otr.set_span_in_context(_report_span))
         try:
 
