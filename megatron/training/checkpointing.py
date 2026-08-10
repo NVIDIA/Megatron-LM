@@ -837,7 +837,12 @@ def save_checkpoint(
                             else mpu.get_expert_data_parallel_group()
                         )
                     save_strategy = FullyParallelSaveStrategyWrapper(
-                        save_strategy, process_group, args.ckpt_assume_constant_structure
+                        save_strategy,
+                        process_group,
+                        args.ckpt_assume_constant_structure,
+                        replicate_local_replicas=getattr(
+                            args, 'ckpt_fully_parallel_save_replicate_local', False
+                        ),
                     )
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
@@ -1624,7 +1629,10 @@ def _load_global_dist_base_checkpoint(
         )
 
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
-    load_strategy = TorchDistLoadShardedStrategy(cache_metadata=args.ckpt_assume_constant_structure)
+    load_strategy = TorchDistLoadShardedStrategy(
+        cache_metadata=args.ckpt_assume_constant_structure,
+        replicate_local_replicas=getattr(args, 'ckpt_fully_parallel_load_replicate_local', False),
+    )
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         if args.ckpt_fully_parallel_load_process_group == 'dp':
