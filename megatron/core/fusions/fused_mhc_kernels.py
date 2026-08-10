@@ -2761,6 +2761,13 @@ def _torch_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tup
     # is reachable whenever cuTile is absent -- including Triton-present builds --
     # so it has to agree with them.
     #
+    # Compatibility note: this function is also FusedHAggregate.backward, which
+    # use_fused_mhc has selected since before this change, so --use-fused-mhc runs
+    # on a cuTile-less stack get a different (less noisy) grad_h than prior
+    # releases and will not reproduce their loss curves. No functional case sets
+    # --use-fused-mhc, so no golden value flags it; a mismatch on such a run is
+    # expected and attributable here.
+    #
     # This does allocate fp32 temporaries, and a batched matmul would avoid them
     # by accumulating bf16 products in fp32 registers. Not taken: the precision of
     # that form depends on torch.backends.cuda.matmul.allow_bf16_reduced_precision

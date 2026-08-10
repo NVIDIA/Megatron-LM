@@ -637,7 +637,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # normally set. Thread it here so the attention-only split replay can
             # bind its fixed-address recompute arena slot (see
             # HyperConnectionTransformerLayer._te_cuda_graph_replay_mhc_attention_split_overlap).
-            if is_hyper_connection_layer:
+            if is_hyper_connection_layer and layer._uses_mhc_recompute_attn_cuda_graph_split():
                 layer._mhc_recompute_manager = mhc_recompute_manager
             forward_func = layer._te_cuda_graph_replay
         else:
@@ -1068,22 +1068,11 @@ def build_mtp_layer_callables(layer):
     # post-processing node. Dropping it here would leave the MTP layer's
     # hyper-connection output unexpanded.
     #
-    # It needs the same RNG fork as its siblings: mHC post runs the fused
-    # H_res/H_post bias-dropout-add, so under sequence parallelism it must draw
-    # from the tensor-parallel state. Before mHC post became its own node it ran
-    # inside combine_forward and inherited that wrapper; appending it raw here
-    # would leave every TP rank drawing the same mask, and the recompute replay
-    # would not reproduce the forward mask.
-    # None means "this layer has no mHC post node"; the schedule tests for it, so
-    # the guard has to survive the wrapping. This uses the module-level helper
-    # rather than the local rng_context_wrapper above only because the plain
-    # builder needs the same wrapping and has no such closure; the pre-existing
-    # callables are left on their original wrapper.
-    mhc_post_func = (
-        None
-        if inner_mhc_post_forward is None
-        else with_sequence_parallel_rng(inner_mhc_post_forward, layer.config)
-    )
+    # Taken as-is: build_transformer_layer_callables already applied
+    # with_sequence_parallel_rng to it, and wrapping again would nest one fork
+    # inside another. None means "this layer has no mHC post node", which the
+    # schedule tests for, so it has to pass through unchanged too.
+    mhc_post_func = inner_mhc_post_forward
     forward_funcs = [
         attn_func,
         dispatch_func,
