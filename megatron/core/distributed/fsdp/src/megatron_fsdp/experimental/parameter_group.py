@@ -530,6 +530,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         mesh: DeviceMesh,
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
+        reduce_scatter_stream: torch.cuda.Stream | None = None,
         use_symm_mem: bool = False,
         grad_divisor: int = 1,
     ) -> None:
