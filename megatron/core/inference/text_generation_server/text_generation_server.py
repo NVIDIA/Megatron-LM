@@ -180,19 +180,31 @@ class MegatronGenerate(Resource):
             # OTel: instrument the request handler with GenAI semantic conventions.
             # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/
             # Gated by the INFERENCE span group so users can selectively disable.
-            _otel_tracer = _otel_meter = None
+            #
+            # _otel_tracer doubles as the "instrumentation is usable" flag at the
+            # span_cm() call site below, which is OUTSIDE this try. So it -- and every
+            # other name that site depends on -- is published only on the last line, after
+            # all the imports have succeeded. Assigning it as soon as the tracer existed
+            # (as this used to) meant a later failure, e.g. importing nemo.lens.propagation
+            # or opentelemetry.metrics, left span_cm unbound with _otel_tracer set, and the
+            # unguarded call site raised NameError -- turning a telemetry problem into an
+            # HTTP 500 on a request that would otherwise have been served fine.
+            _otel_tracer = _otel_meter = _otel_span_cm = None
+            _parent_ctx = None
             try:
                 from nemo.lens.state import is_span_group_enabled
                 if is_span_group_enabled('inference'):
                     from nemo.lens.helpers import span_cm
                     from nemo.lens.propagation import extract_context
                     from opentelemetry import trace as _trace_mod, metrics as _metrics_mod
-                    _otel_tracer = _trace_mod.get_tracer('megatron.core')
-                    _otel_meter = _metrics_mod.get_meter('megatron.core')
-                    _parent_ctx = extract_context(dict(request.headers))
-                else:
-                    _parent_ctx = None
+                    _tracer = _trace_mod.get_tracer('megatron.core')
+                    _meter = _metrics_mod.get_meter('megatron.core')
+                    _ctx = extract_context(dict(request.headers))
+                    # Publish together, last: all imports above have now succeeded.
+                    _otel_tracer, _otel_meter = _tracer, _meter
+                    _otel_span_cm, _parent_ctx = span_cm, _ctx
             except Exception:
+                _otel_tracer = _otel_meter = _otel_span_cm = None
                 _parent_ctx = None
 
             # Resolve model identifier used in span name and attributes.
@@ -223,7 +235,7 @@ class MegatronGenerate(Resource):
             _req_start = datetime.datetime.now()
 
             _request_cm = (
-                span_cm(_span_name, tracer=_otel_tracer, **_span_attrs)
+                _otel_span_cm(_span_name, tracer=_otel_tracer, **_span_attrs)
                 if _otel_tracer is not None else contextlib.nullcontext()
             )
 
