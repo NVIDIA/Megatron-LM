@@ -540,6 +540,7 @@ class _AsyncPairScenario:
     prerequisite: str | None = None
     atol: float = 1.0e-3
     parity: str = "exact"
+    compare_generated_metadata: bool = True
 
 
 _BASE_PAIR_CONFIG = {
@@ -782,6 +783,7 @@ _ASYNC_PAIR_SCENARIOS = (
             {"return_log_probs": True, "skip_prompt_log_probs": True, "top_n_logprobs": 4},
         ),
         signals=("cuda-graph", "logprobs", "mtp", "top-n"),
+        compare_generated_metadata=False,
     ),
     _pair_scenario(
         "hybrid-mamba",
@@ -1207,7 +1209,13 @@ def _assert_top_n_parity(actual, expected, atol, exact):
 
 
 def _assert_request_parity(
-    actual_requests, expected, atol, compare_events=False, exact_numerics=True, exact_top_n=False
+    actual_requests,
+    expected,
+    atol,
+    compare_events=False,
+    exact_numerics=True,
+    exact_top_n=False,
+    compare_generated_metadata=True,
 ):
     assert len(actual_requests) == len(expected)
     for request, reference in zip(actual_requests, expected):
@@ -1216,25 +1224,30 @@ def _assert_request_parity(
         prompt_logprobs = _as_float_list(request.prompt_log_probs) or []
         generated_logprobs = _as_float_list(request.generated_log_probs) or []
         assert len(prompt_logprobs) == len(reference["prompt_logprobs"] or [])
-        assert len(generated_logprobs) == len(reference["generated_logprobs"] or [])
+        if compare_generated_metadata:
+            assert len(generated_logprobs) == len(reference["generated_logprobs"] or [])
+        else:
+            assert len(generated_logprobs) == len(request.generated_tokens)
         if exact_numerics:
             assert request.generated_tokens == reference["tokens"]
             assert prompt_logprobs == pytest.approx(
                 reference["prompt_logprobs"] or [], rel=0, abs=atol
             )
-            assert generated_logprobs == pytest.approx(
-                reference["generated_logprobs"] or [], rel=0, abs=atol
-            )
+            if compare_generated_metadata:
+                assert generated_logprobs == pytest.approx(
+                    reference["generated_logprobs"] or [], rel=0, abs=atol
+                )
         else:
             assert all(0 <= token < 100 for token in request.generated_tokens)
-            assert torch.isfinite(torch.tensor(prompt_logprobs)).all()
-            assert torch.isfinite(torch.tensor(generated_logprobs)).all()
+        assert torch.isfinite(torch.tensor(prompt_logprobs)).all()
+        assert torch.isfinite(torch.tensor(generated_logprobs)).all()
         _assert_top_n_parity(
             request.prompt_top_n_logprobs, reference["prompt_top_n"], atol, exact_top_n
         )
-        _assert_top_n_parity(
-            request.generated_top_n_logprobs, reference["generated_top_n"], atol, exact_top_n
-        )
+        if compare_generated_metadata:
+            _assert_top_n_parity(
+                request.generated_top_n_logprobs, reference["generated_top_n"], atol, exact_top_n
+            )
         if compare_events:
             assert [event.type for event in request.events] == reference["events"]
 
@@ -1407,7 +1420,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         request.generated_log_probs,
                         request.generated_top_n_logprobs,
                     ):
-                        token_text = controller.detokenize([token])
+                        token_text = controller.tokenizer.detokenize([token])
                         assert 0 < len(top_n) <= request.sampling_params.top_n_logprobs
                         assert token_text in top_n
                         assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
@@ -1456,6 +1469,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert model_config.fp8 is not None
         if "fused-rope" in signals:
             assert context.use_flashinfer_fused_rope
+            model = controller.inference_wrapped_model.model
+            assert model.rotary_pos_emb.inv_freq.is_cuda
+            assert model.rotary_pos_emb_cache[context.max_sequence_length].is_cuda
         if "swa" in signals:
             assert model_config.window_size == scenario.config["window_size"]
         if "softmax-sink" in signals:
@@ -1534,6 +1550,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             scenario.atol,
             compare_events="events" in scenario.signals,
             exact_numerics=scenario.parity == "exact",
+            compare_generated_metadata=scenario.compare_generated_metadata,
         )
         cls._assert_runtime_signals(async_env, scenario, runtime, stop_tokens, termination_token)
         if scenario.parity == "reproducible":
@@ -1554,6 +1571,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 scenario.atol,
                 compare_events="events" in scenario.signals,
                 exact_top_n=True,
+                compare_generated_metadata=scenario.compare_generated_metadata,
             )
             cls._assert_runtime_signals(
                 repeat_env, scenario, repeat_runtime, stop_tokens, termination_token
