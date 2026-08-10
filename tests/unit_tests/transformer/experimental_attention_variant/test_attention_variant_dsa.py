@@ -28,6 +28,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
+    _compute_indexer_teacher_probabilities,
+    _normalize_indexer_teacher_target,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
     compute_dsa_indexer_loss,
@@ -1656,6 +1658,25 @@ class TestRotateActivation:
 
         with pytest.raises(AssertionError, match="only support bf16"):
             rotate_activation(x)
+
+
+def test_indexer_teacher_probability_accepts_detached_external_mass():
+    """An omitted-key LSE participates in the denominator without entering the target support."""
+    attention_scores = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
+    valid_mask = torch.ones((1, 2, 2), dtype=torch.bool)
+    non_compressed_lse = torch.tensor([[[0.5, 1.5]]])
+
+    actual = _compute_indexer_teacher_probabilities(
+        attention_scores, valid_mask, non_compressed_lse
+    )
+    expected_denominator = torch.logaddexp(
+        torch.logsumexp(attention_scores, dim=-1), non_compressed_lse
+    )
+    expected = torch.exp(attention_scores - expected_denominator.unsqueeze(-1))
+    torch.testing.assert_close(actual, expected)
+
+    normalized = _normalize_indexer_teacher_target(actual.sum(dim=1), non_compressed_lse)
+    torch.testing.assert_close(normalized.sum(dim=-1), torch.ones((1, 2)))
 
 
 @pytest.mark.parametrize("seqlen_and_topk", [[16, 32], [64, 32]])
