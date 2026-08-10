@@ -110,12 +110,12 @@ def get_attention_mask(seq_length: int) -> torch.Tensor:
 def get_logit_dtype(model) -> torch.dtype:
     """Returns the dtype of the language-model output logits.
 
-    Models may expose a ``logit_dtype`` attribute (see ``--output-logit-dtype``) that overrides
+    Models may expose a `logit_dtype` attribute (see `--output-logit-dtype`) that overrides
     the dtype of the output-layer GEMM result. When it is unset, the logits keep the
     output-layer input dtype, i.e. the dtype the model computes in.
 
     Args:
-        model: The model, optionally wrapped (e.g. in ``Float16Module`` or DDP).
+        model: The model, optionally wrapped (e.g. in `Float16Module` or DDP).
 
     Returns:
         The dtype that the model's logits are produced in.
