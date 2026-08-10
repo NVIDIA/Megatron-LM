@@ -1045,12 +1045,23 @@ def build_mtp_layer_callables(layer):
             hidden_states = pre_contraction_hidden_states
         return hidden_states
 
+    def rng_context_wrapper(func, *args, **kwargs):
+        """
+        Wrapper to add rng context to submodule callables
+        """
+        if layer.config.sequence_parallel:
+            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+        else:
+            rng_context = nullcontext()
+        with rng_context:
+            return func(*args, **kwargs)
+
     # Build forward and backward callable functions
     # attn_forward already has rng context, no need to wrap
     attn_func = submodule_mtp_attn_forward
-    dispatch_func = with_sequence_parallel_rng(dispatch_forward, layer.config)
-    mlp_func = with_sequence_parallel_rng(mlp_forward, layer.config)
-    combine_func = with_sequence_parallel_rng(combine_forward, layer.config)
+    dispatch_func = partial(rng_context_wrapper, dispatch_forward)
+    mlp_func = partial(rng_context_wrapper, mlp_forward)
+    combine_func = partial(rng_context_wrapper, combine_forward)
     mtp_post_process_func = submodule_mtp_postprocess_forward
 
     # The MTP layer wraps a transformer layer, so it inherits that layer's mHC
@@ -1064,7 +1075,10 @@ def build_mtp_layer_callables(layer):
     # would leave every TP rank drawing the same mask, and the recompute replay
     # would not reproduce the forward mask.
     # None means "this layer has no mHC post node"; the schedule tests for it, so
-    # the guard has to survive the wrapping.
+    # the guard has to survive the wrapping. This uses the module-level helper
+    # rather than the local rng_context_wrapper above only because the plain
+    # builder needs the same wrapping and has no such closure; the pre-existing
+    # callables are left on their original wrapper.
     mhc_post_func = (
         None
         if inner_mhc_post_forward is None

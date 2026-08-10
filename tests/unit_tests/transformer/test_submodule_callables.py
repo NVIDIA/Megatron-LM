@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 import pytest
 import torch
 
@@ -66,8 +66,12 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
     output_tensors = []
     # get callables
     callables, dw = build_layer_callables(model)
-    attn, dispatch, moe, combine, post_process = callables
+    # Six slots: mHC post-processing is its own node. This model has no hyper
+    # connections, so that slot is None -- but unpack it explicitly so a future
+    # width change fails here rather than silently dropping the last callable.
+    attn, dispatch, moe, combine, post_process, mhc_post = callables
     assert post_process is None
+    assert mhc_post is None
     dummy_model = DummyState()
     dummy_model.decoder = DummyState()
     dummy_model.decoder.final_layernorm = None

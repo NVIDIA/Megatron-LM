@@ -2057,6 +2057,10 @@ class TECudaGraphHelper:
         consumed_sample_queue = {}
         layer_sample_keys_cache = {}
         last_retired_samples = {}
+        # Only _validate_mhc_static_hidden_inputs reads these, and it early-returns
+        # off the same predicate; recording them for every TE capture would be
+        # bookkeeping no one consumes.
+        track_mhc_intervals = self._uses_mhc_direct_write_arena()
         self._mhc_sample_order_intervals = {}
         fwd_idx = [0] * self.num_model_chunks
         for idx, chunk_id in enumerate(order):
@@ -2143,7 +2147,8 @@ class TECudaGraphHelper:
                             )
                         )
                         model_chunk_idx = abs(chunk_id) - 1
-                    self._mhc_sample_order_intervals[per_callable_fwd_idx] = [idx, None]
+                    if track_mhc_intervals:
+                        self._mhc_sample_order_intervals[per_callable_fwd_idx] = [idx, None]
                 fwd_idx[model_chunk_idx] += 1
             elif ceil(chunk_id) == chunk_id:
                 num_consumed_samples = min(
@@ -2157,7 +2162,8 @@ class TECudaGraphHelper:
                     if sample_keys not in consumed_sample_queue:
                         consumed_sample_queue[sample_keys] = []
                     consumed_sample_queue[sample_keys].append(per_callable_fwd_idx)
-                    self._mhc_sample_order_intervals[per_callable_fwd_idx][1] = idx
+                    if track_mhc_intervals:
+                        self._mhc_sample_order_intervals[per_callable_fwd_idx][1] = idx
                     last_retired_samples[model_chunk_idx].append(per_callable_fwd_idx)
                 fwd_sample_queues[model_chunk_idx] = fwd_sample_queues[model_chunk_idx][
                     num_consumed_samples:
@@ -2167,8 +2173,9 @@ class TECudaGraphHelper:
                 # extend the liveness window of the samples whose dgrad just
                 # retired: a delayed wgrad graph replays after the dgrad graph and
                 # still reads the static input, so the window must end here.
-                for per_callable_fwd_idx in last_retired_samples.get(model_chunk_idx, ()):
-                    self._mhc_sample_order_intervals[per_callable_fwd_idx][1] = idx
+                if track_mhc_intervals:
+                    for per_callable_fwd_idx in last_retired_samples.get(model_chunk_idx, ()):
+                        self._mhc_sample_order_intervals[per_callable_fwd_idx][1] = idx
                 continue
 
         return sample_args, sample_kwargs

@@ -18,7 +18,6 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1960,59 +1959,36 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         return uses_mhc_recompute_attn_cuda_graph_split(self.config)
 
     def _validate_mhc_recompute_attn_cuda_graph_split(self) -> None:
-        """Reject unsupported variants of the initial mHC/partial-CG arena path."""
+        """Reject the variants the direct-write arena provably cannot represent.
+
+        Deliberately short. Only conditions with a mechanism in this file are
+        rejected here; "not yet exercised" is not a reason to fail a user's
+        configuration. An earlier revision of this PR rejected FP4, non-BF16,
+        non-mxfp8 FP8 recipes, fine-grained activation offloading, delayed
+        weight-gradient compute, MoE without EP overlap and an unfused input
+        layernorm on exactly that basis, which left the feature reachable by
+        almost nothing. Those are left to the guards that already own them --
+        and delayed wgrad in particular is *supported*: the capture-order
+        bookkeeping extends a sample's liveness window across its wgrad entry.
+
+        What actually protects this path is enforced at runtime and fails loudly:
+        ``MHCRecomputeArenaSlot.validate_output`` checks that the producer
+        direct-wrote the captured address, and
+        ``TECudaGraphHelper._validate_mhc_static_hidden_inputs`` checks that
+        aliased static inputs have disjoint liveness windows.
+        """
         if not self._uses_mhc_recompute_attn_cuda_graph_split():
             return
 
-        unsupported = []
-        # Two validated modalities share the attention-only split capture:
-        #  - dense BF16 non-interleaved 1F1B (no MoE, no overlap), and
-        #  - MoE + EP a2a overlap, where the split feeds the fine-grained
-        #    schedule (see _te_cuda_graph_replay_mhc_attention_split_overlap).
-        # A MoE layer is only supported under overlap; a non-overlap MoE layer
-        # would replay the whole MoE synchronously via the dense split tail.
-        if self.is_moe_layer and not self.config.overlap_moe_expert_parallel_comm:
-            unsupported.append("MoE layers without EP overlap")
-        if self.config.fp4:
-            unsupported.append("FP4")
-        # Compare against the enum member, not str(): Fp8Recipe is a str mixin, so
-        # equality holds for the plain-string form argparse produces, while
-        # str(Fp8Recipe.mxfp8) is "Fp8Recipe.mxfp8" and would reject an
-        # enum-valued config that is in fact supported.
-        if self.config.fp8 and getattr(self.config, "fp8_recipe", None) != Fp8Recipe.mxfp8:
-            # MXFP8 block scaling keeps quantization inside the captured graph:
-            # the attention graph's static input stays a BF16 hidden-states
-            # tensor and there is no graph-external amax/scale state to drift
-            # across replays, so the direct-write arena composes with it.
-            # Delayed-scaling and tensorwise FP8 recipes carry cross-replay
-            # amax state and remain unvalidated.
-            unsupported.append("FP8 recipes other than mxfp8")
-        if not self.config.bf16:
-            unsupported.append("non-BF16 activations")
-        if self.config.fine_grained_activation_offloading:
-            unsupported.append("fine-grained activation offloading")
-        if self.config.delay_wgrad_compute:
-            unsupported.append("delayed weight-gradient compute")
-        if self._is_thd_cuda_graph():
-            unsupported.append("THD/packed-sequence CUDA Graphs")
-        # A non-fused (real) input layernorm is captured inside the attention
-        # graph and recomputed by the graph's own backward, so it composes with
-        # the split. The dense non-interleaved 1F1B path was only validated with
-        # a fused (IdentityOp) input layernorm, so it stays restricted; the
-        # EP-overlap modality (e.g. MLA, where both dense and MoE hyper-connection
-        # layers carry a real input layernorm) is validated end to end.
-        if (
-            not isinstance(self.input_layernorm, IdentityOp)
-            and not self.config.overlap_moe_expert_parallel_comm
-        ):
-            unsupported.append("an unfused input layernorm")
         if not isinstance(self.cross_attention, IdentityOp):
-            unsupported.append("cross-attention")
-
-        if unsupported:
+            # A captured cross-attention adds a context output, and
+            # _replay_mhc_attention_consumer accepts exactly one attention output
+            # plus an optional bias. Rejecting here turns a mid-capture
+            # RuntimeError into a config-time message.
             raise ValueError(
-                "mHC recompute with attention-only TE CUDA Graphs currently requires the "
-                "minimal dense BF16 path; unsupported: " + ", ".join(unsupported)
+                "mHC recompute with attention-only TE CUDA Graphs cannot represent "
+                "cross-attention: its context output exceeds the split's graph "
+                "output arity."
             )
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):

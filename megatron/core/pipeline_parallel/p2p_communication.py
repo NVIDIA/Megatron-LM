@@ -420,14 +420,23 @@ class P2PCommunicator:
         ):
             # To protect against race condition when using batch_isend_irecv().
             # User should assert that we have a modern enough PyTorch to not need this.
-            # Skipped during CUDA graph capture (cuda_graph_impl="full_iteration"
-            # records the whole pipeline schedule), because host-side
-            # synchronization is illegal while a stream is capturing. The race this
-            # guards is cross-rank, so local stream ordering does not stand in for
-            # it; what does is that every rank replays one fixed op sequence, so the
-            # nondeterministic interleaving of group calls the flag protects against
-            # cannot arise inside a replay. Do not carry this skip over to a
-            # non-captured path on the strength of stream ordering alone.
+            #
+            # Skipped while a stream is capturing, which cuda_graph_impl=
+            # "full_iteration" makes reachable by recording the whole pipeline
+            # schedule. torch.cuda.synchronize() is a host-side device sync and is
+            # illegal under capture -- measured, not assumed: it raises
+            # "operation failed due to a previous error during capture", while the
+            # batch_isend_irecv and the req.wait() above it both capture cleanly.
+            # So no captured pipeline can carry this workaround in any form; the
+            # only choice is to skip it or to reject capture outright.
+            #
+            # Skipping is the right choice because the workaround targets a bug in
+            # older PyTorch, and capturing NCCL point-to-point work needs a far
+            # newer stack than that -- any build that can reach this line under
+            # capture is one the comment above says does not need the sync. This is
+            # a version argument, not a stream-ordering one: the race is cross-rank,
+            # so do not carry this skip over to a non-captured path by reasoning
+            # that local stream order stands in for it.
             torch.cuda.synchronize()
 
         return tensor_recv_prev, tensor_recv_next, reqs
