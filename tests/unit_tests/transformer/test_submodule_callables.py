@@ -199,9 +199,11 @@ class TestTransformerLayerSubmoduleCallables:
             expert_model_parallel_size=2,
             virtual_pipeline_model_parallel_size=2,
         )
+        qk_layernorm = True
         extra_kwargs = {
             "moe_token_dispatcher_type": dispatcher_type,
             "moe_permute_fusion": permute_fusion,
+            "qk_layernorm": qk_layernorm,
         }
         if dispatcher_type == "flex":
             extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
@@ -211,7 +213,7 @@ class TestTransformerLayerSubmoduleCallables:
             transformer_layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
                 num_experts=8,
                 moe_grouped_gemm=grouped_gemm,
-                qk_layernorm=True,
+                qk_layernorm=qk_layernorm,
                 multi_latent_attention=True,
             )
             model = TransformerLayer(config, transformer_layer_submodules)

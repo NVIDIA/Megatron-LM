@@ -82,14 +82,15 @@ class InferenceSetupConfig:
     """Enable dynamic batching mode."""
 
     inference_dynamic_batching_buffer_size_gb: float = 40.0
-    """Amount of on-GPU memory allocated for the KV cache. The total amount of memory allocated for
+    """On-GPU portion of the shared KV cache block pool. The total amount of memory allocated for
     the KV cache (CPU + GPU memory) depends on the value set for the unified virtual memory (UVM)
     level (via inference_dynamic_batching_unified_memory_level)."""
 
     inference_dynamic_batching_paused_buffer_size_gb: float | None = None
-    """Amount of memory reserved for paused requests in the dynamic inference context. Active
-    requests are paused when there are not enough active blocks available to continue generating a
-    request."""
+    """Memory used to derive the paused-request block retention budget. This does not reserve blocks
+    from active requests: active requests may use the entire shared pool of usable KV cache blocks.
+    Under allocation pressure, paused requests retain blocks only within this budget and excess
+    paused requests may be evicted."""
 
     inference_dynamic_batching_mamba_memory_ratio: float | None = None
     """Percentage of memory buffer to allocate for Mamba states. If not specified, allocates Mamba
@@ -132,14 +133,19 @@ class InferenceSetupConfig:
     down to tp_size, giving a log-spaced distribution with bounded relative padding. "linear" uses
     varying linear strides across the range."""
 
-    inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "torch"
-    """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
-    "flashinfer" is requested but the package is not installed."""
+    inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "flashinfer"
+    """Which sampling kernels to use during inference. Defaults to "flashinfer" and falls back to
+    "torch" with a warning if the flashinfer package is not installed."""
 
-    inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial"] = "legacy"
+    offset_sampling_seed_by_dp_rank: bool = True
+    """Offset the inference sampling seed by the data-parallel rank so each DP rank gets a unique
+    generation seed. Disable with --use-same-sampling-seed-across-dp-ranks. Also forced off when
+    --deterministic-mode is enabled."""
+
+    inference_dynamic_batching_async_sched_mode: Literal["legacy", "async"] = "legacy"
     """Async scheduling mode for dynamic batching. "legacy" (default) preserves the
-    existing resolve-before-prepare path. "serial" speculatively prepares and forwards decode-only
-    steps before resolving finished requests."""
+    existing resolve-before-prepare path. "async" overlaps asynchronous scheduling phases by
+    reordering them to prepare-before-resolve."""
 
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"
@@ -372,6 +378,7 @@ class InferenceSetupConfig:
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
+            offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(
                 self.inference_dynamic_batching_async_sched_mode
             ),

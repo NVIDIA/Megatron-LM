@@ -12,6 +12,9 @@ from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
+from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
+from ..openai_streaming import openai_stream
+
 logger = logging.getLogger(__name__)
 
 # pylint: disable=line-too-long
@@ -581,6 +584,17 @@ try:
             max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
             ignore_eos = bool(req.get("ignore_eos", False))
 
+            # Does the client want the prompt tokens echoed back? Only then does the
+            # engine need to keep the prompt_tokens tensor on the response payload.
+            # return_tokenized_data (implied by prevent_retokenization) needs the ids;
+            # return_raw_text needs the ids to detokenize the prompt into raw_text.
+            prevent_retokenization = req.get("prevent_retokenization", True)
+            return_tokenized_data = (
+                req.get("return_tokenized_data", False) or prevent_retokenization
+            )
+            return_raw_text = req.get("return_raw_text", False)
+            return_prompt_tokens = return_tokenized_data or return_raw_text
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
@@ -591,11 +605,42 @@ try:
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
                 termination_id=-1 if ignore_eos else None,
+                return_prompt_tokens=return_prompt_tokens,
+                streaming_interval=int(_get_non_none(req, "streaming_interval", 1)),
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
+        stream_requested = bool(req.get("stream", False))
+        if stream_requested:
+            # Streaming currently supports only Hugging Face fast tokenizers.
+            try:
+                incremental_detokenizers = [
+                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    for _ in range(n)
+                ]
+            except ValueError as error:
+                return Response(str(error), status=400)
+
+            streams = [
+                client.add_request_streaming(prompt_tokens, sampling_params) for _ in range(n)
+            ]
+            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
+            response = Response(
+                openai_stream(
+                    streams,
+                    tokenizer,
+                    incremental_detokenizers,
+                    chat=True,
+                    return_log_probs=return_log_probs,
+                    include_usage=include_usage,
+                ),
+                content_type="text/event-stream",
+            )
+            response.timeout = None
+            return response
+
         tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
 
         if current_app.config['verbose']:
@@ -653,21 +698,20 @@ try:
         prompt_tokens_counts = []
         cached_tokens_counts = []
 
-        prevent_retokenization = req.get("prevent_retokenization", True)
-        # return_tokenized_data controls whether prompt/generation token ids are
-        # included in the response. It is independent of prevent_retokenization
-        # (a client may want token ids without prevent_retokenization, or vice versa),
-        # but prevent_retokenization implicitly requires token ids so the client
-        # can echo them back next turn.
-        return_tokenized_data = req.get("return_tokenized_data", False) or prevent_retokenization
-        return_raw_text = req.get("return_raw_text", False)
+        # return_tokenized_data / return_raw_text / return_prompt_tokens were computed
+        # at submit time (above) and drive both the response shape here and whether the
+        # engine kept the prompt_tokens tensor on the payload.
         request_idx = 0
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
 
-            prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
             text_output = result["generated_text"]
-            prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
+            # The engine always reports prompt_length (for usage), but drops the
+            # prompt_tokens tensor unless return_prompt_tokens was set.
+            prompt_tokens_count = result.get("prompt_length")
+            if prompt_tokens_count is None:
+                prompt_tokens_out = result["prompt_tokens"]
+                prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
             prompt_tokens_counts.append(prompt_tokens_count)
             cached_tokens_counts.append(result.get("num_cached_tokens", 0))
 
