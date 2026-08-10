@@ -572,6 +572,30 @@ def local_to_global_flat(
     return global_idxs.int()
 
 
+def _compact_flat_topk_idxs(global_idxs: Tensor) -> Tuple[Tensor, Tensor]:
+    """Pack valid global indices into a per-row prefix.
+
+    The returned ``topk_length`` selects that prefix in FlashMLA forward and
+    cuDNN DSA backward. Invalid suffix entries remain ``-1`` until forward has
+    consumed them; callers may then replace the ignored suffix with a safe
+    non-negative placeholder before backward.
+    """
+    if global_idxs.ndim != 2:
+        raise ValueError(f"global_idxs must be 2-D (rows, topk), got {tuple(global_idxs.shape)}")
+
+    if global_idxs.is_cuda:
+        _ensure_dsa_namespace()
+        res = _DSA.compactify_wrapper(global_idxs)
+        compact_idxs, topk_length = res["indices"], res["topk_length"]
+    else:
+        valid_mask = global_idxs >= 0
+        sorted_indices = valid_mask.int().argsort(dim=-1, descending=True, stable=True)
+        compact_idxs = global_idxs.gather(-1, sorted_indices)
+        topk_length = valid_mask.sum(dim=-1).int()
+
+    return compact_idxs.int().contiguous(), topk_length.int().contiguous()
+
+
 def build_flat_topk_idxs(
     *idx_groups: Tensor,
     batch_size: int,
@@ -620,21 +644,9 @@ def build_flat_topk_idxs(
 
     topk_length_flat = None
     if compact:
-        if global_idxs.is_cuda:
-            # Fast path: single warp-per-row CuTe DSL kernel from cuDNN's DSA
-            # namespace. Replaces a stable argsort + gather + sum + permute
-            # chain with one global-load + global-store per element.
-            _ensure_dsa_namespace()
-            res = _DSA.compactify_wrapper(global_idxs)
-            global_idxs, topk_length_flat = res["indices"], res["topk_length"]
-        else:
-            # CPU fallback so the unit tests that exercise this helper without
-            # CUDA still work. Production callers always go through the CUDA
-            # path above.
-            valid_mask = global_idxs >= 0
-            sorted_indices = valid_mask.int().argsort(dim=-1, descending=True, stable=True)
-            global_idxs = global_idxs.gather(-1, sorted_indices)
-            topk_length_flat = valid_mask.sum(dim=-1).int()
+        # The CUDA path is a single warp-per-row CuTe DSL kernel; the helper
+        # retains a stable PyTorch fallback for CPU-only unit tests.
+        global_idxs, topk_length_flat = _compact_flat_topk_idxs(global_idxs)
 
     return global_idxs, topk_length_flat
 
@@ -1447,6 +1459,13 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             combined_local = torch.cat([compress_topk_idxs, window_idxs], dim=-1)
             global_idxs = local_to_global_flat(combined_local, b)
 
+        # The dense teacher still needs the fixed window suffix. Attention no
+        # longer needs that segment boundary because FlashMLA's partial
+        # ``lse_indexer`` is not used, so compact the full attention set once
+        # and share the resulting prefix length with forward and backward.
+        window_global_idxs = global_idxs[:, indexer_topk:]
+        global_idxs, topk_length = _compact_flat_topk_idxs(global_idxs)
+
         # ---- 4. FlashMLA forward (flat layout for both SBHD and THD). --------
         if is_thd:
             q_flat = query
@@ -1464,9 +1483,14 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             global_idxs,
             softmax_scale,
             attn_sink=attn_sink,
-            topk_length=None,
+            topk_length=topk_length,
             indexer_topk=0,
         )
+        # cuDNN DSA backward assumes every slot is a non-negative address when
+        # ``topk_length`` is supplied, including ignored suffix slots. Forward
+        # has already consumed the ``-1`` sentinels, so sanitize in-place and
+        # avoid keeping a second TopK-sized tensor for backward.
+        global_idxs.clamp_min_(0)
 
         # ---- 4b. Derive padding-row mask for loss exclusion. -----------------
         # When CUDA-graph padding makes cu_seqlens_q cover all total_q rows
@@ -1487,6 +1511,12 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             # whose real length is 0).
             real_len_per_row = real_seg_lens[row_batch_ids].to(torch.int32)
             padding_row_mask = pos_in_seg >= real_len_per_row
+
+            # FlashMLA correctly treats a zero-length row as sink-only, but
+            # cuDNN DSA backward requires at least one tile. The indices were
+            # sanitized above, so make padding rows consume one harmless
+            # placeholder during backward; dO and LSE are masked below.
+            topk_length.masked_fill_(padding_row_mask, 1)
 
         # ---- 5. Derive predict from indexer_scores, compute target. ----------
         # Layout-specific attn tensors (detached — loss is not differentiable
@@ -1574,7 +1604,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                 kv_flat,
                 k_attn_compressed_det,
                 attn_sink,
-                global_idxs[:, indexer_topk:],
+                window_global_idxs,
                 softmax_scale,
                 ratio,
                 **dense_attn_kwargs,
@@ -1721,6 +1751,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             kv_flat,
             attn_sink,
             global_idxs,
+            topk_length,
             out_flat,
             lse,
             precomputed_grad_q_indexer,
@@ -1729,6 +1760,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         )
         ctx.softmax_scale = softmax_scale
         ctx.is_thd = is_thd
+        ctx.padding_row_mask = padding_row_mask
         ctx.np_ = np_
         ctx.d = d
         if is_thd:
@@ -1754,6 +1786,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             kv_flat,
             attn_sink,
             global_idxs,
+            topk_length,
             out_flat,
             lse,
             precomputed_grad_q_indexer,
@@ -1772,6 +1805,10 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             sq, b, skv = ctx.sq, ctx.b, ctx.skv
             dO_flat = grad_output.reshape(sq * b, np_, d_v)
 
+        if ctx.padding_row_mask is not None:
+            dO_flat = dO_flat.masked_fill(ctx.padding_row_mask[:, None, None], 0)
+            lse = lse.masked_fill(ctx.padding_row_mask[:, None], 0)
+
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             q_flat,
             kv_flat,
@@ -1781,7 +1818,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             attn_sink,
             global_idxs,
             softmax_scale=ctx.softmax_scale,
-            topk_length=None,
+            topk_length=topk_length,
         )
         if is_thd:
             grad_query = attn_bwd["dq"]
@@ -1867,6 +1904,11 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         total_comp = k_indexer.shape[0]
         indexer_topk = indexer_topk_idxs.shape[-1]
 
+        # Preserve the fixed window suffix for the dense teacher before
+        # compacting the complete attention index set.
+        window_topk_idxs = topk_idxs[:, indexer_topk:]
+        topk_idxs, topk_length = _compact_flat_topk_idxs(topk_idxs)
+
         # Do not request FlashMLA's partial indexer LSE: it omits both the
         # window and sink masses required by the CSA teacher.
         out_flat, lse, _ = _csa_fwd_flash_mla(
@@ -1875,9 +1917,14 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             topk_idxs,
             softmax_scale,
             attn_sink=attn_sink,
-            topk_length=None,
+            topk_length=topk_length,
             indexer_topk=0,
         )
+        topk_idxs.clamp_min_(0)
+        if q_padding_mask is not None:
+            # Keep padded sink-only rows out of cuDNN DSA's zero-tile path.
+            # Backward masks their dO and LSE before using this placeholder.
+            topk_length.masked_fill_(q_padding_mask, 1)
 
         bwd_loss_coeff = loss_coeff * total_q / loss_divisor
         unit_grad_loss = torch.ones((), device=query.device, dtype=torch.float32)
@@ -1952,7 +1999,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 kv_full,
                 compressed_kv.detach(),
                 attn_sink,
-                topk_idxs[:, indexer_topk:],
+                window_topk_idxs,
                 softmax_scale,
                 ratio,
                 cu_seqlens_q=cu_seqlens_q,
@@ -2029,6 +2076,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             kv_full,
             attn_sink,
             topk_idxs,
+            topk_length,
             out_flat,
             lse,
             saved_grad_q_indexer,
@@ -2036,6 +2084,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             saved_grad_weights,
         )
         ctx.softmax_scale = softmax_scale
+        ctx.q_padding_mask = q_padding_mask
 
         return out_flat.reshape(total_q, np_ * out_flat.shape[-1]), indexer_loss
 
@@ -2048,6 +2097,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             kv_full,
             attn_sink,
             topk_idxs,
+            topk_length,
             out_flat,
             lse,
             saved_grad_q_indexer,
@@ -2056,6 +2106,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         ) = ctx.saved_tensors
 
         dO_flat = grad_output.reshape(query.shape[0], query.shape[1], out_flat.shape[-1])
+        if ctx.q_padding_mask is not None:
+            dO_flat = dO_flat.masked_fill(ctx.q_padding_mask[:, None, None], 0)
+            lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             query,
             kv_full,
@@ -2065,7 +2118,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             attn_sink,
             topk_idxs,
             softmax_scale=ctx.softmax_scale,
-            topk_length=None,
+            topk_length=topk_length,
         )
         return (
             attn_bwd["dq"],

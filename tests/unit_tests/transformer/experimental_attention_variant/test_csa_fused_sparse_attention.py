@@ -95,6 +95,13 @@ def _make_local_idxs(b: int, sq: int, topk: int, *, with_invalid: bool = False) 
     return base
 
 
+def _mock_compactify(global_idxs: torch.Tensor):
+    """Stable PyTorch reference for the mocked cuDNN compactify wrapper."""
+    valid = global_idxs >= 0
+    order = valid.int().argsort(dim=-1, descending=True, stable=True)
+    return {'indices': global_idxs.gather(-1, order), 'topk_length': valid.sum(dim=-1).int()}
+
+
 def _uniform_dist(B, S, K, dev):
     """Uniform ``1/K`` distribution of shape ``(B, S, K)``."""
     return torch.full((B, S, K), 1.0 / max(K, 1), dtype=torch.float32, device=dev)
@@ -1165,6 +1172,7 @@ def _install_full_dsa_mock(
         target_fn = predict_fn
 
     fake_dsa = MagicMock(name='_DSA_full_stub')
+    fake_dsa.compactify_wrapper.side_effect = _mock_compactify
 
     def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio):
         return {'scores': torch.zeros(b, sq, n_comp, dtype=torch.float32, device=q_bshd.device)}
@@ -1282,6 +1290,7 @@ def _install_full_dsa_mock_dense(
         )
 
     fake_dsa = MagicMock(name='_DSA_full_dense_stub')
+    fake_dsa.compactify_wrapper.side_effect = _mock_compactify
 
     def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio):
         return {'scores': torch.zeros(b, sq, n_comp, dtype=torch.float32, device=q_bshd.device)}
@@ -1469,6 +1478,7 @@ class TestFusedIndexerSparseAttn:
 
         # ---- (a) forward pass-through (no grads needed) ------------------
         inputs = self._make_inputs()
+        inputs['window_idxs'][..., ::2] = -1
         fake_dsa_a, flash_stub_a = _install_full_dsa_mock(
             b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
         )
@@ -1498,12 +1508,22 @@ class TestFusedIndexerSparseAttn:
         assert (
             flash_stub_a.call_args.kwargs['indexer_topk'] == 0
         ), "(a) partial indexer LSE should not be requested"
+        expected_topk_length = torch.full(
+            (s['sq'] * s['b'],),
+            2 + inputs['window_idxs'].shape[-1] // 2,
+            dtype=torch.int32,
+            device='cuda',
+        )
+        torch.testing.assert_close(
+            flash_stub_a.call_args.kwargs['topk_length'], expected_topk_length
+        )
 
         # ---- (b) backward grad propagation -------------------------------
         dk._DSA = None  # fresh mocks
         dk._flash_mla_sparse_fwd = None
         inputs_b = self._make_inputs(requires_grad=True)
-        _install_full_dsa_mock(
+        inputs_b['window_idxs'][..., ::2] = -1
+        fake_dsa_b, _ = _install_full_dsa_mock(
             b=s['b'],
             sq=s['sq'],
             np_=s['np_'],
@@ -1542,6 +1562,11 @@ class TestFusedIndexerSparseAttn:
                 f"(b) {name}: grad does not equal full({value}); "
                 f"got first elem = {grad.float().flatten()[0].item()}"
             )
+        attn_bwd_call = fake_dsa_b.sparse_attention_backward_wrapper.call_args
+        torch.testing.assert_close(attn_bwd_call.kwargs['topk_length'], expected_topk_length)
+        assert torch.all(
+            attn_bwd_call.args[6] >= 0
+        ), "(b) ignored backward slots were not sanitized"
 
         # ---- (c) indexer_topk > n_comp clamp -----------------------------
         dk._DSA = None
@@ -1707,8 +1732,10 @@ class TestDenseFusedIndexerSparseAttn:
         expected_teacher_lse = torch.full(
             (s['b'], s['sq'], s['np_']), 37.0, dtype=torch.float32, device='cuda'
         )
+        teacher_window_indices = []
 
         def fake_dense_teacher_lse(*args, **kwargs):
+            teacher_window_indices.append(args[5].detach().clone())
             del args, kwargs
             return expected_teacher_lse
 
@@ -1716,6 +1743,7 @@ class TestDenseFusedIndexerSparseAttn:
 
         # ---- (a) forward kernel selection + arg shapes -------------------
         inputs_a = self._make_inputs()
+        inputs_a['window_idxs'][..., ::2] = -1
         fake_dsa_a, _ = _install_full_dsa_mock_dense(
             b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
         )
@@ -1752,6 +1780,9 @@ class TestDenseFusedIndexerSparseAttn:
         assert sm_arg == softmax_scale, "(a) dense attn score: positional softmax_scale"
         assert attn_call.kwargs['qhead_per_kv_head'] == s['np_']
         assert attn_call.kwargs['ratio'] == ratio
+        torch.testing.assert_close(
+            teacher_window_indices[0], local_to_global_flat(inputs_a['window_idxs'], s['b'])
+        )
 
         # ---- (b) forward-eager indexer backward + grad propagation --------
         dk._DSA = None
@@ -1827,6 +1858,7 @@ class TestFusedIndexerSparseAttnFromTopk:
 
     def test_sparse_loss_uses_full_flash_lse_plus_sink(self, monkeypatch):
         inputs = self._inputs()
+        inputs['topk_idxs'][1, 0] = -1
         total_q, num_heads, _ = inputs['query'].shape
         full_lse = torch.arange(total_q * num_heads, dtype=torch.float32).reshape(
             total_q, num_heads
@@ -1844,8 +1876,10 @@ class TestFusedIndexerSparseAttnFromTopk:
             topk_length=None,
             indexer_topk=0,
         ):
-            del kv_full, topk_idxs, softmax_scale, d_v, attn_sink, topk_length
+            del kv_full, softmax_scale, d_v, attn_sink
             seen['indexer_topk'] = indexer_topk
+            seen['attention_topk'] = topk_idxs.detach().clone()
+            seen['topk_length'] = topk_length.detach().clone()
             return torch.zeros_like(query), full_lse, partial_lse
 
         class FakeDSA:
@@ -1893,6 +1927,11 @@ class TestFusedIndexerSparseAttnFromTopk:
         expected = torch.logaddexp(full_lse, inputs['attn_sink'].view(1, num_heads)).unsqueeze(0)
         torch.testing.assert_close(seen['teacher_lse'], expected)
         assert seen['indexer_topk'] == 0
+        expected_attention_topk = torch.tensor([[4, 0], [1, -1], [5, 2], [5, 3]], dtype=torch.int32)
+        torch.testing.assert_close(seen['attention_topk'], expected_attention_topk)
+        torch.testing.assert_close(
+            seen['topk_length'], torch.tensor([2, 1, 2, 2], dtype=torch.int32)
+        )
 
     def test_dense_loss_passes_recomputed_full_teacher_lse(self, monkeypatch):
         inputs = self._inputs()
@@ -1968,6 +2007,77 @@ class TestFusedIndexerSparseAttnFromTopk:
 
         assert seen['dense_teacher_called']
         torch.testing.assert_close(seen['teacher_lse'], sentinel_lse)
+
+    def test_backward_reuses_compact_indices_and_length(self, monkeypatch):
+        inputs = self._inputs()
+        inputs['topk_idxs'][1] = -1
+        for name in ('query', 'kv_full', 'attn_sink', 'q_indexer', 'k_indexer', 'weights'):
+            inputs[name].requires_grad_(True)
+
+        total_q, num_heads, _ = inputs['query'].shape
+        q_padding_mask = torch.tensor([False, True, False, False])
+        seen = {}
+
+        def fake_flash(query, *args, **kwargs):
+            del args, kwargs
+            return torch.zeros_like(query), torch.full((total_q, num_heads), 3.0), None
+
+        class FakeDSA:
+            @staticmethod
+            def sparse_indexer_score_recompute_wrapper(q, k, w, topk, **kwargs):
+                del q, k, w, kwargs
+                return {'predict': torch.ones_like(topk, dtype=torch.float32)}
+
+            @staticmethod
+            def sparse_attn_score_recompute_wrapper(q, k, lse, topk, scale, **kwargs):
+                del q, k, lse, scale, kwargs
+                return {'target': torch.ones_like(topk, dtype=torch.float32)}
+
+            @staticmethod
+            def sparse_attention_backward_wrapper(
+                q, kv, out, dO, lse, sink, topk, *, softmax_scale, topk_length
+            ):
+                del out, softmax_scale
+                seen['topk'] = topk.detach().clone()
+                seen['topk_length'] = topk_length.detach().clone()
+                seen['dO'] = dO.detach().clone()
+                seen['lse'] = lse.detach().clone()
+                return {
+                    'dq': torch.zeros_like(q),
+                    'dkv': torch.zeros_like(kv),
+                    'd_sink': torch.zeros_like(sink),
+                }
+
+        monkeypatch.setattr(dk, '_ensure_dsa_namespace', lambda: None)
+        monkeypatch.setattr(dk, '_csa_fwd_flash_mla', fake_flash)
+        monkeypatch.setattr(dk, '_DSA', FakeDSA)
+
+        output, loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
+            *inputs.values(),
+            1.0,
+            1.0,
+            0.0,
+            float(total_q),
+            True,
+            2,
+            total_q,
+            (
+                torch.tensor([0, total_q], dtype=torch.int32),
+                torch.tensor([0, inputs['k_indexer'].shape[0]], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+            ),
+            q_padding_mask,
+        )
+        (output.sum() + loss).backward()
+
+        torch.testing.assert_close(
+            seen['topk'], torch.tensor([[4, 0], [0, 0], [5, 2], [5, 3]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            seen['topk_length'], torch.tensor([2, 1, 2, 2], dtype=torch.int32)
+        )
+        assert torch.count_nonzero(seen['dO'][1]) == 0
+        assert torch.count_nonzero(seen['lse'][1]) == 0
 
 
 # ---------------------------------------------------------------------------
