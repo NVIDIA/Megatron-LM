@@ -96,3 +96,48 @@ def test_parser_mapping_registers_nemotron_v3_reasoning():
     """Super and Ultra share identical reasoning-extraction logic upstream, so
     both models are served by a single consolidated parser and registry key."""
     assert PARSER_MAPPING["nemotron-v3-reasoning"] is NemotronV3ReasoningParser
+
+
+def test_tool_call_marker_implicitly_ends_reasoning_for_downstream_parser():
+    tool_text = (
+        "<tool_call><function=bash><parameter=command>echo hi</parameter>"
+        "</function></tool_call>"
+    )
+    model_output = f"I should inspect this first.\n{tool_text}"
+    tool_parser = PARSER_MAPPING["qwen3-coder-tool"]
+
+    content, reasoning_info = DeepSeekR1ReasoningParser.parse(
+        model_output,
+        implicit_reasoning_end_markers=tool_parser.implicit_reasoning_end_markers,
+    )
+    parsed_content, tool_info = tool_parser.parse(
+        content,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    )
+
+    assert reasoning_info == {"reasoning": "I should inspect this first.\n"}
+    assert parsed_content is None
+    assert tool_info["tool_calls"][0]["function"] == {
+        "name": "bash",
+        "arguments": '{"command": "echo hi"}',
+    }
+
+
+def test_tool_call_marker_does_not_end_reasoning_unless_configured():
+    model_output = "reasoning<tool_call>not enabled</tool_call>"
+
+    assert DeepSeekR1ReasoningParser.parse(model_output) == (
+        "",
+        {"reasoning": model_output},
+    )
