@@ -1717,6 +1717,16 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
+        if getattr(args, 'use_layer_sharding_muon', False):
+            assert args.use_layer_wise_distributed_optimizer, (
+                "--use-layer-sharding-muon requires the layer-wise distributed "
+                "optimizer path (--optimizer muon with --use-distributed-optimizer)."
+            )
+            assert not args.muon_split_qkv, (
+                "--use-layer-sharding-muon does not implement split-QKV Newton-Schulz "
+                "yet; pass --muon-no-split-qkv."
+            )
+
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -2626,13 +2636,32 @@ def _add_regularization_args(parser):
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-tp-mode', type=str, default='duplicated',
                        choices=['blockwise', 'duplicated', 'distributed'],
+<<<<<<< HEAD
                        help='How to perform NS calculation for tensor model parallel weights. '
                        'blockwise orthogonalizes each shard on its own, so the update rule '
                        'depends on the parallelism config; duplicated and distributed both '
                        'orthogonalize the whole matrix and give TP-invariant results.')
+=======
+                       help='How to perform NS calculation for tensor model parallel weights')
+    group.add_argument('--use-layer-sharding-muon', action='store_true',
+                       help='Use LayerShardedMuon: each 2D weight is assigned one NS home '
+                       'rank in the (gtp_remat x tp) domain; all_to_all exchanges assemble '
+                       'the full matrix there, Newton-Schulz runs locally with zero '
+                       'communication and zero redundancy, and the result is scattered '
+                       'back. Mathematically identical to duplicated-mode NS. Requires '
+                       'the layer-wise distributed optimizer path (emerging optimizer + '
+                       '--use-distributed-optimizer).')
+    group.add_argument('--muon-ns-batch-size', type=int, default=32,
+                       help='Max number of same-shape matrices fused into one batched '
+                       'Newton-Schulz on an NS home under --use-layer-sharding-muon. '
+                       'Set to 1 to disable batching (bit-exact per-matrix path).')
+>>>>>>> 31d6e4180 (Wire LayerShardedMuon into the layer-wise distributed optimizer path)
     group.add_argument('--muon-use-syrk', action='store_true',
-                       help='Use the Triton SYRK kernel for the Gram matrix '
-                       'in Newton-Schulz iteration.')
+                       help='Use the Triton SYRK kernel for the symmetric-output '
+                       'Newton-Schulz GEMMs under --use-layer-sharding-muon (~1/3 off '
+                       'NS FLOPs for near-square matrices). Requires '
+                       '--muon-fp32-matmul-prec medium; auto-disabled when Triton/SM '
+                       'requirements are unmet.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
