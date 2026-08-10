@@ -185,7 +185,7 @@ class _FusedMLAQUpProjFunction(torch.autograd.Function):
         dq2d = dq3.reshape(tokens, nh * q_head_dim).contiguous()
 
         # Delegate the projection backward to TE's _linear_backward (via backward_linear)
-        grad_x, ret_grad_w = FusedMLAQUpProjRopeQuant.backward_linear(
+        grad_x, ret_grad_w, _ = FusedMLAQUpProjRopeQuant.backward_linear(
             grad_output=dq2d,
             x_saved=x_saved,
             w_q=w_q,
