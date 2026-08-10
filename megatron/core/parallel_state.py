@@ -30,6 +30,9 @@ _TENSOR_MODEL_PARALLEL_GROUP = None
 # Generalized tensor parallelism group that the current rank belongs to.
 _GTP_WEIGHT_REMAT_GROUP = None
 _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+# Fused (tp x gtp_remat) group for layer-sharded Muon (single all_to_all over the
+# whole weight-shard domain). Group rank = g * tp_size + t (tp innermost).
+_TP_GTP_WEIGHT_REMAT_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -56,6 +59,8 @@ _TENSOR_AND_DATA_PARALLEL_GROUP = None
 # Expert generalized tensor parallelism group that current rank belongs to.
 _EXPERT_GTP_WEIGHT_REMAT_GROUP = None
 _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+# Fused (expt_tp x egtp_remat) group for layer-sharded Muon over expert weights.
+_EXPERT_TP_GTP_WEIGHT_REMAT_GROUP = None
 # Expert model parallel group that current rank belongs to.
 _EXPERT_MODEL_PARALLEL_GROUP = None
 # Expert tensor parallel group that current rank belongs to.
@@ -947,6 +952,28 @@ def initialize_model_parallel(
             _GTP_WEIGHT_REMAT_GROUP = group
             _GTP_WEIGHT_REMAT_GLOBAL_RANKS = gtp_ranks
 
+    # Fused (tp x gtp_remat) group for layer-sharded Muon: one all_to_all over the
+    # whole weight-shard domain replaces the two-stage GTP-then-TP exchange. The
+    # 'tp-gtp_remat-...' order string puts tp innermost, so within each group the
+    # ascending global ranks enumerate (g, t) with t fastest — group rank
+    # g * tp_size + t, exactly LayerShardedMuon's fused-rank convention. Only built
+    # when both axes are non-trivial; otherwise the wiring falls back to the single
+    # non-trivial axis group (identical semantics).
+    global _TP_GTP_WEIGHT_REMAT_GROUP
+    assert (
+        _TP_GTP_WEIGHT_REMAT_GROUP is None
+    ), "tp x gtp_remat group is already initialized"
+    if gtp_remat_size > 1 and tensor_model_parallel_size > 1:
+        for tg_ranks in decoder_rank_generator.get_ranks('tp-gtp_remat'):
+            group = create_group(
+                tg_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("tp_gtp_remat", nccl_comm_cfgs),
+                group_desc="TP_GTP_WEIGHT_REMAT_GROUP",
+            )
+            if rank in tg_ranks:
+                _TP_GTP_WEIGHT_REMAT_GROUP = group
+
     # Disable Gloo under GTP_remat (out of scope; the GTP_remat optimizer uses DCP).
     if gtp_remat_size > 1:
         create_gloo_process_groups = False
@@ -1351,6 +1378,24 @@ def initialize_model_parallel(
             _EXPERT_GTP_WEIGHT_REMAT_GROUP = group
             _EXPERT_GTP_WEIGHT_REMAT_GLOBAL_RANKS = egtp_ranks
 
+    # Fused (expt_tp x egtp_remat) group for layer-sharded Muon over expert weights.
+    # Mirrors the dense tp x gtp_remat group above; 'tp' is innermost in the expert
+    # order string too, so group rank = g * etp_size + t.
+    global _EXPERT_TP_GTP_WEIGHT_REMAT_GROUP
+    assert (
+        _EXPERT_TP_GTP_WEIGHT_REMAT_GROUP is None
+    ), "expert tp x gtp_remat group is already initialized"
+    if expert_gtp_remat_size > 1 and expert_tensor_parallel_size > 1:
+        for etg_ranks in expert_decoder_rank_generator.get_ranks('tp-gtp_remat'):
+            group = create_group(
+                etg_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("expt_tp_gtp_remat", nccl_comm_cfgs),
+                group_desc="EXPERT_TP_GTP_WEIGHT_REMAT_GROUP",
+            )
+            if rank in etg_ranks:
+                _EXPERT_TP_GTP_WEIGHT_REMAT_GROUP = group
+
     # Build the expert model parallel group
     global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
     assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
@@ -1717,6 +1762,28 @@ def get_gtp_weight_remat_group(check_initialized=True):
             _GTP_WEIGHT_REMAT_GROUP is not None
         ), "generalized tensor parallel group is not initialized"
     return _GTP_WEIGHT_REMAT_GROUP
+
+
+def get_tp_gtp_weight_remat_group(check_initialized=True):
+    """Get the fused (tp x gtp_remat) group for layer-sharded Muon.
+
+    None when either axis is trivial — callers fall back to the single
+    non-trivial axis group (same semantics) or the two-stage exchange.
+    """
+    if check_initialized:
+        assert (
+            _TP_GTP_WEIGHT_REMAT_GROUP is not None
+        ), "tp x gtp_remat group is not initialized"
+    return _TP_GTP_WEIGHT_REMAT_GROUP
+
+
+def get_expert_tp_gtp_weight_remat_group(check_initialized=True):
+    """Get the fused (expt_tp x egtp_remat) group for layer-sharded Muon."""
+    if check_initialized:
+        assert (
+            _EXPERT_TP_GTP_WEIGHT_REMAT_GROUP is not None
+        ), "expert tp x gtp_remat group is not initialized"
+    return _EXPERT_TP_GTP_WEIGHT_REMAT_GROUP
 
 
 def get_gtp_weight_remat_world_size():
@@ -2527,6 +2594,12 @@ def destroy_model_parallel():
 
     global _GTP_WEIGHT_REMAT_GLOBAL_RANKS
     _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
+
+    global _TP_GTP_WEIGHT_REMAT_GROUP
+    _TP_GTP_WEIGHT_REMAT_GROUP = None
+
+    global _EXPERT_TP_GTP_WEIGHT_REMAT_GROUP
+    _EXPERT_TP_GTP_WEIGHT_REMAT_GROUP = None
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None

@@ -288,6 +288,38 @@ class OptimizerConfig:
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
+    muon_use_syrk: bool = False
+    """Use the Triton SYRK (symmetric rank-k) kernel for the two symmetric-output
+    Newton-Schulz GEMMs under layer-sharded muon, computing one triangle only —
+    roughly a third off total NS FLOPs for near-square matrices. Only takes effect
+    with muon_fp32_matmul_prec='medium', 8-aligned dims, Triton >= 3.4 and a
+    validated SM arch; applies to unbatched (2-D) NS chunks only. Same math,
+    different kernel: results differ from the GEMM path by kernel-level rounding.
+
+    MEASURED: on GB300 (SM 10.3, Triton 3.4) this is a NET LOSS — NS on a
+    (12288, 10240) matrix takes 30.8 ms with SYRK vs 26.0 ms without, i.e. ~19%
+    slower despite ~32% fewer FLOPs, because cuBLAS's bf16 kernels run far enough
+    ahead of the Triton kernel to erase the saving. Re-measure per architecture
+    before enabling; the trade-off may flip on SM 9.0 where the kernel was tuned.
+    Defaults to False."""
+
+    muon_ns_batch_size: int = 32
+    """Max number of same-shape matrices fused into one batched Newton-Schulz under
+    layer-sharded muon. MoE assigns hundreds of identically shaped expert weights to a
+    single NS home, where the per-matrix loop is kernel-launch bound; batching trades a
+    transient stack of this many matrices for far fewer launches. Set to 1 to disable
+    (batches of more than one use baddbmm instead of addmm, so results differ by
+    kernel-level floating point rounding). Only used when use_layer_sharding_muon is
+    set. Defaults to 32."""
+
+    use_layer_sharding_muon: bool = False
+    """If true, use LayerShardedMuon instead of TensorParallelMuon when optimizer is 'muon'.
+    Each 2D weight is assigned one NS home rank in the (GTP x TP) domain; all_to_all stages
+    over the gtp and tp groups assemble the complete (P, Q) momentum on the home, the exact
+    same full-matrix Newton-Schulz as duplicated mode runs there with zero communication and
+    zero redundancy, and reverse all_to_all stages scatter the result back to the original
+    shards. Equivalent to setting muon_tp_mode="layer_sharded". Defaults to False."""
+
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
