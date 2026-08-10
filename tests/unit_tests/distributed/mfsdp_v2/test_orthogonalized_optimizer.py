@@ -1,0 +1,854 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Unit tests for the M-FSDPv2 owner-compute orthogonalized (Muon) optimizer.
+
+The pure-function tests (shard-plan math, owner assignment, pack/unpack) run on
+CPU without a process group. The optimizer-step numerics tests run under
+`torchrun` and compare the sharded FSDP optimizer against a single-rank
+reference using the same Newton-Schulz kernel (bitwise) and against
+`torch.optim.Muon` (tolerance, since the kernels normalize differently).
+"""
+
+import contextlib
+import types
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from torch.distributed.device_mesh import init_device_mesh
+
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Flat,
+    Placements,
+    fully_shard,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.orthogonalized_optimizer import (
+    FsdpMuon,
+    OwnerGatherPlan,
+    OwnerScatterPlan,
+    ShardPlan,
+    assign_owner_work,
+    compute_shard_plan,
+    pack_owner_work,
+    pack_update_shards,
+    reconstruct_orthogonalization_input,
+    unpack_update_shards,
+)
+
+try:
+    from tests.unit_tests.distributed.mfsdp_v2.conftest import DistributedSetup
+except Exception:  # pragma: no cover
+    import dataclasses
+
+    @dataclasses.dataclass(frozen=True)
+    class DistributedSetup:
+        rank: int
+        world_size: int
+        device: torch.device
+
+
+@pytest.fixture(scope="function")
+def distributed_setup():
+    """Same as the bucket conftest fixture but pins to `local_rank % device_count`.
+
+    The shared `distributed_setup` does `set_device(local_rank)`, which is
+    correct when every rank has its own GPU (the CI configuration). On a
+    single-GPU dev box running multiple ranks, `local_rank` exceeds the
+    device count and `set_device` raises. Pinning modulo the device count is
+    identical to the suite fixture when `nproc <= device_count` (the CI case)
+    and lets these tests run on one GPU with `NCCL_MULTI_RANK_GPU_ENABLE=1`.
+    """
+    import os
+    from collections.abc import Iterator
+
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        pytest.skip("Not running under torchrun. Use torchrun to run this test file.")
+    # Clear the suite-wide NCCL defaults (set in the top-level conftest.py) before
+    # init_device_mesh initializes NCCL communicators, matching the bucket
+    # conftest fixture. With NCCL_MAX_NCHANNELS=1, multiple concurrent
+    # collectives (FSDP reduce-scatter + the owner all-to-all) on several ranks
+    # sharing one GPU exhaust the single NCCL channel.
+    os.environ.pop("NCCL_MAX_NCHANNELS", None)
+    os.environ.pop("NCCL_NVLS_ENABLE", None)
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank % torch.cuda.device_count())
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    else:
+        device = torch.device("cpu")
+    yield DistributedSetup(rank=rank, world_size=world_size, device=device)
+    if dist.is_initialized():
+        if device.type == "cuda":
+            dist.barrier(device_ids=[device.index])
+        else:
+            dist.barrier()
+
+
+# ---------------------------------------------------------------------------
+# Pure CPU tests: shard-plan math
+# ---------------------------------------------------------------------------
+
+
+def test_compute_shard_plan_even_split():
+    """A matrix exactly divisible by world_size splits evenly across ranks."""
+    plan = compute_shard_plan(
+        torch.Size((8, 4)), tensor_flat_offset=0, rank_flat_shard_size=16, world_size=2
+    )
+    assert plan.full_shape == torch.Size((8, 4))
+    assert plan.row_size == 4
+    assert plan.rank_rows == ((0, 4), (4, 4))
+    assert plan.shard_numel(0) == 16
+    assert plan.shard_numel(1) == 16
+
+
+def test_compute_shard_plan_boundary_param_split_across_ranks():
+    """A small matrix landing across a rank boundary is split unevenly."""
+    # 6 rows, 3 cols; each rank's flat shard is 9 elements (= 3 rows). rank0
+    # owns flat [0,9), rank1 owns [9,18). Tensor occupies [0,18) fully.
+    plan = compute_shard_plan(
+        torch.Size((6, 3)), tensor_flat_offset=0, rank_flat_shard_size=9, world_size=2
+    )
+    assert plan.rank_rows == ((0, 3), (3, 3))
+    assert plan.is_boundary()
+
+
+def test_compute_shard_plan_fully_local_param_on_one_rank():
+    """A matrix fully contained in one rank's flat shard is fully local."""
+    # 4 rows, 2 cols = 8 elements. rank0 shard = [0,12), rank1 = [12,24). Tensor
+    # at offset 0 with 8 elements fits entirely in rank0.
+    plan = compute_shard_plan(
+        torch.Size((4, 2)), tensor_flat_offset=0, rank_flat_shard_size=12, world_size=2
+    )
+    assert plan.rank_rows == ((0, 4), (0, 0))
+    assert not plan.is_boundary()
+    assert plan.owner_candidates() == (0,)
+
+
+def test_compute_shard_plan_empty_rank_has_zero_rows():
+    """A rank whose flat shard does not overlap the tensor owns zero rows."""
+    # Tensor offset 12 (entirely in rank1). rank0 gets (0,0).
+    plan = compute_shard_plan(
+        torch.Size((4, 3)), tensor_flat_offset=12, rank_flat_shard_size=12, world_size=2
+    )
+    assert plan.rank_rows == ((0, 0), (0, 4))
+    assert plan.is_boundary() is False
+    assert plan.owner_candidates() == (1,)
+
+
+# ---------------------------------------------------------------------------
+# Pure CPU tests: owner assignment balancing
+# ---------------------------------------------------------------------------
+
+
+def test_assign_owner_work_balances_by_cost():
+    """Owners are balanced so the cheapest eligible rank takes each parameter."""
+    # Two boundary params, all four ranks eligible for each.
+    plan0 = ShardPlan(torch.Size((8, 8)), ((0, 4), (0, 4), (0, 4), (0, 4)), 8)  # cost 64*41
+    plan1 = ShardPlan(torch.Size((4, 4)), ((0, 2), (0, 2), (0, 2), (0, 2)), 4)  # cost 16*21
+    owners = assign_owner_work([plan0, plan1], num_ns_steps=5)
+    # Greedy min running cost: first param -> rank0 (cost 2624), second -> rank1 (cost 336).
+    assert owners == {0: 0, 1: 1}
+
+
+def test_assign_owner_work_only_eligible_ranks_can_own():
+    """A rank with an empty shard can never be the owner."""
+    # Only ranks 0 and 2 have shards for both params.
+    plan0 = ShardPlan(torch.Size((8, 8)), ((0, 4), (0, 0), (0, 4), (0, 0)), 8)
+    plan1 = ShardPlan(torch.Size((8, 8)), ((0, 4), (0, 0), (0, 4), (0, 0)), 8)
+    owners = assign_owner_work([plan0, plan1], num_ns_steps=5)
+    assert all(owners[i] in (0, 2) for i in owners)
+    # Two equal-cost params split across the two eligible ranks.
+    assert owners[0] != owners[1]
+
+
+def test_assign_owner_work_fully_local_owner_is_single_candidate():
+    """A fully local parameter is assigned to its single owning rank."""
+    plan = ShardPlan(torch.Size((4, 2)), ((0, 4), (0, 0)), 2)
+    owners = assign_owner_work([plan], num_ns_steps=3)
+    assert owners == {0: 0}
+
+
+# ---------------------------------------------------------------------------
+# Pure CPU tests: pack / reconstruct round trip (simulated P2P)
+# ---------------------------------------------------------------------------
+
+
+def _simulate_p2p(
+    per_rank_send_buffers: list[dict[int, torch.Tensor]], world_size: int
+) -> list[dict[int, torch.Tensor]]:
+    """Deliver per-owner send buffers to their owners (CPU sim of batch_isend_irecv).
+
+    Returns, per rank, the dict of `{src_rank: received_buffer}` it receives.
+    """
+    per_rank_recv: list[dict[int, torch.Tensor]] = [dict() for _ in range(world_size)]
+    for src in range(world_size):
+        for dst, buf in per_rank_send_buffers[src].items():
+            if buf.numel() == 0:
+                continue
+            per_rank_recv[dst][src] = buf.clone()
+    return per_rank_recv
+
+
+def test_pack_and_reconstruct_round_trip():
+    """Gathered + reconstructed pre-NS matches the concatenation of local shards."""
+    torch.manual_seed(0)
+    world_size = 2
+    # Two params, both boundary, shapes (6,3) and (4,2). Owners: param0->rank0, param1->rank1.
+    plan0 = compute_shard_plan(torch.Size((6, 3)), 0, 9, world_size)  # rank0: 3 rows, rank1: 3 rows
+    plan1 = compute_shard_plan(torch.Size((4, 2)), 0, 4, world_size)  # rank0: 2 rows, rank1: 2 rows
+    plans = [plan0, plan1]
+    owners = {0: 0, 1: 1}
+
+    # Build per-rank local shards as distinct values so reconstruction is checkable.
+    full_p0 = torch.arange(18, dtype=torch.float32).reshape(6, 3)
+    full_p1 = torch.arange(8, dtype=torch.float32).reshape(4, 2) + 100
+    per_rank_local = []
+    for r in range(world_size):
+        rs0, rc0 = plan0.rank_rows[r]
+        rs1, rc1 = plan1.rank_rows[r]
+        per_rank_local.append([full_p0[rs0 : rs0 + rc0].clone(), full_p1[rs1 : rs1 + rc1].clone()])
+
+    per_rank_send = []
+    per_rank_gather = []
+    for r in range(world_size):
+        gather = pack_owner_work(
+            plans,
+            owners,
+            per_rank_local[r],
+            world_size,
+            r,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        per_rank_send.append(gather.send_buffers)
+        per_rank_gather.append(gather)
+
+    recv = _simulate_p2p(per_rank_send, world_size)
+
+    # Rank0 owns param0; reconstruct and compare to full_p0.
+    full0 = reconstruct_orthogonalization_input(0, plan0, per_rank_gather[0], recv[0], owner_rank=0)
+    torch.testing.assert_close(full0, full_p0, atol=0, rtol=0)
+    # Rank1 owns param1; reconstruct and compare to full_p1.
+    full1 = reconstruct_orthogonalization_input(1, plan1, per_rank_gather[1], recv[1], owner_rank=1)
+    torch.testing.assert_close(full1, full_p1, atol=0, rtol=0)
+
+
+def test_pack_and_unpack_update_round_trip():
+    """Scattered update shards match the owner's full update sliced per rank."""
+    torch.manual_seed(1)
+    world_size = 2
+    plan0 = compute_shard_plan(torch.Size((6, 3)), 0, 9, world_size)
+    plan1 = compute_shard_plan(torch.Size((4, 2)), 0, 4, world_size)
+    plans = [plan0, plan1]
+    owners = {0: 0, 1: 1}
+
+    full_update0 = torch.arange(18, dtype=torch.float32).reshape(6, 3) + 1.0
+    full_update1 = torch.arange(8, dtype=torch.float32).reshape(4, 2) + 2.0
+    full_updates_by_rank = {0: {0: full_update0}, 1: {1: full_update1}}
+
+    per_rank_send = []
+    per_rank_scatter = []
+    for r in range(world_size):
+        scatter = pack_update_shards(
+            full_updates_by_rank[r],
+            plans,
+            owners,
+            world_size,
+            r,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        per_rank_send.append(scatter.send_buffers)
+        per_rank_scatter.append(scatter)
+
+    recv = _simulate_p2p(per_rank_send, world_size)
+
+    for r in range(world_size):
+        received = unpack_update_shards(per_rank_scatter[r], recv[r])
+        # Rank r receives the update shard for the param it does NOT own.
+        other = 1 - r
+        plan = plans[other]
+        rs, rc = plan.rank_rows[r]
+        expected = full_updates_by_rank[owners[other]][other][rs : rs + rc]
+        torch.testing.assert_close(received[other], expected, atol=0, rtol=0)
+
+
+def test_group_updates_separates_mixed_dtypes():
+    """`_group_updates` groups shards by (device, dtype), separating mixed dtypes."""
+    optimizer = object.__new__(FsdpMuon)
+    cpu = torch.device("cpu")
+    params = [
+        nn.Parameter(torch.zeros(2, 2, dtype=torch.float32, device=cpu)),  # 0: fp32
+        nn.Parameter(torch.zeros(2, 2, dtype=torch.bfloat16, device=cpu)),  # 1: bf16
+        nn.Parameter(torch.zeros(2, 2, dtype=torch.float32, device=cpu)),  # 2: fp32
+        nn.Parameter(torch.zeros(2, 2, dtype=torch.bfloat16, device=cpu)),  # 3: bf16
+    ]
+    shards = [p.detach() for p in params]
+    chunks = optimizer._group_updates(params, shards)
+
+    # Two chunks: one for fp32, one for bf16.
+    assert len(chunks) == 2
+    # Every chunk is homogeneous in dtype.
+    for chunk in chunks:
+        assert len({shards[i].dtype for i in chunk}) == 1
+    # All indices are covered exactly once.
+    assert sorted(i for chunk in chunks for i in chunk) == [0, 1, 2, 3]
+    # fp32 shards (0, 2) are in a different chunk than bf16 shards (1, 3).
+    chunk_of_0 = next(c for c in chunks if 0 in c)
+    chunk_of_1 = next(c for c in chunks if 1 in c)
+    assert chunk_of_0 is not chunk_of_1
+    assert 2 in chunk_of_0
+    assert 3 in chunk_of_1
+
+
+def test_group_updates_separates_collective_groups():
+    """`_group_updates` separates params from different collective groups.
+
+    Even when all params share the same dtype and device, params whose
+    `FsdpParameterGroup` resolves to a different `ProcessGroup` (via
+    `group.mesh.get_group()`) must land in separate chunks so that each
+    chunk's P2P communication uses a single collective group.
+    """
+    optimizer = object.__new__(FsdpMuon)
+    cpu = torch.device("cpu")
+    # Mock ProcessGroups (the actual collective groups) and FsdpParameterGroups
+    # whose `mesh.get_group()` returns them.
+    pg_a = object()  # mock ProcessGroup A
+    pg_b = object()  # mock ProcessGroup B
+    group_a = types.SimpleNamespace(mesh=types.SimpleNamespace(get_group=lambda: pg_a))
+    group_b = types.SimpleNamespace(mesh=types.SimpleNamespace(get_group=lambda: pg_b))
+    params = [
+        nn.Parameter(torch.zeros(2, 2, dtype=torch.float32, device=cpu)),
+        nn.Parameter(torch.zeros(2, 2, dtype=torch.float32, device=cpu)),
+        nn.Parameter(torch.zeros(2, 2, dtype=torch.float32, device=cpu)),
+        nn.Parameter(torch.zeros(2, 2, dtype=torch.float32, device=cpu)),
+    ]
+    # 0, 1 -> group_a;  2, 3 -> group_b  (all fp32, same device)
+    for p, g in zip(params, [group_a, group_a, group_b, group_b]):
+        p._mfsdp_parameter_group = g
+    shards = [p.detach() for p in params]
+    chunks = optimizer._group_updates(params, shards)
+
+    # Two chunks: one per collective group.
+    assert len(chunks) == 2
+    chunk_of_0 = next(c for c in chunks if 0 in c)
+    chunk_of_2 = next(c for c in chunks if 2 in c)
+    assert chunk_of_0 is not chunk_of_2
+    assert 1 in chunk_of_0
+    assert 3 in chunk_of_2
+
+
+# ---------------------------------------------------------------------------
+# Distributed tests: full optimizer step numerics
+# ---------------------------------------------------------------------------
+
+
+def _flat_placements() -> Placements:
+    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+
+
+class TinyModel(nn.Module):
+    """Two separately shardable 2D linears (no bias, so all params are matrix params)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(8, 16, bias=False)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(16, 4, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.relu(self.fc1(x)))
+
+
+class MixedDtypeModel(nn.Module):
+    """Two 2D linears with different dtypes (fp32 + bf16) to exercise mixed-dtype grouping."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(8, 16, bias=False)  # fp32
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(16, 4, bias=False).to(torch.bfloat16)  # bf16
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.relu(self.fc1(x))
+        return self.fc2(x.to(self.fc2.weight.dtype))
+
+
+def _make_fsdp_model(device: torch.device, mesh, seed: int = 1234) -> TinyModel:
+    torch.manual_seed(seed)
+    model = TinyModel().to(device)
+    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    return model
+
+
+def test_compute_orthogonalization_inputs_matches_reference(distributed_setup):
+    """Local pre-NS (weight decay + momentum + Nesterov) matches a plain reference."""
+    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
+
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("Needs >=2 ranks.")
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = _make_fsdp_model(device, mesh)
+    x = torch.randn(4, 8, device=device)
+
+    inner_optimizer = Muon(
+        model.parameters(),
+        lr=0.05,
+        momentum=0.9,
+        weight_decay=0.0,
+        nesterov=True,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+        use_syrk=False,
+    )
+    optimizer = FsdpMuon(
+        model.parameters(),
+        inner_optimizer=inner_optimizer,
+        dp_mesh=mesh,
+        use_owner_comm_stream=False,
+    )
+    optimizer.zero_grad(set_to_none=True)
+    model(x).sum().backward()
+
+    param = model.fc1.weight
+    optimizer._init_group(optimizer.param_groups[0], skip_non_grad_params=False)
+    pre_ns = optimizer._compute_orthogonalization_inputs(
+        param, param.grad, optimizer.param_groups[0], optimizer.param_groups[0]["lr"]
+    )
+
+    # Reference: same math on the local shard with a plain Muon optimizer state.
+    ref_param = nn.Parameter(param.to_local().clone())
+    ref_opt = Muon(
+        [ref_param],
+        lr=0.05,
+        momentum=0.9,
+        weight_decay=0.0,
+        nesterov=True,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+    )
+    ref_param.grad = param.grad.to_local().clone()
+    with torch.no_grad():
+        ref_opt._init_group(ref_opt.param_groups[0])
+        ref_mom = ref_opt.state[ref_param]["momentum_buffer"]
+        ref_grad = ref_param.grad.to(ref_mom.dtype)
+        ref_opt._apply_weight_decay_inplace(ref_param, ref_grad, 0.05, 0.0)
+        ref_mom.lerp_(ref_grad, 1 - 0.9)
+        ref_pre = ref_grad.lerp(ref_mom, 0.9)
+    torch.testing.assert_close(pre_ns, ref_pre, atol=0, rtol=0)
+
+
+def test_step_bitwise_matches_single_rank_reference(distributed_setup):
+    """The sharded FSDP Muon step must match a single-rank Muon with the same kernel."""
+    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
+
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2 or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            "Needs >=2 ranks and >=1 GPU per rank; "
+            "a 1-GPU-multi-rank config cannot run the owner-compute P2P step."
+        )
+    mesh = init_device_mesh(device.type, (world_size,))
+
+    sharded = _make_fsdp_model(device, mesh)
+    torch.manual_seed(1234)
+    baseline = TinyModel().to(device)
+    # Copy full weights from the sharded model's gathered (pre-shard) initial state.
+    for name, shard_param in (
+        ("fc1.weight", sharded.fc1.weight),
+        ("fc2.weight", sharded.fc2.weight),
+    ):
+        full = _gather_full_param(shard_param, mesh, world_size)
+        with torch.no_grad():
+            getattr(baseline, name.split(".")[0]).weight.copy_(full)
+
+    lr = 0.05
+    momentum = 0.9
+    nesterov = True
+    weight_decay = 0.0
+    inner_optimizer = Muon(
+        sharded.parameters(),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=nesterov,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+        use_syrk=False,
+    )
+    sharded_opt = FsdpMuon(
+        sharded.parameters(),
+        inner_optimizer=inner_optimizer,
+        dp_mesh=mesh,
+        use_owner_comm_stream=False,
+    )
+    base_opt = Muon(
+        baseline.parameters(),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=nesterov,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+    )
+
+    x = torch.randn(4, 8, device=device)
+    for step in range(3):
+        sharded_opt.zero_grad(set_to_none=True)
+        base_opt.zero_grad(set_to_none=True)
+        sharded(x).sum().backward()
+        baseline(x).sum().backward()
+        sharded_opt.step()
+        base_opt.step()
+
+    for name, shard_param in (
+        ("fc1.weight", sharded.fc1.weight),
+        ("fc2.weight", sharded.fc2.weight),
+    ):
+        full = _gather_full_param(shard_param, mesh, world_size)
+        expected = getattr(baseline, name.split(".")[0]).weight
+        torch.testing.assert_close(full, expected, atol=0, rtol=0)
+
+
+def test_step_losses_track_torch_muon(distributed_setup):
+    """The FSDP Muon step should track torch.optim.Muon over several steps.
+
+    The FSDP wrapper reuses the `emerging_optimizers` Newton-Schulz kernel,
+    which normalizes the orthogonalization input in FP32 and then drops to BF16,
+    whereas `torch.optim.Muon` casts to BF16 before normalizing. The two
+    kernels therefore produce slightly different updates, so losses track
+    within a tolerance that admits that kernel difference (empirically
+    `max|Δloss|` ~3e-2 / `max rel` ~1e-1 over many seeds). Bitwise numerics
+    against the same kernel are covered by `test_step_bitwise_matches_single_rank_reference`.
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2 or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            "Needs >=2 ranks and >=1 GPU per rank; "
+            "a 1-GPU-multi-rank config cannot run the owner-compute P2P step."
+        )
+    mesh = init_device_mesh(device.type, (world_size,))
+
+    sharded = _make_fsdp_model(device, mesh)
+    torch.manual_seed(1234)
+    baseline = TinyModel().to(device)
+    for name, shard_param in (
+        ("fc1.weight", sharded.fc1.weight),
+        ("fc2.weight", sharded.fc2.weight),
+    ):
+        full = _gather_full_param(shard_param, mesh, world_size)
+        with torch.no_grad():
+            getattr(baseline, name.split(".")[0]).weight.copy_(full)
+
+    inner_optimizer = Muon(
+        sharded.parameters(),
+        lr=0.05,
+        momentum=0.9,
+        weight_decay=0.0,
+        nesterov=True,
+        coefficient_type="simple",
+        num_ns_steps=5,
+        scale_mode="shape_scaling",
+        fp32_matmul_prec="medium",
+        use_syrk=False,
+    )
+    sharded_opt = FsdpMuon(
+        sharded.parameters(),
+        inner_optimizer=inner_optimizer,
+        dp_mesh=mesh,
+        use_owner_comm_stream=False,
+    )
+    base_opt = torch.optim.Muon(
+        baseline.parameters(), lr=0.05, momentum=0.9, weight_decay=0.0, nesterov=True, ns_steps=5
+    )
+
+    x = torch.randn(4, 8, device=device)
+    sharded_losses, base_losses = [], []
+    for _ in range(5):
+        sharded_opt.zero_grad(set_to_none=True)
+        base_opt.zero_grad(set_to_none=True)
+        sharded_loss = sharded(x).sum()
+        base_loss = baseline(x).sum()
+        sharded_losses.append(sharded_loss.detach())
+        base_losses.append(base_loss.detach())
+        sharded_loss.backward()
+        base_loss.backward()
+        sharded_opt.step()
+        base_opt.step()
+
+    torch.testing.assert_close(
+        torch.stack(sharded_losses),
+        torch.stack(base_losses),
+        atol=5e-2,
+        rtol=2e-1,
+        msg="FSDP Muon losses did not track torch.optim.Muon within the kernel-difference tolerance.",
+    )
+
+
+def _make_mixed_dtype_fsdp_model(device: torch.device, mesh, seed: int = 1234):
+    """Sharded `MixedDtypeModel`: `fc1` in fp32, `fc2` in bf16, both Flat-sharded."""
+    torch.manual_seed(seed)
+    model = MixedDtypeModel().to(device)
+    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    return model
+
+
+def test_step_mixed_dtypes_bitwise_matches_reference(distributed_setup):
+    """The FSDP Muon step must handle a param group with mixed dtypes (fp32 + bf16).
+
+    Exercises the `_group_updates` chunking: boundary params of different dtypes
+    must be processed in separate `_step_boundary` calls with matching P2P
+    buffer metadata, and the result must match a single-rank Muon reference.
+    """
+    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
+
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2 or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            "Needs >=2 ranks and >=1 GPU per rank; "
+            "a 1-GPU-multi-rank config cannot run the owner-compute P2P step."
+        )
+    mesh = init_device_mesh(device.type, (world_size,))
+
+    sharded = _make_mixed_dtype_fsdp_model(device, mesh)
+    torch.manual_seed(1234)
+    baseline = MixedDtypeModel().to(device)
+    # Copy full weights from the sharded model's gathered (pre-shard) initial state.
+    for name, shard_param in (
+        ("fc1.weight", sharded.fc1.weight),
+        ("fc2.weight", sharded.fc2.weight),
+    ):
+        full = _gather_full_param(shard_param, mesh, world_size)
+        with torch.no_grad():
+            getattr(baseline, name.split(".")[0]).weight.copy_(full)
+
+    lr = 0.05
+    momentum = 0.9
+    nesterov = True
+    weight_decay = 0.0
+    inner_optimizer = Muon(
+        sharded.parameters(),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=nesterov,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+        use_syrk=False,
+    )
+    sharded_opt = FsdpMuon(
+        sharded.parameters(),
+        inner_optimizer=inner_optimizer,
+        dp_mesh=mesh,
+        use_owner_comm_stream=False,
+    )
+    base_opt = Muon(
+        baseline.parameters(),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=nesterov,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+    )
+
+    x = torch.randn(4, 8, device=device)
+    for step in range(3):
+        sharded_opt.zero_grad(set_to_none=True)
+        base_opt.zero_grad(set_to_none=True)
+        sharded(x).sum().backward()
+        baseline(x).sum().backward()
+        sharded_opt.step()
+        base_opt.step()
+
+    for name, shard_param in (
+        ("fc1.weight", sharded.fc1.weight),
+        ("fc2.weight", sharded.fc2.weight),
+    ):
+        full = _gather_full_param(shard_param, mesh, world_size)
+        expected = getattr(baseline, name.split(".")[0]).weight
+        torch.testing.assert_close(full, expected, atol=0, rtol=0)
+
+
+def _gather_full_param(param, mesh, world_size):
+    """All-gather a Flat-sharded 2D DTensor parameter into its full matrix."""
+    local = param.to_local().contiguous()
+    full_shape = tuple(param.shape)
+    row_size = full_shape[1]
+    parts = [torch.empty_like(local) for _ in range(world_size)]
+    dist.all_gather(parts, local, group=mesh.get_group())
+    # Flat shards are contiguous rows in rank order; concatenate along dim 0.
+    return torch.cat([p.view(-1, row_size) if p.numel() else p for p in parts], dim=0)[
+        : full_shape[0]
+    ]
+
+
+def test_owner_p2p_round_trip_multi_owner(distributed_setup):
+    """The owner gather + scatter P2P round-trips with multiple owners.
+
+    Exercises the multi-owner path that a 2-rank FSDP run cannot (owners on
+    different ranks, updates scattered to ranks that own neither parameter).
+    Uses synthetic shards and an identity "orthogonalization" so the test
+    isolates the communication (pack/send/reconstruct/pack/scatter/unpack) from
+    the Newton-Schulz kernel and from FSDP's forward/backward collectives.
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 4:
+        pytest.skip("Needs >=4 ranks for a multi-owner P2P.")
+    mesh = init_device_mesh(device.type, (world_size,))
+
+    # Two boundary params, every rank owns a shard of each. Owners are balanced
+    # to ranks 0 and 1 by assign_owner_work.
+    plan0 = compute_shard_plan(torch.Size((8, 8)), 0, 16, world_size)  # 2 rows/rank
+    plan1 = compute_shard_plan(torch.Size((4, 16)), 0, 16, world_size)  # 1 row/rank
+    plans = [plan0, plan1]
+    owners = assign_owner_work(plans, num_ns_steps=5)
+    this_rank = mesh.get_local_rank()
+
+    full_pre0 = torch.arange(64, dtype=torch.float32, device=device).view(8, 8)
+    full_pre1 = torch.arange(64, dtype=torch.float32, device=device).view(4, 16) + 100.0
+    full_pres = [full_pre0, full_pre1]
+
+    local_shards = []
+    for plan, full in zip(plans, full_pres):
+        rs, rc = plan.rank_rows[this_rank]
+        local_shards.append(full[rs : rs + rc].clone())
+
+    optimizer = object.__new__(FsdpMuon)
+    optimizer.dp_mesh = mesh
+    optimizer.use_owner_comm_stream = False
+    optimizer._owner_comm_stream_cache = {}
+
+    gather_plan = pack_owner_work(
+        plans, owners, local_shards, world_size, this_rank, device=device, dtype=torch.float32
+    )
+    recv_buffers, works = optimizer._send_to_owner(gather_plan, device)
+    optimizer._wait_for_dist_buffer(works)
+
+    # Identity orthogonalization: the full update equals the gathered input.
+    full_updates: dict[int, torch.Tensor] = {}
+    for local_index in range(len(plans)):
+        if owners[local_index] != this_rank:
+            continue
+        plan = plans[local_index]
+        if plan.rank_row_count(this_rank) == 0:
+            continue
+        full = reconstruct_orthogonalization_input(
+            local_index, plan, gather_plan, recv_buffers, owner_rank=this_rank
+        )
+        full_updates[local_index] = full
+
+    scatter_plan = pack_update_shards(
+        full_updates, plans, owners, world_size, this_rank, device=device, dtype=torch.float32
+    )
+    scatter_recv, scatter_works = optimizer._send_to_destination(scatter_plan, device)
+    optimizer._wait_for_dist_buffer(scatter_works)
+    received = unpack_update_shards(scatter_plan, scatter_recv)
+
+    for local_index, plan in enumerate(plans):
+        rs, rc = plan.rank_rows[this_rank]
+        expected = full_pres[local_index][rs : rs + rc]
+        if owners[local_index] == this_rank:
+            # Owner applies its own shard directly from the full update.
+            own = full_updates[local_index][rs : rs + rc]
+            torch.testing.assert_close(own, expected, atol=0, rtol=0)
+        else:
+            torch.testing.assert_close(received[local_index], expected, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# Import guard tests
+# ---------------------------------------------------------------------------
+
+_EO_MOD = "megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.orthogonalized_optimizer"
+
+
+def test_import_guard_emerging_optimizers_available():
+    """When emerging_optimizers is installed, HAVE_EMERGING_OPTIMIZERS is True and the real classes are bound."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+        orthogonalized_optimizer as mod,
+    )
+
+    assert mod.HAVE_EMERGING_OPTIMIZERS is True
+    from emerging_optimizers.orthogonalized_optimizers import OrthogonalizedOptimizer as RealEO
+
+    assert mod.OrthogonalizedOptimizer is RealEO
+    from emerging_optimizers.orthogonalized_optimizers.muon import Muon as RealMuon
+
+    assert mod.Muon is RealMuon
+
+
+@contextlib.contextmanager
+def _simulate_no_emerging_optimizers():
+    """Reload `orthogonalized_optimizer` with `emerging_optimizers` blocked.
+
+    Saves and restores `sys.modules` / `sys.meta_path` so the rest of the
+    test session sees the real (installed) module.
+    """
+    import importlib
+    import sys
+
+    class _BlockEO:
+        @staticmethod
+        def find_spec(name, _path, _target=None):
+            if name == "emerging_optimizers" or name.startswith("emerging_optimizers."):
+                raise ModuleNotFoundError(name)
+            return None
+
+    saved_eo = {
+        k: sys.modules.pop(k)
+        for k in list(sys.modules)
+        if k == "emerging_optimizers" or k.startswith("emerging_optimizers.")
+    }
+    saved_mod = sys.modules.pop(_EO_MOD, None)
+
+    sys.meta_path.insert(0, _BlockEO)
+    try:
+        yield importlib.import_module(_EO_MOD)
+    finally:
+        sys.meta_path.pop(0)
+        sys.modules.update(saved_eo)
+        if saved_mod is not None:
+            sys.modules[_EO_MOD] = saved_mod
+        else:
+            sys.modules.pop(_EO_MOD, None)
+
+
+def test_import_guard_without_emerging_optimizers():
+    """When emerging_optimizers is not installed, the module falls back gracefully."""
+    with _simulate_no_emerging_optimizers() as mod:
+        assert mod.HAVE_EMERGING_OPTIMIZERS is False
+        assert mod.OrthogonalizedOptimizer is object
+        assert mod.Muon is object
+
+
+def test_import_guard_construction_error_without_emerging_optimizers():
+    """Constructing the optimizers without emerging_optimizers raises a helpful ModuleNotFoundError."""
+    with _simulate_no_emerging_optimizers() as mod:
+        with pytest.raises(ModuleNotFoundError, match="emerging-optimizers"):
+            mod.FsdpOrthogonalizedOptimizer([], object(), dp_mesh=None)
+        with pytest.raises(ModuleNotFoundError, match="emerging-optimizers"):
+            mod.FsdpMuon([], object(), dp_mesh=None)

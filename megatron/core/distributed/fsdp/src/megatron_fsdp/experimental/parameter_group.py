@@ -32,7 +32,7 @@ from .placement import Partial, Placements, Replicate, changed_mesh_axis
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
 
-def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
+def get_containing_parameter_group(parameter: torch.Tensor) -> "FsdpParameterGroup | None":
     """Return the FSDP parameter group that owns ``parameter``, if any."""
     # This parameter-owned backedge must be weak; otherwise it forms a reference
     # cycle with the parameter group and delays releasing its CUDA storage.
