@@ -374,7 +374,25 @@ _otel_shutdown_done = False
 _otel_interval_span = None
 _otel_interval_ctx_token = None
 _otel_trace_interval_step = 0
+# Set once the atexit hook + SIGTERM handler have been installed, so a second
+# pretrain() call in the same process can't stack duplicate registrations.
+_otel_exit_hooks_installed = False
 
+
+def _otel_telemetry_active():
+    """True only when telemetry is initialized AND actually exporting.
+
+    Gates the process-global side effects (the atexit hook, the SIGTERM handler) that
+    exist purely to flush telemetry. With telemetry off there is nothing to flush, and
+    installing them anyway would change the process's signal semantics -- a Python-level
+    SIGTERM handler makes syscalls EINTR-restartable-through-Python and inserts us into
+    the torchelastic/ft_launcher handler chain -- for a run that asked for none of it.
+
+    Returns False both when nemo-lens is absent (get_telemetry() is None) and when it is
+    present but disabled (the handle exists but is not exporting).
+    """
+    handle = get_telemetry()
+    return handle is not None and bool(getattr(handle, 'is_exporting', False))
 
 
 def _start_otel_job_spans(model_type, program_start):
@@ -1553,64 +1571,75 @@ def pretrain(
         timestamp_after_set_jit_fusion_options,
     )
 
-    # An atexit fallback in case pretrain() exits via unhandled exception --
-    # ensures both spans still get ended and telemetry flushed. Idempotent, so
-    # this doesn't double-flush if _end_otel_job_spans() already ran normally.
-    import atexit
-    atexit.register(_end_otel_job_spans)
+    # Both hooks below exist ONLY to flush telemetry, and both are process-global side
+    # effects, so they are installed only when telemetry is actually active. With it off
+    # there is nothing to flush and Megatron must behave exactly as it does upstream --
+    # in particular it must NOT grow a Python-level SIGTERM handler it never had, which
+    # would change EINTR behaviour and splice us into the ft_launcher/torchelastic
+    # handler chain. _otel_exit_hooks_installed keeps the installation itself idempotent.
+    global _otel_exit_hooks_installed
+    if _otel_telemetry_active() and not _otel_exit_hooks_installed:
+        _otel_exit_hooks_installed = True
 
-    # atexit does NOT run on SIGTERM (CPython terminates without unwinding), and the
-    # ft_launcher tears down ranks with SIGTERM-then-SIGKILL on a fault/restart -- so
-    # without a SIGTERM handler, megatron.train (and the open span tree) leaks as a
-    # never-exported span in exactly the faulted runs we care about.
-    import signal as _signal
+        # An atexit fallback in case pretrain() exits via unhandled exception --
+        # ensures both spans still get ended and telemetry flushed. Idempotent, so
+        # this doesn't double-flush if _end_otel_job_spans() already ran normally.
+        import atexit
+        atexit.register(_end_otel_job_spans)
 
-    _otel_prev_sigterm = _signal.getsignal(_signal.SIGTERM)
-    # with --exit-signal-handler, SIGTERM means "finish the current iteration, save a final
-    # checkpoint, then exit" (DistributedSignalHandler drain -> should_exit). We must not end
-    # spans / shut down the provider in that case -- that truncates megatron.train and drops the
-    # final-iteration + final-checkpoint spans; the normal should_exit path runs _end_otel_job_spans.
-    # There we only bounded-flush so nothing already-ended is lost if SIGKILL beats the drain.
-    # For an immediate/hard terminate (SIG_DFL / ft hard kill) we end + export the tree now.
-    _otel_graceful_drain = False
-    try:
-        _otel_graceful_drain = bool(getattr(get_args(), 'exit_signal_handler', False))
-    except Exception:
-        pass
-    _otel_sigterm_fired = [False]  # re-entry guard so a 2nd SIGTERM can't re-enter shutdown()
+        # atexit does NOT run on SIGTERM (CPython terminates without unwinding), and the
+        # ft_launcher tears down ranks with SIGTERM-then-SIGKILL on a fault/restart -- so
+        # without a SIGTERM handler, megatron.train (and the open span tree) leaks as a
+        # never-exported span in exactly the faulted runs we care about.
+        import signal as _signal
 
-    def _otel_force_flush():
+        _otel_prev_sigterm = _signal.getsignal(_signal.SIGTERM)
+        # with --exit-signal-handler, SIGTERM means "finish the current iteration, save a final
+        # checkpoint, then exit" (DistributedSignalHandler drain -> should_exit). We must not end
+        # spans / shut down the provider in that case -- that truncates megatron.train and drops the
+        # final-iteration + final-checkpoint spans; the normal should_exit path runs
+        # _end_otel_job_spans. There we only bounded-flush so nothing already-ended is lost if
+        # SIGKILL beats the drain.
+        # For an immediate/hard terminate (SIG_DFL / ft hard kill) we end + export the tree now.
+        _otel_graceful_drain = False
         try:
-            from opentelemetry import trace as _ot
-            _prov = _ot.get_tracer_provider()
-            if hasattr(_prov, 'force_flush'):
-                _prov.force_flush()
+            _otel_graceful_drain = bool(getattr(get_args(), 'exit_signal_handler', False))
         except Exception:
             pass
+        _otel_sigterm_fired = [False]  # re-entry guard so a 2nd SIGTERM can't re-enter shutdown()
 
-    def _otel_sigterm_handler(signum, frame):
-        if not _otel_sigterm_fired[0]:
-            _otel_sigterm_fired[0] = True
+        def _otel_force_flush():
             try:
-                if _otel_graceful_drain:
-                    _otel_force_flush()      # graceful drain: flush only, keep provider alive
-                else:
-                    _end_otel_job_spans()    # hard terminate: end + export the tree now
+                from opentelemetry import trace as _ot
+                _prov = _ot.get_tracer_provider()
+                if hasattr(_prov, 'force_flush'):
+                    _prov.force_flush()
             except Exception:
                 pass
-        # chain to whatever handler was already installed (ft/torchelastic drain, or default)
-        if callable(_otel_prev_sigterm):
-            _otel_prev_sigterm(signum, frame)
-        elif _otel_prev_sigterm == _signal.SIG_DFL:
-            _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
-            os.kill(os.getpid(), signum)
-        # SIG_IGN: previous handler ignored SIGTERM -> nothing more to do.
 
-    try:
-        _signal.signal(_signal.SIGTERM, _otel_sigterm_handler)
-    except (ValueError, OSError):
-        # Not the main thread / platform unsupported -> atexit remains the fallback.
-        pass
+        def _otel_sigterm_handler(signum, frame):
+            if not _otel_sigterm_fired[0]:
+                _otel_sigterm_fired[0] = True
+                try:
+                    if _otel_graceful_drain:
+                        _otel_force_flush()      # graceful drain: flush only, keep provider alive
+                    else:
+                        _end_otel_job_spans()    # hard terminate: end + export the tree now
+                except Exception:
+                    pass
+            # chain to whatever handler was already installed (ft/torchelastic drain, or default)
+            if callable(_otel_prev_sigterm):
+                _otel_prev_sigterm(signum, frame)
+            elif _otel_prev_sigterm == _signal.SIG_DFL:
+                _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+            # SIG_IGN: previous handler ignored SIGTERM -> nothing more to do.
+
+        try:
+            _signal.signal(_signal.SIGTERM, _otel_sigterm_handler)
+        except (ValueError, OSError):
+            # Not the main thread / platform unsupported -> atexit remains the fallback.
+            pass
 
     # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
     program_start_global = _TRAIN_START_TIME
