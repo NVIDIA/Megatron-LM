@@ -9,7 +9,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 import torch
 
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_attr_wrapped_model, get_model_config
 
 try:
     FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
@@ -105,6 +105,28 @@ def get_attention_mask(seq_length: int) -> torch.Tensor:
     attention_mask = attention_mask < 0.5
 
     return attention_mask
+
+
+def get_logit_dtype(model) -> torch.dtype:
+    """Returns the dtype of the language-model output logits.
+
+    Models may expose a ``logit_dtype`` attribute (see ``--output-logit-dtype``) that overrides
+    the dtype of the output-layer GEMM result. When it is unset, the logits keep the
+    output-layer input dtype, i.e. ``params_dtype``.
+
+    Args:
+        model: The model, optionally wrapped (e.g. in ``Float16Module`` or DDP).
+
+    Returns:
+        The dtype that the model's logits are produced in.
+    """
+    try:
+        logit_dtype = get_attr_wrapped_model(model, "logit_dtype")
+    except RuntimeError:
+        # Model types that predate `logit_dtype` always emit logits in the input dtype.
+        logit_dtype = None
+
+    return logit_dtype if logit_dtype is not None else get_model_config(model).params_dtype
 
 
 # Initialize cache for sequence parallel modules
