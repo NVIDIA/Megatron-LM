@@ -34,14 +34,28 @@ To pull in the real implementations, install
 `megatron-core[otel]` extra that does this for you arrives with the
 call-site instrumentation.
 
+## Documentation
+
+`docs/user-guide/observability/` holds the full Observability guide:
+
+| Topic | Doc |
+|---|---|
+| Overview | [index.md](../../../docs/user-guide/observability/index.md) |
+| Configuration (env vars, CLI flags) | [configuration.md](../../../docs/user-guide/observability/configuration.md) |
+| Span groups and span hierarchy | [span-groups.md](../../../docs/user-guide/observability/span-groups.md) |
+| Training and inference metrics | [metrics.md](../../../docs/user-guide/observability/metrics.md) |
+| Pipeline-parallel trace correlation | [pipeline-parallel.md](../../../docs/user-guide/observability/pipeline-parallel.md) |
+| Local docker-compose stack | [observability-stack.md](../../../docs/user-guide/observability/observability-stack.md) |
+| Adding new instrumentation | [extending.md](../../../docs/user-guide/observability/extending.md) |
+
+For the generic `nemo-lens` documentation (configuration model, instrumentation
+primitives, custom exporters, design decisions), see the lens docs at
+<https://github.com/NVIDIA-NeMo/Lens/tree/main/docs>.
+
 ## Status
 
 This module is the base layer. The call-site instrumentation (training loop,
 checkpointing, pipeline schedules, inference server), the `otel` install extra,
 the `--otel-*` CLI flags, the `MEGATRON_OTEL_*` environment variables, and the
-full Observability user guide land separately; see
-<https://github.com/NVIDIA/Megatron-LM/pull/6385>.
-
-For the generic `nemo-lens` documentation (configuration model, instrumentation
-primitives, custom exporters, design decisions), see the lens docs at
-<https://github.com/NVIDIA-NeMo/Lens/tree/main/docs>.
+`docs/index.md` toctree entry that publishes the guide above land separately;
+see <https://github.com/NVIDIA/Megatron-LM/pull/6385>.
