@@ -11,7 +11,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     _compressed_thd_topk_to_local,
     _compute_unfused_csa_non_compressed_lse,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
     build_flat_topk_idxs,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (

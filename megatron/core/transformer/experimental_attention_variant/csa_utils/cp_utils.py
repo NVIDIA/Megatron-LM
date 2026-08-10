@@ -14,8 +14,9 @@ import torch.distributed as dist
 
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
-from megatron.core.transformer.experimental_attention_variant import csa_cp_layout_kernels
-from megatron.core.transformer.experimental_attention_variant.csa_kernels import indexer_topk
+
+from . import cp_layout_kernels
+from .fused_sparse_attention import indexer_topk
 
 # =============================================================================
 # RoPE Wrappers
@@ -237,7 +238,7 @@ def prepare_cp_compressor_input(
     group_alignment = 32 // math.gcd(32, ratio)
     c_cap = max(1, (l_local + d_comp) // ratio)
     c_cap = ((c_cap + group_alignment - 1) // group_alignment) * group_alignment
-    hidden_compact, compressed_group_ids = csa_cp_layout_kernels.CompressorInputCompact.apply(
+    hidden_compact, compressed_group_ids = cp_layout_kernels.CompressorInputCompact.apply(
         hidden_local, boundary_hidden, cu_seqlens, global_start, ratio, d_comp, c_cap
     )
 
