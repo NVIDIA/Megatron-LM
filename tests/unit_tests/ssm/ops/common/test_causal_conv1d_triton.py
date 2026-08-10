@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 
 
 def _requires_cuda():

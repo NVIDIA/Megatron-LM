@@ -5,11 +5,14 @@ import unittest
 import torch
 
 try:
-    from megatron.core.ssm.ops.intermediate_extraction import (
+    from megatron.core.ssm.ops.common.intermediate_extraction import (
         scatter_intermediate_conv,
         scatter_intermediate_ssm,
     )
-    from megatron.core.ssm.ops.ssd_combined import is_int_pow_2, mamba_chunk_scan_combined_varlen
+    from megatron.core.ssm.ops.mamba2.ssd_combined import (
+        is_int_pow_2,
+        mamba_chunk_scan_combined_varlen,
+    )
 
     HAVE_SSD_OPS = True
 except (ImportError, Exception):
