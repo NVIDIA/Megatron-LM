@@ -41,10 +41,10 @@ MODEL_ARGS:
   --max-position-embeddings: 1024
   --seq-length: 1024
   --temperature: 0.7
-  --top_k: 4
-  --top_p: 0.8
+  --top_k: 1
+  --top_p: 0.0
   --return-log-probs: true
-  --top-n-logprobs: 3
+  --top-n-logprobs: 1
   --num-tokens-to-generate: 30
   --cuda-graph-impl: local
   --inference-dynamic-batching-buffer-size-gb: 20
