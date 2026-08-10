@@ -150,19 +150,6 @@ def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
-def _strategy_placements(sharding_strategy: str) -> Placements:
-    placements = {
-        "no_shard": (Replicate(), Partial(dist.ReduceOp.AVG), Replicate()),
-        "optim": (Replicate(), Partial(dist.ReduceOp.AVG), Flat()),
-        "optim_grads": (Replicate(), Flat(), Flat()),
-        "optim_grads_params": (Flat(), Flat(), Flat()),
-    }
-    parameter, gradient, optimizer = placements[sharding_strategy]
-    return Placements(
-        dp_axes=[0], parameter=[parameter], gradient=[gradient], optimizer=[optimizer]
-    )
-
-
 def _hsdp_placements() -> Placements:
     """HSDP: params/optimizer replicated across DP-outer (axis 0), sharded within
     DP-inner (axis 1). main_grad rests [Partial, Flat] between microbatches and is
@@ -188,12 +175,27 @@ _GEMM_OP_NAME_SUBSTRING = "aten::mm"
 
 
 @pytest.mark.parametrize(
-    "sharding_strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"]
+    "placements",
+    [
+        Placements(
+            dp_axes=[0],
+            parameter=[Replicate()],
+            gradient=[Partial(dist.ReduceOp.AVG)],
+            optimizer=[Replicate()],
+        ),
+        Placements(
+            dp_axes=[0],
+            parameter=[Replicate()],
+            gradient=[Partial(dist.ReduceOp.AVG)],
+            optimizer=[Flat()],
+        ),
+        Placements(dp_axes=[0], parameter=[Replicate()], gradient=[Flat()], optimizer=[Flat()]),
+        Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]),
+    ],
+    ids=["no_shard", "optim", "optim_grads", "optim_grads_params"],
 )
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_fully_shard_sgd_losses_match_baseline(
-    distributed_setup, num_microbatches, sharding_strategy
-):
+def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatches, placements):
     """Every supported sharding strategy should match single-rank SGD."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
@@ -207,7 +209,6 @@ def test_fully_shard_sgd_losses_match_baseline(
     model = TinyModel().to(device)
     model.load_state_dict(baseline.state_dict())
 
-    placements = _strategy_placements(sharding_strategy)
     with fully_shard_context(device=device) as context:
         fully_shard(model.fc1, mesh=mesh, placements=placements)
         fully_shard(model.fc2, mesh=mesh, placements=placements)
