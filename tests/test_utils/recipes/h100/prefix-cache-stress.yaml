@@ -76,6 +76,13 @@ products:
         environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_prefix_caching]
+    products:
+      - model: [moe]
+        gpus: [8]
+        environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
   - test_case: [hybrid_dynamic_inference_tp1_pp1_583m_prefix_caching_refzero_no_mtp]
     products:
       - model: [hybrid]

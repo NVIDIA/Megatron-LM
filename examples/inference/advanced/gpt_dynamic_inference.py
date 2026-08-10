@@ -138,12 +138,18 @@ def _assert_logprob_parity(pairs):
 
 
 def assert_prefix_cache_parity(reference_requests, cached_requests):
-    """Assert cache-off/cache-on token, text, and log-probability parity."""
+    """Assert cache-off/cache-on token, text, routing, and log-probability parity."""
     assert len(reference_requests) == len(cached_requests)
     pairs = []
     for idx, (reference, cached) in enumerate(zip(reference_requests, cached_requests)):
         assert reference.output_tokens == cached.output_tokens, f"request {idx}: token mismatch"
         assert reference.output_text == cached.output_text, f"request {idx}: text mismatch"
+        assert (reference.routing_indices is None) == (cached.routing_indices is None)
+        assert not get_args().moe_enable_routing_replay or reference.routing_indices is not None
+        if reference.routing_indices is not None:
+            assert len(cached.routing_indices) == (
+                len(cached.prompt_tokens) + len(cached.output_tokens) - 1
+            )
         for field in (
             "prompt_log_probs",
             "generated_log_probs",
@@ -156,6 +162,17 @@ def assert_prefix_cache_parity(reference_requests, cached_requests):
                 f"request {idx}.{field}",
                 pairs,
             )
+    copies = get_args().prefix_cache_stress_copies
+    for start in range(0, len(cached_requests), copies):
+        donor, *followers = cached_requests[start : start + copies]
+        if donor.routing_indices is None:
+            continue
+        for follower in followers:
+            matched = follower.num_cached_tokens
+            assert matched > 0
+            donor_routing = torch.from_numpy(donor.routing_indices[:matched]).sort(dim=-1).values
+            routes = torch.from_numpy(follower.routing_indices[:matched]).sort(dim=-1).values
+            assert torch.equal(donor_routing, routes)
     if pairs:
         _assert_logprob_parity(pairs)
 
@@ -288,6 +305,7 @@ def run_inference(
                 request.output_tokens = finished_request.generated_tokens
                 request.output_text = finished_request.generated_text
                 request.num_cached_tokens = finished_request.num_cached_tokens
+                request.routing_indices = finished_request.routing_indices
                 total_output_tokens += len(request.output_tokens)
 
                 # Log probs.
