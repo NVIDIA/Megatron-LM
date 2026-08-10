@@ -543,58 +543,9 @@ def _set_telemetry(args):
     # setup_telemetry() ignores resource_attributes for a disabled config, so {} is equivalent.
     resource_attrs = build_telemetry_resource_attrs(args) if config.enabled else {}
 
-    # The "console" exporter defaults to stdout, which interleaves spans/metrics
-    # with regular training logs. If --otel-json-dir is set, redirect it to a
-    # dedicated per-rank file instead. gzip-compressed: the per-span resource
-    # block (~25 attributes) is identical on every span and compresses to almost
-    # nothing, so this shrinks the dominant redundancy for free, on the exporter's
-    # own daemon thread -- never the training thread.
-    span_exporter = None
-    metric_reader = None
-    json_dir = getattr(args, 'otel_json_dir', None)
-    if config.enabled and config.exporter == 'console' and json_dir:
-        os.makedirs(json_dir, exist_ok=True)
-        import gzip
-        json_file = gzip.open(  # noqa: SIM115 -- kept open for process lifetime.
-            os.path.join(json_dir, f'lens_rank{args.rank}.jsonl.gz'), 'at'
-        )
-        # gzip needs an explicit close() to write its trailer (CRC + length);
-        # ConsoleSpanExporter.shutdown() only flushes the out= we pass it, never
-        # closes it. Register the close via atexit -- atexit is LIFO and this
-        # runs before pretrain() registers _end_otel_job_spans (which flushes on
-        # shutdown), so flush-then-close ordering is correct on any clean exit.
-        # A hard SIGKILL runs neither: the file is then recoverable-with-warning
-        # (gunzip yields the flushed data but exits nonzero on the missing
-        # trailer), the same graceful-degradation category as a truncated plain
-        # text file, just noisier.
-        import atexit
-        atexit.register(json_file.close)
-        from opentelemetry.sdk.trace.export import ConsoleSpanExporter
-
-        if config.traces_enabled:
-            # Compact single-line JSON per span (indent=None) instead of the
-            # stock exporter's pretty-printed multi-line default: ~1 line/span
-            # vs ~25, so the gzip is far smaller AND a crash-truncated tail loses
-            # only the final partial line rather than risking a half-written
-            # multi-line object. json_to_perfetto parses either form.
-            span_exporter = ConsoleSpanExporter(
-                out=json_file, formatter=lambda span: span.to_json(indent=None) + "\n"
-            )
-        if config.metrics_enabled:
-            from opentelemetry.sdk.metrics.export import (
-                ConsoleMetricExporter,
-                PeriodicExportingMetricReader,
-            )
-
-            export_interval = int(os.environ.get('OTEL_METRIC_EXPORT_INTERVAL', '10000'))
-            metric_reader = PeriodicExportingMetricReader(
-                ConsoleMetricExporter(out=json_file), export_interval_millis=export_interval
-            )
-
     _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
         config, rank=args.rank, world_size=args.world_size,
         resource_attributes=resource_attrs,
-        span_exporter=span_exporter, metric_reader=metric_reader,
     )
 
     # Bridge Python logging to OTel so logs get exported with trace correlation.

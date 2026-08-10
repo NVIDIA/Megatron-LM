@@ -133,7 +133,6 @@ def build_otel_worker_bootstrap(args):
         'service_name': service_name,
         'span_groups': worker_span_groups,
         'resolved_span_groups': resolved_span_groups,
-        'json_dir': getattr(args, 'otel_json_dir', None),
         'rank': args.rank,
         'world_size': args.world_size,
         # Same reasoning as _set_telemetry(): building these calls NVML
