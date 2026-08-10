@@ -9,6 +9,13 @@ training/checkpoint/evaluation boundaries.
 
 import pytest
 
+pytest.importorskip(
+    "nemo.lens", reason="nemo-lens is an optional dependency (install megatron-core[otel])"
+)
+pytest.importorskip(
+    "opentelemetry.sdk", reason="opentelemetry-sdk is an optional dependency (install megatron-core[otel])"
+)
+
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor

@@ -6,6 +6,10 @@ import os
 
 import pytest
 
+pytest.importorskip(
+    "nemo.lens", reason="nemo-lens is an optional dependency (install megatron-core[otel])"
+)
+
 from nemo.lens.config import NemoLensConfig
 from nemo.lens.groups import SpanGroup
 from nemo.lens.groups_megatron import MegatronSpanGroup

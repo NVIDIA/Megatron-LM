@@ -4,6 +4,13 @@
 
 import pytest
 
+pytest.importorskip(
+    "nemo.lens", reason="nemo-lens is an optional dependency (install megatron-core[otel])"
+)
+pytest.importorskip(
+    "opentelemetry.sdk", reason="opentelemetry-sdk is an optional dependency (install megatron-core[otel])"
+)
+
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
