@@ -112,14 +112,14 @@ class TestMcoreAdapter:
         model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
             device="cuda", dtype=config.params_dtype
         )
-        fully_shard_calls = []
-        original_fully_shard = mcore_fsdp_adapter.fully_shard
+        fully_shard_context_calls = []
+        original_fully_shard_context = mcore_fsdp_adapter.fully_shard_context
 
-        def record_fully_shard(*args, **kwargs):
-            fully_shard_calls.append(kwargs["use_symm_mem"])
-            return original_fully_shard(*args, **kwargs)
+        def record_fully_shard_context(*args, **kwargs):
+            fully_shard_context_calls.append(kwargs["use_symmetric_memory"])
+            return original_fully_shard_context(*args, **kwargs)
 
-        monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard", record_fully_shard)
+        monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard_context", record_fully_shard_context)
         FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
@@ -132,7 +132,7 @@ class TestMcoreAdapter:
             pg_collection=self.pg_collection,
         )
 
-        assert fully_shard_calls == [True]
+        assert fully_shard_context_calls == [True]
 
     def test_build_train_and_step(self):
         config = TransformerConfig(

@@ -568,8 +568,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
-        use_symm_mem = ddp_config.nccl_ub
-        with fully_shard_context(device=device):
+        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
                     # The root is always sharded after selected child units so it is not
@@ -581,14 +580,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         mesh=mesh,
                         placements=placements,
                         mixed_precision_policy=self.mp_policy,
-                        use_symm_mem=use_symm_mem,
                     )
             fully_shard(
-                module,
-                mesh=mesh,
-                placements=placements,
-                mixed_precision_policy=self.mp_policy,
-                use_symm_mem=use_symm_mem,
+                module, mesh=mesh, placements=placements, mixed_precision_policy=self.mp_policy
             )
         super().__init__(config=config, module=module)
 
@@ -688,7 +682,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not support megatron_fsdp_max_pool_double_buffer.")
 
     def start_param_sync(self, *unused, **unused_kwargs) -> None:
-        """MFSDP v2 gathers parameters from its forward pre-hook."""
+        """No-op: MFSDP v2 gathers parameters from its forward pre-hooks."""
 
     def start_grad_sync(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 reduces gradients during backward."""
