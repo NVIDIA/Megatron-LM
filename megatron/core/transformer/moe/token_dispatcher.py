@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import socket
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -33,6 +34,17 @@ from megatron.core.transformer.moe.moe_utils import (
     permute,
     sort_chunks_by_idxs,
     unpermute,
+)
+from megatron.core.transformer.moe.moonep import (
+    MoonEPWeightBridge,
+    get_moonep_dispatch_buffer_pool,
+    get_moonep_zero_copy_token_buffers,
+    get_or_create_moonep_buffer,
+    is_moonep_available,
+    moonep_combine,
+    moonep_dispatch,
+    moonep_supports_external_hidden_buffers,
+    te_supports_external_grouped_linear_buffers,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -207,6 +219,13 @@ class MoETokenDispatcher:
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
         self.use_nccl_stream = True
+
+    def set_experts(self, experts) -> None:
+        """Bind expert parameters when required by a communication backend."""
+
+    def get_expert_zero_copy_buffers(self):
+        """Return optional FC2-output and FC1-dgrad buffers for expert computation."""
+        return None, None
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -1392,6 +1411,237 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
+class _MoonEPManager(_DispatchManager):
+    """MoonEP dispatch manager for fixed-shape, single-node BF16 training."""
+
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        router_topk: int,
+        num_experts: int,
+        config: TransformerConfig,
+    ) -> None:
+        self.group = group
+        self.num_local_experts = int(num_local_experts)
+        self.router_topk = int(router_topk)
+        self.num_experts = int(num_experts)
+        self.config = config
+        self.token_probs: Optional[torch.Tensor] = None
+        self.token_indices: Optional[torch.Tensor] = None
+        self.tokens_per_expert: Optional[torch.Tensor] = None
+        self.dispatched_probs: Optional[torch.Tensor] = None
+        self.handle = None
+        self._buffer = None
+        self._bridge: Optional[MoonEPWeightBridge] = None
+        self._buffer_num_tokens: Optional[int] = None
+        self._dispatch_capacity: Optional[int] = None
+        self._dispatch_hidden_buffer_pool = None
+        self._zero_copy_token_buffers = None
+
+        if not is_moonep_available():
+            raise ImportError(
+                "MoonEP is not installed. Install MoonshotAI/MoonEP before using "
+                "moe_flex_dispatcher_backend='moonep'."
+            )
+        if config.moe_moonep_zero_copy and not moonep_supports_external_hidden_buffers():
+            raise RuntimeError(
+                "moe_moonep_zero_copy=True requires the Megatron external-hidden-buffer "
+                "MoonEP extension. Install the documented companion MoonEP commit."
+            )
+        if config.moe_moonep_zero_copy and not te_supports_external_grouped_linear_buffers():
+            raise RuntimeError(
+                "moe_moonep_zero_copy=True requires Transformer Engine op-fuser external "
+                "output/dgrad buffer support. Install the documented TE commit."
+            )
+
+    def bind_experts(self, experts) -> None:
+        """Bind registered grouped parameters to MoonEP's unregistered runtime storage."""
+        if self._bridge is not None:
+            raise RuntimeError("MoonEP experts are already bound for this dispatcher.")
+        self._bridge = MoonEPWeightBridge(
+            experts=experts,
+            group=self.group,
+            num_experts=self.num_experts,
+            num_local_experts=self.num_local_experts,
+            num_sms=self.config.moe_flex_dispatcher_num_sms,
+        )
+        experts.set_moonep_weight_bridge(self._bridge)
+
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> None:
+        """Convert multihot routing metadata to MoonEP top-k tensors without a host sync."""
+        num_tokens = routing_map.shape[0]
+        probs = probs.reshape(num_tokens, self.num_experts)
+        self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
+        self.token_indices = self.token_indices.to(torch.int32)
+        flat_indices = self.token_indices.reshape(-1).long()
+        self.tokens_per_expert = torch.zeros(
+            self.num_experts, dtype=torch.int32, device=flat_indices.device
+        )
+        self.tokens_per_expert.scatter_add_(
+            0, flat_indices, torch.ones_like(flat_indices, dtype=torch.int32)
+        )
+
+    def _ensure_buffer(self, hidden_states: torch.Tensor) -> None:
+        """Collectively create or reuse the process-group MoonEP communication runtime."""
+        if self._bridge is None:
+            raise RuntimeError("MoonEP experts must be bound before the first dispatch.")
+        if (
+            hidden_states.dtype != torch.bfloat16
+            or not hidden_states.is_cuda
+            or hidden_states.ndim != 2
+            or not hidden_states.is_contiguous()
+        ):
+            raise ValueError(
+                "MoonEP dispatch input must be a contiguous 2D CUDA BF16 tensor, "
+                f"got shape={tuple(hidden_states.shape)}, dtype={hidden_states.dtype}, "
+                f"device={hidden_states.device}, contiguous={hidden_states.is_contiguous()}."
+            )
+        num_tokens = int(hidden_states.shape[0])
+        hidden_dim = int(hidden_states.shape[1])
+        if self._buffer is not None:
+            if num_tokens != self._buffer_num_tokens:
+                raise ValueError(
+                    "MoonEP requires a fixed local token count while a runtime is live: "
+                    f"initialized with {self._buffer_num_tokens}, got {num_tokens}."
+                )
+            return
+
+        world_size = torch.distributed.get_world_size(group=self.group)
+        rank_metadata = [None] * world_size
+        torch.distributed.all_gather_object(
+            rank_metadata,
+            (socket.gethostname(), num_tokens, hidden_dim),
+            group=self.group,
+        )
+        hostnames = {metadata[0] for metadata in rank_metadata}
+        token_counts = {metadata[1] for metadata in rank_metadata}
+        hidden_dims = {metadata[2] for metadata in rank_metadata}
+        if len(hostnames) != 1:
+            raise ValueError(
+                "MoonEP requires one NVLink-connected host, " f"got hosts={sorted(hostnames)}."
+            )
+        if len(token_counts) != 1:
+            raise ValueError(
+                "MoonEP requires equal local token counts, " f"got counts={sorted(token_counts)}."
+            )
+        if len(hidden_dims) != 1:
+            raise ValueError(
+                "MoonEP requires equal dispatched hidden dimensions, "
+                f"got dimensions={sorted(hidden_dims)}."
+            )
+
+        num_sms = self.config.moe_flex_dispatcher_num_sms
+        buffer_key = (
+            id(self.group),
+            hidden_states.device.index,
+            num_tokens,
+            hidden_dim,
+            self.router_topk,
+            self.num_experts,
+            world_size,
+            self.num_local_experts,
+            num_sms,
+            self.config.moe_moonep_token_padding,
+        )
+        self._buffer = get_or_create_moonep_buffer(
+            buffer_key,
+            S=num_tokens,
+            H=hidden_dim,
+            K=self.router_topk,
+            E=self.num_experts,
+            num_ep_ranks=world_size,
+            num_sms=num_sms,
+            token_padding=self.config.moe_moonep_token_padding,
+            B=self.num_local_experts,
+            group=self.group,
+        )
+        self._buffer_num_tokens = num_tokens
+        self._bridge.attach_buffer(self._buffer)
+        if self.config.moe_moonep_zero_copy:
+            self._dispatch_hidden_buffer_pool = get_moonep_dispatch_buffer_pool(self._buffer)
+            self._zero_copy_token_buffers = get_moonep_zero_copy_token_buffers(self._buffer)
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
+        """Dispatch tokens and preserve the generated plan for expert compute/combine."""
+        del async_finish, allocate_on_comm_stream
+        self._ensure_buffer(hidden_states)
+        dispatched_hidden, self.dispatched_probs, self.tokens_per_expert = moonep_dispatch(
+            hidden_states,
+            self.token_probs,
+            self.token_indices,
+            self.tokens_per_expert,
+            self._buffer,
+            self._bridge,
+            self._dispatch_hidden_buffer_pool,
+            (
+                self._zero_copy_token_buffers.backward
+                if self._zero_copy_token_buffers is not None
+                else None
+            ),
+        )
+        self.handle = self._bridge.last_plan
+        self._dispatch_capacity = int(dispatched_hidden.shape[0])
+        return dispatched_hidden
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
+        """Combine expert outputs with the saved dispatch plan."""
+        del async_finish, allocate_on_comm_stream
+        output = moonep_combine(
+            hidden_states,
+            self._buffer,
+            self.handle,
+            self._bridge,
+            (
+                self._zero_copy_token_buffers.forward
+                if self._zero_copy_token_buffers is not None
+                else None
+            ),
+        )
+        self.handle = None
+        self.dispatched_probs = None
+        self._dispatch_capacity = None
+        return output
+
+    def get_permuted_hidden_states_by_experts(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return MoonEP's already expert-major fixed-capacity tensors."""
+        return hidden_states, self.dispatched_probs
+
+    def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Restore MoonEP's static dispatch capacity before combine."""
+        pad_rows = self._dispatch_capacity - int(hidden_states.shape[0])
+        if pad_rows > 0:
+            hidden_states = torch.cat(
+                [hidden_states, hidden_states.new_zeros(pad_rows, hidden_states.shape[-1])], dim=0
+            )
+        return hidden_states
+
+    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+        """Return device-side padded token counts for all E+B runtime experts."""
+        return self.tokens_per_expert
+
+    def get_expert_zero_copy_buffers(self):
+        """Return FC2-output and FC1-dgrad local VMM views when enabled."""
+        if self._zero_copy_token_buffers is None:
+            return None, None
+        return (
+            self._zero_copy_token_buffers.forward[1],
+            self._zero_copy_token_buffers.backward[1],
+        )
+
+
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
     """A flexible token dispatcher that abstracts the underlying tensor and expert
     parallelism. It uses a single communication group over all TP and EP ranks,
@@ -1436,12 +1686,32 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
+        elif self.config.moe_flex_dispatcher_backend == "moonep":
+            self._comm_manager = _MoonEPManager(
+                group=self.tp_ep_group,
+                num_local_experts=self.num_local_experts,
+                router_topk=self.tp_size * self.config.moe_router_topk,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                config=self.config,
+            )
         else:
             raise ValueError(
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
                 "Please set --moe-flex-dispatcher-backend=deepep or "
-                "--moe-flex-dispatcher-backend=hybridep"
+                "--moe-flex-dispatcher-backend=hybridep or "
+                "--moe-flex-dispatcher-backend=moonep"
             )
+
+    def set_experts(self, experts) -> None:
+        """Bind expert parameters for backends that own runtime expert storage."""
+        if self.config.moe_flex_dispatcher_backend == "moonep":
+            self._comm_manager.bind_experts(experts)
+
+    def get_expert_zero_copy_buffers(self):
+        """Return optional expert boundary buffers supplied by the backend."""
+        if self.config.moe_flex_dispatcher_backend == "moonep":
+            return self._comm_manager.get_expert_zero_copy_buffers()
+        return None, None
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
