@@ -88,6 +88,20 @@ class MegatronSpanGroup(SpanGroup):
     DATA_LOADING = "data_loading"
     """Data loading and batch preparation."""
 
+    FIRST_ITERATION = "first_iteration"
+    """The first training iteration actually executed in this process (post
+    checkpoint-resume, post iteration-skip) — not necessarily iteration 1, and
+    distinct from the per-step STEP span since it captures one-off warmup
+    costs (compilation, CUDA graph capture, prefetch) absent from steady-state
+    iterations."""
+
+    TRACE_REGION = "trace_region"
+    """Shadows every perfetto-native ``trace_region(...)`` marker with a lens
+    span (see megatron.core.perfetto_trace) — ~85 checkpoint/dataset/load
+    sub-phase markers, covered without per-site instrumentation. Verbose and
+    fine-grained: deliberately NOT in the ``per_step`` preset (only ``all``);
+    opt in explicitly, e.g. ``--otel-span-groups per_step,trace_region``."""
+
     # ------------------------------------------------------------------ #
     # Inference
     # ------------------------------------------------------------------ #
@@ -106,6 +120,8 @@ class MegatronSpanGroup(SpanGroup):
             COMMUNICATION,
             ACTIVATION_OFFLOAD,
             DATA_LOADING,
+            FIRST_ITERATION,
+            TRACE_REGION,
             INFERENCE,
         ]
     )
@@ -116,6 +132,7 @@ class MegatronSpanGroup(SpanGroup):
                 SpanGroup.JOB,
                 SpanGroup.CHECKPOINT,
                 SpanGroup.EVALUATE,
+                FIRST_ITERATION,
                 INFERENCE,
             ]
         ),
@@ -131,6 +148,7 @@ class MegatronSpanGroup(SpanGroup):
                 SpanGroup.OPTIMIZER,
                 COMMUNICATION,
                 DATA_LOADING,
+                FIRST_ITERATION,
                 INFERENCE,
             ]
         ),
