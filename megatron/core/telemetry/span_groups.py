@@ -38,13 +38,8 @@ except ImportError:
             ]
         )
 
-        GOODPUT_GROUPS: Final[frozenset] = frozenset(
-            [JOB, CHECKPOINT, MODEL_INIT, LOAD_CHECKPOINT, STEP]
-        )
-
         _PRESETS: ClassVar[dict] = {
             "default": frozenset([JOB, CHECKPOINT, EVALUATE]),
-            "goodput": GOODPUT_GROUPS,
             "per_step": frozenset(
                 [
                     JOB,
@@ -60,13 +55,6 @@ except ImportError:
             "profiling": ALL_GROUPS,
             "all": ALL_GROUPS,
         }
-
-        @classmethod
-        def categories(cls) -> dict:
-            return {
-                g: ("goodput" if g in cls.GOODPUT_GROUPS else "profiling")
-                for g in cls.ALL_GROUPS
-            }
 
         @classmethod
         def resolve(cls, spec: str) -> frozenset:
@@ -139,48 +127,6 @@ class MegatronSpanGroup(SpanGroup):
         ]
     )
 
-    # Semantic goodput/resiliency boundaries: the base goodput groups plus the
-    # Megatron phases the goodput bucketer keys off (dataloader setup, the
-    # one-off first iteration). Everything else (forward/backward, optimizer,
-    # microbatch, layer, communication, activation offload, trace_region,
-    # inference) is profiling detail. Drives both the "goodput" preset and the
-    # per-span lens.span_category attribute.
-    #
-    # Listed self-contained (NOT `SpanGroup.GOODPUT_GROUPS | ...`) so an older
-    # installed nemo-lens without GOODPUT_GROUPS can't AttributeError at class
-    # definition and take the whole training run down with it -- telemetry must
-    # never break training.
-    # Goodput = resiliency overhead only: the cost of RESTART (job/container,
-    # python+megatron init, model init, checkpoint load, dataloader, first-
-    # iteration warmup) and the cost of DEFENSE (checkpoint save, sniff test, FT
-    # heartbeat, weight-hash check), plus STEP for the productive-time baseline.
-    # EVALUATE is deliberately NOT here -- evaluation is intended work, not a
-    # resiliency cost, so it must not count against goodput. Likewise energy/
-    # straggler monitors and steady-state logging are profiling, not goodput.
-    GOODPUT_GROUPS: Final[frozenset] = frozenset(
-        [
-            SpanGroup.JOB,
-            SpanGroup.CHECKPOINT,
-            SpanGroup.MODEL_INIT,
-            SpanGroup.LOAD_CHECKPOINT,
-            SpanGroup.STEP,
-            DATA_LOADING,
-            FIRST_ITERATION,
-        ]
-    )
-
-    @classmethod
-    def categories(cls) -> dict:
-        """{group: 'goodput'|'profiling'} for every group in ALL_GROUPS.
-
-        Defined here (not only on the base) so it works even against an older
-        nemo-lens whose SpanGroup predates categories().
-        """
-        return {
-            g: ("goodput" if g in cls.GOODPUT_GROUPS else "profiling")
-            for g in cls.ALL_GROUPS
-        }
-
     _PRESETS: ClassVar[dict] = {
         "default": frozenset(
             [
@@ -191,7 +137,6 @@ class MegatronSpanGroup(SpanGroup):
                 INFERENCE,
             ]
         ),
-        "goodput": GOODPUT_GROUPS,
         "per_step": frozenset(
             [
                 SpanGroup.JOB,
