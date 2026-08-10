@@ -1,0 +1,1 @@
+0.5 /workspace/test_data/test_text_document 0.5 /workspace/test_data/test_text_document
