@@ -14,7 +14,6 @@ from megatron.core.models.common.embeddings.rope_utils import (
 )
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
-    get_experimental_attention_variant_stage_input_cp_partition_mode,
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -1771,7 +1770,6 @@ def test_parallel_gated_delta_net_correctness(
         micro_batch_size=micro_batch_size,
         sequence_packing=sequence_packing,
         cp_partition_mode="contiguous" if is_chunkwise_cp else "zigzag",
-        cp_stage_entry_partition_mode="contiguous" if is_chunkwise_cp else "zigzag",
         compare_param_grads=is_chunkwise_cp and tp == 1 and not sequence_packing,
     )
 
@@ -1807,6 +1805,7 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_forward_backward_correctness(tmp_p
             linear_cp_mode="chunkwise",
             transformer_impl="transformer_engine",
             context_parallel_size=context_parallel_size,
+            cp_partition_mode="contiguous",
             hidden_dropout=0.0,
             attention_dropout=0.0,
             bf16=True,
@@ -1819,9 +1818,6 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_forward_backward_correctness(tmp_p
         transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
             config=config, vp_stage=vp_stage, pp_rank=0
         )
-        cp_stage_entry_partition_mode = (
-            get_experimental_attention_variant_stage_input_cp_partition_mode(config)
-        )
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
@@ -1832,7 +1828,6 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_forward_backward_correctness(tmp_p
             position_embedding_type="rope",
             pg_collection=pg_collection,
             vp_stage=vp_stage,
-            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
         )
 
     Utils.initialize_model_parallel(
@@ -1925,7 +1920,7 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_forward_backward_correctness(tmp_p
                 load_checkpoint(parallel_model, None, None)
 
         cp_group = parallel_state.get_context_parallel_group()
-        input_partition_mode = parallel_model[0].decoder.cp_stage_entry_partition_mode
+        input_partition_mode = parallel_config.cp_partition_mode
         assert input_partition_mode == "contiguous"
 
         local_input_ids = get_tensor_on_this_cp_rank(
