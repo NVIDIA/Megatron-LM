@@ -10,6 +10,18 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant.csa import (
+    CompressedSparseAttention,
+    CompressedSparseAttentionSubmodules,
+    Compressor,
+    CompressorSubmodules,
+    CSAIndexer,
+    CSAIndexerSubmodules,
+)
+from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+    DSv4HybridSelfAttention,
+    DSv4HybridSelfAttentionSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
@@ -130,6 +142,57 @@ def get_dsa_module_spec_for_backend(
     return attention
 
 
+def get_dsv4_hybrid_module_spec_for_backend(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Build the native SBHD DSv4 hybrid-attention module spec."""
+    assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
+    assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+
+    rms_norm = config.normalization == "RMSNorm"
+    qk_norm = (
+        backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
+    )
+
+    compressor_spec = ModuleSpec(
+        module=Compressor,
+        submodules=CompressorSubmodules(
+            linear_wkv=backend.linear(),
+            linear_wgate=backend.linear(),
+            norm=backend.layer_norm(rms_norm=True, for_qk=False),
+        ),
+    )
+    indexer_spec = ModuleSpec(
+        module=CSAIndexer,
+        submodules=CSAIndexerSubmodules(
+            linear_wq_b=backend.linear(),
+            linear_weights_proj=backend.linear(),
+            compressor=compressor_spec,
+        ),
+    )
+    core_attention = ModuleSpec(
+        module=CompressedSparseAttention,
+        submodules=CompressedSparseAttentionSubmodules(
+            compressor=compressor_spec, indexer=indexer_spec
+        ),
+    )
+
+    return ModuleSpec(
+        module=DSv4HybridSelfAttention,
+        params={"attn_mask_type": AttnMaskType.causal},
+        submodules=DSv4HybridSelfAttentionSubmodules(
+            linear_q_down_proj=backend.linear(),
+            linear_q_up_proj=backend.column_parallel_linear(),
+            linear_kv_proj=backend.column_parallel_linear(),
+            core_attention=core_attention,
+            linear_proj=backend.row_parallel_linear(),
+            q_layernorm=qk_norm,
+            kv_layernorm=qk_norm,
+        ),
+        metainfo={"fuse_input_layernorm": False},
+    )
+
+
 def get_experimental_attention_variant_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
@@ -142,6 +205,8 @@ def get_experimental_attention_variant_module_spec(
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
+    elif config.experimental_attention_variant == "dsv4_hybrid":
+        return get_dsv4_hybrid_module_spec_for_backend(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"

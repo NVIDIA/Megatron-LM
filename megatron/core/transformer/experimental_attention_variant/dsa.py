@@ -7,7 +7,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -296,32 +295,72 @@ class DSAIndexerLossLoggingHelper:
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
+        # Hybrid MTP layer numbers can exceed ``num_layers + mtp_num_layers``
+        # because every prediction depth can contain multiple hybrid layers.
+        needed = max(num_layers, layer_number)
         if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["values"] = torch.zeros(needed, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < needed:
+            grown = torch.zeros(
+                needed, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         tracker["values"][layer_number - 1] += loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
     @staticmethod
-    def clean_loss_in_tracker():
+    def clean_loss_in_tracker(preserve_groups: bool = False):
         """Clear the indexer losses."""
         tracker = DSAIndexerLossLoggingHelper.tracker
+        reduce_group = tracker.get("reduce_group") if preserve_groups else None
+        avg_group = tracker.get("avg_group") if preserve_groups else None
         if "values" in tracker:
             tracker["values"].zero_()
-        tracker["reduce_group"] = None
-        tracker["avg_group"] = None
+        tracker["reduce_group"] = reduce_group
+        tracker["avg_group"] = avg_group
 
     @staticmethod
-    def reduce_loss_in_tracker():
-        """Collect and reduce the indexer losses across ranks."""
+    def reduce_loss_in_tracker(
+        pg_collection: ProcessGroupCollection, num_layers: Optional[int] = None
+    ):
+        """Collect and reduce indexer losses across every pipeline rank.
+
+        Args:
+            pg_collection: Process groups used for pipeline and data-parallel reductions.
+            num_layers: Total number of decoder and MTP layers. When provided, ranks without
+                local indexer losses contribute zeros to the pipeline-wide reduction.
+        """
         tracker = DSAIndexerLossLoggingHelper.tracker
-        if "values" not in tracker:
+        pp_group = pg_collection.pp
+
+        # Pipeline ranks can own different attention variants, so first agree on
+        # a common tracker size. Cache the result because layer allocation is
+        # static and the negotiation requires a device-to-host synchronization.
+        if tracker.get("agreed_size") is not None:
+            size = tracker["agreed_size"]
+        else:
+            local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
+            size_t = torch.tensor(
+                [local_size], device=torch.cuda.current_device(), dtype=torch.long
+            )
+            torch.distributed.all_reduce(size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+            size = int(size_t.item())
+            tracker["agreed_size"] = size
+        if size == 0:
             return
+        if "values" not in tracker:
+            tracker["values"] = torch.zeros(size, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < size:
+            grown = torch.zeros(
+                size, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         values = tracker["values"]
 
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        torch.distributed.all_reduce(values, group=pp_group)
         # Reduce indexer losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
@@ -330,9 +369,7 @@ class DSAIndexerLossLoggingHelper:
                 values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
         torch.distributed.all_reduce(
-            values,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-            op=torch.distributed.ReduceOp.AVG,
+            values, group=pg_collection.dp, op=torch.distributed.ReduceOp.AVG
         )
 
     @staticmethod
@@ -340,9 +377,13 @@ class DSAIndexerLossLoggingHelper:
         loss_scale: float,
         iteration: int,
         writer,
+        pg_collection: ProcessGroupCollection,
         wandb_writer=None,
         total_loss_dict=None,
         per_layer_logging: bool = False,
+        num_layers: Optional[int] = None,
+        num_indexer_layers: Optional[int] = None,
+        preserve_groups: bool = False,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -350,20 +391,27 @@ class DSAIndexerLossLoggingHelper:
             loss_scale: Scale factor for the loss.
             iteration: Current training iteration.
             writer: TensorBoard writer.
+            pg_collection: Process groups used for pipeline and data-parallel reductions.
             wandb_writer: Weights & Biases writer.
             total_loss_dict: Dictionary to accumulate total losses.
             per_layer_logging: Whether to log per-layer losses.
+            num_layers: Total number of decoder and MTP layers. Passing it makes ranks
+                without a local indexer participate in the pipeline reduction.
+            num_indexer_layers: Number of layers that own an indexer. Defaults to the
+                tracker size when every tracked layer owns one.
+            preserve_groups: Keep the saved reduction groups for CUDA Graph replays.
         """
-        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker()
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
+            pg_collection=pg_collection, num_layers=num_layers
+        )
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             return
 
         indexer_loss_values = tracker["values"] * loss_scale
-        num_layers = indexer_loss_values.shape[0]
-
-        # Average across all layers (assuming all layers have sparse attention)
-        avg_indexer_loss = indexer_loss_values.sum() / num_layers
+        if num_indexer_layers is None:
+            num_indexer_layers = indexer_loss_values.shape[0]
+        avg_indexer_loss = indexer_loss_values.sum() / max(num_indexer_layers, 1)
 
         # Log average loss
         if total_loss_dict is not None:
@@ -378,7 +426,7 @@ class DSAIndexerLossLoggingHelper:
         if wandb_writer is not None:
             wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
 
-        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=preserve_groups)
 
 
 def compute_dsa_indexer_loss(
@@ -396,6 +444,7 @@ def compute_dsa_indexer_loss(
     key_positions: Optional[torch.Tensor] = None,
     query_valid_rows: Optional[torch.Tensor] = None,
     calculate_per_token_loss: bool = False,
+    non_compressed_lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Compute KL divergence loss between index_scores and true attention_scores.
@@ -421,6 +470,10 @@ def compute_dsa_indexer_loss(
         varlen_starts: Optional row-wise key start bounds [sq] for packed THD.
         varlen_ends: Optional row-wise key end bounds [sq] for packed THD.
         key_positions: Optional global key positions [sk] for packed THD.
+        non_compressed_lse: Optional detached FP32 log-sum-exp contribution
+            [batch, heads, seqlen_q] from teacher keys that are intentionally
+            omitted from ``key``. When provided, the selected ``key`` logits
+            are normalized with this external mass before heads are summed.
 
     Returns:
         index_loss: KL divergence loss (scalar).
@@ -489,8 +542,8 @@ def compute_dsa_indexer_loss(
     attention_valid_mask = index_valid_mask if sparse_loss else base_valid_mask
 
     # [b, np, sq, sk] -> [b, np, sq, sk]
-    attention_scores = dsa_masking.masked_softmax(
-        attention_scores.float(), attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk), dim=-1
+    attention_scores = _compute_indexer_teacher_probabilities(
+        attention_scores, attention_valid_mask, non_compressed_lse=non_compressed_lse
     )
     # [b, sq, sk] -> [b, sq, sk]
     index_log_scores = dsa_masking.masked_log_softmax(
@@ -504,7 +557,7 @@ def compute_dsa_indexer_loss(
         # attention scores are scattered to TP ranks in head dimension.
         torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
     # The target is already non-negative because it is a sum of softmax probabilities.
-    attention_scores = dsa_indexer_loss.normalize_indexer_target(attention_scores)
+    attention_scores = _normalize_indexer_teacher_target(attention_scores, non_compressed_lse)
     return dsa_indexer_loss.indexer_loss_from_target(
         attention_scores,
         index_log_scores,
@@ -512,6 +565,52 @@ def compute_dsa_indexer_loss(
         query_valid_rows=query_valid_rows,
         calculate_per_token_loss=calculate_per_token_loss,
     )
+
+
+def _compute_indexer_teacher_probabilities(
+    attention_scores: torch.Tensor,
+    attention_valid_mask: torch.Tensor,
+    non_compressed_lse: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Normalize selected teacher logits, optionally with omitted attention mass.
+
+    ``non_compressed_lse`` is a sufficient statistic for teacher logits that
+    must participate in the softmax denominator but must not appear in the
+    compressed-key target returned by this helper.
+    """
+    b, np, sq, sk = attention_scores.shape
+    expanded_valid_mask = attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk)
+    if non_compressed_lse is None:
+        return dsa_masking.masked_softmax(attention_scores.float(), expanded_valid_mask, dim=-1)
+
+    expected_shape = (b, np, sq)
+    if tuple(non_compressed_lse.shape) != expected_shape:
+        raise ValueError(
+            "non_compressed_lse must have shape [batch, heads, seqlen_q], "
+            f"got {tuple(non_compressed_lse.shape)}, expected {expected_shape}"
+        )
+    if non_compressed_lse.device != attention_scores.device:
+        raise ValueError(
+            "non_compressed_lse and attention_scores must be on the same device, "
+            f"got {non_compressed_lse.device} and {attention_scores.device}"
+        )
+    if non_compressed_lse.requires_grad:
+        raise ValueError("non_compressed_lse must be detached")
+
+    masked_scores = attention_scores.float().masked_fill(~expanded_valid_mask, float("-inf"))
+    compressed_lse = torch.logsumexp(masked_scores, dim=-1)
+    full_lse = torch.logaddexp(non_compressed_lse.float(), compressed_lse)
+    probabilities = torch.exp(masked_scores - full_lse.unsqueeze(-1))
+    return torch.where(expanded_valid_mask, probabilities, torch.zeros_like(probabilities))
+
+
+def _normalize_indexer_teacher_target(
+    target: torch.Tensor, non_compressed_lse: torch.Tensor | None
+) -> torch.Tensor:
+    """L1-normalize teacher mass without changing the legacy DSA path."""
+    if non_compressed_lse is None:
+        return dsa_indexer_loss.normalize_indexer_target(target)
+    return target / target.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
 
 
 def _compute_index_scores(
@@ -627,6 +726,7 @@ def fwd_fused_indexer_loss_naive(
     query_valid_rows=None,
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
+    non_compressed_lse: torch.Tensor | None = None,
 ):
     """Naive implementation of forward pass for indexer loss."""
     index_scores, topk_indices = fused_qk_topk_naive(
@@ -656,6 +756,7 @@ def fwd_fused_indexer_loss_naive(
         key_positions=key_positions,
         query_valid_rows=query_valid_rows,
         calculate_per_token_loss=calculate_per_token_loss,
+        non_compressed_lse=non_compressed_lse,
     )
 
     return topk_indices, indexer_loss
@@ -680,6 +781,7 @@ def bwd_fused_indexer_loss_naive(
     query_valid_rows=None,
     calculate_per_token_loss: bool = False,
     use_relu: bool = True,
+    non_compressed_lse: torch.Tensor | None = None,
 ):
     """Naive implementation of backward pass for indexer loss."""
     query, _ = dsa_layout.ensure_sbhd(query, "query")
@@ -752,8 +854,8 @@ def bwd_fused_indexer_loss_naive(
     else:
         index_valid_mask = base_valid_mask
     attention_valid_mask = index_valid_mask if sparse_loss else base_valid_mask
-    attention_scores_softmax = dsa_masking.masked_softmax(
-        attention_scores.float(), attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk), dim=-1
+    attention_scores_softmax = _compute_indexer_teacher_probabilities(
+        attention_scores, attention_valid_mask, non_compressed_lse=non_compressed_lse
     )
     # Free attention_scores immediately
     del attention_scores
@@ -776,7 +878,9 @@ def bwd_fused_indexer_loss_naive(
     # L1 normalize. Fully masked packed/varlen rows can have zero summed
     # attention mass; clamp the denominator so those rows stay finite and are
     # later zeroed by the row-valid loss mask.
-    attention_scores_normalized = dsa_indexer_loss.normalize_indexer_target(attention_scores_sum)
+    attention_scores_normalized = _normalize_indexer_teacher_target(
+        attention_scores_sum, non_compressed_lse
+    )
     # Free attention_scores_sum - no longer needed after normalization
     del attention_scores_sum
 
@@ -890,6 +994,7 @@ _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES = (
     "query_valid_rows",
     "calculate_per_token_loss",
     "use_relu",
+    "non_compressed_lse",
 )
 
 
@@ -916,6 +1021,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         query_valid_rows=None,
         calculate_per_token_loss: bool = False,
         use_relu: bool = True,
+        non_compressed_lse: torch.Tensor | None = None,
     ):
         """
         Fused forward: index_scores never materialized in full.
@@ -938,10 +1044,17 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             query_valid_rows=query_valid_rows,
             calculate_per_token_loss=calculate_per_token_loss,
             use_relu=use_relu,
+            non_compressed_lse=non_compressed_lse,
         )
 
         # Save for backward (recomputation strategy)
-        ctx.save_for_backward(q, weights, k, query, key, topk_indices)
+        saved_non_compressed_lse = (
+            non_compressed_lse
+            if non_compressed_lse is not None
+            else q.new_empty(0, dtype=torch.float32)
+        )
+        ctx.save_for_backward(q, weights, k, query, key, topk_indices, saved_non_compressed_lse)
+        ctx.has_non_compressed_lse = non_compressed_lse is not None
         ctx.softmax_scale = softmax_scale
         ctx.loss_coeff = loss_coeff
         ctx.sparse_loss = sparse_loss
@@ -953,6 +1066,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         ctx.query_valid_rows = query_valid_rows
         ctx.calculate_per_token_loss = calculate_per_token_loss
         ctx.use_relu = use_relu
+        ctx.num_inputs = len(ctx.needs_input_grad)
 
         return topk_indices, loss
 
@@ -961,7 +1075,8 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         """
         Backward: Recompute what we need.
         """
-        q, weights, k, query, key, topk_indices = ctx.saved_tensors
+        q, weights, k, query, key, topk_indices, saved_non_compressed_lse = ctx.saved_tensors
+        non_compressed_lse = saved_non_compressed_lse if ctx.has_non_compressed_lse else None
 
         grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
             q,
@@ -982,6 +1097,7 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             query_valid_rows=ctx.query_valid_rows,
             calculate_per_token_loss=ctx.calculate_per_token_loss,
             use_relu=ctx.use_relu,
+            non_compressed_lse=non_compressed_lse,
         )
 
         grad_by_name = {
@@ -991,8 +1107,10 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
             # query and key are detached in forward, so return None for their gradients.
             "query": None,
             "key": None,
+            "non_compressed_lse": None,
         }
-        return tuple(grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES)
+        gradients = tuple(grad_by_name.get(name) for name in _FUSED_DSA_INDEXER_LOSS_INPUT_NAMES)
+        return gradients[: ctx.num_inputs]
 
 
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
