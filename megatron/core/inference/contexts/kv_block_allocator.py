@@ -261,9 +261,12 @@ class KVBlockAllocator:
         """
         assert self.enable_prefix_caching, "retaining KV blocks requires prefix caching"
         if block_ids:
-            blocks = torch.tensor(block_ids, dtype=torch.int64, device='cpu')
-            self.block_ref_counts[blocks] += 1
-            self.update_timestamps(blocks)
+            blocks = torch.tensor(block_ids, dtype=torch.int32, device='cpu')
+            unique_blocks, retain_counts = torch.unique(blocks, return_counts=True)
+            self.block_ref_counts[unique_blocks] += retain_counts.to(
+                dtype=self.block_ref_counts.dtype
+            )
+            self.update_timestamps(unique_blocks)
 
     def reset(self) -> None:
         """Reset the allocator to initial state.

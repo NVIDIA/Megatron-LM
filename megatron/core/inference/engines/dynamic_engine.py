@@ -370,6 +370,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self, requests_and_blocks: list[tuple], decode_tokens_by_request: Dict[int, list[int]]
     ) -> dict:
         """Hook overridden by the KV-handoff engine composition."""
+        if any(request.sampling_params.do_kv_handoff for request, _ in requests_and_blocks):
+            self._raise_kv_handoff_not_enabled("KV handoff completion")
         return {}
 
     def _capture_handoff_meta(self, request, prepared) -> None:
@@ -1259,6 +1261,9 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
             sampling_params (Optional[SamplingParams]): Sampling parameters for the request.
+            precomputed_block_hashes (Optional[List[int]]): Prefix-cache hashes already
+                computed for the prompt's complete blocks. Values must match
+                ``compute_block_hashes_batched(prompt_tokens, block_size_tokens)``.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -1531,7 +1536,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Keep handoff blocks only when the request needs them.
                     handoff_blocks = handoff_blocks_by_request.get(request_id, [])
                     if request.sampling_params.do_kv_handoff:
-                        self._capture_handoff_meta(request, prepared_handoff_metadata[request_id])
+                        self._capture_handoff_meta(
+                            request, prepared_handoff_metadata.get(request_id)
+                        )
                     # A prefill-role engine may also serve regular requests; release the
                     # temporary block references when no handoff was requested.
                     elif handoff_blocks:
@@ -3037,7 +3044,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     local_schedulable = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
-                    local_pending = local_schedulable + self.pending_kv_import_count
+                    local_pending_imports = self.pending_kv_import_count
                     if self.disable_ep_consensus:
                         # Skip the EP consensus all-reduce; act on local state only.
                         # NOTE: even with no consensus we must still participate in EP
@@ -3051,6 +3058,10 @@ class DynamicInferenceEngine(AbstractEngine):
                             self._state_events[EngineState.PAUSED].set()
                         elif local_schedulable > 0:
                             await self.async_step()
+                        elif self.ep_world_size == 1 and local_pending_imports > 0:
+                            # No model work is ready; poll the network transfer without
+                            # spending a dummy forward while waiting for decode admission.
+                            await asyncio.sleep(0.001)
                         else:
                             self.step_start_event.record()
                             nvtx_range_push("EP-dummy-forward")
@@ -3078,7 +3089,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         # In the worst case, this delays pausing by 20 steps which is around
                         # 200-400 milliseconds.
                         self._last_ep_consensus = await self._ep_establish_consensus(
-                            local_pending, signal_consensus=(self.state == EngineState.PAUSING)
+                            local_schedulable, signal_consensus=(self.state == EngineState.PAUSING)
                         )
                     global_work, all_pausing = self._last_ep_consensus
                     self._ep_consensus_loop_counter += 1
@@ -3104,7 +3115,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.context.prefix_cache_lru_clock += 1
                     else:
                         # No work, but not all pausing: idle.
-                        await asyncio.sleep(0.02)
+                        await asyncio.sleep(0.001 if local_pending_imports > 0 else 0.02)
 
                 elif self.state == EngineState.PAUSED:
                     await asyncio.sleep(0.02)

@@ -1000,6 +1000,31 @@ def test_legacy_bookkeeping_keeps_partial_chunk_active():
     context.update_requests.assert_called_once()
 
 
+def test_async_bookkeeping_retains_finished_handoff_state():
+    context = _make_async_sched_context(total_request_count=3, paused_request_count=1)
+    context.get_max_sequence_lengths.return_value = torch.tensor([10, 10])
+    context.kv_block_allocator = SimpleNamespace(
+        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
+    )
+    context.request_to_kv_block_ids = torch.tensor(
+        [[8, 9, -1], [10, 11, -1], [12, 13, -1]], dtype=torch.int32
+    )
+    controller = _make_async_sched_controller(context)
+    sample_result = SimpleNamespace(
+        sampled_tokens_cpu_view=torch.tensor([99, 7]),
+        sampled_mtp_tokens_cpu_view=None,
+        accepted_tokens_cpu_view=None,
+    )
+
+    result = controller._run_async_sched_update_requests(
+        sample_result, resolved_sequence_lengths=torch.tensor([3, 3])
+    )
+
+    assert result.finished_handoff_block_ids == {11: [10, 11]}
+    assert result.finished_handoff_decode_tokens == {11: [99]}
+    context.kv_block_allocator.retain_memory_blocks.assert_called_once_with([10, 11])
+
+
 @pytest.mark.parametrize(
     "termination_ids, stop_word_finished_ids",
     [([99, 99, 99], set()), ([99, 2, 99], set()), ([99, 99, 99], {11})],

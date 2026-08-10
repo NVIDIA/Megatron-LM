@@ -32,6 +32,7 @@ class HandoffCompletionTracker:
         self.world_size = dist.get_world_size(process_group)
         self.is_coordinator = self.rank == 0
         self._reports: dict[int, dict[int, bool]] = {}
+        self._failure_notified: set[int] = set()
         self._socket: Any = None
         self.sockets = []
 
@@ -77,9 +78,14 @@ class HandoffCompletionTracker:
         completed = []
         for request_id, reports in list(self._reports.items()):
             failed = any(reports.values())
-            if failed or len(reports) == self.world_size:
+            if failed and request_id not in self._failure_notified:
                 completed.append((request_id, failed))
+                self._failure_notified.add(request_id)
+            if len(reports) == self.world_size:
+                if request_id not in self._failure_notified:
+                    completed.append((request_id, False))
                 del self._reports[request_id]
+                self._failure_notified.discard(request_id)
         return completed
 
     def _record(self, request_id: int, rank: int, failed: bool) -> None:

@@ -34,6 +34,7 @@ from megatron.core.inference.disaggregation.utils import (
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
     DynamicInferenceEventType,
+    Status,
     compute_block_hashes_batched,
 )
 from megatron.core.utils import get_pg_rank, get_pg_size
@@ -64,6 +65,7 @@ class InferenceStateHandoffMixin:
         self._pp_kv_peer_metas = None  # Each PP stage's set of TP KV descriptors.
         self._deferred_kv_handoffs = deque()
         self._pending_kv_imports = deque()
+        self._quarantined_kv_imports: list[PendingKvImport] = []
         self._handoff_completion_tracker: HandoffCompletionTracker | None = None
         self._handoff_completion_notifications: dict[int, bool] = {}  # Request ID -> failed.
         self._pending_kv_pushes: list = []
@@ -145,7 +147,17 @@ class InferenceStateHandoffMixin:
             else:
                 unsafe.append(pending)
         self._pending_kv_imports = unsafe
-        if unsafe_pushes or unsafe:
+        quarantined = []
+        for pending in self._quarantined_kv_imports:
+            safe_to_release = pending.destinations_safe and self._wait_for_transfer_handles(
+                *self._pending_transfer_handles(pending)
+            )
+            if safe_to_release:
+                self._release_pending_kv_import(pending)
+            else:
+                quarantined.append(pending)
+        self._quarantined_kv_imports = quarantined
+        if unsafe_pushes or unsafe or quarantined:
             raise RuntimeError(
                 "Cannot reset while KV handoff transfers may still access cache storage"
             )
@@ -370,12 +382,17 @@ class InferenceStateHandoffMixin:
             raise
 
     def _capture_handoff_meta(
-        self, request: "DynamicInferenceRequest", prepared: _PreparedHandoffMetadata
+        self, request: "DynamicInferenceRequest", prepared: _PreparedHandoffMetadata | None
     ) -> None:
         """Attach prepared transfer metadata and retain the request's blocks.
 
         Side: prefill engine; pull and push transport paths.
         """
+
+        if prepared is None:
+            raise RuntimeError(
+                f"No handoff metadata was prepared for completed request {request.request_id}"
+            )
 
         rid = request.request_id
         block_ids = prepared.local_blocks
@@ -708,10 +725,17 @@ class InferenceStateHandoffMixin:
         )
 
         request = self.get_request(pending.request_id)
-        if pending.request_id not in self.waiting_request_ids:
+        if request.status == Status.FAILED:
             # add_request() reports validation failures through its own future.
             self._release_pending_kv_import(pending)
         else:
+            queued_request_id = self.waiting_request_ids[0]
+            if queued_request_id != pending.request_id:
+                raise RuntimeError(
+                    "Decode-only admission expected the imported request at the waiting queue "
+                    f"head: expected {pending.request_id}, got {queued_request_id}"
+                )
+            self.waiting_request_ids.popleft()
             self._validate_decode_ready_handoff(pending)
             first_token = pending.resume_tokens[0]
             if request.sampling_params.num_tokens_to_generate > 0:
@@ -738,7 +762,6 @@ class InferenceStateHandoffMixin:
                 pending.continuation_blocks,
                 pending.resume_tokens,
             )
-            self.waiting_request_ids.remove(pending.request_id)
             request.num_cached_tokens = len(pending.prompt)
             pending.local_blocks = []
             pending.continuation_blocks = []
@@ -862,7 +885,7 @@ class InferenceStateHandoffMixin:
                 if safe_to_release:
                     self._release_pending_kv_import(pending)
                 else:
-                    remaining.append(pending)
+                    self._quarantined_kv_imports.append(pending)
                     logging.error(
                         "Quarantining request %d cache storage after an incomplete handoff",
                         pending.request_id,
@@ -870,6 +893,8 @@ class InferenceStateHandoffMixin:
                 if not pending.future.done():
                     pending.future.set_exception(exc)
                 logging.exception("DISAGG_DECODE_PULL_FAILED request_id=%d", pending.request_id)
+                if failed:
+                    continue
                 remaining.extend(self._pending_kv_imports)
                 self._pending_kv_imports = remaining
                 raise

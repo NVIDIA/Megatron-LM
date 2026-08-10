@@ -171,6 +171,7 @@ def _completion_tracker(world_size=2):
     tracker.world_size = world_size
     tracker.is_coordinator = True
     tracker._reports = {}
+    tracker._failure_notified = set()
     tracker._socket = None
     return tracker
 
@@ -386,12 +387,12 @@ def test_peer_failure_quarantines_an_unfinished_local_transfer(handoff_loop):
     engine._pending_kv_imports.append(pending)
     engine._record_handoff_completion_notification(4, failed=True)
 
-    with pytest.raises(RuntimeError, match="failed on a model-parallel peer"):
-        engine._poll_pending_kv_imports()
+    engine._poll_pending_kv_imports()
 
     assert isinstance(pending.future.exception(), RuntimeError)
     assert engine.context.kv_block_allocator.releases == []
-    assert list(engine._pending_kv_imports) == [pending]
+    assert not engine._pending_kv_imports
+    assert engine._quarantined_kv_imports == [pending]
 
 
 def test_handoff_completion_waits_for_all_ranks_but_failure_is_immediate():
@@ -404,6 +405,9 @@ def test_handoff_completion_waits_for_all_ranks_but_failure_is_immediate():
 
     tracker._record(8, rank=1, failed=True)
     assert tracker.drain_completed() == [(8, True)]
+    tracker._record(8, rank=0, failed=False)
+    assert tracker.drain_completed() == []
+    assert 8 not in tracker._reports
 
 
 def test_handoff_metadata_batches_completed_requests_across_pipeline(monkeypatch):
@@ -575,8 +579,7 @@ def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(ha
     engine._handoff_completion_tracker.report.assert_called_once_with(8, True)
 
     engine._record_handoff_completion_notification(8, failed=True)
-    with pytest.raises(RuntimeError, match="local handoff submission failed"):
-        engine._poll_pending_kv_imports()
+    engine._poll_pending_kv_imports()
 
     assert isinstance(future.exception(), RuntimeError)
     assert engine.context.kv_block_allocator.releases == [[10, 11, 12]]
@@ -607,6 +610,29 @@ def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):
     assert src_blocks == [101, 102]
     assert dst_blocks == [11, 12]
     assert [stage["block_ids"] for stage in submitted_meta["pp_metas"]] == [[101, 102], [201, 202]]
+
+
+def test_nixl_handoff_trims_per_rank_block_lists(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    prompt = [2] * 8
+    hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
+    cached = engine.context.kv_block_allocator.allocate_memory_blocks(1)
+    engine.context.kv_block_allocator.release_memory_blocks(cached)
+    engine.context.kv_block_allocator.kv_hash_to_block_id[hashes[0]] = int(cached[0])
+    kv_meta = {
+        "resume_tokens": [99],
+        "tp_metas": [{"rank": 0, "block_ids": [100, 101]}, {"rank": 1, "block_ids": [200, 201]}],
+    }
+
+    engine.add_request_with_kv_handoff(
+        6, prompt, SamplingParams(num_tokens_to_generate=2), kv_meta, [100, 101]
+    )
+    _drain_loop(handoff_loop)
+
+    submitted_meta, src_blocks, dst_blocks = engine._kv_transfer_agent.calls[0]
+    assert src_blocks == [101]
+    assert dst_blocks == [11]
+    assert [meta["block_ids"] for meta in submitted_meta["tp_metas"]] == [[101], [201]]
 
 
 def test_nccl_handoff_does_not_filter_source_push(handoff_loop):

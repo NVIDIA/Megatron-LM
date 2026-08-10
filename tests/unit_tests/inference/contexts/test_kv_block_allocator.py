@@ -228,10 +228,12 @@ def test_retain_memory_blocks_adds_one_reference_per_owner():
     allocator.retain_memory_blocks([block_id])
     assert allocator.block_ref_counts[block_id].item() == 3
 
+    allocator.retain_memory_blocks([block_id, block_id])
+    assert allocator.block_ref_counts[block_id].item() == 5
+
     allocator.release_memory_blocks(block)
     allocator.release_memory_blocks(block)
-    assert allocator.block_ref_counts[block_id].item() == 1
-    allocator.release_memory_blocks(block)
+    allocator.release_memory_blocks(torch.tensor([block_id, block_id, block_id]))
     assert allocator.block_ref_counts[block_id].item() == 0
     assert 101 not in allocator.kv_hash_to_block_id
 

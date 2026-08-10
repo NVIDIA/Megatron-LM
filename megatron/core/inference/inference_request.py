@@ -99,6 +99,7 @@ def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -
     Args:
         prompt_tokens: All prompt token IDs, shape [seq_len].
         block_size: Number of tokens per block.
+
     Returns:
         List of positive integer hash values in [1, 2^63-1], one per complete block.
     """
@@ -388,7 +389,8 @@ class DynamicInferenceRequest(InferenceRequest):
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
 
-    # KV handoff metadata for decode-side NIXL pulls.
+    # KV handoff metadata describing this request's pinned prefill state.
+    # Used by decode-side pulls and prefill-side pushes.
     # Shape: {"request_id", "block_ids", "kv_meta"}.
     disaggregated_params: Optional[dict] = None
 

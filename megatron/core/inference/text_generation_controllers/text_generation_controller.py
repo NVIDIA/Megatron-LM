@@ -5,7 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
@@ -175,6 +175,8 @@ class _AsyncScheduleRequestResult:
     survivor_idxs: Optional[Tensor] = None
     newly_paused_request_ids: Optional[Tensor] = None
     evict_request_ids: Optional[Tensor] = None
+    finished_handoff_block_ids: Dict[int, List[int]] = field(default_factory=dict)
+    finished_handoff_decode_tokens: Dict[int, List[int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -1888,6 +1890,41 @@ class TextGenerationController:
             if request_id in stop_word_finished_ids:
                 active_request_mask[idx] = 0
 
+    def _collect_finished_handoff_state(
+        self,
+        finished_idxs: Tensor,
+        sampled_tokens_cpu: Tensor,
+        sampled_mtp_tokens_cpu: Optional[Tensor],
+    ) -> Tuple[Dict[int, List[int]], Dict[int, List[int]]]:
+        """Retain completed prompt blocks and capture tokens needed to resume decode."""
+
+        context = self.inference_wrapped_model.inference_context
+        allocator = context.kv_block_allocator
+        finished_block_ids: Dict[int, List[int]] = {}
+        decode_tokens_by_request: Dict[int, List[int]] = {}
+        if not allocator.enable_handoff_pinning or finished_idxs.numel() == 0:
+            return finished_block_ids, decode_tokens_by_request
+
+        for finished_idx in finished_idxs.tolist():
+            request_id = int(context.request_ids[finished_idx].item())
+            blocks = context.request_to_kv_block_ids[finished_idx]
+            valid_blocks = [int(block) for block in blocks.tolist() if block != -1]
+            if valid_blocks:
+                finished_block_ids[request_id] = valid_blocks
+                # Retain across context cleanup. For an exclusively owned block:
+                # active=1, retain=2, request cleanup=1, coordinator RELEASE_KV=0.
+                allocator.retain_memory_blocks(valid_blocks)
+
+            active_idx = finished_idx - context.paused_request_count
+            decode_tokens = [int(sampled_tokens_cpu[active_idx].item())]
+            if sampled_mtp_tokens_cpu is not None:
+                decode_tokens.extend(
+                    int(token) for token in sampled_mtp_tokens_cpu[:, active_idx].tolist()
+                )
+            decode_tokens_by_request[request_id] = decode_tokens
+
+        return finished_block_ids, decode_tokens_by_request
+
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
@@ -1961,27 +1998,11 @@ class TextGenerationController:
 
         # Retain finished prefill blocks before request cleanup releases them;
         # the handoff path owns this reference until the decode transfer completes.
-        finished_handoff_block_ids = {}
-        finished_handoff_decode_tokens = {}
-        allocator = context.kv_block_allocator
-        if allocator.enable_handoff_pinning and finished_idxs.numel() > 0:
-            for fidx in finished_idxs.tolist():
-                req_id = int(context.request_ids[fidx].item())
-                blocks = context.request_to_kv_block_ids[fidx]
-                valid = [int(b) for b in blocks.tolist() if b != -1]
-                if valid:
-                    finished_handoff_block_ids[req_id] = valid
-                    # Retain across update_requests(), which releases the active request's
-                    # ownership. For an exclusively owned handoff block: active=1, retain=2,
-                    # request cleanup=1, coordinator RELEASE_KV=0.
-                    allocator.retain_memory_blocks(valid)
-                active_idx = fidx - context.paused_request_count
-                decode_tokens = [int(sampled_tokens_cpu[active_idx].item())]
-                if sampled_mtp_tokens_cpu is not None:
-                    decode_tokens.extend(
-                        int(token) for token in sampled_mtp_tokens_cpu[:, active_idx].tolist()
-                    )
-                finished_handoff_decode_tokens[req_id] = decode_tokens
+        finished_handoff_block_ids, finished_handoff_decode_tokens = (
+            self._collect_finished_handoff_state(
+                finished_idxs, sampled_tokens_cpu, sampled_mtp_tokens_cpu
+            )
+        )
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused buffer.
@@ -2710,6 +2731,15 @@ class TextGenerationController:
         )
         range_pop()
 
+        finished_idxs = (
+            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
+        )
+        finished_handoff_block_ids, finished_handoff_decode_tokens = (
+            self._collect_finished_handoff_state(
+                finished_idxs, sampled_tokens_cpu, sample_result.sampled_mtp_tokens_cpu_view
+            )
+        )
+
         # Resolve CPU request lifecycle state.
         range_push("resolve_requests")
         resolved_finished_request_ids, survivor_idxs = context.resolve_requests(active_request_mask)
@@ -2727,6 +2757,8 @@ class TextGenerationController:
             active_request_ids=active_request_ids,
             finished_request_ids=finished_request_ids,
             survivor_idxs=survivor_idxs,
+            finished_handoff_block_ids=finished_handoff_block_ids,
+            finished_handoff_decode_tokens=finished_handoff_decode_tokens,
         )
 
     def _run_async_sched_update_requests(
@@ -2754,6 +2786,15 @@ class TextGenerationController:
             self._build_async_sched_request_state(sampled_tokens_cpu, resolved_sequence_lengths)
         )
 
+        finished_idxs = (
+            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
+        )
+        finished_handoff_block_ids, finished_handoff_decode_tokens = (
+            self._collect_finished_handoff_state(
+                finished_idxs, sampled_tokens_cpu, sample_result.sampled_mtp_tokens_cpu_view
+            )
+        )
+
         mutable_sampled_tokens_cpu = sampled_tokens_cpu.clone()
         mutable_sampled_mtp_tokens_cpu = (
             sample_result.sampled_mtp_tokens_cpu_view.clone()
@@ -2775,6 +2816,8 @@ class TextGenerationController:
             finished_request_ids=finished_request_ids,
             newly_paused_request_ids=update_result.get("newly_paused_request_ids"),
             evict_request_ids=update_result.get("evict_request_ids"),
+            finished_handoff_block_ids=finished_handoff_block_ids,
+            finished_handoff_decode_tokens=finished_handoff_decode_tokens,
         )
 
     def _build_async_sched_step_result(
@@ -2816,6 +2859,8 @@ class TextGenerationController:
                 "finished_request_ids": request_result.finished_request_ids,
                 "sample": request_result.sampled_tokens_cpu,
                 "finished_routing_block_ids": {},
+                "finished_handoff_block_ids": request_result.finished_handoff_block_ids,
+                "finished_handoff_decode_tokens": request_result.finished_handoff_decode_tokens,
                 "newly_paused_request_ids": request_result.newly_paused_request_ids,
                 "evict_request_ids": request_result.evict_request_ids,
                 "accepted_tokens": request_result.accepted_tokens_cpu,

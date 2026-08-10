@@ -37,8 +37,8 @@ class PendingKvImport:
     cached_prefix_block_count: int
     handle: Any
     future: asyncio.Future
-    resume_tokens: List[int] = field(default_factory=list)
-    continuation_blocks: List[int] = field(default_factory=list)
+    resume_tokens: List[int] = field(default_factory=list)  # Sampled token, then MTP proposals.
+    continuation_blocks: List[int] = field(default_factory=list)  # Empty KV for resume writes.
     local_error: Exception | None = None  # Exact local error, if this rank failed.
     destinations_safe: bool = True  # Whether allocated blocks may return to the pool.
-    terminal_state_reported: bool = False  # This rank sent its completion report.
+    terminal_state_reported: bool = False  # Avoid repeat reports and premature block reuse.

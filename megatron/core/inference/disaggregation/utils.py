@@ -70,20 +70,24 @@ def drop_transfer_prefix_blocks(
     if prefix_count < 0:
         raise ValueError("transfer prefix count must be non-negative")
 
-    trimmed_src_blocks = list(src_block_ids[prefix_count:])
-    if not isinstance(peer_meta, dict) or "pp_metas" not in peer_meta:
-        return peer_meta, trimmed_src_blocks
+    def trim_metadata(value: Any) -> Any:
+        if isinstance(value, list):
+            return [trim_metadata(entry) for entry in value]
+        if not isinstance(value, dict):
+            return value
 
-    trimmed_meta = dict(peer_meta)
-    trimmed_stages = []
-    for stage in peer_meta["pp_metas"]:
-        stage = dict(stage)
-        stage_blocks = list(stage.get("block_ids", []))
-        if prefix_count > len(stage_blocks):
-            raise ValueError(
-                f"cannot remove {prefix_count} blocks from a {len(stage_blocks)}-block PP stage"
-            )
-        stage["block_ids"] = stage_blocks[prefix_count:]
-        trimmed_stages.append(stage)
-    trimmed_meta["pp_metas"] = trimmed_stages
-    return trimmed_meta, trimmed_src_blocks
+        trimmed = dict(value)
+        if "block_ids" in trimmed:
+            block_ids = list(trimmed["block_ids"])
+            if prefix_count > len(block_ids):
+                raise ValueError(
+                    f"cannot remove {prefix_count} blocks from a {len(block_ids)}-block peer"
+                )
+            trimmed["block_ids"] = block_ids[prefix_count:]
+        for key in ("pp_metas", "tp_metas"):
+            if key in trimmed:
+                trimmed[key] = trim_metadata(trimmed[key])
+        return trimmed
+
+    trimmed_src_blocks = list(src_block_ids[prefix_count:])
+    return trim_metadata(peer_meta), trimmed_src_blocks
