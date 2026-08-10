@@ -15,12 +15,18 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     pack_thd_forward_kwargs,
+    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
+from megatron.lite.primitive.quantization import (
+    QATSpec,
+    apply_qat_to_chunks,
+    normalize_qat_spec,
+)
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
@@ -87,6 +93,7 @@ class ImplConfig:
     mtp_detach_encoder: bool = False
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
+    qat: QATSpec | dict | None = None
 
 
 def build_model_config(source: str | Path | dict, **overrides) -> KimiK2Config:
@@ -208,6 +215,9 @@ def build_model(model_cfg: KimiK2Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
         for chunk in chunks:
             apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
+
+    # Parametrize before optimizer construction so it captures the BF16 master.
+    apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
 
     optimizer = None
     finalize_grads = None

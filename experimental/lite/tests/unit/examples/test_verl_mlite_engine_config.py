@@ -10,7 +10,6 @@ VERL_EXAMPLE_ROOT = Path(__file__).resolve().parents[3] / "examples" / "verl"
 if str(VERL_EXAMPLE_ROOT) not in sys.path:
     sys.path.insert(0, str(VERL_EXAMPLE_ROOT))
 
-
 from megatron.lite.runtime.contracts import LossContext
 
 pytestmark = pytest.mark.optional
@@ -78,12 +77,32 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
         num_microbatches=num_microbatches,
         output_lst=outputs,
     )
+    assert hook.runtime_output_loss_scale == 1 / num_microbatches
     for _ in range(num_microbatches):
         loss, _ = hook({}, object(), LossContext(source_batch=object()))
         (loss / num_microbatches).backward()
 
     torch.testing.assert_close(weight.grad, torch.tensor(3.0))
     assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
+
+
+def test_verl_loss_hook_has_no_strong_self_reference():
+    engine = _engine(engine_config=_engine_config())
+    hook = engine._make_runtime_loss_fn(None, num_microbatches=1)
+
+    assert all(cell.cell_contents is not hook for cell in (hook.__closure__ or ()))
+
+
+def test_verl_loss_hook_honors_runtime_output_collector():
+    engine = _engine(engine_config=_engine_config())
+    outputs = []
+    engine._build_verl_model_output = lambda **_kwargs: {"log_probs": torch.tensor(1.0)}
+    hook = engine._make_runtime_loss_fn(None, num_microbatches=1, output_lst=outputs)
+
+    hook.runtime_collects_outputs = True
+    hook({}, object(), LossContext(source_batch=object()))
+
+    assert outputs == []
 
 
 def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> None:
@@ -181,6 +200,84 @@ def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
             "target": "vllm",
         },
     }
+
+
+def test_qwen3_moe_online_weight_export_does_not_pass_unsupported_target() -> None:
+    engine = _engine(engine_config=_engine_config())
+    engine.model_config.hf_config = {"model_type": "qwen3_moe"}
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            captured["kwargs"] = kwargs
+            return iter(())
+
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine._initial_sync_cache_cleared = True
+
+    weights, metadata = engine.get_per_tensor_param()
+
+    assert list(weights) == []
+    assert metadata is None
+    assert "target" not in captured["kwargs"]
+
+
+def test_online_qat_export_wraps_mlite_hf_weight_stream(monkeypatch) -> None:
+    engine = _engine(
+        engine_config=_engine_config(
+            qat={
+                "enable": True,
+                "apply_modelopt_fake_quant": False,
+                "mode": "mxfp4",
+                "group_size": 32,
+                "ignore_patterns": ["lm_head"],
+            }
+        )
+    )
+    source_weights = iter(
+        [("model.layers.0.mlp.experts.0.gate_proj.weight", torch.ones(2, 32))]
+    )
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            return source_weights
+
+    def fake_export(weights, modules, qat_config, bridge):
+        captured.update(
+            weights=weights,
+            modules=modules,
+            qat_config=qat_config,
+            bridge=bridge,
+        )
+        return iter([("packed.weight", torch.ones(2, 16, dtype=torch.uint8))])
+
+    fake_modelopt = types.ModuleType("verl.utils.modelopt")
+    fake_modelopt.export_qat_weights = fake_export
+    monkeypatch.setitem(sys.modules, "verl.utils.modelopt", fake_modelopt)
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine.module = object()
+    engine._initial_sync_cache_cleared = True
+
+    weights, metadata = engine.get_per_tensor_param()
+
+    assert [name for name, _ in weights] == ["packed.weight"]
+    assert metadata is None
+    assert captured["weights"] is source_weights
+    assert captured["modules"] == [engine.module]
+    assert captured["bridge"] is None
+    assert captured["qat_config"].mode == "mxfp4"
+    assert captured["qat_config"].group_size == 32
+    assert captured["qat_config"].apply_modelopt_fake_quant is False
+
+
+def test_qat_export_rejects_native_resync_format_double_quantization() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _engine_config(qat={"enable": True, "mode": "mxfp4"}, resync_format="mxfp4")
 
 
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:

@@ -82,7 +82,9 @@ def _environment_markers(item) -> tuple[tuple[str, str | None], ...]:
             raise MarkerError("env accepts keyword arguments only")
         unknown = set(marker.kwargs) - ENVIRONMENT_VARIABLES
         if unknown:
-            raise MarkerError("env contains unsupported variables: " + ", ".join(sorted(unknown)))
+            raise MarkerError(
+                "env contains unsupported variables: " + ", ".join(sorted(unknown))
+            )
         for name, value in marker.kwargs.items():
             if value is not None and not isinstance(value, str):
                 raise MarkerError(f"env value for {name} must be a string or None")

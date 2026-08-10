@@ -3,12 +3,10 @@
 
 from __future__ import annotations
 
-import inspect
 import os
 from contextlib import nullcontext
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
@@ -17,8 +15,8 @@ from megatron.lite.model.kimi_k2.config import KimiK2Config
 from megatron.lite.primitive.modules.attention import MultiLatentAttention
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
-from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
+from megatron.lite.primitive.modules.router import SigmoidTopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
@@ -37,12 +35,6 @@ from megatron.lite.primitive.parallel import (
     scatter_to_sequence_parallel,
 )
 from megatron.lite.primitive.utils import build_fp8_recipe
-from megatron.lite.primitive.utils.moe import (
-    compute_routing_scores_for_aux_loss,
-    router_gating_linear,
-    switch_load_balancing_loss_func,
-    topk_routing_with_score_function,
-)
 
 _SP_GRAD_SUFFIXES: tuple[str, ...] = (
     ".input_layernorm.weight",
@@ -76,140 +68,6 @@ def _reduce_scatter_to_sequence_parallel(x: torch.Tensor, ps: ParallelState) -> 
     if ps.tp_size == 1:
         return x
     return ReduceScatterDim0.apply(x, ps.tp_size, ps.tp_rank, ps.tp_group)
-
-
-def _ordered_topk_from_routing_map(
-    probs_dense: torch.Tensor, routing_map: torch.Tensor, topk: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    expert_ids = torch.arange(
-        probs_dense.size(-1), device=probs_dense.device, dtype=torch.long
-    ).expand_as(routing_map)
-    masked_ids = torch.where(
-        routing_map, expert_ids, torch.full_like(expert_ids, probs_dense.size(-1))
-    )
-    topk_indices = torch.sort(masked_ids, dim=-1).values[:, :topk]
-    topk_scores = torch.gather(probs_dense, dim=-1, index=topk_indices)
-    return topk_scores, topk_indices
-
-
-def _router_linear(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    router_dtype: torch.dtype,
-) -> torch.Tensor:
-    if x.is_cuda:
-        return router_gating_linear(x, weight, bias, router_dtype)
-    return F.linear(
-        x.to(router_dtype),
-        weight.to(router_dtype),
-        None if bias is None else bias.to(router_dtype),
-    )
-
-
-def _topk_routing_supports_groups() -> bool:
-    params = inspect.signature(topk_routing_with_score_function).parameters
-    return "num_groups" in params and "group_topk" in params
-
-
-class KimiK2SigmoidTopKRouter(nn.Module):
-    """Kimi K2 sigmoid router with group-limited routing and persistent expert bias."""
-
-    def __init__(
-        self,
-        config: KimiK2Config,
-        ps: ParallelState,
-        *,
-        router_bias_rate: float = 0.0,
-        compute_aux_loss: bool = True,
-        use_pre_softmax: bool = False,
-        moe_router_fusion: bool = False,
-    ):
-        super().__init__()
-        if router_bias_rate > 0:
-            raise NotImplementedError(
-                "Kimi K2 expert-bias EMA update is not implemented in lite yet."
-            )
-        self.topk = config.num_experts_per_tok
-        self.num_experts = config.n_routed_experts
-        self.aux_loss_coeff = config.aux_loss_alpha
-        self.scaling_factor = config.routed_scaling_factor
-        self.num_groups = config.n_group
-        self.group_topk = config.topk_group
-        self.router_bias_rate = router_bias_rate
-        self.compute_aux_loss = compute_aux_loss
-        self.use_pre_softmax = use_pre_softmax
-        self.moe_router_fusion = moe_router_fusion
-
-        self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
-        self.register_buffer(
-            "expert_bias",
-            torch.zeros(config.n_routed_experts, dtype=torch.float32),
-            persistent=True,
-        )
-        self.register_buffer(
-            "local_tokens_per_expert",
-            torch.zeros(config.n_routed_experts, dtype=torch.float32),
-            persistent=False,
-        )
-        self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
-
-    def _apply(self, fn):
-        super()._apply(fn)
-        self.expert_bias.data = self.expert_bias.data.float()
-        self.local_tokens_per_expert.data = self.local_tokens_per_expert.data.float()
-        return self
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = _router_linear(x, self.gate.weight, None, torch.float32)
-        logits = logits.view(-1, self.num_experts)
-        num_tokens = logits.size(0)
-        routing_kwargs = {}
-        if self.num_groups is not None and self.group_topk is not None:
-            if not _topk_routing_supports_groups():
-                raise NotImplementedError(
-                    "topk_routing_with_score_function does not support group-limited routing."
-                )
-            routing_kwargs = dict(num_groups=self.num_groups, group_topk=self.group_topk)
-        probs_dense, routing_map = topk_routing_with_score_function(
-            logits,
-            self.topk,
-            use_pre_softmax=self.use_pre_softmax,
-            score_function="sigmoid",
-            expert_bias=self.expert_bias.to(logits.dtype),
-            scaling_factor=(self.scaling_factor or None),
-            fused=self.moe_router_fusion,
-            **routing_kwargs,
-        )
-        if torch.is_grad_enabled():
-            with torch.no_grad():
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
-        topk_scores, topk_indices = _ordered_topk_from_routing_map(
-            probs_dense, routing_map, self.topk
-        )
-        topk_scores = topk_scores.to(logits.dtype)
-
-        if self.compute_aux_loss and self.training and torch.is_grad_enabled():
-            _, aux_scores = compute_routing_scores_for_aux_loss(
-                logits, self.topk, score_function="sigmoid", fused=self.moe_router_fusion
-            )
-            tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
-            total_num_tokens = num_tokens
-            if self._aux_loss_group is not None:
-                dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
-            aux_loss = switch_load_balancing_loss_func(
-                aux_scores,
-                tokens_per_expert,
-                total_num_tokens,
-                self.topk,
-                self.num_experts,
-                self.aux_loss_coeff,
-                fused=False,
-            )
-            topk_scores = MoEAuxLossAutoScaler.apply(topk_scores, aux_loss)
-
-        return topk_scores, topk_indices
 
 
 class DenseMLP(nn.Module):
@@ -277,12 +135,14 @@ class MoELayer(nn.Module):
         super().__init__()
         if fp8:
             raise NotImplementedError("Kimi K2 lite MoE fp8 training is not implemented yet.")
-        self.router = KimiK2SigmoidTopKRouter(
+        self.router = SigmoidTopKRouter(
             config,
             ps,
             router_bias_rate=router_bias_rate,
             compute_aux_loss=True,
             use_pre_softmax=True,
+            router_dtype=torch.float32,
+            expert_bias_persistent=True,
         )
         self.experts = Experts(
             config,

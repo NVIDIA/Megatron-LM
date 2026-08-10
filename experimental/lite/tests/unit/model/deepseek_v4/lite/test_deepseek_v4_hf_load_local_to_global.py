@@ -14,13 +14,36 @@ on-disk safetensors keyed by GLOBAL names. ``load_hf_weights`` must copy each
 local layer the GLOBAL layer's tensor; pre-fix it resolves local names, finds
 nothing, and leaves the params untouched.
 """
+
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.utils.parametrize as parametrize
+
+
+def _checkpoint_module():
+    checkpoint_path = (
+        Path(__file__).resolve().parents[3]
+        / "megatron"
+        / "lite"
+        / "model"
+        / "deepseek_v4"
+        / "lite"
+        / "checkpoint.py"
+    )
+    module_spec = importlib.util.spec_from_file_location(
+        "_deepseek_v4_checkpoint_test", checkpoint_path
+    )
+    assert module_spec is not None and module_spec.loader is not None
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    return module
 
 
 class _LayerNorm(nn.Module):
@@ -35,6 +58,14 @@ class _Block(nn.Module):
         self.input_layernorm = _LayerNorm(dim)
 
 
+class _QATBlock(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.self_attn = nn.Module()
+        self.self_attn.self_attn = nn.Module()
+        self.self_attn.self_attn.wq_a = nn.Linear(dim, dim, bias=False)
+
+
 class _Stage(nn.Module):
     """A non-first PP stage: layers keyed by LOCAL position, ``layer_indices``
     gives the GLOBAL ids it owns (e.g. [4, 5] for the 3rd stage of pp)."""
@@ -42,14 +73,30 @@ class _Stage(nn.Module):
     def __init__(self, global_ids: list[int], dim: int):
         super().__init__()
         self.layer_indices = list(global_ids)
-        self.layers = nn.ModuleDict({str(i): _Block(dim) for i in range(len(global_ids))})
+        self.layers = nn.ModuleDict(
+            {str(i): _Block(dim) for i in range(len(global_ids))}
+        )
+
+
+class _QATStage(nn.Module):
+    def __init__(self, global_ids: list[int], dim: int):
+        super().__init__()
+        self.layer_indices = list(global_ids)
+        self.layers = nn.ModuleDict(
+            {str(i): _QATBlock(dim) for i in range(len(global_ids))}
+        )
+
+
+def test_ds4_dynamic_load_map_has_no_blanket_optional_escape_hatch():
+    ckpt = _checkpoint_module()
+    assert not hasattr(ckpt.DeepseekV4WeightSpec, "optional_for_load")
 
 
 def test_ds4_load_hf_resolves_local_pp_layer_to_global(tmp_path):
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
     from safetensors.torch import save_file
 
-    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-    from megatron.lite.model.deepseek_v4.lite import checkpoint as ckpt
+    ckpt = _checkpoint_module()
 
     dim = 4
     global_ids = [4, 5]  # this stage owns global layers 4 and 5, keyed local 0 and 1
@@ -60,7 +107,10 @@ def test_ds4_load_hf_resolves_local_pp_layer_to_global(tmp_path):
     # Real-release layout is keyed by GLOBAL layer index; input_layernorm maps to
     # the bare V4-Flash ``attn_norm.weight``.
     save_file(
-        {f"layers.{g}.attn_norm.weight": torch.full((dim,), float(g)) for g in global_ids},
+        {
+            f"layers.{g}.attn_norm.weight": torch.full((dim,), float(g))
+            for g in global_ids
+        },
         str(tmp_path / "model.safetensors"),
     )
 
@@ -76,9 +126,34 @@ def test_ds4_load_hf_resolves_local_pp_layer_to_global(tmp_path):
     )
 
 
+def test_ds4_load_hf_canonicalizes_qat_state_before_dynamic_mapping(tmp_path):
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+    from safetensors.torch import save_file
+
+    ckpt = _checkpoint_module()
+    dim = 4
+    model = _QATStage([4], dim)
+    linear = model.layers["0"].self_attn.self_attn.wq_a
+    parametrize.register_parametrization(linear, "weight", nn.Identity())
+    master = linear.parametrizations.weight.original
+    master.data.zero_()
+
+    expected = torch.arange(dim * dim, dtype=torch.float32).reshape(dim, dim)
+    save_file(
+        {"layers.4.attn.wq_a.weight": expected}, str(tmp_path / "model.safetensors")
+    )
+
+    cfg = DeepseekV4Config(num_hidden_layers=8, n_routed_experts=8)
+    ps = SimpleNamespace(tp_size=1, etp_size=1, ep_size=1, ep_rank=0)
+    ckpt.load_hf_weights(model, str(tmp_path), cfg, ps)
+
+    torch.testing.assert_close(master, expected)
+
+
 def test_ds4_export_streams_router_buffers_from_every_pp_stage(monkeypatch):
-    from megatron.lite.model.deepseek_v4.lite import checkpoint as ckpt
     from megatron.lite.primitive.ckpt import hf_weights
+
+    ckpt = _checkpoint_module()
 
     class Gate(nn.Module):
         def __init__(self):
@@ -98,25 +173,55 @@ def test_ds4_export_streams_router_buffers_from_every_pp_stage(monkeypatch):
             self.layers = nn.ModuleDict({"0": Layer()})
 
     remote = torch.tensor([3, 1, 4], dtype=torch.int64)
+    remote_headers = iter(
+        [
+            [
+                (
+                    "layers.0.mlp.gate.tid2eid",
+                    tuple(remote.shape),
+                    remote.dtype,
+                )
+            ],
+            [],
+        ]
+    )
 
     def fake_broadcast_object_list(header, *, src, **_kwargs):
         if src == 0:
-            header[0] = [("layers.0.ffn.gate.tid2eid", tuple(remote.shape), remote.dtype)]
+            header[0] = next(remote_headers)
 
     def fake_broadcast(tensor, *, src, **_kwargs):
         if src == 0:
             tensor.copy_(remote)
 
-    monkeypatch.setattr(hf_weights, "export_hf_weights", lambda *_args, **_kwargs: iter(()))
-    monkeypatch.setattr(ckpt.dist, "get_rank", lambda: 1)
-    monkeypatch.setattr(ckpt.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(ckpt.dist, "broadcast_object_list", fake_broadcast_object_list)
-    monkeypatch.setattr(ckpt.dist, "broadcast", fake_broadcast)
+    monkeypatch.setattr(hf_weights.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(hf_weights.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        hf_weights.dist, "broadcast_object_list", fake_broadcast_object_list
+    )
+    monkeypatch.setattr(hf_weights.dist, "broadcast", fake_broadcast)
 
-    ps = SimpleNamespace(pp_size=2, pp_rank=1, pp_global_ranks=[0, 1], pp_group=object())
-    cfg = SimpleNamespace(num_hash_layers=1, vocab_size=8)
+    ps = SimpleNamespace(
+        pp_size=2,
+        pp_rank=1,
+        pp_global_ranks=[0, 1],
+        pp_group=object(),
+        tp_size=1,
+        tp_group=None,
+        ep_size=1,
+        ep_group=None,
+        etp_size=1,
+        etp_group=None,
+    )
+    cfg = SimpleNamespace(num_hash_layers=1, n_routed_experts=1, vocab_size=8)
 
     exported = dict(ckpt._export_unquantized_weights(StageOne(), cfg, ps))
 
-    assert torch.equal(exported["layers.0.ffn.gate.tid2eid"], remote)
-    assert torch.equal(exported["layers.1.ffn.gate.bias"], torch.tensor([0.25, -0.5]))
+    assert torch.equal(
+        exported["layers.0.ffn.gate.tid2eid"],
+        remote.to(exported["layers.0.ffn.gate.tid2eid"].device),
+    )
+    assert torch.equal(
+        exported["layers.1.ffn.gate.bias"],
+        torch.tensor([0.25, -0.5], device=exported["layers.1.ffn.gate.bias"].device),
+    )

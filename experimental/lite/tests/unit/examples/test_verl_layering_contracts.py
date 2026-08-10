@@ -52,7 +52,9 @@ def _import_violations() -> list[str]:
         for lineno, module in _imported_modules(path):
             for prefix in DENIED_IMPORT_PREFIXES:
                 if _matches_prefix(module, prefix):
-                    found.append(f"{relative_path}:{lineno}: {module} matches denied {prefix}")
+                    found.append(
+                        f"{relative_path}:{lineno}: {module} matches denied {prefix}"
+                    )
     return found
 
 
@@ -98,6 +100,7 @@ def test_verl_connector_import_boundaries() -> None:
 
 def test_verl_mlite_layer_does_not_see_model_internal_batch_fields() -> None:
     violations = _violations(
-        _python_files(VERL_MLITE_ROOT), {"packed_seq_params", "position_ids", "to_bridge_dict"}
+        _python_files(VERL_MLITE_ROOT),
+        {"packed_seq_params", "position_ids", "to_bridge_dict"},
     )
     assert violations == []
