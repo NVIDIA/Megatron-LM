@@ -15,6 +15,7 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 import enum
+import weakref
 from collections.abc import Callable
 from functools import partial
 from typing import Literal, cast
