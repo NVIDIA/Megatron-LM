@@ -17,6 +17,7 @@
 from .dbuffer import DBuffer
 from .fully_shard import fully_shard, microbatch
 from .optimizer import fully_shard_optimizer
+from .orthogonalized_optimizer import FsdpMuon, FsdpOrthogonalizedOptimizer
 from .placement import Flat, Partial, Placement, Placements, Replicate
 
 __all__ = [

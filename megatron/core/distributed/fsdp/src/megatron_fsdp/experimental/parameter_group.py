@@ -29,7 +29,7 @@ from .placement import Partial, Placements, Replicate, changed_mesh_axis
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
 
-def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
+def get_containing_parameter_group(parameter: torch.Tensor) -> "FsdpParameterGroup | None":
     """Return the FSDP parameter group that owns ``parameter``, if any."""
     return getattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, None)
 
