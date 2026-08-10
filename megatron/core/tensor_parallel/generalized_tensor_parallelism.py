@@ -42,7 +42,7 @@ from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     register_capture_comm,
     register_capture_wgrad_ring_slot,
 )
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import ensure_params_ready, log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -1222,6 +1222,18 @@ class GTPShardedParam(torch.nn.Parameter):
         nvtx_range_push(f"{nvtx_label}.all_gather_weight")
 
         weights = self._weights
+
+        # 0. Publish the shards before reading them. EVERY chain prefetches ahead of the module
+        #    that owns the target weight -- default chains by one weight, grouped-expert chains by
+        #    one MoE block -- so that module's DDP pre-hook may not have run and the shard can
+        #    still hold last iteration's values. Reading further ahead widens the window, not
+        #    creates it. No-op when no backend owns the parameter, or it is already published.
+        #
+        #    FORWARD ONLY. Backward re-reads what forward published; recompute is a forward
+        #    replayed inside backward, where publishing could dispatch an all-gather into the
+        #    buffer that aliases grads under --reuse-grad-buf-for-mxfp8-param-ag.
+        if fwd and not in_fp8_activation_recompute_phase():
+            ensure_params_ready(weights)
 
         # 1. Transition state for async gathers. Skip during recompute-forward: it gathers
         #    rowwise (_ag_ticket_fwd) while a bwd-chain prefetch may hold an in-flight columnwise
