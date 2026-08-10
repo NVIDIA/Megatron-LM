@@ -32,7 +32,6 @@ configuration
 span-groups
 metrics
 pipeline-parallel
-observability-stack
 extending
 ```
 
@@ -81,4 +80,4 @@ By default, only **one rank** exports (the last rank). For multi-rank telemetry,
 
 - Lens configuration model and env vars: [lens: configuration](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/configuration.md)
 - Instrumentation primitives (`managed_span`, `trace_fn`, `span_cm`): [lens: instrumentation](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/instrumentation.md)
-- Observability stack (docker-compose): [Observability Stack](observability-stack.md)
+- Sending telemetry to a backend: [lens: backends](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/observability/backends.md)

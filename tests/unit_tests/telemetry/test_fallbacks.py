@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for ``megatron.core.telemetry._fallbacks``.
+"""Unit tests for ``megatron.core.telemetry.fallbacks``.
 
 Call sites import these five names unconditionally, so they must exist and be
 callable whether or not ``nemo-lens`` is installed. The no-op behaviour
@@ -9,7 +9,7 @@ assertions only hold for the local stubs, so they skip when lens is present.
 
 import pytest
 
-from megatron.core.telemetry import _fallbacks
+from megatron.core.telemetry import fallbacks
 
 try:
     import nemo.lens  # noqa: F401
@@ -37,7 +37,7 @@ class TestPublicSurface:
         ],
     )
     def test_name_is_exported_and_callable(self, name):
-        assert callable(getattr(_fallbacks, name))
+        assert callable(getattr(fallbacks, name))
 
 
 @requires_no_lens
@@ -46,11 +46,11 @@ class TestTraceFn:
         def original(a, b):
             return a + b
 
-        decorated = _fallbacks.trace_fn("job", "megatron.train")(original)
+        decorated = fallbacks.trace_fn("job", "megatron.train")(original)
         assert decorated is original
 
     def test_decorated_function_still_works(self):
-        @_fallbacks.trace_fn("job", "megatron.train")
+        @fallbacks.trace_fn("job", "megatron.train")
         def add(a, b):
             return a + b
 
@@ -60,38 +60,38 @@ class TestTraceFn:
         def original():
             return None
 
-        assert _fallbacks.trace_fn("job", "megatron.train", tracer=object())(original) is original
+        assert fallbacks.trace_fn("job", "megatron.train", tracer=object())(original) is original
 
 
 @requires_no_lens
 class TestManagedSpan:
     def test_yields_none(self):
-        with _fallbacks.managed_span("job", "megatron.train") as span:
+        with fallbacks.managed_span("job", "megatron.train") as span:
             assert span is None
 
     def test_accepts_arbitrary_attributes(self):
-        with _fallbacks.managed_span("job", "megatron.train", iteration=7, rank=0) as span:
+        with fallbacks.managed_span("job", "megatron.train", iteration=7, rank=0) as span:
             assert span is None
 
     def test_propagates_exceptions_from_the_body(self):
         with pytest.raises(ValueError, match="boom"):
-            with _fallbacks.managed_span("job", "megatron.train"):
+            with fallbacks.managed_span("job", "megatron.train"):
                 raise ValueError("boom")
 
 
 @requires_no_lens
 class TestSpanCm:
     def test_yields_none(self):
-        with _fallbacks.span_cm("megatron.train") as span:
+        with fallbacks.span_cm("megatron.train") as span:
             assert span is None
 
     def test_accepts_record_exception_and_attributes(self):
-        with _fallbacks.span_cm("megatron.train", record_exception=False, rank=3) as span:
+        with fallbacks.span_cm("megatron.train", record_exception=False, rank=3) as span:
             assert span is None
 
     def test_propagates_exceptions_from_the_body(self):
         with pytest.raises(ValueError, match="boom"):
-            with _fallbacks.span_cm("megatron.train"):
+            with fallbacks.span_cm("megatron.train"):
                 raise ValueError("boom")
 
 
@@ -100,15 +100,15 @@ class TestIsSpanGroupEnabled:
     @pytest.mark.parametrize("group", ["job", "step", "microbatch", "not_a_real_group"])
     def test_always_false(self, group):
         """Every group is off, so gated instrumentation stays dormant."""
-        assert _fallbacks.is_span_group_enabled(group) is False
+        assert fallbacks.is_span_group_enabled(group) is False
 
 
 @requires_no_lens
 class TestSafeSetSpanAttributes:
     def test_accepts_a_none_span(self):
-        assert _fallbacks.safe_set_span_attributes(None, {"iteration": 7}) is None
+        assert fallbacks.safe_set_span_attributes(None, {"iteration": 7}) is None
 
     def test_accepts_redact_keys(self):
         assert (
-            _fallbacks.safe_set_span_attributes(None, {"token": "x"}, redact_keys=["token"]) is None
+            fallbacks.safe_set_span_attributes(None, {"token": "x"}, redact_keys=["token"]) is None
         )

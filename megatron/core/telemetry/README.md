@@ -14,7 +14,7 @@ throughput, gradient norm) that export to any OTLP-compatible backend.
 megatron/core/telemetry/
 ├── span_groups.py       — MegatronSpanGroup: Megatron-specific span groups.
 ├── training_metrics.py  — OTel instruments for the training loop.
-├── _fallbacks.py        — No-op shims for when nemo-lens is not installed.
+├── fallbacks.py         — No-op shims for when nemo-lens is not installed.
 └── __init__.py
 ```
 
@@ -24,7 +24,7 @@ Resource detection and the instrumentation primitives themselves live in
 ## Optional dependencies
 
 Nothing here requires `nemo-lens` or `opentelemetry` to import. Both are
-optional: when neither is installed, `_fallbacks` supplies no-op decorators and
+optional: when neither is installed, `fallbacks` supplies no-op decorators and
 context managers, `span_groups` falls back to a local `SpanGroup` stub, and
 `record_training_metrics()` returns immediately. Call sites can therefore import
 from this module unconditionally.
@@ -45,7 +45,6 @@ call-site instrumentation.
 | Span groups and span hierarchy | [span-groups.md](../../../docs/user-guide/observability/span-groups.md) |
 | Training and inference metrics | [metrics.md](../../../docs/user-guide/observability/metrics.md) |
 | Pipeline-parallel trace correlation | [pipeline-parallel.md](../../../docs/user-guide/observability/pipeline-parallel.md) |
-| Local docker-compose stack | [observability-stack.md](../../../docs/user-guide/observability/observability-stack.md) |
 | Adding new instrumentation | [extending.md](../../../docs/user-guide/observability/extending.md) |
 
 For the generic `nemo-lens` documentation (configuration model, instrumentation

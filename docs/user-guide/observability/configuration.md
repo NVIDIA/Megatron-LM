@@ -108,17 +108,19 @@ python examples/run_simple_mcore_train_loop.py
 
 Spans and metrics print to stdout.
 
-### Local stack (Jaeger + Prometheus + Grafana)
+### Local collector
+
+Point Megatron at an OTLP endpoint on localhost — an OpenTelemetry Collector, or
+a backend such as Jaeger that accepts OTLP directly:
 
 ```bash
-docker compose -f docker-compose.otel.yml up -d
-
 export MEGATRON_OTEL_ENABLED=1
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 torchrun --nproc_per_node=8 pretrain_gpt.py ...
 ```
 
-UI: Jaeger at `:16686`, Grafana at `:3000`. See [Observability Stack](observability-stack.md).
+For a local stack to send this to, see
+[lens: sending telemetry to a backend](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/observability/backends.md).
 
 ### Production with remote collector
 

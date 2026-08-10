@@ -55,11 +55,11 @@ try:
     from nemo.lens.helpers import managed_span as _otel_managed_span
     from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
 except ImportError:
-    from megatron.core.telemetry._fallbacks import managed_span as _otel_managed_span
-    from megatron.core.telemetry._fallbacks import is_span_group_enabled as _otel_sg_enabled
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+    from megatron.core.telemetry.fallbacks import is_span_group_enabled as _otel_sg_enabled
 ```
 
-`megatron/core/telemetry/_fallbacks.py` re-exports from `nemo.lens.fallbacks` when lens is installed, otherwise provides inline no-ops.
+`megatron/core/telemetry/fallbacks.py` re-exports from `nemo.lens.fallbacks` when lens is installed, otherwise provides inline no-ops.
 
 See [lens: optional dependency](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/design/optional-dependency.md).
 
