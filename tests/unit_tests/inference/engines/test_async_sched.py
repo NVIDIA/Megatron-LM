@@ -497,6 +497,7 @@ class _AsyncPairScenario:
     prerequisite: str | None = None
     atol: float = 1.0e-3
     parity: str = "exact"
+    exact_top_n: bool = True
 
 
 _BASE_PAIR_CONFIG = {
@@ -752,6 +753,9 @@ _ASYNC_PAIR_SCENARIOS = (
             {"return_log_probs": True, "skip_prompt_log_probs": True, "top_n_logprobs": 4},
         ),
         signals=("cuda-graph", "logprobs", "mtp", "top-n"),
+        # MTP changes the forward batch shape; near-tied non-selected alternatives
+        # may exchange the final top-N slot while selected-token parity remains exact.
+        exact_top_n=False,
     ),
     _pair_scenario(
         "hybrid-mamba",
@@ -1644,7 +1648,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             scenario.atol,
             compare_events="events" in scenario.signals,
             exact_numerics=scenario.parity == "exact",
-            exact_top_n=scenario.parity == "exact",
+            exact_top_n=scenario.parity == "exact" and scenario.exact_top_n,
         )
         cls._assert_runtime_signals(async_env, scenario, runtime, stop_tokens, termination_token)
         if scenario.parity == "reproducible":
