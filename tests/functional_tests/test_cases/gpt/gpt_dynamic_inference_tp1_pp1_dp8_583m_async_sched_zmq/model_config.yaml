@@ -19,10 +19,10 @@ MODEL_ARGS:
   --no-load-optim: true
   --no-use-tokenizer-model-from-checkpoint-args: true
   --timing-log-level: 0
-  --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1
+  --load: ${CHECKPOINT_LOAD_PATH}/model/mcore_mistral/nemo_minitron-0.5b/v1/
   --distributed-backend: nccl
   --log-interval: 1
-  --transformer-impl: transformer_engine
+  --transformer-impl: inference_optimized
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 1
   --deterministic-mode: true
@@ -39,21 +39,23 @@ MODEL_ARGS:
   --seq-length: 1024
   --temperature: 1.0
   --top_k: 1
+  --return-log-probs: true
+  --num-tokens-to-generate: 30
   --inference-dynamic-batching-buffer-size-gb: 20
+  --inference-dynamic-batching-max-requests: 2
+  --inference-dynamic-batching-prefix-caching: true
+  --inference-dynamic-batching-prefix-caching-coordinator-policy: longest_prefix
+  --inference-dynamic-batching-prefix-caching-routing-alpha: 0.8
+  --inference-use-synchronous-zmq-collectives: true
+  --inference-disable-ep-consensus: true
   --inference-dynamic-batching-async-sched-mode: async
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true # To handle the extra_state errors
   --output-path: ${INFERENCE_OUTPUT_PATH}
-  --output-every-n-results: 32
-  --prompt-file: ${DATA_PATH}/text/sharegpt-vicuna/filtered/processed.jsonl
-  --prompt-file-num-truncate: 12
-  --num-tokens-to-generate: 32
-  --incoming-requests-per-step: 2
-  --inference-dynamic-batching-max-requests: 4
-  --termination-id: -1
-  --inference-repeat-n: 1
+  --prompt-file: ./tests/functional_tests/test_cases/gpt/gpt_dynamic_inference_tp1_pp1_583m_async_sched_prefix_chunk_pressure/prompts.jsonl
+  --incoming-requests-per-step: 4
+  --use-flashinfer-fused-rope: true
   --inference-logging-step-interval: 1
   --compare-async-sched-modes: true
-  --async-sched-min-steps: 2
-  --async-sched-min-compactions: 1
 METRICS: []
+LAUNCHER: ft_launcher

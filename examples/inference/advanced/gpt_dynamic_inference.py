@@ -2,18 +2,22 @@
 
 # pylint: disable=bad-builtin
 
+import copy
+import gc
 import hashlib
 import io
 import json
+import math
 import os
 import sys
 import warnings
 from collections import defaultdict
 from typing import Dict, List, Optional
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
 from tqdm import tqdm
+
+from megatron.training.arguments import parse_and_validate_args
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -26,6 +30,7 @@ from examples.inference.utils import (
     get_curr_time,
     get_global_peak_memory_stats_bytes,
 )
+from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, EngineSuspendedError
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -36,6 +41,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,
@@ -54,6 +60,90 @@ from megatron.training import get_args, get_tokenizer, initialize_megatron
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
+
+
+def add_async_sched_comparison_args(parser):
+    parser = add_inference_args(parser)
+    group = parser.add_argument_group(title="Async scheduling functional comparison")
+    group.add_argument("--compare-async-sched-modes", action="store_true")
+    group.add_argument("--async-sched-min-steps", type=int, default=1)
+    group.add_argument("--async-sched-min-compactions", type=int, default=1)
+    group.add_argument("--async-sched-require-prefix-cache-hit", action="store_true")
+    group.add_argument("--async-sched-require-cuda-graph", action="store_true")
+    group.add_argument("--async-sched-require-early-stop", action="store_true")
+    group.add_argument("--async-sched-add-bos", action="store_true")
+    group.add_argument("--async-sched-use-total-length", action="store_true")
+    group.add_argument("--async-sched-mixed-stop-retention", action="store_true")
+    return parser
+
+
+def _stagger_generation_lengths(requests: List[Request]) -> None:
+    base_length = requests[0].sampling_params.num_tokens_to_generate
+    lengths = (base_length, max(2, base_length // 4), max(3, base_length // 2))
+    for request_idx, request in enumerate(requests):
+        request.sampling_params.num_tokens_to_generate = lengths[request_idx % len(lengths)]
+
+
+def _prompt_length(request: Request) -> int:
+    return len(request.prompt_tokens) + int(request.sampling_params.add_BOS)
+
+
+def _generation_budget(request: Request) -> int:
+    params = request.sampling_params
+    if params.num_tokens_to_generate is not None:
+        return params.num_tokens_to_generate
+    return params.num_tokens_total - _prompt_length(request)
+
+
+def _snapshot_request_outputs(requests: List[Request]) -> list[dict]:
+    return [
+        {
+            "prompt_tokens": request.prompt_tokens,
+            "output_tokens": request.output_tokens,
+            "output_text": request.output_text,
+            "prompt_logprobs": getattr(request, "prompt_log_probs", None),
+            "generated_logprobs": getattr(request, "generated_log_probs", None),
+            "prompt_top_n_logprobs": getattr(request, "prompt_top_n_logprobs", None),
+            "generated_top_n_logprobs": getattr(request, "generated_top_n_logprobs", None),
+        }
+        for request in requests
+    ]
+
+
+def _assert_nested_close(expected, actual, *, atol: float, path: str = "output") -> None:
+    assert type(expected) is type(actual), f"{path}: {type(expected)} != {type(actual)}"
+    if isinstance(expected, dict):
+        assert expected.keys() == actual.keys(), f"{path}: keys differ"
+        for key in expected:
+            _assert_nested_close(expected[key], actual[key], atol=atol, path=f"{path}.{key}")
+    elif isinstance(expected, (list, tuple)):
+        assert len(expected) == len(actual), f"{path}: length {len(expected)} != {len(actual)}"
+        for idx, (expected_item, actual_item) in enumerate(zip(expected, actual)):
+            _assert_nested_close(expected_item, actual_item, atol=atol, path=f"{path}[{idx}]")
+    elif isinstance(expected, float):
+        assert math.isclose(
+            expected, actual, rel_tol=0.0, abs_tol=atol
+        ), f"{path}: {expected} != {actual} (atol={atol})"
+    else:
+        assert expected == actual, f"{path}: {expected!r} != {actual!r}"
+
+
+def _build_engine(model, tokenizer, args, requests, mode: AsyncScheduleMode):
+    inference_config = get_inference_config_from_model_and_args(model, args)
+    inference_config.async_sched_mode = mode
+    inference_config.max_sequence_length = max(
+        _prompt_length(request) + _generation_budget(request) for request in requests
+    )
+    context = DynamicInferenceContext(model.config, inference_config)
+    if not args.enable_chunked_prefill:
+        invalid_lengths = {
+            idx: len(request.prompt_tokens)
+            for idx, request in enumerate(requests)
+            if len(request.prompt_tokens) > context.max_tokens
+        }
+        assert not invalid_lengths, f"prompts longer than context.max_tokens: {invalid_lengths}"
+    controller = TextGenerationController(GPTInferenceWrapper(model, context), tokenizer)
+    return DynamicInferenceEngine(controller, context)
 
 
 def run_inference(
@@ -290,7 +380,7 @@ def main():
     """Run dynamic inference."""
     # Initialize Megatron.
     args = parse_and_validate_args(
-        extra_args_provider=add_inference_args,
+        extra_args_provider=add_async_sched_comparison_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
     initialize_megatron()
@@ -323,36 +413,45 @@ def main():
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         top_n_logprobs=args.top_n_logprobs,
         stop_words=args.stop_words,
+        add_BOS=args.async_sched_add_bos,
     )
 
     model = get_model_for_inference()
 
-    # Requests, context, controller.
     requests = build_requests(args, tokenizer, sampling_params)
-    inference_config = get_inference_config_from_model_and_args(model, args)
-
-    # Calculate max_sequence_length from requests
-    max_gen_length = sampling_params.num_tokens_to_generate
-    max_context_length = max(len(r.prompt_tokens) for r in requests)
-    inference_config.max_sequence_length = max_context_length + max_gen_length
-    context = DynamicInferenceContext(model.config, inference_config)
-    wrapped_model = GPTInferenceWrapper(model, context)
-    controller = TextGenerationController(wrapped_model, tokenizer)
-
-    # Validate all context_length's <= max_tokens.
-    if not args.enable_chunked_prefill:
-        invalid_prompt_length_map = {}
-        for request_idx, request in enumerate(requests):
-            if len(request.prompt_tokens) > context.max_tokens:
-                invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
-        assert (
-            not invalid_prompt_length_map
-        ), "request idxs with prompts longer than context.max_tokens: " ", ".join(
-            f"{k}({v})" for k, v in invalid_prompt_length_map.items()
+    if args.compare_async_sched_modes and len(requests) < 8:
+        requests = [copy.deepcopy(requests[idx % len(requests)]) for idx in range(8)]
+    legacy_outputs = None
+    if args.compare_async_sched_modes:
+        _stagger_generation_lengths(requests)
+        if args.async_sched_mixed_stop_retention:
+            for request_idx, request in enumerate(requests):
+                request.sampling_params.detokenize_stop_sequence = bool(request_idx % 2)
+        if args.async_sched_use_total_length:
+            for request in requests:
+                request.sampling_params.num_tokens_total = (
+                    _prompt_length(request) + request.sampling_params.num_tokens_to_generate
+                )
+                request.sampling_params.num_tokens_to_generate = None
+        legacy_requests = copy.deepcopy(requests)
+        legacy_engine = _build_engine(
+            model, tokenizer, args, legacy_requests, AsyncScheduleMode.LEGACY
         )
+        run_inference(legacy_requests, legacy_engine)
+        assert all(request.state == "finished" for request in legacy_requests)
+        legacy_outputs = _snapshot_request_outputs(legacy_requests)
+        delete_cuda_graphs()
+        del legacy_engine, legacy_requests
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    # Inference engine.
-    engine = DynamicInferenceEngine(controller, context)
+    engine_mode = (
+        AsyncScheduleMode.ASYNC
+        if args.compare_async_sched_modes
+        else AsyncScheduleMode(args.inference_dynamic_batching_async_sched_mode)
+    )
+    engine = _build_engine(model, tokenizer, args, requests, engine_mode)
+    context = engine.context
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
@@ -384,6 +483,28 @@ def main():
     # Validate all requests finished.
     for request in requests:
         assert request.state == "finished", f"request.state == '{request.state}' != 'finished'."
+
+    if args.compare_async_sched_modes:
+        async_outputs = _snapshot_request_outputs(requests)
+        tolerance = 5e-3 if args.model_provider != "gpt" or args.fp8 else 1e-3
+        _assert_nested_close(legacy_outputs, async_outputs, atol=tolerance)
+        assert context.async_sched_step_count >= args.async_sched_min_steps
+        assert context.async_sched_compaction_step_count >= args.async_sched_min_compactions, (
+            f"async compactions {context.async_sched_compaction_step_count} "
+            f"< {args.async_sched_min_compactions}"
+        )
+        assert (
+            len(requests) > context.max_requests
+        ), f"stress requires queued requests: {len(requests)} <= max_requests {context.max_requests}"
+        if args.async_sched_require_cuda_graph:
+            assert result["cuda_graph_request_count_map"], "no CUDA graph replay observed"
+        if args.async_sched_require_prefix_cache_hit:
+            assert engine._prefix_cache_hits > 0, "no prefix-cache hit observed"
+            assert engine._prefill_tokens_skipped > 0, "prefix caching skipped no prefill tokens"
+        if args.async_sched_require_early_stop:
+            assert any(
+                len(request.output_tokens) < _generation_budget(request) for request in requests
+            ), "configured stop condition never terminated a request early"
 
     peak_mem_stats = get_global_peak_memory_stats_bytes()
 
@@ -448,7 +569,7 @@ def main():
             json_results = {}
 
             # Write every 'n' requests, plus the final request.
-            for i, req in enumerate(requests):
+            for i, req in enumerate(requests if not args.compare_async_sched_modes else []):
                 if i % args.output_every_n_results == 0 or i == len(requests) - 1:
                     print(f' Attributes of request {i}: {req.__dict__}')
                     result_dict = {
@@ -481,9 +602,9 @@ def main():
             json_results["lifetime_prefill_token_count"] = (
                 engine.context.lifetime_prefill_token_count
             )
-            json_results["async_sched_step_count"] = engine.context.async_sched_step_count
+            json_results["async_sched_step_count"] = context.async_sched_step_count
             json_results["async_sched_compaction_step_count"] = (
-                engine.context.async_sched_compaction_step_count
+                context.async_sched_compaction_step_count
             )
 
             print(f' Saving results to {args.output_path}')

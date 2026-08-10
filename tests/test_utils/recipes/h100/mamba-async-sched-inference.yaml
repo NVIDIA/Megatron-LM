@@ -3,11 +3,11 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}_{environment}_{platforms}"
-  model: gpt
+  name: '{test_case}_{environment}_{platforms}'
+  model: hybrid
   build: mcore-pyt-{environment}
   nodes: 1
-  gpus: 1
+  gpus: 8
   n_repeat: 1
   platforms: dgx_a100
   script_setup: |
@@ -47,9 +47,9 @@ spec:
     ARGUMENTS=(
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
         "CHECKPOINT_SAVE_PATH=/tmp/checkpoints"
-        "DATA_PATH=/mnt/artifacts/"
+        "DATA_PATH=null"
         "DATA_CACHE_PATH=/workspace/data/cache"
-        "TRAINING_SCRIPT_PATH=examples/inference/advanced/gpt_dynamic_inference_with_coordinator.py"
+        "TRAINING_SCRIPT_PATH=examples/inference/advanced/gpt_dynamic_inference.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "OUTPUT_PATH={assets_dir}"
@@ -63,56 +63,8 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [gpt_dynamic_inference_tp8_pp1_dp1_583m_logitsmatch_zmq]
+  - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_2b_async_sched_async]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp8_dp1_583m_logitsmatch_zmq]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_logitsmatch_zmq]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp2_pp2_dp2_583m_logitsmatch_zmq]
-    products:
-      - environment: [dev]
-        scope: [mr, mr-github]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_longest_prefix_zmq]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_load_balanced_zmq]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_async_sched_zmq]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_async_sched_recompute_zmq]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_async_sched_uvm_persist_zmq]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_async_sched_offload_zmq]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  # Throughput coverage for this 583M dynamic-batching DP=8 config now lives at
-  # tests/performance_tests/test_cases/gpt/gpt_583m_perf/ — see
-  # skills/run-performance-tests/SKILL.md for the harness it runs under.

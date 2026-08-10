@@ -189,3 +189,23 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp2_pp2_583m_async_sched_cuda_graphs]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_async_sched_prefix_chunk_pressure]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_async_sched_flashinfer_fp8_logprobs]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_async_sched_stop_bos_length]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
