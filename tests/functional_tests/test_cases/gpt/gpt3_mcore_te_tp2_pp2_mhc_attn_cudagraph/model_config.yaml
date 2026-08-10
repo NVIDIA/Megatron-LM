@@ -54,6 +54,7 @@ MODEL_ARGS:
   --attention-backend: unfused
   --sequence-parallel: true
   --log-memory-to-tensorboard: true
+  --log-timers-to-tensorboard: true
   --enable-hyper-connections: true
   --num-residual-streams: 4
   --mhc-sinkhorn-iterations: 20
