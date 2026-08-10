@@ -681,6 +681,9 @@ _ASYNC_PAIR_SCENARIOS = (
             {"return_log_probs": True, "top_n_logprobs": 5},
         ),
         signals=("full-logits", "logprobs", "top-n"),
+        # Different forward batch shapes may exchange a near-tied, non-selected
+        # final candidate; the harness still requires exact async-repeat top-N.
+        exact_top_n=False,
     ),
     _pair_scenario(
         "processed-skip-prompt-logprobs",
@@ -1651,7 +1654,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             exact_top_n=scenario.parity == "exact" and scenario.exact_top_n,
         )
         cls._assert_runtime_signals(async_env, scenario, runtime, stop_tokens, termination_token)
-        if scenario.parity == "reproducible":
+        if scenario.parity == "reproducible" or not scenario.exact_top_n:
             async_expected = _snapshot_requests(async_env.requests)
             del async_env
             gc.collect()
