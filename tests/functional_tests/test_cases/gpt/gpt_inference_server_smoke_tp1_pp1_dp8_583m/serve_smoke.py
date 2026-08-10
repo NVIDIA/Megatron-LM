@@ -161,6 +161,7 @@ def post_streaming(prompt: str, max_tokens: int) -> dict:
         method="POST",
     )
     chunks = []
+    chunk_token_counts = []
     final = None
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
         assert resp.status == 200
@@ -174,9 +175,11 @@ def post_streaming(prompt: str, max_tokens: int) -> dict:
             choice = choice[0]
             if choice["finish_reason"] is None:
                 chunks.append(choice["text"])
+                chunk_token_counts.append(len(choice["logprobs"]["tokens"]))
             else:
                 final = choice
     assert final is not None and len(chunks) > 1, "stream did not emit multiple deltas"
+    assert all(1 <= count <= 2 for count in chunk_token_counts)
     assert "".join(chunks) == final["generated_text"]
     return final
 

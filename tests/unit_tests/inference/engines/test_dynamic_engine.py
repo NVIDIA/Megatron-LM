@@ -132,6 +132,7 @@ class DynamicEngineTestConfig:
     use_cuda_graphs_for_non_decode_steps: bool = True
     cuda_graph_all_prefills: bool = False
     fp8: bool = False
+    hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     return_log_probs: bool = False
     logprobs_mode: str = "raw_logprobs"
@@ -368,7 +369,11 @@ class DynamicInferenceEngineTestBase:
                 params_dtype=torch.bfloat16,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
-                hidden_size=128 if test_config.fp8 else 32,
+                hidden_size=(
+                    test_config.hidden_size
+                    if test_config.hidden_size is not None
+                    else (128 if test_config.fp8 else 32)
+                ),
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl=effective_cuda_graph_impl,

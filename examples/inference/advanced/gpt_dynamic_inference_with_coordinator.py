@@ -374,6 +374,10 @@ if __name__ == "__main__":
             assert engine.context.prefix_caching_coordinator_policy.value == (
                 args.inference_dynamic_batching_prefix_caching_coordinator_policy
             )
+            assert (
+                engine.context.prefix_caching_routing_alpha
+                == args.inference_dynamic_batching_prefix_caching_routing_alpha
+            )
             if dist.get_rank() == 0:
                 tolerance = 5e-3 if args.model_provider != "gpt" or args.fp8 else 1e-3
                 _assert_nested_close(legacy_outputs, _snapshot_results(results), atol=tolerance)

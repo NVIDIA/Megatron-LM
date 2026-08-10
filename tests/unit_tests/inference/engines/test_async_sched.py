@@ -6,6 +6,7 @@ import os
 from collections import Counter, deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -324,11 +325,14 @@ def test_async_forward_routes_one_controller_iteration(
     engine.context.is_decode_only.assert_not_called()
 
 
-def test_async_bookkeep_uses_consumed_chunked_prefill_request_id():
-    """Post-processing classifies output using the chunk ID from its consumed forward."""
+@pytest.mark.parametrize("track_paused_request_events", [False, True])
+def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(track_paused_request_events):
+    """Bookkeeping uses consumed-forward state and records requested pause events."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
-    engine.track_paused_request_events = False
+    engine.track_paused_request_events = track_paused_request_events
     engine.post_process_requests = mock.Mock(return_value=([10], []))
+    paused_request = DynamicInferenceRequest(request_id=11)
+    engine.get_request = mock.Mock(return_value=paused_request)
     engine.failed_request_ids = set()
     engine.requests = {}
     engine.use_coordinator = False
@@ -338,6 +342,7 @@ def test_async_bookkeep_uses_consumed_chunked_prefill_request_id():
     step_result = {
         "active_request_ids": [10],
         "finished_request_ids": [],
+        "newly_paused_request_ids": torch.tensor([11]),
         "sample": [20],
         "accepted_tokens": None,
         "log_probs": None,
@@ -358,6 +363,9 @@ def test_async_bookkeep_uses_consumed_chunked_prefill_request_id():
 
     assert (
         engine.post_process_requests.call_args.kwargs["consumed_chunked_prefill_request_id"] == 10
+    )
+    assert [event.type for event in paused_request.events] == (
+        [DynamicInferenceEventType.PAUSE] if track_paused_request_events else []
     )
 
 
@@ -432,22 +440,27 @@ _INFERENCE_CONFIG_DISPOSITIONS = {
         "sampling_backend",
         "static_kv_memory_pointers",
         "track_generated_token_events",
+        "track_paused_request_events",
         "use_cuda_graphs_for_non_decode_steps",
         "use_flashinfer_fused_rope",
         "logprobs_mode",
     },
     _FUNCTIONAL: {
         "disable_ep_consensus",
-        "ep_consensus_interval",
         "prefix_caching_mamba_gb",
         "prefix_caching_coordinator_policy",
         "prefix_caching_routing_alpha",
-        "track_paused_request_events",
         "unified_memory_level",
         "use_synchronous_zmq_collectives",
     },
     _NEGATIVE: set(),
-    _OUT_OF_SCOPE: {"logging_step_interval", "metrics_writer", "pg_collection", "verbose"},
+    _OUT_OF_SCOPE: {
+        "ep_consensus_interval",
+        "logging_step_interval",
+        "metrics_writer",
+        "pg_collection",
+        "verbose",
+    },
 }
 
 _SAMPLING_PARAM_DISPOSITIONS = {
@@ -468,62 +481,6 @@ _SAMPLING_PARAM_DISPOSITIONS = {
     _FUNCTIONAL: {"return_prompt_tokens", "streaming", "streaming_interval"},
     _NEGATIVE: set(),
     _OUT_OF_SCOPE: {"return_prompt_top_n_logprobs", "return_segments"},
-}
-
-_HARNESS_CONFIG_DISPOSITIONS = {
-    _UNIT: {
-        "async_sched_mode",
-        "context_block_size_tokens",
-        "context_buffer_size_gb",
-        "context_max_requests",
-        "context_max_tokens",
-        "context_paused_buffer_size_gb",
-        "cuda_graph_all_prefills",
-        "cuda_graph_impl",
-        "cuda_graph_modules",
-        "enable_chunked_prefill",
-        "enable_prefix_caching",
-        "expert_model_parallel_size",
-        "force_build_cuda_graphs",
-        "fp8",
-        "inference_config_overrides",
-        "inference_cuda_graph_scope",
-        "inference_moe_token_dispatcher_type",
-        "kv_cache_management_mode",
-        "logprobs_mode",
-        "materialize_only_last_token_logits",
-        "max_prompt_length",
-        "max_sequence_length",
-        "min_prompt_length",
-        "model_provider",
-        "num_cuda_graphs",
-        "num_requests",
-        "num_speculative_tokens",
-        "num_tokens_to_generate",
-        "num_tokens_total",
-        "pipeline_model_parallel_size",
-        "position_embedding_type",
-        "return_log_probs",
-        "sampling_backend",
-        "sequence_parallel",
-        "skip_prompt_log_probs",
-        "softmax_type",
-        "static_kv_memory_pointers",
-        "suspend_resume_interval",
-        "temperature",
-        "tensor_model_parallel_size",
-        "top_k",
-        "top_p",
-        "track_generated_token_events",
-        "transformer_impl",
-        "use_cuda_graphs_for_non_decode_steps",
-        "use_fixed_output_lengths",
-        "window_attn_skip_freq",
-        "window_size",
-    },
-    _FUNCTIONAL: set(),
-    _NEGATIVE: set(),
-    _OUT_OF_SCOPE: {"num_gap_steps"},
 }
 
 
@@ -585,6 +542,7 @@ _ASYNC_PAIR_SCENARIOS = (
             "last-logits",
             "metadata-schema",
             "persist",
+            "suspend-resume",
             "static-pointers",
             "torch-backend",
         ),
@@ -641,7 +599,6 @@ _ASYNC_PAIR_SCENARIOS = (
         "graph:block-scope",
         "graph:decode-only",
         "graph:exponential",
-        "graph:bounded-prefill",
         config={
             "num_cuda_graphs": 4,
             "force_build_cuda_graphs": True,
@@ -655,13 +612,26 @@ _ASYNC_PAIR_SCENARIOS = (
         signals=("cuda-graph", "graph-decode-config"),
     ),
     _pair_scenario(
+        "graph-bounded-mixed-prefill",
+        "graph:bounded-prefill",
+        "graph:max-token-ceiling",
+        config={
+            "num_cuda_graphs": 4,
+            "force_build_cuda_graphs": True,
+            "inference_config_overrides": {
+                "cuda_graph_max_tokens": 16,
+                "cuda_graph_mixed_prefill_count": 2,
+            },
+        },
+        signals=("cuda-graph", "graph-bounded-config"),
+    ),
+    _pair_scenario(
         "graph-mixed-layer-linear",
         "graph:layer-scope",
         "graph:mixed-prefill",
         "graph:linear",
         "graph:all-prefills",
         "graph:mixed-count",
-        "graph:max-token-ceiling",
         config={
             "num_cuda_graphs": 4,
             "force_build_cuda_graphs": True,
@@ -824,6 +794,7 @@ _ASYNC_PAIR_SCENARIOS = (
         "flashinfer-fused-rope",
         "kernel:flashinfer-fused-rope",
         config={
+            "hidden_size": 64,
             "position_embedding_type": "rope",
             "inference_config_overrides": {"use_flashinfer_fused_rope": True},
         },
@@ -897,6 +868,7 @@ _NEGATIVE_PAIR_OWNERS = {
 }
 
 _FOCUSED_PAIR_OWNERS = {
+    "events:paused-request": "test_async_bookkeep_uses_consumed_chunked_prefill_request_id",
     "metadata:heterogeneous-survivor-compaction": (
         "test_async_compaction_preserves_all_request_metadata"
     ),
@@ -928,6 +900,7 @@ _REQUIRED_ASYNC_PAIR_UNIVERSE = frozenset(
         "capacity:paused-buffer",
         "dispatcher:nccl",
         "events:generated-token",
+        "events:paused-request",
         "execution:eager",
         "graph:all-prefills",
         "graph:block-scope",
@@ -1002,6 +975,98 @@ _REQUIRED_ASYNC_PAIR_UNIVERSE = frozenset(
     }
 )
 
+_UNIT_FIELD_PAIR_OWNERS = {
+    "InferenceConfig": {
+        "async_sched_mode": "execution:eager",
+        "block_size_tokens": "capacity:block-size",
+        "buffer_size_gb": "capacity:buffer",
+        "cuda_graph_all_prefills": "graph:all-prefills",
+        "cuda_graph_max_tokens": "graph:max-token-ceiling",
+        "cuda_graph_mixed_prefill_count": "graph:mixed-count",
+        "cuda_graph_sizing_distribution": "graph:linear",
+        "enable_chunked_prefill": "prefill:chunked",
+        "enable_prefix_caching": "prefix:enabled",
+        "kv_cache_management_mode": "kv:persist",
+        "logprobs_mode": "logprobs:processed",
+        "mamba_inference_state_config": "interaction:mamba-state-compaction",
+        "mamba_memory_ratio": "mamba:memory-ratio",
+        "materialize_only_last_token_logits": "logits:full",
+        "max_requests": "capacity:max-requests",
+        "max_sequence_length": "length:num-total",
+        "max_tokens": "capacity:max-tokens",
+        "num_cuda_graphs": "graph:block-scope",
+        "num_speculative_tokens": "speculation:mtp-depth-two",
+        "offset_sampling_seed_by_dp_rank": "seed:shared-across-dp",
+        "paused_buffer_size_gb": "capacity:paused-buffer",
+        "prefix_caching_eviction_policy": "prefix:lru",
+        "request_metadata_types": "metadata:explicit-request-schema",
+        "sampling_backend": "sampling:flashinfer",
+        "static_kv_memory_pointers": "kv:static-pointers",
+        "track_generated_token_events": "events:generated-token",
+        "track_paused_request_events": "events:paused-request",
+        "use_cuda_graphs_for_non_decode_steps": "graph:decode-only",
+        "use_flashinfer_fused_rope": "kernel:flashinfer-fused-rope",
+    },
+    "SamplingParams": {
+        "add_BOS": "prompt:add-bos",
+        "detokenize_stop_sequence": "termination:stop-sequence-keep",
+        "num_tokens_to_generate": "length:num-generate",
+        "num_tokens_total": "length:num-total",
+        "return_log_probs": "logprobs:raw",
+        "skip_prompt_log_probs": "logprobs:skip-prompt",
+        "stop_words": "termination:stop-sequence-strip",
+        "temperature": "sampling:temperature",
+        "termination_id": "termination:explicit-eos",
+        "top_k": "sampling:top-k",
+        "top_n_logprobs": "logprobs:top-n",
+        "top_p": "sampling:top-p",
+    },
+}
+
+_COORDINATOR_PROFILE = Path(
+    "tests/functional_tests/test_cases/gpt/"
+    "gpt_dynamic_inference_tp1_pp1_dp8_583m_async_sched_zmq/model_config.yaml"
+)
+_UVM_PROFILE = Path(
+    "tests/functional_tests/test_cases/gpt/"
+    "gpt_dynamic_inference_tp1_pp1_dp8_583m_async_sched_uvm_persist_zmq/model_config.yaml"
+)
+_HYBRID_PROFILE = Path(
+    "tests/functional_tests/test_cases/hybrid/"
+    "hybrid_dynamic_inference_tp1_pp1_dp8_2b_async_sched_async/model_config.yaml"
+)
+_HTTP_PROFILE = Path(
+    "tests/functional_tests/test_cases/gpt/"
+    "gpt_inference_server_smoke_tp1_pp1_dp8_583m/serve_smoke.py"
+)
+_FUNCTIONAL_FIELD_OWNERS = {
+    "InferenceConfig": {
+        "disable_ep_consensus": (_COORDINATOR_PROFILE, "--inference-disable-ep-consensus"),
+        "prefix_caching_coordinator_policy": (
+            _COORDINATOR_PROFILE,
+            "--inference-dynamic-batching-prefix-caching-coordinator-policy",
+        ),
+        "prefix_caching_mamba_gb": (
+            _HYBRID_PROFILE,
+            "--inference-dynamic-batching-prefix-caching-mamba-gb",
+        ),
+        "prefix_caching_routing_alpha": (
+            _COORDINATOR_PROFILE,
+            "--inference-dynamic-batching-prefix-caching-routing-alpha",
+        ),
+        "unified_memory_level": (_UVM_PROFILE, "--inference-dynamic-batching-unified-memory-level"),
+        "use_synchronous_zmq_collectives": (
+            _COORDINATOR_PROFILE,
+            "--inference-use-synchronous-zmq-collectives",
+        ),
+    },
+    "SamplingParams": {
+        "return_prompt_tokens": (_HTTP_PROFILE, '"prompt_token_ids"'),
+        "streaming": (_HTTP_PROFILE, '"stream": True'),
+        "streaming_interval": (_HTTP_PROFILE, '"streaming_interval": 2'),
+    },
+}
+
 
 def _flatten_dispositions(dispositions):
     return [field_name for fields in dispositions.values() for field_name in fields]
@@ -1012,11 +1077,6 @@ def _flatten_dispositions(dispositions):
     [
         ("InferenceConfig", InferenceConfig.__annotations__, _INFERENCE_CONFIG_DISPOSITIONS),
         ("SamplingParams", SamplingParams.__annotations__, _SAMPLING_PARAM_DISPOSITIONS),
-        (
-            "DynamicEngineTestConfig",
-            _DynamicEngineTestConfig.__annotations__,
-            _HARNESS_CONFIG_DISPOSITIONS,
-        ),
     ],
 )
 def test_async_pairwise_field_dispositions_are_closed(owner, declared, dispositions):
@@ -1027,6 +1087,26 @@ def test_async_pairwise_field_dispositions_are_closed(owner, declared, dispositi
         f"{owner} disposition drift: missing={set(declared) - set(classified)}, "
         f"unknown={set(classified) - set(declared)}"
     )
+
+
+@pytest.mark.parametrize(
+    ("owner", "dispositions"),
+    [
+        ("InferenceConfig", _INFERENCE_CONFIG_DISPOSITIONS),
+        ("SamplingParams", _SAMPLING_PARAM_DISPOSITIONS),
+    ],
+)
+def test_async_pairwise_fields_have_concrete_owners(owner, dispositions):
+    """Unit fields name a pair owner; functional fields name an active profile signal."""
+    unit_owners = _UNIT_FIELD_PAIR_OWNERS[owner]
+    assert set(unit_owners) == dispositions[_UNIT]
+    assert set(unit_owners.values()) <= _REQUIRED_ASYNC_PAIR_UNIVERSE
+
+    functional_owners = _FUNCTIONAL_FIELD_OWNERS[owner]
+    assert set(functional_owners) == dispositions[_FUNCTIONAL]
+    repo_root = Path(__file__).parents[4]
+    for profile, activation in functional_owners.values():
+        assert activation in (repo_root / profile).read_text()
 
 
 def test_async_pair_owners_are_closed_and_unique():
@@ -1306,6 +1386,14 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 runtime["max_waiting"], len(env.engine.waiting_request_ids)
             )
             step()
+            if wave_idx == 0 and "suspend-resume" in scenario.signals:
+                memory_ptr = env.engine.context.memory_buffer.data_ptr()
+                env.engine.suspend()
+                env.engine.resume()
+                runtime["suspend-resume"] += 1
+                runtime["static-pointer-preserved"] += int(
+                    env.engine.context.memory_buffer.data_ptr() == memory_ptr
+                )
 
         while env.engine.has_unfinished_requests():
             step()
@@ -1340,6 +1428,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert context.kv_cache_management_mode == KVCacheManagementMode.PERSIST
         if "static-pointers" in signals:
             assert context.static_kv_memory_pointers
+        if "suspend-resume" in signals:
+            assert runtime["suspend-resume"] == runtime["static-pointer-preserved"] == 1
         if "dp-offset" in signals:
             assert context.config.offset_sampling_seed_by_dp_rank
         if "last-logits" in signals:
@@ -1397,6 +1487,15 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 context.config.cuda_graph_sizing_distribution == CudaGraphSizingDistribution.LINEAR
             )
             assert max(context.cuda_graph_token_counts) == context.max_tokens
+            assert any(
+                dimensions.prefill_req_count > 0
+                for dimensions in context.cuda_graph_batch_dimensions_list
+            )
+        if "graph-bounded-config" in signals:
+            assert context.use_cuda_graphs_for_non_decode_steps
+            assert not context.config.cuda_graph_all_prefills
+            assert context.config.cuda_graph_max_tokens == 16
+            assert max(context.cuda_graph_token_counts) == 16
             assert any(
                 dimensions.prefill_req_count > 0
                 for dimensions in context.cuda_graph_batch_dimensions_list
@@ -1469,6 +1568,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert model_config.fp8 is not None
         if "fused-rope" in signals:
             assert context.use_flashinfer_fused_rope
+            assert model_config.hidden_size // model_config.num_attention_heads == 16
             model = controller.inference_wrapped_model.model
             assert model.rotary_pos_emb.inv_freq.is_cuda
             assert model.rotary_pos_emb_cache[context.max_sequence_length].is_cuda
