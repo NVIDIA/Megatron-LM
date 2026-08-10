@@ -108,17 +108,21 @@ def load_tokenizer(
                 tokens = json.load(f)
 
             tokens.sort(key=lambda t: t["rank"])
+            tokens = tokens[:-len(special_tokens)]
 
             tokenizer_path = f"{tokenizer_path}.tiktoken"
             if not os.path.isfile(tokenizer_path):
                 with open(tokenizer_path, "w") as f:
-                    for t in tokens:
-                        f.write(f"{t['token_bytes']} {t['rank']}\n")
+                    for token, idx in sorted(special_tokens.items(), key=lambda x: x[1]):
+                        token_b64 = base64.b64encode(token.encode()).decode()
+                        f.write(f"{token_b64} {idx}\n")
+                    for idx, t in enumerate(tokens):
+                        f.write(f"{t['token_bytes']} {idx + len(special_tokens)}\n")
 
             return gt.Tokenizer.from_tiktoken(
                 path=tokenizer_path,
-                pretokenizer="nemotron",
-                #special_tokens=special_tokens,
+                pretokenizer="gpt2",
+                special_tokens=special_tokens,
             ).as_tiktoken()
         else:
             raise ModuleNotFoundError(
