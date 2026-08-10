@@ -86,6 +86,25 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
 
 
+def test_verl_loss_hook_has_no_strong_self_reference():
+    engine = _engine(engine_config=_engine_config())
+    hook = engine._make_runtime_loss_fn(None, num_microbatches=1)
+
+    assert all(cell.cell_contents is not hook for cell in (hook.__closure__ or ()))
+
+
+def test_verl_loss_hook_honors_runtime_output_collector():
+    engine = _engine(engine_config=_engine_config())
+    outputs = []
+    engine._build_verl_model_output = lambda **_kwargs: {"log_probs": torch.tensor(1.0)}
+    hook = engine._make_runtime_loss_fn(None, num_microbatches=1, output_lst=outputs)
+
+    hook.runtime_collects_outputs = True
+    hook({}, object(), LossContext(source_batch=object()))
+
+    assert outputs == []
+
+
 def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> None:
     engine = _engine(
         engine_config=_engine_config(optimizer_offload=True),

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import os
+import weakref
 from enum import Enum
 from typing import Any
 
@@ -891,6 +892,8 @@ class MegatronLiteEngine(BaseEngine):
         return output
 
     def _make_runtime_loss_fn(self, loss_function, num_microbatches: int, output_lst=None):
+        loss_fn_ref = None
+
         def _loss_fn(
             raw_output: dict[str, torch.Tensor],
             runtime_batch: PackedBatch,
@@ -919,7 +922,10 @@ class MegatronLiteEngine(BaseEngine):
                 )
 
             raw_output["_verl_metrics"] = metrics
-            if output_lst is not None:
+            assert loss_fn_ref is not None
+            if output_lst is not None and not getattr(
+                loss_fn_ref(), "runtime_collects_outputs", False
+            ):
                 output_lst.append(
                     {
                         "model_output": model_output,
@@ -929,6 +935,14 @@ class MegatronLiteEngine(BaseEngine):
                 )
             return (loss * num_microbatches if loss_function is not None else loss), metrics
 
+        # Avoid a strong self-reference while preserving the runtime hook attributes.
+        loss_fn_ref = weakref.ref(_loss_fn)
+        _loss_fn.runtime_output_collector = output_lst
+        _loss_fn.runtime_output_extractor = lambda output: output["_verl_model_output"]
+        # The static collector records ``loss`` before this hook applies the
+        # microbatch multiplier used for backward.  Runtime sidecars must report
+        # that same application-level value even when they reschedule batches.
+        _loss_fn.runtime_output_loss_scale = 1 / num_microbatches
         return _loss_fn
 
     def _mtp_enable_train(self) -> bool:
