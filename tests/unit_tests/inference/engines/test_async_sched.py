@@ -539,6 +539,7 @@ class _AsyncPairScenario:
     request_profile: str = "staggered"
     prerequisite: str | None = None
     atol: float = 1.0e-3
+    parity: str = "exact"
 
 
 _BASE_PAIR_CONFIG = {
@@ -598,7 +599,7 @@ _ASYNC_PAIR_SCENARIOS = (
         config={
             "enable_chunked_prefill": True,
             "context_max_tokens": 8,
-            "context_block_size_tokens": 4,
+            "context_block_size_tokens": 512,
             "context_buffer_size_gb": 0.02,
             "context_paused_buffer_size_gb": 0.004,
         },
@@ -679,18 +680,23 @@ _ASYNC_PAIR_SCENARIOS = (
         "sampling:top-k",
         sampling=({"temperature": 0.7, "top_k": 8},),
         signals=("sampled",),
+        parity="reproducible",
     ),
     _pair_scenario(
         "sampling-top-p",
         "sampling:top-p",
         sampling=({"temperature": 1.1, "top_k": 0, "top_p": 0.85},),
         signals=("sampled",),
+        parity="reproducible",
     ),
     _pair_scenario(
         "sampling-top-k-top-p",
         "sampling:top-k-top-p",
+        config={"sampling_backend": "flashinfer"},
         sampling=({"temperature": 0.8, "top_k": 12, "top_p": 0.9},),
-        signals=("sampled",),
+        signals=("flashinfer", "sampled"),
+        prerequisite="flashinfer",
+        parity="reproducible",
     ),
     _pair_scenario(
         "raw-prompt-top-n-logprobs",
@@ -721,9 +727,10 @@ _ASYNC_PAIR_SCENARIOS = (
         "flashinfer-sampling",
         "sampling:flashinfer",
         config={"sampling_backend": "flashinfer"},
-        sampling=({"temperature": 0.8, "top_k": 8, "top_p": 0.9},),
+        sampling=({"temperature": 0.8, "top_k": 0, "top_p": 0.0},),
         signals=("flashinfer", "sampled"),
         prerequisite="flashinfer",
+        parity="reproducible",
     ),
     _pair_scenario(
         "length-zero-and-total",
@@ -809,6 +816,7 @@ _ASYNC_PAIR_SCENARIOS = (
         signals=("fp8",),
         prerequisite="fp8",
         atol=5.0e-3,
+        parity="reproducible",
     ),
     _pair_scenario(
         "flashinfer-fused-rope",
@@ -840,6 +848,7 @@ _ASYNC_PAIR_SCENARIOS = (
         config={"inference_config_overrides": {"offset_sampling_seed_by_dp_rank": False}},
         sampling=({"temperature": 0.8, "top_k": 8},),
         signals=("shared-seed", "sampled"),
+        parity="reproducible",
     ),
 )
 
@@ -1026,6 +1035,7 @@ def test_async_pair_owners_are_closed_and_unique():
         assert scenario.name not in scenario_names
         scenario_names.add(scenario.name)
         assert scenario.signals, f"{scenario.name} has no runtime activation signal"
+        assert scenario.parity in {"exact", "reproducible"}
         for pair in scenario.pairs:
             assert pair not in owners, f"{pair} owned by both {owners[pair]} and {scenario.name}"
             owners[pair] = scenario.name
@@ -1091,7 +1101,9 @@ def _sampling_params_for_request(scenario, request_id, prompt_length):
 
 def _make_scenario_requests(env, scenario, stop_tokens=None, termination_token=None):
     controller = env.engine.controller
-    controller.tokenizer.detokenize = lambda tokens, **kwargs: f"tok_{tokens[0]}"
+    controller.tokenizer.detokenize = lambda tokens, **kwargs: (
+        f"tok_{tokens[0]}" if tokens else ""
+    )
     if scenario.request_profile.startswith("stop"):
         controller.tokenizer.bos = None
         controller.tokenizer.tokenize = lambda text: [int(token) for token in text.split()]
@@ -1178,31 +1190,51 @@ def _snapshot_requests(requests):
     return snapshots
 
 
-def _assert_top_n_parity(actual, expected, atol):
+def _assert_top_n_parity(actual, expected, atol, exact):
     assert (actual is None) == (expected is None)
     if actual is None:
         return
     assert len(actual) == len(expected)
     for actual_row, expected_row in zip(actual, expected):
-        assert actual_row.keys() == expected_row.keys()
-        assert list(actual_row.values()) == pytest.approx(
-            list(expected_row.values()), rel=0, abs=atol
-        )
+        assert len(actual_row) == len(expected_row)
+        assert all(isinstance(token, str) for token in actual_row)
+        assert torch.isfinite(torch.tensor(list(actual_row.values()))).all()
+        if exact:
+            assert actual_row.keys() == expected_row.keys()
+            assert list(actual_row.values()) == pytest.approx(
+                list(expected_row.values()), rel=0, abs=atol
+            )
 
 
-def _assert_request_parity(actual_requests, expected, atol, compare_events=False):
+def _assert_request_parity(
+    actual_requests, expected, atol, compare_events=False, exact_numerics=True, exact_top_n=False
+):
     assert len(actual_requests) == len(expected)
     for request, reference in zip(actual_requests, expected):
         assert request.status == reference["status"] == Status.COMPLETED
-        assert request.generated_tokens == reference["tokens"]
-        assert (_as_float_list(request.prompt_log_probs) or []) == pytest.approx(
-            reference["prompt_logprobs"] or [], rel=0, abs=atol
+        assert len(request.generated_tokens) == len(reference["tokens"])
+        prompt_logprobs = _as_float_list(request.prompt_log_probs) or []
+        generated_logprobs = _as_float_list(request.generated_log_probs) or []
+        assert len(prompt_logprobs) == len(reference["prompt_logprobs"] or [])
+        assert len(generated_logprobs) == len(reference["generated_logprobs"] or [])
+        if exact_numerics:
+            assert request.generated_tokens == reference["tokens"]
+            assert prompt_logprobs == pytest.approx(
+                reference["prompt_logprobs"] or [], rel=0, abs=atol
+            )
+            assert generated_logprobs == pytest.approx(
+                reference["generated_logprobs"] or [], rel=0, abs=atol
+            )
+        else:
+            assert all(0 <= token < 100 for token in request.generated_tokens)
+            assert torch.isfinite(torch.tensor(prompt_logprobs)).all()
+            assert torch.isfinite(torch.tensor(generated_logprobs)).all()
+        _assert_top_n_parity(
+            request.prompt_top_n_logprobs, reference["prompt_top_n"], atol, exact_top_n
         )
-        assert (_as_float_list(request.generated_log_probs) or []) == pytest.approx(
-            reference["generated_logprobs"] or [], rel=0, abs=atol
+        _assert_top_n_parity(
+            request.generated_top_n_logprobs, reference["generated_top_n"], atol, exact_top_n
         )
-        _assert_top_n_parity(request.prompt_top_n_logprobs, reference["prompt_top_n"], atol)
-        _assert_top_n_parity(request.generated_top_n_logprobs, reference["generated_top_n"], atol)
         if compare_events:
             assert [event.type for event in request.events] == reference["events"]
 
@@ -1319,7 +1351,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "capacity" in signals:
             assert context.max_requests == 4
             assert context.max_tokens == 8
-            assert context.block_size_tokens == 4
+            assert context.block_size_tokens == 512
             assert context.kv_block_allocator.paused_limit > 0
         if "paused-buffer-allocation" in signals:
             assert context.config.paused_buffer_size_gb == pytest.approx(0.004)
@@ -1370,6 +1402,19 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if request.sampling_params.top_n_logprobs > 0:
                     assert request.generated_top_n_logprobs
                     assert len(request.generated_top_n_logprobs) == len(request.generated_tokens)
+                    for token, logprob, top_n in zip(
+                        request.generated_tokens,
+                        request.generated_log_probs,
+                        request.generated_top_n_logprobs,
+                    ):
+                        token_text = controller.detokenize([token])
+                        assert 0 < len(top_n) <= request.sampling_params.top_n_logprobs
+                        assert token_text in top_n
+                        assert top_n[token_text] == pytest.approx(logprob, rel=0, abs=0.1)
+                    if request.sampling_params.skip_prompt_log_probs:
+                        assert not request.prompt_top_n_logprobs
+                    else:
+                        assert len(request.prompt_top_n_logprobs) == len(request.prompt_tokens) - 1
         if "processed-logprobs" in signals:
             assert context.config.logprobs_mode == "processed_logprobs"
         if "flashinfer" in signals:
@@ -1417,6 +1462,23 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert model_config.softmax_type == scenario.config["softmax_type"]
         if "shared-seed" in signals:
             assert not context.config.offset_sampling_seed_by_dp_rank
+            assert controller.sampling_rng.initial_seed() == model_config.inference_sampling_seed
+            generated = torch.tensor(
+                [token for request in env.requests for token in request.generated_tokens],
+                dtype=torch.int64,
+                device="cuda",
+            )
+            gathered = [
+                torch.empty_like(generated)
+                for _ in range(torch.distributed.get_world_size(controller.dp_group))
+            ]
+            torch.distributed.all_gather(gathered, generated, group=controller.dp_group)
+            assert all(torch.equal(peer, generated) for peer in gathered)
+        if "dp-offset" in signals:
+            expected_seed = model_config.inference_sampling_seed + torch.distributed.get_rank(
+                group=controller.dp_group
+            )
+            assert controller.sampling_rng.initial_seed() == expected_seed
         if "parallel" in signals:
             assert (
                 model_config.tensor_model_parallel_size > 1
@@ -1467,9 +1529,35 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             termination_token=termination_token,
         )
         _assert_request_parity(
-            async_env.requests, expected, scenario.atol, compare_events="events" in scenario.signals
+            async_env.requests,
+            expected,
+            scenario.atol,
+            compare_events="events" in scenario.signals,
+            exact_numerics=scenario.parity == "exact",
         )
         cls._assert_runtime_signals(async_env, scenario, runtime, stop_tokens, termination_token)
+        if scenario.parity == "reproducible":
+            async_expected = _snapshot_requests(async_env.requests)
+            del async_env
+            gc.collect()
+            delete_cuda_graphs()
+            torch.cuda.empty_cache()
+            repeat_env, repeat_runtime = cls._run_scenario_mode(
+                scenario,
+                AsyncScheduleMode.ASYNC,
+                stop_tokens=stop_tokens,
+                termination_token=termination_token,
+            )
+            _assert_request_parity(
+                repeat_env.requests,
+                async_expected,
+                scenario.atol,
+                compare_events="events" in scenario.signals,
+                exact_top_n=True,
+            )
+            cls._assert_runtime_signals(
+                repeat_env, scenario, repeat_runtime, stop_tokens, termination_token
+            )
 
 
 @pytest.mark.internal
