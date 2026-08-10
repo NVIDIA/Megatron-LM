@@ -25,6 +25,7 @@ from megatron.training.checkpointing import (
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
     load_checkpoint,
+    maybe_save_dataloader_state,
     read_metadata,
     save_checkpoint,
 )
@@ -72,6 +73,80 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
+    """Dataloader checkpoints use the supplied module groups and canonical model-parallel path."""
+    groups = {
+        "tp": SimpleNamespace(rank=0, size=2),
+        "pp": SimpleNamespace(rank=0, size=2),
+        "dp": SimpleNamespace(rank=3, size=4),
+    }
+    barriers = []
+    saved = []
+    iterator = SimpleNamespace(
+        iterable=SimpleNamespace(save_state=lambda: {"global_sequence_id": 16})
+    )
+
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_rank", side_effect=lambda group: group.rank
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_size", side_effect=lambda group: group.size
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.torch.distributed.barrier",
+            side_effect=lambda group: barriers.append(group),
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.torch.save",
+            side_effect=lambda state, path: saved.append((state, path)),
+        ),
+    ):
+        maybe_save_dataloader_state(
+            iterator,
+            2,
+            tmp_path,
+            tp_group=groups["tp"],
+            pp_group=groups["pp"],
+            dp_group=groups["dp"],
+        )
+
+    assert barriers == [groups["dp"], groups["dp"]]
+    assert saved[0][0] == {"dataloader_state_dict": {"global_sequence_id": 16}}
+    assert saved[0][1] == str(
+        tmp_path / "iter_0000002" / "mp_rank_00_000" / "train_dataloader_dprank003.pt"
+    )
+
+
+def test_maybe_save_dataloader_state_skips_empty_state_after_barriers(tmp_path):
+    """Ranks without dataloader state participate in barriers but do not write a file."""
+    group = SimpleNamespace(rank=0, size=1)
+    iterator = SimpleNamespace(iterable=SimpleNamespace(save_state=lambda: None))
+    barriers = []
+
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_rank",
+            side_effect=lambda process_group: process_group.rank,
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_size",
+            side_effect=lambda process_group: process_group.size,
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.torch.distributed.barrier",
+            side_effect=lambda group: barriers.append(group),
+        ),
+        mock.patch("megatron.training.checkpointing.torch.save") as save,
+    ):
+        maybe_save_dataloader_state(
+            iterator, 2, tmp_path, tp_group=group, pp_group=group, dp_group=group
+        )
+
+    assert barriers == [group, group]
+    save.assert_not_called()
 
 
 def create_checkpoint(load_path, ckpt_format):
@@ -382,3 +457,71 @@ def test_read_metadata_non_distributed(tmp_path, metadata_content, expected_iter
 
     assert max_iter == expected_iter, f"Expected iteration {expected_iter}, got {max_iter}"
     assert release == expected_release, f"Expected release={expected_release}, got {release}"
+
+
+def _make_metadata_args(
+    use_distributed_optimizer=False,
+    use_layer_wise_distributed_optimizer=False,
+    ckpt_format='torch_dist',
+    dist_ckpt_optim_fully_reshardable=False,
+    distrib_optim_fully_reshardable_mem_efficient=False,
+):
+    args = SimpleNamespace()
+    args.use_distributed_optimizer = use_distributed_optimizer
+    args.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
+    args.ckpt_format = ckpt_format
+    args.dist_ckpt_optim_fully_reshardable = dist_ckpt_optim_fully_reshardable
+    args.distrib_optim_fully_reshardable_mem_efficient = (
+        distrib_optim_fully_reshardable_mem_efficient
+    )
+    return args
+
+
+class TestBuildShardedStateDictMetadata:
+    """``_build_sharded_state_dict_metadata`` must set ``distrib_optim_sharding_type``
+    whenever a real :class:`DistributedOptimizer` instance will be used at save
+    time -- otherwise the DistOpt path falls through to the deprecated
+    ``fully_sharded_model_space`` default whose ``flattened_range`` usage is
+    rejected by ``ShardedTensor.validate_metadata_integrity`` post commit
+    5ab481cb45.
+    """
+
+    DUMMY_GROUP = object()
+
+    def test_distributed_optimizer_sets_dp_reshardable_default(self):
+        args = _make_metadata_args(use_distributed_optimizer=True)
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
+
+    def test_distributed_optimizer_fully_reshardable_flag(self):
+        args = _make_metadata_args(
+            use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
+        )
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
+        assert metadata['distrib_optim_fully_reshardable_mem_efficient'] is False
+
+    def test_distributed_optimizer_fsdp_dtensor(self):
+        args = _make_metadata_args(use_distributed_optimizer=True, ckpt_format='fsdp_dtensor')
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        assert metadata['distrib_optim_sharding_type'] == 'fsdp_dtensor'
+
+    def test_layer_wise_only_still_sets_sharding_type(self):
+        # Arg parser flips ``use_distributed_optimizer`` off when Muon is in
+        # use, but the LayerWise + DistOpt split path still has a DistOpt
+        # sub-optimizer for non-Muon params, so the metadata is required.
+        args = _make_metadata_args(use_layer_wise_distributed_optimizer=True)
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
+
+    def test_layer_wise_with_fully_reshardable(self):
+        args = _make_metadata_args(
+            use_layer_wise_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
+        )
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
+
+    def test_no_distributed_optimizer_no_sharding_type(self):
+        args = _make_metadata_args()
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+        assert 'distrib_optim_sharding_type' not in metadata

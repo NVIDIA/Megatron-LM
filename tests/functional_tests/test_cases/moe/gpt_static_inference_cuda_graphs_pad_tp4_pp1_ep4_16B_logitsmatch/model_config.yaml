@@ -53,7 +53,7 @@ MODEL_ARGS:
   --max-position-embeddings: 4096
   --micro-batch-size: 1
   --flash-decode: true
-  --enable-cuda-graph: true
+  --cuda-graph-impl: local
   --te-rng-tracker: true
   --inference-rng-tracker: true
   --moe-pad-experts-for-cuda-graph-inference: true
@@ -85,3 +85,4 @@ MODEL_ARGS:
 METRICS:
   - "generated_tokens"
   - "logprobs"
+LAUNCHER: ft_launcher

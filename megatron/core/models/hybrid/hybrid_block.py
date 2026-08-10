@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -15,7 +16,7 @@ from torch import Tensor, nn
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear, TENorm
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -25,9 +26,10 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -44,6 +46,7 @@ class HybridStackSubmodules:
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
+    mla_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
@@ -87,7 +90,12 @@ class HybridStack(MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
+        name: str | None = None,
     ) -> None:
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
@@ -109,6 +117,9 @@ class HybridStack(MegatronModule):
         )
         self.layer_type_list = layer_type_list
 
+        if getattr(self.config, "mla_down_proj_fusion", False):
+            submodules = self._fuse_mla_down_proj(submodules)
+
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
@@ -127,6 +138,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     layer = build_module(
@@ -137,10 +149,22 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.DS_ATTENTION:
                     layer = build_module(
                         submodules.dsa_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif layer_type == LayerSymbols.MLA:
+                    layer = build_module(
+                        submodules.mla_layer,
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -155,6 +179,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
@@ -163,6 +188,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.GDN:
                     layer = build_module(
@@ -172,10 +198,14 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 else:
                     raise ValueError("unexpected layer_type")
             self.layers.append(layer)
+
+        if self.config.cuda_graph_impl == "local":
+            annotate_first_last_layer(self.layers)
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -187,6 +217,26 @@ class HybridStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+
+    def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
+        # Avoid modifying the original object so users don't get surprised about their `submodules`
+        # being modified underneath them.
+        submodules = copy.deepcopy(submodules)
+        mla_spec = submodules.mla_layer
+        # We always fuse the input layernorm because Hybrid always uses TransformerEngine.
+        mla_spec.submodules.input_layernorm = IdentityOp
+        mla_spec.submodules.self_attention.module = FusedMLASelfAttention
+        mla_spec.submodules.self_attention.submodules.linear_qkv_down_proj = (
+            TELayerNormColumnParallelLinear
+        )
+        mla_spec.submodules.self_attention.submodules.linear_q_down_proj = None
+        mla_spec.submodules.self_attention.submodules.linear_kv_down_proj = None
+        mla_spec.submodules.sharded_state_dict_keys_map = {
+            "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
+            "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
+            "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
+        }
+        return submodules
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -255,13 +305,7 @@ class HybridStack(MegatronModule):
             inference_context.seqlen_offset = inference_context.sequence_len_offset
 
         if (
-            (
-                (
-                    self.config.cuda_graph_impl == "local"
-                    and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
-                )
-                or self.config.flash_decode
-            )
+            (self.config.cuda_graph_impl == "local" or self.config.flash_decode)
             and inference_context
             and inference_context.is_static_batching()
             and InferenceMode.is_active()

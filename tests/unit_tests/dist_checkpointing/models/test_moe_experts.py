@@ -1,4 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+import os
+
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support, fp8_autocast
@@ -30,6 +32,25 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, reason_for_no_fp8 = check_fp8_support()
+
+
+@pytest.fixture(autouse=True)
+def enable_te_cutedsl_fused_grouped_mlp():
+    """Enable TE's cuDSL fused grouped MLP path for the duration of the test.
+
+    The kernel additionally requires SM100 (Blackwell), so on H100/A100 CI this is
+    a no-op; setting it here means the kernel is picked up automatically when
+    Blackwell hardware joins the unit-test matrix.
+    """
+    previous = os.environ.get('NVTE_CUTEDSL_FUSED_GROUPED_MLP')
+    os.environ['NVTE_CUTEDSL_FUSED_GROUPED_MLP'] = '1'
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop('NVTE_CUTEDSL_FUSED_GROUPED_MLP', None)
+        else:
+            os.environ['NVTE_CUTEDSL_FUSED_GROUPED_MLP'] = previous
 
 
 def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False, **config_kwargs):
@@ -325,6 +346,7 @@ class TestExpertLayerReconfiguration:
     def test_sequential_grouped_mlp_extra_state(
         self,
         tmp_path_dist_ckpt,
+        monkeypatch,
         src_tp_pp_exp,
         dest_tp_pp_exp,
         src_module,
@@ -372,6 +394,8 @@ class TestExpertLayerReconfiguration:
                 ckpt_dir_A,
                 load_strategy,
             )
+            # This checkpoint was created by the test and is therefore trusted.
+            monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
             model_A.load_state_dict(
                 {k.removeprefix(layer_prefix): v for k, v in state_dict.items()}
             )

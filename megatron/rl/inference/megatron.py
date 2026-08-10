@@ -28,6 +28,7 @@ from ..inference.inference_interface import (
     ReturnsRaw,
     ReturnsTokens,
 )
+from ..rollout_granularity import get_rl_parallel_generation_tasks
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,12 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             extra_body={
                 "skip_prompt_log_probs": True,
                 "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
+                # TODO: These are non-standard fields that add significant memory overheads to the
+                # chat completions payload. return_raw_text also wastes a lot of CPU cycles
+                # detokenizing prompt tokens, especially expensive for long prompts in agentic RL.
+                # Set to False if not needed in MRL.
+                "return_tokenized_data": True,
+                "return_raw_text": True,
             },
         )
 
@@ -72,14 +79,14 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         return InferenceResponse(
             # TODO: Handle tool calls and reasoning in LLMChatMessage
             response=LLMChatMessage(**choice.message.model_dump(include={'role', 'content'})),
-            raw_text=choice.raw_text,
-            token_ids=choice.prompt_token_ids + choice.generation_token_ids,
-            logprobs=choice.generation_log_probs,
+            raw_text=choice.message.raw_text,
+            token_ids=choice.message.prompt_token_ids + choice.message.generation_token_ids,
+            logprobs=choice.message.generation_log_probs,
             finish_reason=choice.finish_reason,
-            prompt_length=len(choice.prompt_token_ids),
-            policy_epoch=choice.policy_epoch,
-            kv_cache_epoch=choice.kv_cache_epoch,
-            num_evictions=getattr(choice, 'num_evictions', 0),
+            prompt_length=len(choice.message.prompt_token_ids),
+            policy_epoch=choice.message.policy_epoch,
+            kv_cache_epoch=choice.message.kv_cache_epoch,
+            num_evictions=choice.message.num_evictions,
         )
 
     @classmethod
@@ -96,6 +103,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 logging.WARNING,
                 "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
             )
+
+        # RL needs log probs, but not prompt log probs.
+        args.return_log_probs = True
+        args.skip_prompt_log_probs = True
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
@@ -126,7 +137,11 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args.rl_kv_cache_management_mode
         )
 
-        concurrency_limit = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
+        concurrency_limit = (
+            args.grpo_prompts_per_step
+            * args.grpo_group_size
+            * get_rl_parallel_generation_tasks(args)
+        )
         custom_limits = httpx.Limits(
             max_connections=concurrency_limit,
             max_keepalive_connections=concurrency_limit,

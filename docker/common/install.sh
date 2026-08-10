@@ -55,6 +55,19 @@ if [[ "$ENVIRONMENT" != "dev" && "$ENVIRONMENT" != "lts" ]]; then
     exit 1
 fi
 
+# AUT-479: LTS Python dependencies were moved out of pyproject.toml into
+# docker/Dockerfile.ci.lts. This script targets the floating dev stack and no
+# longer builds a working LTS environment by itself.
+if [[ "$ENVIRONMENT" == "lts" ]]; then
+    echo "Error: --environment lts is no longer supported by install.sh."
+    echo "       LTS dependencies are pinned in docker/Dockerfile.ci.lts."
+    echo "       Build the LTS image directly with:"
+    echo "         docker build --target main \\"
+    echo "           --build-arg FROM_IMAGE_NAME=\$(cat docker/.ngc_version.lts) \\"
+    echo "           -f docker/Dockerfile.ci.lts -t megatron-lm:local-lts ."
+    exit 1
+fi
+
 main() {
     if [[ -n "${PAT:-}" ]]; then
         echo -e "machine github.com\n  login token\n  password $PAT" >~/.netrc

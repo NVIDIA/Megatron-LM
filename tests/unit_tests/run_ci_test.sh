@@ -3,7 +3,7 @@ set -euxo pipefail
 
 # Parse command line arguments
 usage() {
-    echo "Usage: $0 --tag {latest|legacy} --environment {lts|dev} --bucket BUCKET [--unit-test-repeat N] [--unit-test-timeout N] --log-dir LOG_DIR"
+    echo "Usage: $0 --tag {latest|legacy} --environment {lts|dev} --bucket BUCKET [--platform {h100|gb200}] [--unit-test-repeat N] [--unit-test-timeout N] --log-dir LOG_DIR"
     exit 1
 }
 
@@ -15,6 +15,7 @@ cd $SCRIPT_PATH/../../
 UNIT_TEST_REPEAT=1
 UNIT_TEST_TIMEOUT=10
 LOG_DIR=$(pwd)/logs
+PLATFORM=h100
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -32,6 +33,10 @@ while [[ $# -gt 0 ]]; do
         ;;
     --bucket)
         BUCKET="$2"
+        shift 2
+        ;;
+    --platform)
+        PLATFORM="$2"
         shift 2
         ;;
     --unit-test-repeat)
@@ -96,6 +101,10 @@ fi
 cd $TEST_PATH
 
 MARKER=()
+if [[ "$PLATFORM" == "gb200" ]]; then
+    MARKER+=("launch_on_gb200")
+fi
+
 if [[ "$TAG" == "legacy" ]]; then
     MARKER+=("not internal")
 fi
@@ -117,11 +126,11 @@ export BUCKET
 IGNORE_ARGS=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && IGNORE_ARGS+=("$line")
-done < <(python tests/unit_tests/find_test_cases.py "$BUCKET" "h100")
+done < <(python tests/unit_tests/find_test_cases.py "$BUCKET" "$PLATFORM")
 
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-6000}
+MASTER_PORT=${MASTER_PORT:-29500}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
@@ -136,10 +145,24 @@ DISTRIBUTED_ARGS=(
     --redirects "3"
 )
 
-# Reduce memory usage by NCCL
-export NCCL_MAX_NCHANNELS=1
-export NCCL_NVLS_ENABLE=0
 export ONE_LOGGER_JOB_CATEGORY=test
+
+# Run a pytest command. On marker-driven platforms a bucket can legitimately
+# contain no matching tests; treat pytest's "no tests collected" (exit 5) as a
+# pass there instead of aborting the job under `set -e`.
+run_test_cmd() {
+    local cmd="$1"
+    local rc=0
+    set +e
+    eval "$cmd"
+    rc=$?
+    set -e
+    if [[ "$rc" -eq 5 && "$PLATFORM" == "gb200" ]]; then
+        echo "No tests collected for this bucket on $PLATFORM (pytest exit 5) — treating as pass."
+        return 0
+    fi
+    return "$rc"
+}
 
 for i in $(seq $UNIT_TEST_REPEAT); do
     echo "Running prod test suite."
@@ -151,7 +174,7 @@ for i in $(seq $UNIT_TEST_REPEAT); do
         -vs \
         ${IGNORE_ARGS[@]} \
         -m "'not experimental and ${MARKER_ARG}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))
-    eval "$CMD"
+    run_test_cmd "$CMD"
 
     if [[ "$TAG" == "latest" ]]; then
         CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} -m pytest \
@@ -160,7 +183,7 @@ for i in $(seq $UNIT_TEST_REPEAT); do
              ${IGNORE_ARGS[@]} \
             -m "'experimental and ${MARKER_ARG}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))
 
-        eval "$CMD"
+        run_test_cmd "$CMD"
     fi
 
 done

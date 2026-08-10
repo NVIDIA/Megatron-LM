@@ -4,7 +4,7 @@ from __future__ import annotations
 import warnings
 from abc import abstractmethod
 from functools import partial
-from typing import Optional, Protocol, cast
+from typing import Literal, Optional, Protocol, cast
 
 from typing_extensions import final, override
 
@@ -222,3 +222,19 @@ class InferenceSpecProvider(BackendSpecProvider):
                 activation_func=self.activation_func(),
             ),
         )
+
+
+def get_backend(
+    transformer_impl: Literal["local", "transformer_engine", "inference_optimized"],
+) -> BackendSpecProvider:
+    """Return the backend that's selected with the given `transformer_impl`."""
+    if transformer_impl == "transformer_engine":
+        from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+
+        return TESpecProvider()
+    elif transformer_impl == "inference_optimized":
+        return InferenceSpecProvider()
+    elif transformer_impl == "local":
+        return LocalSpecProvider()
+    else:
+        raise ValueError(f"unknown transformer_impl='{transformer_impl}'")

@@ -14,13 +14,13 @@ Guides for Megatron Core training features.
 ```{toctree}
 :maxdepth: 2
 
+cuda_graph
 fine_grained_activation_offloading
 moe
-context_parallel
 megatron_fsdp
 dist_optimizer
 optimizer_cpu_offload
-pipeline_parallel_layout
+paged_stash
 tokenizers
 megatron_energon
 megatron_rl

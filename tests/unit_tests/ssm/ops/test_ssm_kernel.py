@@ -2,6 +2,7 @@
 
 import math
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -82,6 +83,7 @@ class TestMambaDynamicInference(unittest.TestCase):
 
         # Create the Mixer instance directly
         self.mixer = MagicMock(spec=MambaMixer)
+        self.mixer.config = SimpleNamespace(batch_invariant_mode=False)
         self.mixer.d_state = self.d_state
         self.mixer.d_conv = self.d_conv
         self.mixer.headdim = self.headdim
@@ -108,31 +110,27 @@ class TestMambaDynamicInference(unittest.TestCase):
 
         # Create real parameters for ssm_decode to access
         conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
-        self.mixer.conv1d = nn.Conv1d(
-            in_channels=conv_dim,
-            out_channels=conv_dim,
-            kernel_size=self.d_conv,
-            groups=conv_dim,
-            padding=self.d_conv - 1,
-            bias=True,
-            device=self.device,
+        self.mixer.conv1d_weight = nn.Parameter(
+            torch.randn(conv_dim, 1, self.d_conv, device=self.device)
         )
+        self.mixer.conv1d_bias = nn.Parameter(torch.randn(conv_dim, device=self.device))
         self.mixer.dt_bias = nn.Parameter(torch.randn(self.nheads, device=self.device))
         self.mixer.A_log = nn.Parameter(torch.randn(self.nheads, device=self.device))
         self.mixer.D = nn.Parameter(torch.ones(self.nheads, device=self.device))
 
         # Bind methods
-        self.mixer._ssm_prefill = MambaMixer._ssm_prefill.__get__(self.mixer, MambaMixer)
-        self.mixer._ssm_decode = MambaMixer._ssm_decode.__get__(self.mixer, MambaMixer)
+        self.mixer.ssm_prefill = MambaMixer.ssm_prefill.__get__(self.mixer, MambaMixer)
+        self.mixer.ssm_decode = MambaMixer.ssm_decode.__get__(self.mixer, MambaMixer)
 
     def test_ssm_prefill_padding_isolation(self):
         """
         Tests that ssm_prefill only updates states for the real request
         and that padding request states remain untouched.
 
-        _ssm_prefill expects inputs pre-stripped to real tokens only
-        (stripping is done by _dynamic_inference_prefill). This test
-        passes only the real tokens and verifies that only the active
+        ssm_prefill reads all varlen metadata from the DynamicInferenceContext
+        and expects `zxBCdt` pre-stripped to real tokens only (stripping is
+        done upstream). This test passes only the real tokens, wires the
+        metadata through a mock context, and verifies that only the active
         request's state is modified.
         """
         num_requests = 48
@@ -156,15 +154,29 @@ class TestMambaDynamicInference(unittest.TestCase):
             num_requests, self.nheads, self.headdim, self.d_state, device=self.device
         )
 
-        # Run
-        self.mixer.norm = MagicMock(side_effect=lambda x, z: x * z)
-        output = self.mixer._ssm_prefill(
-            zxBCdt=zxBCdt,
-            conv_state=conv_state,
-            ssm_state=ssm_state,
+        # Mock the dynamic inference context. Leaving the chunk metadata (and
+        # extraction buffers) unset exercises the non-precomputed fallback path,
+        # which rebuilds chunk boundaries from cu_seqlens; no slot allocator means
+        # intermediate-state extraction (prefix caching) is disabled.
+        mamba_metadata = SimpleNamespace(
             seq_idx=seq_idx,
             cu_seqlens=cu_seqlens,
-            batch_indices=batch_indices,
+            batch_indices_prefill=batch_indices,
+            intermediate_chunk_indices=None,
+            intermediate_abs_positions=None,
+            intermediate_real_count=None,
+            cu_chunk_seqlens=None,
+            last_chunk_indices=None,
+            seq_idx_for_varlen=None,
+            conv_seq_idx=None,
+            conv_seq_start=None,
+        )
+        context = SimpleNamespace(mamba_metadata=mamba_metadata, mamba_slot_allocator=None)
+
+        # Run
+        self.mixer.norm = MagicMock(side_effect=lambda x, z: x * z)
+        output = self.mixer.ssm_prefill(
+            zxBCdt=zxBCdt, conv_state=conv_state, ssm_state=ssm_state, context=context
         )
 
         # Output should have real_seq_len tokens

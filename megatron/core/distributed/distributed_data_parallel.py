@@ -7,7 +7,6 @@ from typing import Optional
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
@@ -167,6 +166,15 @@ class DistributedDataParallel(_BaseDataParallel):
 
         self.full_param_layout = full_param_layout
 
+        # GTP_remat needs average_in_collective=False: the per-bucket collective runs over the
+        # replicate group, so NCCL AVG would miss the 1/gtp_remat factor. arguments.py
+        # guards the training path; this assert covers direct megatron-core users.
+        gtp_active = ProcessGroupCollection.is_gtp_remat_active(process_group_dict)
+        assert not (gtp_active and self.ddp_config.average_in_collective), (
+            "GTP requires average_in_collective=False (the default); averaged collectives reduce "
+            "over the GTP-excluded group and would miss the 1/gtp_remat gradient scaling factor."
+        )
+
         # Compute gradient scaling factors.
         if config.calculate_per_token_loss:
             assert (
@@ -306,6 +314,23 @@ class DistributedDataParallel(_BaseDataParallel):
                         bucket_groups[num_bucket_groups - i - 1]
                     )
 
+        # Set `previous_grad_reduce_bucket_group` so each bucket group can drain its predecessor's
+        # reduce-scatter at dispatch time. Only needed for reduce_scatter_with_fp32_accumulation,
+        # which holds an intermediate all-to-all output tensor pinned until .wait() runs; without
+        # this draining, all such tensors stay live until end-of-step. The fp32-accum path asserts
+        # num_distributed_optimizer_instances == 1 elsewhere, so we only link in that case.
+        # Grad-reduce dispatches happen in forward order of bucket_groups during backward (buckets
+        # closer to the output finish their gradients first), so bucket_groups[i]'s immediate
+        # predecessor in dispatch order is bucket_groups[i-1].
+        if (
+            self.ddp_config.overlap_grad_reduce
+            and self.ddp_config.reduce_scatter_with_fp32_accumulation
+            and self.ddp_config.num_distributed_optimizer_instances == 1
+        ):
+            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+                for i in range(1, len(bucket_groups)):
+                    bucket_groups[i].previous_grad_reduce_bucket_group = bucket_groups[i - 1]
+
         # Create map from param to bucket group, used in pre_hook.
         for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
             for bucket_group in bucket_groups:
@@ -353,8 +378,20 @@ class DistributedDataParallel(_BaseDataParallel):
                     param_tmp = param.expand_as(param)
                     # Get the gradient accumulator function.
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    grad_acc.register_hook(self._make_backward_post_hook(param))
-                    self.grad_accs.append(grad_acc)
+                    if getattr(param, 'is_gtp_weight_remat', False) and hasattr(
+                        param, 'register_grad_accum_hook'
+                    ):
+                        # GTP_remat computes wgrad via an async reduce-scatter, so autograd's
+                        # AccumulateGrad sees only a dummy; grad-ready is driven manually from
+                        # _handle_megatron_grad_accum (the hook passed here). RETAINING the node
+                        # keeps it on the capture stream for full-iteration CUDA-graph capture.
+                        # No autograd hook or grad_accs entry: either would fire on a stale grad.
+                        param.register_grad_accum_hook(
+                            grad_acc, self._make_backward_post_hook(param)
+                        )
+                    else:
+                        grad_acc.register_hook(self._make_backward_post_hook(param))
+                        self.grad_accs.append(grad_acc)
 
         # Note: overlap_param_gather covers both the distributed optimizer and the
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True
@@ -392,7 +429,10 @@ class DistributedDataParallel(_BaseDataParallel):
 
         # Force synchronize parameters.
         if param_sync:
-            self.start_param_sync(force_sync=True)
+            # Hook-disable paths (eval/checkpointing/shutdown) synchronize params as an
+            # explicit state update, not as differentiable forward compute.
+            with torch.no_grad():
+                self.start_param_sync(force_sync=True)
 
     def _make_forward_pre_hook(self):
         """
@@ -443,10 +483,15 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
-                if self.ddp_config.overlap_grad_reduce:
-                    assert (
-                        param.grad is not None
-                    ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                cudagraph_wgrad_ready_event = getattr(param, '_cudagraph_wgrad_ready_event', None)
+                if self.ddp_config.overlap_grad_reduce and cudagraph_wgrad_ready_event is None:
+                    # GTP_remat keeps its real wgrad in main_grad (via finalize); param.grad here is
+                    # throwaway (None or a dummy), so skip this assert and rely on
+                    # grad_added_to_main_grad below.
+                    if not getattr(param, 'is_gtp_weight_remat', False):
+                        assert (
+                            param.grad is not None
+                        ), 'param.grad being None is not safe when overlap_grad_reduce is True'
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
@@ -473,6 +518,24 @@ class DistributedDataParallel(_BaseDataParallel):
             for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
                 bucket_group.is_last_microbatch = True
 
+    def _start_bucket_group_param_sync(
+        self, bucket_group: '_ParamAndGradBucketGroup', force_sync: bool
+    ) -> None:
+        """Dispatch one bucket group's param all-gather + run the FP8 / MXFP8 / FP4
+        post-all-gather work the synchronous path needs.
+
+        Factored out of :meth:`start_param_sync` so callers that own a subset
+        of bucket groups (e.g. a chained ``LayerWiseDistributedOptimizer`` +
+        ``DistributedOptimizer`` pair) can sync only their own buckets without
+        losing the post-processing that follows the collective.
+        """
+        bucket_group.start_param_sync(force_sync=force_sync)
+
+        if self.ddp_config.overlap_param_gather:
+            return
+
+        bucket_group._post_param_sync()
+
     def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
         """
         Initiates param sync (all-gather) communication operations for all model parameters.
@@ -493,43 +556,20 @@ class DistributedDataParallel(_BaseDataParallel):
                 return
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
-            bucket_group.start_param_sync(force_sync=force_sync)
+            self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
-            if not self.ddp_config.overlap_param_gather:
-                # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
-                # the param.data, since param buffer is not mapped to model params for MXFP8 case.
-                # The paramaters are cast from bf16 to MXFP8 during copy.
-                # In the case of "overlap_param_gather=True", the param copy is done
-                # in "finish_param_sync" stage after zeroing the shared gardient buffers.
-                if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-                    for bucket in bucket_group.buckets:
-                        is_bf16_weight_bucket = False
-                        for param in bucket.params:
-                            # Skip copying since bf16 weights in the mxfp8 model
-                            # are already mapped to param.data.
-                            if not is_float8tensor(param):
-                                is_bf16_weight_bucket = True
-                                break
-                            param_start, param_end = bucket.param_to_index[param]
-                            param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                            param.data.copy_(param_slice.view(param.data.shape))
-                        if is_bf16_weight_bucket:
-                            continue
-                        # All-gathered params are not needed after being copied to param.data.
-                        # Zero out the param buffer (shared with grad buffer) for gradient
-                        # accumulation. We cannot zero out the entire grad buffer because one grad
-                        # buffer may correspond to multiple param buffers. If we zero out the entire
-                        # grad buffer, it would clear the data of those param buffers that have not
-                        # yet completed AG.
-                        bucket.param_data.zero_()
-                else:
-                    fp8_params = []
-                    for bucket in bucket_group.buckets:
-                        for param in bucket.params:
-                            if is_float8tensor(param):
-                                fp8_params.append(param)
-                    if len(fp8_params) > 0:
-                        post_all_gather_processing(fp8_params)
+    def reset_param_sync_dispatch_state(self):
+        """Mark DDP param all-gathers as not dispatched for the next forward pre-hook."""
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            # A non-None handle means the previous all-gather is still in flight. Resetting only
+            # the dispatch flag would create the invalid state
+            # `param_gather_dispatched=False, param_gather_handle!=None` and could dispatch a
+            # second all-gather into the same parameter buffer.
+            assert bucket_group.param_gather_handle is None, (
+                "Cannot reset parameter all-gather dispatch state while an asynchronous "
+                "parameter all-gather is still in flight."
+            )
+            bucket_group.param_gather_dispatched = False
 
     def start_grad_sync(self, *unused):
         """

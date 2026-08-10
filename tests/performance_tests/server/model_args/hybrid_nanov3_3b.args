@@ -1,0 +1,33 @@
+# Model-specific args for the nanov3 3B hybrid MoE checkpoint (TP=1 PP=1 EP=8 — 8 GPUs).
+# Sourced from tests/functional_tests/test_cases/hybrid/hybrid_dynamic_inference_tp1_ep8_nanov3_chunked_prefill/model_config.yaml
+--load ${CHECKPOINT_LOAD_PATH}/model/nemotron6/3b_hybrid_moe/checkpoints/phase2_lc_reinit_emb/
+--tokenizer-model ${CHECKPOINT_LOAD_PATH}/model/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+--tokenizer-type TikTokenizer
+--tiktoken-pattern v2
+--use-mcore-models
+--model-provider mamba
+--expert-model-parallel-size 8
+--expert-tensor-parallel-size 1
+--use-checkpoint-args
+--no-use-tokenizer-model-from-checkpoint-args
+--dist-ckpt-strictness log_unexpected
+--ckpt-format torch_dist
+--ckpt-fully-parallel-load
+--ckpt-assume-constant-structure
+--no-load-optim
+--moe-router-score-function sigmoid
+--moe-router-enable-expert-bias
+--moe-router-topk-scaling-factor 2.5
+--moe-router-dtype fp32
+--bf16
+--attention-backend flash
+--no-create-attention-mask-in-dataloader
+--mamba-inference-conv-states-dtype fp32
+--mamba-inference-ssm-states-dtype fp32
+--transformer-impl inference_optimized
+--inference-moe-token-dispatcher-type nvls
+--enable-chunked-prefill
+--cuda-graph-impl local
+--inference-cuda-graph-scope block
+--inference-dynamic-batching-num-cuda-graphs -1
+--distributed-backend nccl
