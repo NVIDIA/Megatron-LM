@@ -5,6 +5,10 @@ import pytest
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+def _make_transformer_config(**kwargs) -> TransformerConfig:
+    return TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4, **kwargs)
+
+
 def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
     return TransformerConfig(
         num_layers=1,
@@ -55,3 +59,21 @@ def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
             num_attention_heads=4,
             gdp_num_householder=num_householder,
         )
+
+
+def test_mxfp8_2d_quantization_accepts_mxfp8_recipe():
+    config = _make_transformer_config(fp8="e4m3", fp8_recipe="mxfp8", mxfp8_2d_quantization=True)
+
+    assert config.mxfp8_2d_quantization
+
+
+@pytest.mark.parametrize(
+    ("config_kwargs", "match"),
+    [
+        ({"fp8_recipe": "mxfp8"}, "together with fp8 mode"),
+        ({"fp8": "e4m3", "fp8_recipe": "delayed"}, "requires fp8_recipe='mxfp8'"),
+    ],
+)
+def test_mxfp8_2d_quantization_rejects_incompatible_fp8_config(config_kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _make_transformer_config(mxfp8_2d_quantization=True, **config_kwargs)

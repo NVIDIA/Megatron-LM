@@ -88,6 +88,36 @@ _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
 
 
+def get_mxfp8_block_scaling_recipe(*, mxfp8_2d_quantization: bool = False, **kwargs) -> Any:
+    """Create an MXFP8 recipe, optionally enabling 2D weight quantization.
+
+    Args:
+        mxfp8_2d_quantization: Whether to use 2D block scaling for forward-pass linear weights.
+        **kwargs: Additional arguments forwarded to Transformer Engine's MXFP8 recipe.
+
+    Returns:
+        A Transformer Engine MXFP8 block-scaling recipe.
+
+    Raises:
+        RuntimeError: If 2D quantization is requested with an older Transformer Engine build.
+    """
+    if mxfp8_2d_quantization:
+        parameters = inspect.signature(te.common.recipe.MXFP8BlockScaling).parameters.values()
+        supports_2d_quantization = any(
+            parameter.name == "enable_2d_quantization"
+            or parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+        if not supports_2d_quantization:
+            raise RuntimeError(
+                "MXFP8 2D quantization requires a Transformer Engine build whose "
+                "MXFP8BlockScaling recipe supports enable_2d_quantization."
+            )
+        kwargs["enable_2d_quantization"] = True
+
+    return te.common.recipe.MXFP8BlockScaling(**kwargs)
+
+
 def _set_expert_parameter_attributes(
     module: torch.nn.Module, parallel_mode: Optional[str], use_expert_pgs: bool
 ) -> None:
@@ -149,6 +179,8 @@ class TEQuantizationRecipe:
     """The path to a custom recipe factory if a custom Fp4 or Fp8 recipe is configured"""
     fp8_format: str = "e4m3"
     """A format to select from an FP8Recipe"""
+    mxfp8_2d_quantization: bool = False
+    """Whether to use 2D block scaling for forward-pass linear weights with MXFP8."""
     override_quantized_autocast: bool = True
     """
     If the quantization autocast context for a targeted module is enabled,
@@ -189,6 +221,8 @@ class TEQuantizationRecipe:
         instance = TEQuantizationRecipe(**kwargs)
         if instance.fp8_quantization_recipe == Fp8Recipe.delayed:
             raise ValueError("Delayed scaling not in scope of te per-module quantization config.")
+        if instance.mxfp8_2d_quantization and instance.fp8_quantization_recipe != Fp8Recipe.mxfp8:
+            raise ValueError("mxfp8_2d_quantization requires fp8_quantization_recipe='mxfp8'.")
         if (
             instance.fp8_quantization_recipe is not None
             and instance.fp4_quantization_recipe is not None
@@ -277,7 +311,9 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         elif qrecipe.fp8_quantization_recipe == Fp8Recipe.blockwise:
             quant_recipe = te.common.recipe.Float8BlockScaling(fp8_format=fp8_format)
         elif qrecipe.fp8_quantization_recipe == Fp8Recipe.mxfp8:
-            quant_recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=fp8_format)
+            quant_recipe = get_mxfp8_block_scaling_recipe(
+                mxfp8_2d_quantization=qrecipe.mxfp8_2d_quantization, fp8_format=fp8_format
+            )
         else:
             raise ValueError(f"Unhandled fp8 recipe: {qrecipe.fp8_quantization_recipe}")
     else:
@@ -347,7 +383,9 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             elif qrecipe.fp8_quantization_recipe == Fp8Recipe.blockwise:
                 quant_recipe = te.common.recipe.Float8BlockScaling(fp8_format=fp8_format)
             elif qrecipe.fp8_quantization_recipe == Fp8Recipe.mxfp8:
-                quant_recipe = te.common.recipe.MXFP8BlockScaling(fp8_format=fp8_format)
+                quant_recipe = get_mxfp8_block_scaling_recipe(
+                    mxfp8_2d_quantization=qrecipe.mxfp8_2d_quantization, fp8_format=fp8_format
+                )
             else:
                 raise ValueError(f"Unhandled fp8 recipe: {qrecipe.fp8_quantization_recipe}")
         else:
@@ -3247,7 +3285,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 if os.getenv("FP4_RECIPE", "") == "nvfp4":
                     self._recipe = te.common.recipe.NVFP4BlockScaling()
                 else:
-                    self._recipe = te.common.recipe.MXFP8BlockScaling()
+                    self._recipe = get_mxfp8_block_scaling_recipe(
+                        mxfp8_2d_quantization=self.config.mxfp8_2d_quantization
+                    )
             recipe = self._recipe
 
             if self._fused_impl is None:

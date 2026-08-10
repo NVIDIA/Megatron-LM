@@ -34,7 +34,11 @@ from megatron.core.utils import (
 if HAVE_TE:
     import transformer_engine as te
 
-    from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
+    from megatron.core.extensions.transformer_engine import (
+        TELinear,
+        get_mxfp8_block_scaling_recipe,
+        set_save_original_input,
+    )
     from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 else:
     te = None
@@ -456,7 +460,9 @@ class FusedSharedExpertMLP(SharedExpertMLP):
             if self.config.fp4 and fp4_recipe == "nvfp4":
                 self._fused_grouped_swiglu_recipe = te.common.recipe.NVFP4BlockScaling()
             elif self.config.fp8 and fp8_recipe == "mxfp8":
-                self._fused_grouped_swiglu_recipe = te.common.recipe.MXFP8BlockScaling()
+                self._fused_grouped_swiglu_recipe = get_mxfp8_block_scaling_recipe(
+                    mxfp8_2d_quantization=self.config.mxfp8_2d_quantization
+                )
             else:
                 raise ValueError(
                     f"{self.__class__.__name__} requires fp4_recipe='nvfp4' or "
