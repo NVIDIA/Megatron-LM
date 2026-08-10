@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import heapq
 from collections import deque
@@ -9,6 +9,9 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+
+# Block deregistration observers are currently registered only by DynamoHelper.
+BlocksDeregisteredObserver = Callable[[list[int], set[int]], None]
 
 
 class KVBlockAllocator:
@@ -21,16 +24,16 @@ class KVBlockAllocator:
 
     Args:
         context (DynamicInferenceContext): Dynamic inference context.
-        total_count (int): Total number of blocks in the buffer.
-        paused_count (int): Number of paused blocks in the buffer. Must be less
-            than `total_count`.
+        pool_size (int): Number of blocks in the pool, including the dummy block.
+        paused_limit (int): Paused-request block retention limit. Must leave at
+            least one non-dummy block outside the limit.
     """
 
     def __init__(
         self,
         context: "DynamicInferenceContext",
-        total_count: int,
-        paused_count: int,
+        pool_size: int,
+        paused_limit: int,
         enable_prefix_caching: bool = False,
         prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
             PrefixCachingEvictionPolicy.REF_ZERO
@@ -41,34 +44,35 @@ class KVBlockAllocator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
+        self._blocks_deregistered_observers: list[BlocksDeregisteredObserver] = []
 
-        self.total_count = total_count
-        self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
-        self.paused_count = paused_count
-        self.active_count = total_count - paused_count - 1  # -1 for dummy_block_idx
-        assert self.active_count >= 1  # ensures paused_count < total_count - 1
-        self.dummy_block_idx = self.total_count - 1
+        assert (
+            0 <= paused_limit <= pool_size - 2
+        ), "paused block limit must leave at least one usable block outside the limit"
+
+        self.pool_size = pool_size
+        self.pool_avail = pool_size - 1  # Raw free-pool count; -1 for dummy_block_idx.
+        self.paused_limit = paused_limit
+        self.dummy_block_idx = self.pool_size - 1
 
         # Initialize block pool as a "stack" data structure (CPU for bookkeeping).
-        self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device='cpu')
+        self.block_bag = torch.arange(self.pool_size, dtype=torch.int32, device='cpu')
 
         if self.enable_prefix_caching:
             # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash
-            self.block_hashes = torch.full((self.total_count,), -1, dtype=torch.int64, device='cpu')
+            self.block_hashes = torch.full((self.pool_size,), -1, dtype=torch.int64, device='cpu')
 
             # Hash-to-block mapping for O(1) prefix lookup
             self.kv_hash_to_block_id: Dict[int, int] = {}
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
-            self.block_ref_counts = torch.zeros(
-                (self.total_count,), dtype=torch.int32, device='cpu'
-            )
+            self.block_ref_counts = torch.zeros((self.pool_size,), dtype=torch.int32, device='cpu')
 
             # LRU timestamps for eviction ordering (higher = more recently used)
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps = torch.zeros(
-                    (self.total_count,), dtype=torch.int64, device='cpu'
+                    (self.pool_size,), dtype=torch.int64, device='cpu'
                 )
 
                 # Persisted prefix-chain bookkeeping for LRU eviction, maintained
@@ -79,14 +83,14 @@ class KVBlockAllocator:
                 # block_parent_id[b] = block id of b's parent in the prefix chain,
                 #   or -1 when b is a root block or its parent is not registered.
                 self.block_parent_id = torch.full(
-                    (self.total_count,), -1, dtype=torch.int64, device='cpu'
+                    (self.pool_size,), -1, dtype=torch.int64, device='cpu'
                 )
                 # block_child_count[b] = number of currently-registered children of b.
                 # For a cached block all of its children are cached too, so this
                 # equals its cached-child count and b is an evictable leaf exactly
                 # when it reaches 0.
                 self.block_child_count = torch.zeros(
-                    (self.total_count,), dtype=torch.int64, device='cpu'
+                    (self.pool_size,), dtype=torch.int64, device='cpu'
                 )
 
         # Per-block MoE routing storage (populated when routing replay is enabled)
@@ -94,14 +98,15 @@ class KVBlockAllocator:
 
     def __str__(self):
         return (
-            f"using: total {self.get_total_used()}/{self.total_count - 1}"
-            f"; active {self.get_active_used()}/{self.active_count}"
-            f"; paused {self.get_paused_used()}/{self.paused_count}"
+            f"blocks: occupied {self.get_total_used()}/{self.pool_size - 1}"
+            f"; allocatable {self.get_allocatable_count()}"
+            f"; active-used {self.get_active_used()}"
+            f"; paused-used {self.get_paused_used()}/{self.paused_limit}"
         )
 
     def get_total_used(self):
-        """Compute number of total blocks used."""
-        return self.total_count - self.total_avail - 1
+        """Compute number of physical blocks outside the free pool."""
+        return self.pool_size - self.pool_avail - 1
 
     def get_active_used(self):
         """Compute number of active blocks used."""
@@ -139,18 +144,10 @@ class KVBlockAllocator:
                 return int(torch.unique(valid_ids).numel())
         return 0
 
-    def get_active_avail(self):
-        """Compute number of active blocks available."""
-        return self.active_count - self.get_active_used()
-
-    def get_paused_avail(self):
-        """Compute number of paused blocks available."""
-        return self.paused_count - self.get_paused_used()
-
     def is_memory_available(self, num_blocks: int, potential_matched_count: int = 0) -> bool:
         """Check if memory blocks are available.
 
-        Includes both free pool blocks and evictable cached blocks (ref_count == 0).
+        Includes both free pool blocks and registered, evictable cached blocks.
 
         Args:
             num_blocks (int): Number of blocks to check.
@@ -165,16 +162,11 @@ class KVBlockAllocator:
         Return:
             (bool) Is memory available?
         """
-        # Fast path: avoid expensive evictable count computation when free pool suffices
-        if self.total_avail >= num_blocks:
+        # Fast path: avoid computing the evictable count when the free pool
+        # suffices. Soon-to-be-pinned matches do not affect raw free capacity.
+        if self.pool_avail >= num_blocks:
             return True
-        if not self.enable_prefix_caching:
-            return False
-        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
-            return False  # RZ: no cached blocks to evict
-        # Also count evictable cached blocks, excluding those the caller will pin.
-        evictable_count = int(self.get_evictable_block_count()) - potential_matched_count
-        return (self.total_avail + evictable_count) >= num_blocks
+        return self.get_allocatable_count() - potential_matched_count >= num_blocks
 
     def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
         """Allocate memory blocks if available, else return None.
@@ -188,19 +180,19 @@ class KVBlockAllocator:
             (Optional[Tensor]) Allocated block IDs.
         """
         # Try to evict cached blocks if free pool is insufficient
-        if self.total_avail < num_blocks:
+        if self.pool_avail < num_blocks:
             if (
                 not self.enable_prefix_caching
                 or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
             ):
                 return None  # RZ: no eviction path; disabled: no cached blocks
-            blocks_needed_from_eviction = num_blocks - self.total_avail
+            blocks_needed_from_eviction = num_blocks - self.pool_avail
             if not self.evict_lru_blocks(blocks_needed_from_eviction):
                 return None  # Not enough blocks even after eviction
 
         # Now allocate from the free pool
-        self.total_avail -= num_blocks
-        block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
+        self.pool_avail -= num_blocks
+        block_ids = self.block_bag[self.pool_avail : (self.pool_avail + num_blocks)]
         assert num_blocks == block_ids.numel()
 
         if self.enable_prefix_caching:
@@ -231,38 +223,33 @@ class KVBlockAllocator:
             return
 
         if self.enable_prefix_caching:
-            # When multiple requests that share the same prefix finish on the same step,
-            # their block IDs appear multiple times in the blocks tensor.
-            # Writing `self.block_ref_counts[blocks] -= 1` would only decrement reference counts
-            # once per unique block. This is wrong. The reference counts must be decremented
-            # once per occurrence of the block in the `blocks` tensor. We need `scatter`.
-            blocks_i64 = blocks.to(torch.int64)
-            self.block_ref_counts.scatter_add_(
-                0, blocks_i64, torch.full_like(blocks_i64, -1, dtype=torch.int32)
+            unique_blocks, release_counts = torch.unique(blocks, return_counts=True)
+            remaining_ref_counts = self.block_ref_counts[unique_blocks] - release_counts.to(
+                dtype=self.block_ref_counts.dtype
             )
+            assert torch.all(
+                remaining_ref_counts >= 0
+            ), "released more KV block references than the allocator owns"
+            self.block_ref_counts[unique_blocks] = remaining_ref_counts
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
-                zero_mask = self.block_ref_counts[blocks] == 0
+                zero_mask = remaining_ref_counts == 0
                 if zero_mask.any():
-                    # Deduplicate so a shared block is deregistered/returned once.
-                    self._deregister_blocks(torch.unique(blocks[zero_mask]))
+                    self._deregister_blocks(unique_blocks[zero_mask])
             elif self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 # Unregistered blocks (hash == -1, ref_count == 0) have no hash
                 # entry to preserve for reuse (e.g., partial blocks at the end of
                 # a request). Return them directly to the free pool so they are not
                 # leaked.
-                unreg_mask = (self.block_ref_counts[blocks] == 0) & (
-                    self.block_hashes[blocks] == -1
-                )
+                unreg_mask = (remaining_ref_counts == 0) & (self.block_hashes[unique_blocks] == -1)
                 if unreg_mask.any():
-                    # Deduplicate so a shared block returns to the pool once.
-                    unreg_blocks = torch.unique(blocks[unreg_mask])
+                    unreg_blocks = unique_blocks[unreg_mask]
                     num_unreg = unreg_blocks.numel()
-                    self.block_bag[self.total_avail : self.total_avail + num_unreg] = unreg_blocks
-                    self.total_avail += num_unreg
+                    self.block_bag[self.pool_avail : self.pool_avail + num_unreg] = unreg_blocks
+                    self.pool_avail += num_unreg
         else:
             num_blocks = blocks.numel()
-            self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
-            self.total_avail += num_blocks
+            self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = blocks
+            self.pool_avail += num_blocks
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -279,9 +266,11 @@ class KVBlockAllocator:
         # Without resetting the block bag, context request memory will clash and
         # requests will point to each other's memory blocks, resulting in faulty
         # generations.
-        self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device='cpu')
+        # Refill the existing buffer so it remains mutable when reset runs under
+        # torch.inference_mode(), such as during CUDA graph setup.
+        torch.arange(self.pool_size, out=self.block_bag)
 
-        self.total_avail = self.total_count - 1
+        self.pool_avail = self.pool_size - 1
 
         if self.enable_prefix_caching:
             # Reset all block hashes
@@ -310,6 +299,23 @@ class KVBlockAllocator:
     ) -> None:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
+        Registration is idempotent: a block that already carries the hash being
+        registered is skipped. Callers may legitimately re-offer an already
+        registered block (a cache-matched block whose block-table slot a later
+        prefill chunk also spans), and the bookkeeping below is one-shot per
+        block — applying it twice adds a second child entry to the block's
+        parent that no deregistration can ever cancel, leaving that parent
+        permanently short of ``child_count == 0`` and therefore never an
+        evictable leaf (see ``evict_lru_blocks``).
+
+        Re-registering a live block under a *different* hash would instead
+        overwrite its recorded parent while leaving the previous parent's child
+        count raised, so that case is rejected rather than absorbed.
+
+        This method never touches reference counts. New blocks are pinned at
+        ``ref_count == 1`` by ``allocate_memory_blocks``, and additional owners
+        of an already registered block are pinned by the caller that matched it.
+
         Args:
             block_ids: List of block IDs.
             block_hashes: List of computed hash values (same length as block_ids).
@@ -320,13 +326,46 @@ class KVBlockAllocator:
         """
         if not block_ids:
             return
-        id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
-        hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
-        self.block_hashes[id_tensor] = hash_tensor
         if parent_hashes is not None:
             assert len(parent_hashes) == len(block_ids)
+        # Tensor views of the batch, used to index the per-block state arrays.
+        id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
+        hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
+
+        # Drop blocks that already carry this hash, and reject hash changes on a
+        # block that is still registered. Read the stored hashes before writing
+        # them below, so this sees each block's pre-call state.
+        # Hash each block holds right now; -1 means it is not registered.
+        current_hashes = self.block_hashes[id_tensor]
+        # Per-entry: this exact (block, hash) pair is already registered -> skip it.
+        already_registered = current_hashes == hash_tensor
+        # Per-entry: block is registered, but under some other hash -> illegal.
+        conflict_mask = (current_hashes != -1) & ~already_registered
+        # Batch positions of the illegal entries, for the failure message.
+        conflicting = torch.nonzero(conflict_mask, as_tuple=True)[0].tolist()
+        assert not conflicting, "block re-registered under a different hash: " + ", ".join(
+            f"block {block_ids[i]} holds {int(current_hashes[i])}, given {block_hashes[i]}"
+            for i in conflicting
+        )
+        if already_registered.any():
+            # Batch positions of the entries that still need registering. Every
+            # list and tensor below is narrowed to these so that the writes, the
+            # hash-map update and the child-count bumps all see the same subset.
+            keep = torch.nonzero(~already_registered, as_tuple=True)[0]
+            if keep.numel() == 0:
+                return
+            keep_list = keep.tolist()
+            block_ids = [block_ids[i] for i in keep_list]
+            block_hashes = [block_hashes[i] for i in keep_list]
+            if parent_hashes is not None:
+                parent_hashes = [parent_hashes[i] for i in keep_list]
+            id_tensor = id_tensor[keep]
+            hash_tensor = hash_tensor[keep]
+
+        self.block_hashes[id_tensor] = hash_tensor
         # Add the new blocks to the hash map first so that a block whose parent is
         # elsewhere in this same batch (block k's parent is block k-1) resolves.
+        # Skipped blocks are already in the map, so they resolve as parents too.
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
 
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
@@ -337,11 +376,14 @@ class KVBlockAllocator:
             # falls back to -1.
             if parent_hashes is None:
                 parent_hashes = [0] * len(block_ids)
+            # Parent hashes resolved to block ids, aligned with block_ids; -1 for
+            # a root block and for a parent hash that is no longer cached.
             parent_ids = [
                 self.kv_hash_to_block_id.get(ph, -1) if ph != 0 else -1 for ph in parent_hashes
             ]
             parent_id_tensor = torch.tensor(parent_ids, dtype=torch.int64, device=id_tensor.device)
             self.block_parent_id[id_tensor] = parent_id_tensor
+            # Per-entry: this block has a resolved parent whose count to bump.
             has_parent = parent_id_tensor >= 0
             if has_parent.any():
                 self.block_child_count.scatter_add_(
@@ -349,6 +391,13 @@ class KVBlockAllocator:
                     parent_id_tensor[has_parent],
                     torch.ones(int(has_parent.sum()), dtype=torch.int64),
                 )
+
+    def add_blocks_deregistered_observer(self, observer: BlocksDeregisteredObserver) -> None:
+        """Register a callback invoked when cached blocks are deregistered.
+
+        Currently used only by DynamoHelper.
+        """
+        self._blocks_deregistered_observers.append(observer)
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
@@ -364,6 +413,7 @@ class KVBlockAllocator:
 
         # Gather hashes via batched tensor indexing
         block_ids_i64 = block_ids.to(torch.int64)
+        block_ids_list = block_ids.tolist()
         hashes = self.block_hashes[block_ids_i64].tolist()
 
         # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
@@ -372,10 +422,6 @@ class KVBlockAllocator:
             map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
             maxlen=0,
         )
-
-        # Notify Mamba slot allocator (if wired) to clean up its state
-        if self.on_blocks_deregistered is not None:
-            self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
 
         # Reset block state (batched tensor ops)
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
@@ -397,8 +443,15 @@ class KVBlockAllocator:
         self.block_ref_counts[block_ids] = 0
 
         # Return blocks to free pool
-        self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
-        self.total_avail += num_blocks
+        self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = block_ids
+        self.pool_avail += num_blocks
+
+        # Notify dependent allocators and external observers only after KV allocator
+        # bookkeeping commits, so callback failures cannot leave this allocator partial.
+        if self.on_blocks_deregistered is not None:
+            self.on_blocks_deregistered(block_ids_list, keys_to_delete)
+        for observer in tuple(self._blocks_deregistered_observers):
+            observer(block_ids_list, keys_to_delete)
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
@@ -421,6 +474,22 @@ class KVBlockAllocator:
         """
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
         return cached_mask.sum()
+
+    def get_allocatable_count(self) -> int:
+        """Compute the number of blocks available for allocation.
+
+        Includes both blocks in the free pool and, under LRU prefix caching,
+        registered ref-zero blocks that can be evicted.
+
+        Returns:
+            Number of blocks that can currently be allocated.
+        """
+        if (
+            self.enable_prefix_caching
+            and self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+        ):
+            return self.pool_avail + int(self.get_evictable_block_count())
+        return self.pool_avail
 
     def evict_lru_blocks(self, num_blocks_needed: int) -> bool:
         """Evict LRU cached blocks to free up space in the pool.
@@ -451,8 +520,8 @@ class KVBlockAllocator:
         Worked example, evicting 3 from::
 
             A(ts 1) -> B(ts 2) -> C(ts 5)   (C, F are leaves under B)
-                              \-> F(ts 3)
-                    \-> D(ts 3) -> E(ts 5)   (E is a leaf under D)
+                              +-> F(ts 3)
+                    +-> D(ts 3) -> E(ts 5)   (E is a leaf under D)
 
         Leaf-peel evicts F(3), then C(5); B is now childless so it joins the
         leaves with its own ts=2 and is evicted next -> retains {A, D, E}, keeping

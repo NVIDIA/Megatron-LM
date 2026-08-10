@@ -421,6 +421,7 @@ class Attention(MegatronModule, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".linear_proj") if name is not None else None,
         )
 
@@ -468,7 +469,7 @@ class Attention(MegatronModule, ABC):
                 checkpoint_inputs.append(kwarg_value)
 
         def custom_forward(*inputs):
-            (query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values) = inputs
+            query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values = inputs
             attn_mask_type = AttnMaskType(attn_mask_type.item())
             extra_kwargs = dict(core_attention_extra_kwargs)
             for name, kwarg_value in zip(tensor_kwarg_names, tensor_kwarg_values):
@@ -1689,6 +1690,7 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".linear_qkv") if name is not None else None,
         )
 
@@ -1881,9 +1883,9 @@ class SelfAttention(Attention):
             ]
 
             if SplitAlongDim is not None:
-                (query, gate, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+                query, gate, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
-                (query, gate, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+                query, gate, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
         else:
             # If no output gate: [sq, b, ng, (np/ng + 2) * hn]
             # --> [sq, b, ng, np/ng * hn], None, [sq, b, ng, hn], [sq, b, ng, hn]
@@ -1898,9 +1900,9 @@ class SelfAttention(Attention):
                 return mixed_qkv, split_arg_list
 
             if SplitAlongDim is not None:
-                (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+                query, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
-                (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+                query, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
 
         # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
@@ -2144,7 +2146,7 @@ class CrossAttention(Attention):
         mixed_kv = mixed_kv.view(*new_tensor_shape)
 
         # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
-        (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
+        key, value = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
         query, _ = apply_module(self.linear_q)(hidden_states)
