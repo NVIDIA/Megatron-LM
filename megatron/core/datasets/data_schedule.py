@@ -636,7 +636,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             )
 
         # Step 8: Broadcast to TP group (for non-TP-0 ranks)
-        (num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch) = (
+        num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
             broadcast_scalars(
                 [
                     num_micro_batches,
