@@ -184,6 +184,57 @@ class TestHybridStackMHC:
         for name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
             assert getattr(stack, name).grad is not None
 
+    def test_full_recompute_forwards_input_ids(self, monkeypatch):
+        config = _get_config(
+            num_layers=2,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+        )
+        stack = _get_stack(config, num_local_layers=2).cuda()
+        hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
+        input_ids = torch.arange(8, device="cuda").repeat(2, 1)
+        seen_input_ids = []
+        original = HyperConnectionHybridLayer._call_inner_transformer_layer_without_local_bda
+
+        def record_input_ids(
+            layer,
+            hidden_states,
+            attention_mask,
+            inference_context,
+            rotary_pos_emb,
+            sequence_len_offset,
+            packed_seq_params,
+            padding_mask,
+            input_ids=None,
+        ):
+            seen_input_ids.append(input_ids)
+            return original(
+                layer,
+                hidden_states,
+                attention_mask,
+                inference_context,
+                rotary_pos_emb,
+                sequence_len_offset,
+                packed_seq_params,
+                padding_mask,
+                input_ids,
+            )
+
+        monkeypatch.setattr(
+            HyperConnectionHybridLayer,
+            "_call_inner_transformer_layer_without_local_bda",
+            record_input_ids,
+        )
+
+        output = stack(hidden_states, attention_mask=None, input_ids=input_ids)
+        output.float().sum().backward()
+
+        assert len(seen_input_ids) == 4
+        assert all(
+            captured is not None and torch.equal(captured, input_ids) for captured in seen_input_ids
+        )
+
     def test_fused_bf16_forward_backward(self):
         config = _get_config(
             num_layers=2, bf16=True, params_dtype=torch.bfloat16, use_fused_mhc=True

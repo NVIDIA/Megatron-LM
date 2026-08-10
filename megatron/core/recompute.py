@@ -31,6 +31,7 @@ def checkpointed_forward(
     padding_mask: Optional[Tensor] = None,
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
+    input_ids: Optional[Tensor] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -41,6 +42,7 @@ def checkpointed_forward(
         layer_offset (int): The global layer offset for the current
             pipeline stage. Used to convert local layer indices to
             global indices when checking extract_layer_indices.
+        input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -64,6 +66,7 @@ def checkpointed_forward(
             rotary_pos_emb_local,
             rotary_pos_emb_global,
             padding_mask=None,
+            input_ids=None,
         ):
             rotary_pos_emb = (
                 (rotary_pos_emb_local, rotary_pos_emb_global)
@@ -106,11 +109,19 @@ def checkpointed_forward(
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
                 )
+                if input_ids is not None:
+                    layer_kwargs["input_ids"] = input_ids
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
                     else:  # MambaLayer (HybridStack `M` slot)
-                        for k in ("context", "context_mask", "attention_bias", "padding_mask"):
+                        for k in (
+                            "context",
+                            "context_mask",
+                            "attention_bias",
+                            "padding_mask",
+                            "input_ids",
+                        ):
                             layer_kwargs.pop(k, None)
                         hidden_states = layer(**layer_kwargs)
                         context = None
@@ -126,7 +137,15 @@ def checkpointed_forward(
         nonlocal hidden_states, context
         cf = custom(start, end)
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
-        args = (hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
+        args = (
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            *rotary_pos_emb,
+            padding_mask,
+            input_ids,
+        )
         if use_checkpoint:
             # Precision-aware activation checkpoint: TE under FP8/FP4,
             # tensor_parallel under BF16/FP16/FP32.
