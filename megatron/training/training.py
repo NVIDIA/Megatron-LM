@@ -2842,12 +2842,23 @@ def training_log(
     # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
         indexer_loss_scale = 1 / get_num_microbatches()
+        assert isinstance(
+            pg_collection, ProcessGroupCollection
+        ), "DSA indexer logging requires a ProcessGroupCollection"
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
             writer=writer,
+            pg_collection=pg_collection,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            num_layers=args.num_layers + (args.mtp_num_layers or 0),
+            num_indexer_layers=(
+                sum(ratio == 4 for ratio in args.csa_compress_ratios)
+                if args.csa_compress_ratios is not None
+                else None
+            ),
+            preserve_groups=args.cuda_graph_impl != "none",
         )
 
     # Dump memory snapshot and print metrics to stdout.
