@@ -113,6 +113,14 @@ def build_otel_worker_bootstrap(args):
     #       checkpoint internals). An OLD worker ignores this key.
     worker_span_groups = getattr(args, 'otel_span_groups', None)
     resolved_span_groups = None
+    #   span_categories (dict[str, str]) -- the FULL Megatron group->category map
+    #       ('goodput'/'profiling'). The worker's setup_telemetry() resolves
+    #       categories with the BASE SpanGroup (missing Megatron-only groups like
+    #       'trace_region'), so we pass the full map and the worker overrides
+    #       set_group_categories() with it AFTER setup_telemetry. Without this,
+    #       worker-side trace_region shadows would carry lens.group but no
+    #       lens.span_category. An OLD worker ignores this key.
+    span_categories = None
     if worker_span_groups:
         try:
             from nemo.lens.groups import SpanGroup as _BaseSpanGroup
@@ -120,6 +128,7 @@ def build_otel_worker_bootstrap(args):
 
             resolved = MegatronSpanGroup.resolve(worker_span_groups)
             resolved_span_groups = sorted(resolved)
+            span_categories = MegatronSpanGroup.categories()
             base_safe = resolved & _BaseSpanGroup.ALL_GROUPS
             worker_span_groups = ','.join(sorted(base_safe)) if base_safe else 'default'
         except Exception:
@@ -132,6 +141,7 @@ def build_otel_worker_bootstrap(args):
         'service_name': service_name,
         'span_groups': worker_span_groups,
         'resolved_span_groups': resolved_span_groups,
+        'span_categories': span_categories,
         'json_dir': getattr(args, 'otel_json_dir', None),
         'rank': args.rank,
         'world_size': args.world_size,

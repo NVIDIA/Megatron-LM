@@ -38,8 +38,13 @@ except ImportError:
             ]
         )
 
+        GOODPUT_GROUPS: Final[frozenset] = frozenset(
+            [JOB, CHECKPOINT, EVALUATE, MODEL_INIT, LOAD_CHECKPOINT, STEP]
+        )
+
         _PRESETS: ClassVar[dict] = {
             "default": frozenset([JOB, CHECKPOINT, EVALUATE]),
+            "goodput": GOODPUT_GROUPS,
             "per_step": frozenset(
                 [
                     JOB,
@@ -52,8 +57,16 @@ except ImportError:
                     OPTIMIZER,
                 ]
             ),
+            "profiling": ALL_GROUPS,
             "all": ALL_GROUPS,
         }
+
+        @classmethod
+        def categories(cls) -> dict:
+            return {
+                g: ("goodput" if g in cls.GOODPUT_GROUPS else "profiling")
+                for g in cls.ALL_GROUPS
+            }
 
         @classmethod
         def resolve(cls, spec: str) -> frozenset:
@@ -126,6 +139,19 @@ class MegatronSpanGroup(SpanGroup):
         ]
     )
 
+    # Semantic goodput/resiliency boundaries: the base goodput groups plus the
+    # Megatron phases the goodput bucketer keys off (dataloader setup, the
+    # one-off first iteration). Everything else (forward/backward, optimizer,
+    # microbatch, layer, communication, activation offload, trace_region,
+    # inference) is profiling detail. Drives both the "goodput" preset and the
+    # per-span lens.span_category attribute.
+    GOODPUT_GROUPS: Final[frozenset] = SpanGroup.GOODPUT_GROUPS | frozenset(
+        [
+            DATA_LOADING,
+            FIRST_ITERATION,
+        ]
+    )
+
     _PRESETS: ClassVar[dict] = {
         "default": frozenset(
             [
@@ -136,6 +162,7 @@ class MegatronSpanGroup(SpanGroup):
                 INFERENCE,
             ]
         ),
+        "goodput": GOODPUT_GROUPS,
         "per_step": frozenset(
             [
                 SpanGroup.JOB,
@@ -152,5 +179,6 @@ class MegatronSpanGroup(SpanGroup):
                 INFERENCE,
             ]
         ),
+        "profiling": ALL_GROUPS,
         "all": ALL_GROUPS,
     }
