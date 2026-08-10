@@ -17,7 +17,13 @@ import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
+from megatron.core.utils import (
+    get_emerging_optimizers_version,
+    get_pg_rank,
+    get_pg_size,
+    is_emerging_optimizers_min_version,
+    log_single_rank,
+)
 
 from .optimizer_config import ParamKey, ParamPredicate
 
@@ -29,8 +35,6 @@ try:
         get_muon_scale_factor,
     )
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz_tp
-
-    _NS_TP_SUPPORTS_SYRK = "use_syrk" in inspect.signature(newton_schulz_tp).parameters
 
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
@@ -44,6 +48,12 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+# newton_schulz_tp() gained the use_syrk kwarg in emerging_optimizers 0.4.0. Earlier releases
+# expose use_syrk on the non-TP newton_schulz() only, so 0.3.x still rejects it here. Spelled
+# ".dev0" so pre-release builds of that line are accepted too, matching how the TE minimums
+# elsewhere in the tree are written.
+_SYRK_MIN_EO_VERSION = "0.4.0.dev0"
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
@@ -184,12 +194,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
-        if use_syrk and not _NS_TP_SUPPORTS_SYRK:
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                "use_syrk requested but the installed emerging_optimizers does not support it; "
-                "falling back to standard GEMM.",
+        if use_syrk and not is_emerging_optimizers_min_version(_SYRK_MIN_EO_VERSION):
+            raise ValueError(
+                f"use_syrk requires emerging_optimizers >= {_SYRK_MIN_EO_VERSION}, but "
+                f"{get_emerging_optimizers_version()} is installed. Upgrade "
+                "emerging_optimizers or drop --muon-use-syrk."
             )
 
         def scaled_orthogonalize_fn(
@@ -207,9 +216,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             size = [grad.size(-2), grad.size(-1)]
             if partition_dim is not None:
                 size[partition_dim] *= get_pg_size(tp_group)
-            ns_kwargs = {}
-            if use_syrk and _NS_TP_SUPPORTS_SYRK:
-                ns_kwargs["use_syrk"] = True
+            # Only forward the kwarg when enabled; older emerging_optimizers do not
+            # accept it at all, and __init__ has already rejected use_syrk on those.
+            ns_kwargs = {"use_syrk": True} if use_syrk else {}
             orth_grad = newton_schulz_tp(
                 grad,
                 steps=num_ns_steps,
@@ -367,6 +376,8 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         extra_scale_factor: The additional scale factor to use for the update.
         pg_collection: Process group collection for distributed training.
         tp_mode: Tensor parallel mode ("blockwise", "duplicated", or "distributed").
+        use_syrk: Whether to use the Triton SYRK kernel for the Gram matrix in
+            Newton-Schulz. Requires emerging_optimizers >= 0.4.0.
         moment2_method: Method for second moment accumulation ("adamuon" or "normuon").
         beta2: The exponential decay rate for second moment.
         eps: Small constant for numerical stability.
