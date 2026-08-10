@@ -48,7 +48,11 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.utils import toggle_cuda_graphs, transition_moe_cudagraphs
+from megatron.core.transformer.utils import (
+    set_model_config_attribute,
+    toggle_cuda_graphs,
+    transition_moe_cudagraphs,
+)
 from megatron.core.utils import (
     get_asyncio_loop,
     get_attr_wrapped_model,
@@ -805,7 +809,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
 
             # This is a hack to fix megatron's behaviour when flash-decode affects the training code flow.
             flash_decode = model.config.flash_decode
-            model.config.flash_decode = False
+            set_model_config_attribute(model, "flash_decode", False)
             fp32_output = not (args.fp16 or args.bf16)
             with torch.no_grad() if no_grad else nullcontext():
                 logits_or_hidden_states = model(
@@ -816,7 +820,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
                     runtime_gather_output=True,
                     fp32_output=fp32_output,
                 )
-            model.config.flash_decode = flash_decode
+            set_model_config_attribute(model, "flash_decode", flash_decode)
 
         pg_collection = get_attr_wrapped_model(model, "pg_collection")
         pp_group = pg_collection.pp
@@ -2200,9 +2204,11 @@ def megatron_rl_inference_mode(
 
     # Use local CUDA graphs during rollout inference. An empty module list preserves
     # full-layer capture when the configured inference scope is layer.
-    model[0].config.cuda_graph_modules = []
-    model[0].config.cuda_graph_impl = "local"
-    model[0].config.inference_cuda_graph_scope = args.inference_cuda_graph_scope
+    set_model_config_attribute(model[0], "cuda_graph_modules", [])
+    set_model_config_attribute(model[0], "cuda_graph_impl", "local")
+    set_model_config_attribute(
+        model[0], "inference_cuda_graph_scope", args.inference_cuda_graph_scope
+    )
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
@@ -2260,17 +2266,25 @@ def megatron_rl_inference_mode(
 
         # Restore cudagraph scope for training.
         # MoE partial capture requires specific scopes that aren't user-facing.
-        model[0].config.cuda_graph_impl = args.cuda_graph_impl
-        model[0].config.inference_cuda_graph_scope = args.inference_cuda_graph_scope
+        set_model_config_attribute(model[0], "cuda_graph_impl", args.cuda_graph_impl)
+        set_model_config_attribute(
+            model[0], "inference_cuda_graph_scope", args.inference_cuda_graph_scope
+        )
         if args.num_experts is not None:
-            model[0].config.cuda_graph_modules = [
-                CudaGraphModule.mamba,
-                CudaGraphModule.attn,
-                CudaGraphModule.moe_router,
-                CudaGraphModule.moe_preprocess,
-            ]
+            set_model_config_attribute(
+                model[0],
+                "cuda_graph_modules",
+                [
+                    CudaGraphModule.mamba,
+                    CudaGraphModule.attn,
+                    CudaGraphModule.moe_router,
+                    CudaGraphModule.moe_preprocess,
+                ],
+            )
         else:
-            model[0].config.cuda_graph_modules = copy.copy(args.cuda_graph_modules)
+            set_model_config_attribute(
+                model[0], "cuda_graph_modules", copy.copy(args.cuda_graph_modules)
+            )
 
         # Switch MoE layers to partial CUDA graph capture for training
         if args.rl_training_cuda_graphs and args.num_experts is not None:
