@@ -107,6 +107,21 @@ def test_gdn_pre_gated_delta_rule_fusion_requires_gdn_variant():
         )
 
 
+def test_gdn_norm_out_recompute_accepts_gdn_variant():
+    config = _make_gdn_config(recompute_granularity="selective", recompute_modules=["gdn_norm_out"])
+    assert "gdn_norm_out" in config.recompute_modules
+
+
+def test_gdn_norm_out_recompute_requires_gdn_variant():
+    with pytest.raises(ValueError, match="experimental_attention_variant='gated_delta_net'"):
+        _make_gdn_config(
+            experimental_attention_variant=None,
+            linear_attention_freq=None,
+            recompute_granularity="selective",
+            recompute_modules=["gdn_norm_out"],
+        )
+
+
 def test_gdn_conv_pad_alignment_rejects_chunkwise_cp():
     with pytest.raises(AssertionError, match="gdn_conv_pad_alignment is incompatible"):
         _make_gdn_config(
@@ -442,6 +457,7 @@ class TestGatedDeltaNet:
     def test_module_construction(self):
         gdn = self.gdn
         assert gdn.in_proj_dim == 2 * gdn.qk_dim + 2 * gdn.v_dim + 2 * gdn.num_value_heads
+        assert gdn.feat_dim_split == gdn._get_feat_dim_split(self.cp_size_headwise)
         assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
         assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
 

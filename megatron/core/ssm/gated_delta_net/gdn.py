@@ -60,12 +60,7 @@ class GatedDeltaNet(_GDNBase):
             self.num_value_heads // self.tp_size,  # alpha
         )
         cp_size_headwise = self.cp_size if self.config.linear_cp_mode == "headwise" else 1
-        self.feat_dim_split = (
-            (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size_headwise,  # qkv
-            self.v_dim_local_tp // cp_size_headwise,  # gate (z)
-            self.num_value_heads // self.tp_size // cp_size_headwise,  # beta
-            self.num_value_heads // self.tp_size // cp_size_headwise,  # alpha
-        )
+        self.feat_dim_split = self._get_feat_dim_split(cp_size_headwise)
 
         self.dt_bias_dim = self.num_v_heads_local_tp
         self.a_log_dim = self.num_v_heads_local_tp
@@ -74,6 +69,15 @@ class GatedDeltaNet(_GDNBase):
             self.gated_delta_rule = torch_chunk_gated_delta_rule
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
+
+    def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int, int]:
+        """Return GDN1 qkv/z/beta/alpha split sizes for a runtime headwise CP size."""
+        return (
+            (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size_headwise,
+            self.v_dim_local_tp // cp_size_headwise,
+            self.num_value_heads // self.tp_size // cp_size_headwise,
+            self.num_value_heads // self.tp_size // cp_size_headwise,
+        )
 
     @jit_fuser
     def _compute_gates(
@@ -446,14 +450,7 @@ class GatedDeltaNet(_GDNBase):
 
         qkvzba = qkvzba.transpose(0, 1)
         qkv, gate, beta, alpha = torch.split(
-            qkvzba,
-            [
-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size_headwise,
-                self.v_dim_local_tp // cp_size_headwise,
-                self.num_value_heads // self.tp_size // cp_size_headwise,
-                self.num_value_heads // self.tp_size // cp_size_headwise,
-            ],
-            dim=-1,
+            qkvzba, self._get_feat_dim_split(cp_size_headwise), dim=-1
         )
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
 
@@ -645,6 +642,9 @@ def torch_chunk_gated_delta_rule(
     assert (
         cu_seqlens is None
     ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
+    assert (
+        kwargs.get("cp_context") is None
+    ), "cp_context is not supported for torch_chunk_gated_delta_rule for now."
 
     query, key, value = q, k, v
     initial_dtype = query.dtype

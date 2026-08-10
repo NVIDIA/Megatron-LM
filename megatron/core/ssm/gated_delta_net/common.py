@@ -283,7 +283,7 @@ class _GDNBase(MegatronModule):
         )
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
-        if self.config.recompute_granularity == "selective":
+        if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
         self.recompute_gdn = False
         if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
