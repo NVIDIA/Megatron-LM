@@ -55,6 +55,10 @@ else:
 _SEED = 42
 
 
+def _make_sbhd_cp_packed_seq_params(cp_group):
+    return PackedSeqParams(qkv_format="sbhd", cp_group=cp_group, cp_partition_mode="zigzag")
+
+
 class TestMultiTokenPredictionLayer:
     def setup_method(self, method):
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
@@ -739,8 +743,12 @@ class TestMultiTokenPrediction:
             load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
             batch["output_ref"] = output_ref
             # Get batch for current CP rank (handles CP tensor splitting)
+            cp_group = get_context_parallel_group()
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch,
+                is_hybrid_cp=False,
+                cp_group=cp_group,
+                cp_partition_mode="zigzag",
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = gpt_model[0].forward(
@@ -749,6 +757,9 @@ class TestMultiTokenPrediction:
                 attention_mask=attention_mask,
                 labels=labels,
                 loss_mask=loss_mask,
+                packed_seq_params=(
+                    _make_sbhd_cp_packed_seq_params(cp_group) if cp > 1 else None
+                ),
             )
             # Combine normalized loss contributions across DP+CP.
             MTPLossLoggingHelper.reduce_loss_in_tracker()
@@ -1098,6 +1109,7 @@ class TestMultiTokenPrediction:
                 max_seqlen_q=6,  # max(4, 6) - max local seq length per sequence
                 max_seqlen_kv=6,
                 qkv_format='thd',
+                cp_partition_mode="zigzag",
             )
 
             # Roll by -1 (shift left) with CP communication
@@ -1270,6 +1282,7 @@ class TestMultiTokenPrediction:
                 max_seqlen_q=11,
                 max_seqlen_kv=11,
                 qkv_format='thd',
+                cp_partition_mode="zigzag",
             )
 
             rolled, sum_val = roll_tensor(
@@ -1798,7 +1811,10 @@ class TestMultiTokenPredictionHybrid:
 
             batch["output_ref"] = output_ref
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch,
+                is_hybrid_cp=False,
+                cp_group=get_context_parallel_group(),
+                cp_partition_mode="zigzag",
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = mamba_model[0].forward(

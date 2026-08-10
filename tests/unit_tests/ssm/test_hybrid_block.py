@@ -302,6 +302,51 @@ class TestHybridBlock:
         assert output.shape[2] == block.config.hidden_size
         assert output.dtype == torch.float32
 
+    def test_hyper_connection_mlp_fast_path_forwards_packed_seq_params(self, monkeypatch):
+        """mHC MLP-only fast path preserves packed sequence metadata for MoE routing."""
+        block = self.get_mamba_block(Symbols.MLP, enable_hyper_connections=True)
+        layer = block.layers[0]
+        inner = layer.inner_layer
+
+        captured = {}
+
+        def fake_forward_mlp_output_with_bias(
+            hidden_states,
+            inference_context=None,
+            padding_mask=None,
+            input_ids=None,
+            packed_seq_params=None,
+        ):
+            captured["packed_seq_params"] = packed_seq_params
+            captured["padding_mask"] = padding_mask
+            captured["input_ids"] = input_ids
+            return (hidden_states, None), hidden_states
+
+        monkeypatch.setattr(
+            inner, "_forward_mlp_output_with_bias", fake_forward_mlp_output_with_bias
+        )
+
+        hidden_states = torch.ones((4, 1, block.config.hidden_size))
+        padding_mask = torch.zeros((1, 4), dtype=torch.bool)
+        input_ids = torch.arange(4).view(1, 4)
+        packed_seq_params = object()
+
+        result = layer._call_inner_transformer_layer_without_local_bda(
+            hidden_states=hidden_states,
+            attention_mask=None,
+            inference_context=None,
+            rotary_pos_emb=None,
+            sequence_len_offset=None,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            input_ids=input_ids,
+        )
+
+        assert result is not None
+        assert captured["packed_seq_params"] is packed_seq_params
+        assert captured["padding_mask"] is padding_mask
+        assert captured["input_ids"] is input_ids
+
     def test_hyper_connection_gdn_gpu_forward(self):
         """mHC runs through GDN, attention, and Mamba hybrid layers."""
         layer_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
