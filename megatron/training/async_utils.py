@@ -127,15 +127,20 @@ def build_otel_worker_bootstrap(args):
             # rather than risk handing the worker something it can't resolve.
             worker_span_groups = 'per_step'
 
+    enabled = bool(getattr(args, 'otel_enabled', False))
     return {
-        'enabled': bool(getattr(args, 'otel_enabled', False)),
+        'enabled': enabled,
         'service_name': service_name,
         'span_groups': worker_span_groups,
         'resolved_span_groups': resolved_span_groups,
         'json_dir': getattr(args, 'otel_json_dir', None),
         'rank': args.rank,
         'world_size': args.world_size,
-        'resource_attrs': build_telemetry_resource_attrs(args),
+        # Same reasoning as _set_telemetry(): building these calls NVML
+        # (_detect_gpu_identity), and the worker discards them when 'enabled' is
+        # False, so don't build them on the disabled path. The key is always
+        # present, so the worker-side contract is unchanged.
+        'resource_attrs': build_telemetry_resource_attrs(args) if enabled else {},
     }
 
 

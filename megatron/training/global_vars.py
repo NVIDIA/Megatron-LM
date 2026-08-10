@@ -537,7 +537,11 @@ def _set_telemetry(args):
             lambda self: int.from_bytes(os.urandom(16), 'big') or 1
         )
 
-    resource_attrs = build_telemetry_resource_attrs(args)
+    # Only pay for the resource-attribute build on the enabled path. It is not free:
+    # _detect_gpu_identity() does an nvmlInit()/nvmlShutdown() round trip, and a run with
+    # telemetry off must not touch NVML (or anything else) just because nemo-lens is importable.
+    # setup_telemetry() ignores resource_attributes for a disabled config, so {} is equivalent.
+    resource_attrs = build_telemetry_resource_attrs(args) if config.enabled else {}
 
     # The "console" exporter defaults to stdout, which interleaves spans/metrics
     # with regular training logs. If --otel-json-dir is set, redirect it to a
