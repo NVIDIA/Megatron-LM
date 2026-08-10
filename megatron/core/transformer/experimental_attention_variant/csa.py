@@ -22,7 +22,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils import c
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_compressor import (
     maybe_compress_thd_fused,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (  # pylint: disable=line-too-long
     FusedCSAIndexerSparseAttnFromTopkFunc,
     batch_of_row,
     build_flat_topk_idxs,
