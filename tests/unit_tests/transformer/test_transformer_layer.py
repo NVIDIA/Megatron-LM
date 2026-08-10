@@ -828,20 +828,30 @@ class TestMHCWithCudaGraph:
         assert layer.self_attention in graph_submodules
         assert layer.self_attention_hyper_connection not in graph_submodules
 
-    def test_mhc_recompute_attention_graph_rejects_packed_sequence(self):
-        """The first arena slice is SBHD-only; THD tensors need a separate contract."""
-        with pytest.raises(ValueError, match="THD/packed-sequence"):
-            self._create_mhc_layer(
-                bf16=True,
-                cuda_graph_impl="transformer_engine",
-                cuda_graph_modules=[CudaGraphModule.attn],
-                recompute_granularity="selective",
-                recompute_modules=["mhc"],
-                sequence_packing_scheduler="dp_balanced",
-                max_seqlen_per_dp_cp_rank=32,
-                thd_max_packed_sequences=2,
-                pad_packed_seq_alignment="max",
-            )
+    def test_mhc_recompute_attention_graph_accepts_packed_sequence(self):
+        """THD is not rejected by the split validator.
+
+        An earlier revision rejected it on the grounds that THD changes which
+        tensors enter sample_kwargs. That is true -- padding_mask becomes a
+        capture-time argument there -- but it is handled: the generic replay
+        decomposes packed_seq_params into tensor kwargs and reconstructs it, and
+        the split shares that entry point. The validator now rejects only
+        cross-attention, whose captured context output the split's graph-output
+        arity genuinely cannot represent.
+        """
+        layer, _ = self._create_mhc_layer(
+            bf16=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            recompute_granularity="selective",
+            recompute_modules=["mhc"],
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=32,
+            thd_max_packed_sequences=2,
+            pad_packed_seq_alignment="max",
+        )
+        assert layer._uses_mhc_recompute_attn_cuda_graph_split()
+        assert layer._is_thd_cuda_graph()
 
     def test_te_graph_static_hidden_input_tracks_runtime_microbatch_slot(self):
         """Static-input handles use the same modulo slot selection as TE graphs."""
