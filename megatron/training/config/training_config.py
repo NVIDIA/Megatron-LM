@@ -419,7 +419,9 @@ class CheckpointConfig:
     """
 
     most_recent_k: int | None = -1
-    """Number of latest checkpoint to be saved."""
+    """Maximum number of recent checkpoints to keep. Set to -1 or None to disable.
+    Checkpoints selected by ``save_retain_interval`` are retained in addition to this limit.
+    """
 
     save_optim: bool = True
     """Do not save current optimizer."""

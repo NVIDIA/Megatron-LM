@@ -151,6 +151,10 @@ The following tables group common training arguments by category.
 | `--save` | Checkpoint save directory |
 | `--load` | Checkpoint load directory |
 | `--save-interval` | Save checkpoint every N iterations |
+| `--most-recent-k` | Keep only the K most recent checkpoints (`-1` disables the limit) |
+
+When `--most-recent-k` and `--save-retain-interval` are both set, periodic checkpoints selected
+by `--save-retain-interval` are retained in addition to the K most recent checkpoints.
 
 ## Next Steps
 
