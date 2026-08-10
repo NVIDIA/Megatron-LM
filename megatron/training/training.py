@@ -234,6 +234,9 @@ except ImportError:
 # Module-level globals.
 # Startup timestamps for tracking program initialization phases.
 _STARTUP_TIMESTAMPS = {
+    'slurm_job_start_time': None,  # Set by Slurm itself (SLURM_JOB_START_TIME env var)
+    'launch_script_start': None,  # Set by the sbatch script, its own first line
+    'launch_script_presrun': None,  # Set by the sbatch script, right before srun
     'program_start': None,  # Set by entry script before imports
     'main_entry': None,  # Set by entry script at start of __main__
     'pretrain_entry': None,  # Set at top of pretrain()
@@ -263,7 +266,13 @@ num_checkpoints_memory_reported = 0
 MAX_NUM_CHECKPOINTS_MEMORY_REPORTED = 3
 
 
-def set_startup_timestamps(program_start=None, main_entry=None):
+def set_startup_timestamps(
+    program_start=None,
+    main_entry=None,
+    launch_script_start=None,
+    launch_script_presrun=None,
+    slurm_job_start_time=None,
+):
     """Set startup timestamps from the entry script.
 
     Call this after imports but before calling pretrain() to register
@@ -272,6 +281,18 @@ def set_startup_timestamps(program_start=None, main_entry=None):
     Args:
         program_start: Timestamp captured at very start of program, before any imports.
         main_entry: Timestamp captured right after entering __main__ block.
+        launch_script_start: Timestamp captured at the very top of the sbatch launch
+            script, before any of its own setup work (mkdir, checkpoint symlinking,
+            etc). Optional -- only meaningful if the launch script actually passes
+            it through an env var; entry points that don't have no way to know this.
+        launch_script_presrun: Timestamp captured by the launch script right before
+            it invokes srun. The gap to program_start is container/scheduler
+            overhead the launch script itself can't observe from inside Python.
+        slurm_job_start_time: Slurm's own record of when the job was granted its
+            allocation and started (SLURM_JOB_START_TIME env var, set by Slurm for
+            every process in the job -- no cooperation from the launch script
+            needed). Can be earlier than launch_script_start if there's
+            prolog/scheduling overhead before the launch script's first line runs.
     """
     global _TRAIN_START_TIME, _STARTUP_TIMESTAMPS
     if program_start is not None:
@@ -279,6 +300,12 @@ def set_startup_timestamps(program_start=None, main_entry=None):
         _STARTUP_TIMESTAMPS['program_start'] = program_start
     if main_entry is not None:
         _STARTUP_TIMESTAMPS['main_entry'] = main_entry
+    if launch_script_start is not None:
+        _STARTUP_TIMESTAMPS['launch_script_start'] = launch_script_start
+    if launch_script_presrun is not None:
+        _STARTUP_TIMESTAMPS['launch_script_presrun'] = launch_script_presrun
+    if slurm_job_start_time is not None:
+        _STARTUP_TIMESTAMPS['slurm_job_start_time'] = slurm_job_start_time
 
 
 # OTel: module-level helpers imported once at startup.
@@ -286,13 +313,11 @@ try:
     from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
     from nemo.lens.helpers import managed_span as _otel_managed_span
     from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
-    from nemo.lens.helpers import span_cm
     from nemo.lens.helpers import trace_fn as _otel_trace_fn
 except ImportError:
     from megatron.core.telemetry._fallbacks import is_span_group_enabled as _otel_sg_enabled
     from megatron.core.telemetry._fallbacks import managed_span as _otel_managed_span
     from megatron.core.telemetry._fallbacks import safe_set_span_attributes as _otel_safe_set_attrs
-    from megatron.core.telemetry._fallbacks import span_cm
     from megatron.core.telemetry._fallbacks import trace_fn as _otel_trace_fn
 
 
@@ -340,6 +365,7 @@ _otel_shutdown_done = False
 _otel_interval_span = None
 _otel_interval_ctx_token = None
 _otel_trace_interval_step = 0
+
 
 
 def _start_otel_job_spans(model_type, program_start):
@@ -5064,7 +5090,6 @@ def evaluate(
 
     rerun_state_machine.set_mode(rerun_mode)
 
-    rerun_state_machine.set_mode(rerun_mode)
 
     # OTel: set eval_iters on the active span started by the @_otel_trace_fn decorator.
     # get_current_span() always returns a NonRecordingSpan (no-op) when no span is active,

@@ -852,7 +852,7 @@ def save_checkpoint(
             logger.debug(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
-            with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.io_write'):
+            with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.io_write', is_goodput_span=True):
                 async_save_request = dist_checkpointing.save(
                     state_dict,
                     checkpoint_name,
