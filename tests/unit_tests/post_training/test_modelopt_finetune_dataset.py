@@ -19,8 +19,9 @@ _MODEL_OPT_EXAMPLE_DIR = Path(__file__).parents[3] / "examples" / "post_training
 sys.path.insert(0, str(_MODEL_OPT_EXAMPLE_DIR))
 
 from finetune import SFTDataset
-from megatron.post_training.arguments import add_modelopt_args
 from utils import get_eos_token_id
+
+from megatron.post_training.arguments import add_modelopt_args
 
 
 class _Tokenizer:
