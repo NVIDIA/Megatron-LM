@@ -545,6 +545,8 @@ class MultiLatentAttention(Attention):
             self.offload_core_attention and self.training, query, "core_attn"
         )
         needs_output_trim = False
+        orig_v_dim = None
+        padded_v_dim = None
         if self.checkpoint_core_attention and self.training:
             assert not self._use_fused_q_uproj, (
                 "use_fused_mla_q_uproj is incompatible with checkpoint_core_attention: "
