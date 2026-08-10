@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import gc
 from collections import deque
 from types import SimpleNamespace
 
@@ -25,6 +26,10 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.inference.engines.test_dynamic_engine import (
+    DynamicEngineTestConfig,
+    DynamicInferenceEngineTestBase,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -1978,3 +1983,425 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
             msa._intermediate_block_ids_cpu[0, idx].item()
             == ctx.request_to_kv_block_ids[0][last_aligned_abs // bs - 1].item()
         )
+
+
+PREFIX_CACHE_CONTEXT_CASES = [
+    pytest.param(feature, policy, id=f"{feature}-{policy.name.lower()}")
+    for feature in (
+        "exact-prefix",
+        "partial-prefix",
+        "missing-prefix",
+        "concurrent-sharing",
+        "mixed-cached-fresh",
+    )
+    for policy in (PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.REF_ZERO)
+]
+
+
+class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
+    """Exercise five context behaviors under both eviction policies and forced pressure."""
+
+    def _apply_local_churn(self, ctx, producer, producer_blocks):
+        """Exhaust the pool and make a new request recycle or evict producer blocks."""
+        alloc = ctx.kv_block_allocator
+        policy = alloc.prefix_caching_eviction_policy
+        ctx.release_memory_blocks_from_request_indexes(torch.arange(ctx.total_request_count))
+
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            cached_before = dict(alloc.kv_hash_to_block_id)
+            assert cached_before
+            filler = alloc.allocate_memory_blocks(alloc.pool_avail)
+            assert filler is not None and alloc.pool_avail == 0
+        else:
+            assert not alloc.kv_hash_to_block_id
+            assert all(alloc.block_hashes[block_id].item() == -1 for block_id in producer_blocks)
+            filler = alloc.allocate_memory_blocks(alloc.pool_avail)
+            assert filler is not None and alloc.pool_avail == 0
+            producer_tensor = torch.tensor(producer_blocks, dtype=torch.int32)
+            assert set(producer_blocks) <= set(filler.tolist())
+            alloc.release_memory_blocks(producer_tensor)
+            assert alloc.pool_avail == len(producer_blocks)
+
+        pressure = self._req(
+            ctx, self._prompt(3 * ctx.block_size_tokens, offset=200_000), request_id=100
+        )
+        pressure_idx = ctx.total_request_count
+        ctx.add_request(pressure)
+        pressure_blocks = set(self._block_ids(ctx, pressure_idx, 3))
+
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            evicted_ids = {
+                block_id
+                for block_hash, block_id in cached_before.items()
+                if block_hash not in alloc.kv_hash_to_block_id
+            }
+            assert pressure_blocks == evicted_ids
+        else:
+            assert pressure_blocks == set(producer_blocks)
+            assert not any(
+                block_hash in alloc.kv_hash_to_block_id
+                for block_hash in producer.precomputed_block_hashes
+            )
+
+    def _run_feature_probe(self, feature, policy):
+        """Execute one sharing behavior, then force policy-specific allocator churn."""
+        ctx = self._ctx(
+            buffer_size_gb=0.001,
+            rounder=1,
+            max_requests=12,
+            max_tokens=512,
+            prefix_caching_eviction_policy=policy,
+        )
+        alloc = ctx.kv_block_allocator
+        block_size = ctx.block_size_tokens
+        prompt = self._prompt(3 * block_size)
+        producer = self._req(ctx, prompt.clone())
+        ctx.add_request(producer)
+        producer_blocks = self._block_ids(ctx, 0, 3)
+        if policy == PrefixCachingEvictionPolicy.LRU:
+            ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+
+        if feature == "exact-prefix":
+            probe = self._req(ctx, prompt.clone(), request_id=2)
+            matched, _, _, _, skipped, effective = ctx._compute_prefix_match(probe, len(prompt))
+            assert matched == producer_blocks
+            assert skipped == 2 * block_size and effective == block_size
+            ctx.add_request(probe)
+            assert probe.num_cached_tokens == 3 * block_size
+
+        elif feature == "partial-prefix":
+            partial = torch.cat((prompt[: 2 * block_size], self._prompt(block_size, offset=50_000)))
+            probe = self._req(ctx, partial, request_id=2)
+            matched, *_ = ctx._compute_prefix_match(probe, len(partial))
+            assert matched == producer_blocks[:2]
+            ctx.add_request(probe)
+            assert probe.num_cached_tokens == 2 * block_size
+
+        elif feature == "missing-prefix":
+            probe = self._req(ctx, self._prompt(3 * block_size, offset=50_000), request_id=2)
+            matched, *_ = ctx._compute_prefix_match(probe, 3 * block_size)
+            assert not matched
+            ctx.add_request(probe)
+            assert probe.num_cached_tokens == 0
+
+        elif feature == "concurrent-sharing":
+            for request_id in range(2, 5):
+                ctx.add_request(self._req(ctx, prompt.clone(), request_id=request_id))
+            expected_refs = 3 + int(policy == PrefixCachingEvictionPolicy.REF_ZERO)
+            assert all(
+                alloc.block_ref_counts[block_id].item() == expected_refs
+                for block_id in producer_blocks
+            )
+            ctx.release_memory_blocks_from_request_indexes(torch.tensor([1, 2, 3]))
+            remaining_refs = int(policy == PrefixCachingEvictionPolicy.REF_ZERO)
+            assert all(
+                alloc.block_ref_counts[block_id].item() == remaining_refs
+                for block_id in producer_blocks
+            )
+
+        else:
+            assert feature == "mixed-cached-fresh"
+            cached = self._req(ctx, prompt.clone(), request_id=2)
+            fresh = self._req(ctx, self._prompt(3 * block_size, offset=50_000), request_id=3)
+            ctx.add_request(cached)
+            ctx.add_request(fresh)
+            assert ctx.request_query_lengths[1].item() == block_size
+            assert ctx.request_query_lengths[2].item() == 3 * block_size
+            assert cached.num_cached_tokens == 3 * block_size
+            assert fresh.num_cached_tokens == 0
+
+        self._apply_local_churn(ctx, producer, producer_blocks)
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("feature,policy", PREFIX_CACHE_CONTEXT_CASES)
+    def test_context_policy_matrix(self, feature, policy):
+        self._run_feature_probe(feature, policy)
+
+
+PREFIX_CACHE_ENGINE_CASES = [
+    pytest.param(
+        dict(name="tp4-ref-zero", feature="tp", tp=4, policy=PrefixCachingEvictionPolicy.REF_ZERO),
+        id="tp4-ref-zero",
+    ),
+    pytest.param(
+        dict(name="pp4-lru", feature="pp", pp=4, policy=PrefixCachingEvictionPolicy.LRU),
+        id="pp4-lru",
+    ),
+    pytest.param(
+        dict(
+            name="tp2-pp2-sp-ref-zero",
+            feature="mixed-parallel",
+            tp=2,
+            pp=2,
+            sp=True,
+            policy=PrefixCachingEvictionPolicy.REF_ZERO,
+        ),
+        id="tp2-pp2-sp-ref-zero",
+    ),
+    pytest.param(
+        dict(name="ep4-moe-lru", feature="moe", ep=4, policy=PrefixCachingEvictionPolicy.LRU),
+        id="ep4-moe-lru",
+    ),
+    pytest.param(
+        dict(
+            name="gpt-chunked-ref-zero",
+            feature="chunked",
+            policy=PrefixCachingEvictionPolicy.REF_ZERO,
+        ),
+        id="gpt-chunked-ref-zero",
+    ),
+    pytest.param(
+        dict(name="mtp2-ref-zero", feature="mtp", policy=PrefixCachingEvictionPolicy.REF_ZERO),
+        id="mtp2-ref-zero",
+    ),
+]
+
+
+class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
+    """Run independent real GPT engine rows through cache hits and KV-pool pressure."""
+
+    @classmethod
+    def _build_inference_context(
+        cls, test_config, transformer_config, requests, mamba_inference_state_config=None
+    ):
+        """Build the shared harness context with the row's cache eviction policy."""
+        assert not requests
+        assert mamba_inference_state_config is None
+        return DynamicInferenceContext(
+            model_config=transformer_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=test_config.max_sequence_length,
+                buffer_size_gb=test_config.context_buffer_size_gb,
+                paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
+                block_size_tokens=test_config.context_block_size_tokens,
+                max_requests=test_config.context_max_requests,
+                max_tokens=test_config.context_max_tokens,
+                materialize_only_last_token_logits=(test_config.materialize_only_last_token_logits),
+                enable_chunked_prefill=test_config.enable_chunked_prefill,
+                enable_prefix_caching=test_config.enable_prefix_caching,
+                prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
+                num_speculative_tokens=test_config.num_speculative_tokens,
+            ),
+        )
+
+    @staticmethod
+    def _case_config(case, *, enable_prefix_caching):
+        """Build a small real-engine configuration for one capability row."""
+        block_size = 256  # FlashAttention paged KV blocks must be divisible by 256.
+        prompt_length = 2 * block_size + 5
+        feature = case["feature"]
+        config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=4,
+            max_sequence_length=prompt_length + 8,
+            context_buffer_size_gb=0.02,
+            context_block_size_tokens=block_size,
+            context_max_requests=32,
+            context_max_tokens=block_size + 8 if feature == "chunked" else 4096,
+            tensor_model_parallel_size=case.get("tp", 1),
+            pipeline_model_parallel_size=case.get("pp", 1),
+            expert_model_parallel_size=case.get("ep", 1),
+            sequence_parallel=case.get("sp", False),
+            model_provider="gpt",
+            enable_prefix_caching=enable_prefix_caching,
+            enable_chunked_prefill=feature == "chunked",
+            num_speculative_tokens=2 if feature == "mtp" else 0,
+            materialize_only_last_token_logits=feature != "mtp",
+            top_k=1,
+        )
+        config.prefix_caching_eviction_policy = case["policy"]
+        return config
+
+    @staticmethod
+    def _make_request(context, request_id, prompt, enable_prefix_caching):
+        """Build a deterministic request whose hashes are ready before scheduling."""
+        return DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1, top_k=1),
+            block_size_tokens=context.block_size_tokens,
+            enable_prefix_caching=enable_prefix_caching,
+        )
+
+    @torch.inference_mode()
+    def _run_engine_session(self, case, *, enable_prefix_caching):
+        """Run three donor/follower/pressure waves through one real engine."""
+        config = self._case_config(case, enable_prefix_caching=enable_prefix_caching)
+        env = self._build_test_env(config)
+        engine = env.engine
+        context = engine.context
+        allocator = context.kv_block_allocator
+        pool_size = allocator.pool_size
+        storage_size = context.memory_buffer.untyped_storage().nbytes()
+        finished = {}
+        wave_block_ids = []
+        all_hashes = set()
+        min_pool_avail = allocator.pool_avail
+        saw_chunk = False
+        step_count = 0
+
+        for cycle in range(3):
+            block_size = context.block_size_tokens
+            base = (
+                torch.arange(
+                    2 * block_size + 5, dtype=torch.int64, device=torch.cuda.current_device()
+                )
+                + cycle * 17
+            ) % (config.vocab_size - 1)
+            pressure = (base + 37) % (config.vocab_size - 1)
+
+            # Cached execution needs three producer blocks, one follower tail,
+            # and three divergent blocks. Cache-off needs all nine blocks.
+            target_allocatable = 7 if enable_prefix_caching or config.enable_chunked_prefill else 9
+            allocatable = allocator.get_allocatable_count()
+            if allocatable > target_allocatable:
+                filler = allocator.allocate_memory_blocks(allocatable - target_allocatable)
+                assert filler is not None
+            assert allocator.get_allocatable_count() == target_allocatable
+
+            requests = [
+                self._make_request(
+                    context, 3 * cycle, base, enable_prefix_caching=enable_prefix_caching
+                ),
+                self._make_request(context, 3 * cycle + 1, base.clone(), enable_prefix_caching),
+                self._make_request(context, 3 * cycle + 2, pressure, enable_prefix_caching),
+            ]
+            wave_ids = {request.request_id for request in requests}
+            if enable_prefix_caching:
+                for request in requests:
+                    engine._add_request(request)
+                    all_hashes.update(request.precomputed_block_hashes)
+            else:
+                engine._add_request(requests[0])
+                if not config.enable_chunked_prefill:
+                    engine._add_request(requests[2])
+
+            baseline_follower_pending = not enable_prefix_caching
+            hits_before = engine._prefix_cache_hits
+            blocks_this_wave = set()
+            while wave_ids - finished.keys():
+                result = engine.step_modern()
+                step_count += 1
+                if baseline_follower_pending and (
+                    not config.enable_chunked_prefill or context.chunked_prefill_request_id == -1
+                ):
+                    engine._add_request(requests[1])
+                    if config.enable_chunked_prefill:
+                        engine._add_request(requests[2])
+                    baseline_follower_pending = False
+
+                min_pool_avail = min(min_pool_avail, allocator.pool_avail)
+                active_blocks = context.request_to_kv_block_ids[: context.total_request_count]
+                blocks_this_wave.update(active_blocks[active_blocks >= 0].tolist())
+                saw_chunk |= context.chunked_prefill_request_id != -1
+                for record in result["finished_request_records"]:
+                    merged = record.merge()
+                    finished[merged.request_id] = merged
+                assert step_count < 256, f"{case['name']} did not converge"
+
+            torch.cuda.synchronize()
+            assert allocator.pool_size == pool_size
+            assert context.memory_buffer.untyped_storage().nbytes() == storage_size
+            assert allocator.pool_avail + allocator.get_total_used() == pool_size - 1
+            wave_block_ids.append(blocks_this_wave)
+            if enable_prefix_caching:
+                assert engine._prefix_cache_hits > hits_before
+                if case["policy"] == PrefixCachingEvictionPolicy.REF_ZERO:
+                    assert not allocator.kv_hash_to_block_id
+                    assert all(
+                        allocator.block_ref_counts[block_id].item() == 0
+                        for block_id in blocks_this_wave
+                    )
+
+        assert len(finished) == 9
+        if enable_prefix_caching:
+            assert min_pool_avail == 0
+            assert engine._prefix_cache_hits >= 3
+            assert engine._prefix_cache_blocks_matched >= 6
+            assert engine._prefix_coordination_waits >= 3
+            if case["policy"] == PrefixCachingEvictionPolicy.LRU:
+                assert all_hashes - allocator.kv_hash_to_block_id.keys()
+            else:
+                assert all(
+                    len(previous & current) >= 2
+                    for previous, current in zip(wave_block_ids, wave_block_ids[1:])
+                )
+        else:
+            assert engine._prefix_cache_hits == 0
+
+        return finished, {
+            "config": config,
+            "saw_chunk": saw_chunk,
+            "mtp_tokens_proposed": int(engine._spec_tokens_proposed_per_pos.sum()),
+            "num_moe_experts": (
+                engine.controller.inference_wrapped_model.model.config.num_moe_experts
+            ),
+            "min_pool_avail": min_pool_avail,
+        }
+
+    @staticmethod
+    def _clear_engine_runtime():
+        """Release per-row model and inference allocations before rebuilding."""
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    @torch.inference_mode()
+    def _run_engine_case(self, case):
+        """Compare cache-on and cache-off output while asserting row activation."""
+        self._clear_engine_runtime()
+        try:
+            cached, stats = self._run_engine_session(case, enable_prefix_caching=True)
+            self._clear_engine_runtime()
+            baseline, baseline_stats = self._run_engine_session(case, enable_prefix_caching=False)
+
+            for request_id in range(9):
+                cached_request = cached[request_id]
+                baseline_request = baseline[request_id]
+                assert cached_request.generated_tokens == baseline_request.generated_tokens
+                assert cached_request.generated_text == baseline_request.generated_text
+                assert len(cached_request.generated_tokens) == 4
+
+            assert stats["min_pool_avail"] == 0
+            assert baseline_stats["min_pool_avail"] <= 1
+            config = stats["config"]
+            feature = case["feature"]
+            if feature == "tp":
+                assert config.tensor_model_parallel_size > 1
+            elif feature == "pp":
+                assert config.pipeline_model_parallel_size > 1
+            elif feature == "mixed-parallel":
+                assert config.tensor_model_parallel_size > 1
+                assert config.pipeline_model_parallel_size > 1
+                assert config.sequence_parallel
+            elif feature == "moe":
+                assert config.expert_model_parallel_size > 1
+                assert stats["num_moe_experts"] == config.expert_model_parallel_size
+            elif feature == "chunked":
+                assert stats["saw_chunk"]
+            else:
+                assert feature == "mtp"
+                assert config.num_speculative_tokens == 2
+                assert stats["mtp_tokens_proposed"] > 0
+        finally:
+            self._clear_engine_runtime()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("case", PREFIX_CACHE_ENGINE_CASES)
+    def test_real_engine_stress_row(self, case):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=case.get("tp", 1),
+            pipeline_model_parallel_size=case.get("pp", 1),
+            expert_model_parallel_size=case.get("ep", 1),
+            expert_tensor_parallel_size=1,
+        )
+        try:
+            self._run_engine_case(case)
+        finally:
+            DynamicInferenceContext.ROUNDER = 64
+            DynamicInferenceContext.TOKEN_ROUNDER = 64
+            DynamicInferenceContext.REQUEST_ROUNDER = 64
+            Utils.destroy_model_parallel()
