@@ -570,12 +570,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     functions. This decomposition separates computation-heavy tasks (e.g., self-attention,
     MLP) from communication-heavy tasks (e.g., MoE's All-to-All).
 
-    The five callable slots are:
+    The six callable slots are:
     1. Attention and routing preprocess (computation)
     2. MoE Dispatch (communication)
     3. MLP / MoE Experts (computation)
-    4. MoE Combine and MLP-side mHC post-processing (communication)
-    5. MTP post-processing (computation, MTP layers only)
+    4. MoE Combine (communication)
+    5. MTP post-processing (computation, MTP layers only; None here)
+    6. MLP-side mHC post-processing (computation, mHC layers only)
+
+    Slot 6 used to run inside slot 4. It has its own compute-stream node because
+    running it on the communication stream made the recompute's tensors
+    cross-stream; see submodule_combine_forward's early return.
 
     By assigning these functions to different CUDA streams (e.g., a compute stream
     and a communication stream), the scheduler can overlap their execution, preventing

@@ -450,7 +450,16 @@ if _TRITON_AVAILABLE:
         sb = s * b
         if out is None:
             out = torch.empty(s, b, C, dtype=x.dtype, device=x.device)
-        elif out.shape != (s, b, C) or out.dtype != x.dtype or out.device != x.device:
+        elif (
+            out.shape != (s, b, C)
+            or out.dtype != x.dtype
+            or out.device != x.device
+            or not out.is_contiguous()
+        ):
+            # Contiguity matters here too: out.view() below would either raise a
+            # bare RuntimeError or, for a view-able but non-row-major stride,
+            # write to the wrong addresses. Matches the Function wrappers so a
+            # future caller that bypasses them fails the same way.
             raise ValueError("Invalid caller-owned Triton H-aggregate output")
         out_flat = out.view(sb, C)
         x_flat = x.contiguous().view(sb, n, C)
@@ -1091,7 +1100,16 @@ if _CUTILE_AVAILABLE:
         stream = torch.cuda.current_stream()
         if out is None:
             out = torch.empty(s, b, C, dtype=x.dtype, device=x.device)
-        elif out.shape != (s, b, C) or out.dtype != x.dtype or out.device != x.device:
+        elif (
+            out.shape != (s, b, C)
+            or out.dtype != x.dtype
+            or out.device != x.device
+            or not out.is_contiguous()
+        ):
+            # Contiguity matters here too: out.view() below would either raise a
+            # bare RuntimeError or, for a view-able but non-row-major stride,
+            # write to the wrong addresses. Matches the Function wrappers so a
+            # future caller that bypasses them fails the same way.
             raise ValueError("Invalid caller-owned cuTile H-aggregate output")
         out_flat = out.view(sb, C)
         x_flat = x.view(sb, n, C)

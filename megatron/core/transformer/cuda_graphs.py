@@ -2666,14 +2666,14 @@ class TECudaGraphHelper:
             self._validate_mhc_static_hidden_inputs(sample_args)
 
             # Push the captured graphs to the corresponding TransformerBlock.
+            # Only the direct-write arena consumes these handles. Every other
+            # configuration would retain num_microbatches static input tensors
+            # per layer for nothing. Config-level, so hoisted out of both loops.
+            retain_static_inputs = self._uses_mhc_direct_write_arena()
             num_layers_accumulated = 0
             for layers in self.callables_per_chunk:
                 for layer_number, layer in enumerate(layers):
                     layer.cuda_graphs = []
-                    # Only the direct-write arena consumes these handles. Every
-                    # other configuration would retain num_microbatches static
-                    # input tensors per layer for nothing.
-                    retain_static_inputs = self._uses_mhc_direct_write_arena()
                     static_hidden_inputs = []
                     for batch_number in range(self.num_microbatches):
                         if self.config.overlap_moe_expert_parallel_comm:

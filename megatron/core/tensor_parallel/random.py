@@ -945,6 +945,10 @@ class CheckpointManager:
         # compute-stream node: the ordering problem is the extra readers, not
         # which stream they are on.)
         for ckpt in self.checkpoints:
+            # This filter cannot discriminate yet: add_checkpoint rejects any
+            # phase other than BEFORE_COMBINE_BWD, so it admits every checkpoint
+            # for either barrier argument. Both call sites therefore replay the
+            # whole group. See MHCRecomputePhase's TODO.
             if ckpt.recompute_phase <= phase:
                 ckpt._recompute(None)
         self._recomputed = all(ckpt.ctx is None for ckpt in self.checkpoints)
