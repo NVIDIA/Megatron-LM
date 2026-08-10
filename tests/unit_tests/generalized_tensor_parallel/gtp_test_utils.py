@@ -33,9 +33,14 @@ def reset_fp8_state():
 
 @pytest.fixture(autouse=True)
 def reset_gtp_globals():
-    """Reset GTP mutable class-level state between tests."""
+    """Reset GTP mutable class-level state between tests.
+
+    Covers the recompute chain too: leaving its cursor set would link the next test's first
+    recompute node to a param from the previous test.
+    """
     yield
     GTPShardedParam._chain_state = {}
+    GTPShardedParam._recompute_chain_state = {}
 
 
 # ---------------------------------------------------------------------------
