@@ -7,6 +7,7 @@ import logging
 import math
 import warnings
 from abc import ABC, abstractmethod
+from itertools import chain
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -1031,9 +1032,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         }
 
         def model_params_in_optimizer_order():
-            for inner_group in self.optimizer.param_groups:
-                for param in inner_group['params']:
-                    yield main_param_id_to_model_param.get(id(param), param)
+            for param in chain.from_iterable(
+                inner_group['params'] for inner_group in self.optimizer.param_groups
+            ):
+                yield main_param_id_to_model_param.get(id(param), param)
 
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
             model_sharded_state_dict, model_params_in_optimizer_order()
