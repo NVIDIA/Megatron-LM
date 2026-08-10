@@ -201,15 +201,17 @@ class DBuffer:
     def distribute_tensors(
         cls, tensors: Iterable[torch.Tensor], mesh: DeviceMesh, placements: Iterable[Placement]
     ) -> "DBuffer":
-        """Distribute full local tensor values into a DBuffer.
+        """Distribute full local tensors into a DBuffer.
 
         Args:
-            tensors: Full tensor values available on this rank.
+            tensors: Full tensors available on this rank. Meta tensors contribute
+                shape and dtype metadata but no values.
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
 
         Returns:
-            A DBuffer whose local storage matches ``placements``.
+            A DBuffer whose real local storage matches ``placements``. Ranges
+            corresponding to meta tensors are left uninitialized.
         """
         tensors = tuple(tensor.detach().contiguous() for tensor in tensors)
         if not tensors:
@@ -232,7 +234,7 @@ class DBuffer:
         # observable through get_local_tensor() and can remain unspecified.
         for index, tensor in enumerate(tensors):
             owned_range = buffer._get_owned_range(index)
-            if owned_range is None:
+            if owned_range is None or tensor.is_meta:
                 continue
 
             source_slice = tensor.view(-1).narrow(
@@ -394,12 +396,27 @@ class DBuffer:
         placements[axis] = new_placement
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
+        reduce_op = partial_placement.reduce_op
+        # Symmetric-memory MFSDP requires this detector, but ordinary DBuffer
+        # reductions remain supported on older PyTorch versions that lack it.
+        is_symm_mem = hasattr(symm_mem, "is_symm_mem_tensor") and symm_mem.is_symm_mem_tensor(
+            self.local_buffer
+        )
+        if is_symm_mem:
+            self.rendezvous(axis)
+            # NCCL symmetric-memory reduce-scatter selects its symmetric kernel
+            # for SUM. Preserve the placement's AVG semantics by scaling the
+            # SUM result after the collective.
+            if reduce_op == dist.ReduceOp.AVG:
+                reduce_op = dist.ReduceOp.SUM
         dist.reduce_scatter_tensor(
             output=out.local_buffer,
             input=self.local_buffer,
-            op=partial_placement.reduce_op,
+            op=reduce_op,
             group=self.mesh.get_group(axis),
         )
+        if is_symm_mem and partial_placement.reduce_op == dist.ReduceOp.AVG:
+            out.local_buffer.div_(self.mesh.size(axis))
         return out
 
     def scatter(
