@@ -292,6 +292,13 @@ class OptimizerConfig:
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
+    muon_ht_eps: float = 1e-8
+    """Minimum norm used for numerical stability by TensorParallelMuonHT."""
+
+    muon_ht_radius: float | None = None
+    """Optional fixed global Frobenius norm for TensorParallelMuonHT parameters. If unset,
+    each matrix preserves its own initial norm."""
+
     # Lion.
     lion_beta1: float = 0.95
     """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""

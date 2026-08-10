@@ -15,6 +15,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     TensorParallelAdaptiveMuon,
     TensorParallelMuon,
+    TensorParallelMuonHT,
     _get_qkv_split_shapes,
     get_supported_coefficient_types,
     validate_coefficient_type,
@@ -141,6 +142,78 @@ def test_muon_optimizer_smoke():
 
     # Load state dict should not raise error
     optimizer.load_state_dict(state_dict)
+
+
+def test_muon_ht_normalizes_update_and_preserves_weight_norm():
+    """TensorParallelMuonHT should enforce both Hyperball norm constraints."""
+    parameter = torch.nn.Parameter(
+        torch.arange(1, 13, dtype=torch.float32, device='cuda').reshape(3, 4)
+    )
+    optimizer = TensorParallelMuonHT(
+        params=[parameter],
+        lr=0.1,
+        momentum=0.0,
+        nesterov=False,
+        weight_decay=0.0,
+        pg_collection=None,
+        tp_mode="duplicated",
+    )
+    update = torch.arange(12, 0, -1, dtype=torch.float32, device='cuda').reshape(3, 4)
+    radius = parameter.norm()
+
+    with torch.no_grad():
+        optimizer.pre_weight_update_fn_inplace(parameter, update)
+        torch.testing.assert_close(update.norm(), radius)
+
+        parameter.add_(update, alpha=-optimizer.param_groups[0]["lr"])
+        optimizer.post_weight_update_fn_inplace(parameter)
+
+    torch.testing.assert_close(parameter.norm(), radius)
+
+
+def test_muon_ht_optimizer_step_preserves_initial_weight_norm():
+    """The emerging-optimizer step should invoke the Hyperball pre/post hooks."""
+    model = torch.nn.Linear(16, 8, bias=False, dtype=torch.float32, device='cuda')
+    model.weight.data.normal_(0.0, 0.1)
+    optimizer = TensorParallelMuonHT(
+        params=[model.weight],
+        lr=0.01,
+        momentum=0.95,
+        nesterov=True,
+        weight_decay=0.0,
+        num_ns_steps=5,
+        pg_collection=None,
+        tp_mode="duplicated",
+    )
+    initial_radius = model.weight.norm().detach().clone()
+
+    loss = model(torch.randn(4, 16, device='cuda')).sum()
+    loss.backward()
+    optimizer.step()
+
+    torch.testing.assert_close(model.weight.norm(), initial_radius, rtol=1e-5, atol=1e-6)
+    assert model.weight._muon_ht_radius is not None
+    assert "hyperball_R" not in optimizer.state[model.weight]
+
+    optimizer.load_state_dict(optimizer.state_dict())
+    assert model.weight._muon_ht_radius is None
+    with torch.no_grad():
+        optimizer.pre_weight_update_fn_inplace(model.weight, torch.ones_like(model.weight))
+    torch.testing.assert_close(model.weight._muon_ht_radius, initial_radius, rtol=1e-5, atol=1e-6)
+
+
+def test_muon_ht_fixed_radius_and_validation():
+    """A fixed radius should rescale at construction and weight decay should be rejected."""
+    parameter = torch.nn.Parameter(torch.ones(3, 4, dtype=torch.float32, device='cuda'))
+    optimizer = TensorParallelMuonHT(params=[parameter], weight_decay=0.0, hyperball_radius=2.5)
+
+    torch.testing.assert_close(parameter.norm(), torch.tensor(2.5, device='cuda'))
+    assert optimizer.hyperball_radius == 2.5
+
+    with pytest.raises(ValueError, match="set weight_decay=0.0"):
+        TensorParallelMuonHT(
+            params=[torch.nn.Parameter(torch.ones(2, 2, device='cuda'))], weight_decay=0.01
+        )
 
 
 @pytest.mark.skipif(
@@ -294,6 +367,35 @@ class TestMuonOptimizerMultiRank:
 
         with pytest.raises(ValueError, match='num_ns_steps must be at least 1'):
             get_megatron_optimizer(config=optimizer_config_invalid_ns, model_chunks=[model])
+
+    def test_get_megatron_optimizer_muon_ht(self):
+        """The public optimizer factory should construct and run TensorParallelMuonHT."""
+        model = self.create_ddp_model(Net().bfloat16().cuda().requires_grad_(True))
+        optimizer_config = OptimizerConfig(
+            optimizer='muon_ht',
+            lr=0.01,
+            weight_decay=0.0,
+            bf16=True,
+            muon_momentum=0.95,
+            muon_nesterov=True,
+            muon_num_ns_steps=5,
+            muon_tp_mode="duplicated",
+            muon_ht_eps=1e-8,
+        )
+
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+        )
+        raw_optimizers = [
+            child.optimizer for child in optimizer.chained_optimizers if hasattr(child, "optimizer")
+        ]
+        assert any(isinstance(raw, TensorParallelMuonHT) for raw in raw_optimizers)
+
+        loss = model(torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')).sum()
+        loss.backward()
+        update_successful, _, _ = optimizer.step()
+
+        assert update_successful
 
     def test_get_megatron_optimizer_layer_wise(self):
         """Test get_megatron_optimizer with layer-wise distributed optimizer."""
@@ -515,6 +617,101 @@ class TestMuonOptimizerMultiRankTP:
         assert not torch.equal(
             model.weight.data, original_weight
         ), "Weight should be updated with mode=blockwise"
+
+    def test_muon_ht_uses_global_norm_for_tp_shards(self):
+        """Hyperball norms should include every unique tensor-parallel shard."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tp_rank = pg_collection.tp.rank()
+        parameter = torch.nn.Parameter(
+            torch.full((3, 4), float(tp_rank + 1), dtype=torch.float32, device='cuda')
+        )
+        parameter.tensor_model_parallel = True
+        parameter.partition_dim = 0
+        update = torch.full_like(parameter, float(tp_rank + 2))
+
+        optimizer = TensorParallelMuonHT(
+            params=[parameter],
+            lr=0.1,
+            momentum=0.0,
+            nesterov=False,
+            weight_decay=0.0,
+            pg_collection=pg_collection,
+            tp_mode="distributed",
+        )
+
+        radius_squared = parameter.float().square().sum()
+        torch.distributed.all_reduce(radius_squared, group=pg_collection.tp)
+        radius = radius_squared.sqrt()
+
+        with torch.no_grad():
+            optimizer.pre_weight_update_fn_inplace(parameter, update)
+
+            update_norm_squared = update.float().square().sum()
+            torch.distributed.all_reduce(update_norm_squared, group=pg_collection.tp)
+            torch.testing.assert_close(update_norm_squared.sqrt(), radius)
+
+            parameter.add_(update, alpha=-optimizer.param_groups[0]["lr"])
+            optimizer.post_weight_update_fn_inplace(parameter)
+
+        result_norm_squared = parameter.float().square().sum()
+        torch.distributed.all_reduce(result_norm_squared, group=pg_collection.tp)
+        torch.testing.assert_close(result_norm_squared.sqrt(), radius)
+
+
+@pytest.mark.skipif(
+    int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
+)
+class TestMuonOptimizerMultiRankGTP:
+    """Test TensorParallelMuonHT normalization over GTP-remat weight shards."""
+
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        """Use the full test world as one GTP-remat shard group."""
+        world = int(os.getenv('WORLD_SIZE', '1'))
+        Utils.initialize_model_parallel(gtp_remat_size=world)
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_muon_ht_uses_global_norm_for_gtp_shards(self):
+        """Hyperball norms should include every unique GTP-remat shard."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        gtp_rank = pg_collection.gtp_remat.rank()
+        parameter = torch.nn.Parameter(
+            torch.full((3, 4), float(gtp_rank + 1), dtype=torch.float32, device='cuda')
+        )
+        parameter.tensor_model_parallel = False
+        parameter.partition_dim = -1
+        parameter.is_gtp_weight_remat = True
+        parameter.allreduce = True
+        update = torch.full_like(parameter, float(gtp_rank + 2))
+
+        optimizer = TensorParallelMuonHT(
+            params=[parameter],
+            lr=0.1,
+            momentum=0.0,
+            nesterov=False,
+            weight_decay=0.0,
+            pg_collection=pg_collection,
+            tp_mode="duplicated",
+        )
+
+        radius_squared = parameter.float().square().sum()
+        torch.distributed.all_reduce(radius_squared, group=pg_collection.gtp_remat)
+        radius = radius_squared.sqrt()
+
+        with torch.no_grad():
+            optimizer.pre_weight_update_fn_inplace(parameter, update)
+
+            update_norm_squared = update.float().square().sum()
+            torch.distributed.all_reduce(update_norm_squared, group=pg_collection.gtp_remat)
+            torch.testing.assert_close(update_norm_squared.sqrt(), radius)
+
+            parameter.add_(update, alpha=-optimizer.param_groups[0]["lr"])
+            optimizer.post_weight_update_fn_inplace(parameter)
+
+        result_norm_squared = parameter.float().square().sum()
+        torch.distributed.all_reduce(result_norm_squared, group=pg_collection.gtp_remat)
+        torch.testing.assert_close(result_norm_squared.sqrt(), radius)
 
 
 # All non-custom coefficient types supported by emerging_optimizers.

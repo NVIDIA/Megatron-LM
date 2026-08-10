@@ -805,7 +805,7 @@ def _get_megatron_emerging_optimizer(
     # params is configurable via ``config.muon_scalar_optimizer`` (e.g., 'adam' or 'lion');
     # deep-copy the registry defaults before rewriting so we never mutate shared state.
     default_param_overrides = copy.deepcopy(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
-    if eopt_name in ('muon', 'adaptive_muon'):
+    if eopt_name in ('muon', 'muon_ht', 'adaptive_muon'):
         for override in default_param_overrides.values():
             if override.get('optimizer') in ('adam', 'lion'):
                 override['optimizer'] = config.muon_scalar_optimizer
