@@ -286,6 +286,9 @@ class OptimizerConfig:
     change as TP changes. "auto" select between duplicated and distributed mode per-weight for
     dense weights. Defaults to "duplicated"."""
 
+    muon_use_syrk: bool = False
+    """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
+
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 

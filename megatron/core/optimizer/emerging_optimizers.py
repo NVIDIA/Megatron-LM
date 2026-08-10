@@ -17,7 +17,13 @@ import torch
 from torch.optim.optimizer import ParamsT
 
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
-from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
+from megatron.core.utils import (
+    get_emerging_optimizers_version,
+    get_pg_rank,
+    get_pg_size,
+    is_emerging_optimizers_min_version,
+    log_single_rank,
+)
 
 from .optimizer_config import ParamKey, ParamPredicate
 
@@ -42,6 +48,12 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+# newton_schulz_tp() gained the use_syrk kwarg in emerging_optimizers 0.4.0. Earlier releases
+# expose use_syrk on the non-TP newton_schulz() only, so 0.3.x still rejects it here. Spelled
+# ".dev0" so pre-release builds of that line are accepted too, matching how the TE minimums
+# elsewhere in the tree are written.
+_SYRK_MIN_EO_VERSION = "0.4.0.dev0"
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
@@ -260,6 +272,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
+        if use_syrk and not is_emerging_optimizers_min_version(_SYRK_MIN_EO_VERSION):
+            raise ValueError(
+                f"use_syrk requires emerging_optimizers >= {_SYRK_MIN_EO_VERSION}, but "
+                f"{get_emerging_optimizers_version()} is installed. Upgrade "
+                "emerging_optimizers or drop --muon-use-syrk."
+            )
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -691,6 +709,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             extra_scale_factor=extra_scale_factor,
             pg_collection=pg_collection,
             tp_mode=tp_mode,
+            use_syrk=use_syrk,
         )
         self.scale_mode = scale_mode
         self.extra_scale_factor = extra_scale_factor
