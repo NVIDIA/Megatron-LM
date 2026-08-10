@@ -194,6 +194,24 @@ def test_config_accepts_hybrid_model_ratio_tail():
     assert config.csa_compress_ratios == [0, 4, 128, 4]
 
 
+def test_hybrid_dsv4_stack_spec_assigns_fixed_ratios_and_preserves_main_layers():
+    """C/H/W use DSv4 while ordinary D DSA and + MLA remain unchanged."""
+    from megatron.core.models.hybrid.hybrid_layer_specs import (
+        hybrid_dsv4_stack_spec,
+        hybrid_stack_spec,
+    )
+
+    stack_spec = hybrid_dsv4_stack_spec(_make_config())
+    submodules = stack_spec.submodules
+    baseline = hybrid_stack_spec.submodules
+
+    assert submodules.dsa_layer is baseline.dsa_layer
+    assert submodules.mla_layer is baseline.mla_layer
+    assert submodules.csa_layer.submodules.self_attention.params["compress_ratio"] == 4
+    assert submodules.hca_layer.submodules.self_attention.params["compress_ratio"] == 128
+    assert submodules.window_layer.submodules.self_attention.params["compress_ratio"] == 0
+
+
 def test_constructor_requires_explicit_process_groups():
     """Production DSv4 construction must not read process groups from global MPU state."""
     from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (

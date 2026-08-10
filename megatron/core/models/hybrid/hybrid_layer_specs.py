@@ -1,4 +1,5 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+from dataclasses import replace
 from functools import partial
 
 from megatron.core.extensions.transformer_engine import (
@@ -10,6 +11,9 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_dsv4_hybrid_module_spec_for_backend,
+)
 from megatron.core.models.gpt.moe_module_specs import (
     get_inference_optimized_moe_spec,
     get_moe_module_spec,
@@ -49,6 +53,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayerSubmodules,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     MoETransformerLayer,
     TransformerLayer,
@@ -362,3 +367,39 @@ hybrid_inference_stack_spec = ModuleSpec(
 # Backward-compatible aliases
 mamba_stack_spec = hybrid_stack_spec
 mamba_inference_stack_spec = hybrid_inference_stack_spec
+
+
+def hybrid_dsv4_stack_spec(config: TransformerConfig) -> ModuleSpec:
+    """Build a HybridStack with fixed-ratio DSv4 C/H/W attention layers.
+
+    The cloned stack deliberately preserves the ordinary ``D`` DSA layer and
+    the ``+`` MLA layer from :data:`hybrid_stack_spec`.
+    """
+    assert (
+        config.transformer_impl == "transformer_engine"
+    ), "DSv4 HybridModel currently supports only the transformer-engine implementation."
+
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+
+    dsv4_attention = get_dsv4_hybrid_module_spec_for_backend(
+        config=config, backend=TESpecProvider()
+    )
+
+    def wrap_dsv4_layer(compress_ratio: int) -> ModuleSpec:
+        attention = replace(
+            dsv4_attention, params={**dsv4_attention.params, "compress_ratio": compress_ratio}
+        )
+        return ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm, self_attention=attention, self_attn_bda=get_bias_dropout_add
+            ),
+        )
+
+    submodules = replace(
+        hybrid_stack_spec.submodules,
+        csa_layer=wrap_dsv4_layer(compress_ratio=4),
+        hca_layer=wrap_dsv4_layer(compress_ratio=128),
+        window_layer=wrap_dsv4_layer(compress_ratio=0),
+    )
+    return replace(hybrid_stack_spec, submodules=submodules)
