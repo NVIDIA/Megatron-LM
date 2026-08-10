@@ -24,7 +24,7 @@ from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .indexed_order import IndexedOrder
+from .context import FsdpContext
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Placements
 
@@ -32,94 +32,6 @@ from .placement import Placements
 def _is_in_backward() -> bool:
     """Return whether the current thread is executing an autograd GraphTask."""
     return torch._C._current_graph_task_id() != -1
-
-
-class FsdpContext:
-    """Runtime stream and prefetch state shared by FSDP roots constructed together."""
-
-    allgather_stream: torch.cuda.Stream
-    reduce_scatter_stream: torch.cuda.Stream
-    # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
-    # unnecessary because it can be detected when ``model_weight``, after syncing
-    # from ``main_weight``, has placements different from ``Placements.optimizer``.
-    is_last_microbatch: bool
-    # Static orders used to drive all-gather prefetch. We may want to switch to
-    # capturing runtime order if static module order proves too fragile. Each
-    # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
-    forward_order: IndexedOrder["FsdpModule"]
-    backward_order: IndexedOrder["FsdpModule"]
-
-    def __init__(self, device: torch.device) -> None:
-        """Create rank-local runtime state for FSDP modules on ``device``.
-
-        Args:
-            device: Device on which this context schedules communication.
-        """
-        self.is_last_microbatch = True
-        self.forward_order = IndexedOrder()
-        self.backward_order = IndexedOrder()
-        # Construction-only; empty after finalization.
-        self._registered_modules: list[FsdpModule] = []
-        self._is_finalized = False
-        with torch.cuda.device(device):
-            self.allgather_stream = torch.cuda.Stream()
-            self.reduce_scatter_stream = torch.cuda.Stream()
-
-    def register_module(self, module: "FsdpModule") -> None:
-        """Register a module constructed in this context."""
-        if self._is_finalized:
-            raise RuntimeError("Cannot register an FSDP module after its context is finalized.")
-        self._registered_modules.append(module)
-
-    def finalize(self) -> None:
-        """Finalize roots, names, and cross-root prefetch orders."""
-        if self._is_finalized:
-            raise RuntimeError("FSDP context is already finalized.")
-
-        children: set[FsdpModule] = set()
-        for module in self._registered_modules:
-            _collect_fsdp_children(cast(nn.Module, module), children)
-        # FsdpModules that are not descendants of any other FsdpModule.
-        roots = [module for module in self._registered_modules if module not in children]
-
-        for root in roots:
-            root._is_root = True
-            for name, module in cast(nn.Module, root).named_modules():
-                if not isinstance(module, FsdpModule):
-                    continue
-                module._name = name
-                self.forward_order.append(module)
-
-        for root in reversed(roots):
-            _collect_backward_order(cast(nn.Module, root), self.backward_order)
-
-        self._registered_modules.clear()
-        self._is_finalized = True
-
-    def ensure_finalized(self) -> None:
-        """Raise if construction has not completed for this context."""
-        if not self._is_finalized:
-            raise RuntimeError(
-                "FSDP context is not finalized. Exit fully_shard_context before running forward."
-            )
-
-    def current_stream(self) -> torch.cuda.Stream:
-        """Current stream on this context's device."""
-        return torch.cuda.current_stream(self.allgather_stream.device)
-
-    def register_post_backward_final_callback(self) -> None:
-        """Register this root context's final callback for the current backward.
-
-        Root ``post_backward()`` means only that root-owned parameters have
-        accumulated gradients; it may run before descendant reductions, or not
-        run at all when the root owns no trainable parameters. Waiting at
-        autograd completion orders consumers after every descendant reduction.
-        """
-
-        def post_backward_final_callback() -> None:
-            self.current_stream().wait_stream(self.reduce_scatter_stream)
-
-        torch.autograd.Variable._execution_engine.queue_callback(post_backward_final_callback)
 
 
 class FsdpModule:
@@ -397,24 +309,6 @@ class FsdpModule:
     def _nvtx_label(self, phase: Literal["forward", "backward"]) -> str:
         name = self.name if self.name else "<root>"
         return f"MFSDP {name} {phase}"
-
-
-def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]) -> None:
-    """Collect one root's static backward prefetch order."""
-    if isinstance(module, FsdpModule):
-        order.append(module)
-
-    for child in reversed(list(module.children())):
-        _collect_backward_order(child, order)
-
-
-def _collect_fsdp_children(module: nn.Module, children: set["FsdpModule"]) -> None:
-    """Collect the nearest FSDP descendants of ``module``."""
-    for child in module.children():
-        if isinstance(child, FsdpModule):
-            children.add(child)
-        else:
-            _collect_fsdp_children(child, children)
 
 
 def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:
