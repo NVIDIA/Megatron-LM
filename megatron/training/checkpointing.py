@@ -42,7 +42,9 @@ from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
-from megatron.core._rank_utils import safe_get_rank as get_rank_safe 
+from megatron.core._rank_utils import safe_get_rank as get_rank_safe
+from megatron.training.argument_utils import _default_config_from_args
+from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_tokenizer
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
@@ -1052,9 +1054,10 @@ def save_checkpoint(
                     and iteration > 0
                 ):
                     checkpoint_name = get_checkpoint_name(
-                        args.save, iteration=iteration, return_base_dir=True
+                        save_dir, iteration=iteration, return_base_dir=True
                     )
-                    save_tokenizer_assets(get_tokenizer(), args, checkpoint_name)
+                    config = _default_config_from_args(TokenizerConfig, args)
+                    save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
                 if args.log_progress and args.async_save:
                     append_to_progress_log(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
@@ -1205,7 +1208,7 @@ def save_checkpoint(
 
 def save_tokenizer_assets(
     tokenizer: MegatronTokenizer,
-    args: Namespace,
+    config: TokenizerConfig,
     checkpoint_path: str,
 ) -> None:
     """Save tokenizer files to the checkpoint directory.
@@ -1216,7 +1219,7 @@ def save_tokenizer_assets(
 
     Args:
         tokenizer: The tokenizer instance to save.
-        args: argparse arguments.
+        config: Tokenizers config.
         checkpoint_path: The checkpoint directory path.
     """
     if tokenizer is None:
@@ -1250,7 +1253,7 @@ def save_tokenizer_assets(
             os.makedirs(tokenizer_dir, exist_ok=True)
             use_msc = False
 
-        tokenizer_type = args.tokenizer_type
+        tokenizer_type = config.tokenizer_type
 
         # Handle HuggingFace and Multimodal tokenizers
         if tokenizer_type in ("HuggingFaceTokenizer", "MultimodalTokenizer"):
@@ -1286,26 +1289,26 @@ def save_tokenizer_assets(
         files_to_copy = []
 
         if tokenizer_type in ("BertWordPieceLowerCase", "BertWordPieceCase"):
-            if args.vocab_file:
-                resolved_path = resolve_path(args.vocab_file)
+            if config.vocab_file:
+                resolved_path = resolve_path(config.vocab_file)
                 files_to_copy.append(("vocab_file", resolved_path, "vocab.txt"))
 
         elif tokenizer_type == "GPT2BPETokenizer":
-            if args.vocab_file:
-                resolved_path = resolve_path(args.vocab_file)
+            if config.vocab_file:
+                resolved_path = resolve_path(config.vocab_file)
                 files_to_copy.append(("vocab_file", resolved_path, "vocab.json"))
-            if args.merge_file:
-                resolved_path = resolve_path(args.merge_file)
+            if config.merge_file:
+                resolved_path = resolve_path(config.merge_file)
                 files_to_copy.append(("merge_file", resolved_path, "merges.txt"))
 
         elif tokenizer_type in ("SentencePieceTokenizer", "GPTSentencePieceTokenizer", "Llama2Tokenizer"):
-            if args.tokenizer_model:
-                resolved_path = resolve_path(args.tokenizer_model)
+            if config.tokenizer_model:
+                resolved_path = resolve_path(config.tokenizer_model)
                 files_to_copy.append(("tokenizer_model", resolved_path, "tokenizer.model"))
 
         elif tokenizer_type == "TikTokenizer":
-            if args.tokenizer_model:
-                resolved_path = resolve_path(args.tokenizer_model)
+            if config.tokenizer_model:
+                resolved_path = resolve_path(config.tokenizer_model)
                 files_to_copy.append(("tokenizer_model", resolved_path, "tokenizer.json"))
 
         elif tokenizer_type == "NullTokenizer":
