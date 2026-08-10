@@ -6,8 +6,6 @@ import time
 
 _PROGRAM_START_TIME = time.time()
 
-import os
-import re
 import warnings
 from copy import deepcopy
 from functools import partial
