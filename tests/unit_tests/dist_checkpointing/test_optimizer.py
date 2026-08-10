@@ -80,11 +80,13 @@ class Model(torch.nn.Module):
 
 
 class NativeFp32Model(torch.nn.Module):
-    """Three parameters that can be converted to an interleaved BF16/FP32/BF16 group."""
+    """Parameters for an interleaved trainable/frozen BF16 and FP32 group."""
 
     def __init__(self):
         super().__init__()
         self.pre = torch.nn.Linear(8, 8, bias=False)
+        self.frozen = torch.nn.Linear(8, 8, bias=False)
+        self.frozen.weight.requires_grad_(False)
         self.gate = torch.nn.Parameter(torch.zeros(24, dtype=torch.float32))
         self.post = torch.nn.Linear(8, 8, bias=False)
         self.config = TransformerConfig(
@@ -257,8 +259,8 @@ class TestOptimizer:
             ]
         )
 
-    def test_float16_optimizer_with_native_fp32_params(self):
-        """Native FP32 state ids must remain correct between two BF16 parameters."""
+    def test_float16_optimizer_with_native_fp32_and_frozen_params(self):
+        """Native FP32 and frozen param ids must not shift BF16 checkpoint state."""
         from megatron.core.optimizer import OptimizerConfig
         from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
         from megatron.core.transformer.module import (
@@ -271,14 +273,17 @@ class TestOptimizer:
         model.gate = mark_keep_in_fp32(model.gate)
         convert_module_to_dtype_except_fp32_marked(model, torch.bfloat16)
         assert model.pre.weight.dtype == torch.bfloat16
+        assert model.frozen.weight.dtype == torch.bfloat16
+        assert not model.frozen.weight.requires_grad
         assert model.gate.dtype == torch.float32
         assert model.post.weight.dtype == torch.bfloat16
 
-        # Use an explicit BF16/FP32/BF16 optimizer order. Module.parameters()
-        # would yield the root gate before parameters owned by child modules.
-        ordered_params = [model.pre.weight, model.gate, model.post.weight]
+        # Use an explicit trainable BF16/frozen BF16/FP32/trainable BF16 order.
+        # Module.parameters() would yield the root gate before child parameters.
+        ordered_params = [model.pre.weight, model.frozen.weight, model.gate, model.post.weight]
         for param in ordered_params:
-            param.grad = torch.zeros_like(param)
+            if param.requires_grad:
+                param.grad = torch.zeros_like(param)
         inner_optim = Adam(ordered_params)
         inner_optim.step()
 
@@ -297,9 +302,12 @@ class TestOptimizer:
             ('optimizer.state.fp32_param.post.weight', (8, 8)),
         ]
 
-        # Per-param state maps every param, including the native FP32 one, to the right key.
+        # The frozen parameter has neither optimizer state nor an fp32 main copy.
         state = sharded_state_dict['optimizer']['state']
-        expected = {0: ('pre.weight', (8, 8)), 1: ('gate', (24,)), 2: ('post.weight', (8, 8))}
+        assert 1 not in state
+
+        # Per-param state maps every trainable param, including native FP32, to the right key.
+        expected = {0: ('pre.weight', (8, 8)), 2: ('gate', (24,)), 3: ('post.weight', (8, 8))}
         for param_id, (model_key, shape) in expected.items():
             for state_key in ('exp_avg', 'exp_avg_sq'):
                 sharded = state[param_id][state_key]
