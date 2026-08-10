@@ -82,3 +82,9 @@ products:
         environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  - test_case: [hybrid_dynamic_inference_tp1_pp1_583m_prefix_caching_lru_chunked_mamba_pressure]
+    products:
+      - model: [hybrid]
+        environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]

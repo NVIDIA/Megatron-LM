@@ -13,6 +13,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import replace
 from typing import Dict, List, Optional
+from unittest.mock import Mock
 
 import torch
 from tqdm import tqdm
@@ -498,6 +499,9 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         context, engine = _build_dynamic_engine(model, inference_config, tokenizer)
+        mamba = context.mamba_slot_allocator
+        if mamba is not None:
+            mamba._evict_lru_slots_batch = Mock(wraps=mamba._evict_lru_slots_batch)
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
@@ -552,6 +556,9 @@ def main():
                 block_hash not in context.kv_block_allocator.kv_hash_to_block_id
                 for block_hash in first_group_hashes
             )
+        if 0 < (inference_config.prefix_caching_mamba_gb or 0) < 1:
+            assert mamba is not None
+            assert engine._prefill_tokens_skipped > 0 and mamba._evict_lru_slots_batch.called
         assert memory_cycles[-1] <= memory_cycles[-2] + 64 * 1024**2, (
             "cache-on CUDA allocation grew by more than 64 MiB after warmup: "
             f"{memory_cycles[-2:]}"
