@@ -3520,115 +3520,117 @@ def save_checkpoint_and_time(
         _otel_tag_span(_exposed_save_span, 'checkpoint')
         _exposed_save_span.set_attribute('megatron.iteration', iteration)
         _exposed_save_token = _octx.attach(_otr.set_span_in_context(_exposed_save_span))
+    try:
 
-    # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
-    if should_disable_forward_pre_hook(args):
-        force_param_sync(model, optimizer=optimizer)
+        # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
+        if should_disable_forward_pre_hook(args):
+            force_param_sync(model, optimizer=optimizer)
 
-    # Stop timer to get accurate train interval time and exclude checkpointing duration
-    timers('interval-time').stop()
-    energy_monitor.pause()
+        # Stop timer to get accurate train interval time and exclude checkpointing duration
+        timers('interval-time').stop()
+        energy_monitor.pause()
 
-    # Log E2E metrics before save-checkpoint
-    one_logger_utils.track_e2e_metrics()
-    # Free overlap param-gather buffers and release cached GPU memory so
-    # that the async checkpoint worker process has enough GPU headroom for
-    # D2H tensor transfers.
-    with _otel_managed_span('checkpoint', 'megatron.checkpoint.reclaim_memory'):
-        for model_chunk in model:
-            if hasattr(model_chunk, 'free_overlap_buffers'):
-                model_chunk.free_overlap_buffers()
-        torch.cuda.empty_cache()
+        # Log E2E metrics before save-checkpoint
+        one_logger_utils.track_e2e_metrics()
+        # Free overlap param-gather buffers and release cached GPU memory so
+        # that the async checkpoint worker process has enough GPU headroom for
+        # D2H tensor transfers.
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.reclaim_memory'):
+            for model_chunk in model:
+                if hasattr(model_chunk, 'free_overlap_buffers'):
+                    model_chunk.free_overlap_buffers()
+            torch.cuda.empty_cache()
 
-    # timer.log() reports the min & max time. We do not need a barrier here.
-    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
-    timers(timer_key, log_level=0).start(barrier=False)
+        # timer.log() reports the min & max time. We do not need a barrier here.
+        timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
+        timers(timer_key, log_level=0).start(barrier=False)
 
-    # Resolve checkpoint groups from this rank's module PGC; None for stock runs
-    # falls back to the mpu groups inside save_checkpoint (byte-identical).
-    ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
-    tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
-    pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
-    dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
-    # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
-    dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
-    expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
-    # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
-    rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
+        # Resolve checkpoint groups from this rank's module PGC; None for stock runs
+        # falls back to the mpu groups inside save_checkpoint (byte-identical).
+        ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
+        tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
+        pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
+        dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
+        # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
+        dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
+        expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
+        # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
+        rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
 
-    global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
-    should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+        global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+        should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
 
-    if should_report_memory:
-        # Track memory before checkpoint save.
-        report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_group)
+        if should_report_memory:
+            # Track memory before checkpoint save.
+            report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_group)
 
-    # Save checkpoint.
-    with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', **{'megatron.iteration': iteration}):
-        save_checkpoint(
-            iteration,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            num_floating_point_operations_so_far,
-            checkpointing_context,
-            non_persistent_ckpt=non_persistent_ckpt,
-            train_data_iterator=train_data_iterator,
-            preprocess_common_state_dict_fn=preprocess_common_state_dict,
-            tp_group=tp_group,
-            pp_group=pp_group,
-            dp_cp_group=dp_cp_group,
-            dp_group=dp_group,
-            expt_dp_group=expt_dp_group,
-            rng_state_key_prefix=rng_state_key_prefix,
-        )
+        # Save checkpoint.
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', **{'megatron.iteration': iteration}):
+            save_checkpoint(
+                iteration,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                num_floating_point_operations_so_far,
+                checkpointing_context,
+                non_persistent_ckpt=non_persistent_ckpt,
+                train_data_iterator=train_data_iterator,
+                preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                tp_group=tp_group,
+                pp_group=pp_group,
+                dp_cp_group=dp_cp_group,
+                dp_group=dp_group,
+                expt_dp_group=expt_dp_group,
+                rng_state_key_prefix=rng_state_key_prefix,
+            )
 
-        # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
-        # Since timer.log() reports the min & max time, we do not need a barrier here.
-        timers(timer_key).stop(barrier=False)
-        save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
-    if should_report_memory:
-        # Track memory after checkpoint save.
-        with _otel_managed_span('checkpoint', 'megatron.checkpoint.report_memory'):
-            report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_group)
-    num_checkpoints_memory_reported += 1
+            # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
+            # Since timer.log() reports the min & max time, we do not need a barrier here.
+            timers(timer_key).stop(barrier=False)
+            save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
+        if should_report_memory:
+            # Track memory after checkpoint save.
+            with _otel_managed_span('checkpoint', 'megatron.checkpoint.report_memory'):
+                report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_group)
+        num_checkpoints_memory_reported += 1
 
-    if args.fp8:
-        # Run garbage collection after checkpoint saving to free memory from
-        # dequantized bf16 tensors that were temporarily created during fp8
-        # model checkpoint saving.
-        with _otel_managed_span('checkpoint', 'megatron.checkpoint.gc_collect'):
-            gc.collect()
+        if args.fp8:
+            # Run garbage collection after checkpoint saving to free memory from
+            # dequantized bf16 tensors that were temporarily created during fp8
+            # model checkpoint saving.
+            with _otel_managed_span('checkpoint', 'megatron.checkpoint.gc_collect'):
+                gc.collect()
 
-    # timers.log reports min & max across ranks -> a collective. Sitting right
-    # after the per-rank-imbalanced save (and outside the save spans), it's a
-    # prime spot for the fast ranks to serialize waiting for the slowest saver.
-    with _otel_managed_span('step', 'megatron.checkpoint.timers_log'):
-        timers.log([timer_key])
+        # timers.log reports min & max across ranks -> a collective. Sitting right
+        # after the per-rank-imbalanced save (and outside the save spans), it's a
+        # prime spot for the fast ranks to serialize waiting for the slowest saver.
+        with _otel_managed_span('step', 'megatron.checkpoint.timers_log'):
+            timers.log([timer_key])
 
-    # Log E2E metrics after save-checkpoint
-    one_logger_utils.track_e2e_metrics()
+        # Log E2E metrics after save-checkpoint
+        one_logger_utils.track_e2e_metrics()
 
-    one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
+        one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
 
-    if args.log_progress and not non_persistent_ckpt:
-        compute_throughputs_and_append_to_progress_log(
-            iteration, num_floating_point_operations_so_far
-        )
+        if args.log_progress and not non_persistent_ckpt:
+            compute_throughputs_and_append_to_progress_log(
+                iteration, num_floating_point_operations_so_far
+            )
 
-    # Recover timing
-    energy_monitor.resume()
-    # Interval-time timer restarts with an explicit GLOBAL BARRIER -- the first
-    # hard sync after the checkpoint. If the skew didn't already serialize at
-    # timers.log above, it serializes HERE: fast ranks block for the slowest
-    # saver. Outside every save span, so it read as the dark post-checkpoint gap.
-    timers('interval-time', log_level=0).start(barrier=True)
+        # Recover timing
+        energy_monitor.resume()
+        # Interval-time timer restarts with an explicit GLOBAL BARRIER -- the first
+        # hard sync after the checkpoint. If the skew didn't already serialize at
+        # timers.log above, it serializes HERE: fast ranks block for the slowest
+        # saver. Outside every save span, so it read as the dark post-checkpoint gap.
+        timers('interval-time', log_level=0).start(barrier=True)
 
-    # OTel: close the exposed-save goodput span that parents all of the above.
-    if _exposed_save_span is not None:
-        from opentelemetry import context as _octx
-        _octx.detach(_exposed_save_token)
-        _exposed_save_span.end()
+        # OTel: close the exposed-save goodput span that parents all of the above.
+    finally:
+        if _exposed_save_span is not None:
+            from opentelemetry import context as _octx
+            _octx.detach(_exposed_save_token)
+            _exposed_save_span.end()
 
 
 def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test'):
@@ -4572,53 +4574,55 @@ def train(
             _report_span = get_telemetry().tracer.start_span('megatron.train.iteration_report')
             _otel_tag_span(_report_span, 'step')
             _report_token = _octx.attach(_otr.set_span_in_context(_report_span))
+        try:
 
-        # Logging.
-        if optimizer is not None and not optimizer.is_stub_optimizer:
-            # First .item() after the train_step: a device sync draining the
-            # iteration's pending GPU queue (captured under iteration_report).
-            loss_scale = optimizer.get_loss_scale().item()
-        else:
-            loss_scale = 1.0
-        params_norm = None
+            # Logging.
+            if optimizer is not None and not optimizer.is_stub_optimizer:
+                # First .item() after the train_step: a device sync draining the
+                # iteration's pending GPU queue (captured under iteration_report).
+                loss_scale = optimizer.get_loss_scale().item()
+            else:
+                loss_scale = 1.0
+            params_norm = None
 
-        if args.log_params_norm:
-            # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
-            # + all-reduce that BLOCKS the training loop -- exposed goodput cost
-            # (~1.5s cold on the first iteration, ~10ms steady). Kept as a real
-            # cost span (it stalls the critical path), unlike passive monitors.
-            with _otel_managed_span('step', 'megatron.train.params_norm'):
-                params_norm = calc_params_l2_norm(model)
-        if optimizer is not None:
-            learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
-        else:
-            learning_rate = None
-        # Per-iteration logging (throughput calc, tensorboard/wandb writes) --
-        # uninstrumented per-iteration overhead outside the train_step span.
-        with _otel_managed_span('step', 'megatron.train.log'):
-            report_memory_flag = training_log(
-                loss_dict,
-                total_loss_dict,
-                learning_rate,
-                iteration,
-                loss_scale,
-                report_memory_flag,
-                skipped_iter,
-                grad_norm,
-                params_norm,
-                num_zeros_in_grad,
-                max_attention_logit,
-                pg_collection=model_pg_collection,
-                is_first_iteration=is_first_iteration,
-                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-                total_real_tokens_in_batch=total_real_tokens_in_batch,
-            )
-        # OTel: close the iteration-report super-span (parents params_norm + log;
-        # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
-        if _report_span is not None:
-            from opentelemetry import context as _octx
-            _octx.detach(_report_token)
-            _report_span.end()
+            if args.log_params_norm:
+                # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
+                # + all-reduce that BLOCKS the training loop -- exposed goodput cost
+                # (~1.5s cold on the first iteration, ~10ms steady). Kept as a real
+                # cost span (it stalls the critical path), unlike passive monitors.
+                with _otel_managed_span('step', 'megatron.train.params_norm'):
+                    params_norm = calc_params_l2_norm(model)
+            if optimizer is not None:
+                learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
+            else:
+                learning_rate = None
+            # Per-iteration logging (throughput calc, tensorboard/wandb writes) --
+            # uninstrumented per-iteration overhead outside the train_step span.
+            with _otel_managed_span('step', 'megatron.train.log'):
+                report_memory_flag = training_log(
+                    loss_dict,
+                    total_loss_dict,
+                    learning_rate,
+                    iteration,
+                    loss_scale,
+                    report_memory_flag,
+                    skipped_iter,
+                    grad_norm,
+                    params_norm,
+                    num_zeros_in_grad,
+                    max_attention_logit,
+                    pg_collection=model_pg_collection,
+                    is_first_iteration=is_first_iteration,
+                    seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                    total_real_tokens_in_batch=total_real_tokens_in_batch,
+                )
+            # OTel: close the iteration-report super-span (parents params_norm + log;
+            # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
+        finally:
+            if _report_span is not None:
+                from opentelemetry import context as _octx
+                _octx.detach(_report_token)
+                _report_span.end()
         is_first_iteration = False
 
         # Evaluation.
