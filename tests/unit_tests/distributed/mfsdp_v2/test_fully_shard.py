@@ -330,6 +330,11 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
     mesh = init_device_mesh(
         device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
     )
+    # TEMPORARY race-repro probe (do not merge): a small all-reduce on each mesh
+    # axis right after the mesh is built perturbs stream/allocator ordering and
+    # made the #6187 race collide reliably on 4xA100; try it for HFSDP too.
+    for _dim_name in ("dp_outer", "dp_inner"):
+        dist.all_reduce(torch.ones(1, device=device), group=mesh[_dim_name].get_group())
     torch.manual_seed(1234)
     dim = 8
     baseline = MultiChildModel(dim=dim, num_children=2).to(device)
@@ -376,11 +381,17 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
     baseline_losses = train(baseline, baseline_optimizer, "Baseline")
     sharded_losses = train(model, optimizer, "HFSDP")
 
-    torch.testing.assert_close(
-        torch.stack(sharded_losses),
-        torch.stack(baseline_losses),
-        msg="HFSDP losses did not match baseline losses.",
-    )
+    # TEMPORARY magnitude diagnostic (do not merge): expose the actual losses and
+    # their diff, and drop the custom msg so torch prints the numeric mismatch, to
+    # tell a scale/layout corruption apart from a tolerance miss.
+    sharded_stack = torch.stack(sharded_losses)
+    baseline_stack = torch.stack(baseline_losses)
+    if rank == 0:
+        print(f"[HFSDP-DIAG] sharded ={sharded_stack.tolist()}", flush=True)
+        print(f"[HFSDP-DIAG] baseline={baseline_stack.tolist()}", flush=True)
+        print(f"[HFSDP-DIAG] absdiff ={(sharded_stack - baseline_stack).abs().tolist()}", flush=True)
+
+    torch.testing.assert_close(sharded_stack, baseline_stack)
 
 
 def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
