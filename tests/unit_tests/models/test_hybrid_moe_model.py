@@ -145,6 +145,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fused_single_qkv_rope": False,
     "gated_attention_proj_granularity": "elementwise",
     "gated_linear_unit": False,
+    "gtp_remat_opt_in_modules": [],
     "gtp_weight_remat_size": 1,
     "glu_linear_offset": 0.0,
     "grad_scale_func": None,
