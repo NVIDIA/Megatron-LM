@@ -19,14 +19,7 @@ def test_linear_default_output_dtype_preserves_input_dtype(dtype):
         input_data = torch.randn(4, 3, 16, device="cuda", dtype=dtype)
         weight = torch.randn(32, 16, device="cuda", dtype=dtype)
         output = linear_with_grad_accumulation_and_async_allreduce(
-            input_data,
-            weight,
-            None,
-            False,
-            False,
-            False,
-            tp_group=None,
-            output_dtype=None,
+            input_data, weight, None, False, False, False, tp_group=None, output_dtype=None
         )
         reference = torch.nn.functional.linear(input_data, weight)
 
@@ -113,20 +106,15 @@ def test_linear_with_grad_accumulation_supports_fp32_output_and_bf16_backward():
     reference_weight = weight.detach().clone().requires_grad_(True)
 
     output = linear_with_grad_accumulation_and_async_allreduce(
-        input_data,
-        weight,
-        None,
-        False,
-        False,
-        False,
-        tp_group=None,
-        output_dtype=torch.float32,
+        input_data, weight, None, False, False, False, tp_group=None, output_dtype=torch.float32
     )
     output.sum().backward()
 
     reference_output = torch.nn.functional.linear(reference_input, reference_weight)
     reference_output.sum().backward()
-    fp32_reference_output = torch.nn.functional.linear(input_data.detach().float(), weight.detach().float())
+    fp32_reference_output = torch.nn.functional.linear(
+        input_data.detach().float(), weight.detach().float()
+    )
 
     assert output.dtype == torch.float32
     assert input_data.grad.dtype == torch.bfloat16
@@ -153,14 +141,7 @@ def test_linear_fp32_output_is_bitwise_exact_for_integer_bf16_operands():
     ).to(torch.bfloat16)
 
     output = linear_with_grad_accumulation_and_async_allreduce(
-        input_data,
-        weight,
-        None,
-        False,
-        False,
-        False,
-        tp_group=None,
-        output_dtype=torch.float32,
+        input_data, weight, None, False, False, False, tp_group=None, output_dtype=torch.float32
     )
     reference = torch.nn.functional.linear(input_data.float(), weight.float())
 
@@ -188,14 +169,7 @@ def test_linear_fp32_output_matches_plain_te_general_gemm():
     input_data = torch.randn(4, 3, 64, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(96, 64, device="cuda", dtype=torch.bfloat16)
     wrapped_output = linear_with_grad_accumulation_and_async_allreduce(
-        input_data,
-        weight,
-        None,
-        False,
-        False,
-        False,
-        tp_group=None,
-        output_dtype=torch.float32,
+        input_data, weight, None, False, False, False, tp_group=None, output_dtype=torch.float32
     )
 
     kwargs = {

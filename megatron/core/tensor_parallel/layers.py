@@ -458,7 +458,9 @@ def _linear_forward(
     from megatron.core.extensions.transformer_engine import te_general_gemm
 
     if te_general_gemm is None:
-        raise RuntimeError("A mixed-precision linear output requires Transformer Engine general_gemm.")
+        raise RuntimeError(
+            "A mixed-precision linear output requires Transformer Engine general_gemm."
+        )
 
     input_shape = input.shape
     input_2d = input.reshape(-1, input_shape[-1])
