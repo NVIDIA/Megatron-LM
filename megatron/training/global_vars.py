@@ -501,19 +501,6 @@ def _set_telemetry(args):
         return
     from megatron.core.telemetry.span_groups import MegatronSpanGroup
 
-    # OTel's default RandomIdGenerator draws span/trace IDs from Python's `random`, which Megatron
-    # seeds IDENTICALLY across data-parallel ranks (_set_random_seed with data_parallel_random_init
-    # off) -> every rank emits the SAME span/trace ID sequence, so a backend sees many spans sharing
-    # one span ID and parent links resolve to the wrong span (Honeycomb: "multiple spans sharing the
-    # same non-null span ID", broken checkpoint parents). Patch the default generator to os.urandom.
-    # NOTE: this is the IMMEDIATE, mounted stopgap for THE TRAINER PROCESS only. The ckpt worker and
-    # nvrx set up telemetry in their OWN process (nemo-lens from_env, forkserver) and never run this,
-    # so they are covered by the seed-independent id_generator baked into nemo-lens providers.py --
-    # which is the real fix (effective on the next image rebuild; then this becomes a harmless no-op).
-    from opentelemetry.sdk.trace import id_generator as _idg
-    _idg.RandomIdGenerator.generate_span_id = lambda self: int.from_bytes(os.urandom(8), 'big') or 1
-    _idg.RandomIdGenerator.generate_trace_id = lambda self: int.from_bytes(os.urandom(16), 'big') or 1
-
     config = NemoLensConfig.from_env(
         prefix='MEGATRON_OTEL', fallback_prefix='NEMO_LENS',
         span_group_cls=MegatronSpanGroup,
@@ -526,6 +513,30 @@ def _set_telemetry(args):
         config.service_name = args.otel_service_name
     if getattr(args, 'otel_span_groups', None):
         config.span_groups = args.otel_span_groups
+
+    if config.enabled:
+        # OTel's default RandomIdGenerator draws span/trace IDs from Python's `random`, which
+        # Megatron seeds IDENTICALLY across data-parallel ranks (_set_random_seed with
+        # data_parallel_random_init off) -> every rank emits the SAME span/trace ID sequence, so a
+        # backend sees many spans sharing one span ID and parent links resolve to the wrong span
+        # (Honeycomb: "multiple spans sharing the same non-null span ID", broken checkpoint
+        # parents). Patch the default generator to os.urandom.
+        # NOTE: this is the IMMEDIATE, mounted stopgap for THE TRAINER PROCESS only. The ckpt worker
+        # and nvrx set up telemetry in their OWN process (nemo-lens from_env, forkserver) and never
+        # run this, so they are covered by the seed-independent id_generator baked into nemo-lens
+        # providers.py -- which is the real fix (effective on the next image rebuild; then this
+        # becomes a harmless no-op).
+        # It patches a class on an SDK module process-globally, so it is deliberately confined to
+        # the telemetry-enabled path: a run with telemetry off must not have its OTel SDK mutated
+        # just because nemo-lens happens to be importable.
+        from opentelemetry.sdk.trace import id_generator as _idg
+        _idg.RandomIdGenerator.generate_span_id = (
+            lambda self: int.from_bytes(os.urandom(8), 'big') or 1
+        )
+        _idg.RandomIdGenerator.generate_trace_id = (
+            lambda self: int.from_bytes(os.urandom(16), 'big') or 1
+        )
+
     resource_attrs = build_telemetry_resource_attrs(args)
 
     # The "console" exporter defaults to stdout, which interleaves spans/metrics
