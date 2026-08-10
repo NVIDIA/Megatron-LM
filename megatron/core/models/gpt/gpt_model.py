@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -372,6 +373,9 @@ class GPTModel(LanguageModule):
         rotary_pos_sin = None
         # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
         rotary_pos_cos_sin = None
+        # Model-level rotary_pos_emb is only for regular attention. Regular
+        # attention uses the default zigzag CP RoPE layout; MLA/CSA/DSv4-style
+        # variants must ignore this external RoPE and build/apply RoPE internally.
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             use_flash_infer_fused_rope = (
@@ -579,6 +583,21 @@ class GPTModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        if cp_group is not None and cp_group.size() > 1 and packed_seq_params is None:
+            warnings.warn(
+                "GPTModel received no PackedSeqParams while running under context "
+                "parallelism. Megatron-LM will temporarily assume SBHD tensors and "
+                "create layout metadata for this forward pass. In a future release, "
+                "callers must pass PackedSeqParams with qkv_format and cp_partition_mode "
+                "set explicitly.",
+                FutureWarning,
+                stacklevel=2,
+            )
+            packed_seq_params = PackedSeqParams(
+                qkv_format="sbhd", cp_partition_mode=self.config.cp_partition_mode
+            )
+
         preproc_output = self._preprocess(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -697,7 +716,10 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
+
+        mtp_forward_ran = mtp_in_postprocess and not (in_inference_mode or is_spec_decode)
+
+        if mtp_forward_ran:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,

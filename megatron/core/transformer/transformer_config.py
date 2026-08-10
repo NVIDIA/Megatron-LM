@@ -1555,20 +1555,41 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.cp_partition_mode not in ("zigzag", "contiguous"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
-
         if self.context_parallel_size > 1:
-            if (
-                self.experimental_attention_variant == "dsv4_hybrid"
-                and self.cp_partition_mode != "contiguous"
-            ):
-                raise ValueError("DSv4 Hybrid with CP requires cp_partition_mode='contiguous'.")
-            if (
-                self.experimental_attention_variant != "dsv4_hybrid"
-                and self.cp_partition_mode != "zigzag"
-            ):
-                raise ValueError(
-                    "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
-                )
+            if self.cp_partition_mode == "contiguous":
+                if (
+                    self.multi_latent_attention
+                    and self.experimental_attention_variant != "dsv4_hybrid"
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is not supported with "
+                        "multi_latent_attention outside dsv4_hybrid."
+                    )
+                if self.experimental_attention_variant not in (
+                    "dsv4_hybrid",
+                    "gated_delta_net",
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' with context parallelism currently "
+                        "requires experimental_attention_variant to be either 'dsv4_hybrid' "
+                        "or 'gated_delta_net'."
+                    )
+                if (
+                    self.experimental_attention_variant == "gated_delta_net"
+                    and self.linear_cp_mode == "headwise"
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is incompatible with "
+                        "gated_delta_net linear_cp_mode='headwise'."
+                    )
+            elif self.cp_partition_mode == "zigzag":
+                if self.experimental_attention_variant == "dsv4_hybrid":
+                    raise ValueError(
+                        "DSv4 Hybrid with context parallelism requires "
+                        "cp_partition_mode='contiguous'."
+                    )
+            else:
+                raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
 
         # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
         # selectors have been folded into experimental_attention_variant, and immediately

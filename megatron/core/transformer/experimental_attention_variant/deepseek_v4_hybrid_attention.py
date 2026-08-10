@@ -267,8 +267,19 @@ class DSv4HybridAttention(Attention):
         if cp_size > 1 and qkv_format != 'thd':
             raise ValueError("DSv4 Hybrid with CP requires qkv_format='thd'.")
         use_thd_cp = cp_size > 1 and qkv_format == 'thd'
-        if use_thd_cp and packed_seq_params.cp_partition_mode != "contiguous":
-            raise ValueError("DSv4 THD CP requires a contiguous CP partition.")
+        if use_thd_cp:
+            actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+            if actual_cp_partition_mode is None:
+                raise ValueError(
+                    "DSv4HybridAttention requires PackedSeqParams.cp_partition_mode "
+                    "when context parallelism is active."
+                )
+            if actual_cp_partition_mode != "contiguous":
+                raise ValueError(
+                    "DSv4HybridAttention requires cp_partition_mode='contiguous', but "
+                    f"packed_seq_params has {actual_cp_partition_mode!r}. CP partition "
+                    "conversion must be handled before entering DSv4HybridAttention."
+                )
         self.pg_collection.cp = cp_group
 
         boundary_hidden = None

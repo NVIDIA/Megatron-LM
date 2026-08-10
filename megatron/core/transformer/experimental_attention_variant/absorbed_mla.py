@@ -916,6 +916,23 @@ class AbsorbedMLASelfAttention(Attention):
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             self.pg_collection.cp = packed_seq_params.cp_group
+        if packed_seq_params is not None:
+            cp_group = packed_seq_params.cp_group
+            if cp_group is None:
+                cp_group = self.pg_collection.cp
+            if cp_group is not None and cp_group.size() > 1:
+                actual_cp_partition_mode = packed_seq_params.cp_partition_mode
+                if actual_cp_partition_mode is None:
+                    raise ValueError(
+                        "AbsorbedMLASelfAttention requires PackedSeqParams.cp_partition_mode "
+                        "when context parallelism is active."
+                    )
+                if actual_cp_partition_mode != "zigzag":
+                    raise ValueError(
+                        "AbsorbedMLASelfAttention requires cp_partition_mode='zigzag', but "
+                        f"packed_seq_params has {actual_cp_partition_mode!r}. CP partition "
+                        "conversion must be handled before entering AbsorbedMLA."
+                    )
 
         # =====================
         # Query, Key, and Value

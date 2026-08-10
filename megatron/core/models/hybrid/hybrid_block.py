@@ -412,6 +412,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             inference_context=inference_context,
             padding_mask=padding_mask,
             input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
         )
         if layer.mlp_norm_manager is not None:
             output_with_bias = layer._group_offload_output_with_bias(
