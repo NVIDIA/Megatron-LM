@@ -116,7 +116,6 @@ from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
 )
 from megatron.core.resharding.refit import swap_model_weights
-from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
@@ -2087,6 +2086,8 @@ def setup_model_and_optimizer(
                 use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
+                use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
+                use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
             )
         else:
             assert model_provider_func is not None, "Must provide a model config via config_container or a model_provider_func."
