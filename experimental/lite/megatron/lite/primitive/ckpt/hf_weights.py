@@ -875,7 +875,11 @@ def _load_weight_map_for_model(
     state: dict[str, torch.Tensor],
 ) -> dict[str, list[str]]:
     """Build the one native-to-HF plan shared by load and export."""
-    logical_state_keys = tuple(canonical_state_key(name) for name in state)
+    logical_state_keys = tuple(
+        canonical_state_key(name)
+        for name in state
+        if ".parametrizations." not in name or name.endswith(".original")
+    )
     load_weight_map = getattr(spec, "load_weight_map", None)
     return (
         load_weight_map(base_model, ps, logical_state_keys)

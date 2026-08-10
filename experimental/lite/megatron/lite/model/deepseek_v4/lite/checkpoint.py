@@ -272,7 +272,7 @@ class DeepseekV4WeightSpec:
         )
         weight_map: dict[str, list[str]] = {}
         for name in logical_state_keys:
-            if _is_native_metadata_key(name):
+            if ".parametrizations." in name or _is_native_metadata_key(name):
                 continue
             global_name = to_global_layer_name(name, layer_map)
             mapped_name = _to_global_expert_name(global_name, self.config, ps)
