@@ -218,10 +218,11 @@ def _apply_rotary_pos_emb_thd(
     multi_latent_attention: Optional[bool] = None,
     max_seqlen: Optional[int] = None,
 ) -> Tensor:
-    """Apply RoPE for `thd` format using pure CUDA ops (CUDA Graph compatible).
+    """Apply RoPE for `thd` format using vectorized CUDA operations.
 
-    Replaces the original Python-loop + .tolist() implementation with vectorized
-    CUDA operations. No GPU->CPU syncs, compatible with CUDA Graph capture.
+    When ``max_seqlen`` is supplied, this path performs no GPU-to-CPU sync and is
+    compatible with CUDA Graph capture. The compatibility path for legacy callers
+    that omit ``max_seqlen`` retains one GPU-to-CPU sync.
 
     Args:
         t (Tensor): Input tensor of shape [total_tokens, h, d]
