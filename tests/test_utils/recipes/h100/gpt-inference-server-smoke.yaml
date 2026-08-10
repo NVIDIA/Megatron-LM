@@ -52,5 +52,5 @@ products:
   - test_case: [gpt_inference_server_async_sched_tp2_pp2_ep2_gptoss_20b]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]

@@ -96,22 +96,22 @@ products:
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_async_sched_zmq]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_async_sched_recompute_zmq]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_async_sched_uvm_persist_zmq]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_async_sched_offload_zmq]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   # Throughput coverage for this 583M dynamic-batching DP=8 config now lives at
   # tests/performance_tests/test_cases/gpt/gpt_583m_perf/ — see
