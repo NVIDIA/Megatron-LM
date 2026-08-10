@@ -3479,6 +3479,27 @@ def training_log(
         if learning_rate is not None:
             log_string += f' learning rate: {learning_rate:.6E} |'
         log_string += f' global batch size: {batch_size:5d} |'
+
+        # OTel: snapshot the accumulator state BEFORE it is torn down. The loop directly
+        # below zeroes each loss tensor when should_reset, and the should_reset block
+        # further down zeroes advanced/skipped/nan_iters -- so anything read after that
+        # point sees 0.0 loss and 0 skipped iterations on EVERY export, which is exactly
+        # what the metrics emission (further below, where the other emission inputs like
+        # `throughput` are in scope) used to do. Take the values here and emit them there.
+        # The .item() is a device sync, so it stays inside the telemetry guard and is not
+        # paid at all when telemetry is off -- the same guard the emission itself uses.
+        _otel_telemetry_log = get_telemetry()
+        _otel_loss_snapshot = None
+        _otel_skipped_iters_snapshot = 0
+        if _otel_telemetry_log is not None and _otel_telemetry_log.is_exporting:
+            _meta_keys = (advanced_iters_key, skipped_iters_key, nan_iters_key)
+            _loss_keys = [k for k in total_loss_dict if k not in _meta_keys]
+            if _loss_keys:
+                _otel_loss_snapshot = total_loss_dict[_loss_keys[0]].item() / float(
+                    max(1, total_loss_dict.get(advanced_iters_key, 1))
+                )
+            _otel_skipped_iters_snapshot = int(total_loss_dict.get(skipped_iters_key, 0))
+
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
                 avg = total_loss_dict[key].item() / float(
@@ -3514,17 +3535,12 @@ def training_log(
             total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
 
-        # OTel: emit training metrics at log interval (export rank only).
-        _otel_telemetry_log = get_telemetry()
+        # OTel: emit training metrics at log interval (export rank only). Loss and
+        # skipped-iteration counts come from the snapshot taken above, before the
+        # accumulators were reset; everything else is still live at this point.
         if _otel_telemetry_log is not None and _otel_telemetry_log.is_exporting:
             from megatron.core.telemetry.training_metrics import record_training_metrics
-            _meta_keys = (advanced_iters_key, skipped_iters_key, nan_iters_key)
-            _loss_keys = [k for k in total_loss_dict if k not in _meta_keys]
-            _avg_loss = (
-                total_loss_dict[_loss_keys[0]].item()
-                / float(max(1, total_loss_dict.get(advanced_iters_key, 1)))
-                if _loss_keys else None
-            )
+            _avg_loss = _otel_loss_snapshot
             _tokens_per_sec = (
                 batch_size * args.seq_length / elapsed_time_per_iteration
                 if elapsed_time_per_iteration > 0 else None
@@ -3537,7 +3553,7 @@ def training_log(
                 throughput_tflops=throughput if args.log_throughput else None,
                 grad_norm=grad_norm,
                 learning_rate=learning_rate,
-                skipped_iters=int(total_loss_dict.get(skipped_iters_key, 0)),
+                skipped_iters=_otel_skipped_iters_snapshot,
                 tokens_per_sec=_tokens_per_sec,
                 memory_allocated_gb=_mem_gb,
             )
