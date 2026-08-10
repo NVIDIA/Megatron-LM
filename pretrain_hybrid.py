@@ -463,15 +463,34 @@ if __name__ == "__main__":
     # Under NVRx/ft_launcher the batch script's launch_script_start is captured ONCE, outside the
     # single srun, and is STALE for every restart -- re-using it backdates a restart's startup all the
     # way to t0 (a promoted spare then shows a fake ~580s "startup" spanning its standby wait). The
-    # ft_launcher agent hands each worker cohort a FRESH in-srun launch stamp via NVRX_LAUNCH_TIME; use
-    # it as THIS restart's launch anchor so workload.startup measures this relaunch (spawn + import),
-    # not a backdate. presrun is an outside-srun/one-shot concept -> it does not apply to a restart, so
-    # drop it here. The one-time "outside srun -> first nvrx" cold start is captured separately by the
-    # agent (nvrx.cold_start). Non-NVRx runs have no NVRX_LAUNCH_TIME and behave exactly as before.
+    # ft_launcher agent hands each worker cohort a FRESH in-srun launch stamp via NVRX_LAUNCH_TIME.
+    #
+    # The agent sets NVRX_LAUNCH_TIME on EVERY cohort, cycle 0 included, so this override must be
+    # RESTART-ONLY (audit section K): on cycle 0 the sbatch stamp is the correct, non-stale anchor,
+    # and it is also where the agent starts nvrx.cold_start. Overriding it there made pre_startup end
+    # at worker-spawn instead of at the launch script's first line, so pre_startup OVERLAPPED
+    # cold_start by the whole cold-start window (~16.7s in smoke 2938524) instead of tiling with it.
+    # On cycles >= 1 the override is right and stays: the restart's launch anchor is this cohort's
+    # spawn instant, not t0.
+    #
+    # presrun is an outside-srun/one-shot concept and never applies under NVRx, on ANY cycle: the
+    # launch_script_start -> python window is owned by the agent's own spans (nvrx.cold_start on
+    # cycle 0, the restart-cycle tree afterwards). Dropping presrun on every NVRx cohort is what
+    # suppresses megatron.startup.launch_script / .container_load in training.py (both are
+    # None-guarded), so we never double-count that window. Non-NVRx runs have no NVRX_LAUNCH_TIME
+    # and behave exactly as before.
     _NVRX_LAUNCH_TIME = _env_float('NVRX_LAUNCH_TIME')
+    _NVRX_CYCLE = os.environ.get('NVRX_CYCLE', '').strip()
+    # A restart cohort: NVRX_CYCLE > 0. NVRX_CYCLE_START_TIME is only ever stamped on cycles >= 1,
+    # so its mere presence is a compatible fallback signal for an agent that predates NVRX_CYCLE.
+    _NVRX_CYCLE_START = _env_float('NVRX_CYCLE_START_TIME')
+    _IS_NVRX_RESTART = (
+        (_NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()) or _NVRX_CYCLE_START is not None
+    )
     if _NVRX_LAUNCH_TIME is not None:
-        _LAUNCH_SCRIPT_START_TIME = _NVRX_LAUNCH_TIME
         _LAUNCH_SCRIPT_PRESRUN_TIME = None
+        if _IS_NVRX_RESTART:
+            _LAUNCH_SCRIPT_START_TIME = _NVRX_LAUNCH_TIME
 
     # SLURM_JOB_START_TIME is set by Slurm itself for the whole job (every
     # process in it, not just the launch script) -- Slurm's own record of when
@@ -481,15 +500,15 @@ if __name__ == "__main__":
     # LENS_LAUNCH_SCRIPT_* vars, this needs no cooperation from the launch
     # script -- it's just already there.
     _SLURM_JOB_START_TIME = _env_float('SLURM_JOB_START_TIME')
-    # pre_startup anchors on the 'before the start' stamp. Priority to NVRx: on a RESTART the agent
-    # supplies NVRX_CYCLE_START_TIME (this cycle's pre-rendezvous instant), so pre_startup measures
-    # THIS restart's pre-launch gap (teardown + rejoin) instead of backdating to the one-time
-    # slurm_job_start. On cycle 0 (and non-NVRx) the agent supplies no such stamp, so we keep sbatch's
-    # SLURM_JOB_START_TIME = the real queue/prolog before the launch script.
-    _NVRX_CYCLE_START = _env_float('NVRX_CYCLE_START_TIME')
-    if _NVRX_CYCLE_START is not None:
-        _SLURM_JOB_START_TIME = _NVRX_CYCLE_START
-
+    # pre_startup (slurm_job_start_time -> launch_script_start) is a CYCLE-0-ONLY concept (audit
+    # section K): it is the coarse in-process fallback for the SLURM job-start -> launch-script gap
+    # when the out-of-band sacct reckoner isn't running. On a restart cohort that gap is not ours to
+    # describe -- the agent's own restart tree (cycle / rendezvous / worker_launch spans) covers the
+    # teardown+rejoin window authoritatively, and re-emitting it here is what made pre_startup fight
+    # with the launch anchors. So: drop the stamp on restarts, which drops the span (training.py
+    # only emits pre_startup when slurm_job_start_time is present and precedes launch_script_start).
+    if _IS_NVRX_RESTART:
+        _SLURM_JOB_START_TIME = None
     # Register startup timestamps for timing report in pretrain()
     set_startup_timestamps(
         program_start=_PROGRAM_START_TIME,
