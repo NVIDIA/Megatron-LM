@@ -500,14 +500,16 @@ if __name__ == "__main__":
     # LENS_LAUNCH_SCRIPT_* vars, this needs no cooperation from the launch
     # script -- it's just already there.
     _SLURM_JOB_START_TIME = _env_float('SLURM_JOB_START_TIME')
-    # pre_startup (slurm_job_start_time -> launch_script_start) is a CYCLE-0-ONLY concept (audit
-    # section K): it is the coarse in-process fallback for the SLURM job-start -> launch-script gap
-    # when the out-of-band sacct reckoner isn't running. On a restart cohort that gap is not ours to
-    # describe -- the agent's own restart tree (cycle / rendezvous / worker_launch spans) covers the
-    # teardown+rejoin window authoritatively, and re-emitting it here is what made pre_startup fight
-    # with the launch anchors. So: drop the stamp on restarts, which drops the span (training.py
-    # only emits pre_startup when slurm_job_start_time is present and precedes launch_script_start).
-    if _IS_NVRX_RESTART:
+    # pre_startup (slurm_job_start_time -> launch_script_start) is the coarse in-process fallback for
+    # the SLURM job-start -> launch-script gap (queue tail / prolog / node setup). Under NVRx the
+    # ft_launcher AGENT owns this window: it emits pre_startup itself at cold start (once per node),
+    # alongside nvrx.cold_start, so the whole pre-Python scheduling envelope has a single owner and
+    # megatron never fights the agent over it. Megatron only emits pre_startup on the bare (no
+    # ft_launcher) path. So drop the stamp on ANY NVRx cohort -- not just restarts -- which drops
+    # megatron's span (training.py only emits pre_startup when slurm_job_start_time is present and
+    # precedes launch_script_start). NVRX_LAUNCH_TIME is set on every ft_launcher cohort (cycle 0
+    # included), so its presence is the "under NVRx" signal.
+    if _NVRX_LAUNCH_TIME is not None:
         _SLURM_JOB_START_TIME = None
     # Register startup timestamps for timing report in pretrain()
     set_startup_timestamps(
