@@ -24,6 +24,7 @@ from megatron.core.transformer.enums import (
     CudaGraphModule,
     CudaGraphScope,
     InferenceCudaGraphScope,
+    LayerType,
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
@@ -546,7 +547,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out".
+             "shared_experts", "gdn_norm_out", "mhc".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -556,7 +557,11 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
-    "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
+    "mhc": recompute HyperConnection intermediate activations via
+            CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
+            enable_hyper_connections=True. Cannot be used with "mlp".
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", and "mhc" use
+    output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -819,6 +824,15 @@ class TransformerConfig(ModelParallelConfig):
     If positive, generates new random bias each forward pass.
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
+
+    moe_n_hash_layers: int = 0
+    """Number of leading transformer layers that use hash-based MoE routing.
+    Layers with ``layer_number <= moe_n_hash_layers`` select experts from a
+    token-to-expert lookup table instead of learned top-k routing."""
+
+    actual_vocab_size: Optional[int] = None
+    """Vocabulary size of the token-to-expert lookup table.
+    Required when ``moe_n_hash_layers > 0``."""
 
     use_grouped_gemm_for_dense_mlp: bool = False
     """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
@@ -1092,6 +1106,42 @@ class TransformerConfig(ModelParallelConfig):
     migrated to cuda_graph_modules in __post_init__. Will be removed in a future release.
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
+
+    ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC residual connections."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams (n in paper)."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of Gating Factor (alpha in paper)."""
+
+    use_fused_mhc: bool = False
+    """Use fused kernels for mHC operations when supported.
+
+    Backend selection is operation-specific, with native torch fallbacks that
+    preserve the same public behavior when Triton or cuTile is unavailable.
+    """
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Number of layers per MHC recompute block.
+
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new CheckpointWithoutOutputManager is created for subsequent layers
+
+    If None, all layers in the transformer block share a single recompute block.
+
+    Must be a positive integer when set."""
 
     ####################
     # miscellaneous
@@ -1800,6 +1850,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "gdn_norm_out",
+                    "mhc",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1870,6 +1921,46 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # Validation for "mhc" in recompute_modules
+        if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "'mhc' in recompute_modules requires enable_hyper_connections=True."
+                )
+            if "mlp" in self.recompute_modules:
+                raise ValueError(
+                    "'mhc' and 'mlp' in recompute_modules cannot be used together. "
+                    "They use different checkpoint mechanisms that may conflict."
+                )
+            if self.mhc_recompute_layer_num is not None and (
+                isinstance(self.mhc_recompute_layer_num, bool)
+                or not isinstance(self.mhc_recompute_layer_num, int)
+                or self.mhc_recompute_layer_num < 1
+            ):
+                raise ValueError(
+                    "mhc_recompute_layer_num must be a positive integer when "
+                    "'mhc' is in recompute_modules."
+                )
+            if self.fine_grained_activation_offloading:
+                raise NotImplementedError(
+                    "'mhc' in recompute_modules + fine_grained_activation_offloading is "
+                    "not yet supported. The mHC recompute hook currently fires before "
+                    "the offloading backward chunk is initialized, causing tensor_pop "
+                    "on a None chunk. Disable one of them."
+                )
+
+        if self.enable_hyper_connections and not (
+            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        ):
+            warnings.warn(
+                "HyperConnections are enabled but 'mhc' is not in "
+                "recompute_modules with selective recompute. Consider adding 'mhc' to "
+                "recompute_modules with selective recompute to reduce activation memory."
+            )
+
+        if self.use_fused_mhc and not self.enable_hyper_connections:
+            raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
 
         if self.fine_grained_activation_offloading:
             assert (
@@ -2315,6 +2406,37 @@ class TransformerConfig(ModelParallelConfig):
                 "Expert bias for aux-loss-free routing only supports 'sigmoid' and 'sqrtsoftplus' "
                 "score functions. Please set --moe-router-score-function to 'sigmoid' or "
                 "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
+            )
+
+        if self.moe_n_hash_layers > 0:
+            assert (
+                self.actual_vocab_size is not None and self.actual_vocab_size > 0
+            ), "actual_vocab_size must be positive when moe_n_hash_layers > 0."
+            assert (
+                self.num_moe_experts is not None
+            ), "num_moe_experts must be set when moe_n_hash_layers > 0."
+            if self.pipeline_model_parallel_size > 1 and not self.is_hybrid_model:
+                assert self.pipeline_model_parallel_layout is not None, (
+                    "pipeline_model_parallel_layout must be set when using hash MoE "
+                    "layers with pipeline parallelism (PP > 1)."
+                )
+                embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
+                n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
+                assert self.moe_n_hash_layers <= n_decoders_with_embedding, (
+                    "All hash MoE layers must currently share the virtual pipeline stage "
+                    "that owns the embedding. The embedding stage has "
+                    f"{n_decoders_with_embedding} decoder layers, but "
+                    f"moe_n_hash_layers={self.moe_n_hash_layers}."
+                )
+            assert (
+                not self.overlap_moe_expert_parallel_comm
+            ), "overlap_moe_expert_parallel_comm does not support hash MoE layers yet."
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Hash MoE initialized with a placeholder round-robin token-to-expert table. "
+                "Load a trained table from a checkpoint or provide a workload-aware "
+                "initialization before training.",
             )
 
         if self.num_moe_experts and self.fp8:
