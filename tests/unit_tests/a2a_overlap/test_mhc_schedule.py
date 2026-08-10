@@ -547,8 +547,13 @@ class TestMhcA2AOverlapNumerics:
             for layer in model.decoder.layers:
                 # Make submodule_attn_forward take the CUDA-graph replay branch
                 # without capturing anything: the branch is gated on a truthy
-                # cuda_graphs attribute plus attn in cuda_graph_modules.
+                # cuda_graphs attribute, and the padding_mask threading below it
+                # on _uses_mhc_recompute_attn_cuda_graph_split(), which needs the
+                # TE impl and attn scope as well as the mHC recompute modules the
+                # config already carries. Setting only the modules would describe
+                # a configuration that is not the attention-only split.
                 layer.cuda_graphs = [object()]
+                layer.config.cuda_graph_impl = "transformer_engine"
                 layer.config.cuda_graph_modules = [CudaGraphModule.attn]
                 layer.set_te_cuda_graph_backward_dw_wrapper = lambda: None
 
