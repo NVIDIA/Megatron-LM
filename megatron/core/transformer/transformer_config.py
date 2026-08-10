@@ -3180,52 +3180,41 @@ class TransformerConfig(ModelParallelConfig):
             ], 'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'
 
             if self.recompute_granularity == 'full':
-                # EP A2A overlap supports full recompute through a dedicated layer-level
-                # recompute path: the chunk's layers are split into segments of
-                # recompute_num_layers layers, only each segment's input tensor is
-                # retained across the forward->backward gap, and a segment's forward is
-                # replayed (with an exposed, non-overlapped A2A) at the start of its own
-                # backward. The normal forward/backward A2A overlap is preserved.
-                # recompute_method / recompute_num_layers keep exactly the same meaning
-                # as on the non-overlap path (megatron/core/recompute.py for the decoder,
-                # MultiTokenPredictionLayer._checkpointed_forward for MTP), and are
-                # validated above by the shared recompute_granularity checks.
-                # See megatron/core/models/common/model_chunk_schedule_plan.py.
-                if self.mtp_num_layers:
-                    if self.recompute_method == 'uniform':
-                        # Mirrors the assert in
-                        # MultiTokenPredictionLayer._checkpointed_forward.
-                        assert self.recompute_num_layers == 1, (
-                            'recompute_num_layers must be 1 for MTP recompute'
-                        )
-                    else:
-                        warnings.warn(
-                            "recompute_method == 'block' is not supported for MTP yet."
-                            " Skipping recompute."
-                        )
-                # The recompute replays the segment forward. With attention/hidden
-                # dropout the forward RNG stream is interleaved across microbatches
-                # in the 1F1B schedule and cannot yet be faithfully replayed, so the
-                # recomputed activations would diverge from the forward pass.
+                # Full recompute runs per layer segment; recompute_method /
+                # recompute_num_layers keep their non-overlap meaning and are validated
+                # by the shared checks above. See
+                # megatron/core/models/common/model_chunk_schedule_plan.py.
+                # The replay is hand-rolled rather than a checkpoint primitive, so it
+                # cannot shard the retained segment input across TP ranks.
+                assert not self.distribute_saved_activations, (
+                    'overlap_moe_expert_parallel_comm full recompute does not support '
+                    'distribute_saved_activations: the segment replay does not go through '
+                    'a checkpoint primitive, so the retained input is not sharded.'
+                )
+                # MTP is segmented under both methods here, so unlike
+                # MultiTokenPredictionLayer._checkpointed_forward there is no 'block'
+                # exemption. The 'uniform' restriction below is config parity with that
+                # function's own assert, not a constraint of this schedule - multi-layer
+                # decoder segments hand the mHC bridge over correctly.
+                if self.mtp_num_layers and self.recompute_method == 'uniform':
+                    assert (
+                        self.recompute_num_layers == 1
+                    ), 'recompute_num_layers must be 1 for MTP recompute'
+                # With dropout the forward RNG stream is interleaved across microbatches
+                # in the 1F1B schedule and cannot yet be faithfully replayed.
                 assert self.attention_dropout == 0.0 and self.hidden_dropout == 0.0, (
                     'overlap_moe_expert_parallel_comm full recompute currently requires '
                     'attention_dropout==0 and hidden_dropout==0 (RNG replay across the '
                     'interleaved 1F1B schedule is not yet supported for nonzero dropout)'
                 )
-                # The layer-level recompute re-runs a segment forward at backward time.
-                # Combining it with CUDA graphs is not yet supported: the graph captures
-                # a fixed forward/backward node sequence and pre-allocates static buffers,
-                # which the inserted (no_grad) initial forward + backward-time recompute
-                # pass does not fit. Full recompute (drop+recompute activations) and CUDA
-                # graphs (fixed pre-allocated buffers) also target opposite memory regimes.
+                # CUDA graphs capture a fixed node sequence with static buffers, which
+                # the inserted no_grad forward + backward-time replay does not fit.
                 assert self.cuda_graph_impl == "none", (
                     'overlap_moe_expert_parallel_comm full recompute is not yet supported '
                     'together with CUDA graphs (cuda_graph_impl != "none").'
                 )
-                # Paged stash keeps per-layer activations in a paged buffer, while full
-                # recompute drops and recomputes them — the two activation-memory
-                # strategies are redundant and their stash/restore lifecycle conflicts
-                # with the recompute activation release. Not yet supported together.
+                # Paged stash and full recompute are redundant activation-memory
+                # strategies, and stash/restore conflicts with the recompute release.
                 assert not self.moe_paged_stash, (
                     'overlap_moe_expert_parallel_comm full recompute is not yet supported '
                     'together with moe_paged_stash.'

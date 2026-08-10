@@ -403,8 +403,7 @@ def combined_forward_backward_step(
         # needs the (sharded) parameters to be all-gathered again. That interaction
         # with the FSDP reshard hooks is not yet supported.
         assert not (
-            forward_fsdp_wrapper is not None
-            and getattr(f_schedule_plan, "recompute_full", False)
+            forward_fsdp_wrapper is not None and getattr(f_schedule_plan, "recompute_full", False)
         ), (
             "overlap_moe_expert_parallel_comm full recompute (recompute_granularity=full) "
             "is not yet supported together with Megatron FSDP."

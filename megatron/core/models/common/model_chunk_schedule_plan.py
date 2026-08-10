@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 from torch import Tensor
@@ -28,57 +28,41 @@ class ModelChunkState:
     pass
 
 
-# Fields of ModelChunkState that layer forwards mutate in place, and that a
-# backward-time recompute must therefore see at their pre-segment values:
-#   * input_ids / position_ids / padding_mask: MultiTokenPredictionLayer._get_embeddings
-#     rolls the tokens by one and writes them back (see
-#     fine_grained_callables.submodule_mtp_attn_forward). Decoder attention reads
-#     padding_mask too, so without a restore the decoder segments (replayed after the
-#     MTP ones, since backward runs in reverse order) would see the MTP-rolled mask.
-#   * mtp_hidden_states: rebuilt by the first MTP layer, appended to by each MTP
-#     post-process, cleared by the last one.
-#   * mhc_multistream: produced by the last decoder layer, consumed by the first MTP
-#     layer, cleared by the last MTP post-process.
+# ModelChunkState fields the layer forwards mutate in place; each segment snapshots them
+# so its backward-time replay sees the pre-segment values instead of end-of-chunk ones.
 _MUTABLE_CHUNK_STATE_FIELDS = (
-    'input_ids',
-    'position_ids',
-    'padding_mask',
-    'mtp_hidden_states',
-    'mhc_multistream',
+    "input_ids",
+    "position_ids",
+    "padding_mask",
+    "mtp_hidden_states",
+    "mhc_multistream",
 )
 
 
-def _copy_chunk_state_value(value):
-    """Copy list-valued chunk state so later in-place mutation cannot corrupt a
-    snapshot (``mtp_hidden_states`` is appended to during the forward)."""
+def _copy_chunk_state_value(value: Any) -> Any:
+    """Copy list-valued chunk state so a later in-place append cannot corrupt a snapshot."""
     return list(value) if isinstance(value, list) else value
 
 
 class RecomputeSegment:
-    """A contiguous group of transformer layers recomputed as a single unit.
+    """A contiguous group of layers recomputed as one unit.
 
-    Full activation recompute under ``--overlap-moe-expert-parallel-comm`` keeps only
-    the *input* of each segment alive across the forward->backward gap: the initial
-    forward of every segment layer runs under ``no_grad`` and the layers' activations
-    are released once the chunk forward completes. At the start of the segment's
-    backward the forward is replayed with grad enabled, so only one segment's
-    activations are materialized at a time.
+    The initial forward runs under ``no_grad`` and is replayed with grad enabled at the
+    start of the segment's own backward. What survives the forward->backward gap is the
+    segment's input tensor plus the ``_MUTABLE_CHUNK_STATE_FIELDS`` snapshot - which for an
+    MTP segment pins the pre-contraction mHC bridge tensor, since the carrier hand-off
+    needs it. Layers left eager under ``block`` keep their activations throughout. The A2A
+    issued by a replay is exposed by design; normal fwd/bwd A2A overlap is preserved.
 
-    Segmentation mirrors the non-overlap recompute semantics -
-    ``megatron.core.recompute.checkpointed_forward`` for the decoder block and
-    ``MultiTokenPredictionLayer._checkpointed_forward`` for MTP:
-
-    * ``recompute_method='uniform'``: decoder layers in groups of
-      ``recompute_num_layers``; one segment per MTP layer (``recompute_num_layers``
-      is asserted to be 1 when MTP is present, as in the non-overlap path).
-    * ``recompute_method='block'``: the first ``recompute_num_layers`` decoder layers,
-      one segment each; MTP layers are not recomputed.
-
-    The A2A communication issued by a segment replay is exposed (not overlapped) by
-    design; the normal forward and normal backward A2A overlap is preserved.
+    ``start_index`` is the segment's first layer index within the chunk, for NVTX labels.
     """
 
-    def __init__(self, layers, chunk_state, start_index):
+    def __init__(
+        self,
+        layers: List["TransformerLayerSchedulePlan"],
+        chunk_state: ModelChunkState,
+        start_index: int,
+    ):
         assert len(layers) > 0, "a recompute segment must contain at least one layer"
         self.layers = layers
         self.chunk_state = chunk_state
@@ -87,44 +71,42 @@ class RecomputeSegment:
         self.input_tensor = None
         self.state_snapshot = None
         self.rng_states = None
-        for i, layer in enumerate(layers):
+        for layer in layers:
             layer.recompute_segment = self
-            layer.is_segment_head = i == 0
-            layer.is_segment_tail = i == len(layers) - 1
             # The initial forward retains no autograd graph for these layers.
             layer.set_forward_no_grad(True)
 
-    def capture(self, f_input):
-        """Snapshot what the backward-time replay needs: the segment input tensor,
-        the mutable chunk-state fields, and the RNG states."""
+    def capture(self, layer: "TransformerLayerSchedulePlan", f_input: Tensor) -> None:
+        """When the head layer starts its forward, snapshot what the replay needs:
+        input tensor, mutable chunk state, RNG."""
+        if layer is not self.layers[0]:
+            return
         from megatron.core.tensor_parallel.random import _get_all_rng_states
 
         self.input_tensor = f_input
         cs = self.chunk_state
         self.state_snapshot = {
-            name: _copy_chunk_state_value(getattr(cs, name, None))
-            for name in _MUTABLE_CHUNK_STATE_FIELDS
+            name: _copy_chunk_state_value(getattr(cs, name)) for name in _MUTABLE_CHUNK_STATE_FIELDS
         }
         self.rng_states = _get_all_rng_states()
 
-    def release_activations(self):
-        """Free the layers' retained forward activations after the initial forward."""
-        for layer in self.layers:
-            layer.reset_for_recompute()
-
-    def release_input(self):
-        """Drop the retained input once the segment backward has consumed it."""
+    def release_input(self, layer: "TransformerLayerSchedulePlan") -> None:
+        """Drop the retained input once the head layer has finished its backward."""
+        if layer is not self.layers[0]:
+            return
         self.input_tensor = None
         self.state_snapshot = None
 
-    def recompute(self):
-        """Replay the segment forward with grad enabled, right before its backward.
+    def recompute(self, layer: "TransformerLayerSchedulePlan") -> None:
+        """Replay the segment with grad enabled when its tail layer enters the backward.
 
-        The mapping from the replayed activations back to the per-submodule
-        ScheduleNodes is implicit: the same node objects are re-run in the same
-        forward order, so each node repopulates its own ``inputs`` / ``output`` /
-        ``detached`` / ``layer_state`` slots exactly as in the initial forward.
+        Must run before any of that layer's nodes backwards: ``mtp_post_process`` is in the
+        recompute scope, so its graph does not exist until the replay has run. Re-running
+        the same nodes in the same order repopulates each node's ``inputs`` / ``output`` /
+        ``detached`` / ``layer_state`` as in the initial forward.
         """
+        if layer is not self.layers[-1]:
+            return
         from megatron.core.tensor_parallel.random import _fork_rng, _set_all_rng_states
 
         assert self.input_tensor is not None, (
@@ -136,47 +118,36 @@ class RecomputeSegment:
         for name, value in self.state_snapshot.items():
             setattr(cs, name, _copy_chunk_state_value(value))
 
-        # ``mhc_multistream`` is the only cross-layer detach bridge
-        # (fine_grained_callables.finalize_decoder_layer_output): the last decoder layer
-        # detaches it into the chunk state and the first MTP layer consumes it. Backward
-        # runs in reverse order, so the MTP segment is replayed and backwarded *before*
-        # the decoder segment that produces the leaf is replayed, and that replay
-        # installs a freshly detached tensor in ``node.detached``. Park the leaf the MTP
-        # backward accumulates into on the chunk state - not in ``mhc_multistream``,
-        # which the replayed MTP post-process clears - so the producer replay can carry
-        # the gradient over.
+        # mhc_multistream is a detach bridge from the last decoder layer to the MTP layer.
+        # Backward runs in reverse, so MTP is replayed and backwarded before the producer
+        # replay installs a fresh leaf; park the old leaf so that replay can carry its
+        # gradient over (mhc_multistream itself is cleared by the replayed MTP postprocess).
         if cs.mhc_multistream is not None:
             if not cs.mhc_multistream.requires_grad:
-                # Produced by the last decoder layer's no_grad forward, so the detached
-                # leaf carries requires_grad=False and would not accumulate anything.
                 cs.mhc_multistream.requires_grad_(True)
             cs.mhc_grad_carrier = cs.mhc_multistream
 
-        stage_input = self.input_tensor
-        if not stage_input.requires_grad:
-            # The initial forward ran under no_grad, so the segment input is a plain
-            # leaf. The replayed nodes detach their inputs and read ``inputs[i].grad``
-            # to propagate to the previous segment, which needs a grad-tracking leaf.
-            stage_input.requires_grad_(True)
+        # The replayed nodes read inputs[i].grad to reach the previous segment, so the
+        # retained input has to be a grad-tracking leaf.
+        segment_input = self.input_tensor
+        if not segment_input.requires_grad:
+            segment_input.requires_grad_(True)
 
-        # Enable grad on the segment nodes' forward so the replay builds the graph.
-        for layer in self.layers:
-            layer.set_forward_no_grad(False)
+        for seg_layer in self.layers:
+            seg_layer.set_forward_no_grad(False)
 
-        # Replay the forward RNG stream so dropout / rng-forked ops reproduce the
-        # initial forward. _fork_rng() restores the ambient RNG state on exit.
+        # Replay the forward RNG stream so rng-forked ops reproduce the initial forward.
         with _fork_rng():
             _set_all_rng_states(*self.rng_states)
-            f_input = stage_input
-            for i, layer in enumerate(self.layers):
+            f_input = segment_input
+            for i, seg_layer in enumerate(self.layers):
                 nvtx_msg = f"recompute_layer_{self.start_index + i}"
                 nvtx_range_push(nvtx_msg)
-                f_input = layer.recompute_forward(f_input)
+                f_input = seg_layer.recompute_forward(f_input)
                 nvtx_range_pop(nvtx_msg)
         self.rng_states = None
 
-        # If this segment re-produced the mHC bridge leaf, hand it the gradient the MTP
-        # backward accumulated on the pre-replay leaf (see the carrier note above).
+        # This replay re-produced the bridge leaf: hand it the parked gradient.
         new_mhc_multistream = cs.mhc_multistream
         carrier = cs.mhc_grad_carrier
         if (
@@ -185,6 +156,8 @@ class RecomputeSegment:
             and new_mhc_multistream is not carrier
         ):
             new_mhc_multistream.grad = carrier.grad
+            # Only cleared here: the carrier has to survive from the consumer's replay
+            # until the producer's, so there is no earlier point at which it is dead.
             cs.mhc_grad_carrier = None
 
 
@@ -242,12 +215,8 @@ class TransformerLayerSchedulePlan:
         self.comp_stream = comp_stream
         self.comm_stream = comm_stream
 
-        # Layer-level full recompute bookkeeping, filled in by
-        # TransformerModelChunkSchedulePlan._build_recompute_segments(). Layers that
-        # are not recomputed keep recompute_segment == None and retain their graph.
+        # Set by _build_recompute_segments(); None means this layer keeps its graph.
         self.recompute_segment = None
-        self.is_segment_head = False
-        self.is_segment_tail = False
 
         # get callable nodes for transformer/mtp layer
         self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
@@ -404,39 +373,30 @@ class TransformerLayerSchedulePlan:
         # After the last forward op, release forward-pass params.
         last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(hook_module))
 
-    def _iter_recomputed_nodes(self):
-        """Yield the ScheduleNodes of this layer that take part in full recompute.
+    def _iter_layer_nodes(self):
+        """Yield this layer's nodes in forward order, NoopScheduleNodes included.
 
-        The recompute scope is the whole layer: [attn, moe_dispatch, mlp, moe_combine,
-        mtp_post_process].
+        Single definition of the sequence for recompute_forward/set_forward_no_grad/
+        reset_for_recompute; run() issues the same order inline (it interleaves each node
+        with the backward layer's), so a new node must be added in both places.
 
-        Including ``mtp_post_process`` is a deliberate difference from the non-overlap
-        MTP path, where ``MultiTokenPredictionLayer._checkpointed_forward`` wraps
-        ``_proj_and_transformer_layer`` only and leaves ``_postprocess`` outside the
-        checkpoint. That boundary does not survive the fine-grained node split:
-        ``submodule_mtp_attn_forward`` stores the attention node's *detached* input in
-        ``chunk_state.mtp_hidden_states``, and ``submodule_mtp_postprocess_forward``
-        concatenates it into the layer output. Leaving the post-process outside the
-        scope would build that ``torch.cat`` against the initial (no_grad, therefore
-        non-grad-tracking) detached input, dropping the decoder's gradient contribution
-        through the MTP branch entirely.
-
-        This is safe because ``MultiTokenPredictionLayer._postprocess`` is pure - an mHC
-        output contraction plus the final layer norm, no loss and no persistent state -
-        and because ``overlap_moe_expert_parallel_comm`` only supports
-        ``mtp_num_layers == 1``, so the ``mtp_hidden_states`` / ``torch.cat`` graph never
-        spans two MTP depths and stays inside a single segment.
-
-        For decoder layers ``mtp_post_process`` is a NoopScheduleNode and is skipped by
-        the isinstance filter.
+        This is also the full-recompute scope. mtp_post_process must stay in it: it builds
+        a torch.cat over the MTP attn node's detached input, so leaving it outside would
+        anchor that cat on a no_grad leaf and drop the decoder's gradient via MTP.
         """
-        for node in (
-            self.attn,
-            self.moe_dispatch,
-            self.mlp,
-            self.moe_combine,
-            self.mtp_post_process,
-        ):
+        yield self.attn
+        yield self.moe_dispatch
+        yield self.mlp
+        yield self.moe_combine
+        yield self.mtp_post_process
+
+    def _iter_recomputed_nodes(self):
+        """Yield the real ScheduleNodes (skips NoopScheduleNode, which holds no state).
+
+        Only for state toggling; the forward helpers walk _iter_layer_nodes, since a Noop
+        still passes the tensor through and still consumes an fp8 context in run().
+        """
+        for node in self._iter_layer_nodes():
             if isinstance(node, ScheduleNode):
                 yield node
 
@@ -449,44 +409,15 @@ class TransformerLayerSchedulePlan:
         for node in self._iter_recomputed_nodes():
             node.forward_no_grad = no_grad
 
-    def recompute_forward(self, f_input):
-        """Re-run this layer's recompute scope with grad enabled.
+    def recompute_forward(self, f_input: Tensor) -> Tensor:
+        """Re-run this layer with grad enabled and return its output.
 
-        Mirrors the forward half of ``TransformerLayerSchedulePlan.run``, including the
-        per-node fp8 context. The returned tensor is the layer output, so a multi-layer
-        segment chains through it.
+        One fp8 context per node, matching run()'s forward half node for node.
         """
-        with self.get_fp8_context():
-            f_input = self.attn.forward(f_input)
-        with self.get_fp8_context():
-            f_input = self.moe_dispatch.forward(f_input)
-        with self.get_fp8_context():
-            f_input = self.mlp.forward(f_input)
-        with self.get_fp8_context():
-            f_input = self.moe_combine.forward(f_input)
-        with self.get_fp8_context():
-            f_input = self.mtp_post_process.forward(f_input)
+        for node in self._iter_layer_nodes():
+            with self.get_fp8_context():
+                f_input = node.forward(f_input)
         return f_input
-
-    def maybe_capture_recompute_input(self, f_input):
-        """Capture the segment input at the start of the segment's initial forward."""
-        if self.recompute_segment is not None and self.is_segment_head:
-            self.recompute_segment.capture(f_input)
-
-    def maybe_recompute_segment(self):
-        """Replay this layer's segment if this layer is its backward entry point.
-
-        Called at the very start of the layer backward, before any node of the layer
-        runs its backward - ``mtp_post_process`` is part of the recompute scope, so its
-        graph does not exist until the replay has run.
-        """
-        if self.recompute_segment is not None and self.is_segment_tail:
-            self.recompute_segment.recompute()
-
-    def maybe_release_recompute_input(self):
-        """Drop the retained segment input once the segment backward has consumed it."""
-        if self.recompute_segment is not None and self.is_segment_head:
-            self.recompute_segment.release_input()
 
     def reset_for_recompute(self):
         """Free the retained forward activations of this layer, keeping the nodes
@@ -554,19 +485,18 @@ class TransformerLayerSchedulePlan:
         """
 
         if b_layer is not None:
-            # Layer-level full recompute: rebuild this layer's segment forward graph
-            # from the retained segment input before any node of the layer runs its
-            # backward. No-op unless recompute is on.
-            b_layer.maybe_recompute_segment()
+            # Full recompute: rebuild this layer's segment graph before its backward.
+            if b_layer.recompute_segment is not None:
+                b_layer.recompute_segment.recompute(b_layer)
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             if b_layer.mhc_recompute is not None:
                 b_layer.mhc_recompute.forward()
             b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
-            # Capture the segment input right before its first layer's forward.
-            # No-op unless this layer starts a recompute segment.
-            f_layer.maybe_capture_recompute_input(f_input)
+            # Full recompute: retain this segment's input for the backward-time replay.
+            if f_layer.recompute_segment is not None:
+                f_layer.recompute_segment.capture(f_layer, f_input)
             with f_layer.get_fp8_context():
                 f_input = f_layer.attn.forward(f_input)
 
@@ -598,17 +528,23 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.mtp_post_process.forward(f_input)
+            segment = f_layer.recompute_segment
+            if segment is not None and f_layer is segment.layers[-1]:
+                # The segment ran under no_grad, so its output can be a plain leaf.
+                # Whatever consumes it - the next segment, an eager layer under
+                # recompute_method='block', or post_process - reads a gradient off it to
+                # reach back into this segment, which needs a grad-tracking leaf.
+                if not f_input.requires_grad:
+                    f_input.requires_grad_(True)
 
         # Delay the last attn_dw in backward pass (attn_dw of the first layer)
         # for overlapping with the p2p comm
         if b_layer is not None and not is_last_layer_in_bwd:
             b_layer.attn.backward_dw()
 
-        if b_layer is not None:
-            # The segment input is only needed by the replay, which has already run and
-            # whose gradient has now been propagated past this layer. attn.backward_dw()
-            # does not read it. No-op unless this layer starts a recompute segment.
-            b_layer.maybe_release_recompute_input()
+        if b_layer is not None and b_layer.recompute_segment is not None:
+            # The replay has run and its gradient is past this layer; drop the input.
+            b_layer.recompute_segment.release_input(b_layer)
 
         return f_input, b_grad
 
@@ -678,13 +614,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self.post_process = None
         self.vp_stage = model.vp_stage
 
-        # Full activation recompute: the chunk's layers are split into
-        # RecomputeSegments; only each segment's input tensor is retained across the
-        # forward->backward gap and the segment forward is replayed at the start of its
-        # own backward. See _build_recompute_segments() and RecomputeSegment.
-        # This schedule plan is only ever built for the EP A2A overlap scheduler, so
-        # recompute_granularity alone decides; overlap_moe_expert_parallel_comm is not
-        # re-checked here (that lets the schedule be unit-tested standalone).
+        # Full activation recompute; see RecomputeSegment. This plan is only built for
+        # the EP A2A overlap scheduler, so recompute_granularity alone decides (not
+        # re-checking overlap_moe_expert_parallel_comm keeps the schedule unit-testable).
         self.recompute_full = model.config.recompute_granularity == 'full'
         self._recompute_segments = []
         self._num_decoder_layers = 0
@@ -697,8 +629,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.labels = labels
         self._model_chunk_state.mtp_hidden_states = None
         self._model_chunk_state.mhc_multistream = None
-        # Holds the mHC bridge leaf across a segment replay; see
-        # RecomputeSegment.recompute(). Always None outside full recompute.
+        # Holds the mHC bridge leaf across a segment replay; see RecomputeSegment.
         self._model_chunk_state.mhc_grad_carrier = None
         self._model_chunk_state.loss_mask = loss_mask
         self._model_chunk_state.packed_seq_params = packed_seq_params
@@ -723,8 +654,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._build_layer_schedule_plan(
             model.decoder, get_comp_stream, get_comm_stream, module_tag="decoder"
         )
-        # Recompute segmentation follows the non-overlap path, which applies different
-        # rules to the decoder block and to MTP, so record where the decoder ends.
+        # Segmentation applies different rules to the decoder and MTP; mark the split.
         self._num_decoder_layers = len(self._transformer_layers)
         self._build_layer_schedule_plan(
             getattr(model, "mtp", None), get_comp_stream, get_comm_stream, module_tag="mtp"
@@ -736,9 +666,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
 
-        # For full recompute, split the layers into segments. The initial forward of
-        # every segment layer runs under no_grad (no activation retained); pre_process,
-        # post_process and mtp_post_process keep their graphs (they are not recomputed).
+        # Split into segments; pre_process and post_process keep their graphs.
         self._build_recompute_segments(model.config)
 
     def _build_layer_schedule_plan(self, module, comp_stream, comm_stream, module_tag):
@@ -792,59 +720,51 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     def _build_recompute_segments(self, config):
         """Split this chunk's layers into full-recompute segments.
 
-        The segmentation mirrors the non-overlap recompute path so that
-        ``recompute_method`` / ``recompute_num_layers`` mean the same thing with and
-        without ``--overlap-moe-expert-parallel-comm``:
+        Decoder segmentation mirrors megatron.core.recompute.checkpointed_forward, so
+        recompute_method / recompute_num_layers mean the same thing with and without
+        --overlap-moe-expert-parallel-comm: 'uniform' groups every decoder layer by
+        recompute_num_layers, 'block' recomputes the first recompute_num_layers decoder
+        layers one per segment. MTP gets one segment per depth under both methods.
 
-        * ``uniform`` (``megatron.core.recompute.checkpointed_forward``): the decoder
-          layers are uniformly divided into groups of ``recompute_num_layers``, and
-          every group is recomputed. MTP recomputes one depth at a time
-          (``MultiTokenPredictionLayer._checkpointed_forward`` asserts
-          ``recompute_num_layers == 1``), so each MTP layer becomes its own segment.
-        * ``block``: only the first ``recompute_num_layers`` decoder layers are
-          recomputed, one layer per segment; the remaining decoder layers and all MTP
-          layers keep their forward graph, matching the non-overlap path where MTP
-          warns and skips recompute under ``block``.
-
-        One difference from the non-overlap ``block`` branch is intentional: it grows a
-        ``recompute_skip_num_layers`` window under fp8/fp4 while ``hidden_states`` does
-        not require grad, because ``te_checkpoint``'s reentrant autograd needs a
-        grad-requiring input. This path does not use a checkpoint primitive - the replay
-        marks the retained segment input grad-tracking itself - so no such window is
-        needed and the recomputed layer set is exactly the first N.
+        Unlike the non-overlap 'block' branch there is no recompute_skip_num_layers
+        window under fp8/fp4: no checkpoint primitive is involved, since the replay marks
+        the retained segment input grad-tracking itself.
         """
         if not self.recompute_full:
             return
 
         method = config.recompute_method
         num_layers = config.recompute_num_layers
-        # transformer_config validates these; assert here so a mis-wired config fails
-        # at plan-build time rather than silently recomputing nothing.
-        assert method in ("uniform", "block"), (
-            "recompute_method must be 'uniform' or 'block' with "
-            f"overlap_moe_expert_parallel_comm full recompute, got {method}"
-        )
-        assert (
-            isinstance(num_layers, int) and num_layers >= 1
-        ), f"recompute_num_layers must be a positive integer, got {num_layers}"
+        # TransformerConfig owns the user-facing validation; re-check here because
+        # build_schedule_plan() is reachable directly and 'block' with num_layers=None
+        # would slice [:None] and silently recompute every decoder layer.
+        if method not in ("uniform", "block"):
+            raise ValueError(f"Invalid activation recompute method: {method}.")
+        if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers < 1:
+            raise ValueError(f"recompute_num_layers must be a positive integer, got {num_layers}.")
+
+        def add_segment(layers, start_index):
+            self._recompute_segments.append(
+                RecomputeSegment(layers, self._model_chunk_state, start_index)
+            )
 
         decoder_layers = self._transformer_layers[: self._num_decoder_layers]
         mtp_layers = self._transformer_layers[self._num_decoder_layers :]
 
-        def add_segment(layers, start_index):
-            if layers:
-                self._recompute_segments.append(
-                    RecomputeSegment(layers, self._model_chunk_state, start_index)
-                )
-
         if method == "uniform":
             for start in range(0, len(decoder_layers), num_layers):
                 add_segment(decoder_layers[start : start + num_layers], start)
-            for i, layer in enumerate(mtp_layers):
-                add_segment([layer], self._num_decoder_layers + i)
         else:
             for start, layer in enumerate(decoder_layers[:num_layers]):
                 add_segment([layer], start)
+        # MTP is one segment per depth under both methods. overlap_moe_expert_parallel_comm
+        # only supports mtp_num_layers == 1, so the MTP side of the config is identical
+        # either way. MultiTokenPredictionLayer._checkpointed_forward leaves MTP eager
+        # under 'block' (its own TODO), which is safe there because the decoder block goes
+        # through tensor_parallel.checkpoint and keeps an autograd edge into MTP. This
+        # path's replay has no such edge, so an eager MTP would strand the hand-off.
+        for i, layer in enumerate(mtp_layers):
+            add_segment([layer], self._num_decoder_layers + i)
 
     @property
     def event(self):
@@ -881,7 +801,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
     def release_state(self):
         """Release reference, this helps avoid memory leak."""
-        # Segments hold the layer plans and the retained segment inputs.
         self._recompute_segments = []
         self._model_chunk_state.model = None
         self.pre_process.model_chunk_state = None
@@ -892,14 +811,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self.post_process = None
 
     def release_layer_activations(self):
-        """Free every recompute segment's retained forward activations after the
-        initial forward, keeping only each segment's input tensor.
-
-        The layer nodes remain reusable; RecomputeSegment.recompute() rebuilds their
-        forward state right before the segment's backward.
-        """
+        """Free the segments' forward activations, keeping only their input tensors."""
         for segment in self._recompute_segments:
-            segment.release_activations()
+            for layer in segment.layers:
+                layer.reset_for_recompute()
 
     @staticmethod
     def run(
@@ -953,12 +868,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 pre_backward(b_schedule_plan.vp_stage)
                 b_schedule_plan.record_current_stream()
 
-            # Run post_process backward before any layer backward. post_process keeps
-            # its own graph (it is not recomputed) and detaches its input, so its
-            # backward produces b_grad independently of the segment replays. Releasing
-            # the post_process graph (output projection / logits / saved tensors) first
-            # avoids co-materializing it with a recomputed segment on the last PP stage,
-            # where a large vocab would otherwise spike peak memory.
+            # Before any layer backward: post_process keeps its own graph and detaches
+            # its input, and releasing it first avoids co-materializing a large vocab
+            # graph with a recomputed segment on the last PP stage.
             if b_schedule_plan.post_process is not None:
                 b_grad = b_schedule_plan.post_process.backward(b_grad)
 
@@ -1026,25 +938,17 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # post process forward
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
-            if (
-                f_schedule_plan.recompute_full
-                and f_input is not None
-                and not f_input.requires_grad
-            ):
-                # The last layer's forward ran under no_grad, so the chunk output is a
-                # plain value tensor. post_process needs a grad-requiring leaf so its
-                # backward produces the grad seed that feeds the replayed last segment.
-                # Under recompute_method='block' the trailing layers keep their graph
-                # and f_input already requires grad, so this is skipped.
+            if f_schedule_plan.recompute_full and f_input is not None and not f_input.requires_grad:
+                # The last layer ran under no_grad, so post_process needs a grad-tracking
+                # leaf to seed the replayed last segment's backward.
                 f_input.requires_grad_(True)
             f_input = f_schedule_plan.post_process.forward(f_input)
         # pre process backward
         if b_schedule_plan is not None:
             b_schedule_plan.pre_process.backward(b_grad)
 
-        # Free the forward chunk's recomputed-layer activations now that its forward
-        # output has been consumed (PP send / post_process). Only each segment's input
-        # tensor is kept for the backward-time replay. No-op unless recompute is on.
+        # The forward output has been consumed (PP send / post_process), so the
+        # recomputed layers' activations can go; only segment inputs are kept.
         if f_schedule_plan is not None:
             f_schedule_plan.release_layer_activations()
 
