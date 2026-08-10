@@ -4,4 +4,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class MambaLayerConfig(TransformerConfig):
-    """Configuration for a Mamba layer in a hybrid stack."""
+    """Configuration for a Mamba layer in a hybrid stack.
+
+    Due to backwards-compatibility, this config's arguments are defined in TransformerConfig.
+    """
