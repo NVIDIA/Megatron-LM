@@ -1,6 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Helpers for defining sharding for optimizer states based on existing sharding
+"""Helpers for defining sharding for optimizer states based on existing sharding
 for model parameters.
 """
 

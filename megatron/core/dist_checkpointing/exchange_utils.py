@@ -424,7 +424,7 @@ def exchange_loaded_tensors_gather_object(
 
 
 def exchange_loaded_objects_gather_object(
-    loaded_objects: Dict[_ShardId, Any]
+    loaded_objects: Dict[_ShardId, Any],
 ) -> Dict[_ShardId, Any]:
     """Exchange the objects loaded by different ranks with a simple all_gather_object call.
 

@@ -46,7 +46,7 @@ class RankModuleInfo:
 
 
 def _prepare_tensor_for_comm(
-    tensor: Union[torch.Tensor, List[torch.Tensor], None]
+    tensor: Union[torch.Tensor, List[torch.Tensor], None],
 ) -> Union[torch.Tensor, List[torch.Tensor], None]:
     """Prepare tensor for P2P communication by expanding to 3D if needed.
 
@@ -82,7 +82,7 @@ def _prepare_tensor_for_comm(
 
 
 def _restore_tensor_from_comm(
-    tensor: Union[torch.Tensor, List[torch.Tensor], None]
+    tensor: Union[torch.Tensor, List[torch.Tensor], None],
 ) -> Union[torch.Tensor, List[torch.Tensor], None]:
     """Restore tensor shape after P2P communication by squeezing singleton dim.
 
