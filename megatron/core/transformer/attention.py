@@ -446,6 +446,10 @@ class Attention(MegatronModule, ABC):
             rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
             self._build_per_layer_rotary_pos_emb(rotary_base)
 
+    def get_preferred_cp_partition_mode(self):
+        """Return Attention's CP layout preference for ``cp_partition_mode="auto"`` rollout."""
+        return "zigzag"
+
     def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
         """Build self.rotary_pos_emb using a layer-specific rotary base."""
         from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -1373,13 +1377,14 @@ class Attention(MegatronModule, ABC):
             packed_seq_params=packed_seq_params,
             cp_group=self.pg_collection.cp,
             tp_group=self.pg_collection.tp,
-            target_partition_mode="zigzag",
+            target_partition_mode=self.get_preferred_cp_partition_mode(),
             sequence_parallel=self.config.sequence_parallel,
             config=self.config,
             attention_mask=attention_mask,
             attention_bias=attention_bias,
         )
-        if packed_seq_params is not None:
+        preferred_cp_partition_mode = self.get_preferred_cp_partition_mode()
+        if packed_seq_params is not None and preferred_cp_partition_mode is not None:
             cp_group = packed_seq_params.cp_group
             if cp_group is None and hasattr(self.pg_collection, 'cp'):
                 cp_group = self.pg_collection.cp
@@ -1390,9 +1395,10 @@ class Attention(MegatronModule, ABC):
                         f"{self.__class__.__name__} requires "
                         "PackedSeqParams.cp_partition_mode when context parallelism is active."
                     )
-                if actual_cp_partition_mode != "zigzag":
+                if actual_cp_partition_mode != preferred_cp_partition_mode:
                     raise ValueError(
-                        f"{self.__class__.__name__} requires cp_partition_mode='zigzag', but "
+                        f"{self.__class__.__name__} prefers "
+                        f"cp_partition_mode={preferred_cp_partition_mode!r}, but "
                         f"packed_seq_params has {actual_cp_partition_mode!r}. CP partition "
                         "conversion must be handled by TransformerBlock before entering "
                         "attention."

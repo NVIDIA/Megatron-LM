@@ -11,6 +11,10 @@ class IdentityOp(torch.nn.Module):
     This is a placeholder for IdentityOp(x) -> x
     """
 
+    def get_preferred_cp_partition_mode(self):
+        """Return IdentityOp's CP layout preference for ``cp_partition_mode="auto"`` rollout."""
+        return None
+
     def __init__(self, *args: object, **kwargs: object):
         super().__init__()
 

@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.context_parallel_layout import get_preferred_cp_partition_mode_for_layer
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -1320,6 +1321,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
                 mtp_layer_number=self.layer_number,
+                cp_stage_entry_partition_mode="zigzag",
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
@@ -1836,6 +1838,18 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
+        cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', None)
+        if cp_partition_mode is not None:
+            preferred_partition_mode = get_preferred_cp_partition_mode_for_layer(
+                self.mtp_model_layer, self.config
+            )
+            if preferred_partition_mode is not None and preferred_partition_mode != cp_partition_mode:
+                raise NotImplementedError(
+                    "MTP inner layer CP partition mode preference does not match the current "
+                    "MTP input layout: "
+                    f"preferred {preferred_partition_mode!r}, got {cp_partition_mode!r}."
+                )
+
         input_ids, position_ids, padding_mask, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,

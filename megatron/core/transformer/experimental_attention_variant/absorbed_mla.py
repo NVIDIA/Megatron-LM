@@ -142,6 +142,10 @@ class AbsorbedMLASelfAttention(Attention):
     computation which can be more efficient for certain attention variants.
     """
 
+    def get_preferred_cp_partition_mode(self):
+        """Return AbsorbedMLA's CP layout preference for ``cp_partition_mode="auto"`` rollout."""
+        return "zigzag"
+
     def __init__(
         self,
         config: MLATransformerConfig,
@@ -921,15 +925,17 @@ class AbsorbedMLASelfAttention(Attention):
             if cp_group is None:
                 cp_group = self.pg_collection.cp
             if cp_group is not None and cp_group.size() > 1:
+                preferred_cp_partition_mode = self.get_preferred_cp_partition_mode()
                 actual_cp_partition_mode = packed_seq_params.cp_partition_mode
                 if actual_cp_partition_mode is None:
                     raise ValueError(
                         "AbsorbedMLASelfAttention requires PackedSeqParams.cp_partition_mode "
                         "when context parallelism is active."
                     )
-                if actual_cp_partition_mode != "zigzag":
+                if actual_cp_partition_mode != preferred_cp_partition_mode:
                     raise ValueError(
-                        "AbsorbedMLASelfAttention requires cp_partition_mode='zigzag', but "
+                        "AbsorbedMLASelfAttention prefers "
+                        f"cp_partition_mode={preferred_cp_partition_mode!r}, but "
                         f"packed_seq_params has {actual_cp_partition_mode!r}. CP partition "
                         "conversion must be handled before entering AbsorbedMLA."
                     )

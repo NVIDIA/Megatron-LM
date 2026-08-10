@@ -358,7 +358,8 @@ def forward_step(data_iterator, model: HybridModel):
 
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        cp_partition_mode = args.cp_partition_mode
+        decoder = get_attr_wrapped_model(model, "decoder")
+        cp_partition_mode = decoder.cp_stage_entry_partition_mode
         (
             attention_mask,
             cu_seqlens,

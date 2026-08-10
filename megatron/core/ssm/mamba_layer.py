@@ -65,6 +65,10 @@ class MambaLayer(GraphableMegatronModule):
     output of the same size.
     """
 
+    def get_preferred_cp_partition_mode(self):
+        """Return Mamba's CP layout preference for ``cp_partition_mode="auto"`` rollout."""
+        return "zigzag"
+
     def __init__(
         self,
         config: TransformerConfig,

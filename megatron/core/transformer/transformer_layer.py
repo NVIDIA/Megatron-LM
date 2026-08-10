@@ -16,6 +16,7 @@ import torch.distributed
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.context_parallel_layout import get_preferred_cp_partition_mode_for_layer
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
@@ -1373,13 +1374,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         the padded static value and cannot be read from CUDA tensors during graph capture.
         pad_between_seqs is conservatively enabled because its Python value is not a
         graph input and inferring it from CUDA tensors would synchronize during capture.
+        cp_partition_mode is inferred from this layer's layout preference instead
+        of the deprecated TransformerConfig.cp_partition_mode global field.
         """
         if 'cu_seqlens_q' not in kwargs:
             return
         max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        cp_partition_mode = get_preferred_cp_partition_mode_for_layer(self, self.config)
+        if cp_partition_mode is None:
+            if self.config.context_parallel_size > 1 or self.config.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot reconstruct THD PackedSeqParams for a layout-agnostic transformer "
+                    "layer under context parallelism. The CP partition mode must be provided "
+                    "by the model-level layout plan."
+                )
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
-            cp_partition_mode=self.config.cp_partition_mode,
+            cp_partition_mode=cp_partition_mode,
             cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
             cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
             cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),

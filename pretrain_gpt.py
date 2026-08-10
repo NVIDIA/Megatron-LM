@@ -434,7 +434,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        cp_partition_mode = args.cp_partition_mode
+        decoder = get_attr_wrapped_model(model, "decoder")
+        cp_partition_mode = decoder.cp_stage_entry_partition_mode
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
             get_batch(data_iterator, vp_stage, cp_partition_mode=cp_partition_mode)
         )

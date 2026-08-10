@@ -54,6 +54,15 @@ class PackedSeqParams:
         cu_seqlens_q_padded[-1] == max_seqlen then this additional sequence index will not be
         included.
         """
+        if self.cp_partition_mode is not None and self.cp_partition_mode not in (
+            "zigzag",
+            "contiguous",
+        ):
+            raise ValueError(
+                "PackedSeqParams.cp_partition_mode must be a concrete runtime layout "
+                f"('zigzag' or 'contiguous'), got {self.cp_partition_mode!r}."
+            )
+
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )

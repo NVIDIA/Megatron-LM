@@ -13,14 +13,99 @@ from megatron.core.context_parallel_layout import (
     build_thd_cp_partition_route,
     decode_thd_cp_partition_route,
     get_context_parallel_layout_chunk_indices,
+    get_preferred_cp_partition_mode_for_layer,
     get_stage_entry_partition_mode,
     get_thd_context_parallel_rank_indices,
     get_thd_cp_partition_route,
     prebuild_thd_cp_partition_routes,
     replace_packed_seq_params_cp_partition_mode,
 )
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_experimental_attention_variant_stage_input_cp_partition_mode,
+)
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    get_hybrid_stage_input_cp_partition_mode,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+class _PipelineLayout:
+
+    def __init__(self, offset):
+        self.offset = offset
+
+    def get_layer_offset(self, **_kwargs):
+        return self.offset
+
+
+def _minimal_transformer_config_kwargs():
+    return dict(num_layers=1, hidden_size=8, num_attention_heads=1)
+
+
+def test_transformer_config_cp_partition_mode_selector():
+    assert TransformerConfig(**_minimal_transformer_config_kwargs()).cp_partition_mode == "zigzag"
+    assert (
+        TransformerConfig(
+            **_minimal_transformer_config_kwargs(), cp_partition_mode="contiguous"
+        ).cp_partition_mode
+        == "contiguous"
+    )
+    assert (
+        TransformerConfig(**_minimal_transformer_config_kwargs(), cp_partition_mode="auto")
+        .cp_partition_mode
+        == "auto"
+    )
+
+    with pytest.raises(ValueError, match="Unsupported cp_partition_mode"):
+        TransformerConfig(**_minimal_transformer_config_kwargs(), cp_partition_mode="invalid")
+
+
+def test_packed_seq_params_rejects_auto_cp_partition_mode():
+    with pytest.raises(ValueError, match="concrete runtime layout"):
+        PackedSeqParams(qkv_format="sbhd", cp_partition_mode="auto")
+
+
+class IdentityOp:
+
+    def get_preferred_cp_partition_mode(self):
+        return None
+
+
+class GatedDeltaNet:
+
+    def get_preferred_cp_partition_mode(self):
+        mode = getattr(self.config, "linear_cp_mode", "chunkwise")
+        if mode == "chunkwise":
+            return "contiguous"
+        if mode == "headwise":
+            return "zigzag"
+        raise ValueError(f"Unsupported GatedDeltaNet linear_cp_mode: {mode!r}.")
+
+
+class _PreferredContiguousLayer:
+
+    def get_preferred_cp_partition_mode(self):
+        return "contiguous"
+
+
+class _PreferredAgnosticLayer:
+
+    def get_preferred_cp_partition_mode(self):
+        return None
+
+
+class _DynamicPreferredLayer:
+
+    def get_preferred_cp_partition_mode(self):
+        return "zigzag"
+
+
+class _InvalidPreferredLayer:
+
+    def get_preferred_cp_partition_mode(self):
+        return "unsupported"
 
 
 class _FakeGroup:
@@ -439,6 +524,48 @@ def test_cp_partition_mode_converter_rejects_thd_full_iteration_cuda_graph_conve
         )
 
 
+def test_preferred_partition_mode_rejects_unknown_layer_type():
+    with pytest.raises(ValueError, match="Cannot determine CP partition mode"):
+        get_preferred_cp_partition_mode_for_layer(object(), SimpleNamespace(cp_comm_type=None))
+
+
+def test_preferred_partition_mode_uses_explicit_method():
+    config = SimpleNamespace(cp_comm_type=None)
+
+    assert (
+        get_preferred_cp_partition_mode_for_layer(_PreferredContiguousLayer(), config)
+        == "contiguous"
+    )
+    assert get_preferred_cp_partition_mode_for_layer(_PreferredAgnosticLayer(), config) is None
+
+
+def test_preferred_partition_mode_uses_dynamic_method():
+    config = SimpleNamespace(cp_comm_type=None)
+
+    assert get_preferred_cp_partition_mode_for_layer(_DynamicPreferredLayer(), config) == "zigzag"
+
+
+def test_preferred_partition_mode_rejects_invalid_explicit_declaration():
+    config = SimpleNamespace(cp_comm_type=None)
+
+    with pytest.raises(ValueError, match="Invalid CP partition mode preference"):
+        get_preferred_cp_partition_mode_for_layer(_InvalidPreferredLayer(), config)
+
+
+@pytest.mark.parametrize(
+    ("linear_cp_mode", "expected_partition_mode"),
+    [("chunkwise", "contiguous"), ("headwise", "zigzag")],
+)
+def test_gated_delta_net_layer_layout_policy_follows_cp_mode(
+    linear_cp_mode, expected_partition_mode
+):
+    config = SimpleNamespace(cp_comm_type=None, linear_cp_mode=linear_cp_mode)
+    layer = object.__new__(GatedDeltaNet)
+    layer.config = config
+
+    assert get_preferred_cp_partition_mode_for_layer(layer, config) == expected_partition_mode
+
+
 def test_get_stage_entry_partition_mode_uses_packed_metadata():
     packed_seq_params = SimpleNamespace(
         cp_partition_mode="zigzag",
@@ -476,3 +603,57 @@ def test_get_stage_entry_partition_mode_allows_missing_layout_without_cp():
     packed_seq_params = SimpleNamespace(cp_partition_mode=None, cp_group=_FakeGroup(size=1, rank=0))
 
     assert get_stage_entry_partition_mode(packed_seq_params, None, owner_name="TestBlock") is None
+
+
+def test_gated_delta_net_chunkwise_layout_plan_follows_linear_attention_pattern():
+    config = SimpleNamespace(
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=2,
+        linear_cp_mode="chunkwise",
+        num_layers=4,
+        pipeline_model_parallel_layout=None,
+        pipeline_model_parallel_size=1,
+    )
+
+    assert get_experimental_attention_variant_stage_input_cp_partition_mode(config) == "contiguous"
+
+    config.pipeline_model_parallel_layout = _PipelineLayout(offset=2)
+    assert get_experimental_attention_variant_stage_input_cp_partition_mode(config) == "zigzag"
+
+
+def test_gated_delta_net_headwise_layout_plan_uses_zigzag():
+    config = SimpleNamespace(
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=[1, 0],
+        linear_cp_mode="headwise",
+        num_layers=2,
+        pipeline_model_parallel_layout=None,
+        pipeline_model_parallel_size=1,
+    )
+
+    assert get_experimental_attention_variant_stage_input_cp_partition_mode(config) == "zigzag"
+
+
+@pytest.mark.parametrize(
+    ("layer_pattern", "local_index", "linear_cp_mode", "attention_variant", "expected"),
+    [
+        pytest.param("M-G", 0, "chunkwise", None, "zigzag", id="before-previous-mamba"),
+        pytest.param("M-G", 2, "chunkwise", None, "zigzag", id="before-previous-gdn"),
+        pytest.param("M-G", 3, "chunkwise", None, "contiguous", id="after-chunkwise-gdn"),
+        pytest.param("-G", 0, "chunkwise", None, "contiguous", id="future-chunkwise-gdn"),
+        pytest.param("-G", 0, "headwise", None, "zigzag", id="future-headwise-gdn"),
+        pytest.param("D-E", 0, "chunkwise", "dsv4_hybrid", "contiguous", id="dsv4-d"),
+        pytest.param("C-E", 0, "chunkwise", "dsv4_hybrid", "contiguous", id="dsv4-c"),
+        pytest.param("-E-", 0, "chunkwise", None, None, id="no-sensitive-layer-start"),
+        pytest.param("-E-", 3, "chunkwise", None, None, id="no-sensitive-layer-late"),
+    ],
+)
+def test_hybrid_stage_input_layout_policy(
+    layer_pattern, local_index, linear_cp_mode, attention_variant, expected
+):
+    config = SimpleNamespace(
+        experimental_attention_variant=attention_variant,
+        linear_cp_mode=linear_cp_mode,
+    )
+
+    assert get_hybrid_stage_input_cp_partition_mode(config, layer_pattern, local_index) == expected

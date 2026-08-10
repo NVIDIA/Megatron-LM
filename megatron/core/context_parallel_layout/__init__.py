@@ -30,6 +30,7 @@ from megatron.core.context_parallel_layout.metadata import (
 )
 from megatron.core.context_parallel_layout.policy import (
     get_context_parallel_layout_chunk_indices,
+    get_preferred_cp_partition_mode_for_layer,
     get_stage_entry_partition_mode,
 )
 from megatron.core.context_parallel_layout.routes import (
@@ -50,6 +51,7 @@ __all__ = [
     "decode_thd_cp_partition_route",
     "get_context_parallel_layout_chunk_indices",
     "get_packed_seq_params_cp_partition_cu_seqlens",
+    "get_preferred_cp_partition_mode_for_layer",
     "get_stage_entry_partition_mode",
     "get_thd_cp_partition_route",
     "get_thd_context_parallel_rank_indices",

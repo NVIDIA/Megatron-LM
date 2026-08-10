@@ -717,6 +717,7 @@ def _test_parallel_attention_correctness(
     micro_batch_size=4,
     sequence_packing=False,
     cp_partition_mode="zigzag",
+    cp_stage_entry_partition_mode="zigzag",
     compare_param_grads=False,
 ):
     # Model initialization function
@@ -732,6 +733,7 @@ def _test_parallel_attention_correctness(
             post_process=post_process,
             vp_stage=vp_stage,
             pg_collection=pg_collection,
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
         )
         return gpt_model
 

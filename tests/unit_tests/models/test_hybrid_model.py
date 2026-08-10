@@ -9,6 +9,7 @@ import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
+import megatron.core.models.hybrid.hybrid_model as hybrid_model_module
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
@@ -71,6 +72,35 @@ def _get_dummy_hybrid_stack_spec() -> ModuleSpec:
             moe_layer=dummy_layer_spec,
         ),
     )
+
+
+class _FakeCpGroup:
+    def size(self):
+        return 2
+
+
+class _FakeHybridDecoder:
+    cp_stage_entry_partition_mode = "zigzag"
+
+    def __init__(self, hidden_states):
+        self.hidden_states = hidden_states
+
+    def __call__(self, **kwargs):
+        packed_seq_params = kwargs.get("packed_seq_params")
+        if packed_seq_params is not None:
+            packed_seq_params.cp_partition_mode = "contiguous"
+        return self.hidden_states
+
+
+class _RecordingOutputLayer:
+    sequence_parallel = False
+
+    def __init__(self):
+        self.hidden_states = None
+
+    def __call__(self, hidden_states, **_kwargs):
+        self.hidden_states = hidden_states
+        return hidden_states, None
 
 
 def test_hybrid_logging_process_groups_are_paired():
@@ -183,6 +213,71 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         assert logits.shape[2] == divide(model.vocab_size, tp_size)
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_hybrid_forward_restores_output_layout_to_input_layout(monkeypatch):
+    cp_group = _FakeCpGroup()
+    block_output_hidden = torch.arange(24, dtype=torch.float32).view(4, 2, 3)
+    input_layout_hidden = block_output_hidden + 1000.0
+    output_layer = _RecordingOutputLayer()
+    calls = []
+
+    class FakeCpPartitionModeConverter:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def convert(self, value, *, seq_dim=0, sequence_parallel=False):
+            calls.append((value, self.kwargs, seq_dim, sequence_parallel))
+            assert value is block_output_hidden
+            assert self.kwargs["cp_group"] is cp_group
+            return input_layout_hidden
+
+    monkeypatch.setattr(
+        hybrid_model_module, "CpPartitionModeConverter", FakeCpPartitionModeConverter
+    )
+
+    model = object.__new__(HybridModel)
+    model.config = SimpleNamespace(
+        context_parallel_size=2,
+        cuda_graph_impl="none",
+        fine_grained_activation_offloading=False,
+        moe_n_hash_layers=0,
+        moe_paged_stash=False,
+        mtp_num_layers=0,
+        multi_latent_attention=False,
+        sequence_parallel=False,
+        use_mup=False,
+    )
+    model.decoder = _FakeHybridDecoder(block_output_hidden)
+    model.pg_collection = SimpleNamespace(cp=cp_group, tp=None)
+    model.position_embedding_type = "none"
+    model.pre_process = False
+    model.post_process = True
+    model.mtp_process = False
+    model.share_embeddings_and_output_weights = False
+    model.output_layer = output_layer
+    model._scale_logits = lambda logits: logits
+
+    output = HybridModel.forward(
+        model,
+        input_ids=torch.zeros(2, 4, dtype=torch.long),
+        position_ids=torch.zeros(2, 4, dtype=torch.long),
+        attention_mask=None,
+        decoder_input=torch.empty_like(block_output_hidden),
+        packed_seq_params=PackedSeqParams(
+            qkv_format="sbhd",
+            cp_group=cp_group,
+            cp_partition_mode="zigzag",
+        ),
+    )
+
+    assert output_layer.hidden_states is input_layout_hidden
+    assert torch.equal(output, input_layout_hidden.transpose(0, 1).contiguous())
+    assert len(calls) == 1
+    _, kwargs, seq_dim, _ = calls[0]
+    assert kwargs["source_partition_mode"] == "contiguous"
+    assert kwargs["target_partition_mode"] == "zigzag"
+    assert seq_dim == 0
 
 
 class TestHybridModel:

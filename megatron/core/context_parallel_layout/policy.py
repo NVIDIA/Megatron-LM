@@ -28,12 +28,57 @@ def get_context_parallel_layout_chunk_indices(
     )
 
 
+################################################################################
+# Layer-to-CP-partition-mode mapping
+################################################################################
+# ``None`` is a meaningful result here: it means the module is token-layout
+# agnostic and preserves whichever CP partition mode it receives.  It must not
+# be used as the fallback for an unrecognized module type; unknown types should
+# fail loudly so new layer implementations add an explicit partition-mode policy.
+
+
 def _validate_cp_partition_mode_preference(
     mode: Optional[str], *, module_name: str
 ) -> Optional[CpPartitionMode]:
     if mode is None or mode in ("zigzag", "contiguous"):
         return mode
     raise ValueError(f"Invalid CP partition mode preference {mode!r} declared by {module_name}.")
+
+
+def get_preferred_cp_partition_mode_for_layer(
+    layer: Any, config: Any, *, cp_comm_type: Optional[str] = None
+) -> Optional[CpPartitionMode]:
+    """Return a layer/module's CP partition mode preference for auto layout rollout.
+
+    Modules should declare their auto-mode layout preference via
+    ``get_preferred_cp_partition_mode()``.  This is a preference rather than a
+    hard requirement: some modules can consume more than one layout but still
+    prefer one for performance or rollout consistency.  Wrapper modules may
+    delegate to ``inner_layer`` or ``self_attention``.
+    """
+    if cp_comm_type is None:
+        cp_comm_type = getattr(config, "cp_comm_type", None)
+
+    if layer is None:
+        raise ValueError("Cannot determine CP partition mode for None.")
+
+    module_name = layer.__class__.__name__
+    get_preferred_mode = getattr(layer, "get_preferred_cp_partition_mode", None)
+    if callable(get_preferred_mode):
+        return _validate_cp_partition_mode_preference(
+            get_preferred_mode(), module_name=module_name
+        )
+
+    if hasattr(layer, "inner_layer"):
+        return get_preferred_cp_partition_mode_for_layer(
+            layer.inner_layer, getattr(layer, "config", config), cp_comm_type=cp_comm_type
+        )
+    if hasattr(layer, "self_attention"):
+        return get_preferred_cp_partition_mode_for_layer(
+            layer.self_attention, getattr(layer, "config", config), cp_comm_type=cp_comm_type
+        )
+
+    raise ValueError(f"Cannot determine CP partition mode for layer/module type {module_name!r}.")
 
 
 def get_stage_entry_partition_mode(

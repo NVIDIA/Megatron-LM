@@ -78,6 +78,15 @@ class GatedDeltaNet(MegatronModule):
     and returns output of the same size.
     """
 
+    def get_preferred_cp_partition_mode(self):
+        """Return GDN's CP layout preference for ``cp_partition_mode="auto"`` rollout."""
+        mode = getattr(self.config, "linear_cp_mode", "chunkwise")
+        if mode == "chunkwise":
+            return "contiguous"
+        if mode == "headwise":
+            return "zigzag"
+        raise ValueError(f"Unsupported GatedDeltaNet linear_cp_mode: {mode!r}.")
+
     def __init__(
         self,
         config: TransformerConfig,

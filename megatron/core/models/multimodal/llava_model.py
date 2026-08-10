@@ -183,6 +183,11 @@ class LLaVAModel(MegatronModule):
         self.pg_collection = pg_collection
 
         language_model_type = getattr(language_transformer_config, "language_model_type", "")
+        if getattr(language_transformer_config, "cp_partition_mode", "zigzag") == "auto":
+            raise ValueError(
+                'LLaVAModel does not support cp_partition_mode="auto"; use a pretraining '
+                'entrypoint that owns CP layout prebuild and batch partitioning.'
+            )
         self.sequence_parallel_lm = language_transformer_config.sequence_parallel
         self.tp_comm_overlap_lm = language_transformer_config.tp_comm_overlap
         self.context_parallel_lm = language_transformer_config.context_parallel_size
@@ -871,7 +876,9 @@ class LLaVAModel(MegatronModule):
                 from megatron.core.utils import get_batch_on_this_cp_rank
 
                 batch = get_batch_on_this_cp_rank(
-                    batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                    batch,
+                    is_hybrid_cp=False,
+                    cp_group=get_context_parallel_group(),
                 )
             else:
                 assert HAVE_TEX and is_te_min_version(
