@@ -694,11 +694,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
+        if config.rl_offload_optimizer_during_inference and not HAVE_TORCH_MEMORY_SAVER:
+            raise ImportError(
+                "rl_offload_optimizer_during_inference requires torch_memory_saver. "
+                "See https://github.com/fzyzcjy/torch_memory_saver."
+            )
         # Opt in to TMS-based RL offload.
-        self._tms_offload_enabled = (
-            HAVE_TORCH_MEMORY_SAVER
-            and config.rl_offload_optimizer_during_inference
-            and not isinstance(optimizer, HybridDeviceOptimizer)
+        self._tms_offload_enabled = config.rl_offload_optimizer_during_inference and not isinstance(
+            optimizer, HybridDeviceOptimizer
         )
 
         assert (

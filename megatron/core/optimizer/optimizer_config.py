@@ -401,6 +401,16 @@ class OptimizerConfig:
     def __post_init__(self):
         """Check the validity of the config."""
 
+        if self.rl_offload_optimizer_during_inference:
+            assert (
+                self.use_distributed_optimizer
+            ), 'rl_offload_optimizer_during_inference only supported with distributed optimizer'
+            if self.optimizer_cpu_offload:
+                raise ValueError(
+                    "rl_offload_optimizer_during_inference is incompatible with "
+                    "optimizer_cpu_offload."
+                )
+
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are
         # different for different training precision settings. FP8 cases require different

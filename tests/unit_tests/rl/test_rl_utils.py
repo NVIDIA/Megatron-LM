@@ -855,7 +855,7 @@ class TestRLUtils:
         indirect=["initialize_model_parallel"],
     )
     def test_optimizer_offload(self, initialize_model_parallel, use_tms_offload):
-        """Test optimizer offload_to_cpu/restore_from_cpu with and without TMS."""
+        """Test the optimizer offload/restore round trip with TMS, and fail-loud without it."""
         if use_tms_offload:
             pytest.importorskip("torch_memory_saver")
         world_size, dp, tp, pp = initialize_model_parallel
@@ -938,31 +938,13 @@ class TestRLUtils:
                     v, expected, msg="Optimizer state must be identical after offload/restore"
                 )
         else:
-            for opt in optimizer.chained_optimizers:
-                if hasattr(opt, 'optimizer') and opt.optimizer is not None:
-                    for group in opt.optimizer.param_groups:
-                        for p in group['params']:
-                            if len(opt.optimizer.state[p]) == 0:
-                                opt.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
-                                opt.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
-                                opt.optimizer.state[p]['step'] = torch.tensor(1)
-
-            def state_devices():
-                return {str(v.device) for v in iter_state_tensors()}
-
-            assert any(
-                'cuda' in d for d in state_devices()
-            ), f"Expected optimizer state on GPU initially, got: {state_devices()}"
-
-            optimizer.offload_to_cpu()
-            assert all(
-                'cpu' in d for d in state_devices()
-            ), f"Expected all optimizer state on CPU after offload, got: {state_devices()}"
-
-            optimizer.restore_from_cpu()
-            assert any(
-                'cuda' in d for d in state_devices()
-            ), f"Expected optimizer state on GPU after restore, got: {state_devices()}"
+            # There is deliberately no non-TMS fallback: offload/restore must fail loudly
+            # rather than silently degrade to the .cpu()/.cuda() round trip, which would
+            # re-allocate optimizer state inside the CUDA-graph memory pool on restore.
+            with pytest.raises(RuntimeError, match="torch_memory_saver"):
+                optimizer.offload_to_cpu()
+            with pytest.raises(RuntimeError, match="torch_memory_saver"):
+                optimizer.restore_from_cpu()
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",

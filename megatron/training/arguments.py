@@ -510,8 +510,13 @@ def validate_args(args, defaults={}):
             not args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode == "offload"
         ), "Cannot recapture CUDA graphs while offloading KV cache."
 
-        # Validate optimizer offloading requires torch_memory_saver.
+        # Validate optimizer offloading requires the distributed optimizer and torch_memory_saver.
         if args.rl_offload_optimizer_during_inference:
+            assert args.use_distributed_optimizer, \
+                "--rl-offload-optimizer-during-inference requires --use-distributed-optimizer."
+            assert not args.optimizer_cpu_offload, \
+                "--rl-offload-optimizer-during-inference is incompatible with " \
+                "--optimizer-cpu-offload."
             try:
                 from torch_memory_saver import torch_memory_saver
             except ImportError:

@@ -572,20 +572,15 @@ class MegatronOptimizer(ABC):
         ):
             log_single_rank(logger, logging.INFO, '[OFFLOAD] moving optimizer state to CPU')
 
-            # Move all optimizer tensors to CPU while keeping the optimizer instance
-            if self._tms_offload_enabled:
-                torch_memory_saver.pause(_OPTIMIZER_TMS_TAG)
-            else:
-                for param_group in self.optimizer.param_groups:
-                    for p in param_group['params']:
-                        if isinstance(p, torch.Tensor) and p.is_cuda:
-                            p.data = p.data.cpu()
+            if not self._tms_offload_enabled:
+                # There is deliberately no .cpu()/.cuda() fallback: it would re-allocate the
+                # optimizer state inside the CUDA-graph memory pool on restore.
+                raise RuntimeError(
+                    "Optimizer offload requires torch_memory_saver and the distributed optimizer "
+                    "(rl_offload_optimizer_during_inference)."
+                )
 
-                for state_dict in self.optimizer.state.values():
-                    for k, v in state_dict.items():
-                        if isinstance(v, torch.Tensor) and v.is_cuda:
-                            state_dict[k] = v.cpu()
-
+            torch_memory_saver.pause(_OPTIMIZER_TMS_TAG)
             torch.cuda.empty_cache()
 
     def restore_from_cpu(self):
@@ -596,19 +591,13 @@ class MegatronOptimizer(ABC):
         ):
             log_single_rank(logger, logging.INFO, '[RESTORE] moving optimizer state back to GPU')
 
-            # Move all optimizer tensors back to GPU
-            if self._tms_offload_enabled:
-                torch_memory_saver.resume(_OPTIMIZER_TMS_TAG)
-            else:
-                for param_group in self.optimizer.param_groups:
-                    for p in param_group['params']:
-                        if isinstance(p, torch.Tensor) and not p.is_cuda:
-                            p.data = p.data.cuda()
+            if not self._tms_offload_enabled:
+                raise RuntimeError(
+                    "Optimizer restore requires torch_memory_saver and the distributed optimizer "
+                    "(rl_offload_optimizer_during_inference)."
+                )
 
-                for state_dict in self.optimizer.state.values():
-                    for k, v in state_dict.items():
-                        if isinstance(v, torch.Tensor) and not v.is_cuda:
-                            state_dict[k] = v.cuda()
+            torch_memory_saver.resume(_OPTIMIZER_TMS_TAG)
 
     @staticmethod
     def _filter_and_reorder_param_groups(
