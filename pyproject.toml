@@ -113,6 +113,7 @@ dev = [
     "orjson",
     "fast-hadamard-transform",
     "zstandard",
+    "nvidia-cutlass-dsl[cu13]~=4.5.0",
 ]
 
 ### 'lts' extra is deprecated                                                   ###
@@ -129,7 +130,6 @@ te = [
 ssm = [
     "mamba-ssm",
     "causal-conv1d~=1.5",
-    "nvidia-cutlass-dsl[cu13]~=4.5.0",
 ]
 
 [dependency-groups]

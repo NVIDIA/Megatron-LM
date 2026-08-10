@@ -2216,6 +2216,7 @@ dev = [
     { name = "megatron-energon", extra = ["av-decode"] },
     { name = "multi-storage-client" },
     { name = "nvidia-cudnn-frontend", extra = ["cutedsl"] },
+    { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
     { name = "nvidia-modelopt", marker = "sys_platform != 'darwin'" },
     { name = "nvidia-resiliency-ext" },
     { name = "onnxscript" },
@@ -2240,7 +2241,6 @@ mlm = [
 ssm = [
     { name = "causal-conv1d" },
     { name = "mamba-ssm" },
-    { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
 ]
 te = [
     { name = "transformer-engine" },
@@ -2332,7 +2332,7 @@ requires-dist = [
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "numpy" },
     { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = "==1.26.0" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'ssm'", specifier = "~=4.5.0" },
+    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'dev'", specifier = "~=4.5.0" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.44" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.6.0" },
     { name = "omegaconf", marker = "extra == 'mlm'" },
