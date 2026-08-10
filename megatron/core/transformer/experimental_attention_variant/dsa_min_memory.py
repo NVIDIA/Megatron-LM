@@ -1121,6 +1121,7 @@ def _cudnn_indexer_topk_full_k(
     topk: int,
     q_start: int,
     q_end: int,
+    full_key_len: int = 0,
     profile: Optional[_DSATimingProfiler] = None,
     profile_suffix: str = "fwd",
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
@@ -1165,8 +1166,31 @@ def _cudnn_indexer_topk_full_k(
             seq_lens = torch.isfinite(flat).sum(dim=1).to(torch.int32)
     with _profile_record(profile, f"routing_cudnn_topk_{profile_suffix}", q_index.device):
         with torch.cuda.nvtx.range("dsa_mm_indexer_top_k_cudnn"):
+            # cuDNN's varlen top-k reads out of bounds when the score width is
+            # close to top_k. This path truncates the width to the causal limit
+            # (k_total = min(q_end, sq)), so at seq 8192 / chunk 512 / topk 1024
+            # it produces 1536, 2560, 3584, ... and 7 of 16 tiles land in the bad
+            # range; main's MLA path never hits it because it always passes the
+            # full key length. Measured on a captured faulting call (rows=512,
+            # top_k=1024, cudnn-frontend 1.26.0, GB300), varying only the width:
+            #     sk=1536 -> illegal memory access
+            #     sk=2048 -> no fault, but one returned index == 2304 (invalid)
+            #     sk=4096, 8192 -> clean, all indices < k_total
+            # so a single multiple of top_k is NOT enough: it converts the crash
+            # into silent corruption. Pad to the full key length, which is what
+            # main's MLA path (dsa_cudnn_kernels.py) always passes and which is
+            # the configuration cuDNN is exercised with in practice.
+            topk_flat = flat
+            if full_key_len and full_key_len > k_total:
+                topk_flat = torch.cat(
+                    [
+                        flat,
+                        flat.new_full((flat.size(0), full_key_len - k_total), float("-inf")),
+                    ],
+                    dim=1,
+                ).contiguous()
             topk_indices = _DSA.indexer_top_k_wrapper(
-                flat, seq_lens, top_k=topk, return_val=False, stream=None,
+                topk_flat, seq_lens, top_k=topk, return_val=False, stream=None,
             )["indices"].reshape(b, q_len, topk)
             # Rows with fewer valid keys than top_k come back with -1 padding slots.
             # Match the Triton path (which stores the first causally-invalid key
@@ -1175,7 +1199,13 @@ def _cudnn_indexer_topk_full_k(
             # and > query_pos, so _selected_causal_invalid_mask drops it from attention.
             q_pos = (q_start + torch.arange(q_len, device=topk_indices.device)).view(1, q_len, 1)
             pad_idx = torch.clamp(q_pos + 1, max=k_total - 1).to(topk_indices.dtype)
-            topk_indices = torch.where(topk_indices < 0, pad_idx, topk_indices)
+            # NB: this only handled the -1 padding case. An out-of-range POSITIVE
+            # index (which this kernel has produced before -- see the constant
+            # seq_lens bug) sailed through into the downstream gather and faulted
+            # with cudaErrorIllegalAddress. Treat any out-of-range index the same
+            # way, so a bad index can never reach a gather.
+            oob = (topk_indices < 0) | (topk_indices >= k_total)
+            topk_indices = torch.where(oob, pad_idx, topk_indices)
     with _profile_record(profile, f"routing_cudnn_sort_{profile_suffix}", q_index.device):
         with torch.cuda.nvtx.range("dsa_mm_indexer_sort_cudnn"):
             topk_indices, _ = torch.sort(topk_indices.to(torch.long), dim=-1)
@@ -1514,6 +1544,7 @@ def _topk_index_tile_impl(
             k_index_full = full_k_index[:causal_key_limit]
         running_scores, running_indices = _cudnn_indexer_topk_full_k(
             q_index, weights, k_index_full, topk, q_start, q_end,
+            full_key_len=hidden_states.size(0),
             profile=profile, profile_suffix=profile_suffix,
         )
         return running_scores, running_indices, q_index, weights
