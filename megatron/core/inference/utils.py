@@ -112,7 +112,7 @@ def get_logit_dtype(model) -> torch.dtype:
 
     Models may expose a ``logit_dtype`` attribute (see ``--output-logit-dtype``) that overrides
     the dtype of the output-layer GEMM result. When it is unset, the logits keep the
-    output-layer input dtype, i.e. ``params_dtype``.
+    output-layer input dtype, i.e. the dtype the model computes in.
 
     Args:
         model: The model, optionally wrapped (e.g. in ``Float16Module`` or DDP).
@@ -126,7 +126,21 @@ def get_logit_dtype(model) -> torch.dtype:
         # Model types that predate `logit_dtype` always emit logits in the input dtype.
         logit_dtype = None
 
-    return logit_dtype if logit_dtype is not None else get_model_config(model).params_dtype
+    if logit_dtype is not None:
+        return logit_dtype
+
+    # Deferred to avoid a circular import: `megatron.core.transformer` imports this module.
+    from megatron.core.transformer.module import Float16Module
+
+    # `Float16Module` casts the wrapped module to fp16/bf16 irrespective of `params_dtype`, so
+    # its precision - not `params_dtype` - is what the output layer actually receives.
+    module = model
+    while module is not None:
+        if isinstance(module, Float16Module):
+            return torch.float16 if module.fp16 else torch.bfloat16
+        module = getattr(module, "module", None)
+
+    return get_model_config(model).params_dtype
 
 
 # Initialize cache for sequence parallel modules
