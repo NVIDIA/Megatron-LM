@@ -497,7 +497,6 @@ class _AsyncPairScenario:
     prerequisite: str | None = None
     atol: float = 1.0e-3
     parity: str = "exact"
-    compare_generated_metadata: bool = True
 
 
 _BASE_PAIR_CONFIG = {
@@ -753,7 +752,6 @@ _ASYNC_PAIR_SCENARIOS = (
             {"return_log_probs": True, "skip_prompt_log_probs": True, "top_n_logprobs": 4},
         ),
         signals=("cuda-graph", "logprobs", "mtp", "top-n"),
-        compare_generated_metadata=False,
     ),
     _pair_scenario(
         "hybrid-mamba",
@@ -800,6 +798,7 @@ _ASYNC_PAIR_SCENARIOS = (
         },
         signals=("fused-rope",),
         prerequisite="flashinfer",
+        parity="reproducible",
     ),
     _pair_scenario(
         "swa-off-by-one-sink",
@@ -1280,7 +1279,10 @@ def _assert_top_n_parity(actual, expected, atol, exact):
     for actual_row, expected_row in zip(actual, expected):
         assert len(actual_row) == len(expected_row)
         assert all(isinstance(token, str) for token in actual_row)
-        assert torch.isfinite(torch.tensor(list(actual_row.values()))).all()
+        values = torch.tensor(list(actual_row.values()))
+        assert not torch.isnan(values).any()
+        assert not torch.isposinf(values).any()
+        assert torch.isfinite(values).any()
         if exact:
             assert actual_row.keys() == expected_row.keys()
             assert list(actual_row.values()) == pytest.approx(
@@ -1289,13 +1291,7 @@ def _assert_top_n_parity(actual, expected, atol, exact):
 
 
 def _assert_request_parity(
-    actual_requests,
-    expected,
-    atol,
-    compare_events=False,
-    exact_numerics=True,
-    exact_top_n=False,
-    compare_generated_metadata=True,
+    actual_requests, expected, atol, compare_events=False, exact_numerics=True, exact_top_n=False
 ):
     assert len(actual_requests) == len(expected)
     for request, reference in zip(actual_requests, expected):
@@ -1304,19 +1300,15 @@ def _assert_request_parity(
         prompt_logprobs = _as_float_list(request.prompt_log_probs) or []
         generated_logprobs = _as_float_list(request.generated_log_probs) or []
         assert len(prompt_logprobs) == len(reference["prompt_logprobs"] or [])
-        if compare_generated_metadata:
-            assert len(generated_logprobs) == len(reference["generated_logprobs"] or [])
-        else:
-            assert len(generated_logprobs) == len(request.generated_tokens)
+        assert len(generated_logprobs) == len(reference["generated_logprobs"] or [])
         if exact_numerics:
             assert request.generated_tokens == reference["tokens"]
             assert prompt_logprobs == pytest.approx(
                 reference["prompt_logprobs"] or [], rel=0, abs=atol
             )
-            if compare_generated_metadata:
-                assert generated_logprobs == pytest.approx(
-                    reference["generated_logprobs"] or [], rel=0, abs=atol
-                )
+            assert generated_logprobs == pytest.approx(
+                reference["generated_logprobs"] or [], rel=0, abs=atol
+            )
         else:
             assert all(0 <= token < 100 for token in request.generated_tokens)
         assert torch.isfinite(torch.tensor(prompt_logprobs)).all()
@@ -1324,10 +1316,9 @@ def _assert_request_parity(
         _assert_top_n_parity(
             request.prompt_top_n_logprobs, reference["prompt_top_n"], atol, exact_top_n
         )
-        if compare_generated_metadata:
-            _assert_top_n_parity(
-                request.generated_top_n_logprobs, reference["generated_top_n"], atol, exact_top_n
-            )
+        _assert_top_n_parity(
+            request.generated_top_n_logprobs, reference["generated_top_n"], atol, exact_top_n
+        )
         if compare_events:
             assert [event.type for event in request.events] == reference["events"]
 
@@ -1507,6 +1498,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if request.sampling_params.return_log_probs:
                     assert request.generated_log_probs is not None
                     assert len(request.generated_log_probs) == len(request.generated_tokens)
+                else:
+                    assert request.prompt_log_probs is None
+                    assert request.generated_log_probs is None
         if "full-logits" in signals:
             assert not context.config.materialize_only_last_token_logits
         if "top-n" in signals:
@@ -1650,7 +1644,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             scenario.atol,
             compare_events="events" in scenario.signals,
             exact_numerics=scenario.parity == "exact",
-            compare_generated_metadata=scenario.compare_generated_metadata,
+            exact_top_n=scenario.parity == "exact",
         )
         cls._assert_runtime_signals(async_env, scenario, runtime, stop_tokens, termination_token)
         if scenario.parity == "reproducible":
@@ -1671,7 +1665,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 scenario.atol,
                 compare_events="events" in scenario.signals,
                 exact_top_n=True,
-                compare_generated_metadata=scenario.compare_generated_metadata,
             )
             cls._assert_runtime_signals(
                 repeat_env, scenario, repeat_runtime, stop_tokens, termination_token
