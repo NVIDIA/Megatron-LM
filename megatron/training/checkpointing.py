@@ -837,8 +837,16 @@ def save_checkpoint(
                             else mpu.get_expert_data_parallel_group()
                         )
                     save_strategy = FullyParallelSaveStrategyWrapper(
-                        save_strategy, process_group, args.ckpt_assume_constant_structure
+                        save_strategy,
+                        process_group,
+                        args.ckpt_assume_constant_structure,
+                        validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
                     )
+            # Allow opting out of save-side sharding validation entirely (even on
+            # the first save) via --no-ckpt-load-validate-sharding-integrity. This
+            # skips the world-wide determine_global_metadata all_gather_object.
+            if not args.ckpt_load_validate_sharding_integrity:
+                validate_sharding_integrity = False
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
@@ -1740,10 +1748,16 @@ def _load_base_checkpoint(
             print_rank_0('    will not load any checkpoints and will start from random')
         # Conditionally exit if checkpoint not found.
         if args.exit_on_missing_checkpoint:
-            print_rank_0(">> '--exit-on-missing-checkpoint' set ... exiting. <<")
+            print_rank_0(
+                ">> '--exit-on-missing-checkpoint' is set but no checkpoint was found under "
+                f"load directory '{load_dir}' (missing metadata/tracker file "
+                f"'{tracker_filename}'). Exiting with a non-zero status. <<"
+            )
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
-            sys.exit()
+            # Exit non-zero so that callers (e.g. CI harnesses) detect the missing
+            # checkpoint as a failure instead of silently treating exit code 0 as success.
+            sys.exit(1)
 
         return None, '', False, None
 
