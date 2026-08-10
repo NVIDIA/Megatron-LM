@@ -365,6 +365,12 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    rl_offload_optimizer_during_inference: bool = False
+    """When True, the distributed optimizer allocates its master weights and optimizer state
+    inside a torch_memory_saver region, so RL offload/restore during inference pauses/resumes
+    their physical pages in place instead of doing a .cpu()/.cuda() round trip. This is faster and
+    keeps optimizer tensors out of the CUDA-graph memory pool. Requires torch_memory_saver."""
+
     ################
     # Miscellaneous
     ################
