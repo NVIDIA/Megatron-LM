@@ -190,22 +190,31 @@ class MegatronGenerate(Resource):
             # unguarded call site raised NameError -- turning a telemetry problem into an
             # HTTP 500 on a request that would otherwise have been served fine.
             _otel_tracer = _otel_meter = _otel_span_cm = None
-            _parent_ctx = None
+            _otel_ctx_mod = _parent_ctx = None
             try:
                 from nemo.lens.state import is_span_group_enabled
                 if is_span_group_enabled('inference'):
                     from nemo.lens.helpers import span_cm
                     from nemo.lens.propagation import extract_context
+                    from opentelemetry import context as _context_mod
                     from opentelemetry import trace as _trace_mod, metrics as _metrics_mod
                     _tracer = _trace_mod.get_tracer('megatron.core')
                     _meter = _metrics_mod.get_meter('megatron.core')
+                    # Continue the caller's trace: pull W3C traceparent/tracestate (and
+                    # baggage) off the inbound HTTP headers. Only keep the result if it
+                    # actually carries a valid span -- extract_context() returns an empty
+                    # Context for a request with no traceparent, and attaching THAT below
+                    # would clear whatever ambient context the server thread had rather
+                    # than parenting to anything.
                     _ctx = extract_context(dict(request.headers))
+                    if not _trace_mod.get_current_span(_ctx).get_span_context().is_valid:
+                        _ctx = None
                     # Publish together, last: all imports above have now succeeded.
                     _otel_tracer, _otel_meter = _tracer, _meter
-                    _otel_span_cm, _parent_ctx = span_cm, _ctx
+                    _otel_span_cm, _otel_ctx_mod, _parent_ctx = span_cm, _context_mod, _ctx
             except Exception:
                 _otel_tracer = _otel_meter = _otel_span_cm = None
-                _parent_ctx = None
+                _otel_ctx_mod = _parent_ctx = None
 
             # Resolve model identifier used in span name and attributes.
             _model_id = (
@@ -234,42 +243,66 @@ class MegatronGenerate(Resource):
             _span_name = f"text_completion {_model_id}"
             _req_start = datetime.datetime.now()
 
-            _request_cm = (
-                _otel_span_cm(_span_name, tracer=_otel_tracer, **_span_attrs)
-                if _otel_tracer is not None else contextlib.nullcontext()
-            )
+            # Make the extracted caller context current for the duration of the request
+            # span. span_cm() takes no explicit-parent argument -- it parents off whatever
+            # is current -- so attach/detach is the mechanism, not a context= kwarg. The
+            # attach must happen before _request_cm is entered; building the context
+            # manager object is inert (the generator body only runs on __enter__), but the
+            # attach is placed first anyway so the ordering is not load-bearing on that.
+            _ctx_token = None
+            if _parent_ctx is not None:
+                try:
+                    _ctx_token = _otel_ctx_mod.attach(_parent_ctx)
+                except Exception:
+                    _ctx_token = None
 
             try:
-                with _request_cm as _req_span:
-                    send_do_generate()  # Tell other ranks we're doing generate
+                _request_cm = (
+                    _otel_span_cm(_span_name, tracer=_otel_tracer, **_span_attrs)
+                    if _otel_tracer is not None else contextlib.nullcontext()
+                )
 
-                    response_dict = run_mcore_engine(
-                        self.engine, prompts, temperature, top_k, top_p, logprobs, tokens_to_generate
-                    )
+                try:
+                    with _request_cm as _req_span:
+                        send_do_generate()  # Tell other ranks we're doing generate
 
-                    # Set output token count on span if derivable from response.
-                    if _req_span is not None and isinstance(response_dict, dict):
-                        _output_tokens = sum(
-                            len(v.get('tokens', []))
-                            for v in response_dict.values()
-                            if isinstance(v, dict)
+                        response_dict = run_mcore_engine(
+                            self.engine, prompts, temperature, top_k, top_p, logprobs, tokens_to_generate
                         )
-                        if _output_tokens:
-                            _req_span.set_attribute('gen_ai.usage.output_tokens', _output_tokens)
 
-                _req_duration_s = (datetime.datetime.now() - _req_start).total_seconds()
-                if _otel_meter is not None:
-                    from nemo.lens.instruments.inference import record_inference_metrics
-                    record_inference_metrics(
-                        meter=_otel_meter,
-                        request_duration_s=_req_duration_s,
-                        model=_model_id,
-                    )
+                        # Set output token count on span if derivable from response.
+                        if _req_span is not None and isinstance(response_dict, dict):
+                            _output_tokens = sum(
+                                len(v.get('tokens', []))
+                                for v in response_dict.values()
+                                if isinstance(v, dict)
+                            )
+                            if _output_tokens:
+                                _req_span.set_attribute(
+                                    'gen_ai.usage.output_tokens', _output_tokens
+                                )
 
-                return jsonify(response_dict)
+                    _req_duration_s = (datetime.datetime.now() - _req_start).total_seconds()
+                    if _otel_meter is not None:
+                        from nemo.lens.instruments.inference import record_inference_metrics
+                        record_inference_metrics(
+                            meter=_otel_meter,
+                            request_duration_s=_req_duration_s,
+                            model=_model_id,
+                        )
 
-            except ValueError as ve:
-                return ve.args[0]
+                    return jsonify(response_dict)
+
+                except ValueError as ve:
+                    return ve.args[0]
+            finally:
+                # Always unwind, on every exit path, or the caller's context leaks into
+                # this server thread and silently reparents the NEXT request's span.
+                if _ctx_token is not None:
+                    try:
+                        _otel_ctx_mod.detach(_ctx_token)
+                    except Exception:
+                        pass
 
 
 class MegatronServer(object):
