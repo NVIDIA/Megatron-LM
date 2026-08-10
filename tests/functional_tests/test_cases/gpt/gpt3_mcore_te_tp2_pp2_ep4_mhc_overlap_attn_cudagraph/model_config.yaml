@@ -10,8 +10,16 @@ MODEL_ARGS:
   # node -- the change this PR is built around, and the one whose failure mode
   # (a cross-stream use-after-free surfacing as ~1e8 grad norms) is visible in a
   # multi-rank loss curve rather than in a single-process unit test.
-  # TP=2, PP=2, DP=2, EP=4, ETP=1 -> eight GPUs.
+  # TP=2, PP=2, DP=2, EP=4, ETP=1 -> eight GPUs, interleaved (VPP=2).
+  #
+  # VPP is deliberate, not incidental: interleaving is where the use-after-free
+  # actually bit (grad norms ~1e8 from the first iteration), and
+  # transformer_config admits VPP with mHC recompute only together with EP
+  # overlap, precisely because the fix lives in the overlap schedule. A
+  # non-interleaved case would exercise the mhc_post node but not the schedule
+  # shape that broke.
   --num-layers: 12
+  --num-layers-per-virtual-pipeline-stage: 3
   --hidden-size: 512
   --num-attention-heads: 8
   --micro-batch-size: 4
