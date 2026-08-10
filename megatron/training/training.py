@@ -1937,7 +1937,7 @@ def pretrain(
                 )
             except Exception:
                 # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
-                # fault, or the injected test fault) would skip the _end_otel_job_spans()
+                # fault, or an injected fault) would skip the _end_otel_job_spans()
                 # at the bottom of pretrain(), leaving the in-flight megatron.train block
                 # unended -> unexported (only the graceful-SIGTERM and normal-exit paths
                 # flush it today). End + flush the open spans here, then re-raise so the
@@ -4397,27 +4397,6 @@ def train(
         # trace instead of accreting into a run-long one. Must be the first thing in
         # the pass so everything below nests under the current interval root.
         _maybe_reroot_otel_interval()
-        # Test-only deliberate fault injection (gated by env; a no-op in normal
-        # runs). Raises on ONE named rank after N seconds of training to exercise
-        # the goodput lost-work / recovery path. Only that rank fails; the others
-        # then hit the distributed timeout.
-        #  - LENS_INJECT_FAULT_AT_ITER: ALL ranks raise once iteration >= that value -- a
-        #    fast, clean crash of the whole step (no survivor NCCL-timeout hang), for
-        #    requeue/trampoline tests where we just want the job to die and be requeued.
-        #  - LENS_INJECT_FAULT_RANK + LENS_INJECT_FAULT_AFTER_S: ONE rank raises after N
-        #    seconds; survivors then hit the distributed timeout -- for the lost-work path.
-        _finj_at_iter = os.environ.get('LENS_INJECT_FAULT_AT_ITER')
-        _finj_rank = os.environ.get('LENS_INJECT_FAULT_RANK')
-        _fault_iter = _finj_at_iter is not None and iteration >= int(_finj_at_iter)
-        _fault_time = (_finj_rank is not None
-                       and torch.distributed.get_rank() == int(_finj_rank)
-                       and (time.time() - _TRAIN_START_TIME)
-                       > float(os.environ.get('LENS_INJECT_FAULT_AFTER_S', '1e18')))
-        if _fault_iter or _fault_time:
-            raise RuntimeError(
-                f"[lens fault-injection] rank {torch.distributed.get_rank()} deliberate failure "
-                f"at iteration {iteration} ({'iter-gated' if _fault_iter else 'time-gated'})"
-            )
         if (args.profile
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
