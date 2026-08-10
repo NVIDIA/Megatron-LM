@@ -5,8 +5,35 @@ on:
     types: [ready_for_review]
 
 jobs:
+  check-write-permission:
+    name: Check PR Author Permission
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      has-write-permission: ${{ steps.permission.outputs.has-write-permission }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      AUTHOR: ${{ github.event.pull_request.user.login }}
+    steps:
+      - name: Check PR author permission
+        id: permission
+        run: |
+          permission=$(gh api "repos/$REPO/collaborators/$AUTHOR/permission" --jq .permission)
+          case "$permission" in
+            admin|maintain|write)
+              echo "has-write-permission=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "has-write-permission=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
   label-complexity:
     name: Label PR Complexity
+    needs: check-write-permission
+    if: needs.check-write-permission.outputs.has-write-permission == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
