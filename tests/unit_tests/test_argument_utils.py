@@ -687,9 +687,9 @@ class TestMegatronMixedPrecisionArguments:
 
         return _add_mixed_precision_args(ArgumentParser(exit_on_error=False))
 
-    def test_logit_dtype_defaults_to_bf16(self):
+    def test_logit_dtype_defaults_to_input_dtype(self):
         args = self._parser().parse_args([])
-        assert args.logit_dtype == 'bf16'
+        assert args.logit_dtype is None
 
     @pytest.mark.parametrize("dtype", ["bf16", "fp32"])
     def test_logit_dtype_accepts_supported_choices(self, dtype):

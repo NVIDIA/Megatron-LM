@@ -11,6 +11,31 @@ from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_para
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_linear_default_output_dtype_preserves_input_dtype(dtype):
+    Utils.initialize_model_parallel(1, 1)
+
+    try:
+        input_data = torch.randn(4, 3, 16, device="cuda", dtype=dtype)
+        weight = torch.randn(32, 16, device="cuda", dtype=dtype)
+        output = linear_with_grad_accumulation_and_async_allreduce(
+            input_data,
+            weight,
+            None,
+            False,
+            False,
+            False,
+            tp_group=None,
+            output_dtype=None,
+        )
+        reference = torch.nn.functional.linear(input_data, weight)
+
+        assert output.dtype == input_data.dtype
+        torch.testing.assert_close(output, reference)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("tensor_parallel,allreduce_dgrad", [(1, False), (8, True)])
 def test_LinearWithFrozenWeight(tensor_parallel, allreduce_dgrad):
     Utils.initialize_model_parallel(tensor_parallel, 1)
