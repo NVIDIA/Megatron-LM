@@ -7,13 +7,13 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from megatron.core.ssm.gated_delta_net import GDNLayerConfig
-from megatron.core.ssm.mamba_layer import MambaLayerConfig
-from megatron.core.ssm.mlp_layer import MLPLayerConfig
-from megatron.core.transformer.attention import AttentionLayerConfig
-from megatron.core.transformer.experimental_attention_variant.dsa import DSALayerConfig
-from megatron.core.transformer.moe.moe_layer import MoELayerConfig
-from megatron.core.transformer.multi_latent_attention import MLALayerConfig
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
 

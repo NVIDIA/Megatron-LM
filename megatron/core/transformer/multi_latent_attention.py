@@ -127,10 +127,6 @@ class MLASelfAttentionSubmodules:
     core_attention: Union[ModuleSpec, type] = None
 
 
-class MLALayerConfig(MLATransformerConfig):
-    """Configuration for a Multi-Latent Attention layer in a hybrid stack."""
-
-
 class MultiLatentAttention(Attention):
     """Multi-Latent Attention layer abstract class.
 

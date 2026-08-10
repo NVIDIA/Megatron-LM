@@ -25,7 +25,7 @@ from megatron.core.transformer.experimental_attention_variant import (
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_pg_size
 
 try:
@@ -1525,10 +1525,6 @@ def unfused_dsa_fn(
     if query_was_thd:
         output = output.squeeze(1)
     return output
-
-
-class DSALayerConfig(MLATransformerConfig):
-    """Configuration for a DeepSeek Sparse Attention layer in a hybrid stack."""
 
 
 class DSAttention(MegatronModule):

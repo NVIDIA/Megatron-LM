@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+import subprocess
+import sys
 from argparse import ArgumentParser
 from types import SimpleNamespace
 
@@ -12,14 +14,44 @@ from megatron.core.inference.config import (
     InferenceConfig,
     MambaInferenceStateConfig,
 )
-from megatron.core.ssm.mamba_layer import MambaLayerConfig
-from megatron.core.transformer.attention import AttentionLayerConfig
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import _add_inference_args
 from megatron.training.config.inference_config import InferenceSetupConfig
+from tests.unit_tests.test_utilities import Utils
 
 
 class TestInferenceConfig:
+    @pytest.mark.parametrize(
+        "imports",
+        [
+            (
+                "from megatron.core.inference.config import MambaInferenceStateConfig; "
+                "from megatron.core.ssm.mamba_layer import MambaLayer; "
+                "from megatron.core.ssm.gated_delta_net import GatedDeltaNet; "
+                "from megatron.core.transformer.attention import Attention"
+            ),
+            (
+                "from megatron.core.ssm.mamba_layer import MambaLayer; "
+                "from megatron.core.inference.config import MambaInferenceStateConfig"
+            ),
+            (
+                "from megatron.core.ssm.gated_delta_net import GatedDeltaNet; "
+                "from megatron.core.inference.config import MambaInferenceStateConfig"
+            ),
+            (
+                "from megatron.core.transformer.attention import Attention; "
+                "from megatron.core.inference.config import MambaInferenceStateConfig"
+            ),
+        ],
+    )
+    def test_layer_config_modules_do_not_create_inference_import_cycles(self, imports):
+        """Inference config and layer implementations import cleanly in either order."""
+        if Utils.rank != 0:
+            return
+        subprocess.run([sys.executable, "-c", imports], check=True)
+
     def test_mutual_exclusivity_with_transformer_config(self):
         """
         Ensure mutual exclusivity between fields in `InferenceConfig` and

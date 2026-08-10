@@ -251,7 +251,7 @@ class TestBatchInvariantDecodeBufferedScan(unittest.TestCase):
         from unittest.mock import patch
 
         from megatron.core.inference.config import MambaInferenceStateConfig
-        from megatron.core.ssm.mamba_layer import MambaLayerConfig
+        from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 
         model = SimpleNamespace(
             config=SimpleNamespace(batch_invariant_mode=True, params_dtype=torch.bfloat16)

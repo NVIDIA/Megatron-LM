@@ -25,17 +25,18 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import HybridLayerConfi
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
-from megatron.core.ssm.gated_delta_net import GDNLayerConfig
-from megatron.core.ssm.mamba_layer import MambaLayerConfig
-from megatron.core.ssm.mlp_layer import MLPLayerConfig
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.attention import AttentionLayerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
-from megatron.core.transformer.experimental_attention_variant.dsa import DSALayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.moe_layer import MoELayerConfig
-from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention, MLALayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default

@@ -6,12 +6,13 @@
 # LICENSE file in the root directory of this source tree.
 
 from functools import partial
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net.common import (
     _build_head_perm_for_split_sections,
@@ -23,15 +24,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     tensor_a2a_cp2hp,
     torch_chunk_gated_delta_rule,
 )
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
-
-if TYPE_CHECKING:
-    from megatron.core.inference.contexts import BaseInferenceContext
-
-
-class GDNLayerConfig(TransformerConfig):
-    """Configuration for a Gated DeltaNet layer in a hybrid stack."""
 
 
 class GatedDeltaNet(_GDNBase):
@@ -72,11 +65,11 @@ class GatedDeltaNet(_GDNBase):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        inference_context: Optional["BaseInferenceContext"] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
-        inference_params: Optional["BaseInferenceContext"] = None,
+        inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """

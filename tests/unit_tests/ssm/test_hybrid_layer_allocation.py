@@ -17,8 +17,8 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     validate_segment_layers,
 )
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.experimental_attention_variant.dsa import DSALayerConfig
-from megatron.core.transformer.multi_latent_attention import MLALayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 

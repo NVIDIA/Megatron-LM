@@ -22,9 +22,9 @@ from megatron.core.inference.inference_request import (
     compute_block_hashes_batched,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.ssm.mamba_layer import MambaLayerConfig
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.attention import AttentionLayerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils

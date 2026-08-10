@@ -210,10 +210,6 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router.set_layer_number(layer_number)
 
 
-class MoELayerConfig(TransformerConfig):
-    """Configuration for a Mixture-of-Experts layer in a hybrid stack."""
-
-
 class MoELayer(BaseMoELayer):
     """Mixture of Experts layer.
 

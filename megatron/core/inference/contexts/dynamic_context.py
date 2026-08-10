@@ -436,13 +436,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Convert each global layer index to the corresponding attention or
             # Mamba cache index. Keep the attention variants in separate maps to
             # preserve the legacy cache-indexing behavior.
-            from megatron.core.ssm.gated_delta_net import GDNLayerConfig
-            from megatron.core.ssm.mamba_layer import MambaLayerConfig
-            from megatron.core.ssm.mlp_layer import MLPLayerConfig
-            from megatron.core.transformer.attention import AttentionLayerConfig
-            from megatron.core.transformer.experimental_attention_variant.dsa import DSALayerConfig
-            from megatron.core.transformer.moe.moe_layer import MoELayerConfig
-            from megatron.core.transformer.multi_latent_attention import MLALayerConfig
+            from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+            from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+            from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
+            from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+            from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import (
+                DSALayerConfig,
+            )
+            from megatron.core.transformer.mla_layer_config import MLALayerConfig
+            from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
             attention_layer_map = {}
             dsa_layer_map = {}

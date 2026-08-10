@@ -9,6 +9,7 @@ import torch
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import HybridLayerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
 
@@ -51,8 +52,6 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Returns Mamba inference state config from the model if it is a hybrid model."""
-        from megatron.core.ssm.mamba_layer import MambaLayerConfig
-
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_config_list = getattr(decoder, "layer_config_list", None)
         if layer_config_list is not None and any(

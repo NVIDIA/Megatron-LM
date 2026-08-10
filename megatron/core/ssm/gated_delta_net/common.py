@@ -10,13 +10,14 @@
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, Union
+from typing import Callable, Optional, Protocol, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -38,9 +39,6 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
-
-if TYPE_CHECKING:
-    from megatron.core.inference.contexts import BaseInferenceContext
 
 try:
     from fla.modules.convolution import causal_conv1d
@@ -321,11 +319,11 @@ class _GDNBase(MegatronModule):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        inference_context: Optional["BaseInferenceContext"] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
-        inference_params: Optional["BaseInferenceContext"] = None,
+        inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # pylint: disable=missing-function-docstring
