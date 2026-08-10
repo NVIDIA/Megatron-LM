@@ -48,10 +48,16 @@ class MHCRecomputePhase(IntEnum):
     rejects anything else -- so ``recompute_until``'s filter currently admits
     every checkpoint whatever phase it is asked for.
 
+    The members name *barrier arguments* to ``recompute_until``, and both of these
+    have callers: the schedule node passes ``BEFORE_COMBINE_BWD`` and
+    ``recompute_now`` passes ``BEFORE_ATTN_BWD``. What is inert is the checkpoint
+    side -- no checkpoint carries a phase other than ``BEFORE_COMBINE_BWD``, so
+    the filter cannot yet discriminate between the two arguments.
+
     TODO: partition checkpoints across phases so ``recompute_until`` replays only
     what each barrier needs, and add the intermediate ``BEFORE_MLP_BWD`` barrier
-    in the same change. Members are deliberately not declared ahead of a producer:
-    an unconstructible enum member invites comparisons that can never be true.
+    in the same change. It is not declared here because nothing would pass it:
+    an unreachable member invites comparisons that can never be true.
     """
 
     BEFORE_COMBINE_BWD = 0

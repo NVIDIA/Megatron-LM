@@ -2670,6 +2670,10 @@ class TECudaGraphHelper:
             for layers in self.callables_per_chunk:
                 for layer_number, layer in enumerate(layers):
                     layer.cuda_graphs = []
+                    # Only the direct-write arena consumes these handles. Every
+                    # other configuration would retain num_microbatches static
+                    # input tensors per layer for nothing.
+                    retain_static_inputs = self._uses_mhc_direct_write_arena()
                     static_hidden_inputs = []
                     for batch_number in range(self.num_microbatches):
                         if self.config.overlap_moe_expert_parallel_comm:
@@ -2690,8 +2694,10 @@ class TECudaGraphHelper:
                         # slot in lockstep. _validate_mhc_static_hidden_inputs()
                         # has asserted that aliased entries have disjoint
                         # [fwd, bwd] liveness windows.
-                        static_hidden_inputs.append(sample_args[graph_idx][0])
-                    layer.set_te_cuda_graph_static_hidden_inputs(static_hidden_inputs)
+                        if retain_static_inputs:
+                            static_hidden_inputs.append(sample_args[graph_idx][0])
+                    if retain_static_inputs:
+                        layer.set_te_cuda_graph_static_hidden_inputs(static_hidden_inputs)
                 num_layers_accumulated += len(layers)
 
             self._graphs_created = True

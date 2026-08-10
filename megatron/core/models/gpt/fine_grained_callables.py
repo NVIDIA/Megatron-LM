@@ -735,15 +735,17 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             or CudaGraphModule.attn not in layer.config.cuda_graph_modules
         ):
             forward_kwargs["mhc_recompute_manager"] = mhc_recompute_manager
-        elif is_hyper_connection_layer:
+        elif is_hyper_connection_layer and layer._uses_mhc_recompute_attn_cuda_graph_split():
             # The attention-only split replay runs the MoE routing tail itself, so
             # it needs the padding_mask that the eager branch above reads straight
             # off node.chunk_state; without it the graphed path routes as if the
-            # batch were unpadded. Threading it here is confined to this path on
-            # purpose: _replay_mhc_attention_consumer forwards only its tensor
-            # allowlist to the captured callable, whereas the generic
-            # _te_cuda_graph_replay_impl hands **kwargs straight to TE, where an
-            # argument absent at capture time would break replay.
+            # batch were unpadded. The guard is the split predicate, not merely
+            # "hyper-connection layer": hyper connections with TE attention graphs
+            # but without mHC recompute are a supported configuration, and they
+            # fall through to GraphableMegatronModule._te_cuda_graph_replay, which
+            # copies **kwargs straight to TE. padding_mask only enters sample_kwargs
+            # on the THD path, so on SBHD it was never a capture-time argument and
+            # passing it breaks replay -- including when it is None.
             forward_kwargs["padding_mask"] = node.chunk_state.padding_mask
         forward_outputs = forward_func(**forward_kwargs)
         if is_mhc_layer:

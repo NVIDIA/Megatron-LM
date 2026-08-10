@@ -126,7 +126,16 @@ class TransformerLayerSchedulePlan:
             # holds -- on the module, and a later replay that arrives without a
             # fresh assignment would bind arena slots against an already
             # recomputed checkpoint set.
-            self.layer._mhc_recompute_manager = None
+            #
+            # Clear it on the object it was installed on: build_mtp_layer_callables
+            # builds over layer.mtp_model_layer, so for an MTP plan the manager
+            # lives on the inner transformer layer, not on the wrapper.
+            from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
+            if isinstance(self.layer, MultiTokenPredictionLayer):
+                self.layer.mtp_model_layer._mhc_recompute_manager = None
+            else:
+                self.layer._mhc_recompute_manager = None
             del self.layer
 
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):

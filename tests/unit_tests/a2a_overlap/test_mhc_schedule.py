@@ -174,6 +174,37 @@ def test_layer_schedule_orders_recompute(explicit_recompute):
         assert "backward.mhc_recompute.forward" not in calls
 
 
+def test_release_state_clears_the_mhc_manager_on_the_mtp_inner_layer():
+    # build_mtp_layer_callables builds over layer.mtp_model_layer, so the schedule
+    # installs _mhc_recompute_manager on the inner transformer layer. Clearing it
+    # on the MultiTokenPredictionLayer wrapper instead leaves the iteration's
+    # CheckpointManager -- and every tensor it still holds -- pinned on the inner
+    # module, and lets a later replay bind arena slots against an already
+    # recomputed checkpoint set. Both failures are silent.
+    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
+    inner = SimpleNamespace(_mhc_recompute_manager=CheckpointManager())
+    wrapper = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
+    wrapper.mtp_model_layer = inner
+    wrapper._mhc_recompute_manager = CheckpointManager()
+
+    plan = TransformerLayerSchedulePlan.__new__(TransformerLayerSchedulePlan)
+    plan.layer = wrapper
+    plan.release_state()
+
+    assert inner._mhc_recompute_manager is None
+
+
+def test_release_state_clears_the_mhc_manager_on_a_plain_layer():
+    # The non-MTP path must keep working: the manager lives on the layer itself.
+    layer = SimpleNamespace(_mhc_recompute_manager=CheckpointManager())
+    plan = TransformerLayerSchedulePlan.__new__(TransformerLayerSchedulePlan)
+    plan.layer = layer
+    plan.release_state()
+
+    assert layer._mhc_recompute_manager is None
+
+
 def test_model_chunk_recompute_groups_trigger_in_reverse_order():
     calls = []
     layers = [_RecordingLayer(calls, f"layer_{index}") for index in range(5)]
