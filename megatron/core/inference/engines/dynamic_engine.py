@@ -23,7 +23,6 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.communication_utils import is_pipeline_first_stage
 from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
@@ -44,6 +43,7 @@ from megatron.core.inference.inference_request import (
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
     Status,
+    resolve_multimodal_data_for_engine,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -1414,9 +1414,9 @@ class DynamicInferenceEngine(AbstractEngine):
             pp_world_size = torch.distributed.get_world_size(pp_group)
             if pp_world_size > 1:
                 raise NotImplementedError(
-                    "Dynamic VLM inference currently supports pipeline-parallel "
-                    "world size 1 only; PP>1 requires the non-first-stage "
-                    "embedding recv path which is not yet available upstream."
+                    "Dynamic VLM inference does not support pipeline parallel. "
+                    "PP>1 requires the non-first-stage embedding recv path "
+                    "which is not yet available upstream."
                 )
 
         device = torch.cuda.current_device()
@@ -1447,7 +1447,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
             )
 
-        if has_images and imgs is not None and is_pipeline_first_stage(self.controller.pp_group):
+        # PP>1 is rejected above, so we're on the (only) stage that owns the
+        # vision encoder — no is_pipeline_first_stage check needed here.
+        if has_images and imgs is not None:
             with torch.inference_mode():
                 image_embeddings = self.controller.inference_wrapped_model._forward_vision_encoder(
                     imgs, num_image_tiles=num_tiles, imgs_sizes=imgs_sizes
@@ -1457,13 +1459,23 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id, image_embeddings=image_embeddings, image_token_mask=mask_tensor
         )
 
+        # Image-bearing requests: skip prefix caching. After image expansion,
+        # two requests with the same text but different images produce
+        # identical token sequences (runs of -1 pads), so KV block hashes
+        # collide and the second request would serve completions conditioned
+        # on the first request's image. Disabling caching at the request
+        # level is a correctness fix; a follow-up could mix an image digest
+        # into the block hash for cross-request reuse of identical (text,
+        # image) pairs.
+        request_has_images = has_images
+        enable_prefix_caching = self.context.enable_prefix_caching and not request_has_images
         return DynamicVLMInferenceRequest(
             request_id=request_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
             sampling_params=sampling_params,
             block_size_tokens=self.context.block_size_tokens,
-            enable_prefix_caching=self.context.enable_prefix_caching,
+            enable_prefix_caching=enable_prefix_caching,
             precomputed_block_hashes=precomputed_block_hashes or [],
             num_img_embeddings_per_tile=num_img_embeddings_per_tile,
             imgs=imgs,
@@ -2956,23 +2968,24 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                # Payload is [request_id, prompt, sampling_params, image_payload].
-                # image_payload is either list[bytes] (preprocess here) or a
-                # tensor dict (use directly).
+                # Payload is [request_id, prompt, sampling_params, multi_modal_data].
                 fields = data[1:]
                 if len(fields) == 3:
                     request_id, prompt, sampling_params = fields
-                    image_payload = None
+                    multi_modal_data = None
                 else:
-                    request_id, prompt, sampling_params, image_payload = fields[:4]
+                    request_id, prompt, sampling_params, multi_modal_data = fields[:4]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request")
-                from megatron.core.inference.inference_request import (
-                    resolve_image_payload_for_engine,
-                )
-
-                vlm_kwargs = resolve_image_payload_for_engine(
-                    image_payload,
+                # TODO(perf): image preprocessing (PIL decode / resize /
+                # normalize / patchify) runs synchronously on the engine step
+                # loop, adding directly to inter-token latency for every
+                # in-flight request. Move off the engine thread — either via a
+                # bounded ThreadPoolExecutor here or, better, on the
+                # server/coordinator side before the ZMQ hop so the engine
+                # receives ready tensors.
+                vlm_kwargs = resolve_multimodal_data_for_engine(
+                    multi_modal_data,
                     image_preprocessing_config=self.context.config.image_preprocessing_config,
                 )
                 if vlm_kwargs:

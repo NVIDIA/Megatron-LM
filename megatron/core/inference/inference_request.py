@@ -49,88 +49,121 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     return tensor
 
 
-def serialize_image_payload(image_payload: Any) -> Optional[Union[List[bytes], Dict[str, Any]]]:
-    """Serialize one request's multimodal payload for the coordinator wire.
+def serialize_multimodal_data(
+    multi_modal_data: Any,
+) -> Optional[Dict[str, Union[List[bytes], Dict[str, Any]]]]:
+    """Serialize one request's vLLM-style multimodal dictionary.
 
-    Accepted forms:
+    Supported modalities:
 
-    * ``None``: text-only.
-    * ``list[bytes]``: raw images; the engine will preprocess.
-    * ``dict`` with tensor fields (``imgs``, ``imgs_sizes``, optional
-      ``num_tiles`` / ``num_img_embeddings_per_tile``): already-processed
-      pixels (e.g. NeMo-RL ``pixel_values``); the engine skips preprocessing.
+    Images:
+        ``"image"`` accepts raw image bytes, a list of raw image bytes, or a
+        preprocessed tensor dictionary containing ``imgs`` / ``imgs_sizes``
+        or ``imgs`` / ``num_tiles``.
+    Video:
+        Video does not yet have any supported data preprocessing or modeling
+        formats.
+    Audio:
+        Audio does not yet have any supported data preprocessing or modeling
+        formats.
     """
-    if image_payload is None:
+    if multi_modal_data is None:
         return None
-    if isinstance(image_payload, list):
-        if image_payload and not isinstance(image_payload[0], (bytes, bytearray)):
-            raise TypeError(
-                "list image_payload must be list[bytes]; "
-                f"got list[{type(image_payload[0]).__name__}]."
-            )
-        return [bytes(item) for item in image_payload]
-    if not isinstance(image_payload, dict):
+    if not isinstance(multi_modal_data, dict):
+        raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
+
+    unsupported = set(multi_modal_data) - {"image"}
+    if unsupported:
+        raise NotImplementedError(
+            f"Unsupported multimodal modalities: {sorted(unsupported)}; "
+            "only 'image' is currently supported."
+        )
+    image_data = multi_modal_data.get("image")
+    if image_data is None:
+        return None
+
+    if isinstance(image_data, (bytes, bytearray)):
+        return {"image": [bytes(image_data)]}
+    if isinstance(image_data, list):
+        if any(not isinstance(item, (bytes, bytearray)) for item in image_data):
+            raise TypeError("multi_modal_data['image'] list must contain only bytes.")
+        return {"image": [bytes(item) for item in image_data]}
+    if not isinstance(image_data, dict):
         raise TypeError(
-            "image_payload must be None, list[bytes], or dict with tensor fields; "
-            f"got {type(image_payload)}."
+            "multi_modal_data['image'] must be bytes, list[bytes], or a "
+            f"preprocessed tensor dict; got {type(image_data)}."
         )
 
     wire: Dict[str, Any] = {}
     for key in ("imgs", "imgs_sizes", "num_tiles"):
-        value = image_payload.get(key)
+        value = image_data.get(key)
         if value is None:
             continue
         if not isinstance(value, torch.Tensor):
-            raise TypeError(f"image_payload[{key!r}] must be a Tensor, got {type(value)}.")
+            raise TypeError(
+                f"multi_modal_data['image'][{key!r}] must be a Tensor, " f"got {type(value)}."
+            )
         wire[key] = serialize_tensor(value)
-    if "num_img_embeddings_per_tile" in image_payload:
-        wire["num_img_embeddings_per_tile"] = int(
-            image_payload["num_img_embeddings_per_tile"]
-        )
-    if not wire:
-        return None
-    return wire
+    if "num_img_embeddings_per_tile" in image_data:
+        wire["num_img_embeddings_per_tile"] = int(image_data["num_img_embeddings_per_tile"])
+    return {"image": wire} if wire else None
 
 
-def resolve_image_payload_for_engine(
-    image_payload: Any,
-    *,
-    image_preprocessing_config: Optional[ImageProcessingConfig] = None,
+def resolve_multimodal_data_for_engine(
+    multi_modal_data: Any, *, image_preprocessing_config: Optional[ImageProcessingConfig] = None
 ) -> Dict[str, Any]:
-    """Turn a wire image payload into ``DynamicInferenceEngine.add_request`` kwargs.
+    """Resolve wire-format multimodal data into dynamic-engine arguments.
 
-    * ``list[bytes]`` -> preprocess into ``imgs`` / ``imgs_sizes`` using the
-      engine's image preprocessing configuration.
-    * tensor dict -> deserialize and pass through without preprocessing.
+    Supported modalities:
+
+    Images:
+        Raw image bytes are preprocessed into model inputs. Serialized or
+        in-process preprocessed image tensor dictionaries are passed through
+        as dynamic-engine image arguments.
+    Video:
+        Video does not yet have any supported data preprocessing or modeling
+        formats.
+    Audio:
+        Audio does not yet have any supported data preprocessing or modeling
+        formats.
     """
-    if image_payload is None:
+    if multi_modal_data is None:
         return {}
-    if isinstance(image_payload, list):
-        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (  # noqa: E501
+    if not isinstance(multi_modal_data, dict):
+        raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
+
+    unsupported = set(multi_modal_data) - {"image"}
+    if unsupported:
+        raise NotImplementedError(
+            f"Unsupported multimodal modalities: {sorted(unsupported)}; "
+            "only 'image' is currently supported."
+        )
+    image_data = multi_modal_data.get("image")
+    if image_data is None:
+        return {}
+
+    if isinstance(image_data, list):
+        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (  # noqa: E501  # pylint: disable=line-too-long
             preprocess_image_bytes_list,
         )
 
         if image_preprocessing_config is None:
-            raise RuntimeError(
-                "Raw image payloads require InferenceConfig.image_preprocessing_config."
-            )
-        return preprocess_image_bytes_list(image_payload, image_preprocessing_config)
-    if not isinstance(image_payload, dict):
+            raise RuntimeError("Raw image data require InferenceConfig.image_preprocessing_config.")
+        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
+        return preprocess_image_bytes_list(image_data, image_preprocessing_config, device=device)
+    if not isinstance(image_data, dict):
         raise TypeError(
-            f"Unsupported image payload type: {type(image_payload)}; "
-            "expected None, list[bytes], or dict."
+            "Wire multi_modal_data['image'] must be list[bytes] or a serialized "
+            f"tensor dict; got {type(image_data)}."
         )
+
     kwargs: Dict[str, Any] = {}
     for key in ("imgs", "imgs_sizes", "num_tiles"):
-        if key in image_payload:
-            value = image_payload[key]
-            kwargs[key] = (
-                value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
-            )
-    if "num_img_embeddings_per_tile" in image_payload:
-        kwargs["num_img_embeddings_per_tile"] = int(
-            image_payload["num_img_embeddings_per_tile"]
-        )
+        if key in image_data:
+            value = image_data[key]
+            kwargs[key] = value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
+    if "num_img_embeddings_per_tile" in image_data:
+        kwargs["num_img_embeddings_per_tile"] = int(image_data["num_img_embeddings_per_tile"])
     return kwargs
 
 

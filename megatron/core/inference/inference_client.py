@@ -7,7 +7,10 @@ import time
 from typing import List, Optional, Union
 
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    serialize_multimodal_data,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
@@ -93,7 +96,7 @@ class InferenceClient:
         prompt: Union[str, List[int]],
         sampling_params: SamplingParams,
         *,
-        image_payload=None,
+        multi_modal_data=None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -107,17 +110,23 @@ class InferenceClient:
             sampling_params: An object containing the sampling parameters for
                 text generation (e.g., temperature, top_p). It must have a
                 `serialize()` method.
-            image_payload: Optional multimodal input. Either ``list[bytes]``
-                (engine preprocesses) or a dict of tensors such as
-                ``{"imgs": pixel_values, "imgs_sizes": sizes}`` (skip preprocess).
+            multi_modal_data: Optional vLLM-style modality dictionary.
+
+                Images:
+                    ``"image"`` accepts raw image bytes, a list of raw image
+                    bytes, or a preprocessed image tensor dictionary.
+                Video:
+                    Video does not yet have any supported data preprocessing
+                    or modeling formats.
+                Audio:
+                    Audio does not yet have any supported data preprocessing
+                    or modeling formats.
 
         Returns:
             asyncio.Future: A future that will be resolved with a
             `DynamicInferenceRequest` object (if deserialize=True) or a raw
             serialized dict (if deserialize=False) containing the completed result.
         """
-        from megatron.core.inference.inference_request import serialize_image_payload
-
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [
@@ -125,7 +134,7 @@ class InferenceClient:
             request_id,
             prompt,
             sampling_params.serialize(),
-            serialize_image_payload(image_payload),
+            serialize_multimodal_data(multi_modal_data),
         ]
         return self._submit_request(payload, request_id)
 
@@ -230,7 +239,7 @@ class InferenceClient:
         prompt: Union[str, List[int]],
         sampling_params: SamplingParams,
         *,
-        image_payload=None,
+        multi_modal_data=None,
     ) -> AsyncStream[dict]:
         """Submit a streaming inference request.
 
@@ -250,13 +259,21 @@ class InferenceClient:
             prompt: A string or list of token IDs.
             sampling_params: Sampling parameters. ``streaming`` is set to True
                 in-place.
-            image_payload: Optional multimodal input (``list[bytes]`` or tensor dict).
+            multi_modal_data: Optional vLLM-style modality dictionary.
+
+                Images:
+                    ``"image"`` accepts raw image bytes, a list of raw image
+                    bytes, or a preprocessed image tensor dictionary.
+                Video:
+                    Video does not yet have any supported data preprocessing
+                    or modeling formats.
+                Audio:
+                    Audio does not yet have any supported data preprocessing
+                    or modeling formats.
 
         Returns:
             AsyncStream[dict]: Per-step partial and final reply frames.
         """
-        from megatron.core.inference.inference_request import serialize_image_payload
-
         sampling_params.streaming = True
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -265,7 +282,7 @@ class InferenceClient:
             request_id,
             prompt,
             sampling_params.serialize(),
-            serialize_image_payload(image_payload),
+            serialize_multimodal_data(multi_modal_data),
         ]
         return self._submit_stream(payload, request_id)
 

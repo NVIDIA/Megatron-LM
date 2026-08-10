@@ -81,13 +81,13 @@ def handle_submit_request(coordinator, sender_identity, payload):
     # this is a message from a client.
     # route it to a data parallel rank
     # Payload is [SUBMIT_REQUEST, client_request_id, prompt, sampling_params,
-    # image_payload]. image_payload is either list[bytes] or a tensor dict.
+    # multi_modal_data].
     fields = payload[1:]
     if len(fields) == 3:
         client_request_id, prompt, sampling_params = fields
-        image_payload = None
+        multi_modal_data = None
     else:
-        client_request_id, prompt, sampling_params, image_payload = fields[:4]
+        client_request_id, prompt, sampling_params, multi_modal_data = fields[:4]
 
     # map client request_id to server request_id
     # necessary because multiple clients might have the same request_id.
@@ -106,14 +106,16 @@ def handle_submit_request(coordinator, sender_identity, payload):
         raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
     engine_payload = msgpack.packb(
-        [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params, image_payload],
+        [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params, multi_modal_data],
         use_bin_type=True,
     )
 
-    # Skip prefix-aware routing for image-bearing requests: two prompts with
-    # identical text tokens but different images would otherwise hash the same
-    # and falsely share kv-cache prefixes.
-    if image_payload:
+    # Skip prefix-aware routing for image-bearing requests. Prefix *caching*
+    # itself is disabled for these requests in _build_vlm_request, so cross-image
+    # cache reuse can't happen; clearing hashes here just prevents affinity
+    # routing that would concentrate multimodal requests onto whichever rank
+    # happened to serve a text-identical prompt first.
+    if multi_modal_data:
         request_hashes = []
     else:
         request_hashes = coordinator.compute_request_hashes(prompt)

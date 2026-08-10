@@ -2,13 +2,20 @@
 
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
+import socket
 import time
 import traceback
+import urllib.parse
 import urllib.request
 import uuid
 import warnings
+
+_IMAGE_FETCH_TIMEOUT_S = 5.0
+_MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB
+_IMAGE_FETCH_USER_AGENT = "megatron-inference"
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
@@ -246,8 +253,32 @@ def _extract_image_url_bytes(url: str) -> bytes:
         _, b64_data = url.split(",", 1)
         return base64.b64decode(b64_data)
     if url.startswith(("http://", "https://")):
-        with urllib.request.urlopen(url) as response:
-            return response.read()
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.hostname:
+            raise ValueError(f"Invalid image_url: {url[:40]!r}")
+        try:
+            ip = ipaddress.ip_address(socket.gethostbyname(parsed.hostname))
+        except (socket.gaierror, ValueError) as exc:
+            raise ValueError(f"Cannot resolve image_url host: {parsed.hostname}") from exc
+        # Refuse SSRF-prone destinations (loopback, RFC1918, link-local,
+        # multicast, reserved, unspecified). Public addresses only.
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(
+                f"Refusing to fetch image from non-public address: {parsed.hostname}"
+            )
+        req = urllib.request.Request(url, headers={"User-Agent": _IMAGE_FETCH_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=_IMAGE_FETCH_TIMEOUT_S) as response:
+            data = response.read(_MAX_IMAGE_BYTES + 1)
+        if len(data) > _MAX_IMAGE_BYTES:
+            raise ValueError(f"Image at {parsed.hostname} exceeds {_MAX_IMAGE_BYTES} byte limit")
+        return data
     raise ValueError(f"Unsupported image_url scheme: {url[:40]!r}")
 
 
@@ -260,13 +291,13 @@ def _extract_images_from_messages(messages):
     with plain string ``content`` are passed through unchanged.
 
     Returns:
-        (messages_with_markers, image_payload)
+        (messages_with_markers, image_bytes_list)
     """
     if not isinstance(messages, list):
         return messages, []
 
     rewritten = []
-    image_payload: list[bytes] = []
+    image_bytes_list: list[bytes] = []
 
     for message in messages:
         if not isinstance(message, dict):
@@ -286,7 +317,7 @@ def _extract_images_from_messages(messages):
                 if not url:
                     continue
                 try:
-                    image_payload.append(_extract_image_url_bytes(url))
+                    image_bytes_list.append(_extract_image_url_bytes(url))
                 except Exception as e:
                     logger.warning(f"Failed to decode image_url: {e}")
                     continue
@@ -302,7 +333,7 @@ def _extract_images_from_messages(messages):
         else:
             rewritten.append(message)
 
-    return rewritten, image_payload
+    return rewritten, image_bytes_list
 
 
 def _sanitize_messages_for_template(messages):
@@ -542,7 +573,7 @@ try:
         # Extract any image_url blocks before template sanitization, which would
         # otherwise drop them. Replaces each image block with an inline <image>
         # text marker that the chat template can substitute.
-        messages, image_payload = _extract_images_from_messages(messages)
+        messages, image_bytes_list = _extract_images_from_messages(messages)
         template_messages = _sanitize_messages_for_template(messages)
         template_tools = _sanitize_tools_for_template(tools)
 
@@ -736,7 +767,9 @@ try:
 
             streams = [
                 client.add_request_streaming(
-                    prompt_tokens, sampling_params, image_payload=image_payload or None
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=({"image": image_bytes_list} if image_bytes_list else None),
                 )
                 for _ in range(n)
             ]
@@ -792,7 +825,9 @@ try:
 
         tasks = [
             client.add_request(
-                prompt_tokens, sampling_params, image_payload=image_payload or None
+                prompt_tokens,
+                sampling_params,
+                multi_modal_data=({"image": image_bytes_list} if image_bytes_list else None),
             )
             for _ in range(n)
         ]

@@ -58,7 +58,7 @@ class MegatronLLM(_MegatronLLMBase):
         self,
         prompts: Union[str, List[int], List[str], List[List[int]]],
         sampling_params: Optional[SamplingParams] = None,
-        image_payload=None,
+        multi_modal_data=None,
     ) -> List["DynamicInferenceRequest"]:
         """Run inference for one prompt or a batch.
 
@@ -66,9 +66,18 @@ class MegatronLLM(_MegatronLLMBase):
         input returns a one-element list -- the always-list shape is the
         deliberate sync-vs-async asymmetry.
 
-        ``image_payload`` is either ``list[bytes]`` (engine preprocesses) or a
-        tensor dict such as ``{"imgs": pixel_values, "imgs_sizes": sizes}``
-        (skip preprocess). Batched prompts take a list of those (or ``None``).
+        ``multi_modal_data`` follows vLLM's modality-dictionary shape. Batched
+        prompts take one modality dictionary per prompt.
+
+        Images:
+            ``"image"`` accepts raw image bytes, a list of raw image bytes, or
+            a preprocessed image tensor dictionary.
+        Video:
+            Video does not yet have any supported data preprocessing or
+            modeling formats.
+        Audio:
+            Audio does not yet have any supported data preprocessing or
+            modeling formats.
 
         No concurrency guard: sync is single-caller by Python's GIL. If you
         need to call ``generate`` concurrently from multiple threads, callers
@@ -85,21 +94,17 @@ class MegatronLLM(_MegatronLLMBase):
         if not normalized:
             return []
 
-        per_prompt_images = self._normalize_image_payload_list(
-            image_payload,
-            num_prompts=len(normalized),
-            is_batch=is_batch,
+        per_prompt_multi_modal_data = self._normalize_multi_modal_data_list(
+            multi_modal_data, num_prompts=len(normalized), is_batch=is_batch
         )
 
         if self._use_coordinator:
             assert self._loop_manager is not None
             return self._loop_manager.run_sync(
-                self._generate_impl(normalized, sampling_params, per_prompt_images)
+                self._generate_impl(normalized, sampling_params, per_prompt_multi_modal_data)
             )
-        if any(per_prompt_images):
-            raise ValueError(
-                "image_payload is only supported with use_coordinator=True."
-            )
+        if any(per_prompt_multi_modal_data):
+            raise ValueError("multi_modal_data is only supported with use_coordinator=True.")
         # Direct mode: bypass _generate_impl (which would use to_thread,
         # pointless for sync). Call the engine directly and merge.
         records = self._engine.generate(normalized, sampling_params)

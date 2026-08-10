@@ -264,7 +264,7 @@ class _MegatronLLMBase:
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
-        inference_wrapper_cls: Optional[Type[AbstractModelInferenceWrapper]] = None,
+        inference_wrapper_cls: Type[AbstractModelInferenceWrapper] = GPTInferenceWrapper,
     ) -> None:
         if (coordinator_host is not None or coordinator_port is not None) and not use_coordinator:
             raise ValueError("coordinator_host/port require use_coordinator=True")
@@ -284,8 +284,7 @@ class _MegatronLLMBase:
 
         # Build the engine pipeline. Mirrors examples/inference/gpt/gpt_dynamic_inference.py.
         context = DynamicInferenceContext(model.config, inference_config)
-        wrapper_cls = inference_wrapper_cls or GPTInferenceWrapper
-        wrapper = wrapper_cls(model, context)
+        wrapper = inference_wrapper_cls(model, context)
         controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)
         engine = DynamicInferenceEngine(controller=controller, context=context)
 
@@ -447,44 +446,28 @@ class _MegatronLLMBase:
             f"got {type(prompts)}"
         )
 
-    def _normalize_image_payload_list(
-        self,
-        image_payload,
-        *,
-        num_prompts: int,
-        is_batch: bool,
+    def _normalize_multi_modal_data_list(
+        self, multi_modal_data, *, num_prompts: int, is_batch: bool
     ):
-        """Normalize multimodal inputs to one payload entry per prompt.
-
-        Each entry is ``None``, ``list[bytes]``, or a tensor dict
-        ``{"imgs": Tensor, "imgs_sizes": Tensor, ...}``.
-        """
-        if image_payload is None:
+        """Normalize vLLM-style multimodal dictionaries per prompt."""
+        if multi_modal_data is None:
             return [None] * num_prompts
 
         if not is_batch:
-            if (
-                isinstance(image_payload, list)
-                and image_payload
-                and isinstance(image_payload[0], list)
-            ):
-                raise TypeError(
-                    "For a single prompt, image_payload must be list[bytes] or a "
-                    "tensor dict, not a batch of per-prompt payloads."
-                )
-            return [image_payload]
+            if not isinstance(multi_modal_data, dict):
+                raise TypeError("For a single prompt, multi_modal_data must be a modality dict.")
+            return [multi_modal_data]
 
-        if not isinstance(image_payload, list):
-            raise TypeError(
-                "For batched prompts, image_payload must be "
-                "list[list[bytes] | dict | None]."
-            )
-        if len(image_payload) != num_prompts:
+        if not isinstance(multi_modal_data, list):
+            raise TypeError("For batched prompts, multi_modal_data must be list[dict | None].")
+        if len(multi_modal_data) != num_prompts:
             raise ValueError(
-                "Batched image_payload must be the same length as prompts "
-                f"(got {len(image_payload)} vs {num_prompts})."
+                "Batched multi_modal_data must be the same length as prompts "
+                f"(got {len(multi_modal_data)} vs {num_prompts})."
             )
-        return list(image_payload)
+        if any(item is not None and not isinstance(item, dict) for item in multi_modal_data):
+            raise TypeError("Each batched multi_modal_data entry must be a dict or None.")
+        return list(multi_modal_data)
 
     # ---- private impl coroutines ----
     # Subclasses' public methods bridge to these via ``_EventLoopManager``
@@ -495,10 +478,7 @@ class _MegatronLLMBase:
     # loop to our runtime loop
 
     async def _generate_impl(
-        self,
-        prompts: Union[List[str], List[List[int]]],
-        sp: SamplingParams,
-        image_payload_list,
+        self, prompts: Union[List[str], List[List[int]]], sp: SamplingParams, multi_modal_data_list
     ) -> List["DynamicInferenceRequest"]:
         """Run inference for a non-empty list of prompts; returns input-ordered list.
 
@@ -508,10 +488,10 @@ class _MegatronLLMBase:
         - Direct mode: runs on the caller's event loop; offloads the synchronous
           ``engine.generate`` to a thread.
         """
-        if len(image_payload_list) != len(prompts):
+        if len(multi_modal_data_list) != len(prompts):
             raise ValueError(
-                "image_payload_list must be the same length as prompts "
-                f"(got {len(image_payload_list)} vs {len(prompts)})."
+                "multi_modal_data_list must be the same length as prompts "
+                f"(got {len(multi_modal_data_list)} vs {len(prompts)})."
             )
 
         if self._use_coordinator:
@@ -522,15 +502,13 @@ class _MegatronLLMBase:
             assert self._coord_runtime is not None and self._coord_runtime.client is not None
             futures = [
                 self._coord_runtime.client.add_request(
-                    p, sp, image_payload=image_payload
+                    p, sp, multi_modal_data=sample_multi_modal_data
                 )
-                for p, image_payload in zip(prompts, image_payload_list, strict=True)
+                for p, sample_multi_modal_data in zip(prompts, multi_modal_data_list, strict=True)
             ]
             return list(await asyncio.gather(*futures))
-        if any(image_payload_list):
-            raise ValueError(
-                "image_payload is only supported with use_coordinator=True."
-            )
+        if any(multi_modal_data_list):
+            raise ValueError("multi_modal_data is only supported with use_coordinator=True.")
         # TODO: replace with an upstream ``engine.async_generate`` so direct-mode
         # async generate doesn't block the caller's event loop.
         records = self._engine.generate(prompts, sp)
