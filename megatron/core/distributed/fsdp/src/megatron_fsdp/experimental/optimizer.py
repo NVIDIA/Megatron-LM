@@ -118,7 +118,12 @@ def fully_shard_optimizer(
                 if parameter_group in seen_parameter_groups:
                     continue
                 seen_parameter_groups.add(parameter_group)
-                parameter_group.sync_model_weight_from_main_weight()
+
+                context = parameter_group.get_context()
+                allgather_stream = context.allgather_stream
+                allgather_stream.wait_stream(context.current_stream())
+                with torch.cuda.stream(allgather_stream):
+                    parameter_group.cast_main_weight_to_model_weight()
 
     optimizer.register_step_pre_hook(step_pre_hook)
     optimizer.register_step_post_hook(step_post_hook)

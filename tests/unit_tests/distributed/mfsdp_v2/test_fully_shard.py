@@ -857,8 +857,8 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
         torch.testing.assert_close(second_loss, first_loss)
 
 
-def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, monkeypatch):
-    """Optimizer synchronization should run once per group, not once per microbatch."""
+def test_optimizer_post_step_casts_once_per_parameter_group(distributed_setup, monkeypatch):
+    """Optimizer model-weight casts should run once per group, not once per microbatch."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
@@ -870,20 +870,20 @@ def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, m
         fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     parameter_groups = (*model.fc1.parameter_groups, *model.fc2.parameter_groups)
-    sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
+    cast_counts = {parameter_group: 0 for parameter_group in parameter_groups}
 
-    def make_count_sync(parameter_group):
-        sync_model_weight = parameter_group.sync_model_weight_from_main_weight
+    def make_count_cast(parameter_group):
+        cast_model_weight = parameter_group.cast_main_weight_to_model_weight
 
-        def count_sync():
-            sync_counts[parameter_group] += 1
-            sync_model_weight()
+        def count_cast():
+            cast_counts[parameter_group] += 1
+            cast_model_weight()
 
-        return count_sync
+        return count_cast
 
     for parameter_group in parameter_groups:
         monkeypatch.setattr(
-            parameter_group, "sync_model_weight_from_main_weight", make_count_sync(parameter_group)
+            parameter_group, "cast_main_weight_to_model_weight", make_count_cast(parameter_group)
         )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
@@ -895,9 +895,9 @@ def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, m
         for microbatch_input in inputs:
             (model(microbatch_input).sum() / len(inputs)).backward()
 
-        assert all(sync_count == step for sync_count in sync_counts.values())
+        assert all(cast_count == step for cast_count in cast_counts.values())
         optimizer.step()
-        assert all(sync_count == step + 1 for sync_count in sync_counts.values())
+        assert all(cast_count == step + 1 for cast_count in cast_counts.values())
 
 
 def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setup):

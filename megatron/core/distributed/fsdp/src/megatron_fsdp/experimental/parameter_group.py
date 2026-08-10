@@ -16,6 +16,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, cast
 from weakref import ReferenceType, ref
 
 import torch
@@ -27,6 +28,9 @@ from torch.distributed import DeviceMesh
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
 from .placement import Partial, Placements, Replicate, changed_mesh_axis
+
+if TYPE_CHECKING:
+    from .module import FsdpContext, FsdpModule
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -106,6 +110,7 @@ class FsdpParameterGroup:
         model_weight_placements = tuple(placements.parameter)
         main_grad_placements = tuple(placements.gradient)
         main_weight_placements = tuple(placements.optimizer)
+        self._model_weight_placements = model_weight_placements
 
         # Python dicts preserve insertion order, so parameter_to_fqns and
         # fsdp_parameters define the same stable DBuffer tensor order.
@@ -220,6 +225,15 @@ class FsdpParameterGroup:
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
 
+    def get_context(self) -> "FsdpContext":
+        """Return the finalized runtime context that owns this parameter group."""
+        owning_module = self._owning_module()
+        if owning_module is None:
+            raise RuntimeError("FSDP parameter group outlived its owning module.")
+        context = cast("FsdpModule", owning_module).context
+        context.ensure_finalized()
+        return context
+
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:
             return nullcontext()
@@ -242,7 +256,12 @@ class FsdpParameterGroup:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
     def sync_model_weight_from_main_weight(self) -> None:
-        """Refresh compute weights from optimizer weights."""
+        """Cast optimizer weights and restore the configured model-weight placements."""
+        self.cast_main_weight_to_model_weight()
+        self.restore_model_weight()
+
+    def cast_main_weight_to_model_weight(self) -> None:
+        """Cast optimizer weights to the model-weight dtype."""
         if self.main_weight is self.model_weight:
             return
 
@@ -250,15 +269,19 @@ class FsdpParameterGroup:
             self.main_weight.cast(self.model_weight.dtype, out=self.model_weight)
             return
 
-        # main_weight is typically the higher-precision optimizer dtype, while
-        # model_weight is the lower-precision compute dtype. Cast before redistributing
-        # so cross-rank communication moves the smaller compute-dtype payload.
-        self.main_weight.cast(self.model_weight.dtype).redistribute(
-            self.model_weight.placements, out=self.model_weight
-        )
+        self.model_weight = self.main_weight.cast(self.model_weight.dtype)
+
+    def restore_model_weight(self) -> None:
+        """Restore a deferred ZeRO-1 model weight to its compute placements."""
+        self.model_weight = self.model_weight.redistribute(self._model_weight_placements)
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
+        # In ZeRO-1, the post-step cast leaves model_weight sharded. Only the first
+        # microbatch sees placements different from the configured model placements
+        # and restores the replicated model weight.
+        if self.model_weight.placements != self._model_weight_placements:
+            self.restore_model_weight()
         with self._symmetric_memory_context():
             self._unsharded_model_weight.reallocate_storage()
         # This buffer backs unsharded Parameters whose views may be saved by autograd.
