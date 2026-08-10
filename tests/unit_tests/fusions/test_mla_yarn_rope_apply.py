@@ -106,6 +106,31 @@ class TestApplyRotaryPosEmbTHD:
 
         torch.testing.assert_close(legacy_out, explicit_out)
 
+    def test_shared_max_seqlen_maps_asymmetric_query_sequences_from_zero(self):
+        cp_group = FakeCPGroup(size=1, rank=0)
+        cu_seqlens_q = torch.tensor([0, 3, 6], dtype=torch.int32)
+        t = torch.randn(6, 2, 8)
+        freqs = torch.randn(4, 1, 1, 8)
+
+        max_seqlen_q = 3
+        max_seqlen_kv = freqs.size(0)
+        assert max_seqlen_q < max_seqlen_kv < t.size(0)
+        combined_max_seqlen = max(max_seqlen_q, max_seqlen_kv)
+        out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens_q, freqs, cp_group=cp_group, max_seqlen=combined_max_seqlen
+        )
+        compatibility_out = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens_q, freqs, cp_group=cp_group
+        )
+
+        expected_freqs = freqs[torch.tensor([0, 1, 2, 0, 1, 2])]
+        expected = rope_utils_module._apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1), expected_freqs
+        ).squeeze(1)
+
+        torch.testing.assert_close(out, expected)
+        torch.testing.assert_close(out, compatibility_out)
+
 
 class _SaveOutputForBackward(torch.autograd.Function):
     """Minimal stand-in for a kernel whose backward consumes its output."""
