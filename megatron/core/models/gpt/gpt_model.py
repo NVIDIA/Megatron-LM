@@ -34,6 +34,7 @@ from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_han
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
+    prepare_mtp_sequence_roll_context,
     process_mtp_loss,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -703,6 +704,38 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             and inference_context.is_dynamic_batching()
             and inference_context.num_speculative_tokens > 0
         )
+        mtp_cp_group = None
+        sequence_roll_context = None
+        if (
+            self.config.mtp_num_layers
+            and (mtp_in_postprocess or self.post_process)
+            and not (in_inference_mode or is_spec_decode)
+        ):
+            mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            # Build layout-specific metadata once, then fetch every locally owned
+            # MTP field's compact successor rows in one grouped operation. The extra
+            # row covers RL's initial label derivation before the per-layer rolls.
+            sequence_roll_context = prepare_mtp_sequence_roll_context(
+                tensor=input_ids if input_ids is not None else labels,
+                cp_group=mtp_cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            if sequence_roll_context is not None:
+                roll_position_ids = mtp_in_postprocess and getattr(
+                    self.embedding, "add_position_embedding", True
+                )
+                sequence_roll_context = sequence_roll_context.prefetch_halos(
+                    width=self.config.mtp_num_layers + 1,
+                    input_ids=(
+                        input_ids
+                        if mtp_in_postprocess or (self.post_process and labels is None)
+                        else None
+                    ),
+                    position_ids=position_ids if roll_position_ids else None,
+                    labels=labels if self.post_process else None,
+                    loss_mask=loss_mask if self.post_process else None,
+                    padding_mask=padding_mask if mtp_in_postprocess else None,
+                )
 
         # logits and loss
         output_weight = None
@@ -719,6 +752,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
+                sequence_roll_context=sequence_roll_context,
                 sequence_len_offset=sequence_len_offset,
                 padding_mask=padding_mask,
                 embedding=self.embedding,
@@ -756,6 +790,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     cp_group=self.pg_collection.cp,
                     tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
+                    sequence_roll_context=sequence_roll_context,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
                 )
