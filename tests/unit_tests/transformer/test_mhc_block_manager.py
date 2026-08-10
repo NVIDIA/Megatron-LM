@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import (
+    CheckpointManager,
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
     initialize_rng_tracker,
@@ -20,6 +21,11 @@ class TestCheckpointWithoutOutputManagerAPI:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_reviewed_manager_name_is_compatible_alias(self):
+        """The #4531 manager name remains a compatible public alias."""
+        assert CheckpointWithoutOutputManager is CheckpointManager
+        assert isinstance(CheckpointWithoutOutputManager(), CheckpointManager)
 
     def test_auto_register(self):
         """CheckpointWithoutOutput auto-registers to manager when ckpt_manager is provided."""

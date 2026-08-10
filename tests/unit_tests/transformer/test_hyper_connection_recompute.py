@@ -5,8 +5,8 @@ Unit tests for HyperConnection block-level recomputation.
 
 Tests the following functionality:
 1. HyperConnectionModule._forward_with_checkpoint correctness
-2. HyperConnectionModule.apply_h_post with CheckpointWithoutOutputManager
-3. Multiple HyperConnectionModules chained with a single CheckpointWithoutOutputManager
+2. HyperConnectionModule.apply_h_post with CheckpointManager
+3. Multiple HyperConnectionModules chained with a single CheckpointManager
 4. Partial checkpoint (last layer not checkpointed)
 5. TransformerConfig 'mhc' in recompute_modules option
 """
@@ -14,10 +14,7 @@ Tests the following functionality:
 import pytest
 import torch
 
-from megatron.core.tensor_parallel.random import (
-    CheckpointWithoutOutputManager,
-    model_parallel_cuda_manual_seed,
-)
+from megatron.core.tensor_parallel.random import CheckpointManager, model_parallel_cuda_manual_seed
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -49,6 +46,32 @@ class TestHyperConnectionCheckpoint:
         module.cuda()
         return module
 
+    def test_apply_h_res_uses_h_res_transpose(self):
+        """apply_h_res should compute H_res.T @ residual."""
+        module = self._create_hyper_connection_module(hidden_size=4, num_residual_streams=2)
+        h_res = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]], device='cuda')
+        residual = torch.tensor([[[10.0, 100.0, 3.0, 4.0, 1.0, 2.0, 5.0, 6.0]]], device='cuda')
+        expected = torch.tensor(
+            [[[13.0, 106.0, 18.0, 22.0, 24.0, 208.0, 26.0, 32.0]]], device='cuda'
+        )
+
+        mixed = module.apply_h_res(h_res, residual)
+
+        torch.testing.assert_close(mixed, expected, atol=0.0, rtol=0.0)
+
+    def test_forward_preserves_three_tuple_api_and_hybrid_can_request_residual(self):
+        module = self._create_hyper_connection_module(hidden_size=8, num_residual_streams=2)
+        hidden_states = torch.randn(4, 1, 16, device='cuda', requires_grad=True)
+
+        compatible_output = module(hidden_states)
+        hybrid_output = module(hidden_states, return_residual=True)
+
+        assert len(compatible_output) == 3
+        assert len(hybrid_output) == 4
+        for compatible, hybrid in zip(compatible_output, hybrid_output[:3]):
+            torch.testing.assert_close(compatible, hybrid)
+        assert hybrid_output[3].shape == hidden_states.shape
+
     def test_forward_normal_vs_checkpoint_correctness(self):
         """
         Test that _forward_with_checkpoint produces the same outputs as _forward_normal.
@@ -75,7 +98,7 @@ class TestHyperConnectionCheckpoint:
         # Forward without checkpoint (reference)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        aggregated_ref, h_res_ref, h_post_ref = module._forward_normal(hidden_states)
+        aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(hidden_states)
         mixed_ref = module.apply_h_res(h_res_ref, residual)
         loss_ref = aggregated_ref.sum() + mixed_ref.sum() + h_post_ref.sum()
         loss_ref.backward()
@@ -85,9 +108,9 @@ class TestHyperConnectionCheckpoint:
         # Forward with checkpoint
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = CheckpointWithoutOutputManager()
-        aggregated_ckpt, h_res_ckpt, h_post_ckpt = module._forward_with_checkpoint(
-            hidden_states_ckpt, manager
+        manager = CheckpointManager()
+        aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt_out = (
+            module._forward_with_checkpoint(hidden_states_ckpt, manager)
         )
         mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
         # Calculate loss before discarding outputs
@@ -145,7 +168,7 @@ class TestHyperConnectionCheckpoint:
 
         # With checkpoint (manager provided)
         torch.manual_seed(42)
-        manager = CheckpointWithoutOutputManager()
+        manager = CheckpointManager()
         x_out_ckpt, bias_out_ckpt = module.apply_h_post(
             (x_ckpt, bias), h_post_ckpt, manager=manager
         )
@@ -194,7 +217,7 @@ class TestHyperConnectionCheckpoint:
         # With manager (uses _forward_with_checkpoint)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = CheckpointWithoutOutputManager()
+        manager = CheckpointManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
             hidden_states_ckpt, mhc_recompute_manager=manager
         )
@@ -209,7 +232,7 @@ class TestHyperConnectionCheckpoint:
 
 
 class TestMHCBlockRecomputeIntegration:
-    """Test CheckpointWithoutOutputManager integration with HyperConnection."""
+    """Test CheckpointManager integration with HyperConnection."""
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -221,7 +244,7 @@ class TestMHCBlockRecomputeIntegration:
     def test_multiple_hyper_connections_in_chain(self):
         """
         Test that multiple HyperConnectionModules can be chained together
-        with a single CheckpointWithoutOutputManager.
+        with a single CheckpointManager.
         """
         hidden_size = 64
         num_streams = 4
@@ -278,7 +301,7 @@ class TestMHCBlockRecomputeIntegration:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
-        manager = CheckpointWithoutOutputManager()
+        manager = CheckpointManager()
 
         h = hidden_states_ckpt
         r = residual_ckpt
@@ -359,7 +382,7 @@ class TestMHCBlockRecomputeIntegration:
         # With manager - checkpoint everything except final output
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = CheckpointWithoutOutputManager()
+        manager = CheckpointManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
             hidden_states_ckpt, mhc_recompute_manager=manager
         )
