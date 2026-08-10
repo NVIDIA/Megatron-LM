@@ -9,7 +9,7 @@ ARG UV_VERSION=0.7.2
 ARG YQ_VERSION=4.44.1
 # TE 2.18's NCCL EP build requires NCCL 2.30.7+; the 26.06 base uses CUDA 13.3.
 ARG NCCL_VERSION=2.30.7-1+cuda13.3
-ENV PATH="/root/.local/bin:$PATH"
+ENV PATH="/usr/local/bin:$PATH"
 ARG UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
 ENV VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
@@ -31,6 +31,7 @@ RUN bash -ex <<"EOF"
     wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/local/bin/yq
     chmod a+x /usr/local/bin/yq
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+    install -m 0755 /root/.local/bin/uv /usr/local/bin/uv
 EOF
 
 RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_nccl.sh \
@@ -126,8 +127,33 @@ EOF
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+RUN groupadd --gid "${RUNTIME_GID}" nemo-runtime && \
+    useradd --no-log-init --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
+        --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime && \
+    install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" \
+        /opt/megatron-lm /home/gitlab-runner/data/gpt3_data
+
+ENV HOME=/home/nemo-runtime \
+    XDG_CACHE_HOME=/tmp/regent-cache/xdg \
+    UV_CACHE_DIR=/tmp/regent-cache/uv
+
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+
+# The CI harness materializes an immutable test commit here rather than over
+# the dependency-build checkout in /workspace. Prove that this canonical
+# coverage path and all runtime cache roots work under the final image user.
+RUN test "$(id -u)" = "${RUNTIME_UID}" && \
+    test -x /usr/local/bin/uv && \
+    test -x /opt/venv/bin/python && \
+    mkdir -p "${XDG_CACHE_HOME}" "${UV_CACHE_DIR}" && \
+    touch /opt/megatron-lm/.nonroot-write-probe && \
+    rm /opt/megatron-lm/.nonroot-write-probe
+
 ##### For NVIDIANS only #####
 FROM main AS jet
+USER root
 ARG JET_API_VERSION
 ENV PATH="$PATH:/opt/jet/bin"
 RUN --mount=type=secret,id=JET_INDEX_URLS bash -ex <<"EOF"
@@ -145,4 +171,8 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     uv pip install --no-cache-dir --upgrade "setuptools>=80"
     uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=4.0" 
 EOF
+
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+USER ${RUNTIME_UID}:${RUNTIME_GID}
 ###
