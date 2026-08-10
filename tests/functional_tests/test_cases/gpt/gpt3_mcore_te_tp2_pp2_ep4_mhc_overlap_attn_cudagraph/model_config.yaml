@@ -71,6 +71,9 @@ MODEL_ARGS:
 
   # MoE. Every layer is an expert layer so every layer builds an mhc_post node;
   # the dense hyper-connection path is already covered by the sibling case.
+  # TEGroupedMLP asserts bias_dropout_fusion and add_bias_linear are not both
+  # on, and both default to True; every MoE case in the suite disables the bias.
+  --disable-bias-linear: true
   --num-experts: 8
   --moe-ffn-hidden-size: 512
   --moe-router-topk: 2
