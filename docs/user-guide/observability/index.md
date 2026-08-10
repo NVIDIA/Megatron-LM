@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 <!---
    Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -74,7 +78,7 @@ Each span is tagged with a **span group** that controls whether it's emitted at 
 - **Metrics**: Prometheus via the OTel Collector, or direct OTLP to Grafana Mimir / Datadog / etc.
 - **Logs** (optional): via the OTel log bridge when `MEGATRON_OTEL_LOGS_ENABLED=1` — correlates `logging` records with the active span's trace ID.
 
-By default, only **one rank** exports (the last rank). For multi-rank telemetry, see [Configuration — Export strategy](configuration.md#export-strategy).
+By default, only **one rank** exports (the last rank). For multi-rank telemetry, see [Configuration — Rank strategy](configuration.md#rank-strategy).
 
 ## Related
 
