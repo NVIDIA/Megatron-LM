@@ -691,6 +691,27 @@ def test_is_fused_impl_supported_uses_config_activation_for_swiglu(monkeypatch):
     assert module._is_fused_impl_supported() is True
 
 
+@pytest.mark.parametrize("activation_func_clamp_value", [None, 10.0], ids=("unclamped", "clamped"))
+def test_is_fused_impl_supported_requires_cutedsl_for_swiglu(
+    monkeypatch, activation_func_clamp_value
+):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    monkeypatch.delenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", raising=False)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+        activation_func_clamp_value=activation_func_clamp_value,
+    )
+
+    assert module._is_fused_impl_supported() is False
+
+
 def test_is_fused_impl_supported_requires_scaled_fc2_bias(monkeypatch):
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
 

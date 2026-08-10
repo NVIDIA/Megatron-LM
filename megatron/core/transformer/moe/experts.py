@@ -384,7 +384,6 @@ class TEGroupedMLP(MegatronModule):
                     from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
                 except ImportError:
                     return False
-            return True
         elif self.config.activation_func == quick_gelu:
             try:
                 from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401

@@ -280,6 +280,7 @@ def test_make_fused_grouped_swiglu_ops_builds_clamped_activation(monkeypatch):
     assert activation_op.alpha == 1.0
     assert activation_op.limit == 7.0
     assert activation_op.glu_linear_offset == 0.0
+    assert activation_op._grouped_mlp_unit_activation_scale is True
 
 
 def test_fused_grouped_swiglu_ops_replay_linear_pre_forward_hooks(monkeypatch):
@@ -456,6 +457,50 @@ class TestSharedExperts:
             assert torch.allclose(
                 p_overlap.grad, p_no_overlap.grad
             ), f"max diff: {torch.max(torch.abs(p_overlap.grad - p_no_overlap.grad))}"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_shared_expert_glu_linear_offset_overlap_parity(self):
+        """Nonzero GLU offsets produce identical overlap and synchronous results."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, expert_model_parallel_size=1)
+        shared_expert_kwargs = {
+            "moe_token_dispatcher_type": "alltoall",
+            "bias_activation_fusion": False,
+            "activation_func_clamp_value": None,
+            "glu_linear_offset": 0.5,
+        }
+
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        moe_layer_overlap = self.get_moe_layer(
+            moe_shared_expert_overlap=True, **shared_expert_kwargs
+        ).to(dtype=torch.bfloat16)
+
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        moe_layer_no_overlap = self.get_moe_layer(
+            moe_shared_expert_overlap=False, **shared_expert_kwargs
+        ).to(dtype=torch.bfloat16)
+        moe_layer_no_overlap.load_state_dict(moe_layer_overlap.state_dict())
+
+        hidden_states = torch.randn(
+            (32, 2, self.config.hidden_size),
+            requires_grad=True,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        hidden_states_no_overlap = hidden_states.detach().clone().requires_grad_(True)
+
+        output_overlap, _ = moe_layer_overlap(hidden_states)
+        output_no_overlap, _ = moe_layer_no_overlap(hidden_states_no_overlap)
+        torch.testing.assert_close(output_overlap, output_no_overlap)
+
+        output_overlap.mean().backward()
+        output_no_overlap.mean().backward()
+
+        torch.testing.assert_close(hidden_states.grad, hidden_states_no_overlap.grad)
+        for p_overlap, p_no_overlap in zip(
+            moe_layer_overlap.parameters(), moe_layer_no_overlap.parameters()
+        ):
+            torch.testing.assert_close(p_overlap.grad, p_no_overlap.grad)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
