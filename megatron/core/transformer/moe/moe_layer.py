@@ -13,7 +13,7 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.megakernel import (
     build_megakernel_backend,
@@ -305,9 +305,11 @@ class MoELayer(BaseMoELayer):
                 linear_cls = InferenceLinear
             else:
                 linear_cls = TELinear
-            # TODO: When LatentMoE gains GTP plumbing on dev, resolve the non-expert GTP
-            # rematerialization group when `moe_latent_proj` is opted in, and pass that group
-            # plus `pg_collection.dp_cp` as the replica group to both latent projections.
+            gtp_remat_group = (
+                resolve_gtp_remat_group(pg_collection, is_expert=False)
+                if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
+                else None
+            )
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -319,6 +321,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
+                gtp_remat_group=gtp_remat_group,
             )
             fc2_linear_cls = (
                 TERMSNormDuplicatedLinear
@@ -344,6 +347,7 @@ class MoELayer(BaseMoELayer):
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
                 **fc2_extra_kwargs,
+                gtp_remat_group=gtp_remat_group,
             )
 
         # Megakernel backends replace native dispatch, expert compute, and combine,
