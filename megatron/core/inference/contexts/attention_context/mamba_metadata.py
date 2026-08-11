@@ -1,6 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Optional
+# pylint: disable=missing-function-docstring
+
+from dataclasses import dataclass, fields
+from typing import Dict, Optional
 
 import torch
 
@@ -8,6 +11,98 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
 )
+from megatron.core.ssm.ops.ssd_combined import _cutedsl_ssd_enabled
+from megatron.core.utils import round_up_to_nearest_multiple
+
+
+@dataclass(frozen=True, kw_only=True)
+class MambaSSDChunkState:
+    """
+    Track the chunk states across requests in a batch, shared by all Mamba layers once in a forward.
+    """
+
+    seq_chunk_start_bytes: int
+    seq_chunk_count_bytes: int
+    seq_chunk_base_bytes: int
+    active_seq_idx_bytes: int
+    empty_seq_idx_bytes: int
+    chunk_token_base_bytes: int
+    chunk_valid_start_bytes: int
+    chunk_valid_end_bytes: int
+
+    @staticmethod
+    def create(max_requests: int, max_mamba_chunks: int) -> Optional["MambaSSDChunkState"]:
+        max_ssd_chunks = max_mamba_chunks + max_requests
+        if _cutedsl_ssd_enabled():
+            mamba_ssd_seq_chunk_start_bytes = round_up_to_nearest_multiple(max_requests * 4, 16)
+            mamba_ssd_seq_chunk_count_bytes = round_up_to_nearest_multiple(max_requests * 4, 16)
+            mamba_ssd_seq_chunk_base_bytes = round_up_to_nearest_multiple(max_requests * 4, 16)
+            mamba_ssd_active_seq_idx_bytes = round_up_to_nearest_multiple(max_requests * 4, 16)
+            mamba_ssd_empty_seq_idx_bytes = round_up_to_nearest_multiple(max_requests * 4, 16)
+            mamba_ssd_chunk_token_base_bytes = round_up_to_nearest_multiple(max_ssd_chunks * 4, 16)
+            mamba_ssd_chunk_valid_start_bytes = round_up_to_nearest_multiple(max_ssd_chunks * 4, 16)
+            mamba_ssd_chunk_valid_end_bytes = round_up_to_nearest_multiple(max_ssd_chunks * 4, 16)
+
+            return MambaSSDChunkState(
+                seq_chunk_start_bytes=mamba_ssd_seq_chunk_start_bytes,
+                seq_chunk_count_bytes=mamba_ssd_seq_chunk_count_bytes,
+                seq_chunk_base_bytes=mamba_ssd_seq_chunk_base_bytes,
+                active_seq_idx_bytes=mamba_ssd_active_seq_idx_bytes,
+                empty_seq_idx_bytes=mamba_ssd_empty_seq_idx_bytes,
+                chunk_token_base_bytes=mamba_ssd_chunk_token_base_bytes,
+                chunk_valid_start_bytes=mamba_ssd_chunk_valid_start_bytes,
+                chunk_valid_end_bytes=mamba_ssd_chunk_valid_end_bytes,
+            )
+        else:
+            return None
+
+    def total_bytes(self) -> int:
+        return sum(getattr(self, f.name) for f in fields(self))
+
+    def bind_buf(self, offset: int, buf: torch.Tensor) -> Dict[str, torch.Tensor]:
+        cpu_mamba_ssd_seq_chunk_start = buf[offset : offset + self.seq_chunk_start_bytes].view(
+            torch.int32
+        )
+        offset += self.seq_chunk_start_bytes
+        cpu_mamba_ssd_seq_chunk_count = buf[offset : offset + self.seq_chunk_count_bytes].view(
+            torch.int32
+        )
+        offset += self.seq_chunk_count_bytes
+        cpu_mamba_ssd_seq_chunk_base = buf[offset : offset + self.seq_chunk_base_bytes].view(
+            torch.int32
+        )
+        offset += self.seq_chunk_base_bytes
+        cpu_mamba_ssd_active_seq_idx = buf[offset : offset + self.active_seq_idx_bytes].view(
+            torch.int32
+        )
+        offset += self.active_seq_idx_bytes
+        cpu_mamba_ssd_empty_seq_idx = buf[offset : offset + self.empty_seq_idx_bytes].view(
+            torch.int32
+        )
+        offset += self.empty_seq_idx_bytes
+        cpu_mamba_ssd_chunk_token_base = buf[offset : offset + self.chunk_token_base_bytes].view(
+            torch.int32
+        )
+        offset += self.chunk_token_base_bytes
+        cpu_mamba_ssd_chunk_valid_start = buf[offset : offset + self.chunk_valid_start_bytes].view(
+            torch.int32
+        )
+        offset += self.chunk_valid_start_bytes
+        cpu_mamba_ssd_chunk_valid_end = buf[offset : offset + self.chunk_valid_end_bytes].view(
+            torch.int32
+        )
+        offset += self.chunk_valid_end_bytes
+
+        return {
+            "ssd_seq_chunk_start": cpu_mamba_ssd_seq_chunk_start,
+            "ssd_seq_chunk_count": cpu_mamba_ssd_seq_chunk_count,
+            "ssd_seq_chunk_base": cpu_mamba_ssd_seq_chunk_base,
+            "ssd_active_seq_idx": cpu_mamba_ssd_active_seq_idx,
+            "ssd_empty_seq_idx": cpu_mamba_ssd_empty_seq_idx,
+            "ssd_chunk_token_base": cpu_mamba_ssd_chunk_token_base,
+            "ssd_chunk_valid_start": cpu_mamba_ssd_chunk_valid_start,
+            "ssd_chunk_valid_end": cpu_mamba_ssd_chunk_valid_end,
+        }
 
 
 class MambaMetadata:
@@ -229,32 +324,7 @@ class MambaMetadata:
 
     @staticmethod
     def _compute_mamba_chunk_meta(cu_seqlens_all, padded_prefill_count, chunk_size):
-        """Derive how the varlen SSD kernel tiles this prefill batch.
-
-        Each sequence is tiled from the chunk-aligned position at or below its
-        start, so a sequence starting mid-chunk shares that chunk with its
-        predecessor; each owner then gets its own valid-token window, so together
-        they cover every real token exactly once.
-
-        Pure host arithmetic on plain ints -- no device work -- and the single
-        source of truth for both the legacy ``update`` path and the coalesced
-        ``compute_cpu_metadata`` one.
-
-        Args:
-            cu_seqlens_all: Cumulative token counts, one entry per padded slot
-                plus one. Empty padding slots repeat the previous value.
-            padded_prefill_count: Number of batch slots.
-            chunk_size: Tokens per chunk.
-
-        Returns:
-            ``(active, chunk_base, chunk_count, chunk_start, token_base,
-            valid_start, valid_end, empty, starts_aligned, active_is_prefix)``.
-            The first eight are lists the kernel reads on device: the first four
-            hold one entry per active sequence, the next three one per workspace
-            chunk, and ``empty`` lists the slots carrying no tokens. The last two
-            are host-side flags the op cannot recompute from the device arrays
-            without a device->host sync.
-        """
+        """Derive how the varlen SSD kernel tiles this prefill batch."""
         active, chunk_base, chunk_count, chunk_start = [], [], [], []
         token_base, valid_start, valid_end = [], [], []
         acc = 0
@@ -413,6 +483,7 @@ class MambaMetadata:
                 _starts_aligned,
                 _active_is_prefix,
             ) = self._compute_mamba_chunk_meta(cu_seqlens_all, padded_prefill_count, chunk_size)
+
             self.ssd_active_is_prefix = _active_is_prefix
             self.ssd_starts_aligned = _starts_aligned
             self._ssd_seq_chunk_start_buffer[: len(_chunk_start)].copy_(
@@ -769,6 +840,7 @@ class MambaMetadata:
             # Chunk metadata (Python loop, pure CPU).
             cu_seqlens_all = cu_seqlens_view[: padded_prefill_count + 1].tolist()
 
+            # Compute Mamba2 SSD chunk metadata for current batch
             (
                 _active,
                 _chunk_base,
@@ -781,6 +853,7 @@ class MambaMetadata:
                 _starts_aligned,
                 _active_is_prefix,
             ) = self._compute_mamba_chunk_meta(cu_seqlens_all, padded_prefill_count, chunk_size)
+
             result["ssd_active_is_prefix"] = _active_is_prefix
             result["ssd_starts_aligned"] = _starts_aligned
             bufs["ssd_seq_chunk_start"][: len(_chunk_start)] = torch.tensor(
@@ -806,6 +879,7 @@ class MambaMetadata:
             result["ssd_num_active_seqs"] = len(_active)
             result["ssd_num_empty_seqs"] = len(_empty)
             result["ssd_num_chunks"] = len(_tok_base)
+
             chunk_boundaries = [0]
             last_chunk_idx_list = []
             chunk_to_seq_list = []

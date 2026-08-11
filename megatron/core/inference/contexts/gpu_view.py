@@ -2,7 +2,7 @@
 
 import torch
 
-from megatron.core.utils import round_up_to_nearest_multiple
+from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaSSDChunkState
 
 
 class ContextGPUView:
@@ -111,35 +111,22 @@ class ContextGPUView:
             mamba_seq_idx_for_varlen_bytes = max_mamba_chunks * 4
             mamba_conv_seq_idx_bytes = max_tokens * 4
             mamba_conv_seq_start_bytes = max_tokens * 4
-            # SSD ragged-tiling section: one entry per active sequence, or per
-            # workspace chunk (a sequence starting mid-chunk adds one).
-            max_ssd_chunks = max_mamba_chunks + max_bs
-            # SSD arrays back CuteDSL descriptors, which require 16-byte aligned
-            # data pointers; pad so the block starts aligned (each field size is
-            # already rounded to 16, so every field within it stays aligned).
-            mamba_ssd_align_pad = (
-                -(
-                    pre_mamba_bytes
-                    + mamba_align_pad
-                    + mamba_batch_indices_decode_bytes
-                    + mamba_batch_indices_prefill_bytes
-                    + mamba_seq_idx_bytes
-                    + mamba_cu_seqlens_bytes
-                    + mamba_cu_chunk_seqlens_bytes
-                    + mamba_last_chunk_indices_bytes
-                    + mamba_seq_idx_for_varlen_bytes
-                    + mamba_conv_seq_idx_bytes
-                    + mamba_conv_seq_start_bytes
-                )
-            ) % 16
-            mamba_ssd_seq_chunk_start_bytes = round_up_to_nearest_multiple(max_bs * 4, 16)
-            mamba_ssd_seq_chunk_count_bytes = round_up_to_nearest_multiple(max_bs * 4, 16)
-            mamba_ssd_seq_chunk_base_bytes = round_up_to_nearest_multiple(max_bs * 4, 16)
-            mamba_ssd_active_seq_idx_bytes = round_up_to_nearest_multiple(max_bs * 4, 16)
-            mamba_ssd_empty_seq_idx_bytes = round_up_to_nearest_multiple(max_bs * 4, 16)
-            mamba_ssd_chunk_token_base_bytes = round_up_to_nearest_multiple(max_ssd_chunks * 4, 16)
-            mamba_ssd_chunk_valid_start_bytes = round_up_to_nearest_multiple(max_ssd_chunks * 4, 16)
-            mamba_ssd_chunk_valid_end_bytes = round_up_to_nearest_multiple(max_ssd_chunks * 4, 16)
+            pre_mamba_ssd_bytes = (
+                pre_mamba_bytes
+                + mamba_align_pad
+                + mamba_batch_indices_decode_bytes
+                + mamba_batch_indices_prefill_bytes
+                + mamba_seq_idx_bytes
+                + mamba_cu_seqlens_bytes
+                + mamba_cu_chunk_seqlens_bytes
+                + mamba_last_chunk_indices_bytes
+                + mamba_seq_idx_for_varlen_bytes
+                + mamba_conv_seq_idx_bytes
+                + mamba_conv_seq_start_bytes
+            )
+            mamba_ssd_align_pad = (-pre_mamba_ssd_bytes) % 16
+            mamba_ssd_states = MambaSSDChunkState.create(max_requests, max_mamba_chunks)
+            mamba_ssd_total_bytes = mamba_ssd_states.total_bytes() if mamba_ssd_states else 0
         else:
             mamba_align_pad = 0
             mamba_batch_indices_decode_bytes = 0
@@ -152,14 +139,7 @@ class ContextGPUView:
             mamba_conv_seq_idx_bytes = 0
             mamba_conv_seq_start_bytes = 0
             mamba_ssd_align_pad = 0
-            mamba_ssd_seq_chunk_start_bytes = 0
-            mamba_ssd_seq_chunk_count_bytes = 0
-            mamba_ssd_seq_chunk_base_bytes = 0
-            mamba_ssd_active_seq_idx_bytes = 0
-            mamba_ssd_empty_seq_idx_bytes = 0
-            mamba_ssd_chunk_token_base_bytes = 0
-            mamba_ssd_chunk_valid_start_bytes = 0
-            mamba_ssd_chunk_valid_end_bytes = 0
+            mamba_ssd_total_bytes = 0
 
         total_bytes = (
             pre_mamba_bytes
@@ -174,14 +154,7 @@ class ContextGPUView:
             + mamba_conv_seq_idx_bytes
             + mamba_conv_seq_start_bytes
             + mamba_ssd_align_pad
-            + mamba_ssd_seq_chunk_start_bytes
-            + mamba_ssd_seq_chunk_count_bytes
-            + mamba_ssd_seq_chunk_base_bytes
-            + mamba_ssd_active_seq_idx_bytes
-            + mamba_ssd_empty_seq_idx_bytes
-            + mamba_ssd_chunk_token_base_bytes
-            + mamba_ssd_chunk_valid_start_bytes
-            + mamba_ssd_chunk_valid_end_bytes
+            + mamba_ssd_total_bytes
         )
 
         # Zero-initialized so pre-transfer reads see zeros (matches prior semantics).
@@ -296,38 +269,17 @@ class ContextGPUView:
             )
             off += mamba_conv_seq_start_bytes
             off += mamba_ssd_align_pad
-            self.mamba_ssd_seq_chunk_start = self._buf[
-                off : off + mamba_ssd_seq_chunk_start_bytes
-            ].view(torch.int32)
-            off += mamba_ssd_seq_chunk_start_bytes
-            self.mamba_ssd_seq_chunk_count = self._buf[
-                off : off + mamba_ssd_seq_chunk_count_bytes
-            ].view(torch.int32)
-            off += mamba_ssd_seq_chunk_count_bytes
-            self.mamba_ssd_seq_chunk_base = self._buf[
-                off : off + mamba_ssd_seq_chunk_base_bytes
-            ].view(torch.int32)
-            off += mamba_ssd_seq_chunk_base_bytes
-            self.mamba_ssd_active_seq_idx = self._buf[
-                off : off + mamba_ssd_active_seq_idx_bytes
-            ].view(torch.int32)
-            off += mamba_ssd_active_seq_idx_bytes
-            self.mamba_ssd_empty_seq_idx = self._buf[
-                off : off + mamba_ssd_empty_seq_idx_bytes
-            ].view(torch.int32)
-            off += mamba_ssd_empty_seq_idx_bytes
-            self.mamba_ssd_chunk_token_base = self._buf[
-                off : off + mamba_ssd_chunk_token_base_bytes
-            ].view(torch.int32)
-            off += mamba_ssd_chunk_token_base_bytes
-            self.mamba_ssd_chunk_valid_start = self._buf[
-                off : off + mamba_ssd_chunk_valid_start_bytes
-            ].view(torch.int32)
-            off += mamba_ssd_chunk_valid_start_bytes
-            self.mamba_ssd_chunk_valid_end = self._buf[
-                off : off + mamba_ssd_chunk_valid_end_bytes
-            ].view(torch.int32)
-            off += mamba_ssd_chunk_valid_end_bytes
+            mamba_ssd_bufs = mamba_ssd_states.bind_buf(off, self._buf) if mamba_ssd_states else {}
+            off += mamba_ssd_total_bytes
+            if mamba_ssd_states:
+                self.mamba_ssd_seq_chunk_start = mamba_ssd_bufs["ssd_seq_chunk_start"]
+                self.mamba_ssd_seq_chunk_count = mamba_ssd_bufs["ssd_seq_chunk_count"]
+                self.mamba_ssd_seq_chunk_base = mamba_ssd_bufs["ssd_seq_chunk_base"]
+                self.mamba_ssd_active_seq_idx = mamba_ssd_bufs["ssd_active_seq_idx"]
+                self.mamba_ssd_empty_seq_idx = mamba_ssd_bufs["ssd_empty_seq_idx"]
+                self.mamba_ssd_chunk_token_base = mamba_ssd_bufs["ssd_chunk_token_base"]
+                self.mamba_ssd_chunk_valid_start = mamba_ssd_bufs["ssd_chunk_valid_start"]
+                self.mamba_ssd_chunk_valid_end = mamba_ssd_bufs["ssd_chunk_valid_end"]
         else:
             self.mamba_batch_indices_decode = None
             self.mamba_batch_indices_prefill = None
