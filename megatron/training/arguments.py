@@ -1805,6 +1805,10 @@ def validate_args(args, defaults={}):
             "must be used in conjunction with `--fp8-recipe delayed`."
         )
 
+    if args.use_fused_lce:
+        assert args.tensor_model_parallel_size == 1, 'fused lce only support tp=1 now'
+
+
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
     if args.replication:
@@ -2813,6 +2817,10 @@ def _add_training_args(parser):
                        dest='deprecated_use_mcore_models',
                        help='DEPRECATED. Use the implementation from megatron core.'
                        'Now ignored and mcore models are the default.')
+    group.add_argument('--use-fused-lce', action='store_true', default=False,
+                       help='Use fused linear cross entropy to reduce the peak memory')     
+    group.add_argument('--logits-split-chunks', type=int, default=8,
+                       help='Number of logits to split')
 
     return parser
 
