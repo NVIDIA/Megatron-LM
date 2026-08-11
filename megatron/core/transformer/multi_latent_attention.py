@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, NoReturn, Optional, Union
 
 import torch
 import torch.nn.functional as F
-import triton
 
 try:
     from einops import rearrange
@@ -53,12 +52,10 @@ try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
         fused_apply_mla_rope_for_kv,
         fused_apply_mla_rope_for_q,
-        rotary_bwd_q_kernel,
     )
 except:
     fused_apply_mla_rope_for_kv = None
     fused_apply_mla_rope_for_q = None
-    rotary_bwd_q_kernel = None
 
 
 if HAVE_TE:
@@ -66,8 +63,10 @@ if HAVE_TE:
 
     try:
         from transformer_engine.pytorch.attention import FusedMLAQUpProjRopeQuant
+        from transformer_engine.pytorch.attention.fused_mla_q_uproj import _FusedMLAQUpProjFunction
     except ImportError:
         FusedMLAQUpProjRopeQuant = None
+        _FusedMLAQUpProjFunction = None
     from transformer_engine.pytorch.attention.dot_product_attention.utils import (
         mxfp8_quantize_only,
         mxfp8_transpose_swizzle,
@@ -95,126 +94,16 @@ else:
         set_save_original_input,
         split_te_layernorm_column_parallel_linear,
         FusedMLAQUpProjRopeQuant,
+        _FusedMLAQUpProjFunction,
         mxfp8_quantize_only,
         mxfp8_transpose_swizzle,
         QuantizedTensor,
         MXFP8Quantizer,
-    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
-
-
-# ---------------------------------------------------------------------------
-# Fused MLA Q up-projection: GEMM + per-head RoPE + MXFP8 quantize.
-# Backward uses Megatron's rotary_bwd_q_kernel; wgrad uses FP8×FP8 GEMM (matching TE Linear).
-# ---------------------------------------------------------------------------
-class _FusedMLAQUpProjFunction(torch.autograd.Function):
-    """Fused Q up-proj: q_normed -> (GEMM + per-head RoPE + MXFP8) -> MXFP8Tensor Q."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        q_normed,  # [s, b, q_lora_rank] bf16 (post-layernorm)
-        w_q,  # [nh*q_head_dim, q_lora_rank] FP8 QuantizedTensor or bf16 (TE out×in layout)
-        cos,  # [s, 1, 1, rope_dim]
-        sin,  # [s, 1, 1, rope_dim]
-        wgrad_store,
-        fuse_wgrad_accumulation,
-        nh,
-        q_head_dim,
-        qk_head_dim,
-        qk_pos_emb_head_dim,
-        s,
-        b,
-        tp_group,  # tensor-parallel process group
-        sequence_parallel,  # True if sequence parallelism is active
-    ):
-        """Run the fused gemm + rope + mxfp8 quantization"""
-
-        tokens = s * b
-        x = q_normed.detach().reshape(tokens, -1).contiguous()
-
-        # Reshape [s, 1, 1, rope_dim] -> [s*b, rope_dim] bf16 as required by the KF kernel.
-        def _flat(t):
-            t = t.reshape(s, -1)
-            if b > 1:
-                t = t.unsqueeze(1).expand(s, b, t.shape[-1]).reshape(tokens, -1)
-            return t.to(torch.bfloat16).contiguous()
-
-        cos, sin = _flat(cos), _flat(sin)
-        query, x_saved = FusedMLAQUpProjRopeQuant.run(x, w_q.detach(), cos, sin, s, b)
-
-        ctx.save_for_backward(x_saved, w_q, cos, sin)
-        ctx.wgrad_store = wgrad_store
-        ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
-        ctx.act_dtype = q_normed.dtype
-        ctx.dims = (nh, q_head_dim, qk_head_dim, qk_pos_emb_head_dim, s, b)
-        ctx.tp_group = tp_group
-        ctx.sequence_parallel = sequence_parallel
-        return query
-
-    @staticmethod
-    def backward(ctx, dq):
-        """Backward is unfused and matches the typical backward pass"""
-        x_saved, w_q, cos, sin = ctx.saved_tensors
-        nh, q_head_dim, qk_head_dim, qk_pos_emb_head_dim, s, b = ctx.dims
-        tokens = s * b
-        act_dtype = ctx.act_dtype
-
-        # --- RoPE backward (unchanged: bf16, same rotary_bwd_q_kernel as the unfused path) ---
-        dq3 = dq.reshape(tokens, nh, q_head_dim).contiguous()
-        grid = lambda META: (tokens, triton.cdiv(nh, META["BLOCK_H"]))
-        rotary_bwd_q_kernel[grid](
-            dq3,
-            cos.contiguous(),
-            sin.contiguous(),
-            qk_head_dim,
-            qk_pos_emb_head_dim,
-            nh,
-            1,
-            None,
-            None,
-            dq3.stride(0),
-            dq3.stride(1),
-            0,
-            1,
-        )
-        # grad w.r.t. the (pre-RoPE) up-proj GEMM output; bf16.
-        dq2d = dq3.reshape(tokens, nh * q_head_dim).contiguous()
-
-        # Delegate the projection backward to TE's _linear_backward (via backward_linear)
-        grad_x, ret_grad_w, _ = FusedMLAQUpProjRopeQuant.backward_linear(
-            grad_output=dq2d,
-            x_saved=x_saved,
-            w_q=w_q,
-            act_dtype=act_dtype,
-            wgrad_store=ctx.wgrad_store,
-            fuse_wgrad_accumulation=ctx.fuse_wgrad_accumulation,
-            tp_group=ctx.tp_group,
-            sequence_parallel=ctx.sequence_parallel,
-        )
-        grad_x = grad_x.reshape(s, b, -1)
-
-        # grads for: q_normed, w_q, cos, sin, then 10 non-tensor args
-        # (including tp_group, sequence_parallel)
-        return (
-            grad_x,
-            ret_grad_w,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
 
 
 class _QuantizeKVForFusedAttn(torch.autograd.Function):
@@ -744,7 +633,7 @@ class MLASelfAttention(MultiLatentAttention):
                 tp_group=pg_collection.tp,
                 name=(name + ".linear_q_up_proj") if name is not None else None,
             )
-            if self._use_fused_q_uproj:
+            if self._use_fused_q_uproj and self.config.qk_layernorm:
                 self._q_up_proj_norm = TENorm(
                     config=self.config,
                     hidden_size=self.config.q_lora_rank,
@@ -1044,7 +933,9 @@ class MLASelfAttention(MultiLatentAttention):
 
             if use_fused_q_uproj:
                 b = q_compressed.shape[1]
-                q_normed = self._q_up_proj_norm(q_compressed)
+                q_normed = (
+                    self._q_up_proj_norm(q_compressed) if self.config.qk_layernorm else q_compressed
+                )
 
                 # With sequence parallelism q_normed is sequence-split; gather to full sequence
                 # before the fused kernel.
@@ -1537,7 +1428,7 @@ class FusedMLASelfAttention(MLASelfAttention):
             tp_group=pg_collection.tp,
             name=(name + ".linear_q_up_proj") if name is not None else None,
         )
-        if self._use_fused_q_uproj:
+        if self._use_fused_q_uproj and self.config.qk_layernorm:
             self._q_up_proj_norm = TENorm(
                 config=self.config,
                 hidden_size=self.config.q_lora_rank,
