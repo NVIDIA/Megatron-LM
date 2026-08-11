@@ -2222,6 +2222,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             num_speculative_tokens=2 if feature == "mtp" else 0,
             materialize_only_last_token_logits=feature != "mtp",
             position_embedding_type="rope" if feature == "fused-rope" else "learned_absolute",
+            hidden_size=64 if feature == "fused-rope" else None,
             top_k=1,
         )
         config.prefix_caching_eviction_policy = case["policy"]
@@ -2285,16 +2286,15 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             wrapper.forward_pass_with_pipeline_parallel = traced_pipeline_forward
 
         if feature == "moe":
+            instrumented_layers = 0
             for module in model.modules():
-                dispatcher = getattr(module, "token_dispatcher", None)
-                if dispatcher is None or not hasattr(dispatcher, "token_dispatch"):
+                if module.__class__.__name__ != "MoELayer":
                     continue
-                original = dispatcher.token_dispatch
+                original = module.dispatch
 
-                def traced_token_dispatch(
-                    *args, _dispatcher=dispatcher, _original=original, **kwargs
-                ):
-                    assert torch.distributed.get_world_size(_dispatcher.ep_group) > 1
+                def traced_moe_dispatch(*args, _module=module, _original=original, **kwargs):
+                    dispatcher = _module.token_dispatcher
+                    assert torch.distributed.get_world_size(dispatcher.ep_group) > 1
                     evidence["moe_dispatches"] += 1
                     active_request_ids = engine.context.request_ids[
                         engine.context.paused_request_count : engine.context.total_request_count
@@ -2304,7 +2304,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     )
                     return _original(*args, **kwargs)
 
-                dispatcher.token_dispatch = traced_token_dispatch
+                module.dispatch = traced_moe_dispatch
+                instrumented_layers += 1
+            assert instrumented_layers > 0
 
         if feature == "fused-rope":
             context = engine.context
@@ -2312,6 +2314,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
             def traced_fused_rope(*args, **kwargs):
                 assert context.use_flashinfer_fused_rope
+                cos_sin_cache = args[2] if len(args) > 2 else kwargs["cos_sin_emb"]
+                assert cos_sin_cache.is_cuda
                 evidence["fused_rope_calls"] += 1
                 return original(*args, **kwargs)
 
@@ -2346,6 +2350,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             model = engine.controller.inference_wrapped_model.model
             model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.cuda()
             model.rotary_pos_emb_cache.clear()
+            assert model.config.hidden_size // model.config.num_attention_heads == 16
         evidence = self._install_runtime_witnesses(engine, case["feature"])
         pool_size = allocator.pool_size
         storage_size = context.memory_buffer.untyped_storage().nbytes()
