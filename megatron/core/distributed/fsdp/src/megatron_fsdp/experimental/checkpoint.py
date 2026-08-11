@@ -41,26 +41,9 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from ..uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
-from .module import FsdpModule
+from .parameter_group import sync_model_weights_from_main_weights
 
 __all__ = ["save_checkpoint", "load_checkpoint"]
-
-
-def _sync_model_weight_from_main_weight(model: torch.nn.Module) -> None:
-    """Refresh every FSDP group's compute weights from its (loaded) main weights.
-
-    A load writes into the ``main_weight``-backed sharded DTensors. When mixed precision keeps a
-    separate lower-precision compute buffer, that buffer is stale until the next forward pre-hook
-    would resync it; doing it here makes the post-load state deterministic. It is a no-op when the
-    compute buffer aliases the main buffer.
-
-    Args:
-        model: Root module (or any module tree) containing ``FsdpModule`` instances.
-    """
-    for module in model.modules():
-        if isinstance(module, FsdpModule):
-            for parameter_group in module.parameter_groups:
-                parameter_group.sync_model_weight_from_main_weight()
 
 
 def _init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
@@ -139,4 +122,4 @@ def load_checkpoint(
     set_model_state_dict(model, model_state_dict)
     set_optimizer_state_dict(model, optimizer, optimizer_state_dict)
     if sync_model_weights:
-        _sync_model_weight_from_main_weight(model)
+        sync_model_weights_from_main_weights(model.parameters())

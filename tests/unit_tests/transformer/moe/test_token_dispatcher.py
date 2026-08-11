@@ -101,7 +101,6 @@ class MoEModelTestContainer:
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
-            moe_ncclep_static_shape=kwargs.get("moe_ncclep_static_shape", False),
             moe_ncclep_zero_copy=kwargs.get("moe_ncclep_zero_copy", False),
             use_transformer_engine_op_fuser=kwargs.get("use_transformer_engine_op_fuser", False),
             gated_linear_unit=kwargs.get("gated_linear_unit", False),
@@ -155,7 +154,7 @@ class MoEModelTestContainer:
         probs, indices = apply_module(moe_layer.router)(hidden_states)
         probs = torch.ones_like(probs) / moe_layer.router.topk
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
@@ -244,7 +243,7 @@ class MoEModelTestContainer:
         restored_hidden_states_answer = hidden_states * local_probss.sum(dim=1).unsqueeze(1)
         restored_hidden_states_answer = restored_hidden_states_answer.to(dtype=self.test_dtype)
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
@@ -295,7 +294,7 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
-        (permuted_input_1, tokens_per_expert, permuted_probs_1) = token_permutation(
+        permuted_input_1, tokens_per_expert, permuted_probs_1 = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
@@ -313,7 +312,7 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
-        (permuted_input_2, tokens_per_expert, permuted_probs_2) = token_permutation(
+        permuted_input_2, tokens_per_expert, permuted_probs_2 = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         permuted_input_2 = permuted_input_2 * permuted_probs_2.unsqueeze(-1)
@@ -366,7 +365,7 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
-        (permuted_input_1, tokens_per_expert_1, permuted_probs_1) = token_permutation(
+        permuted_input_1, tokens_per_expert_1, permuted_probs_1 = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
@@ -383,7 +382,7 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
-        (permuted_input_2, tokens_per_expert_2, permuted_probs_2) = token_permutation(
+        permuted_input_2, tokens_per_expert_2, permuted_probs_2 = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         assert (
@@ -615,13 +614,6 @@ class TestFlexDispatcher:
             hidden_size=1024,
             moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
             moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
-            # ncclep sizes a per-rank recv buffer from this and overflow HARD-TRAPS (device-side
-            # em_scan check -> CUDA launch failure), so size it generously: small token counts have
-            # high routing-imbalance variance and a tight factor traps. The staging buffer is tiny
-            # at this model size, so a large factor costs little.
-            moe_expert_rank_capacity_factor=(
-                8.0 if moe_flex_dispatcher_backend == "ncclep" else None
-            ),
             test_dtype=torch.bfloat16,
         )
         container.dispatcher_dropless_test()
@@ -639,7 +631,8 @@ class TestFlexDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8)])
     def test_forward_backward_zero_copy(self, tp_size, ep_size):
-        # zero-copy requires static_shape, which requires BOTH op-fuser and grouped_gemm; bf16 so no
+        # zero-copy requires a capacity factor, which requires BOTH op-fuser and grouped_gemm; bf16
+        # so no
         # fp8/Blackwell dependency. The op-fuser needs tp=1 and a SwiGLU activation. Parity: the
         # zero-copy IO path must match the staged (no-zc) path.
         container = MoEModelTestContainer(
@@ -653,7 +646,6 @@ class TestFlexDispatcher:
             moe_flex_dispatcher_backend="ncclep",
             moe_grouped_gemm=True,
             use_transformer_engine_op_fuser=True,
-            moe_ncclep_static_shape=True,
             gated_linear_unit=True,
             activation_func=F.silu,
             # ncclep sizes a per-rank recv buffer from this and overflow HARD-TRAPS; size generously.

@@ -1585,8 +1585,6 @@ class TestPartialCudaGraph:
                 pytest.skip("NCCL EP requires expert_model_parallel_size >= 2 (ep_bootstrap)")
             extra_kwargs["moe_token_dispatcher_type"] = "flex"
             extra_kwargs["moe_flex_dispatcher_backend"] = "ncclep"
-            # ncclep sizes a per-rank recv buffer from this and overflow hard-traps; size generously.
-            extra_kwargs["moe_expert_rank_capacity_factor"] = 8.0
         else:
             extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
         if not moe_dropless_dispatcher:
