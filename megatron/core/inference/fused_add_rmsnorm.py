@@ -27,6 +27,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from megatron.core.inference import fusion_diag as _diag
+
 try:
     import triton
     import triton.language as tl
@@ -143,12 +145,18 @@ def fused_add_rmsnorm(
     return o, nr
 
 
-def _tensors_compatible(w: torch.Tensor, hidden: torch.Tensor, residual: torch.Tensor) -> bool:
+def _tensors_compatible(
+    w: torch.Tensor, hidden: torch.Tensor, residual: torch.Tensor, site: str = ""
+) -> bool:
     """Shared shape/layout/token-count check for the fused add+RMSNorm kernel.
 
-    This runs once per layer per decode step, so it short-circuits on the
-    cheapest checks first and allocates nothing.
+    This runs twice per layer per decode step, so it keeps the original
+    short-circuiting form: the diagnostic breakdown is built only when
+    ``MCORE_FUSION_DIAG`` is set, never on the default path.
     """
+    if _diag.ENABLED and site:
+        _report_compatibility(w, hidden, residual, site)
+
     hn = hidden.shape[-1]
     if hidden.shape != residual.shape or hn != w.numel():
         return False
@@ -162,6 +170,33 @@ def _tensors_compatible(w: torch.Tensor, hidden: torch.Tensor, residual: torch.T
     if n_tokens > FUSED_ADD_NORM_MAX_TOKENS:
         return False
     return True
+
+
+def _report_compatibility(
+    w: torch.Tensor, hidden: torch.Tensor, residual: torch.Tensor, site: str
+) -> None:
+    """Name the individual compatibility check that rejects this call site.
+
+    Split out because a gate that silently returns False is unfalsifiable from a
+    profile: `FUSION-INERT-S17` spent a session on a fusion that was enabled and
+    never firing, which this would have answered immediately.
+    """
+    n_tokens = 1
+    for d in hidden.shape[:-1]:
+        n_tokens *= d
+    _diag.report(
+        site,
+        lambda: {
+            "shapes_match": hidden.shape == residual.shape,
+            "gamma_matches_H": hidden.shape[-1] == w.numel(),
+            "on_cuda": hidden.is_cuda and residual.is_cuda,
+            "last_dim_contiguous": hidden.stride(-1) == 1 and residual.stride(-1) == 1,
+            "decode_sized": n_tokens <= FUSED_ADD_NORM_MAX_TOKENS,
+            "info:n_tokens": n_tokens,
+            "info:max_tokens": FUSED_ADD_NORM_MAX_TOKENS,
+            "info:hidden": tuple(hidden.shape),
+        },
+    )
 
 
 def can_use_fused_add_rmsnorm(norm_module, hidden: torch.Tensor, residual: torch.Tensor) -> bool:
@@ -179,7 +214,7 @@ def can_use_fused_add_rmsnorm(norm_module, hidden: torch.Tensor, residual: torch
         return False
     if getattr(norm_module, "bias", None) is not None:
         return False
-    return _tensors_compatible(w, hidden, residual)
+    return _tensors_compatible(w, hidden, residual, site="pre_mlp_layernorm")
 
 
 def can_use_fused_add_rmsnorm_qkv(
@@ -196,4 +231,4 @@ def can_use_fused_add_rmsnorm_qkv(
         return False
     if weight is None:
         return False
-    return _tensors_compatible(weight, hidden, residual)
+    return _tensors_compatible(weight, hidden, residual, site="next_layer_qkv_norm")

@@ -5,6 +5,7 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.inference import insitu_timing as _insitu
 from megatron.core.inference.moe.router_topk import (
     can_fuse_route_mask,
     can_use_fused_softmax_topk,
@@ -981,7 +982,8 @@ class InferenceTopKRouter(TopKRouter):
             )
             and not is_batch_invariant_mode_enabled()
         ):
-            return fused_softmax_topk(logits, self.topk, mask_padding=can_fuse_route_mask())
+            with _insitu.site("router_topk"):
+                return fused_softmax_topk(logits, self.topk, mask_padding=can_fuse_route_mask())
 
         routing = (
             topk_routing_with_score_function

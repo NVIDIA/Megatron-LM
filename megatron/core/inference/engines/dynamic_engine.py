@@ -55,6 +55,7 @@ from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
+    configure_nvtx_profiling,
     deprecate_args,
     experimental_api,
     get_asyncio_loop,
@@ -279,6 +280,35 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialization options.
         self.controller = controller
         self.context = context
+
+        # Profiling aid: the engine's per-step NVTX ranges (bookkeeping,
+        # detokenization, console_logging, ...) are inert unless NVTX profiling
+        # is enabled, which only the training loop does. Allow the inference
+        # server to opt in via env so an nsys ``cuda,nvtx`` capture can attribute
+        # the host chain between decode steps. Default off (no-op).
+        if os.environ.get("MCORE_INFER_NVTX", "0") == "1":
+            configure_nvtx_profiling(True)
+
+        # Zero-nsys host-phase timing: patches the decode loop's NVTX range
+        # push/pop names with perf_counter self-timers and prints a per-step
+        # breakdown. Env-gated (``MCORE_INFER_HOST_TIMING``); no-op by default.
+        from megatron.core.inference.host_phase_timing import install as _install_host_timing
+
+        _install_host_timing()
+
+        # GPU-side step accounting: times the transformer-block CUDA graph with
+        # CUDA events and records per-rank step-entry timestamps for EP skew.
+        # Env-gated (``MCORE_INFER_STEP_GPU_TIMING``); no-op by default.
+        from megatron.core.inference.step_gpu_timing import install as _install_step_gpu_timing
+
+        _install_step_gpu_timing()
+
+        # Host cost of CUDA graph replay, measured with no profiler attached, because
+        # the profiled figure is confounded by node-level graph tracing.
+        # Env-gated (``MCORE_GRAPH_LAUNCH_TIMING``); no-op by default.
+        from megatron.core.inference.graph_launch_timing import install as _install_graph_timing
+
+        _install_graph_timing()
 
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         self.materialize_only_last_token_logits = (

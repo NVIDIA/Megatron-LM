@@ -30,6 +30,7 @@ if not HAVE_TRITON:
     triton.jit = null_decorator
     tl = MagicMock()
 
+from megatron.core.inference import insitu_timing as _insitu
 from megatron.core.inference.moe.activations import bounded_silu_mul
 from megatron.core.inference.moe.fused_moe import ActivationType
 from megatron.core.inference.moe.permute import (
@@ -1211,9 +1212,14 @@ def vllm_fused_moe(
         align_fn = _moe_align_block_size_fused
     else:
         align_fn = _moe_align_block_size_cuda_graphable
-    sorted_token_ids, expert_ids, num_post_padded = align_fn(
-        routing_map, config['BLOCK_SIZE_M'], num_local_experts, local_expert_start, valid_tokens
-    )
+    with _insitu.site("moe_align"):
+        sorted_token_ids, expert_ids, num_post_padded = align_fn(
+            routing_map,
+            config['BLOCK_SIZE_M'],
+            num_local_experts,
+            local_expert_start,
+            valid_tokens,
+        )
     num_valid = max_tokens * topk
 
     N = fc1_weight.size(1)
@@ -1250,21 +1256,22 @@ def vllm_fused_moe(
     intermediate1 = torch.empty(
         num_valid, fc1_out_width, dtype=hidden_states.dtype, device=hidden_states.device
     )
-    _invoke_fused_moe_kernel(
-        hidden_states,
-        fc1_weight,
-        intermediate1,
-        topk_weights_flat,
-        sorted_token_ids,
-        expert_ids,
-        num_post_padded,
-        mul_routed_weight=False,
-        top_k=topk,
-        config=config_fc1,
-        grid_size=grid_size_fc1,
-        fuse_squared_relu=not is_swiglu,
-        fuse_swiglu=use_fused_swiglu,
-    )
+    with _insitu.site("expert_gemm_fc1"):
+        _invoke_fused_moe_kernel(
+            hidden_states,
+            fc1_weight,
+            intermediate1,
+            topk_weights_flat,
+            sorted_token_ids,
+            expert_ids,
+            num_post_padded,
+            mul_routed_weight=False,
+            top_k=topk,
+            config=config_fc1,
+            grid_size=grid_size_fc1,
+            fuse_squared_relu=not is_swiglu,
+            fuse_swiglu=use_fused_swiglu,
+        )
     if is_swiglu and not use_fused_swiglu:
         # intermediate1 is [num_valid, 2N] (gate | up); reduce to [num_valid, N] via
         # SiLU(gate) * up over the valid_tokens*topk live rows only.
@@ -1279,33 +1286,35 @@ def vllm_fused_moe(
     intermediate3 = torch.empty(
         num_valid, K, dtype=hidden_states.dtype, device=hidden_states.device
     )
-    _invoke_fused_moe_kernel(
-        intermediate1,
-        fc2_weight,
-        intermediate3,
-        topk_weights_flat,
-        sorted_token_ids,
-        expert_ids,
-        num_post_padded,
-        mul_routed_weight=False,
-        top_k=1,
-        config=config_fc2,
-        grid_size=grid_size_fc2,
-    )
+    with _insitu.site("expert_gemm_fc2"):
+        _invoke_fused_moe_kernel(
+            intermediate1,
+            fc2_weight,
+            intermediate3,
+            topk_weights_flat,
+            sorted_token_ids,
+            expert_ids,
+            num_post_padded,
+            mul_routed_weight=False,
+            top_k=1,
+            config=config_fc2,
+            grid_size=grid_size_fc2,
+        )
 
     # Reduce over topk: [max_tokens*topk, K] → [max_tokens, K]
     # Applies routing weights and accumulates in fp32, writes directly to
     # out (if provided), zeros rows beyond valid_tokens, and skips non-local
     # expert slots.
-    return _moe_sum(
-        intermediate3,
-        probs,
-        max_tokens,
-        topk,
-        K,
-        valid_tokens,
-        routing_map,
-        local_expert_start,
-        num_local_experts,
-        out=out,
-    )
+    with _insitu.site("moe_sum"):
+        return _moe_sum(
+            intermediate3,
+            probs,
+            max_tokens,
+            topk,
+            K,
+            valid_tokens,
+            routing_map,
+            local_expert_start,
+            num_local_experts,
+            out=out,
+        )

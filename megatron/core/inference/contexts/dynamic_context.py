@@ -4,6 +4,7 @@ import logging
 import math
 import operator
 import os
+import time
 import warnings
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -108,6 +109,56 @@ def _incr_diag(reason: str) -> None:
             for k, v in sorted(_incr_diag_counts.items(), key=lambda x: -x[1])
         )
         logging.info("[INCR_DIAG] %d calls: %s", total, parts)
+
+
+# ---------------------------------------------------------------------------
+# Host-side phase profiling for `initialize_attention_state`.
+#
+# `initialize_attention_state` is pure CPU work on the per-step critical path
+# (see its call site comment in text_generation_controller.py). Set
+# MCORE_INFER_ATTN_PROF=1 to accumulate per-phase host wall time and log a
+# breakdown every MCORE_INFER_ATTN_PROF_EVERY calls. Inert (one predictable
+# branch per phase boundary) when unset.
+# ---------------------------------------------------------------------------
+_ATTN_PROF_ENABLED = os.environ.get("MCORE_INFER_ATTN_PROF", "0") == "1"
+_ATTN_PROF_EVERY = int(os.environ.get("MCORE_INFER_ATTN_PROF_EVERY", "100"))
+_ATTN_PROF_PHASES = (
+    "pre",  # pending mamba ops + dummy-request branches
+    "graphmatch",  # batch dims + match_graph_config
+    "paddims",  # padded batch dimension derivation
+    "slices",  # build_active_slices + pad_active_slices
+    "tokenpad",  # token_to_* padding writes
+    "mhameta",  # MHA metadata into the pinned CPU bookkeeping buffer
+    "maxlen",  # max_seqlen derivation + mha.set_state_data
+    "tail",  # hybrid / routing-replay / dispatcher flags + mamba flush
+    "xfer_inner",  # the transfer_bookkeeping_to_gpu() call at the end
+    "TOTAL",
+)
+_attn_prof_ns = [0] * len(_ATTN_PROF_PHASES)
+_attn_prof_calls = [0]
+_perf_ns = time.perf_counter_ns
+
+
+def _attn_prof_mark(idx: int, t_prev: int) -> int:
+    """Accumulate elapsed ns into phase `idx` and return the new timestamp."""
+    now = _perf_ns()
+    _attn_prof_ns[idx] += now - t_prev
+    return now
+
+
+def _attn_prof_report() -> None:
+    """Log the mean per-call host cost of each phase, then reset counters."""
+    n = _attn_prof_calls[0]
+    if n == 0:
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    parts = " ".join(
+        f"{name}={_attn_prof_ns[i] / n / 1000.0:.1f}" for i, name in enumerate(_ATTN_PROF_PHASES)
+    )
+    logging.info("[ATTN_PROF rank=%d] calls=%d us/call: %s", rank, n, parts)
+    for i in range(len(_attn_prof_ns)):
+        _attn_prof_ns[i] = 0
+    _attn_prof_calls[0] = 0
 
 
 DEPRECATED_ARGS = [
@@ -2361,6 +2412,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 completion, or `None` when no event was requested or no
                 transfer was performed.
         """
+        _prof = _ATTN_PROF_ENABLED
+        _t = _perf_ns() if _prof else 0
+        _t_start = _t
+
         _verify_snapshot = None
         if _INCR_ATTN_STATE and not is_expert_parallel_dummy_cuda_graph_step:
             advanced, fast_bookkeeping_done_event = self._incremental_attention_state_update(
@@ -2370,6 +2425,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             if advanced:
                 if not _INCR_ATTN_STATE_VERIFY:
+                    if _prof:
+                        _t = _attn_prof_mark(8, _t)
+                        _attn_prof_ns[9] += _t - _t_start
+                        _attn_prof_calls[0] += 1
+                        if _attn_prof_calls[0] >= _ATTN_PROF_EVERY:
+                            _attn_prof_report()
                     return fast_bookkeeping_done_event
                 # Verify mode: keep what the fast path produced, redo everything
                 # from scratch below, then assert the two agree exactly.
@@ -2397,6 +2458,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
             )
 
+        if _prof:
+            _t = _attn_prof_mark(0, _t)
+
         batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,
             prefill_req_count=self.num_prefill_requests,
@@ -2417,6 +2481,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if construct_graph_dimensions is not None:
             assert self._using_cuda_graph_this_step
+
+        if _prof:
+            _t = _attn_prof_mark(1, _t)
 
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
@@ -2452,10 +2519,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
+        if _prof:
+            _t = _attn_prof_mark(2, _t)
+
         self.build_active_slices(
             min(self.padded_active_request_count, self.max_requests - self.paused_request_count)
         )
         self.pad_active_slices()
+
+        if _prof:
+            _t = _attn_prof_mark(3, _t)
 
         # Update token position indexes.
         self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
@@ -2494,6 +2567,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
 
         assert self.active_attn_metadata is not None
+
+        if _prof:
+            _t = _attn_prof_mark(4, _t)
 
         # Compute MHA metadata directly into the pinned CPU section of
         # _cpu_bookkeeping_buf. The single coalesced H2D in
@@ -2543,6 +2619,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         if real_bs < padded_bs:
             self._cpu_mha_block_table[real_bs:padded_bs] = self.kv_block_allocator.dummy_block_idx
 
+        if _prof:
+            _t = _attn_prof_mark(5, _t)
+
         # Max sequence lengths (Python scalars; consumed as kernel launch args).
         if not self.using_cuda_graph_this_step() and real_bs > 0:
             # NonGraphedMHAMetadata: use actual max values.
@@ -2570,6 +2649,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
         )
+
+        if _prof:
+            _t = _attn_prof_mark(6, _t)
 
         if self.is_hybrid_model:
             # Mamba metadata update is deferred to transfer_bookkeeping_to_gpu()
@@ -2618,6 +2700,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             construct_graph_dimensions is not None or is_expert_parallel_dummy_cuda_graph_step
         )
 
+        if _prof:
+            _t = _attn_prof_mark(7, _t)
+
         # Preserve the existing behavior for callers that do not publish explicitly.
         bookkeeping_done_event = None
         if transfer_bookkeeping_to_gpu:
@@ -2629,6 +2714,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._incr_attn_state_store(real_bs, padded_bs, max_seqlen_q, max_seqlen_k)
             if _verify_snapshot is not None:
                 self._incr_attn_state_verify(_verify_snapshot)
+
+        if _prof:
+            _t = _attn_prof_mark(8, _t)
+            _attn_prof_ns[9] += _t - _t_start
+            _attn_prof_calls[0] += 1
+            if _attn_prof_calls[0] >= _ATTN_PROF_EVERY:
+                _attn_prof_report()
 
         return bookkeeping_done_event
 

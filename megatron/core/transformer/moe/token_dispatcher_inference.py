@@ -29,11 +29,13 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
+from megatron.core.inference import insitu_timing as _insitu
 from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, batch_invariant
+from megatron.core.inference.moe import expert_histogram as _exphist
 from megatron.core.inference.moe import router_topk as _fused_topk
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -600,6 +602,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # itself and retires this launch. The skip below keys off the tag the router
         # leaves on the tensor it actually masked, so it is evidence that the fused
         # path ran rather than a second copy of the gate.
+        if _exphist.ENABLED:
+            # Allocated here rather than in __init__ because this is the first point
+            # with both the device and the global expert count in hand; it is a no-op
+            # after the first call, and capture has not happened yet on that call.
+            _exphist.configure(self.config.num_moe_experts, self.routing_map.device)
+        _exphist.record(self.routing_map)
+
         if self.__class__._real_token_count_tensor is not None and self._rows_unsharded:
             _fused_topk.publish_graph_padding(self.__class__._real_token_count_tensor)
 
@@ -619,20 +628,25 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
 
-        multimem_all_gatherv_3tensor(
-            agv_h["tensor"],
-            agv_r["tensor"],
-            agv_p["tensor"],
-            hidden_states,
-            self.routing_map,
-            probs,
-            agv_h["handle"],
-            agv_r["handle"],
-            agv_p["handle"],
-            rank_token_offset=rank_token_offset,
-            ep_max_tokens=ep_max_tokens,
-            per_rank_max_tokens=per_rank_max,
-        )
+        # Empty region in the same graph: its reading is the per-pair event overhead
+        # that every other site is reported net of.
+        with _insitu.site(_insitu.CALIB):
+            pass
+        with _insitu.site("nvls_dispatch"):
+            multimem_all_gatherv_3tensor(
+                agv_h["tensor"],
+                agv_r["tensor"],
+                agv_p["tensor"],
+                hidden_states,
+                self.routing_map,
+                probs,
+                agv_h["handle"],
+                agv_r["handle"],
+                agv_p["handle"],
+                rank_token_offset=rank_token_offset,
+                ep_max_tokens=ep_max_tokens,
+                per_rank_max_tokens=per_rank_max,
+            )
 
         topk = probs.shape[1]
         hidden_dim = hidden_states.shape[1]
@@ -683,14 +697,15 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             if batch_invariant.enabled()
             else multimem_reduce_scatter_v
         )
-        reduce_scatter_v(
-            output,
-            rsv["tensor"],
-            rsv["handle"],
-            rank_token_offset=self._rank_token_offset(),
-            ep_max_tokens=self._ep_max_tokens(),
-            per_rank_max_tokens=self._per_rank_worst_case_token_count,
-        )
+        with _insitu.site("nvls_combine"):
+            reduce_scatter_v(
+                output,
+                rsv["tensor"],
+                rsv["handle"],
+                rank_token_offset=self._rank_token_offset(),
+                ep_max_tokens=self._ep_max_tokens(),
+                per_rank_max_tokens=self._per_rank_worst_case_token_count,
+            )
         return output.to(torch.bfloat16)
 
     def combine_postprocess(self, hidden_states):
