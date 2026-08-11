@@ -4,6 +4,7 @@ import asyncio
 import concurrent
 import copy
 import functools
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, OrderedDict, Tuple, Union
@@ -71,6 +72,10 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
     prepare_next_forward_pass,
     verify_speculative_tokens,
 )
+
+# Reduced-op path for the post-sampling bookkeeping chain; shares the gate with
+# `DynamicInferenceContext.update_requests`. See the ledger record QWEN-024.
+_VEC_UPDATE_REQS = os.environ.get("MCORE_INFER_VEC_UPDATE_REQS", "0") == "1"
 
 
 @dataclass
@@ -1860,6 +1865,26 @@ class TextGenerationController:
         # Clear temporary dummy state while preserving reusable prefix state and counters.
         context.reset(preserve_prefix_cache=True, preserve_counters=True)
 
+    def _empty_finished_idxs(self, device: torch.device) -> Tensor:
+        """Cached empty index tensor matching what `torch.nonzero` would return."""
+        cached = getattr(self, "_empty_finished_idxs_cache", None)
+        if cached is None or cached.device != device:
+            cached = torch.empty(0, dtype=torch.long, device=device)
+            self._empty_finished_idxs_cache = cached
+        return cached
+
+    def _empty_finished_ids(self, request_ids: Tensor) -> Tensor:
+        """Cached empty tensor matching an empty gather from `request_ids`."""
+        cached = getattr(self, "_empty_finished_ids_cache", None)
+        if (
+            cached is None
+            or cached.dtype != request_ids.dtype
+            or cached.device != request_ids.device
+        ):
+            cached = torch.empty(0, dtype=request_ids.dtype, device=request_ids.device)
+            self._empty_finished_ids_cache = cached
+        return cached
+
     def _transfer_samples_to_cpu(self, active_request_count: int) -> tuple:
         """Batch GPU-to-CPU transfer of sampled tokens.
 
@@ -1948,10 +1973,17 @@ class TextGenerationController:
         # Apply stop words detected during the previous engine bookkeeping step.
         self._apply_stop_word_finished_ids(active_request_ids, active_request_mask)
 
-        finished_idxs = (
-            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
-        )
-        finished_request_ids = context.request_ids[finished_idxs]
+        if _VEC_UPDATE_REQS and int(active_request_mask.sum()) == active_request_count:
+            # Steady-state decode: nothing finished this step, so skip the
+            # `nonzero` scan and the advanced-index gather it feeds.
+            finished_idxs = self._empty_finished_idxs(active_request_mask.device)
+            finished_request_ids = self._empty_finished_ids(context.request_ids)
+        else:
+            finished_idxs = (
+                torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
+                + context.paused_request_count
+            )
+            finished_request_ids = context.request_ids[finished_idxs]
 
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.
