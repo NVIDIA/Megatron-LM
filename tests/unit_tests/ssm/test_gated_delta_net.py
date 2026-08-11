@@ -447,6 +447,34 @@ class TestGatedDeltaNet:
             assert (g <= 0).all()
             assert (beta >= 0).all() and (beta <= 1).all()
 
+            # The fused pre-GDR path exposes Z as a strided view into the combined
+            # qkvzba projection. Verify gated norm consumes that view directly and
+            # remains numerically identical to a contiguous gate tensor.
+            gate_channels = num_v_heads_local * gdn.value_head_dim
+            z_offset = 7
+            gate_storage = torch.randn(
+                seq_len,
+                batch,
+                z_offset + gate_channels + 5,
+                device=torch.cuda.current_device(),
+                dtype=torch.bfloat16,
+            )
+            gate_view = (
+                gate_storage[:, :, z_offset : z_offset + gate_channels]
+                .view(seq_len, batch, num_v_heads_local, gdn.value_head_dim)
+                .permute(1, 0, 2, 3)
+            )
+            assert not gate_view.is_contiguous()
+            assert (
+                gate_view.untyped_storage().data_ptr() == gate_storage.untyped_storage().data_ptr()
+            )
+
+            norm_input = torch.randn_like(gate)
+            with torch._dynamo.config.patch(disable=True):
+                strided_output = gdn._apply_gated_norm(norm_input, gate_view)
+                contiguous_output = gdn._apply_gated_norm(norm_input, gate_view.contiguous())
+            torch.testing.assert_close(strided_output, contiguous_output)
+
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")

@@ -83,6 +83,20 @@ class GatedDeltaNet(_GDNBase):
         beta = beta.sigmoid()
         return g, {"beta": beta.contiguous()}
 
+    @jit_fuser
+    def _apply_gated_norm(self, x, gate):
+        # Output norm. X is contiguous, so flattening it preserves a view.
+        x_dtype = x.dtype
+        original_shape = x.shape
+        y = self.out_norm(x.reshape(-1, x.shape[-1])).reshape(original_shape)
+
+        # Output gate. In the fused pre-GDR path, gate is a strided view of
+        # qkvzba's Z channels. Keep it 4-D so this pointwise operation reads Z
+        # through its strides instead of reshape() materializing a copy.
+        y = y * self.act_fn(gate.float())
+        y = y.to(x_dtype)
+        return y
+
     def forward(
         self,
         hidden_states: torch.Tensor,
