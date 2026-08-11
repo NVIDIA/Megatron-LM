@@ -553,12 +553,7 @@ class GatedDeltaNet(_GDNBase):
         return kernel_inputs
 
     def _fused_streamed_pre_gated_delta_rule(
-        self,
-        qkvzba,
-        cu_seqlens_q=None,
-        seq_idx=None,
-        cp_group=None,
-        cp_group_headwise=None,
+        self, qkvzba, cu_seqlens_q=None, seq_idx=None, cp_group=None, cp_group_headwise=None
     ):
         """Call the streamed fused pre-GDR wrapper."""
 
@@ -596,9 +591,9 @@ class GatedDeltaNet(_GDNBase):
         A_log = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group_headwise)
         dt_bias = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group_headwise)
         num_value_heads = A_log.numel()
-        num_key_heads = (
-            conv1d_weight.shape[0] - num_value_heads * self.value_head_dim
-        ) // (2 * self.key_head_dim)
+        num_key_heads = (conv1d_weight.shape[0] - num_value_heads * self.value_head_dim) // (
+            2 * self.key_head_dim
+        )
 
         return fused_streamed_pre_gated_delta_rule(
             qkvzba,

@@ -554,10 +554,7 @@ class TestGatedDeltaNet:
         mtp_layer_spec = mtp_block_spec.layer_specs[0]
 
         mtp_layer = build_module(
-            mtp_layer_spec,
-            config=config,
-            layer_number=1,
-            pg_collection=self.gdn.pg_collection,
+            mtp_layer_spec, config=config, layer_number=1, pg_collection=self.gdn.pg_collection
         )
         mtp_gdn = mtp_layer.mtp_model_layer.self_attention
         assert isinstance(mtp_gdn, GatedDeltaNet)
@@ -709,10 +706,7 @@ class TestGatedDeltaNet:
             "fused_streamed_pre_gated_delta_rule",
             side_effect=fake_fused_streamed_pre_gated_delta_rule,
         ):
-            gdn._fused_streamed_pre_gated_delta_rule(
-                qkvzba,
-                cp_group_headwise=gdn.pg_collection.cp,
-            )
+            gdn._fused_streamed_pre_gated_delta_rule(qkvzba, cp_group_headwise=gdn.pg_collection.cp)
 
         assert captured["qkvzba"] is qkvzba
         assert captured["conv1d_weight"].shape == (

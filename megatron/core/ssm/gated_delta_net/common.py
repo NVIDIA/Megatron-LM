@@ -11,7 +11,6 @@ from typing import Optional, Protocol, Union
 
 import torch
 import torch.nn as nn
-import torch.nn as nn
 
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -701,6 +700,7 @@ def get_parameter_local_cp(
     slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
     param = param[slices]
     return param
+
 
 def tensor_a2a_cp2hp(
     tensor: torch.Tensor,
