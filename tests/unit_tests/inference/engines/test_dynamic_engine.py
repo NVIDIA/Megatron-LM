@@ -421,11 +421,17 @@ class DynamicInferenceEngineTestBase:
                 window_attn_skip_freq=test_config.window_attn_skip_freq,
             )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
-                layer_spec = get_gpt_layer_with_transformer_engine_spec()
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=transformer_config.num_moe_experts
+                )
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec()
+                layer_spec = get_gpt_layer_local_spec(
+                    num_experts=transformer_config.num_moe_experts
+                )
             elif test_config.transformer_impl == "inference_optimized":
-                layer_spec = get_gpt_layer_with_inference_spec()
+                layer_spec = get_gpt_layer_with_inference_spec(
+                    num_experts=transformer_config.num_moe_experts
+                )
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
