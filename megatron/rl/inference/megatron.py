@@ -158,6 +158,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 server_port=kwargs.get('port', 8294),
                 parsers=args.rl_inference_parsers,
                 verbose=kwargs.get('verbose', False),
+                multimodal_prompt_config=(
+                    inference_engine.controller.inference_wrapped_model.get_multimodal_prompt_config()
+                ),
             )
         else:
             client = None

@@ -8,13 +8,39 @@ can import it without circular dependencies.
 """
 
 import io
+import json
 import math
+from pathlib import Path
 from typing import Optional
 
 import torch
 
-from megatron.core.inference.config import ImageProcessingConfig
+from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.models.vision.encoder_registry import REGISTRY as _ENCODER_REGISTRY
+
+
+def _video_target_resolution(image, config: ImageProcessingConfig) -> tuple[int, int]:
+    """Return a video frame target as ``(height, width)``."""
+    target_patches = config.dynamic_resolution_max_patches
+    aspect_ratio = image.width / max(image.height, 1)
+    patch_height = max(1, round(math.sqrt(target_patches / aspect_ratio)))
+    patch_width = max(1, round(math.sqrt(target_patches * aspect_ratio)))
+    required_divisor = 2 if config.pixel_shuffle else 1
+    if required_divisor > 1:
+        height_remainder = patch_height % required_divisor
+        width_remainder = patch_width % required_divisor
+        height_up = patch_height + (
+            required_divisor - height_remainder if height_remainder else 0
+        )
+        width_up = patch_width + (
+            required_divisor - width_remainder if width_remainder else 0
+        )
+        if height_up * width_up <= target_patches:
+            patch_height, patch_width = height_up, width_up
+        else:
+            patch_height = max(required_divisor, patch_height - height_remainder)
+            patch_width = max(required_divisor, patch_width - width_remainder)
+    return patch_height * config.patch_dim, patch_width * config.patch_dim
 
 
 def _resolve_pixel_stats(vision_model_type: str):
@@ -34,6 +60,41 @@ def _resolve_pixel_stats(vision_model_type: str):
 
     fields = EncoderSpec.__dataclass_fields__
     return list(fields["pixel_mean"].default), list(fields["pixel_std"].default)
+
+
+def _load_frame_sequence_manifest(
+    payload: bytes,
+    frame_manifest_magic: Optional[bytes],
+):
+    """Load PIL images from a configured frame-sequence manifest."""
+    if not frame_manifest_magic or not payload.startswith(frame_manifest_magic):
+        return None
+
+    from PIL import Image
+
+    try:
+        manifest = json.loads(payload[len(frame_manifest_magic) :])
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid frame-sequence manifest JSON.") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("Frame-sequence manifest must be a JSON object.")
+
+    frame_paths = manifest.get("frame_paths")
+    if (
+        not isinstance(frame_paths, list)
+        or not frame_paths
+        or not all(isinstance(path, str) and path for path in frame_paths)
+    ):
+        raise ValueError(
+            "Frame-sequence manifest requires non-empty string frame_paths."
+        )
+
+    frames = []
+    for frame_path in frame_paths:
+        resolved = Path(frame_path).expanduser().resolve()
+        with Image.open(resolved) as image:
+            frames.append(image.convert("RGB").copy())
+    return frames
 
 
 def dynamic_res_preprocess(
@@ -99,28 +160,13 @@ def dynamic_res_preprocess(
     return resized_img
 
 
-def preprocess_image_bytes(
-    image_bytes: bytes,
+def preprocess_image(
+    image,
     config: ImageProcessingConfig,
     target_hw=None,
     device: Optional[torch.device] = None,
 ) -> tuple:
-    """Preprocess raw image bytes into tensors for dynamic-resolution inference.
-
-    Args:
-        image_bytes: Raw image file bytes (e.g. JPEG/PNG).
-        config: Image preprocessing configuration.
-        target_hw: Optional (H, W) tuple in pixels. If given, resize to exactly
-            this size instead of running dynamic_res_preprocess. Used to keep
-            all images in a multi-image request at the same patch dimensions.
-
-    Returns:
-        (imgs, imgs_sizes) tensors on CUDA.
-        imgs shape: [1, num_patches, C*patch_dim*patch_dim]
-        imgs_sizes shape: [1, 2] with [H, W] in pixels.
-    """
-    from PIL import Image
-
+    """Convert one PIL image into packed vision patches and its resized shape."""
     try:
         from torchvision import transforms as T
     except ImportError as exc:
@@ -130,7 +176,7 @@ def preprocess_image_bytes(
             "PyTorch container that ships one."
         ) from exc
 
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img = image.convert("RGB")
 
     patch_dim = config.patch_dim
 
@@ -169,6 +215,24 @@ def preprocess_image_bytes(
     if device is not None:
         return images.to(device), imgs_sizes.to(device)
     return images, imgs_sizes
+
+
+def preprocess_image_bytes(
+    image_bytes: bytes,
+    config: ImageProcessingConfig,
+    target_hw=None,
+    device: Optional[torch.device] = None,
+) -> tuple:
+    """Decode image bytes and return packed vision patches and its resized shape."""
+    from PIL import Image
+
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        return preprocess_image(
+            image,
+            config,
+            target_hw=target_hw,
+            device=device,
+        )
 
 
 def preprocess_image_bytes_list(
@@ -227,3 +291,121 @@ def preprocess_image_bytes_list(
     imgs = torch.cat(all_imgs, dim=1) if len(all_imgs) > 1 else all_imgs[0]
     imgs_sizes = torch.cat(all_sizes, dim=0) if len(all_sizes) > 1 else all_sizes[0]
     return {"imgs": imgs, "imgs_sizes": imgs_sizes}
+
+
+def preprocess_video_bytes_list(
+    video_bytes_list,
+    config: VideoProcessingConfig,
+    device: Optional[torch.device] = None,
+) -> dict:
+    """Decode videos and return packed dynamic-resolution engine inputs.
+
+    Frames are sampled uniformly, resized using the same image preprocessing
+    configuration as still images, and kept grouped through ``num_frames``.
+    """
+    if not video_bytes_list:
+        return {}
+    if config.num_frames <= 0:
+        raise ValueError("VideoProcessingConfig.num_frames must be positive.")
+    if config.temporal_patch_size <= 0:
+        raise ValueError(
+            "VideoProcessingConfig.temporal_patch_size must be positive."
+        )
+    if (
+        not config.image_config.dynamic_resolution
+        or config.image_config.use_tiling
+    ):
+        raise NotImplementedError(
+            "Raw video preprocessing currently requires dynamic-resolution, "
+            "non-tiled vision inputs."
+        )
+
+    import numpy as np
+
+    def decode_frames(encoded_video):
+        frames = _load_frame_sequence_manifest(
+            encoded_video,
+            config.frame_manifest_magic,
+        )
+        if frames is not None:
+            return frames, True
+
+        import av
+
+        with av.open(io.BytesIO(encoded_video)) as container:
+            return (
+                [
+                    frame.to_image().convert("RGB")
+                    for frame in container.decode(video=0)
+                ],
+                False,
+            )
+
+    packed_videos = []
+    packed_sizes = []
+    frame_counts = []
+    reference_hw = None
+
+    for encoded_video in video_bytes_list:
+        if not isinstance(encoded_video, (bytes, bytearray)):
+            raise TypeError("video payloads must contain only bytes.")
+        frames, is_frame_sequence = decode_frames(bytes(encoded_video))
+        if not frames:
+            raise ValueError("Decoded video contains no frames.")
+
+        if is_frame_sequence:
+            if len(frames) != config.num_frames:
+                raise ValueError(
+                    "Frame-sequence count must match the configured count: "
+                    f"{len(frames)} != {config.num_frames}."
+                )
+            sampled_frames = frames
+        else:
+            sample_count = min(config.num_frames, len(frames))
+            if (
+                config.temporal_patch_size > 1
+                and sample_count % config.temporal_patch_size
+            ):
+                rounded_down = (
+                    sample_count // config.temporal_patch_size
+                ) * config.temporal_patch_size
+                sample_count = (
+                    rounded_down
+                    if rounded_down > 0
+                    else min(config.temporal_patch_size, len(frames))
+                )
+            sample_indices = (
+                np.rint(np.linspace(0, len(frames) - 1, num=sample_count))
+                .astype(np.int64)
+                .tolist()
+            )
+            sampled_frames = [frames[index] for index in sample_indices]
+        sample_count = len(sampled_frames)
+
+        frame_tensors = []
+        frame_sizes = []
+        if reference_hw is None:
+            reference_hw = _video_target_resolution(
+                sampled_frames[0], config.image_config
+            )
+        for frame in sampled_frames:
+            imgs, imgs_sizes = preprocess_image(
+                frame,
+                config.image_config,
+                target_hw=reference_hw,
+                device=device,
+            )
+            frame_tensors.append(imgs)
+            frame_sizes.append(imgs_sizes)
+
+        packed_videos.append(torch.cat(frame_tensors, dim=1))
+        packed_sizes.append(torch.cat(frame_sizes, dim=0))
+        frame_counts.append(sample_count)
+
+    return {
+        "imgs": torch.cat(packed_videos, dim=1),
+        "imgs_sizes": torch.cat(packed_sizes, dim=0),
+        "num_frames": torch.tensor(
+            frame_counts, dtype=torch.int32, device=packed_videos[0].device
+        ),
+    }

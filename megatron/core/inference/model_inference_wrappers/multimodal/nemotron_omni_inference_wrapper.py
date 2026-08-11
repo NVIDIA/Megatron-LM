@@ -17,28 +17,37 @@ from typing import Any, Dict, Optional
 import torch
 
 from megatron.core import tensor_parallel
+from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-
-
-def _image_embedding_counts(imgs_sizes: torch.Tensor, patch_dim: int) -> torch.Tensor:
-    """Return projected RADIO token counts for dynamic-resolution images."""
-    if patch_dim <= 0:
-        raise ValueError("patch_dim must be greater than 0.")
-    if imgs_sizes.ndim != 2 or imgs_sizes.shape[1] != 2:
-        raise ValueError(f"imgs_sizes must have shape [N, 2], got {tuple(imgs_sizes.shape)}.")
-
-    grid_sizes = torch.div(imgs_sizes, patch_dim, rounding_mode="floor")
-    if torch.any(grid_sizes * patch_dim != imgs_sizes):
-        raise ValueError("Image dimensions must be divisible by patch_dim.")
-    if torch.any(grid_sizes % 2 != 0):
-        raise ValueError("Image patch grids must be even for pixel shuffle.")
-    return (grid_sizes.prod(dim=1) // 4).to(dtype=torch.int)
+from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
+    dynamic_media_embedding_counts,
+    dynamic_media_replacement_counts,
+    resolve_wrapped_model,
+)
 
 
 class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
     """Dynamic-inference adapter for canonical, expanded-sequence Nemotron Omni."""
+
+    def get_multimodal_prompt_config(self) -> MultimodalPromptConfig:
+        """Return Nemotron Omni's compact visual-span contract."""
+        model = resolve_wrapped_model(self.model)
+        return MultimodalPromptConfig(
+            image_spec=MediaPromptSpec(
+                model_token="<image>",
+                model_token_id=int(model.image_token_index),
+                prefix="<img>",
+                suffix="</img>",
+            ),
+            video_spec=MediaPromptSpec(
+                model_token="<image>",
+                model_token_id=int(model.image_token_index),
+                prefix="<img>",
+                suffix="</img>",
+            ),
+        )
 
     def run_one_forward_step(
         self, inference_input: Dict[str, Any], recv_buffer_seq_len: Optional[int] = None
@@ -50,30 +59,39 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             )
         return super().run_one_forward_step(inference_input, recv_buffer_seq_len)
 
-    def expand_image_tokens(self, tokens, num_tiles=None, imgs_sizes=None):
-        """Expand compact image placeholders and build embedding-index masks."""
+    def expand_image_tokens(
+        self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None
+    ):
+        """Expand compact image/video placeholders and build embedding masks."""
         if imgs_sizes is None:
             raise NotImplementedError(
                 "Canonical Nemotron Omni inference supports dynamic-resolution images only."
             )
         if num_tiles is not None:
             raise ValueError("num_tiles must be omitted for dynamic-resolution Omni inference.")
-        if not getattr(self.model, "dynamic_resolution", False):
+        model = resolve_wrapped_model(self.model)
+        if not getattr(model, "dynamic_resolution", False):
             raise ValueError("NemotronOmniModel must have dynamic_resolution enabled.")
 
-        replacement_counts = _image_embedding_counts(
-            imgs_sizes, patch_dim=self.model.patch_dim
-        ).tolist()
+        frame_embedding_counts = dynamic_media_embedding_counts(
+            imgs_sizes,
+            patch_dim=model.patch_dim,
+            pixel_shuffle=True,
+        )
         placeholder_count = sum(
-            token == self.model.image_token_index
+            token == model.image_token_index
             for sample_tokens in tokens
             for token in sample_tokens
         )
-        if placeholder_count != len(replacement_counts):
-            raise ValueError(
-                f"Expected {placeholder_count} image-size entries, "
-                f"got {len(replacement_counts)}."
-            )
+
+        replacement_counts = dynamic_media_replacement_counts(
+            frame_embedding_counts,
+            num_frames=num_frames,
+            temporal_patch_size=int(
+                getattr(model.vision_model, "temporal_patch_dim", 1)
+            ),
+            placeholder_count=placeholder_count,
+        )
 
         expanded_tokens = []
         image_masks = []
@@ -83,7 +101,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             expanded_sample = []
             mask_sample = []
             for token in sample_tokens:
-                if token != self.model.image_token_index:
+                if token != model.image_token_index:
                     expanded_sample.append(token)
                     mask_sample.append(None)
                     continue
@@ -104,6 +122,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
         images: torch.Tensor,
         num_image_tiles: Optional[torch.Tensor] = None,
         imgs_sizes: Optional[torch.Tensor] = None,
+        num_frames: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Encode and project dynamic-resolution images once per request."""
         if imgs_sizes is None:
@@ -111,12 +130,22 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
         if num_image_tiles is not None:
             raise ValueError("num_image_tiles is not used by canonical Nemotron Omni.")
 
-        embeddings = self.model._encode_images(
-            images,
-            imgs_sizes,
-            vision_packed_seq_params=None,
-            num_frames=torch.ones(imgs_sizes.shape[0], dtype=torch.int32, device=imgs_sizes.device),
-        )
+        media_kind = "video" if num_frames is not None else "image"
+        if num_frames is None:
+            num_frames = torch.ones(
+                imgs_sizes.shape[0],
+                dtype=torch.int32,
+                device=imgs_sizes.device,
+            )
+
+        model = resolve_wrapped_model(self.model)
+        with torch.cuda.nvtx.range(f"megatron.multimodal.{media_kind}_encoder"):
+            embeddings = model._encode_images(
+                images,
+                imgs_sizes,
+                vision_packed_seq_params=None,
+                num_frames=num_frames,
+            )
         return embeddings.unsqueeze(1)
 
     def _forward(self, inference_input: Dict[str, Any]) -> torch.Tensor:
@@ -140,9 +169,10 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
         attention_mask = inference_input["attention_mask"]
         image_token_mask = inference_input["image_token_mask"]
         image_embeddings = inference_input.get("image_embeddings")
+        model = resolve_wrapped_model(self.model)
 
         input_ids_text = tokens.masked_fill(tokens == -1, 0)
-        decoder_input = self.model.language_model.embedding(
+        decoder_input = model.language_model.embedding(
             input_ids=input_ids_text, position_ids=position_ids
         )
         combined_embeddings = decoder_input.transpose(0, 1).contiguous()
@@ -164,12 +194,12 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             combined_embeddings[image_positions] = flat_image_embeddings[image_indices]
 
         decoder_input = combined_embeddings.transpose(0, 1).contiguous()
-        if self.model.sequence_parallel_lm:
+        if model.sequence_parallel_lm:
             decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
-                decoder_input, group=self.model.pg_collection.tp
+                decoder_input, group=model.pg_collection.tp
             ).contiguous()
 
-        return self.model.language_model(
+        return model.language_model(
             input_ids=None,
             position_ids=position_ids,
             attention_mask=attention_mask,

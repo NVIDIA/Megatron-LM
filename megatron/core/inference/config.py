@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
 
@@ -230,6 +230,53 @@ class ImageProcessingConfig:
 
 
 @dataclass
+class VideoProcessingConfig:
+    """Configuration for decoding raw video bytes into model input tensors."""
+
+    image_config: ImageProcessingConfig
+    num_frames: int = 8
+    temporal_patch_size: int = 1
+    frame_manifest_magic: Optional[bytes] = None
+    """Prefix for payloads encoded as ``magic + UTF-8 {"frame_paths": [...]}``."""
+
+
+@dataclass(frozen=True)
+class MediaPromptSpec:
+    """Map one API media type to the model's prompt-token contract."""
+
+    model_token: str = "<image>"
+    model_token_id: Optional[int] = None
+    prefix: str = ""
+    suffix: str = ""
+    input_marker: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class MultimodalPromptConfig:
+    """Prompt contracts used to lower structured image/video blocks."""
+
+    image_spec: MediaPromptSpec = field(default_factory=MediaPromptSpec)
+    video_spec: MediaPromptSpec = field(default_factory=MediaPromptSpec)
+
+    def get_spec(self, modality: str) -> MediaPromptSpec:
+        """Return the prompt specification for ``image`` or ``video``."""
+        if modality == "image":
+            return self.image_spec
+        if modality == "video":
+            return self.video_spec
+        raise ValueError(f"Unsupported media modality: {modality!r}")
+
+    @classmethod
+    def from_dict(cls, value):
+        if not value:
+            return cls()
+        return cls(
+            image_spec=MediaPromptSpec(**value.get("image_spec", {})),
+            video_spec=MediaPromptSpec(**value.get("video_spec", {})),
+        )
+
+
+@dataclass
 class InferenceConfig:
     """
     Config for inference.
@@ -366,6 +413,9 @@ class InferenceConfig:
     image_preprocessing_config: Optional[ImageProcessingConfig] = None
     """Configuration for preprocessing raw image payloads."""
 
+    video_preprocessing_config: Optional[VideoProcessingConfig] = None
+    """Configuration for decoding and preprocessing raw video payloads."""
+
     use_flashinfer_fused_rope: Optional[bool] = False
     """
     If True, use flashinfer's fused rope implementation.
@@ -389,6 +439,13 @@ class InferenceConfig:
 
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
+
+    vision_embedding_cache_max_bytes: int = 0
+    """Maximum GPU bytes retained for reusable vision embeddings.
+
+    A value of zero disables the cache. Cache entries are keyed explicitly by
+    callers and are discarded whenever the inference engine is suspended.
+    """
 
     prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
         PrefixCachingEvictionPolicy.REF_ZERO

@@ -115,6 +115,11 @@ def handle_submit_request(coordinator, sender_identity, payload):
     # cache reuse can't happen; clearing hashes here just prevents affinity
     # routing that would concentrate multimodal requests onto whichever rank
     # happened to serve a text-identical prompt first.
+    media_cache_key = (
+        multi_modal_data.get("media_cache_key")
+        if isinstance(multi_modal_data, dict)
+        else None
+    )
     if multi_modal_data:
         request_hashes = []
     else:
@@ -127,7 +132,12 @@ def handle_submit_request(coordinator, sender_identity, payload):
 
     # Account for the fact that some engines may have died.
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
-        next_identity = coordinator.get_best_data_parallel_rank(request_hashes)
+        if isinstance(media_cache_key, str):
+            next_identity = coordinator.get_media_affine_data_parallel_rank(
+                media_cache_key
+            )
+        else:
+            next_identity = coordinator.get_best_data_parallel_rank(request_hashes)
         if coordinator._send_to_engine(next_identity, engine_payload):
             break
     else:

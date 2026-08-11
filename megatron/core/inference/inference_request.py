@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 
-from megatron.core.inference.config import ImageProcessingConfig
+from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
@@ -51,7 +51,7 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
 
 def serialize_multimodal_data(
     multi_modal_data: Any,
-) -> Optional[Dict[str, Union[List[bytes], Dict[str, Any]]]]:
+) -> Optional[Dict[str, Any]]:
     """Serialize one request's vLLM-style multimodal dictionary.
 
     Supported modalities:
@@ -61,8 +61,9 @@ def serialize_multimodal_data(
         preprocessed tensor dictionary containing ``imgs`` / ``imgs_sizes``
         or ``imgs`` / ``num_tiles``.
     Video:
-        Video does not yet have any supported data preprocessing or modeling
-        formats.
+        ``"video"`` accepts raw video bytes, a list of raw video bytes, or a
+        preprocessed tensor dictionary containing ``imgs``, ``imgs_sizes``,
+        and ``num_frames``.
     Audio:
         Audio does not yet have any supported data preprocessing or modeling
         formats.
@@ -72,45 +73,89 @@ def serialize_multimodal_data(
     if not isinstance(multi_modal_data, dict):
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
 
-    unsupported = set(multi_modal_data) - {"image"}
+    unsupported = set(multi_modal_data) - {"image", "video", "media_cache_key"}
     if unsupported:
         raise NotImplementedError(
             f"Unsupported multimodal modalities: {sorted(unsupported)}; "
-            "only 'image' is currently supported."
+            "supported modalities are 'image' and 'video'."
         )
-    image_data = multi_modal_data.get("image")
-    if image_data is None:
+    if multi_modal_data.get("image") is not None and multi_modal_data.get("video") is not None:
+        raise NotImplementedError(
+            "Mixing image and video inputs in one inference request is not supported."
+        )
+    modality = "video" if multi_modal_data.get("video") is not None else "image"
+    modality_data = multi_modal_data.get(modality)
+    if modality_data is None:
         return None
-
-    if isinstance(image_data, (bytes, bytearray)):
-        return {"image": [bytes(image_data)]}
-    if isinstance(image_data, list):
-        if any(not isinstance(item, (bytes, bytearray)) for item in image_data):
-            raise TypeError("multi_modal_data['image'] list must contain only bytes.")
-        return {"image": [bytes(item) for item in image_data]}
-    if not isinstance(image_data, dict):
+    media_cache_key = multi_modal_data.get("media_cache_key")
+    if media_cache_key is not None and not isinstance(media_cache_key, str):
         raise TypeError(
-            "multi_modal_data['image'] must be bytes, list[bytes], or a "
-            f"preprocessed tensor dict; got {type(image_data)}."
+            "multi_modal_data['media_cache_key'] must be a string or None, "
+            f"got {type(media_cache_key)}."
+        )
+
+    def key_for_bytes(items: List[bytes]) -> str:
+        digest = hashlib.sha256()
+        digest.update(b"megatron-media-v1\0")
+        digest.update(modality.encode())
+        for item in items:
+            digest.update(len(item).to_bytes(8, "big"))
+            digest.update(item)
+        return digest.hexdigest()
+
+    def with_cache_key(payload: Dict[str, Any]) -> Dict[str, Any]:
+        if media_cache_key is not None:
+            payload["media_cache_key"] = media_cache_key
+        return payload
+
+    if isinstance(modality_data, (bytes, bytearray)):
+        items = [bytes(modality_data)]
+        if media_cache_key is None:
+            media_cache_key = key_for_bytes(items)
+        return with_cache_key({modality: items})
+    if isinstance(modality_data, list):
+        if any(not isinstance(item, (bytes, bytearray)) for item in modality_data):
+            raise TypeError(
+                f"multi_modal_data[{modality!r}] list must contain only bytes."
+            )
+        items = [bytes(item) for item in modality_data]
+        if media_cache_key is None:
+            media_cache_key = key_for_bytes(items)
+        return with_cache_key({modality: items})
+    if not isinstance(modality_data, dict):
+        raise TypeError(
+            f"multi_modal_data[{modality!r}] must be bytes, list[bytes], or a "
+            f"preprocessed tensor dict; got {type(modality_data)}."
         )
 
     wire: Dict[str, Any] = {}
-    for key in ("imgs", "imgs_sizes", "num_tiles"):
-        value = image_data.get(key)
+    tensor_keys = ("imgs", "imgs_sizes", "num_frames") if modality == "video" else (
+        "imgs",
+        "imgs_sizes",
+        "num_tiles",
+    )
+    for key in tensor_keys:
+        value = modality_data.get(key)
         if value is None:
             continue
         if not isinstance(value, torch.Tensor):
             raise TypeError(
-                f"multi_modal_data['image'][{key!r}] must be a Tensor, " f"got {type(value)}."
+                f"multi_modal_data[{modality!r}][{key!r}] must be a Tensor, "
+                f"got {type(value)}."
             )
         wire[key] = serialize_tensor(value)
-    if "num_img_embeddings_per_tile" in image_data:
-        wire["num_img_embeddings_per_tile"] = int(image_data["num_img_embeddings_per_tile"])
-    return {"image": wire} if wire else None
+    if "num_img_embeddings_per_tile" in modality_data:
+        wire["num_img_embeddings_per_tile"] = int(
+            modality_data["num_img_embeddings_per_tile"]
+        )
+    return with_cache_key({modality: wire}) if wire else None
 
 
 def resolve_multimodal_data_for_engine(
-    multi_modal_data: Any, *, image_preprocessing_config: Optional[ImageProcessingConfig] = None
+    multi_modal_data: Any,
+    *,
+    image_preprocessing_config: Optional[ImageProcessingConfig] = None,
+    video_preprocessing_config: Optional[VideoProcessingConfig] = None,
 ) -> Dict[str, Any]:
     """Resolve wire-format multimodal data into dynamic-engine arguments.
 
@@ -121,8 +166,8 @@ def resolve_multimodal_data_for_engine(
         in-process preprocessed image tensor dictionaries are passed through
         as dynamic-engine image arguments.
     Video:
-        Video does not yet have any supported data preprocessing or modeling
-        formats.
+        Raw video bytes are decoded and sampled into model inputs. Serialized
+        or in-process preprocessed tensor dictionaries are passed through.
     Audio:
         Audio does not yet have any supported data preprocessing or modeling
         formats.
@@ -132,18 +177,54 @@ def resolve_multimodal_data_for_engine(
     if not isinstance(multi_modal_data, dict):
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
 
-    unsupported = set(multi_modal_data) - {"image"}
+    unsupported = set(multi_modal_data) - {"image", "video", "media_cache_key"}
     if unsupported:
         raise NotImplementedError(
             f"Unsupported multimodal modalities: {sorted(unsupported)}; "
-            "only 'image' is currently supported."
+            "supported modalities are 'image' and 'video'."
         )
-    image_data = multi_modal_data.get("image")
-    if image_data is None:
+    if multi_modal_data.get("image") is not None and multi_modal_data.get("video") is not None:
+        raise NotImplementedError(
+            "Mixing image and video inputs in one inference request is not supported."
+        )
+    modality = "video" if multi_modal_data.get("video") is not None else "image"
+    modality_data = multi_modal_data.get(modality)
+    if modality_data is None:
         return {}
+    media_cache_key = multi_modal_data.get("media_cache_key")
+    if media_cache_key is not None and not isinstance(media_cache_key, str):
+        raise TypeError(
+            "multi_modal_data['media_cache_key'] must be a string or None, "
+            f"got {type(media_cache_key)}."
+        )
 
-    if isinstance(image_data, list):
-        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (  # noqa: E501  # pylint: disable=line-too-long
+    def with_cache_key(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        if media_cache_key is not None:
+            kwargs["media_cache_key"] = media_cache_key
+        return kwargs
+
+    if isinstance(modality_data, list):
+        if modality == "video":
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (  # noqa: E501
+                preprocess_video_bytes_list,
+            )
+
+            if video_preprocessing_config is None:
+                raise RuntimeError(
+                    "Raw video data require InferenceConfig.video_preprocessing_config."
+                )
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else None
+            )
+            return with_cache_key(
+                preprocess_video_bytes_list(
+                    modality_data, video_preprocessing_config, device=device
+                )
+            )
+
+        from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (  # noqa: E501
             preprocess_image_bytes_list,
         )
 
@@ -152,37 +233,55 @@ def resolve_multimodal_data_for_engine(
         device = (
             torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
         )
-        return preprocess_image_bytes_list(image_data, image_preprocessing_config, device=device)
-    if not isinstance(image_data, dict):
+        return with_cache_key(
+            preprocess_image_bytes_list(
+                modality_data, image_preprocessing_config, device=device
+            )
+        )
+    if not isinstance(modality_data, dict):
         raise TypeError(
-            "Wire multi_modal_data['image'] must be list[bytes] or a serialized "
-            f"tensor dict; got {type(image_data)}."
+            f"Wire multi_modal_data[{modality!r}] must be list[bytes] or a "
+            f"serialized tensor dict; got {type(modality_data)}."
         )
 
     kwargs: Dict[str, Any] = {}
-    for key in ("imgs", "imgs_sizes", "num_tiles"):
-        if key in image_data:
-            value = image_data[key]
-            kwargs[key] = value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
-    if "num_img_embeddings_per_tile" in image_data:
-        kwargs["num_img_embeddings_per_tile"] = int(image_data["num_img_embeddings_per_tile"])
-
-    # Reject incomplete static-tiling payloads. Static tiling (imgs +
-    # num_tiles, no imgs_sizes) needs num_img_embeddings_per_tile to size the
-    # image-token expansion; without it the engine defaults the count to
-    # zero, has_images silently becomes False, and neither the image-token
-    # expansion nor the vision encoder runs. Fail fast at the wire boundary
-    # instead of returning a text-only completion for what the client thinks
-    # is a multimodal request.
-    has_num_tiles = "num_tiles" in kwargs
-    has_imgs_sizes = "imgs_sizes" in kwargs
-    has_per_tile = kwargs.get("num_img_embeddings_per_tile", 0) > 0
-    if has_num_tiles and not has_imgs_sizes and not has_per_tile:
-        raise ValueError(
-            "Static-tiling image payload requires num_img_embeddings_per_tile > 0 "
-            "when num_tiles is provided without imgs_sizes."
+    tensor_keys = ("imgs", "imgs_sizes", "num_frames") if modality == "video" else (
+        "imgs",
+        "imgs_sizes",
+        "num_tiles",
+    )
+    for key in tensor_keys:
+        if key in modality_data:
+            value = modality_data[key]
+            kwargs[key] = (
+                value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
+            )
+    if "num_img_embeddings_per_tile" in modality_data:
+        kwargs["num_img_embeddings_per_tile"] = int(
+            modality_data["num_img_embeddings_per_tile"]
         )
-    return kwargs
+
+    if modality == "image":
+        # Reject incomplete static-tiling payloads. Static tiling (imgs +
+        # num_tiles, no imgs_sizes) needs num_img_embeddings_per_tile to size
+        # image-token expansion. Without it, the request would silently run as
+        # text-only.
+        has_num_tiles = "num_tiles" in kwargs
+        has_imgs_sizes = "imgs_sizes" in kwargs
+        has_per_tile = kwargs.get("num_img_embeddings_per_tile", 0) > 0
+        if has_num_tiles and not has_imgs_sizes and not has_per_tile:
+            raise ValueError(
+                "Static-tiling image payload requires num_img_embeddings_per_tile > 0 "
+                "when num_tiles is provided without imgs_sizes."
+            )
+    else:
+        missing = {"imgs", "imgs_sizes", "num_frames"} - set(kwargs)
+        if missing:
+            raise ValueError(
+                "Preprocessed video payload requires imgs, imgs_sizes, and num_frames; "
+                f"missing {sorted(missing)}."
+            )
+    return with_cache_key(kwargs)
 
 
 def serialize_ndarray(arr: np.ndarray) -> dict:
@@ -509,6 +608,7 @@ class DynamicInferenceRequest(InferenceRequest):
     uid: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
+    compact_prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     policy_epoch: Optional[list[tuple[int, int]]] = None
@@ -896,7 +996,8 @@ class DynamicInferenceRequestRecord:
             else:
                 return [v for r in self.requests for v in getattr(r, key)]
 
-        prompt_tokens = self.requests[0].prompt_tokens
+        first_request = self.requests[0]
+        prompt_tokens = first_request.prompt_tokens
         prompt_text = self.requests[0].prompt
         routing_indices = None
         routing_parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
@@ -919,6 +1020,7 @@ class DynamicInferenceRequestRecord:
             uid=self.requests[0].uid,
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
+            compact_prompt_tokens=first_request.compact_prompt_tokens,
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
             generated_text=generated_text,

@@ -8,9 +8,15 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
+from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
+)
+from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
+    dynamic_media_embedding_counts,
+    dynamic_media_replacement_counts,
+    resolve_wrapped_model,
 )
 
 
@@ -20,6 +26,16 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
     _recv_only_vision_embeds: bool = False
     _encoder_only: bool = False
+
+    def get_multimodal_prompt_config(self) -> MultimodalPromptConfig:
+        """Use the conventional compact ``<image>`` placeholder."""
+        module = resolve_wrapped_model(self.model)
+        token_id = getattr(module, "image_token_index", None)
+        spec = MediaPromptSpec(
+            model_token="<image>",
+            model_token_id=int(token_id) if token_id is not None else None,
+        )
+        return MultimodalPromptConfig(image_spec=spec, video_spec=spec)
 
     def prep_model_for_inference(self, prompts_tokens: Optional[torch.Tensor] = None):
         """A utility function for preparing model for inference
@@ -128,7 +144,9 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
     # ---- Dynamic inference methods ----
 
-    def expand_image_tokens(self, tokens, num_tiles=None, imgs_sizes=None):
+    def expand_image_tokens(
+        self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None
+    ):
         """Expand image tokens to multiple pad tokens.
 
         Supports two modes:
@@ -147,9 +165,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             mask (List[List[int or None]]): Mask indicating image embedding indices for each
                 position, None for non-image positions.
         """
-        module = (
-            self.model.module.module if hasattr(self.model.module, "module") else self.model.module
-        )
+        module = resolve_wrapped_model(self.model)
         image_token_index = module.image_token_index
 
         pad_value = -1
@@ -170,21 +186,33 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
         # Compute per-image embedding counts
         if imgs_sizes is not None and getattr(module, '_dynamic_resolution', False):
-            # Dynamic resolution: compute per-image embedding count from imgs_sizes.
-            patch_dim = module.patch_dim
-            do_pixel_shuffle = module._pixel_shuffle
-
-            # One D2H sync total instead of two per image. Previous code did
-            # imgs_sizes[i][0].item() + imgs_sizes[i][1].item() inside a Python
-            # loop, incurring 2 * num_images blocking syncs per admission.
-            imgs_sizes_cpu = imgs_sizes.tolist()
-            per_image_embeddings = []
-            for row in imgs_sizes_cpu:
-                h, w = row[0], row[1]
-                num_embeddings = (h // patch_dim) * (w // patch_dim)
-                if do_pixel_shuffle:
-                    num_embeddings //= 4
-                per_image_embeddings.append(num_embeddings)
+            frame_embedding_counts = dynamic_media_embedding_counts(
+                imgs_sizes,
+                module.patch_dim,
+                pixel_shuffle=module._pixel_shuffle,
+                spatial_merge_size=2 if module._conv_merging else 1,
+            )
+            if not module._drop_vision_class_token:
+                class_token_len = int(getattr(module, "_class_token_len", 0))
+                if module._pixel_shuffle and class_token_len > 0:
+                    raise ValueError(
+                        "Dynamic-resolution pixel shuffle requires dropping "
+                        "vision class tokens."
+                    )
+                frame_embedding_counts = [
+                    count + class_token_len for count in frame_embedding_counts
+                ]
+            placeholder_count = sum(
+                token == image_token_index
+                for sample_tokens in tokens
+                for token in sample_tokens
+            )
+            per_image_embeddings = dynamic_media_replacement_counts(
+                frame_embedding_counts,
+                num_frames=num_frames,
+                temporal_patch_size=int(getattr(module, "temporal_patch_dim", 1)),
+                placeholder_count=placeholder_count,
+            )
         else:
             # Static resolution: fixed embeddings per tile
             img_embeddings_per_tile = module.img_seq_len
@@ -274,7 +302,11 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         return expanded_tokens_list, mask_list
 
     def _forward_vision_encoder(
-        self, images, num_image_tiles=None, imgs_sizes=None
+        self,
+        images,
+        num_image_tiles=None,
+        imgs_sizes=None,
+        num_frames=None,
     ) -> torch.Tensor:
         """Run the vision encoder only, returning image embeddings.
 
@@ -291,9 +323,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         """
         from megatron.core.packed_seq_params import PackedSeqParams
 
-        module = (
-            self.model.module.module if hasattr(self.model.module, "module") else self.model.module
-        )
+        module = resolve_wrapped_model(self.model)
 
         # Reject dynamic-resolution requests when the model does not expose
         # the required attributes (see expand_image_tokens for context).
@@ -327,18 +357,21 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
         old_add_decoder = module.add_decoder
         module.add_decoder = False
+        media_kind = "video" if num_frames is not None else "image"
         try:
-            output = self.model(
-                images,
-                [],
-                position_ids=None,
-                attention_mask=None,
-                inference_context=self.inference_context,
-                num_image_tiles=num_image_tiles,
-                runtime_gather_output=True,
-                imgs_sizes=imgs_sizes,
-                vision_packed_seq_params=vision_packed_seq_params,
-            )
+            with torch.cuda.nvtx.range(f"megatron.multimodal.{media_kind}_encoder"):
+                output = self.model(
+                    images,
+                    [],
+                    position_ids=None,
+                    attention_mask=None,
+                    inference_context=self.inference_context,
+                    num_image_tiles=num_image_tiles,
+                    runtime_gather_output=True,
+                    imgs_sizes=imgs_sizes,
+                    vision_packed_seq_params=vision_packed_seq_params,
+                    num_frames=num_frames,
+                )
         finally:
             module.add_decoder = old_add_decoder
 
@@ -369,9 +402,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         attention_mask = inference_input.get("attention_mask", None)
         image_embeddings = inference_input.get("image_embeddings", None)
 
-        module = (
-            self.model.module.module if hasattr(self.model.module, "module") else self.model.module
-        )
+        module = resolve_wrapped_model(self.model)
 
         if is_pipeline_first_stage(self.pp_group) or self._recv_only_vision_embeds:
             # Replace -1 padding with 0 for embedding lookup
@@ -548,7 +579,9 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             return super().run_one_forward_step(inference_input)
 
         # Static VLM path
-        num_image_tokens = (tokens == self.model.module.image_token_index).sum().item()
+        num_image_tokens = (
+            tokens == resolve_wrapped_model(self.model).image_token_index
+        ).sum().item()
         num_img_embeddings = inference_input["num_img_embeddings"]
         decoder_seq_length = inference_input["decoder_seq_length"]
         num_tokens = tokens.size(1)

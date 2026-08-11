@@ -12,6 +12,7 @@ from megatron.core.inference.communication_utils import (
     recv_from_prev_pipeline_rank_,
     send_to_next_pipeline_rank,
 )
+from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -82,6 +83,10 @@ class AbstractModelInferenceWrapper(abc.ABC):
         )
 
         self.inference_context.reset()
+
+    def get_multimodal_prompt_config(self) -> Optional[MultimodalPromptConfig]:
+        """Return this model's structured-media prompt contract, if any."""
+        return None
 
     @abc.abstractmethod
     def prep_inference_input(self, prompt_tokens) -> Dict[str, Any]:

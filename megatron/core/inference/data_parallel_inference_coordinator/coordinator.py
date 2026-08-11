@@ -6,7 +6,7 @@ import json
 import logging
 import signal
 import socket
-from collections import deque
+from collections import OrderedDict, deque
 from multiprocessing import Event
 from multiprocessing.connection import Connection
 
@@ -223,6 +223,8 @@ class DataParallelInferenceCoordinator:
         # timestamps (positive int).  Missing entries are implicitly zero.
         self._hash_table: dict[int, dict[int, int]] = {}
         self._hash_assignment_counter = 0
+        self._media_cache_affinity: OrderedDict[str, bytes] = OrderedDict()
+        self._media_cache_affinity_max_entries = 65536
 
         # Clients that have completed the CONNECT handshake.
         self.known_clients = set()
@@ -243,6 +245,21 @@ class DataParallelInferenceCoordinator:
             raise RuntimeError("No engines connected")
         best_idx = int(np.argmin(self._pending_counts))
         return self._identities_list[best_idx]
+
+    def get_media_affine_data_parallel_rank(self, media_cache_key: str):
+        """Keep equal media keys on one DP rank while balancing new media."""
+        identity = self._media_cache_affinity.pop(media_cache_key, None)
+        if identity in self.identities_of_data_parallel_ranks:
+            rank_idx = self.identity_to_rank_index[identity]
+            if self._pending_counts[rank_idx] < self.max_requests:
+                self._media_cache_affinity[media_cache_key] = identity
+                return identity
+
+        identity = self.get_least_loaded_data_parallel_rank()
+        self._media_cache_affinity[media_cache_key] = identity
+        if len(self._media_cache_affinity) > self._media_cache_affinity_max_entries:
+            self._media_cache_affinity.popitem(last=False)
+        return identity
 
     def _register_rank_identity(self, identity):
         """Register a new rank identity in the scoring data structures.

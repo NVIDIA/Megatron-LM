@@ -5,6 +5,7 @@ import random
 import string
 import time
 from collections import OrderedDict
+from types import SimpleNamespace
 from typing import Dict, List
 from unittest import mock
 
@@ -13,8 +14,15 @@ import torch
 
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status, VLMInferenceRequest
+from megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper import (
+    NemotronOmniInferenceWrapper,
+)
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
+)
+from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
+    dynamic_media_embedding_counts,
+    dynamic_media_replacement_counts,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
@@ -30,6 +38,102 @@ from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.internal
+def test_dynamic_video_embedding_counts_support_video_and_tubelet_markers():
+    frame_counts = dynamic_media_embedding_counts(
+        torch.tensor([[448, 576]] * 4),
+        patch_dim=16,
+        pixel_shuffle=True,
+    )
+    assert frame_counts == [252] * 4
+
+    assert dynamic_media_replacement_counts(
+        frame_counts,
+        num_frames=torch.tensor([4]),
+        temporal_patch_size=2,
+        placeholder_count=2,
+    ) == [252, 252]
+    assert dynamic_media_replacement_counts(
+        frame_counts,
+        num_frames=torch.tensor(4),
+        temporal_patch_size=2,
+        placeholder_count=1,
+    ) == [504]
+
+
+@pytest.mark.internal
+def test_dynamic_video_embedding_counts_reject_misaligned_placeholders():
+    with pytest.raises(ValueError, match="must match either"):
+        dynamic_media_replacement_counts(
+            [252] * 4,
+            num_frames=torch.tensor([4]),
+            temporal_patch_size=2,
+            placeholder_count=3,
+        )
+
+
+@pytest.mark.internal
+def test_vlm_wrapper_expands_one_video_marker_to_all_tubelet_embeddings():
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = SimpleNamespace()
+    wrapper.model.module = SimpleNamespace(
+        image_token_index=-200,
+        _dynamic_resolution=True,
+        patch_dim=16,
+        _pixel_shuffle=True,
+        _conv_merging=False,
+        _drop_vision_class_token=True,
+        temporal_patch_dim=2,
+    )
+
+    expanded, masks = wrapper.expand_image_tokens(
+        [[11, -200, 12]],
+        imgs_sizes=torch.tensor([[448, 576]] * 4),
+        num_frames=torch.tensor([4]),
+    )
+
+    assert expanded == [[11] + [-1] * 504 + [12]]
+    assert masks[0][0] is None
+    assert masks[0][1:-1] == list(range(504))
+    assert masks[0][-1] is None
+
+
+@pytest.mark.internal
+def test_vlm_and_omni_wrappers_expand_tubelet_markers_consistently():
+    model = SimpleNamespace(
+        image_token_index=-200,
+        _dynamic_resolution=True,
+        dynamic_resolution=True,
+        patch_dim=16,
+        _pixel_shuffle=True,
+        _conv_merging=False,
+        _drop_vision_class_token=True,
+        temporal_patch_dim=2,
+    )
+    model.vision_model = SimpleNamespace(temporal_patch_dim=2)
+
+    vlm_wrapper = object.__new__(VLMInferenceWrapper)
+    vlm_wrapper.model = SimpleNamespace(module=model)
+    omni_wrapper = object.__new__(NemotronOmniInferenceWrapper)
+    omni_wrapper.model = model
+
+    kwargs = {
+        "imgs_sizes": torch.tensor([[448, 576]] * 4),
+        "num_frames": torch.tensor([4]),
+    }
+    vlm_expanded, vlm_masks = vlm_wrapper.expand_image_tokens(
+        [[11, -200, -200, 12]], **kwargs
+    )
+    omni_expanded, omni_masks = omni_wrapper.expand_image_tokens(
+        [[11, -200, -200, 12]], **kwargs
+    )
+
+    assert vlm_expanded == [[11] + [-1] * 504 + [12]]
+    assert omni_expanded == [[11] + [-1] * 504 + [12]]
+    assert vlm_masks == omni_masks
+    assert vlm_masks[0][1:-1] == list(range(504))
 
 
 class TestVLMTextGenerationController:

@@ -19,6 +19,7 @@ _IMAGE_FETCH_TIMEOUT_S = 5.0
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB
 _IMAGE_FETCH_USER_AGENT = "megatron-inference"
 
+from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
@@ -301,27 +302,32 @@ def _extract_image_url_bytes(url: str) -> bytes:
     raise ValueError(f"Unsupported image_url scheme: {url[:40]!r}")
 
 
-def _extract_images_from_messages(messages):
-    """Pull image_url blocks out of OpenAI-style multimodal messages.
+def _extract_multimodal_from_messages(
+    messages, prompt_config: MultimodalPromptConfig
+):
+    """Extract media bytes and replace structured blocks with internal slots.
 
-    Walks the message list, extracting bytes from each ``image_url`` block,
-    replacing it with an inline ``<image>`` text marker, and returning both
-    the rewritten messages and the ordered list of image bytes. Messages
-    with plain string ``content`` are passed through unchanged.
-
-    Fetching a remote ``image_url`` blocks, so call this off the event loop.
-
-    Returns:
-        (messages_with_markers, image_bytes_list)
-
-    Raises:
-        ValueError: an ``image_url`` could not be loaded.
+    Remote image fetching is blocking, so callers must run this function off
+    the event loop.
     """
     if not isinstance(messages, list):
-        return messages, []
+        return messages, [], [], []
 
     rewritten = []
     image_bytes_list: list[bytes] = []
+    video_bytes_list: list[bytes] = []
+    media_slots = []
+
+    def add_slot(modality):
+        """Preserve a media block's position while the chat template renders text.
+
+        The actual bytes travel separately. After rendering,
+        _tokenize_with_media_slots replaces this sentinel with the
+        model-specific MediaPromptSpec tokens.
+        """
+        sentinel = f"__MCORE_MEDIA_SLOT_{len(media_slots)}__"
+        media_slots.append((sentinel, modality))
+        return {"type": "text", "text": sentinel}
 
     for message in messages:
         if not isinstance(message, dict):
@@ -334,7 +340,7 @@ def _extract_images_from_messages(messages):
             continue
 
         new_chunks = []
-        found_image = False
+        found_modalities = set()
         for chunk in content:
             if isinstance(chunk, dict) and chunk.get("type") == "image_url":
                 url = chunk.get("image_url", {}).get("url", "")
@@ -347,19 +353,55 @@ def _extract_images_from_messages(messages):
                     # text-only, handing the client a confident answer about an
                     # image the model never saw. Surface it as a 400 instead.
                     raise ValueError(f"Failed to load image_url: {e}") from e
-                new_chunks.append({"type": "text", "text": "<image>"})
-                found_image = True
+                new_chunks.append(add_slot("image"))
+                found_modalities.add("image")
+            elif isinstance(chunk, dict) and chunk.get("type") in {
+                "video_url",
+                "input_video",
+            }:
+                video_value = chunk.get("video_url") or chunk.get("video")
+                url = (
+                    video_value.get("url", "")
+                    if isinstance(video_value, dict)
+                    else video_value
+                )
+                if not isinstance(url, str) or not url.startswith("data:"):
+                    raise ValueError(
+                        "Megatron chat video inputs must be base64 data URLs."
+                    )
+                try:
+                    video_bytes_list.append(_extract_image_url_bytes(url))
+                except Exception as e:
+                    raise ValueError(f"Failed to load video_url: {e}") from e
+                new_chunks.append(add_slot("video"))
+                found_modalities.add("video")
             else:
                 new_chunks.append(chunk)
 
-        if found_image:
+        if found_modalities:
+            input_markers = {
+                prompt_config.get_spec(modality).input_marker
+                for modality in found_modalities
+            } - {None}
+            for index, chunk in enumerate(new_chunks):
+                if isinstance(chunk, dict) and chunk.get("type") == "text":
+                    chunk = dict(chunk)
+                    for marker in input_markers:
+                        chunk["text"] = str(chunk.get("text", "")).replace(
+                            marker, ""
+                        )
+                    new_chunks[index] = chunk
             msg_copy = dict(message)
             msg_copy["content"] = new_chunks
             rewritten.append(msg_copy)
         else:
             rewritten.append(message)
 
-    return rewritten, image_bytes_list
+    if image_bytes_list and video_bytes_list:
+        raise ValueError(
+            "Mixing image and video blocks in one request is not supported."
+        )
+    return rewritten, image_bytes_list, video_bytes_list, media_slots
 
 
 def _sanitize_messages_for_template(messages):
@@ -546,6 +588,122 @@ def _coerce_to_token_id_list(result):
     return list(result)
 
 
+def _media_model_token_ids(chat_tok, prompt_config):
+    """Resolve the model token ids that stand in for media in a chat template."""
+    token_ids = set()
+    for modality in ("image", "video"):
+        spec = prompt_config.get_spec(modality)
+        token_id = spec.model_token_id
+        if token_id is None and hasattr(chat_tok, "convert_tokens_to_ids"):
+            resolved_id = chat_tok.convert_tokens_to_ids(spec.model_token)
+            if resolved_id is not None and resolved_id != getattr(
+                chat_tok, "unk_token_id", None
+            ):
+                token_id = resolved_id
+        if token_id is not None:
+            token_ids.add(int(token_id))
+    return token_ids
+
+
+def _collapse_expanded_media_tokens(token_ids, media_token_ids):
+    """Collapse each consecutive run of a media token ID to one token.
+
+    ``token_ids`` contains the expanded model-input prompt, while
+    ``media_token_ids`` contains the image/video marker IDs from
+    ``MediaPromptSpec``. The result matches the compact chat-template token form.
+    """
+    if not media_token_ids:
+        return list(token_ids)
+
+    collapsed = []
+    previous_token_id = None
+    for token_id in token_ids:
+        if token_id in media_token_ids and token_id == previous_token_id:
+            continue
+        collapsed.append(token_id)
+        previous_token_id = token_id
+    return collapsed
+
+
+async def _tokenize_with_media_slots(
+    chat_tok,
+    messages,
+    media_slots,
+    prompt_config,
+    *,
+    tools,
+    chat_template_kwargs,
+    add_generation_prompt=True,
+):
+    """Render a chat template and lower internal media slots to model tokens."""
+    rendered = await asyncio.to_thread(
+        functools.partial(
+            chat_tok.apply_chat_template,
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            **chat_template_kwargs,
+        )
+    )
+    if not isinstance(rendered, str):
+        raise TypeError("Multimodal chat template rendering must return a string.")
+
+    positioned_slots = []
+    for sentinel, modality in media_slots:
+        if rendered.count(sentinel) != 1:
+            raise ValueError(f"Chat template did not preserve media slot {sentinel}.")
+        positioned_slots.append((rendered.index(sentinel), sentinel, modality))
+
+    prompt_tokens = []
+    cursor = 0
+    for position, sentinel, modality in sorted(positioned_slots):
+        prompt_tokens.extend(
+            _coerce_to_token_id_list(
+                chat_tok(rendered[cursor:position], add_special_tokens=False)
+            )
+        )
+        spec = prompt_config.get_spec(modality)
+        token_id = spec.model_token_id
+        resolved_id = (
+            chat_tok.convert_tokens_to_ids(spec.model_token)
+            if hasattr(chat_tok, "convert_tokens_to_ids")
+            else None
+        )
+        if resolved_id == getattr(chat_tok, "unk_token_id", None):
+            resolved_id = None
+        if token_id is None:
+            if resolved_id is None:
+                raise ValueError(
+                    f"Tokenizer does not define media token {spec.model_token!r}."
+                )
+            token_id = resolved_id
+        elif resolved_id is not None and token_id != resolved_id:
+            raise ValueError(
+                f"Configured token id {token_id} does not match "
+                f"{spec.model_token!r} id {resolved_id}."
+            )
+        prompt_tokens.extend(
+            _coerce_to_token_id_list(
+                chat_tok(spec.prefix, add_special_tokens=False)
+            )
+        )
+        prompt_tokens.append(int(token_id))
+        prompt_tokens.extend(
+            _coerce_to_token_id_list(
+                chat_tok(spec.suffix, add_special_tokens=False)
+            )
+        )
+        cursor = position + len(sentinel)
+
+    prompt_tokens.extend(
+        _coerce_to_token_id_list(
+            chat_tok(rendered[cursor:], add_special_tokens=False)
+        )
+    )
+    return prompt_tokens
+
+
 try:
     import orjson
 
@@ -625,17 +783,20 @@ try:
             return Response("Missing 'messages' field", status=400)
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
-        # Extract any image_url blocks before template sanitization, which would
-        # otherwise drop them. Replaces each image block with an inline <image>
-        # text marker that the chat template can substitute. Runs in a worker
-        # thread because a remote image_url fetch blocks, which would otherwise
-        # stall every other in-flight generation on this rank.
+        prompt_config = current_app.config['multimodal_prompt_config']
+        # Extract structured media before template sanitization. Remote image
+        # fetches block, so keep this work off the event loop.
         try:
-            messages, image_bytes_list = await asyncio.to_thread(
-                _extract_images_from_messages, messages
+            messages, image_bytes_list, video_bytes_list, media_slots = await asyncio.to_thread(
+                _extract_multimodal_from_messages, messages, prompt_config
             )
-        except ValueError as e:
-            return Response(str(e), status=400)
+        except ValueError as error:
+            return Response(str(error), status=400)
+        multi_modal_data = None
+        if image_bytes_list:
+            multi_modal_data = {"image": image_bytes_list}
+        elif video_bytes_list:
+            multi_modal_data = {"video": video_bytes_list}
         template_messages = _sanitize_messages_for_template(messages)
         template_tools = _sanitize_tools_for_template(tools)
 
@@ -668,18 +829,29 @@ try:
                 # rejected in _sanitize_chat_template_kwargs -- that is the actual
                 # fix. The real win here is the tokenizer half, which drops into
                 # Rust and releases the GIL for long conversations.
-                prompt_tokens = _coerce_to_token_id_list(
-                    await asyncio.to_thread(
-                        functools.partial(
-                            chat_tok.apply_chat_template,
-                            template_messages,
-                            tokenize=True,
-                            add_generation_prompt=True,
-                            tools=template_tools,
-                            **chat_template_kwargs,
+                if media_slots:
+                    prompt_tokens = await _tokenize_with_media_slots(
+                        chat_tok,
+                        template_messages,
+                        media_slots,
+                        prompt_config,
+                        tools=template_tools,
+                        chat_template_kwargs=chat_template_kwargs,
+                        add_generation_prompt=True,
+                    )
+                else:
+                    prompt_tokens = _coerce_to_token_id_list(
+                        await asyncio.to_thread(
+                            functools.partial(
+                                chat_tok.apply_chat_template,
+                                template_messages,
+                                tokenize=True,
+                                add_generation_prompt=True,
+                                tools=template_tools,
+                                **chat_template_kwargs,
+                            )
                         )
                     )
-                )
 
                 if req.get("prevent_retokenization", True):
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
@@ -702,8 +874,8 @@ try:
                     # Dataset-provided conversation history won't have these fields.
                     if (
                         last_assistant_message is not None
-                        and "prompt_token_ids" in last_assistant_message
-                        and "generation_token_ids" in last_assistant_message
+                        and isinstance(last_assistant_message.get("prompt_token_ids"), list)
+                        and isinstance(last_assistant_message.get("generation_token_ids"), list)
                     ):
                         eos_token_id = tokenizer.eos_id
                         assert eos_token_id is not None, "Your tokenizer must have an EOS token ID!"
@@ -719,42 +891,60 @@ try:
                         ]
 
                         # Get the templated tokenization of just the previous generation
-                        retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
-                            await asyncio.to_thread(
-                                functools.partial(
-                                    chat_tok.apply_chat_template,
+                        previous_media_slots = [
+                            slot
+                            for slot in media_slots
+                            if slot[0] in str(messages_to_last_assistant_message)
+                        ]
+                        if previous_media_slots:
+                            retokenized_previous_turn_token_ids = (
+                                await _tokenize_with_media_slots(
+                                    chat_tok,
                                     messages_to_last_assistant_message,
-                                    tokenize=True,
-                                    add_generation_prompt=False,
+                                    previous_media_slots,
+                                    prompt_config,
                                     tools=template_tools,
-                                    **chat_template_kwargs,
+                                    chat_template_kwargs=chat_template_kwargs,
+                                    add_generation_prompt=False,
                                 )
                             )
+                        else:
+                            retokenized_previous_turn_token_ids = (
+                                _coerce_to_token_id_list(
+                                    await asyncio.to_thread(
+                                        functools.partial(
+                                            chat_tok.apply_chat_template,
+                                            messages_to_last_assistant_message,
+                                            tokenize=True,
+                                            add_generation_prompt=False,
+                                            tools=template_tools,
+                                            **chat_template_kwargs,
+                                        )
+                                    )
+                                )
+                            )
+
+                        # Responses carry model-input tokens, but prefix stitching happens
+                        # before media expansion, so undo the expansion first.
+                        previous_turn_token_ids = (
+                            _collapse_expanded_media_tokens(
+                                last_assistant_message["prompt_token_ids"],
+                                _media_model_token_ids(chat_tok, prompt_config),
+                            )
+                            + last_assistant_message["generation_token_ids"]
+                        )
+                        prompt_tokens = _replace_prefix_tokens(
+                            eos_token_id,
+                            previous_turn_token_ids,
+                            retokenized_previous_turn_token_ids,
+                            prompt_tokens,
                         )
 
-                        # Replace the prefix tokens with the tokens from the previous generation.
-                        # If prior token IDs are unavailable, fall back to normal retokenized prompt
-                        # instead of failing the request.
-                        prompt_token_ids = last_assistant_message.get("prompt_token_ids")
-                        generation_token_ids = last_assistant_message.get("generation_token_ids")
-
-                        if isinstance(prompt_token_ids, list) and isinstance(
-                            generation_token_ids, list
-                        ):
-                            previous_turn_token_ids = prompt_token_ids + generation_token_ids
-                            prompt_tokens = _replace_prefix_tokens(
-                                eos_token_id,
-                                previous_turn_token_ids,
-                                retokenized_previous_turn_token_ids,
-                                prompt_tokens,
-                            )
-                        else:
-                            logger.warning(
-                                "Last assistant message missing prompt_token_ids/"
-                                "generation_token_ids; skipping prefix replacement."
-                            )
-
             else:
+                if media_slots:
+                    raise ValueError(
+                        "Multimodal chat requests require a chat template."
+                    )
                 warnings.warn(
                     "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
                 )
@@ -856,7 +1046,7 @@ try:
                 client.add_request_streaming(
                     prompt_tokens,
                     sampling_params,
-                    multi_modal_data=({"image": image_bytes_list} if image_bytes_list else None),
+                    multi_modal_data=multi_modal_data,
                 )
                 for _ in range(n)
             ]
@@ -914,7 +1104,7 @@ try:
             client.add_request(
                 prompt_tokens,
                 sampling_params,
-                multi_modal_data=({"image": image_bytes_list} if image_bytes_list else None),
+                multi_modal_data=multi_modal_data,
             )
             for _ in range(n)
         ]
@@ -1063,6 +1253,9 @@ try:
                 message["reasoning_content"] = metadata["reasoning"]
 
             if return_tokenized_data:
+                # Wire contract matches vLLM: prompt_token_ids are model-input tokens
+                # (post vision/video expansion). Compact chat-template tokens stay
+                # engine-internal (compact_prompt_tokens) and are never returned.
                 message["prompt_token_ids"] = result["prompt_tokens"]
                 message["generation_token_ids"] = result["generated_tokens"]
             if return_raw_text:
