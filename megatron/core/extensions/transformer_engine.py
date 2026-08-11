@@ -1555,6 +1555,13 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         )
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
+        # FP32 residual connections pass the FP32 residual stream into this fused module, but
+        # TE LayerNormLinear requires its input dtype to match its BF16/FP16 parameters outside
+        # torch.autocast. Tensor.to() is out-of-place, so this only narrows the local norm/linear
+        # input; the residual tensor retained by TransformerLayer remains FP32.
+        if x.dtype != self.layer_norm_weight.dtype:
+            x = x.to(self.layer_norm_weight.dtype)
+
         with quant_context:
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
 
