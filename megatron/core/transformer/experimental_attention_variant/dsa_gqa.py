@@ -279,15 +279,13 @@ class DSGQAttention(DSAttention):
     def forward(self, query, key, value, attention_mask, x=None, qr=None, **kwargs):
         """Dispatch to the min-memory kernels (default) or main's reference DSA path.
 
-        Backend selected by env `DSA_GQA_KERNEL` ∈ {min_memory (default), reference}.
-        - min_memory: the branch's streamed GQA kernels (genuine GQA, no K/V expansion,
-          O(tile) memory); `DSA_MIN_MEMORY_USE_TRITON` / `DSA_MIN_MEMORY_USE_CUDNN` pick
-          the fast backends (default off → PyTorch oracle).
+        Backend selected by ``config.dsa_gqa_kernel``.
+        - min_memory: the streamed GQA kernels (genuine GQA, no K/V expansion, O(tile)
+          memory); ``dsa_min_memory_use_triton`` / ``dsa_min_memory_use_cudnn`` pick the
+          fast backends (default off -> PyTorch reference implementation).
         - reference: main's DSAttention path (dense teacher + unfused_dsa_fn) with GQA
           K/V expanded to full heads. Kept for numerical A/B; OOMs at long seq.
         """
-        import os
-
         if x is None:
             x = getattr(self, "_dsa_hidden_states", None)
         if qr is None:
@@ -298,7 +296,7 @@ class DSGQAttention(DSAttention):
                 "DSGQASelfAttention to stash them via get_query_key_value_tensors."
             )
 
-        if os.environ.get("DSA_GQA_KERNEL", "min_memory") == "min_memory":
+        if getattr(self.config, "dsa_gqa_kernel", "min_memory") == "min_memory":
             return self._forward_min_memory(
                 query,
                 key,
@@ -330,7 +328,6 @@ class DSGQAttention(DSAttention):
         Genuine GQA (no K/V head expansion). Returns a single tensor with the indexer
         KL loss attached via DSAIndexerLossAutoScaler (identity forward, gradient inject).
         """
-        import os
 
         from megatron.core.transformer.experimental_attention_variant.dsa import (
             DSAIndexerLossAutoScaler,
@@ -355,9 +352,10 @@ class DSGQAttention(DSAttention):
             raise NotImplementedError("DSGQAttention min-memory path supports causal masking only.")
 
         cfg = self.config
-        use_triton = os.environ.get("DSA_MIN_MEMORY_USE_TRITON", "0") == "1"
-        use_cudnn = os.environ.get("DSA_MIN_MEMORY_USE_CUDNN", "0") == "1" or getattr(
-            cfg, "dsa_use_cudnn", False
+        use_triton = bool(getattr(cfg, "dsa_min_memory_use_triton", False))
+        # dsa_use_cudnn is the pre-existing field on this path; keep honouring it.
+        use_cudnn = bool(getattr(cfg, "dsa_min_memory_use_cudnn", False)) or bool(
+            getattr(cfg, "dsa_use_cudnn", False)
         )
         # Indexer applies its own RoPE (rotary_pos_emb always built); enable it.
         use_indexer_rope = True

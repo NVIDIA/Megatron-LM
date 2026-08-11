@@ -6,17 +6,18 @@
 # hybrid_stack_spec_dsa_gqa spec instead of '*'.
 #
 # Knobs (all optional):
-#   DSA_MIN_MEMORY_USE_TRITON=1   Triton sparse attention + indexer top-k
-#   DSA_MIN_MEMORY_USE_CUDNN=1    cuDNN indexer top-k
-#   DSA_GQA_KERNEL=min_memory     (default) | reference
+#   DSA_MIN_MEMORY_USE_TRITON=0|1 -> --dsa-min-memory-use-triton  (default on)
+#   DSA_MIN_MEMORY_USE_CUDNN=0|1  -> --dsa-min-memory-use-cudnn   (default on)
+#     Set either to 0 to fall back to the PyTorch reference for that component,
+#     which is how the kernels are A/B'd against it.
+#   DSA_GQA_KERNEL=min_memory     -> --dsa-gqa-kernel (default) | reference
 #   DATA=mock (default) | real    real needs BLEND_FILE + TOKENIZER_MODEL
 #   PRECISION=bf16 (default) | fp32
 #   DSA_TIMING=1                  per-DSA-layer forward ms
 #   WANDB_PROJECT=<project>       opt-in wandb logging
 #
 # Needs 4 GPUs (TP=4, DP=1). Example:
-#   DSA_MIN_MEMORY_USE_TRITON=1 DSA_MIN_MEMORY_USE_CUDNN=1 \
-#     bash examples/mamba/train_dsa_gqa.sh
+#   bash examples/mamba/train_dsa_gqa.sh
 #
 # NB: the default mock data is trivially learnable -- the model memorizes it
 # within ~25 iterations and enters a regime where tiny kernel differences
@@ -40,7 +41,8 @@ PRECISION=${PRECISION:-bf16}
 export CUDA_DEVICE_MAX_CONNECTIONS=1   # pre-Blackwell TP>1 non-FSDP; harmless otherwise
 
 # --- backend selection for the GQA-DSA layer (see dsa_gqa.py DSGQAttention.forward) ---
-export DSA_GQA_KERNEL=${DSA_GQA_KERNEL:-min_memory}
+# These map to TransformerConfig fields, passed below as CLI flags.
+DSA_GQA_KERNEL=${DSA_GQA_KERNEL:-min_memory}
 
 # --- wandb (opt-in): set WANDB_PROJECT to enable; distinct name per backend+seq ---
 _T=${DSA_MIN_MEMORY_USE_TRITON:-0}; _C=${DSA_MIN_MEMORY_USE_CUDNN:-0}
@@ -64,6 +66,7 @@ MODEL_ARGS=(
   --spec ${SPEC}
   --hybrid-layer-pattern "${PATTERN}"
   --experimental-attention-variant dsa
+  --dsa-gqa-kernel ${DSA_GQA_KERNEL}
   --dsa-kernel-backend ${DSA_BACKEND}
   --dsa-indexer-n-heads 32
   --dsa-indexer-head-dim 64
@@ -156,6 +159,15 @@ else
   exit 1
 fi
 echo "data: ${DATA}"
+
+# Backend kernels: TransformerConfig booleans, so bare store_true flags.
+if [ "${DSA_MIN_MEMORY_USE_TRITON:-1}" = 1 ]; then
+  MODEL_ARGS+=(--dsa-min-memory-use-triton)
+fi
+if [ "${DSA_MIN_MEMORY_USE_CUDNN:-1}" = 1 ]; then
+  MODEL_ARGS+=(--dsa-min-memory-use-cudnn)
+fi
+echo "dsa backend: kernel=${DSA_GQA_KERNEL} triton=${DSA_MIN_MEMORY_USE_TRITON:-1} cudnn=${DSA_MIN_MEMORY_USE_CUDNN:-1}"
 
 if [ "${PRECISION}" = "bf16" ]; then
   MODEL_ARGS+=(--bf16)
