@@ -358,6 +358,9 @@ class FsdpParameterGroup:
         # DP-outer-Partial accumulation placement -- a metadata relabel for HSDP,
         # and a fresh reduce-scattered buffer for HFSDP in the future.
         if self.main_grad.placements != self._accumulation_placements:
+            assert self.main_grad.allocation_stream == (
+                torch.cuda.current_stream(self.main_grad.device)
+            )
             self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
 
         can_reduce_into_main_grad = (
@@ -389,6 +392,9 @@ class FsdpParameterGroup:
         if is_last_microbatch:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
             # reduce-scatter for HFSDP) before binding the sharded parameter grads.
+            assert self.main_grad.allocation_stream == (
+                torch.cuda.current_stream(self.main_grad.device)
+            )
             self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
 
         # Make each sharded parameter's .grad consistent with the final main_grad.
