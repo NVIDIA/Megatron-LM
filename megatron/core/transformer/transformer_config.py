@@ -999,6 +999,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
+    moe_latent_output_norm: bool = False
+    """Apply normalization to the combined routed-expert output in the latent dimension before
+    projecting it back to the transformer hidden size. The normalization type and epsilon are
+    controlled by ``normalization`` and ``layernorm_epsilon``, respectively."""
+
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
     backends (deepep, hybridep, ncclep). None lets each backend use its own default. Unifies the
@@ -1927,6 +1932,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
+
+        if self.moe_latent_output_norm and self.moe_latent_size is None:
+            raise ValueError("moe_latent_output_norm requires moe_latent_size to be set.")
 
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
