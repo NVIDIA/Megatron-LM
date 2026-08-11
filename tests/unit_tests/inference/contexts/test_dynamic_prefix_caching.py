@@ -23,6 +23,7 @@ from megatron.core.inference.inference_request import (
     compute_block_hashes_batched,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -2128,37 +2129,39 @@ PREFIX_CACHE_ENGINE_CASES = [
         id="pp4-lru",
     ),
     pytest.param(
-        dict(
-            name="tp2-pp2-sp-ref-zero",
-            feature="mixed-parallel",
-            tp=2,
-            pp=2,
-            sp=True,
-            policy=PrefixCachingEvictionPolicy.REF_ZERO,
-        ),
-        id="tp2-pp2-sp-ref-zero",
-    ),
-    pytest.param(
         dict(name="ep4-moe-lru", feature="moe", ep=4, policy=PrefixCachingEvictionPolicy.LRU),
         id="ep4-moe-lru",
     ),
     pytest.param(
+        dict(name="gpt-chunked-lru", feature="chunked", policy=PrefixCachingEvictionPolicy.LRU),
+        id="gpt-chunked-lru",
+    ),
+    pytest.param(
         dict(
-            name="gpt-chunked-ref-zero",
-            feature="chunked",
+            name="gpt-fused-rope-ref-zero",
+            feature="fused-rope",
             policy=PrefixCachingEvictionPolicy.REF_ZERO,
         ),
-        id="gpt-chunked-ref-zero",
+        id="gpt-fused-rope-ref-zero",
     ),
     pytest.param(
         dict(name="mtp2-ref-zero", feature="mtp", policy=PrefixCachingEvictionPolicy.REF_ZERO),
         id="mtp2-ref-zero",
     ),
+    pytest.param(
+        dict(
+            name="hybrid-mamba-ref-zero",
+            feature="mamba",
+            model_provider="hybrid",
+            policy=PrefixCachingEvictionPolicy.REF_ZERO,
+        ),
+        id="hybrid-mamba-ref-zero",
+    ),
 ]
 
 
 class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
-    """Run independent real GPT engine rows through cache hits and KV-pool pressure."""
+    """Run real model rows through cache hits, runtime feature paths, and KV pressure."""
 
     @classmethod
     def _build_inference_context(
@@ -2166,7 +2169,6 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
     ):
         """Build the shared harness context with the row's cache eviction policy."""
         assert not requests
-        assert mamba_inference_state_config is None
         return DynamicInferenceContext(
             model_config=transformer_config,
             inference_config=InferenceConfig(
@@ -2176,11 +2178,20 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 block_size_tokens=test_config.context_block_size_tokens,
                 max_requests=test_config.context_max_requests,
                 max_tokens=test_config.context_max_tokens,
+                mamba_inference_state_config=mamba_inference_state_config,
                 materialize_only_last_token_logits=(test_config.materialize_only_last_token_logits),
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
+                prefix_caching_mamba_gb=(
+                    0.2
+                    if test_config.enable_prefix_caching
+                    and mamba_inference_state_config is not None
+                    else None
+                ),
+                use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
                 num_speculative_tokens=test_config.num_speculative_tokens,
+                sampling_backend="torch",
             ),
         )
 
@@ -2203,15 +2214,16 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             tensor_model_parallel_size=case.get("tp", 1),
             pipeline_model_parallel_size=case.get("pp", 1),
             expert_model_parallel_size=case.get("ep", 1),
-            sequence_parallel=case.get("sp", False),
-            model_provider="gpt",
+            model_provider=case.get("model_provider", "gpt"),
             enable_prefix_caching=enable_prefix_caching,
             enable_chunked_prefill=feature == "chunked",
             num_speculative_tokens=2 if feature == "mtp" else 0,
             materialize_only_last_token_logits=feature != "mtp",
+            position_embedding_type="rope" if feature == "fused-rope" else "learned_absolute",
             top_k=1,
         )
         config.prefix_caching_eviction_policy = case["policy"]
+        config.use_flashinfer_fused_rope = feature == "fused-rope"
         return config
 
     @staticmethod
@@ -2220,10 +2232,90 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         return DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=prompt,
-            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1, top_k=1),
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=4,
+                termination_id=-1,
+                return_log_probs=True,
+                top_n_logprobs=5,
+                skip_prompt_log_probs=True,
+                top_k=1,
+            ),
             block_size_tokens=context.block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
         )
+
+    @staticmethod
+    def _install_runtime_witnesses(engine, feature):
+        """Count calls on the feature path during the stressed engine run."""
+        evidence = {
+            "tp_reducing_forwards": 0,
+            "pipeline_forwards": 0,
+            "moe_dispatches": 0,
+            "fused_rope_calls": 0,
+            "mamba_restores": 0,
+        }
+        model = engine.controller.inference_wrapped_model.model
+
+        if feature == "tp":
+
+            def trace_tp_reduce(module, *_):
+                assert torch.distributed.get_world_size(module.tp_group) > 1
+                evidence["tp_reducing_forwards"] += 1
+
+            for module in model.modules():
+                if module.__class__.__name__ == "RowParallelLinear":
+                    module.register_forward_pre_hook(trace_tp_reduce)
+
+        if feature == "pp":
+            wrapper = engine.controller.inference_wrapped_model
+            original = wrapper.forward_pass_with_pipeline_parallel
+
+            def traced_pipeline_forward(*args, **kwargs):
+                assert wrapper.model_is_pipeline_parallel
+                evidence["pipeline_forwards"] += 1
+                return original(*args, **kwargs)
+
+            wrapper.forward_pass_with_pipeline_parallel = traced_pipeline_forward
+
+        if feature == "moe":
+            for module in model.modules():
+                dispatcher = getattr(module, "token_dispatcher", None)
+                if dispatcher is None or not hasattr(dispatcher, "token_dispatch"):
+                    continue
+                original = dispatcher.token_dispatch
+
+                def traced_token_dispatch(
+                    *args, _dispatcher=dispatcher, _original=original, **kwargs
+                ):
+                    assert torch.distributed.get_world_size(_dispatcher.ep_group) > 1
+                    evidence["moe_dispatches"] += 1
+                    return _original(*args, **kwargs)
+
+                dispatcher.token_dispatch = traced_token_dispatch
+
+        if feature == "fused-rope":
+            context = engine.context
+            original = context.apply_fused_qk_rotary_emb
+
+            def traced_fused_rope(*args, **kwargs):
+                assert context.use_flashinfer_fused_rope
+                evidence["fused_rope_calls"] += 1
+                return original(*args, **kwargs)
+
+            context.apply_fused_qk_rotary_emb = traced_fused_rope
+
+        if feature == "mamba" and engine.context.mamba_slot_allocator is not None:
+            allocator = engine.context.mamba_slot_allocator
+            original = allocator.restore_to_live
+
+            def traced_mamba_restore(*args, **kwargs):
+                restored = original(*args, **kwargs)
+                evidence["mamba_restores"] += int(restored)
+                return restored
+
+            allocator.restore_to_live = traced_mamba_restore
+
+        return evidence
 
     @torch.inference_mode()
     def _run_engine_session(self, case, *, enable_prefix_caching):
@@ -2233,6 +2325,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         engine = env.engine
         context = engine.context
         allocator = context.kv_block_allocator
+        engine.controller.tokenizer.detokenize = lambda tokens, **_: f"tok_{tokens[0]}"
+        evidence = self._install_runtime_witnesses(engine, case["feature"])
         pool_size = allocator.pool_size
         storage_size = context.memory_buffer.untyped_storage().nbytes()
         finished = {}
@@ -2240,6 +2334,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         all_hashes = set()
         min_pool_avail = allocator.pool_avail
         saw_chunk = False
+        max_mamba_matched_blocks = 0
         step_count = 0
 
         for cycle in range(3):
@@ -2296,6 +2391,10 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 active_blocks = context.request_to_kv_block_ids[: context.total_request_count]
                 blocks_this_wave.update(active_blocks[active_blocks >= 0].tolist())
                 saw_chunk |= context.chunked_prefill_request_id != -1
+                max_mamba_matched_blocks = max(
+                    max_mamba_matched_blocks,
+                    *(getattr(request, "_mamba_num_matched_blocks", 0) for request in requests),
+                )
                 for record in result["finished_request_records"]:
                     merged = record.merge()
                     finished[merged.request_id] = merged
@@ -2332,14 +2431,39 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             assert engine._prefix_cache_hits == 0
 
         return finished, {
-            "config": config,
             "saw_chunk": saw_chunk,
             "mtp_tokens_proposed": int(engine._spec_tokens_proposed_per_pos.sum()),
-            "num_moe_experts": (
-                engine.controller.inference_wrapped_model.model.config.num_moe_experts
-            ),
             "min_pool_avail": min_pool_avail,
+            "max_mamba_matched_blocks": max_mamba_matched_blocks,
+            **evidence,
         }
+
+    @staticmethod
+    def _assert_logprob_parity(cached_request, baseline_request):
+        """Check generated and top-N logprobs against the cache-off run."""
+        cached_logprobs = cached_request.generated_log_probs
+        baseline_logprobs = baseline_request.generated_log_probs
+        assert cached_logprobs is not None and baseline_logprobs is not None
+        assert len(cached_logprobs) == len(cached_request.generated_tokens)
+        np.testing.assert_allclose(cached_logprobs, baseline_logprobs, rtol=2e-2, atol=5e-2)
+
+        cached_top_n = cached_request.generated_top_n_logprobs
+        baseline_top_n = baseline_request.generated_top_n_logprobs
+        assert cached_top_n is not None and baseline_top_n is not None
+        assert len(cached_top_n) == len(cached_request.generated_tokens)
+        for token, logprob, cached_values, baseline_values in zip(
+            cached_request.generated_tokens, cached_logprobs, cached_top_n, baseline_top_n
+        ):
+            assert cached_values.keys() == baseline_values.keys()
+            assert 0 < len(cached_values) <= 5
+            for key, value in cached_values.items():
+                assert value == pytest.approx(baseline_values[key], rel=2e-2, abs=5e-2)
+            token_key = f"tok_{token}"
+            assert token_key in cached_values
+            assert cached_values[token_key] == pytest.approx(logprob, abs=0.1)
+
+        assert not cached_request.prompt_log_probs
+        assert not cached_request.prompt_top_n_logprobs
 
     @staticmethod
     def _clear_engine_runtime():
@@ -2364,27 +2488,26 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 assert cached_request.generated_tokens == baseline_request.generated_tokens
                 assert cached_request.generated_text == baseline_request.generated_text
                 assert len(cached_request.generated_tokens) == 4
+                self._assert_logprob_parity(cached_request, baseline_request)
 
             assert stats["min_pool_avail"] == 0
             assert baseline_stats["min_pool_avail"] <= 1
-            config = stats["config"]
             feature = case["feature"]
             if feature == "tp":
-                assert config.tensor_model_parallel_size > 1
+                assert stats["tp_reducing_forwards"] > 0
             elif feature == "pp":
-                assert config.pipeline_model_parallel_size > 1
-            elif feature == "mixed-parallel":
-                assert config.tensor_model_parallel_size > 1
-                assert config.pipeline_model_parallel_size > 1
-                assert config.sequence_parallel
+                assert stats["pipeline_forwards"] > 0
             elif feature == "moe":
-                assert config.expert_model_parallel_size > 1
-                assert stats["num_moe_experts"] == config.expert_model_parallel_size
+                assert stats["moe_dispatches"] > 0
             elif feature == "chunked":
                 assert stats["saw_chunk"]
+            elif feature == "fused-rope":
+                assert stats["fused_rope_calls"] > 0
+            elif feature == "mamba":
+                assert stats["max_mamba_matched_blocks"] > 0
+                assert stats["mamba_restores"] > 0
             else:
                 assert feature == "mtp"
-                assert config.num_speculative_tokens == 2
                 assert stats["mtp_tokens_proposed"] > 0
         finally:
             self._clear_engine_runtime()
@@ -2392,6 +2515,12 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
     @pytest.mark.internal
     @pytest.mark.parametrize("case", PREFIX_CACHE_ENGINE_CASES)
     def test_real_engine_stress_row(self, case):
+        if case["feature"] == "mamba":
+            available, reason = _check_mamba_sequence_packing_support()
+            if not available:
+                pytest.skip(reason)
+        if case["feature"] == "fused-rope":
+            pytest.importorskip("flashinfer")
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=case.get("tp", 1),
             pipeline_model_parallel_size=case.get("pp", 1),

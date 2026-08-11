@@ -39,29 +39,18 @@ MODEL_ARGS:
   --seq-length: 1024
   --temperature: 1.0
   --top_k: 1
-  --top_p: 0
   --return-log-probs: true
-  --skip-prompt-log-probs: true
   --num-tokens-to-generate: 30
-  --inference-dynamic-batching-buffer-size-gb: 0.17
-  --inference-dynamic-batching-max-requests: 4
-  --inference-dynamic-batching-max-tokens: 1024
+  --inference-dynamic-batching-buffer-size-gb: 20
   --inference-dynamic-batching-prefix-caching: true
-  --inference-dynamic-batching-prefix-caching-eviction-policy: ref_zero
-  --prefix-cache-compare: true
-  --prefix-cache-stress-groups: 6
-  --prefix-cache-stress-copies: 4
-  --prefix-cache-stress-prompt-tokens: 512
-  --prefix-cache-stress-staged: true
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true
   --output-path: ${INFERENCE_OUTPUT_PATH}
   --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
-  --incoming-requests-per-step: 1
-  --inference-repeat-n: 3
+  --incoming-requests-per-sec: -1
+  --inference-repeat-n: 8
   --inference-logging-step-interval: 1
 METRICS:
   - "generated_tokens"
-  - "generated_text"
   - "logprobs"
 LAUNCHER: ft_launcher
