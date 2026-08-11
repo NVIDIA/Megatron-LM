@@ -672,11 +672,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 isinstance(submodule, MoETransformerLayer) for submodule in module.modules()
             ):
                 raise ValueError("MFSDP v2 with EP requires MoE transformer layers.")
-        else:  # expert_model_parallel_size == 1
-            if any(not getattr(parameter, "allreduce", True) for parameter in module.parameters()):
-                raise ValueError(
-                    "MFSDP v2 expert parameters require expert_model_parallel_size > 1."
-                )
         if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
             raise ValueError(
                 "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."
