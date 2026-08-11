@@ -27,6 +27,16 @@ The following table summarizes MTP configuration fields:
 | --- | --- |
 | `mtp_num_layers` | Number of MTP layers. MTP extends prediction to multiple future tokens at each position. This stack uses `mtp_num_layers` sequential modules to predict that many additional tokens per position. Default: `None`. |
 | `mtp_loss_scaling_factor` | Weight for the MTP loss term. The implementation averages MTP losses across depths, multiplies by this factor, and adds the result to the training objective. Default: `0.1`. |
+| `mtp_use_repeated_layer` | Reuse one physical MTP layer for every prediction depth. Parameters are shared, while the hidden state, shifted token input, and query are recomputed at each iteration. Default: `False`. |
+| `dsa_mtp_index_kv_share` | For repeated-layer DSA MTP, compute latent KV and indexer top-k at iteration 0 and reuse them at later iterations. Queries and sparse attention are still evaluated at every iteration. Default: `False`. |
+
+## Repeated DSA MTP IndexShare and KVShare
+
+Set `mtp_use_repeated_layer: true`, choose more than one MTP iteration, and enable `dsa_mtp_index_kv_share` to use GLM-5.2-style sharing across MTP iterations. The physical MTP layer must be a DSA indexer-compute layer under the model's `dsa_indexer_topk_freq` and `dsa_indexer_skip_topk_offset` schedule.
+
+Iteration 0 produces the post-RoPE, post-TP/CP-gather latent key and top-k indices. Later iterations reuse those tensors while recomputing the query and running sparse attention. The shared key remains attached to autograd. Under full activation recomputation it is an explicit checkpoint output from iteration 0 and an explicit checkpoint input to later iterations, so gradients from all sparse-attention consumers accumulate into the iteration-0 KV projection.
+
+The current implementation uses the split indexer-top-k and sparse-attention path because the combined DSA kernel does not expose top-k for reuse. Fused top-k and fused sparse-attention kernels remain available independently. Selective `mla_up_proj` recompute and CUDA graph scopes that capture attention are not supported with MTP iteration sharing; MoE-only CUDA graph scopes remain supported.
 
 ## Pipeline Parallel Layout for MTP
 
@@ -55,4 +65,4 @@ Use `m` for MTP layers in the pipeline layout string. For example:
 
 ## Unsupported Combinations
 
-Context Parallel (CP), arbitrary `AttnMaskType`, and learned absolute position embeddings are not supported with MTP.
+Arbitrary `AttnMaskType` and learned absolute position embeddings are not supported with MTP. MTP supports Context Parallel execution for attention implementations that provide a compatible CP path; repeated DSA sharing requires DSA all-gather CP and reuses the iteration-0 global latent key within the same microbatch CP group.
