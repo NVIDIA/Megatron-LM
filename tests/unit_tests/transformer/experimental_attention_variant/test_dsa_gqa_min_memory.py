@@ -48,9 +48,11 @@ def test_cudnn_indexer_topk_pads_scores_to_full_key_length(monkeypatch):
             seen["width"] = scores_flat.size(1)
             seen["rows"] = scores_flat.size(0)
             # Everything past k_total must be -inf so it can never be selected.
-            seen["pad_is_neg_inf"] = bool(
-                torch.isneginf(scores_flat[:, k_total:]).all()
-            ) if scores_flat.size(1) > k_total else True
+            seen["pad_is_neg_inf"] = (
+                bool(torch.isneginf(scores_flat[:, k_total:]).all())
+                if scores_flat.size(1) > k_total
+                else True
+            )
             indices = torch.arange(top_k, dtype=torch.int32).expand(scores_flat.size(0), top_k)
             return {"indices": indices.contiguous()}
 
@@ -100,9 +102,7 @@ def test_cudnn_indexer_topk_clamps_out_of_range_indices(monkeypatch):
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, return_val, stream):
             # Row 0: a -1 padding slot. Row 1: an out-of-range positive index.
-            indices = torch.tensor(
-                [[0, 1, 2, -1], [0, 1, 2, k_total + 300]], dtype=torch.int32
-            )
+            indices = torch.tensor([[0, 1, 2, -1], [0, 1, 2, k_total + 300]], dtype=torch.int32)
             return {"indices": indices}
 
     monkeypatch.setattr(dsa_min_memory, "_DSA", FakeDSA)
@@ -121,9 +121,9 @@ def test_cudnn_indexer_topk_clamps_out_of_range_indices(monkeypatch):
     query_positions = q_start + torch.arange(q_len)
     expected_pad = torch.clamp(query_positions + 1, max=k_total - 1)
     for row in range(q_len):
-        assert expected_pad[row] in topk_indices[0, row], (
-            f"row {row} should contain the substituted padding index {int(expected_pad[row])}"
-        )
+        assert (
+            expected_pad[row] in topk_indices[0, row]
+        ), f"row {row} should contain the substituted padding index {int(expected_pad[row])}"
         invalid = topk_indices[0, row] > query_positions[row]
         assert int(invalid.sum()) == 1, "exactly one slot was substituted in this row"
 
@@ -152,9 +152,10 @@ def test_cudnn_indexer_topk_matches_pytorch_indexer():
     torch.manual_seed(1234)
     dev = torch.device("cuda")
     hidden_states = torch.randn((sq, 1, hidden), device=dev, dtype=torch.bfloat16)
-    linear_q = torch.randn(
-        (index_n_heads * index_head_dim, hidden), device=dev, dtype=torch.bfloat16
-    ) / hidden**0.5
+    linear_q = (
+        torch.randn((index_n_heads * index_head_dim, hidden), device=dev, dtype=torch.bfloat16)
+        / hidden**0.5
+    )
     linear_k = torch.randn((index_head_dim, hidden), device=dev, dtype=torch.bfloat16) / hidden**0.5
     linear_w = torch.randn((index_n_heads, hidden), device=dev, dtype=torch.bfloat16) / hidden**0.5
     k_norm_w = torch.ones(index_head_dim, device=dev, dtype=torch.bfloat16)
@@ -163,15 +164,25 @@ def test_cudnn_indexer_topk_matches_pytorch_indexer():
     def run(use_cudnn: bool):
         with dsa_min_memory._triton_dispatch_enabled(False):
             _, indices, _, _ = dsa_min_memory._topk_index_tile(
-                hidden_states, q_start, q_end,
-                linear_q, linear_k, k_norm_w, k_norm_b, False, linear_w,
-                1e-5, index_n_heads, index_head_dim, topk,
-                0,      # index_rotary_dim: rope off keeps the comparison focused
-                None,   # rotary_pos_emb
+                hidden_states,
+                q_start,
+                q_end,
+                linear_q,
+                linear_k,
+                k_norm_w,
+                k_norm_b,
+                False,
+                linear_w,
+                1e-5,
+                index_n_heads,
+                index_head_dim,
+                topk,
+                0,  # index_rotary_dim: rope off keeps the comparison focused
+                None,  # rotary_pos_emb
                 False,  # rotary_interleaved
                 False,  # use_indexer_rope
                 False,  # use_hadamard
-                sq,     # key_chunk_size: single block, tie-equivalent to a full topk
+                sq,  # key_chunk_size: single block, tie-equivalent to a full topk
                 use_cudnn=use_cudnn,
             )
         return indices

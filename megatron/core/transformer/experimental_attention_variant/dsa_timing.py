@@ -16,6 +16,7 @@ Usage (from the training entrypoint, after the model is built):
     # once per iteration, after the forward (or after the step):
     timer.log(iteration)
 """
+
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -136,5 +137,8 @@ def attach_dsa_forward_timing(model, profile_rank: int = 0, label: str = "") -> 
                 n_attached += 1
     profiler.n_layers = n_attached  # enables auto-log once per full forward pass
     if profiler.enabled:
-        print(f"[rank{profiler.rank}] DSA timing attached to {n_attached} DSAttention layer(s)", flush=True)
+        print(
+            f"[rank{profiler.rank}] DSA timing attached to {n_attached} DSAttention layer(s)",
+            flush=True,
+        )
     return profiler

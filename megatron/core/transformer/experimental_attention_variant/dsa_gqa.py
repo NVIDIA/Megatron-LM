@@ -26,6 +26,7 @@ top-k (``run_fused_qk_topk`` — GQA-safe) with a PyTorch fallback, the PyTorch
 reference indexer loss, and the PyTorch ``unfused_dsa_fn`` sparse-attention output.
 A Triton attention output can be swapped in later; this is the option-1 first cut.
 """
+
 import copy
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -338,7 +339,9 @@ class DSGQAttention(DSAttention):
         )
 
         if attention_bias is not None:
-            raise NotImplementedError("DSGQAttention min-memory path does not support attention_bias.")
+            raise NotImplementedError(
+                "DSGQAttention min-memory path does not support attention_bias."
+            )
         if packed_seq_params is not None:
             raise NotImplementedError(
                 "DSGQAttention min-memory path does not support packed sequences."
@@ -432,9 +435,7 @@ class DSGQAttention(DSAttention):
 
         if coeff > 0:
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                loss=indexer_loss,
-                layer_number=self.layer_number,
-                num_layers=cfg.num_layers,
+                loss=indexer_loss, layer_number=self.layer_number, num_layers=cfg.num_layers
             )
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
         return output

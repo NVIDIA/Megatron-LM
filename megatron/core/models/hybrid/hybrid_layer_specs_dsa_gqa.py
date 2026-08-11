@@ -10,6 +10,7 @@ the attention module that produces Q/K/V changes.
 Reference it via:  --spec megatron.core.models.hybrid.hybrid_layer_specs_dsa_gqa hybrid_stack_spec_dsa_gqa
 and place DSA layers with `D` in --hybrid-layer-pattern.
 """
+
 import copy
 
 from megatron.core.extensions.transformer_engine import (
@@ -30,10 +31,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGQAttention,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import (
-    TransformerLayer,
-    TransformerLayerSubmodules,
-)
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 # GQA DSA layer: DSGQASelfAttention (GQA QKV + DSA-input injection) with a plain
 # DSAttention core whose indexer is the hidden-based DSGQAIndexer. Because value is
@@ -58,7 +56,7 @@ dsa_gqa_layer = ModuleSpec(
                                 k_norm=TENorm,
                                 linear_weights_proj=TELinear,
                             ),
-                        ),
+                        )
                     ),
                 ),
                 linear_proj=TERowParallelLinear,
