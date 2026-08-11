@@ -220,6 +220,29 @@ operations to occur at the submodule level.
 
 # Key Building Blocks
 
+### Ownership and lifetime
+
+The FSDP module tree owns its persistent runtime state:
+
+```
+nn.Module / FsdpModule
+├── active nn.Parameter
+├── FsdpParameterGroup
+│   ├── paired sharded and unsharded nn.Parameters
+│   └── DBuffers
+└── shared FsdpContext
+    ├── communication streams
+    └── prefetch-order metadata
+```
+
+The module’s active parameter is one of the pair owned by its parameter group.
+
+After construction is finalized, every backedge to the module tree **must use a weak
+reference**: context prefetch metadata, parameter-group ownership markers, and hook
+callbacks. Otherwise, deleting a model retains its persistent CUDA storage until cyclic
+garbage collection; with weak backedges, storage is released immediately without
+teardown. See https://github.com/NVIDIA/Megatron-LM/pull/6230.
+
 ### FsdpContext
 
 - Created by `fully_shard_context` and shared by every `FsdpModule` constructed in that
