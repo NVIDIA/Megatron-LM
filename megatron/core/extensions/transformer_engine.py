@@ -457,8 +457,62 @@ def _gtp_pre_init(
     return shard_out, gtp_ctx
 
 
-def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
-    """Attach the GTP surface to a pre-sharded TE module's weights and restore logical out_features.
+def _restore_gtp_replicated_bias(module, logical_out_features, out_split_size, is_grouped=False):
+    """Restore full TP-local biases after TE constructed them at GTP-shard size.
+
+    GTP remat shards only weights. Biases stay regular parameters replicated across the GTP
+    axis, but TE sizes both weight and bias from the pre-sharded ``out_features`` constructor
+    argument. Resize each bias back to the logical TP-local output width before model use.
+    """
+    # Bias-disabled TE modules may still expose a zero-length Tensor placeholder. It is not a
+    # parameter and must stay untouched; only real, trainable biases need their width restored.
+    if not getattr(module, "use_bias", True):
+        return
+
+    local_out_features = divide(logical_out_features, out_split_size)
+    if is_grouped:
+        if getattr(module, "single_grouped_bias", False):
+            raise NotImplementedError(
+                "GTP does not support TE single_grouped_bias=True; "
+                "set moe_single_grouped_bias=False"
+            )
+        bias_names = tuple(f"bias{idx}" for idx in range(module.num_gemms))
+    else:
+        # TE's authoritative list. It deviates from ["bias"] only under parameters_split
+        # (per-split biases with TE-side TP-divided widths), which this restore does not model.
+        bias_names = tuple(getattr(module, "bias_names", ("bias",)))
+        if bias_names != ("bias",):
+            raise NotImplementedError(
+                "GTP bias restore supports only the default TE bias layout; got "
+                f"bias_names={bias_names} (TE parameters_split is not supported under GTP)"
+            )
+
+    for bias_name in bias_names:
+        bias = getattr(module, bias_name, None)
+        if bias is None:
+            # use_bias is set, so every expected bias attribute must exist. Skipping silently
+            # would leave a shard-sized bias to fail much later, at the first forward pass.
+            raise AttributeError(
+                f"use_bias is set but {type(module).__name__} has no attribute {bias_name!r}; "
+                "cannot restore the GTP replicated bias"
+            )
+        if not isinstance(bias, Parameter):
+            raise TypeError(f"Expected {bias_name} to be a Parameter, got {type(bias).__name__}")
+        if bias.ndim == 0:
+            raise RuntimeError(f"Cannot restore scalar GTP bias {bias_name}")
+
+        target_shape = (*bias.shape[:-1], local_out_features)
+        if tuple(bias.shape) == target_shape:
+            continue
+
+        # TE initializes linear biases to zero. Preserve the Parameter object (and any attributes
+        # TE attached to it) while replacing only its constructor-sized storage.
+        with torch.no_grad():
+            bias.data = bias.data.new_zeros(target_shape)
+
+
+def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False, *, out_split_size):
+    """Attach GTP weights and restore logical output and replicated-bias dimensions.
 
     ``is_grouped=True`` for GroupedLinear (per-expert weight0..N, coalesced AG via weight_list).
     """
@@ -469,6 +523,9 @@ def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
     # super().__init__): downstream code reads it, e.g. the grouped-MLP fusion gate checks
     # fc1.out_features == 2 * fc2.in_features (a shard-sized fc1 would silently disable fusion).
     module.out_features = logical_out_features
+    _restore_gtp_replicated_bias(
+        module, logical_out_features, out_split_size, is_grouped=is_grouped
+    )
     attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grouped=is_grouped)
 
 
@@ -502,7 +559,7 @@ def _init_gtp_remat_context(
         out_split_size=out_split_size,
     )
     yield out_features
-    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped)
+    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped, out_split_size=out_split_size)
 
 
 def split_te_layernorm_column_parallel_linear(

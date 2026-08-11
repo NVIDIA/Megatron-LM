@@ -15,6 +15,8 @@ Test groups
 2.  TestTPGTPColumnParallelLinear - column-parallel Linear: fwd/bwd correctness (weight shape verified inline)
 3.  TestTPGTPRowParallelLinear    - row-parallel Linear: fwd/bwd smoke test + numerical correctness
 4.  TestTPGTPLayerNormLinear      - LayerNormLinear column-parallel smoke test
+5.  TestTPGTPPaddingAlignment     - pre-init pads the per-TP slice for alignment
+6.  TestTPGTPReplicatedBias       - replicated bias and bias-disabled TE placeholder coverage
 
 Tests use (tp_size, gtp_remat_size) = (2, 2) → world_size = 4 (runs on 4-GPU machines).
 
@@ -35,7 +37,7 @@ if not HAVE_GTP:
 
 import transformer_engine.pytorch as te
 
-from megatron.core.extensions.transformer_engine import _gtp_pre_init
+from megatron.core.extensions.transformer_engine import _gtp_attach_post_init, _gtp_pre_init
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTP_CONFIG,
     GTPShardedParam,
@@ -395,3 +397,162 @@ class TestTPGTPPaddingAlignment:
         world_size = tp_size * gtp_remat_size
         _requires_multi_gpu(world_size)
         _run_distributed(_worker_pre_init_tp_padding, world_size, tp_size, gtp_remat_size)
+
+
+# ---------------------------------------------------------------------------
+# 6. TestTPGTPReplicatedBias - TE pre-shards out_features for weight construction, but
+#    bias stays full and replicated across the GTP axis.
+# ---------------------------------------------------------------------------
+
+
+def _worker_presharded_bias(rank, world_size, port, tp_size, gtp_remat_size):
+    """Row/column GTP linears return a full TP-local bias and backpropagate through BDA."""
+    torch.manual_seed(0)
+    tp_group, gtp_remat_group, tp_rank, _ = _build_groups(rank, world_size, tp_size, gtp_remat_size)
+    batch = 4
+    dtype = torch.bfloat16
+    original_pad = GTP_CONFIG.pad_for_alignment
+    update_gtp_config(pad_for_alignment=16)
+    try:
+        loss_terms = []
+        tracked_layers = []
+
+        # Qwen3.5 GDN uses a bias-disabled LayerNormLinear. TE still exposes a non-Parameter bias
+        # placeholder in this mode, which GTP post-init must leave untouched.
+        no_bias_out_features = tp_size * 1152
+        no_bias_shard_out_features, no_bias_ctx = _gtp_pre_init(
+            types.SimpleNamespace(),
+            no_bias_out_features,
+            gtp_remat_group,
+            {},
+            rng_via_kwarg=False,
+            out_split_size=tp_size,
+        )
+        no_bias_layer = te.LayerNormLinear(
+            in_features=64,
+            out_features=no_bias_shard_out_features,
+            eps=1e-5,
+            bias=False,
+            return_bias=False,
+            params_dtype=dtype,
+            parallel_mode="column",
+            tp_group=tp_group,
+            device="cuda",
+        )
+        assert not no_bias_layer.use_bias
+        no_bias_placeholder = getattr(no_bias_layer, "bias", None)
+        assert isinstance(no_bias_placeholder, torch.Tensor)
+        assert not isinstance(no_bias_placeholder, torch.nn.Parameter)
+        assert no_bias_placeholder.numel() == 0
+        assert "bias" not in dict(no_bias_layer.named_parameters())
+        _gtp_attach_post_init(no_bias_layer, no_bias_ctx, out_split_size=tp_size)
+        assert isinstance(no_bias_layer.weight, GTPShardedParam)
+        assert no_bias_layer.bias is no_bias_placeholder
+        assert no_bias_layer.bias.numel() == 0
+
+        no_bias_input = torch.randn(batch, 64, dtype=dtype, device="cuda")
+        dist.broadcast(no_bias_input, src=0)
+        no_bias_input.requires_grad_(True)
+        no_bias_output = no_bias_layer(no_bias_input, is_first_microbatch=True)
+        assert no_bias_output.shape == (batch, 1152)
+        no_bias_layer.weight.main_grad = torch.zeros(
+            no_bias_layer.weight.shape, dtype=dtype, device="cuda"
+        )
+        loss_terms.append(no_bias_output.float().sum())
+        tracked_layers.append((no_bias_layer, no_bias_input, False))
+
+        # The first two enabled-bias cases produce a TP-local width of 1152. Before the fix, TE
+        # constructed each bias at the GTP shard width (576), while the materialized weight produced
+        # 1152 outputs. The third case covers alignment padding.
+        cases = (
+            ("row", 1152, 1, tp_size * 64),
+            ("column", tp_size * 1152, tp_size, 64),
+            ("row", 4304, 1, tp_size * 64),
+        )
+        for parallel_mode, logical_out_features, out_split_size, input_features in cases:
+            shard_out_features, gtp_ctx = _gtp_pre_init(
+                types.SimpleNamespace(),
+                logical_out_features,
+                gtp_remat_group,
+                {},
+                rng_via_kwarg=False,
+                out_split_size=out_split_size,
+            )
+            layer = te.Linear(
+                in_features=input_features,
+                out_features=shard_out_features,
+                bias=True,
+                return_bias=True,
+                params_dtype=dtype,
+                parallel_mode=parallel_mode,
+                tp_group=tp_group,
+                device="cuda",
+            )
+            bias_before_attach = layer.bias
+            bias_metadata = {
+                name: getattr(layer.bias, name)
+                for name in (
+                    "tensor_model_parallel",
+                    "partition_dim",
+                    "partition_stride",
+                    "sequence_parallel",
+                )
+                if hasattr(layer.bias, name)
+            }
+            # Guard against this check silently becoming vacuous if TE stops tagging biases.
+            assert bias_metadata, "TE no longer tags bias params; update this test"
+            _gtp_attach_post_init(layer, gtp_ctx, out_split_size=out_split_size)
+
+            expected_out_features = logical_out_features // out_split_size
+            _, pad_length, _ = gtp_ctx
+            assert isinstance(layer.weight, GTPShardedParam)
+            assert not isinstance(layer.bias, GTPShardedParam)
+            assert layer.weight.shape[0] == (expected_out_features + pad_length) // gtp_remat_size
+            assert layer.bias.shape == (expected_out_features,)
+            assert layer.bias is bias_before_attach
+            for name, value in bias_metadata.items():
+                assert getattr(layer.bias, name) == value
+
+            assert torch.count_nonzero(layer.bias) == 0
+
+            if parallel_mode == "row":
+                full_input = torch.randn(batch, input_features, dtype=dtype, device="cuda")
+                dist.broadcast(full_input, src=0)
+                local_input_features = input_features // tp_size
+                inp = full_input[
+                    :, tp_rank * local_input_features : (tp_rank + 1) * local_input_features
+                ].clone()
+            else:
+                inp = torch.randn(batch, input_features, dtype=dtype, device="cuda")
+                dist.broadcast(inp, src=0)
+            inp.requires_grad_(True)
+
+            output, output_bias = layer(inp, is_first_microbatch=True)
+            assert output.shape == (batch, expected_out_features)
+            assert output_bias is not None
+            assert output_bias.shape == output.shape[-1:]
+
+            # Mirrors TransformerLayer BDA, where the original Qwen3.5-VL run failed at x + bias.
+            fused = output + output_bias
+            layer.weight.main_grad = torch.zeros(layer.weight.shape, dtype=dtype, device="cuda")
+            loss_terms.append(fused.float().sum())
+            tracked_layers.append((layer, inp, True))
+
+        # Build every forward first so autograd traverses the GTP prefetch chain in reverse order.
+        torch.stack(loss_terms).sum().backward()
+        for layer, inp, has_bias in tracked_layers:
+            assert inp.grad is not None and torch.isfinite(inp.grad).all()
+            if has_bias:
+                assert layer.bias.grad is not None
+                assert layer.bias.grad.shape == layer.bias.shape
+                assert torch.isfinite(layer.bias.grad).all()
+    finally:
+        update_gtp_config(pad_for_alignment=original_pad)
+
+
+class TestTPGTPReplicatedBias:
+    @pytest.mark.parametrize("tp_size,gtp_remat_size", [(2, 2)])
+    def test_row_and_column_bias_forward_backward(self, tp_size, gtp_remat_size):
+        world_size = tp_size * gtp_remat_size
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_presharded_bias, world_size, tp_size, gtp_remat_size)
