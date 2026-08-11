@@ -256,11 +256,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         shard_compute_loads = [0] * dp_size
 
         def _ns_compute_cost(param):
-            """Estimate Newton-Schulz compute cost for a 2D parameter.
+            """Estimate Newton-Schulz compute cost for a parameter.
 
-            For GTP-sharded params, reconstructs the full post-AllGather shape
-            (GTP always shards along dim 0). Cost ~ max(M,N) * min(M,N)^2,
-            which is the dominant term in the NS orthogonalization.
+            Newton-Schulz only runs on matrices, so anything that is not 2D falls
+            back to its element count. For a 2D param the cost is
+            ~ max(M,N) * min(M,N)^2, the dominant term in the orthogonalization;
+            GTP-sharded params reconstruct the full post-AllGather shape first
+            (GTP always shards along dim 0).
             """
             if param.dim() != 2:
                 return param.data.nelement()
