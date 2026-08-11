@@ -327,6 +327,32 @@ class TestSizeMatchingLayout:
         total_buffer_numel = layout.bucket_indices[-1][1]
         assert total_buffer_numel == 8 * numel
 
+    def test_mixed_sizes_can_absorb_into_larger_bucket(self):
+        """Absorbing is not always a win: with mixed sizes it can cost space.
+
+        ``_place`` walks params in backprop order while ``_emit_bucket`` sorts the
+        chunk first, so for mixed sizes the two reach different shard loads.
+        ``_absorbs`` compares against its own lower estimate and admits the two
+        128-element params, after which the sorted packing stacks both onto one
+        shard and the bucket grows. Closing at the threshold instead would have
+        emitted 768 + 512 = 1280 elements; absorbing emits 1024 + 384 = 1408.
+
+        Documented rather than fixed: the target case is equal-sized expert
+        matrices, where sorting is a no-op and the estimate is exact.
+        """
+        dp_size = 2
+        # Backprop order is reversed(params), so this list is written back to front.
+        backprop_order_numels = [192, 192, 256, 128, 128, 192]
+        params = [_make_param((n,)) for n in reversed(backprop_order_numels)]
+        cfg = _make_ddp_config()
+
+        layout = _LWO._compute_per_buffer_param_layout(params, 448, dp_size, cfg)
+
+        for param in params:
+            _assert_param_within_shard(layout, param, dp_size)
+        assert len(layout.bucket_indices) == 2
+        assert layout.bucket_indices[-1][1] == 1408
+
     # -- bucket alignment --
 
     def test_bucket_dp_divisible(self):

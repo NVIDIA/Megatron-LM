@@ -361,10 +361,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         chunk_numel = 0
         chunk_max_param = 0
         # Approximate _emit_bucket's placement so we can decide, per param,
-        # whether it still fits in the current bucket. _emit_bucket assigns by
-        # Newton-Schulz compute cost while this tracks numel, so the two can
-        # disagree. The estimate errs optimistic, which makes a bucket slightly
-        # larger than predicted rather than producing an invalid layout.
+        # whether it still fits in the current bucket. This estimates rather
+        # than mirrors, for two reasons: _emit_bucket sorts the chunk before
+        # packing it, while this places params in backprop order, and
+        # _emit_bucket assigns by Newton-Schulz compute cost, while this tracks
+        # numel. Equal-sized params make both differences vanish, because
+        # sorting is then a no-op and cost is proportional to numel. Mixed
+        # sizes send params to different shards under the two orders, so the
+        # real maximum shard load can exceed the estimated one. _absorbs then
+        # admits a param that does grow the bucket, leaving a buffer larger
+        # than closing the bucket early would have produced. The layout stays
+        # valid either way; see test_mixed_sizes_can_absorb_into_larger_bucket.
         shard_loads = [0] * dp_size
 
         def _absorbs(numel: int) -> bool:
