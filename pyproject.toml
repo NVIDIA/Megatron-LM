@@ -194,6 +194,30 @@ override-dependencies = [
     "urllib3>=2.6.3",
 ]
 
+[[tool.uv.dependency-metadata]]
+name = "flash-mla"
+version = "1.0.0+b7643bd"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "transformer-engine"
+version = "2.14.0+f031cf87"
+requires-dist = [
+    "einops",
+    "importlib-metadata",
+    "nvdlfw-inspect",
+    "onnx",
+    "onnxscript",
+    "packaging",
+    "pydantic",
+    "torch",
+]
+
+[[tool.uv.dependency-metadata]]
+name = "fast-hadamard-transform"
+version = "1.0.4.post1"
+requires-dist = ["torch", "packaging", "ninja"]
+
 [tool.uv.sources]
 
 flash_mla = [
