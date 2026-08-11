@@ -85,6 +85,13 @@ _INCR_ATTN_STATE = os.environ.get("MCORE_INFER_INCR_ATTN_STATE", "0") == "1"
 # every buffer the fast path served is identical. Very slow; correctness only.
 _INCR_ATTN_STATE_VERIFY = os.environ.get("MCORE_INFER_INCR_ATTN_STATE_VERIFY", "0") == "1"
 
+# Reduced-op path for the post-sampling bookkeeping in `update_requests`. Off by
+# default; see `DynamicInferenceContext._write_decode_token_bookkeeping_fast`.
+_VEC_UPDATE_REQS = os.environ.get("MCORE_INFER_VEC_UPDATE_REQS", "0") == "1"
+# Debug mode: run the reduced-op path, snapshot every buffer it wrote, restore
+# the inputs, run the reference path, and assert the two agree exactly.
+_VEC_UPDATE_REQS_VERIFY = os.environ.get("MCORE_INFER_VEC_UPDATE_REQS_VERIFY", "0") == "1"
+
 # Diagnostic: tally why the incremental fast path declines, so a single run answers
 # "which guard is rejecting every step" instead of requiring a guess per experiment.
 _INCR_DIAG = os.environ.get("MCORE_INFER_INCR_DIAG", "0") == "1"
@@ -354,6 +361,11 @@ class DynamicInferenceContext(BaseInferenceContext):
     _incr_attn_state_max_seqlen_q = 0
     _incr_attn_state_max_seqlen_k = 0
     _incr_attn_state_state_data = None
+
+    # Cached `torch.arange(paused_request_count, total_request_count)` for the
+    # reduced-op decode bookkeeping path (MCORE_INFER_VEC_UPDATE_REQS).
+    _decode_req_idx_bounds = None
+    _decode_req_idx_arange = None
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -4423,7 +4435,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask[-1] = 1
 
         active_request_count = (active_requests_mask == 1).sum().item()
-        finished_request_count = (active_requests_mask == 0).sum().item()
+        if _VEC_UPDATE_REQS:
+            # The mask is 0/1 by construction (a `&` of two byte comparisons in
+            # text_generation_controller), so the complement is exact and saves a
+            # second full comparison + reduction over the request dimension.
+            finished_request_count = active_requests_mask.numel() - active_request_count
+        else:
+            finished_request_count = (active_requests_mask == 0).sum().item()
         assert (
             active_request_count + finished_request_count + self.paused_request_count
             == self.total_request_count
@@ -4514,7 +4532,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             ]
             active_requests_requiring_new_block = (
                 num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
-            ).byte()
+            )
+            if not _VEC_UPDATE_REQS:
+                # The bool tensor supports every downstream use (nonzero, `== 0`,
+                # scalar assignment, sum), so the byte cast is a pure copy.
+                active_requests_requiring_new_block = active_requests_requiring_new_block.byte()
 
             # Find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
             if (
@@ -4531,9 +4553,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                     # Force-pause excess requests in a decode-only batch
                     active_requests_requiring_new_block[max_allowed_active:] = 1
 
-            active_requests_requiring_new_block_count = (
-                (active_requests_requiring_new_block == 1).sum().item()
-            )
+            if _VEC_UPDATE_REQS:
+                active_requests_requiring_new_block_count = int(
+                    active_requests_requiring_new_block.sum()
+                )
+            else:
+                active_requests_requiring_new_block_count = (
+                    (active_requests_requiring_new_block == 1).sum().item()
+                )
 
             if active_requests_requiring_new_block_count > 0:
                 newly_paused_request_ids = self.request_ids[
@@ -4681,6 +4708,123 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_generated_tokens
         )
 
+        if _VEC_UPDATE_REQS and self.num_speculative_tokens == 0:
+            if _VEC_UPDATE_REQS_VERIFY:
+                self._verify_decode_token_bookkeeping(active_request_count, next_tokens)
+            else:
+                self._write_decode_token_bookkeeping_fast(active_request_count, next_tokens)
+        else:
+            self._write_token_bookkeeping_reference(
+                active_request_count,
+                num_generated_tokens,
+                next_tokens,
+                prev_last_block_ids,
+                new_speculative_tokens,
+            )
+
+        return {
+            "newly_paused_request_ids": newly_paused_request_ids,
+            "evict_request_ids": evict_request_ids,
+        }
+
+    def _write_decode_token_bookkeeping_fast(
+        self, active_request_count: int, next_tokens: Tensor
+    ) -> None:
+        """Reduced-op form of `_write_token_bookkeeping_reference` for plain decode.
+
+        Only valid when `num_speculative_tokens == 0`, i.e. exactly one generated
+        token per active request. Under that condition the reference path spends
+        most of its host time on operations that are provably identity:
+        `repeat_interleave(1)`, adding `torch.arange(1).repeat(n)` (a zero
+        vector), and building the `raw_positions` / `crosses_boundary` tensors
+        whose only consumer is a branch that a zero speculative-token count makes
+        unreachable. This writes the same values with those operations removed.
+        """
+        paused = self.paused_request_count
+        total = self.total_request_count
+        active_slice = slice(paused, total)
+        num_tokens = active_request_count
+
+        block_offsets = self.request_last_kv_block_offset
+        block_offsets[active_slice] = (
+            block_offsets[active_slice] + 1
+        ) % self.block_size_tokens
+
+        self.active_token_count = num_tokens
+        self.token_to_input_ids[:num_tokens] = next_tokens[active_slice]
+
+        pos_ids = self.token_to_pos_ids
+        pos_ids[:num_tokens] = self.request_kv_length_offsets[active_slice]
+
+        if self._decode_req_idx_bounds != (paused, total):
+            self._decode_req_idx_bounds = (paused, total)
+            self._decode_req_idx_arange = torch.arange(paused, total, device='cpu')
+        self.token_to_request_idx[:num_tokens] = self._decode_req_idx_arange
+
+        self.token_to_position_in_request[:num_tokens] = pos_ids[:num_tokens]
+        self.token_to_local_position_within_kv_block[:num_tokens] = (
+            pos_ids[:num_tokens] % self.block_size_tokens
+        )
+        self.token_to_block_idx[:num_tokens] = self.request_last_kv_block_id[active_slice]
+
+    def _verify_decode_token_bookkeeping(
+        self, active_request_count: int, next_tokens: Tensor
+    ) -> None:
+        """Run the fast path, then the reference path, and assert they agree."""
+        paused = self.paused_request_count
+        total = self.total_request_count
+        pre_block_offsets = self.request_last_kv_block_offset[paused:total].clone()
+
+        self._write_decode_token_bookkeeping_fast(active_request_count, next_tokens)
+        num_tokens = self.active_token_count
+        fast = {
+            "request_last_kv_block_offset": self.request_last_kv_block_offset[
+                paused:total
+            ].clone(),
+            "active_token_count": self.active_token_count,
+            "token_to_input_ids": self.token_to_input_ids[:num_tokens].clone(),
+            "token_to_pos_ids": self.token_to_pos_ids[:num_tokens].clone(),
+            "token_to_request_idx": self.token_to_request_idx[:num_tokens].clone(),
+            "token_to_position_in_request": self.token_to_position_in_request[
+                :num_tokens
+            ].clone(),
+            "token_to_local_position_within_kv_block": (
+                self.token_to_local_position_within_kv_block[:num_tokens].clone()
+            ),
+            "token_to_block_idx": self.token_to_block_idx[:num_tokens].clone(),
+        }
+
+        self.request_last_kv_block_offset[paused:total] = pre_block_offsets
+        self._write_token_bookkeeping_reference(active_request_count, 1, next_tokens, None)
+
+        mismatches = []
+        for name, fast_value in fast.items():
+            if name == "active_token_count":
+                if fast_value != self.active_token_count:
+                    mismatches.append(f"{name}: {fast_value} != {self.active_token_count}")
+                continue
+            if name == "request_last_kv_block_offset":
+                reference = self.request_last_kv_block_offset[paused:total]
+            else:
+                reference = getattr(self, name)[:num_tokens]
+            if not torch.equal(fast_value, reference):
+                bad = int((fast_value != reference).sum())
+                mismatches.append(f"{name}: {bad} of {reference.numel()} elements differ")
+        if mismatches:
+            raise AssertionError(
+                "MCORE_INFER_VEC_UPDATE_REQS verification failed at step "
+                f"{self.step_count}: " + "; ".join(mismatches)
+            )
+
+    def _write_token_bookkeeping_reference(
+        self,
+        active_request_count: int,
+        num_generated_tokens: int,
+        next_tokens: Tensor,
+        prev_last_block_ids: Optional[Tensor],
+        new_speculative_tokens: Optional[Tensor] = None,
+    ) -> None:
+        """Per-token bookkeeping for the next forward pass (general path)."""
         # Clone needed: old_offsets is reused later to compute raw_positions
         # for block-boundary detection. The write-back on the next line overwrites the
         # underlying tensor, so without clone the boundary-crossing logic would see the
@@ -4806,11 +4950,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Convert back to 1d tensor
             self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
-
-        return {
-            "newly_paused_request_ids": newly_paused_request_ids,
-            "evict_request_ids": evict_request_ids,
-        }
 
     def _processed_log_probs(
         self,
