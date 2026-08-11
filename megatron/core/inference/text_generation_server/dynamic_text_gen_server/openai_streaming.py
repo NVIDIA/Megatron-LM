@@ -103,11 +103,13 @@ class StreamingChatParser:
         self._parse = parse
         self._marker_prefixes = tuple(marker_prefixes)
         self._named_tool_choice = named_tool_choice
+        # Retain emitted content/reasoning prefixes and stable per-tool IDs and emission flags.
         self._content_sent = ""
         self._reasoning_sent = ""
         self._tool_arguments_sent = []
         self._tool_ids = []
         self._tool_names_sent = []
+        # Track whether a tool delta was emitted so the final finish reason can reflect it.
         self.tools_streamed = False
 
     def _append_state_for_tool(self):
@@ -140,6 +142,7 @@ class StreamingChatParser:
                 deltas.append({"reasoning_content": reasoning_delta})
                 self._reasoning_sent = reasoning
 
+        # Buffer partial control-marker prefixes so parser syntax is not emitted as content.
         safe_content = (
             content
             if finished or tool_calls
@@ -185,10 +188,7 @@ class StreamingChatParser:
                     deltas.append(
                         {
                             "tool_calls": [
-                                {
-                                    "index": index,
-                                    "function": {"arguments": current_arguments},
-                                }
+                                {"index": index, "function": {"arguments": current_arguments}}
                             ]
                         }
                     )
