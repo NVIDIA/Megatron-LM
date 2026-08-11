@@ -100,6 +100,60 @@ def _get_default_config(M: int, E: int, top_k: int) -> dict:
     }
 
 
+# Retune the two grouped GEMMs independently for the MoE *decode* regime.
+# Env-toggleable for A/B; the tuned path is the same kernel with different M and N
+# tiles. It inherits BLOCK_SIZE_K, which is what fixes the fp32 reduction order, so
+# the results are bit-exact against the default config.
+_TUNE_DECODE_GEMM: bool = os.environ.get("MCORE_MOE_GEMM_TUNE", "0") == "1"
+
+
+def _get_decode_tuned_configs(M: int, E: int, top_k: int) -> tuple[dict, dict]:
+    """Per-GEMM launch configs for the decode regime; returns (fc1, fc2).
+
+    Measured on GB200 at the Qwen3-30B-A3B EP4 decode shape (hidden 2048,
+    moe_ffn 768, 32 local experts, top-8, 256 tokens): expert-weight traffic is
+    302 MB per layer against a 6.08 TB/s streaming-read ceiling, i.e. a 49.7 us
+    floor, while `_get_default_config` lands at 72.1 us. The gap is *not* FLOPs
+    (63-83 TFLOP/s achieved, ~3% of BF16 peak) and not the indirection-table
+    padding (shrinking it 3.9x -> 1.5x buys only ~1.2x); it is tile-quantized
+    SM occupancy. `_get_default_config` picks BLOCK_SIZE_N=128 for both GEMMs,
+    which leaves FC1 at ceil(768/128)=6 N-tiles x 32 M-tiles = 192 CTAs on 148
+    SMs — 1.3 waves, so ~30% of the machine idles in the tail.
+
+    So the two GEMMs want opposite N-tiles at decode: FC1 (narrow N=768) needs a
+    *small* BLOCK_SIZE_N to manufacture enough CTAs to fill the GPU, while FC2
+    (wide N=2048) already has plenty and prefers a *large* one for weight-load
+    efficiency. `_get_default_config` cannot express that because vLLM shares one
+    config across both passes. BLOCK_SIZE_M stays shared — one indirection table
+    is built for both GEMMs — and is dropped to 16 to cut padded rows as well.
+
+    Measured FC1+FC2, median of 3 x 300 iters: 72.13 us default -> 57.24 us here
+    (1.26x), i.e. 1.15x off the streaming-read floor.
+
+    Falls back to the shared default outside the decode regime (large M is
+    compute-bound and vLLM's heuristic is tuned for it).
+    """
+    default = _get_default_config(M, E, top_k)
+    # Measured CUDA-graph device time vs the default config: 1.289x at 128
+    # tokens, 1.197x at 256 (the decode point, = local_tokens * ep_size),
+    # 1.120x at 384, but 0.952x at 512 — past ~384 tokens there are already
+    # enough M-tiles to fill the GPU and the narrow FC1 tile starts costing
+    # weight-load efficiency. Hand back to upstream's heuristic there.
+    if M > 384:
+        return default, default
+    shared = dict(default)
+    shared['BLOCK_SIZE_M'] = 16
+    shared['GROUP_SIZE_M'] = 1
+    # BLOCK_SIZE_K is deliberately inherited rather than set. The fp32 K-reduction
+    # order is a function of BLOCK_SIZE_K alone, so inheriting it keeps this path
+    # bit-exact against the default config at every M. The default is already 64
+    # throughout the measured range (it only rises to 128 at M <= 64), so this is
+    # a no-op where the configs below were tuned.
+    fc1 = dict(shared, BLOCK_SIZE_N=64, num_warps=4, num_stages=3)
+    fc2 = dict(shared, BLOCK_SIZE_N=256, num_warps=8, num_stages=4)
+    return fc1, fc2
+
+
 @triton.jit
 def _fused_moe_kernel(
     # Pointers
@@ -1050,8 +1104,19 @@ def vllm_fused_moe(
 
     # Mirror upstream vLLM: pick the full launch config (tile sizes, warps,
     # stages) host-side from the token-count hint, not from the worst-case
-    # buffer size. Same config is used for both FC1 and FC2 (matches vLLM).
-    config = _get_default_config(M=effective_tokens, E=num_local_experts, top_k=topk)
+    # buffer size. Same config is used for both FC1 and FC2 (matches vLLM),
+    # unless the decode retune is enabled, which tiles the two passes
+    # separately (they have very different N) around a shared BLOCK_SIZE_M.
+    if _TUNE_DECODE_GEMM:
+        config_fc1, config_fc2 = _get_decode_tuned_configs(
+            M=effective_tokens, E=num_local_experts, top_k=topk
+        )
+    else:
+        config_fc1 = config_fc2 = _get_default_config(
+            M=effective_tokens, E=num_local_experts, top_k=topk
+        )
+    # BLOCK_SIZE_M is shared: one indirection table feeds both GEMMs.
+    config = config_fc1
 
     if _USE_FUSED_ALIGN and _USE_FUSED_COUNT and effective_tokens <= _FUSED_COUNT_MAX_TOKENS:
         if _USE_FUSED_SCATTER:
@@ -1086,8 +1151,8 @@ def vllm_fused_moe(
     block_m = config['BLOCK_SIZE_M']
     em_hint = effective_tokens * topk + block_m * num_local_experts
     num_pid_m_hint = _ceil_div(em_hint, block_m)
-    num_pid_n_fc1 = _ceil_div(fc1_out_width, config['BLOCK_SIZE_N'])
-    num_pid_n_fc2 = _ceil_div(K, config['BLOCK_SIZE_N'])
+    num_pid_n_fc1 = _ceil_div(fc1_out_width, config_fc1['BLOCK_SIZE_N'])
+    num_pid_n_fc2 = _ceil_div(K, config_fc2['BLOCK_SIZE_N'])
     grid_size_fc1 = num_pid_m_hint * num_pid_n_fc1
     grid_size_fc2 = num_pid_m_hint * num_pid_n_fc2
 
@@ -1111,7 +1176,7 @@ def vllm_fused_moe(
         num_post_padded,
         mul_routed_weight=False,
         top_k=topk,
-        config=config,
+        config=config_fc1,
         grid_size=grid_size_fc1,
         fuse_squared_relu=not is_swiglu,
         fuse_swiglu=use_fused_swiglu,
@@ -1140,7 +1205,7 @@ def vllm_fused_moe(
         num_post_padded,
         mul_routed_weight=False,
         top_k=1,
-        config=config,
+        config=config_fc2,
         grid_size=grid_size_fc2,
     )
 
