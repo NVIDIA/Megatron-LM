@@ -34,7 +34,7 @@ def get_cp_slice_for_thd(
             before slicing. Existing cu_seqlens metadata is left unchanged.
     """
     cp_size = cp_group.size()
-    if cp_size <= 1:
+    if cp_size <= 1 and partition_total_tokens is None:
         return
     cp_rank = cp_group.rank()
     # Partition with padded cumulative lengths so CP slices match the THD
@@ -63,6 +63,8 @@ def get_cp_slice_for_thd(
             if pad_len > 0:
                 pad_value = True if key == 'padding_mask' else 0
                 batch[key] = torch.cat([batch[key], batch[key].new_full((pad_len,), pad_value)])
+    if cp_size <= 1:
+        return
     if cp_partition_mode == "contiguous":
         if total_tokens % cp_size != 0:
             raise RuntimeError(

@@ -2,6 +2,7 @@
 
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -151,6 +152,63 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
         "max_seqlen": max_seqlen,
     }
     return iter([batch]), num_real_tokens
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("needs_padding_mask", [False, True])
+def test_get_batch_on_this_tp_rank_full_iteration_cudagraph_safe(
+    monkeypatch, tp_rank, needs_padding_mask
+):
+    """Optional batch inputs must not require host/device transfers during capture."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA Graph capture requires CUDA")
+
+    from megatron.training.utils import common_utils
+
+    torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
+    device = torch.cuda.current_device()
+    shape = (1, 4)
+    data = {
+        "tokens": torch.ones(shape, dtype=torch.int64, device=device),
+        "labels": torch.ones(shape, dtype=torch.int64, device=device),
+        "loss_mask": torch.ones(shape, dtype=torch.float32, device=device),
+        "position_ids": torch.arange(shape[1], dtype=torch.int64, device=device).view(shape),
+    }
+    if needs_padding_mask:
+        data["padding_mask"] = torch.zeros(shape, dtype=torch.bool, device=device)
+
+    args = SimpleNamespace(
+        create_attention_mask_in_dataloader=False,
+        cuda_graph_impl="full_iteration",
+        dynamic_context_parallel=False,
+        micro_batch_size=shape[0],
+        pipeline_model_parallel_size=1,
+        seq_length=shape[1],
+        sft=False,
+    )
+    monkeypatch.setattr(common_utils, "get_args", lambda: args)
+    monkeypatch.setattr(common_utils.mpu, "get_tensor_model_parallel_rank", lambda: tp_rank)
+    monkeypatch.setattr(common_utils.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
+    monkeypatch.setattr(common_utils.mpu, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda *args, **kwargs: None)
+
+    data_iterator = iter([data]) if tp_rank == 0 else None
+    marker = torch.zeros((), device=device)
+    marker.add_(1)
+    marker.zero_()
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        marker.add_(1)
+        batch = common_utils.get_batch_on_this_tp_rank(
+            data_iterator, needs_padding_mask=needs_padding_mask
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    # Capture records CUDA work without executing it; one replay increments once.
+    assert marker.item() == 1
+    assert (batch["padding_mask"] is not None) == needs_padding_mask
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])

@@ -34,6 +34,7 @@ from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
+    _validate_dsa_kernel_backend_dependencies,
     get_te_version,
     init_method_normal,
     is_te_min_version,
@@ -309,7 +310,11 @@ class TransformerConfig(ModelParallelConfig):
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
-    """How THD sequence rows are partitioned across context-parallel ranks."""
+    """How THD sequence rows are partitioned across context-parallel ranks.
+
+    Contiguous partitioning is defined only for THD inputs; BSHD context parallelism uses the
+    standard zigzag layout.
+    """
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
@@ -326,12 +331,37 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk: Optional[int] = None
     """Number of top-k tokens to select in DSA indexer."""
 
+    dsa_indexer_topk_freq: int = 1
+    """Frequency of DSA indexer top-k computation across layers.
+    A value greater than 1 enables cross-layer top-k sharing."""
+
+    dsa_indexer_skip_topk_offset: int = 0
+    """Layer offset for DSA cross-layer top-k sharing."""
+
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
+    """Optional fused ordinary-DSA kernel backend. Unsupported layouts use PyTorch fallback."""
+
+    dsa_indexer_rope_interleaved: bool = False
+    """Whether DSA indexer RoPE should use MLA-style interleaving."""
+
+    dsa_indexer_rotate_activation: bool = True
+    """Whether DSA indexer should apply Hadamard rotation before scoring."""
+
+    dsa_indexer_scoring_relu: bool = True
+    """Whether DSA indexer should apply ReLU to q@k scores before weighting."""
+
+    dsa_indexer_k_norm_epsilon: Optional[float] = None
+    """Optional epsilon override for the DSA indexer key LayerNorm."""
+
+    dsa_indexer_k_norm_fp32: bool = False
+    """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
     ####################
     # DeepSeek-v4 hybrid attention
@@ -350,10 +380,9 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
     disabled."""
 
-    apply_dsa_kernel_fusion: bool = False
-    """If True, use fused DSA sparse-attention kernels (FlashMLA forward + cuDNN DSA backward,
-    indexer scoring, and top-K selection). Requires ``flash_mla`` and ``nvidia-cudnn-frontend``
-    with CuTe-DSL support. When False, falls back to unfused PyTorch implementations."""
+    apply_dsa_kernel_fusion: Optional[bool] = None
+    """Deprecated DSv4 fused-kernel switch. Use ``dsa_kernel_backend`` instead. For
+    ``dsv4_hybrid`` only, True maps to ``cudnn`` and False maps to ``none``."""
 
     ####################
     # linear attention
@@ -1531,12 +1560,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.cp_partition_mode not in ("zigzag", "contiguous"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
 
-        if self.experimental_attention_variant == "dsv4_hybrid" and (
+        if self.cp_partition_mode == "contiguous" and (
             self.context_parallel_size > 1 or self.dynamic_context_parallel
         ):
-            assert (
-                self.sequence_packing_scheduler is not None
-            ), "DSv4 Hybrid with CP requires a sequence_packing_scheduler for THD inputs."
+            if self.sequence_packing_scheduler is None:
+                raise ValueError(
+                    "cp_partition_mode='contiguous' with context parallelism requires THD "
+                    "inputs from a sequence_packing_scheduler; BSHD inputs are not supported."
+                )
 
         if self.context_parallel_size > 1:
             if (
@@ -1552,6 +1583,36 @@ class TransformerConfig(ModelParallelConfig):
                     "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
                 )
 
+        # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
+        # selectors have been folded into experimental_attention_variant, and immediately
+        # before the centralized attention-variant validation consumes dsa_kernel_backend.
+        if self.apply_dsa_kernel_fusion is not None:
+            if self.experimental_attention_variant != "dsv4_hybrid":
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "apply_dsa_kernel_fusion is deprecated and ignored outside "
+                    "experimental_attention_variant='dsv4_hybrid'; use dsa_kernel_backend "
+                    "instead.",
+                )
+            else:
+                legacy_backend = "cudnn" if self.apply_dsa_kernel_fusion else "none"
+                if self.dsa_kernel_backend not in ("none", legacy_backend):
+                    raise ValueError(
+                        "Conflicting DSA kernel controls: "
+                        f"apply_dsa_kernel_fusion={self.apply_dsa_kernel_fusion} maps to "
+                        f"dsa_kernel_backend={legacy_backend!r}, but "
+                        f"dsa_kernel_backend={self.dsa_kernel_backend!r} was also selected. "
+                        "Remove apply_dsa_kernel_fusion and use dsa_kernel_backend only."
+                    )
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "apply_dsa_kernel_fusion is deprecated and will be removed in a future "
+                    f"release; use dsa_kernel_backend={legacy_backend!r} instead.",
+                )
+                self.dsa_kernel_backend = legacy_backend
+
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
                 self.linear_attention_freq is not None
@@ -1559,9 +1620,10 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.experimental_attention_variant == "gated_delta_net":
                 if self.pad_packed_seq_alignment is not None:
-                    assert self.pad_packed_seq_by_appending_dummy_seq, (
+                    tail_policy = self.thd_tail_padding_policy or 'append_dummy_seq'
+                    assert tail_policy == 'append_dummy_seq', (
                         "gated_delta_net with pad_packed_seq_alignment requires "
-                        "pad_packed_seq_by_appending_dummy_seq."
+                        "thd_tail_padding_policy='append_dummy_seq'."
                     )
 
                 # Check required parameters
@@ -1616,7 +1678,36 @@ class TransformerConfig(ModelParallelConfig):
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
             )
         elif self.experimental_attention_variant == "dsa":
-            pass
+            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+            if self.add_bias_linear:
+                raise ValueError(
+                    "DSA uses AbsorbedMLASelfAttention, which requires add_bias_linear=False. "
+                    "Disable linear bias for DSA configs."
+                )
+            if self.dsa_indexer_topk_freq < 1:
+                raise ValueError(
+                    f"dsa_indexer_topk_freq must be positive, got {self.dsa_indexer_topk_freq}."
+                )
+            if self.dsa_indexer_skip_topk_offset < 0:
+                raise ValueError(
+                    "dsa_indexer_skip_topk_offset must be non-negative, got "
+                    f"{self.dsa_indexer_skip_topk_offset}."
+                )
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+            if self.context_parallel_size > 1:
+                cp_comm_types = (
+                    self.cp_comm_type
+                    if isinstance(self.cp_comm_type, list)
+                    else [self.cp_comm_type]
+                )
+                assert all(
+                    cp_comm_type is not None
+                    and cp_comm_type.replace("_", "").lower() == "allgather"
+                    for cp_comm_type in cp_comm_types
+                ), (
+                    "DSAttention context parallelism currently supports "
+                    "cp_comm_type=allgather only."
+                )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
@@ -1640,13 +1731,17 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             self.hetereogenous_dist_checkpoint = True
 
-            if self.apply_dsa_kernel_fusion:
-                assert (
-                    torch.cuda.is_available()
-                ), "apply_dsa_kernel_fusion requires a CUDA device, but none is available."
+            if self.dsa_kernel_backend == "tilelang":
+                raise ValueError(
+                    "dsv4_hybrid does not support dsa_kernel_backend='tilelang'; use 'cudnn' "
+                    "for fused CSA kernels or 'none' for the PyTorch fallback."
+                )
+            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+
+            if self.dsa_kernel_backend == "cudnn":
                 sm = torch.cuda.get_device_capability()
                 assert sm[0] >= 9, (
-                    f"apply_dsa_kernel_fusion requires SM90+ (Hopper or later), "
+                    f"dsa_kernel_backend='cudnn' requires SM90+ (Hopper or later), "
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
                 uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
@@ -1660,36 +1755,10 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "DSv4 with fused DSA and dense indexer loss is not supported on SM90 "
                         "because the cuDNN Frontend SM90 dense DSA kernels are not reliable for "
-                        "this path. Use sparse indexer loss or disable DSA kernel fusion."
+                        "this path. Use sparse indexer loss or set dsa_kernel_backend='none'."
                     )
 
-                _flash_mla_available = True
-                try:
-                    from flash_mla import flash_mla_sparse_fwd  # noqa: F401
-                except ImportError:
-                    _flash_mla_available = False
-
-                _cudnn_dsa_available = True
-                try:
-                    from cudnn import DSA  # noqa: F401
-                except ImportError:
-                    _cudnn_dsa_available = False
-
-                if not _flash_mla_available or not _cudnn_dsa_available:
-                    missing = []
-                    if not _flash_mla_available:
-                        missing.append(
-                            "flash_mla (install from "
-                            "https://github.com/deepseek-ai/FlashMLA/tree/nv_dev)"
-                        )
-                    if not _cudnn_dsa_available:
-                        missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
-                    raise ValueError(
-                        f"apply_dsa_kernel_fusion requires fused DSA kernels, but the "
-                        f"following packages are not available: {', '.join(missing)}. "
-                        f"Install them or pass --no-dsa-kernel-fusion to use the unfused "
-                        f"PyTorch fallback."
-                    )
+                from cudnn import DSA
 
                 if (
                     self.context_parallel_size > 1 or self.dynamic_context_parallel
@@ -1713,7 +1782,7 @@ class TransformerConfig(ModelParallelConfig):
                             "DSv4 CP with ratio-4 fused DSA requires cuDNN Frontend wrappers "
                             "with q_causal_offsets support; missing from: "
                             f"{', '.join(missing_offsets)}. Install a compatible cuDNN Frontend "
-                            "build or disable DSA kernel fusion."
+                            "build or set dsa_kernel_backend='none'."
                         )
 
         if (
@@ -2056,18 +2125,30 @@ class TransformerConfig(ModelParallelConfig):
                     'or "selective".'
                 )
 
+            # EP A2A overlap drives its own VPP-stage full recompute (the whole model
+            # chunk is recomputed as a single unit) and therefore does not use
+            # recompute_method / recompute_num_layers. Skip the block/uniform
+            # requirement below in that case.
+            ep_overlap_full_recompute = (
+                self.overlap_moe_expert_parallel_comm and self.recompute_granularity == "full"
+            )
+
             if self.recompute_method is not None:
                 if self.recompute_method not in ["block", "uniform"]:
                     raise ValueError(
                         f'recompute_method: {self.recompute_method} must be "block" or "uniform".'
                     )
-            elif self.recompute_granularity != "selective":
+            elif self.recompute_granularity != "selective" and not ep_overlap_full_recompute:
                 raise ValueError(
                     f"Using recompute_granularity: {self.recompute_granularity} so "
                     'recompute_method must be "block" or "uniform"'
                 )
 
-            if self.recompute_granularity != "selective" and self.recompute_num_layers is None:
+            if (
+                self.recompute_granularity != "selective"
+                and self.recompute_num_layers is None
+                and not ep_overlap_full_recompute
+            ):
                 raise ValueError(
                     f"When using recompute_granularity: {self.recompute_granularity} "
                     "recompute_num_layers must be between "
@@ -3123,15 +3204,74 @@ class TransformerConfig(ModelParallelConfig):
                 'flex',
             ], 'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'
 
-            assert (
-                self.recompute_granularity != 'full'
-            ), 'disable full recomputation when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.recompute_method is None
-            ), 'disable recomputation method when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.recompute_num_layers is None
-            ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
+            if self.recompute_granularity == 'full':
+                # EP A2A overlap supports full recompute through a dedicated
+                # VPP-stage (model-chunk) recompute path: only the input tensor of
+                # each VPP stage is retained across the forward->backward gap, and
+                # the whole stage forward is recomputed (with an exposed,
+                # non-overlapped A2A) at the start of its backward. The normal
+                # forward/backward A2A overlap is preserved.
+                # See megatron/core/models/common/model_chunk_schedule_plan.py.
+                assert self.recompute_method is None, (
+                    'recompute_method must be None with overlap_moe_expert_parallel_comm full '
+                    'recompute: the whole VPP stage (model chunk) is recomputed as a single unit'
+                )
+                assert self.recompute_num_layers is None, (
+                    'recompute_num_layers must be None with overlap_moe_expert_parallel_comm '
+                    'full recompute (the whole VPP stage is recomputed as a single unit)'
+                )
+                # The recompute replays the stage forward. With attention/hidden
+                # dropout the forward RNG stream is interleaved across microbatches
+                # in the 1F1B schedule and cannot yet be faithfully replayed, so the
+                # recomputed activations would diverge from the forward pass.
+                assert self.attention_dropout == 0.0 and self.hidden_dropout == 0.0, (
+                    'overlap_moe_expert_parallel_comm full recompute currently requires '
+                    'attention_dropout==0 and hidden_dropout==0 (RNG replay across the '
+                    'interleaved 1F1B schedule is not yet supported for nonzero dropout)'
+                )
+                # The VPP-stage recompute re-runs the stage forward at backward time.
+                # Combining it with CUDA graphs is not yet supported: the graph captures
+                # a fixed forward/backward node sequence and pre-allocates static buffers,
+                # which the inserted (no_grad) initial forward + backward-time recompute
+                # pass does not fit. Full recompute (drop+recompute activations) and CUDA
+                # graphs (fixed pre-allocated buffers) also target opposite memory regimes.
+                assert self.cuda_graph_impl == "none", (
+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '
+                    'together with CUDA graphs (cuda_graph_impl != "none").'
+                )
+                # Paged stash keeps per-layer activations in a paged buffer, while full
+                # recompute drops and recomputes them — the two activation-memory
+                # strategies are redundant and their stash/restore lifecycle conflicts
+                # with the recompute activation release. Not yet supported together.
+                assert not self.moe_paged_stash, (
+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '
+                    'together with moe_paged_stash.'
+                )
+                # Delayed-scaling FP8 accumulates amax into a persistent
+                # amax_history across microbatches. Both the initial no_grad forward
+                # and the backward-time recompute run under the delayed FP8 autocast,
+                # and this path does not enter TE's activation-recompute
+                # (recompute_phase) machinery that te_checkpoint uses to snapshot and
+                # restore FP8 metadata, so the recompute would update amax_history a
+                # second time and silently diverge. Current-scaling recipes
+                # (tensorwise / mxfp8 / blockwise) derive scales from the current
+                # tensor each pass, so the replayed forward re-derives identical
+                # scales (validated bitwise-identical to recompute-off); only delayed
+                # scaling is rejected here.
+                assert not (self.fp8 and self.fp8_recipe == Fp8Recipe.delayed), (
+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '
+                    'with delayed-scaling FP8 (fp8_recipe="delayed"): the backward-time '
+                    'recompute would double-update the persistent amax_history. Use a '
+                    'current-scaling recipe (tensorwise / mxfp8 / blockwise) instead.'
+                )
+            else:
+                assert self.recompute_method is None, (
+                    'disable recomputation method when enabling ' 'overlap_moe_expert_parallel_comm'
+                )
+                assert self.recompute_num_layers is None, (
+                    'recompute_num_layers must be None when enabling '
+                    'overlap_moe_expert_parallel_comm'
+                )
             assert (
                 "moe" not in self.recompute_modules
             ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'
@@ -3335,6 +3475,21 @@ class TransformerConfig(ModelParallelConfig):
                 "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
                 "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
+            )
+
+        # 'extend_last' THD tail padding with context parallelism requires the
+        # global metadata to be extended before CP slicing, which only the
+        # sequence-packing scheduler path performs. Restrict this combination.
+        if (
+            self.sequence_packing_scheduler is None
+            and self.pad_packed_seq_alignment is not None
+            and (self.thd_tail_padding_policy or 'append_dummy_seq') == 'extend_last'
+            and (self.context_parallel_size > 1 or self.dynamic_context_parallel)
+        ):
+            raise ValueError(
+                "thd_tail_padding_policy='extend_last' with context parallelism is only "
+                "supported together with a sequence_packing_scheduler. Either enable a "
+                "sequence_packing_scheduler, or use thd_tail_padding_policy='append_dummy_seq'."
             )
 
         if self.sequence_packing_scheduler is not None:

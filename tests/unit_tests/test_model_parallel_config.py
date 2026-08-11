@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import parse_args, validate_args
 
 
@@ -21,6 +22,25 @@ def test_native_cross_entropy_loss_fusion_is_allowed():
 
     assert config.cross_entropy_loss_fusion
     assert config.cross_entropy_fusion_impl == 'native'
+
+
+def test_invalid_thd_tail_padding_policy_is_rejected_during_config_initialization():
+    with pytest.raises(ValueError, match="thd_tail_padding_policy must be"):
+        ModelParallelConfig(thd_tail_padding_policy="bogus")
+
+
+def test_contiguous_context_parallel_rejects_bshd_inputs():
+    with pytest.raises(
+        ValueError,
+        match="cp_partition_mode='contiguous'.*requires THD.*BSHD inputs are not supported",
+    ):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            context_parallel_size=2,
+            cp_partition_mode="contiguous",
+        )
 
 
 def test_te_cross_entropy_loss_fusion_is_disabled_by_training_args(monkeypatch):
