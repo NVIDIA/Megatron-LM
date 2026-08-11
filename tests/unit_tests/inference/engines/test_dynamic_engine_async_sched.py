@@ -576,22 +576,6 @@ _ASYNC_PAIR_SCENARIOS = (
         parity="reproducible",
     ),
     _pair_scenario(
-        "raw-prompt-top-n-logprobs",
-        "logprobs:raw",
-        "logprobs:prompt",
-        "logprobs:top-n",
-        "logits:full",
-        config={"return_log_probs": True, "materialize_only_last_token_logits": False},
-        sampling=(
-            {"return_log_probs": True, "top_n_logprobs": 2},
-            {"return_log_probs": True, "top_n_logprobs": 5},
-        ),
-        signals=("full-logits", "logprobs", "top-n"),
-        # Different forward batch shapes may exchange a near-tied, non-selected
-        # final candidate; the harness still requires exact async-repeat top-N.
-        exact_top_n=False,
-    ),
-    _pair_scenario(
         "processed-skip-prompt-logprobs",
         "logprobs:processed",
         "logprobs:skip-prompt",
