@@ -110,7 +110,7 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh "${{ARGUMENTS[@]}}"
 
 products:
-  - test_case: [nemotron3_5_lightning_nightly_tp1_pp1_cp1_ep8_dgx_gb200_2N8G]
+  - test_case: [nemotron3_5_lightning_nightly_tp1_pp1_cp1_ep8_dgx_gb200]
     products:
       - environment: [dev]
         scope: [L2]
