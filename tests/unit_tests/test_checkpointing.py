@@ -649,3 +649,28 @@ class TestBuildShardedStateDictMetadata:
         args = _make_metadata_args()
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert 'distrib_optim_sharding_type' not in metadata
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_args", "configured_num_householder", "expected_num_householder"),
+    [(SimpleNamespace(gdp_num_householder=5), 3, 5), (SimpleNamespace(), 5, 3)],
+)
+def test_load_args_restores_gdp_num_householder_from_checkpoint(
+    checkpoint_args, configured_num_householder, expected_num_householder
+):
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        gdp_num_householder=configured_num_householder,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.gdp_num_householder == expected_num_householder
