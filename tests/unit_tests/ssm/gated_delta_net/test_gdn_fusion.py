@@ -358,6 +358,33 @@ class TestFusedPreGatedDeltaRule:
             output_tolerances={"g": (1e-3, 3e-3)},
         )
 
+    def test_apply_gated_norm_accepts_strided_gate_view(self):
+        import torch._dynamo
+
+        gdn = self.fused_gdn
+        batch = 2
+        seq_len = 16
+        device = torch.cuda.current_device()
+        num_value_heads = gdn.num_v_heads_local_tp
+        gate_channels = num_value_heads * gdn.value_head_dim
+        z_offset = 7
+        gate_storage = torch.randn(
+            seq_len, batch, z_offset + gate_channels + 5, device=device, dtype=torch.bfloat16
+        )
+        gate_view = (
+            gate_storage[:, :, z_offset : z_offset + gate_channels]
+            .view(seq_len, batch, num_value_heads, gdn.value_head_dim)
+            .permute(1, 0, 2, 3)
+        )
+        assert not gate_view.is_contiguous()
+        assert gate_view.untyped_storage().data_ptr() == gate_storage.untyped_storage().data_ptr()
+
+        norm_input = torch.randn_like(gate_view.contiguous())
+        with torch._dynamo.config.patch(disable=True):
+            strided_output = gdn._apply_gated_norm(norm_input, gate_view)
+            contiguous_output = gdn._apply_gated_norm(norm_input, gate_view.contiguous())
+        torch.testing.assert_close(strided_output, contiguous_output)
+
     def test_fused_and_unfused_pre_gated_delta_rule_backward_match(self):
         reference_gdn = self._build_gdn(
             gdn_pre_gated_delta_rule_fusion=False, deterministic_mode=True, conv_kernel_dim=4

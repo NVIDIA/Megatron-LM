@@ -4,9 +4,10 @@
 
 The public entry point consumes the dense ``qkvzba`` projection and returns
 ``query``, ``key``, ``value``, ``gate``, ``beta``, and ``g`` in the layouts
-expected by the gated delta rule. The forward path keeps QK, V, Z, and
-G/Beta as separate streamed scopes. The backward mirrors those scopes for
-layout/l2norm/g-beta work, then delegates depthwise conv gradients to the
+expected by the gated delta rule. The forward path keeps QK, V, and G/Beta as
+separate streamed scopes and returns Z as a strided view into ``qkvzba`` rather
+than materializing a contiguous gate tensor. The backward mirrors those scopes
+for layout/l2norm/g-beta work, then delegates depthwise conv gradients to the
 ``causal_conv1d`` backend.
 
 Unsupported cases are rejected at the Python entry point: CPU tensors,
@@ -426,52 +427,6 @@ def _conv_silu_project_thd_kernel(
             + chan_off[None, :]
         )
         tl.store(write_ptr, out_typed, mask=s_mask[:, None])
-
-
-@triton.jit
-def _copy_z_kernel(
-    qkvzba_ptr,
-    gate_ptr,
-    seq_len,
-    num_v_heads,
-    z_channel_offset,
-    qkvzba_s_stride,
-    qkvzba_b_stride,
-    qkvzba_c_stride,
-    gate_b_stride,
-    gate_s_stride,
-    gate_h_stride,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_S: tl.constexpr,
-):
-    """Copy the z slice from qkvzba into the final gate layout."""
-
-    pid_bh = tl.program_id(0)
-    pid_s = tl.program_id(1)
-
-    batch_id = pid_bh // num_v_heads
-    head_id = pid_bh - batch_id * num_v_heads
-
-    chan_off = tl.arange(0, HEAD_DIM)
-    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
-    s_mask = s_offs < seq_len
-
-    z_chan = z_channel_offset + head_id * HEAD_DIM + chan_off
-    z_src_ptr = (
-        qkvzba_ptr
-        + s_offs[:, None] * qkvzba_s_stride
-        + batch_id * qkvzba_b_stride
-        + z_chan[None, :] * qkvzba_c_stride
-    )
-    z_val = tl.load(z_src_ptr, mask=s_mask[:, None])
-    z_write_ptr = (
-        gate_ptr
-        + batch_id * gate_b_stride
-        + s_offs[:, None] * gate_s_stride
-        + head_id * gate_h_stride
-        + chan_off[None, :]
-    )
-    tl.store(z_write_ptr, z_val, mask=s_mask[:, None])
 
 
 @triton.autotune(configs=_g_beta_autotune_configs(), key=["seq_len", "num_v_heads"])
@@ -1877,7 +1832,7 @@ def _triton_pre_gated_delta_rule_forward(
     global_token_offset = 0
     global_seq_len = seq_len
     if cp_active:
-        (left_boundary, left_boundary_recv_ops, left_boundary_send_ops, _left_boundary_send_buf) = (
+        left_boundary, left_boundary_recv_ops, left_boundary_send_ops, _left_boundary_send_buf = (
             _start_left_boundary_exchange(
                 qkvzba, conv_dim=conv_dim, boundary=boundary, cp_group=cp_group
             )
@@ -1929,11 +1884,15 @@ def _triton_pre_gated_delta_rule_forward(
     bias_tensor = qkvzba
     bias_stride = 0
 
-    # Allocate the gate (z) output buffer that the independent Z kernel will
-    # populate. Keeping Z separate makes the forward scopes QK / V / Z /
-    # G-Beta explicit.
-    gate = torch.empty(
-        batch, seq_len, num_value_heads, value_head_dim, dtype=out_dtype, device=device
+    # Z is already contiguous within each token's channel range in qkvzba.
+    # Expose it as logical (b, s, h, d) without copying. The sequence stride
+    # intentionally skips over the non-Z projection channels; consumers must
+    # preserve this 4-D view instead of flattening it with reshape().
+    z_channel_offset = 2 * qk_channels + v_channels
+    gate = (
+        qkvzba[:, :, z_channel_offset : z_channel_offset + v_channels]
+        .view(seq_len, batch, num_value_heads, value_head_dim)
+        .permute(1, 0, 2, 3)
     )
 
     # Persist the QK silu(conv(x)) intermediate in channel-last layout so the
@@ -1949,51 +1908,26 @@ def _triton_pre_gated_delta_rule_forward(
 
     overlap_boundary_exchange = bool(left_boundary_recv_ops or left_boundary_send_ops)
 
-    # Stream setup. Each side stream handles one of the four sub-computations
-    # (QK conv+l2norm, V conv, Z copy, g/beta). When chunkwise CP boundary exchange
-    # is active, QK/V consume the received boundary and stay on the caller stream.
-    # Z and g/beta do not depend on the boundary, so they can still overlap with
-    # the boundary exchange on side streams.
+    # Stream setup. Each side stream handles one of the three materialized
+    # sub-computations (QK conv+l2norm, V conv, and g/beta). When chunkwise CP
+    # boundary exchange is active, QK/V consume the received boundary and stay on
+    # the caller stream. G/beta does not depend on the boundary, so it can still
+    # overlap with the boundary exchange on a side stream. Z is only a view.
     main_stream = torch.cuda.current_stream(device=device)
     if overlap_boundary_exchange:
         qk_stream = main_stream
         v_stream = main_stream
         g_beta_stream = _get_side_stream(device, slot=_G_BETA_STREAM_SLOT)
-        z_stream = _get_side_stream(device, slot=_Z_STREAM_SLOT)
     else:
         qk_stream = _get_side_stream(device, slot=_QK_STREAM_SLOT)
         v_stream = _get_side_stream(device, slot=_V_STREAM_SLOT)
         g_beta_stream = _get_side_stream(device, slot=_G_BETA_STREAM_SLOT)
-        z_stream = _get_side_stream(device, slot=_Z_STREAM_SLOT)
-    for stream in (qk_stream, v_stream, g_beta_stream, z_stream):
+    for stream in (qk_stream, v_stream, g_beta_stream):
         stream.wait_stream(main_stream)
 
     v_channel_offset = 2 * qk_channels
-    z_channel_offset = 2 * qk_channels + v_channels
     beta_channel_offset = 2 * qk_channels + 2 * v_channels
     alpha_channel_offset = beta_channel_offset + num_value_heads
-
-    def _launch_z_copy() -> None:
-        BLOCK_Z_S = _LAYOUT_BLOCK_S
-        z_grid = (batch * num_value_heads, triton.cdiv(seq_len, BLOCK_Z_S))
-        with torch.cuda.stream(z_stream):
-            _copy_z_kernel[z_grid](
-                qkvzba,
-                gate,
-                seq_len,
-                num_value_heads,
-                z_channel_offset,
-                qkvzba.stride(0),
-                qkvzba.stride(1),
-                qkvzba.stride(2),
-                gate.stride(0),
-                gate.stride(1),
-                gate.stride(2),
-                HEAD_DIM=value_head_dim,
-                BLOCK_S=BLOCK_Z_S,
-                num_warps=4,
-                num_stages=2,
-            )
 
     def _launch_g_beta() -> None:
         g_beta_grid = lambda meta: (
@@ -2024,9 +1958,8 @@ def _triton_pre_gated_delta_rule_forward(
             )
 
     if overlap_boundary_exchange:
-        # Z and g/beta do not consume the CP left boundary, so issue them while
-        # the boundary recv is in flight. QK/V wait below right before they need it.
-        _launch_z_copy()
+        # G/beta does not consume the CP left boundary, so issue it while the
+        # boundary recv is in flight. QK/V wait below right before they need it.
         _launch_g_beta()
     _wait_distributed_ops(left_boundary_recv_ops)
 
@@ -2207,14 +2140,11 @@ def _triton_pre_gated_delta_rule_forward(
             )
 
     if not overlap_boundary_exchange:
-        # --- Z copy ---
-        _launch_z_copy()
-
         # --- g and beta ---
         _launch_g_beta()
 
     # Re-join the side streams so the caller's stream observes the writes.
-    _wait_for_streams(main_stream, qk_stream, v_stream, z_stream, g_beta_stream)
+    _wait_for_streams(main_stream, qk_stream, v_stream, g_beta_stream)
     # The boundary send uses an owned contiguous buffer that no downstream
     # kernel reads, so defer this wait to overlap the send with QK/V compute.
     _wait_distributed_ops(left_boundary_send_ops)
