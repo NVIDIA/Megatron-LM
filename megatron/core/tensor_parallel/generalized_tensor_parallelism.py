@@ -986,7 +986,7 @@ class GTPShardedParam(torch.nn.Parameter):
     def _recompute_link_table_row(
         cls, prev: "GTPShardedParam", curr: "GTPShardedParam", rchain: dict
     ) -> None:
-        """Buffer one recompute-chain link row, plus the AG buffer each node gathers into."""
+        """Buffer one recompute-chain link row, under its own table heading."""
         cls._buffer_link_table_row(prev, curr, rchain, label="RECOMPUTE chain")
 
     @classmethod
