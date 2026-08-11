@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Gated Delta Net (GDN) family of layers.
+"""Gated Delta Net (GDN) layer exports.
 
 This package replaces the former ``megatron/core/ssm/gated_delta_net.py`` module
 at the same import path; the names below preserve that module's public surface.

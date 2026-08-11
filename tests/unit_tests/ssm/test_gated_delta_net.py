@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import inspect
 import os
 from functools import partial
 from unittest import mock
@@ -10,10 +11,12 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
     get_transformer_block_with_experimental_attention_variant_spec,
 )
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -26,6 +29,7 @@ from megatron.core.ssm.gated_delta_net.common import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.spec_utils import build_module
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
@@ -112,6 +116,13 @@ def test_gdn_norm_out_recompute_accepts_gdn_variant():
     assert "gdn_norm_out" in config.recompute_modules
 
 
+def test_gdn_and_norm_out_recompute_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="'gdn' and 'gdn_norm_out'"):
+        _make_gdn_config(
+            recompute_granularity="selective", recompute_modules=["gdn", "gdn_norm_out"]
+        )
+
+
 def test_gdn_norm_out_recompute_requires_gdn_variant():
     with pytest.raises(ValueError, match="experimental_attention_variant='gated_delta_net'"):
         _make_gdn_config(
@@ -138,6 +149,24 @@ def test_gdn_chunkwise_cp_head_divisibility_ignores_cp_size():
         linear_num_value_heads=8,
     )
     assert config.linear_cp_mode == "chunkwise"
+
+
+def test_torch_chunk_gated_delta_rule_preserves_public_signature():
+    signature = inspect.signature(torch_chunk_gated_delta_rule)
+    assert tuple(signature.parameters) == (
+        "query",
+        "key",
+        "value",
+        "g",
+        "beta",
+        "chunk_size",
+        "initial_state",
+        "output_final_state",
+        "use_qk_l2norm_in_kernel",
+        "cu_seqlens",
+        "cp_context",
+        "scale",
+    )
 
 
 def test_fused_pre_gdr_split_batched_recv_send_works():
@@ -351,6 +380,56 @@ class TestGatedDeltaNet:
                 msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
             )
 
+    @pytest.mark.flaky_in_dev  # Issue #5473
+    def test_selective_recompute_gdn_norm_out(self):
+        """Output-discarding 'gdn_norm_out' recompute must preserve outputs and gradients."""
+        gdn = self.gdn
+        gdn.train()
+
+        micro_batch_size = 1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
+        seq_length = 64
+        torch.manual_seed(1234)
+        base_input = torch.randn(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        def run(recompute_norm_out):
+            gdn.recompute_gdn = False
+            gdn.recompute_norm_out = recompute_norm_out
+            gdn.norm_out_checkpoint = None
+            gdn.zero_grad(set_to_none=True)
+            hidden_states = base_input.clone().detach().requires_grad_(True)
+            output, _ = gdn(hidden_states, None)
+            output.float().square().mean().backward()
+            param_grads = {
+                name: param.grad.detach().clone()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            return output.detach().clone(), hidden_states.grad.detach().clone(), param_grads
+
+        try:
+            out_ref, dinput_ref, pgrad_ref = run(recompute_norm_out=False)
+            out_rc, dinput_rc, pgrad_rc = run(recompute_norm_out=True)
+        finally:
+            gdn.recompute_norm_out = False
+            gdn.norm_out_checkpoint = None
+
+        torch.testing.assert_close(out_rc, out_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dinput_rc, dinput_ref, rtol=1e-4, atol=1e-4)
+        assert pgrad_ref.keys() == pgrad_rc.keys(), "recompute changed the set of grad params"
+        assert len(pgrad_ref) > 0, "expected at least one parameter gradient"
+        for name in pgrad_ref:
+            torch.testing.assert_close(
+                pgrad_rc[name],
+                pgrad_ref[name],
+                rtol=1e-4,
+                atol=1e-4,
+                msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
+            )
+
     def test_gpu_forward_rejects_sbhd_chunkwise_cp_batch_gt_one(self):
         if not (self.linear_cp_mode == "chunkwise" and self.cp_size > 1):
             pytest.skip("Only chunkwise CP with CP>1 uses the FLA CP batch guard.")
@@ -457,9 +536,67 @@ class TestGatedDeltaNet:
     def test_module_construction(self):
         gdn = self.gdn
         assert gdn.in_proj_dim == 2 * gdn.qk_dim + 2 * gdn.v_dim + 2 * gdn.num_value_heads
-        assert gdn.feat_dim_split == gdn._get_feat_dim_split(self.cp_size_headwise)
         assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
         assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
+
+    def test_mtp_path_builds_gdn_attention_with_transformer_optional_kwargs(self):
+        if self.tp_size != 1 or self.sp_size != 1 or self.cp_size != 1:
+            pytest.skip("One representative non-parallel MTP construction case is enough.")
+        if self.linear_cp_mode is not None:
+            pytest.skip("CP mode is irrelevant when context_parallel_size=1.")
+
+        config = copy.deepcopy(self.transformer_config)
+        config.mtp_num_layers = 1
+        decoder_block_spec = get_transformer_block_with_experimental_attention_variant_spec(
+            config=config
+        )
+        mtp_block_spec = get_gpt_mtp_block_spec(config, decoder_block_spec, True)
+        mtp_layer_spec = mtp_block_spec.layer_specs[0]
+
+        mtp_layer = build_module(
+            mtp_layer_spec,
+            config=config,
+            layer_number=1,
+            pg_collection=self.gdn.pg_collection,
+        )
+        mtp_gdn = mtp_layer.mtp_model_layer.self_attention
+        assert isinstance(mtp_gdn, GatedDeltaNet)
+        assert mtp_gdn.is_mtp_layer
+
+        transformer_layer = build_module(
+            mtp_layer_spec.submodules.mtp_model_layer,
+            config=config,
+            layer_number=1,
+            is_mtp_layer=True,
+            pp_layer_offset=0,
+            pg_collection=self.gdn.pg_collection,
+        )
+        transformer_gdn = transformer_layer.self_attention
+        assert isinstance(transformer_gdn, GatedDeltaNet)
+        assert transformer_gdn.is_mtp_layer
+        assert transformer_gdn._pp_layer_offset == 0
+
+    def test_sharded_state_dict_splits_gdn_parameters(self):
+        sharded_sd = self.gdn.sharded_state_dict(prefix="gdn.")
+
+        in_proj_weight = sharded_sd["gdn.in_proj.weight"]
+        conv1d_weight = sharded_sd["gdn.conv1d.weight"]
+        assert isinstance(in_proj_weight, ShardedTensorFactory)
+        assert isinstance(conv1d_weight, ShardedTensorFactory)
+
+        in_proj_chunks = in_proj_weight.build()
+        assert tuple(chunk.key for chunk in in_proj_chunks) == tuple(
+            f"gdn.in_proj.weight.{name}" for name in self.gdn.in_proj_split_names
+        )
+        assert sum(chunk.data.numel() for chunk in in_proj_chunks) == in_proj_weight.data.numel()
+
+        conv1d_chunks = conv1d_weight.build()
+        assert tuple(chunk.key for chunk in conv1d_chunks) == (
+            "gdn.conv1d.weight.query",
+            "gdn.conv1d.weight.key",
+            "gdn.conv1d.weight.value",
+        )
+        assert sum(chunk.data.numel() for chunk in conv1d_chunks) == conv1d_weight.data.numel()
 
     def test_jit_compiled_helpers(self):
         import torch._dynamo
@@ -574,7 +711,6 @@ class TestGatedDeltaNet:
         ):
             gdn._fused_streamed_pre_gated_delta_rule(
                 qkvzba,
-                cp_size_headwise=self.cp_size_headwise,
                 cp_group_headwise=gdn.pg_collection.cp,
             )
 

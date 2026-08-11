@@ -5,12 +5,9 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pylint: disable=unused-import
-
-import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Optional, Protocol, Union
+from typing import Optional, Protocol, Union
 
 import torch
 import torch.nn as nn
@@ -55,7 +52,23 @@ except ImportError:
 
     HAVE_FLA = False
 
-logger = logging.getLogger(__name__)
+__all__ = [
+    "HAVE_FLA",
+    "GatedDeltaNetSubmodules",
+    "_GDNBase",
+    "_build_head_perm_for_split_sections",
+    "_build_thd_cp_a2a_perm",
+    "_split_tensor_factory",
+    "a2a_cp_to_hp",
+    "a2a_hp_to_cp",
+    "build_cp_context",
+    "causal_conv1d",
+    "chunk_gated_delta_rule",
+    "get_parameter_local_cp",
+    "l2norm",
+    "tensor_a2a_cp2hp",
+    "tensor_a2a_hp2cp",
+]
 
 
 @dataclass
@@ -71,10 +84,7 @@ class GatedDeltaNetSubmodules:
 
 class GatedDeltaRuleInterface(Protocol):
     """
-    Unified typing protocol for linear attention interfaces, compliant to upstream FLA interfaces.
-
-    ``beta`` is passed as a keyword argument because its positional location differs
-    across backend implementations.
+    Unified typing protocol for GDN core computation interfaces.
     """
 
     def __call__(
@@ -83,6 +93,7 @@ class GatedDeltaRuleInterface(Protocol):
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
+        beta: torch.Tensor,
         *,
         scale: float | None = None,
         initial_state: torch.Tensor | None = None,
@@ -94,16 +105,15 @@ class GatedDeltaRuleInterface(Protocol):
 
 
 class _GDNBase(MegatronModule):
-    """Common base class for the Gated Delta Net (GDN) family of layers.
+    """Shared implementation for the Gated Delta Net (GDN) layer.
 
-    Hosts everything the GDN variants share: the fused input projection, causal
-    convolution on q/k/v, the CP all-to-all plumbing, the kernel-input preparation
-    skeleton, the gated output norm + projection, and sharded checkpointing.
+    Hosts the fused input projection, causal convolution on q/k/v, CP all-to-all
+    plumbing, kernel-input preparation, gated output norm + projection, and
+    sharded checkpointing.
     """
 
     dt_bias_dim: int
     a_log_dim: int
-    in_proj_qkvg_dim: int
     in_proj_extra_dim: int
     in_proj_dim: int
 
@@ -126,6 +136,8 @@ class _GDNBase(MegatronModule):
         *,
         name: str | None = None,
         cp_comm_type: str | None = None,
+        pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ):
         """
         Args:
@@ -143,6 +155,9 @@ class _GDNBase(MegatronModule):
             cp_comm_type (Optional[str]): Accepted for TransformerLayer compatibility and
                 ignored; GDN implements context parallelism with its own all-to-alls rather
                 than the attention CP communication schemes.
+            pp_layer_offset (Optional[int]): Pipeline layer offset forwarded by
+                TransformerLayer. Stored for MTP/TransformerLayer API compatibility.
+            is_mtp_layer (bool): Whether this module is inside an MTP prediction depth.
         """
         if not HAVE_FLA:
             raise ImportError(
@@ -154,6 +169,8 @@ class _GDNBase(MegatronModule):
 
         # Attributes from arguments
         self.layer_number = layer_number
+        self._pp_layer_offset = pp_layer_offset
+        self.is_mtp_layer = is_mtp_layer
         self.bias = bias
         self.conv_bias = conv_bias
         self.conv_init = conv_init
@@ -206,15 +223,13 @@ class _GDNBase(MegatronModule):
             "in_proj_extra_dim",
             "in_proj_split_names",
             "in_proj_split_sections",
-            "feat_dim_split",
             "gated_delta_rule",
         )
         self._setup_variant_attrs()
         for attr in attrs_to_check:
             assert getattr(self, attr, None) is not None, f"Attribute {attr} for GDN is not set"
-        # QK, V, gate, shared across all variants
-        self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
-        self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
+        # QK, V, and gate sections shared by the GDN input projection.
+        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
 
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
@@ -308,14 +323,13 @@ class _GDNBase(MegatronModule):
         self.reset_parameters()
 
     def _setup_variant_attrs(self):
-        """Set variant specifics on the module. Called once from ``__init__``.
+        """Set GDN projection sections, gate parameter sizes, and kernel callable.
 
         Must set:
-        - ``in_proj_extra_dim`` (the variant-specific in_proj sections beyond q/k/v/z;
-          the base class derives ``in_proj_dim`` from it)
+        - ``in_proj_extra_dim`` (the in_proj sections beyond q/k/v/z; the base
+          class derives ``in_proj_dim`` from it)
         - ``in_proj_split_names``
         - ``in_proj_split_sections``
-        - ``feat_dim_split``
         - ``dt_bias_dim`` / ``a_log_dim`` (sizes of the gate parameters, which the
           base class creates after the conv1d module to preserve the original
           parameter registration order)
@@ -326,8 +340,8 @@ class _GDNBase(MegatronModule):
     def _reset_dt_bias(self):
         """Initialize ``dt_bias``. Called from ``reset_parameters`` under the RNG tracker.
 
-        Defaults to ones; variants whose kernel expects a different step-size
-        parametrization override this.
+        Defaults to ones; subclasses can override this if their kernel expects a
+        different step-size parametrization.
         """
         torch.ones(
             self.dt_bias_dim,
@@ -415,12 +429,12 @@ class _GDNBase(MegatronModule):
         Prepare all gated delta rule kernel inputs.
 
         Fuses split, reshape, L2 norm, decay/gate activations, repeat_interleave, and
-        contiguous operations. ``gate_feats`` holds the variant-specific in_proj
-        sections, which ``_compute_gates`` turns into the decay and gating tensors.
+        contiguous operations. ``gate_feats`` holds the in_proj sections after qkv
+        and gate, which ``_compute_gates`` turns into the decay and gating tensors.
 
         Returns:
             (dict[str, Tensor]): Kernel inputs keyed by kernel argument name (``q``,
-            ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
+            ``k``, ``v``, ``g``, and ``beta``), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
         cp_size = self.cp_size if cp_size_headwise is None else cp_size_headwise
@@ -471,19 +485,18 @@ class _GDNBase(MegatronModule):
         *gate_feats: tuple[torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
-        Compute the log-decay ``g`` and the variant-specific kernel inputs.
+        Compute the log-decay ``g`` and remaining kernel inputs.
 
         Args:
             A_log_local_cp: CP-local slice of ``A_log``.
             dt_bias_local_cp: CP-local slice of ``dt_bias``.
             batch: Batch size.
             seq_len: Sequence length.
-            gate_feats: The variant-specific in_proj output sections (everything after
-                the qkv and output-gate sections, in ``feat_dim_split`` order).
+            gate_feats: The in_proj output sections after the qkv and output-gate sections.
 
         Returns:
             (tuple[Tensor, dict[str, Tensor]]): The log-decay ``g`` and a dict of the
-            remaining variant-specific kernel inputs keyed by kernel argument name.
+            remaining kernel inputs keyed by kernel argument name.
         """
         raise NotImplementedError
 

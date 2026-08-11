@@ -59,9 +59,6 @@ class GatedDeltaNet(_GDNBase):
             self.num_value_heads // self.tp_size,  # beta
             self.num_value_heads // self.tp_size,  # alpha
         )
-        cp_size_headwise = self.cp_size if self.config.linear_cp_mode == "headwise" else 1
-        self.feat_dim_split = self._get_feat_dim_split(cp_size_headwise)
-
         self.dt_bias_dim = self.num_v_heads_local_tp
         self.a_log_dim = self.num_v_heads_local_tp
 
@@ -312,7 +309,6 @@ class GatedDeltaNet(_GDNBase):
                 cu_seqlens_q=fused_cu_seqlens_q,
                 seq_idx=seq_idx,
                 cp_group=cp_group_chunkwise if cp_size_chunkwise > 1 else None,
-                cp_size_headwise=cp_size_headwise,
                 cp_group_headwise=cp_group_headwise,
             )
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
@@ -346,8 +342,17 @@ class GatedDeltaNet(_GDNBase):
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
+        gated_delta_rule_inputs = kernel_inputs
+        if self.gated_delta_rule is torch_chunk_gated_delta_rule:
+            gated_delta_rule_inputs = {
+                "query": kernel_inputs["q"],
+                "key": kernel_inputs["k"],
+                "value": kernel_inputs["v"],
+                "g": kernel_inputs["g"],
+                "beta": kernel_inputs["beta"],
+            }
         core_attn_out, _ = self.gated_delta_rule(
-            **kernel_inputs,
+            **gated_delta_rule_inputs,
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
@@ -552,7 +557,6 @@ class GatedDeltaNet(_GDNBase):
         cu_seqlens_q=None,
         seq_idx=None,
         cp_group=None,
-        cp_size_headwise=1,
         cp_group_headwise=None,
     ):
         """Call the streamed fused pre-GDR wrapper."""
@@ -590,8 +594,10 @@ class GatedDeltaNet(_GDNBase):
         )
         A_log = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group_headwise)
         dt_bias = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group_headwise)
-        num_key_heads = self.qk_dim_local_tp // self.key_head_dim // cp_size_headwise
-        num_value_heads = self.v_dim_local_tp // self.value_head_dim // cp_size_headwise
+        num_value_heads = A_log.numel()
+        num_key_heads = (
+            conv1d_weight.shape[0] - num_value_heads * self.value_head_dim
+        ) // (2 * self.key_head_dim)
 
         return fused_streamed_pre_gated_delta_rule(
             qkvzba,
@@ -614,27 +620,25 @@ class GatedDeltaNet(_GDNBase):
 # Torch native gated delta rule
 ####################
 def torch_chunk_gated_delta_rule(
-    q,
-    k,
-    v,
+    query,
+    key,
+    value,
     g,
     beta,
-    scale=None,
     chunk_size=64,
     initial_state=None,
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
     cu_seqlens=None,
-    **kwargs,
+    cp_context=None,
+    scale=None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     # pylint: disable=line-too-long
     '''
     Torch-native implementation of chunked gated delta rule for deterministic mode.
     Need this because FLA is not deterministic.
 
-    ``scale`` defaults to ``1 / sqrt(K)``, matching the FLA kernel. Extra keyword
-    arguments are accepted and ignored so this stays interchangeable with the FLA
-    kernel, which takes several options this implementation does not model.
+    ``scale`` defaults to ``1 / sqrt(K)``, matching the FLA kernel.
 
     Reference: https://github.com/huggingface/transformers/blob/144c8ce2809a2e21914017652700e1ecb450501e/src/transformers/models/qwen3_next/modeling_qwen3_next.py#L470-L547
     '''
@@ -643,10 +647,9 @@ def torch_chunk_gated_delta_rule(
         cu_seqlens is None
     ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
     assert (
-        kwargs.get("cp_context") is None
+        cp_context is None
     ), "cp_context is not supported for torch_chunk_gated_delta_rule for now."
 
-    query, key, value = q, k, v
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
         query = l2norm(query, dim=-1, eps=1e-6)
