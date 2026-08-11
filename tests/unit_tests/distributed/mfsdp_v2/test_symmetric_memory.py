@@ -14,6 +14,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
     fully_shard,
+    fully_shard_context,
 )
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_kernels
 
@@ -58,24 +59,23 @@ def test_fully_shard_symmetric_memory_matches_default_and_profiles_nccl(
     mesh = init_device_mesh(device.type, (world_size,))
     num_training_steps = 5
 
-    def train(use_symm_mem: bool) -> list[torch.Tensor]:
+    def train(use_symmetric_memory: bool) -> list[torch.Tensor]:
         torch.manual_seed(1234)
         model = TinyModel().to(device=device, dtype=torch.bfloat16)
         mixed_precision_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
-        fully_shard(
-            model.fc1,
-            mesh=mesh,
-            placements=_flat_placements(),
-            mixed_precision_policy=mixed_precision_policy,
-            use_symm_mem=use_symm_mem,
-        )
-        fully_shard(
-            model.fc2,
-            mesh=mesh,
-            placements=_flat_placements(),
-            mixed_precision_policy=mixed_precision_policy,
-            use_symm_mem=use_symm_mem,
-        )
+        with fully_shard_context(device=device, use_symmetric_memory=use_symmetric_memory):
+            fully_shard(
+                model.fc1,
+                mesh=mesh,
+                placements=_flat_placements(),
+                mixed_precision_policy=mixed_precision_policy,
+            )
+            fully_shard(
+                model.fc2,
+                mesh=mesh,
+                placements=_flat_placements(),
+                mixed_precision_policy=mixed_precision_policy,
+            )
         optimizer = torch.optim.SGD(model.parameters(), lr=0.05, foreach=False)
 
         micro_batch_size = 2
@@ -99,11 +99,11 @@ def test_fully_shard_symmetric_memory_matches_default_and_profiles_nccl(
         return losses
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof_without_symm_mem:
-        losses_without_symm_mem = train(use_symm_mem=False)
+        losses_without_symm_mem = train(use_symmetric_memory=False)
         torch.cuda.synchronize()
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof_with_symm_mem:
-        losses_with_symm_mem = train(use_symm_mem=True)
+        losses_with_symm_mem = train(use_symmetric_memory=True)
         torch.cuda.synchronize()
 
     torch.testing.assert_close(
@@ -186,20 +186,19 @@ def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup)
     num_training_steps = 5
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
     mixed_precision_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
-    fully_shard(
-        model.fc1,
-        mesh=mesh,
-        placements=_flat_placements(),
-        mixed_precision_policy=mixed_precision_policy,
-        use_symm_mem=True,
-    )
-    fully_shard(
-        model.fc2,
-        mesh=mesh,
-        placements=_flat_placements(),
-        mixed_precision_policy=mixed_precision_policy,
-        use_symm_mem=True,
-    )
+    with fully_shard_context(device=device, use_symmetric_memory=True):
+        fully_shard(
+            model.fc1,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=mixed_precision_policy,
+        )
+        fully_shard(
+            model.fc2,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=mixed_precision_policy,
+        )
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05, foreach=False)
     x = torch.randn(2, _HIDDEN, device=device, dtype=torch.bfloat16)
     target = torch.randn(2, _HIDDEN, device=device, dtype=torch.bfloat16)

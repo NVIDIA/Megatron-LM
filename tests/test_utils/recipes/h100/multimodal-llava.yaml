@@ -16,7 +16,9 @@ spec:
   script_setup: |
     set -euo pipefail
     unset https_proxy
-    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> /root/.netrc
+    trap 'rm -f /root/.netrc; unset RO_API_TOKEN' EXIT
 
     # Checkout latest
     cd /opt
@@ -37,7 +39,11 @@ spec:
     git checkout $MCORE_BACKWARDS_COMMIT
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+    rm -f /root/.netrc
+    unset RO_API_TOKEN
   script: |-
+    rm -f /root/.netrc
+    unset RO_API_TOKEN
     set -euo pipefail
     ls
     cd /opt/megatron-lm

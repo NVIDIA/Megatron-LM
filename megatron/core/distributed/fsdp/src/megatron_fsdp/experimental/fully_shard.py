@@ -17,7 +17,9 @@
 import dataclasses
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 
+import torch
 from torch import nn
 from torch.distributed import DeviceMesh
 
@@ -25,13 +27,49 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .module import FsdpContext, FsdpModule
 from .placement import MeshAxis, Placements
 
+_FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
+
+
+@contextmanager
+def fully_shard_context(
+    device: torch.device | None = None, *, use_symmetric_memory: bool = False
+) -> Iterator[FsdpContext]:
+    """Construct FSDP modules that share runtime streams and prefetch orders.
+
+    Independent roots are ordered by their root-level ``fully_shard`` calls.
+    Construction must finish before any of the registered modules run forward.
+
+    Args:
+        device: CUDA device on which to create communication streams. Defaults to
+            the current CUDA device.
+        use_symmetric_memory: Allocate communication staging buffers from PyTorch's
+            NCCL symmetric-memory pool.
+    """
+    if _FSDP_CONTEXT.get() is not None:
+        raise RuntimeError("fully_shard_context does not support nesting.")
+
+    device = device or torch.device("cuda", torch.cuda.current_device())
+    if device.type != "cuda":
+        raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
+
+    context = FsdpContext(device=device, use_symmetric_memory=use_symmetric_memory)
+    token = _FSDP_CONTEXT.set(context)
+    try:
+        yield context
+    except Exception:
+        raise
+    else:
+        context.finalize()
+    finally:
+        _FSDP_CONTEXT.reset(token)
+
 
 def fully_shard(
     module: nn.Module,
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
-    use_symm_mem: bool = False,
+    grad_divisor: int = 1,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -44,11 +82,29 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
-        use_symm_mem: Allocate all-gather and reduce-scatter staging buffers from
-            PyTorch's NCCL symmetric-memory pool.
+        grad_divisor: Additional divisor applied to the reduced gradient, on top of the
+            averaging the mesh already performs. Defaults to 1, which is correct whenever
+            each mesh rank contributes exactly one term to the gradient.
+
+            Expert parallelism is the motivating case. A rank's experts process tokens
+            routed to them from every rank in the expert-parallel group, and the backward
+            pass routes those tokens' gradients back, so a rank's expert gradient already
+            sums over ``ep_size`` ranks' data before any reduction happens. Averaging over
+            the expert-data-parallel mesh alone therefore divides by too little, and
+            ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
+            their own rank's tokens and need no divisor.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
+    context = _FSDP_CONTEXT.get()
+    if context is None:
+        raise RuntimeError("fully_shard must run inside fully_shard_context.")
+    for submodule in module.modules():
+        if isinstance(submodule, FsdpModule) and submodule.context is not context:
+            raise ValueError(
+                "Cannot fully_shard a module containing an FSDP child from another "
+                "fully_shard_context."
+            )
 
     placements = _normalize_placements(mesh, placements)
     mixed_precision_policy = mixed_precision_policy or MixedPrecisionPolicy()
@@ -58,10 +114,12 @@ def fully_shard(
         assert isinstance(module, FsdpModule)
         FsdpModule.__init__(
             module,
+            context=context,
             mesh=mesh,
             placements=placements,
             mixed_precision_policy=mixed_precision_policy,
-            use_symm_mem=use_symm_mem,
+            grad_divisor=grad_divisor,
+            use_symmetric_memory=context.use_symmetric_memory,
         )
     except Exception:
         module.__class__ = original_cls
@@ -90,7 +148,7 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
 
 
 @contextmanager
-def microbatch(module: nn.Module, is_last: bool) -> Iterator[None]:
+def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
     """Mark an FSDP microbatch as the last accumulation microbatch.
 
     At present, this is only needed for HSDP/HFSDP gradient accumulation, so
@@ -98,20 +156,17 @@ def microbatch(module: nn.Module, is_last: bool) -> Iterator[None]:
     parallelism finalizes gradients on every backward and does not need it.
 
     Args:
-        module: Module tree whose FSDP roots should use this microbatch state.
+        context: FSDP context whose roots should use this microbatch state.
         is_last: Whether forwards in this scope are for the last microbatch.
     """
-    contexts: list[FsdpContext] = []
-    _collect_fsdp_contexts(module, contexts)
-    previous_states = [(context, context.is_last_microbatch) for context in contexts]
-    for context in contexts:
-        context.is_last_microbatch = is_last
+    context.ensure_finalized()
+    previous_state = context.is_last_microbatch
+    context.is_last_microbatch = is_last
 
     try:
         yield
     finally:
-        for context, is_last_microbatch in previous_states:
-            context.is_last_microbatch = is_last_microbatch
+        context.is_last_microbatch = previous_state
 
 
 def _attach_mixin(module: nn.Module) -> None:
@@ -120,13 +175,3 @@ def _attach_mixin(module: nn.Module) -> None:
     module_cls = module.__class__
     fsdp_cls = type(f"ExperimentalFsdp{module_cls.__name__}", (FsdpModule, module_cls), {})
     module.__class__ = fsdp_cls
-
-
-def _collect_fsdp_contexts(module: nn.Module, contexts: list[FsdpContext]) -> None:
-    if isinstance(module, FsdpModule):
-        module._lazy_init_context()
-        contexts.append(module.context)
-        return
-
-    for child in module.children():
-        _collect_fsdp_contexts(child, contexts)
