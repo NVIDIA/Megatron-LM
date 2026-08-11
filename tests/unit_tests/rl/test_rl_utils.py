@@ -726,8 +726,20 @@ class TestRLUtils:
             )
 
         rollouts = [[single(str(i), float(i % 2)) for i in range(4)] for _ in range(dp)]
+        # Every rollout is the same single-turn stream; the join pops one record per turn.
+        request_ledger = {
+            _token_stream_key([1], [2, 3, tokenizer.eod]): [
+                _ledger_record(0) for _ in range(4 * dp)
+            ]
+        }
         rl_utils.prepare_data_for_update(
-            [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
+            [model],
+            {},
+            rollouts,
+            tokenizer,
+            sequence_packing=False,
+            is_correction=False,
+            request_ledger=request_ledger,
         )
         assert get_num_microbatches() == 1
 
@@ -1301,8 +1313,9 @@ class TestRLUtils:
                 lst.append([sentinel, sentinel])  # the fully failed extra group
             for lst in (policy_epoch, kv_cache_epoch):
                 for group in lst:
-                    group.append([0])  # sentinel epoch stamp of a placeholder
-                lst.append([[0], [0]])
+                    # Placeholders pop no ledger records, so their epoch rows are empty.
+                    group.append([])
+                lst.append([[], []])
             # Placeholders contribute no turns, and compute_group_stats already
             # excludes them from completed_epochs; the failed group adds empty
             # inner lists, which the group-level stats must skip, not crash on.
