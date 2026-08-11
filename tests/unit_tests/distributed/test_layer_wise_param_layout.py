@@ -515,3 +515,49 @@ class TestComputeBalancedLayout:
         imbalance = max(loads) / (sum(loads) / dp_size)
         # Numel-ordered placement gives 3.77x on this input.
         assert imbalance < 1.5, f"compute imbalance {imbalance:.2f}x too high: {loads}"
+
+    def test_gtp_params_land_on_different_shards_in_each_bucket(self):
+        """Expensive params spread across buckets because compute loads do not reset.
+
+        Four buckets, each holding one GTP-sharded matrix plus three dense params of
+        identical numel. ``shard_cursors`` resets per bucket, so numel gives every
+        bucket the same starting state and would send all four GTP matrices to shard
+        0. ``shard_compute_loads`` carries over, so each bucket sees the previous
+        ones' cost and picks a different shard.
+        """
+        dp_size = 4
+        buckets = 4
+        params = []
+        for _ in range(buckets):
+            params.append(_make_param((64, 256), is_gtp_weight_remat=True, gtp_remat_size=64))
+            params.extend(_make_param((128, 128)) for _ in range(3))
+        gtp_params = [param for param in params if hasattr(param, 'gtp_remat_size')]
+        cfg = _make_ddp_config()
+
+        # Each group of four params is 4 * 16384 elements, so this cuts one bucket per group.
+        layout = _LWO._compute_per_buffer_param_layout(params, 4 * 16384, dp_size, cfg)
+
+        assert len(layout.bucket_indices) == buckets
+        gtp_shards = [_get_shard_for_param(layout, param, dp_size) for param in gtp_params]
+        assert len(set(gtp_shards)) == buckets, f"GTP params clustered onto {gtp_shards}"
+
+    def test_param_larger_than_cap_is_still_placed(self):
+        """A param larger than the per-bucket cap still gets placed.
+
+        The cap is ``total_chunk_numel / dp_size * 1.3``. A param above it disqualifies
+        every shard, so assignment falls back to the previous least-numel rule instead
+        of wedging.
+        """
+        dp_size = 2
+        oversized = _make_param((1024,))
+        small_params = [_make_param((64,)) for _ in range(2)]
+        cfg = _make_ddp_config()
+
+        # cap = (1024 + 64 + 64) / 2 * 1.3 = 748.8, below the oversized param's numel.
+        layout = _LWO._compute_per_buffer_param_layout(
+            small_params + [oversized], None, dp_size, cfg
+        )
+
+        for param in small_params + [oversized]:
+            _assert_param_within_shard(layout, param, dp_size)
+        assert oversized in layout.param_index_map

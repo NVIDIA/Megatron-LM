@@ -213,15 +213,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
            followed by an isolated bucket for that embedding alone.
         2. When the chunk's total numel reaches ``bucket_size`` (or all
            params have been consumed), bin-pack the chunk into ``dp_size``
-           shards via greedy LPT — sort by numel descending and assign each
-           param to the shard with the smallest current load.
+           shards: sort by estimated Newton-Schulz compute cost descending and
+           assign each param to the shard with the smallest accumulated compute
+           load, subject to a per-bucket numel cap that bounds shard-imbalance
+           padding. Compute loads persist across buckets so expensive
+           (GTP-sharded) matrices spread over the whole buffer instead of
+           clustering inside each bucket.
         3. Pad each shard to ``max(shard_cursors)`` aligned to
            :meth:`_shard_divisor`, then emit the bucket.
 
         Each bucket therefore spans a contiguous backprop range so that
         ``overlap_grad_reduce`` can dispatch the bucket's reduce-scatter as
         soon as the bucket's backward segment finishes — preserving the
-        original DDP overlap semantics.  LPT bin-packing keeps shards close
+        original DDP overlap semantics.  Greedy bin-packing keeps shards close
         to balanced; for uniform transformer blocks where ``params_per_layer
         * num_layers`` is a multiple of ``dp_size`` the packing is perfect.
 
