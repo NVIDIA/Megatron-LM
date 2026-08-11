@@ -17,10 +17,12 @@ Usage (from the training entrypoint, after the model is built):
     timer.log(iteration)
 """
 
-import time
-from typing import Dict, List, Optional, Tuple
+import logging
+from typing import Dict, List, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def _distributed_rank() -> int:
@@ -56,6 +58,7 @@ class _DSATimingProfiler:
 
     # ---- forward hooks ----
     def pre_hook(self, module, args):
+        """Record the layer start time (forward pre-hook)."""
         if not self.enabled or not torch.cuda.is_available():
             return
         ev = torch.cuda.Event(enable_timing=True)
@@ -63,6 +66,7 @@ class _DSATimingProfiler:
         self._pending[id(module)] = ev
 
     def post_hook(self, module, args, output):
+        """Record the elapsed time for one layer (forward hook)."""
         if not self.enabled or not torch.cuda.is_available():
             return
         start = self._pending.pop(id(module), None)
@@ -79,6 +83,7 @@ class _DSATimingProfiler:
 
     # ---- reporting ----
     def log(self, iteration: int) -> None:
+        """Log per-layer and total DSA forward times for one iteration."""
         if not self.enabled or not self._records:
             return
         torch.cuda.synchronize()
@@ -98,19 +103,24 @@ class _DSATimingProfiler:
 
         label = f" {self.label}" if self.label else ""
         per_layer = " ".join(f"{n}={totals[n]:.3f}ms" for n in order)
-        print(
-            f"[rank{self.rank}] DSA forward iter{iteration}{label}: "
-            f"total={dsa_total:.3f}ms | {per_layer}",
-            flush=True,
+        logger.info(
+            "[rank%s] DSA forward iter%s%s: total=%.3fms | %s",
+            self.rank,
+            iteration,
+            label,
+            dsa_total,
+            per_layer,
         )
 
         if len(self._history) >= self._MEDIAN_WINDOW:
             meds = sorted(h["dsa_forward_total"] for h in self._history)
             median_total = meds[len(meds) // 2]
-            print(
-                f"[rank{self.rank}] DSA forward MEDIAN over {self._MEDIAN_WINDOW} "
-                f"iters{label}: dsa_forward_total={median_total:.3f}ms",
-                flush=True,
+            logger.info(
+                "[rank%s] DSA forward MEDIAN over %s iters%s: dsa_forward_total=%.3fms",
+                self.rank,
+                self._MEDIAN_WINDOW,
+                label,
+                median_total,
             )
             self._history = []
 
@@ -137,8 +147,7 @@ def attach_dsa_forward_timing(model, profile_rank: int = 0, label: str = "") -> 
                 n_attached += 1
     profiler.n_layers = n_attached  # enables auto-log once per full forward pass
     if profiler.enabled:
-        print(
-            f"[rank{profiler.rank}] DSA timing attached to {n_attached} DSAttention layer(s)",
-            flush=True,
+        logger.info(
+            "[rank%s] DSA timing attached to %s DSAttention layer(s)", profiler.rank, n_attached
         )
     return profiler

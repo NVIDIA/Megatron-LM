@@ -28,6 +28,7 @@ A Triton attention output can be swapped in later; this is the option-1 first cu
 """
 
 import copy
+import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -48,13 +49,17 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import log_single_rank
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class DSGQAIndexerSubmodules:
     """Submodules for :class:`DSGQAIndexer`.
 
-    Mirrors :class:`~megatron.core.transformer.experimental_attention_variant.dsa.DSAIndexerSubmodules`
+    Mirrors ``DSAIndexerSubmodules`` from
+    :mod:`megatron.core.transformer.experimental_attention_variant.dsa`
     but replaces the MLA ``linear_wq_b`` (query-from-``qr``) with ``linear_q``
     (query-from-hidden).
 
@@ -368,19 +373,20 @@ class DSGQAttention(DSAttention):
         # NOT read by this path; only these env-derived flags matter.
         if not getattr(self, "_dsa_backend_logged", False):
             self._dsa_backend_logged = True
-            from megatron.core.transformer.experimental_attention_variant.dsa_min_memory_triton import (
-                HAVE_TRITON,
+            from megatron.core.transformer.experimental_attention_variant import (
+                dsa_min_memory_triton,
             )
 
             cudnn_active = _cudnn_available_for_indexer(use_cudnn, self.indexer.index_n_heads)
             # triton_active = the request AND Triton actually importable; if False while
             # use_triton=True, the Triton kernels silently fell back to the PyTorch oracle.
-            triton_active = bool(use_triton and HAVE_TRITON)
-            print(
+            triton_active = bool(use_triton and dsa_min_memory_triton.HAVE_TRITON)
+            log_single_rank(
+                logger,
+                logging.INFO,
                 f"[DSGQAttention layer{self.layer_number}] min-memory backend: "
                 f"use_triton={use_triton} triton_active={triton_active} "
                 f"use_cudnn={use_cudnn} cudnn_indexer_active={cudnn_active}",
-                flush=True,
             )
 
         if not torch.is_grad_enabled():

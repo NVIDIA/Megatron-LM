@@ -7,7 +7,10 @@ plain GQA SelfAttention, so the same cuDNN/TileLang DSA kernels run over GQA Q/K
 instead of MLA. The DSAttention + DSAIndexer core is byte-identical to main's; only
 the attention module that produces Q/K/V changes.
 
-Reference it via:  --spec megatron.core.models.hybrid.hybrid_layer_specs_dsa_gqa hybrid_stack_spec_dsa_gqa
+Reference it via::
+
+    --spec megatron.core.models.hybrid.hybrid_layer_specs_dsa_gqa \
+        hybrid_stack_spec_dsa_gqa
 and place DSA layers with `D` in --hybrid-layer-pattern.
 """
 

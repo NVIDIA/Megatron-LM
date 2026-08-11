@@ -10,6 +10,7 @@ forward/backward boundary.  Explicit cache flags may trade bounded sequence-size
 
 from __future__ import annotations
 
+import logging
 import time
 from contextlib import contextmanager
 from typing import Optional, Tuple
@@ -67,6 +68,9 @@ except ImportError:
 _SIMPLIFIED_LEARNED_K_SUPPORT_CHUNK_SIZE = 64
 
 
+logger = logging.getLogger(__name__)
+
+
 def _module_weight(module) -> torch.Tensor:
     weight = getattr(module, "weight", None)
     if weight is None:
@@ -113,6 +117,7 @@ class _DSATimingProfiler:
 
     @contextmanager
     def record(self, name: str, device: Optional[torch.device] = None):
+        """Time a named region, accumulating into this profiler."""
         if not self.enabled:
             yield
             return
@@ -139,6 +144,7 @@ class _DSATimingProfiler:
             self.records.append((name, (time.perf_counter() - start_time) * 1000.0, None, None))
 
     def log(self, phase: str) -> None:
+        """Emit the accumulated timings for one phase."""
         if not self.enabled or not self.records:
             return
 
@@ -166,7 +172,7 @@ class _DSATimingProfiler:
         parts = " ".join(
             f"{name}={totals[name]:.3f}ms(avg={totals[name]/counts[name]:.3f}ms)" for name in order
         )
-        print(f"[rank{self.rank}] DSA min-memory {phase}{label}: {parts}", flush=True)
+        logger.info("[rank%s] DSA min-memory %s%s: %s", self.rank, phase, label, parts)
 
         _csv_exclude = {"selected_index_scores_fwd_score_fallback"}
 
@@ -195,12 +201,13 @@ class _DSATimingProfiler:
                 med = sorted_pairs[len(sorted_pairs) // 2]
                 ft, fc, fo = med["forward"]
                 bt, bc, bo = med["backward"]
-                print(
-                    f"[rank{self.rank}] CSV (median fwd of {_DSATimingProfiler._MEDIAN_WINDOW}):\n"
-                    f"{_csv_header(fo)}\n"
-                    f"{_csv_values('forward', ft, fc, fo)}\n"
-                    f"{_csv_values('backward', bt, bc, bo)}",
-                    flush=True,
+                logger.info(
+                    "[rank%s] CSV (median fwd of %s):\n%s\n%s\n%s",
+                    self.rank,
+                    _DSATimingProfiler._MEDIAN_WINDOW,
+                    _csv_header(fo),
+                    _csv_values("forward", ft, fc, fo),
+                    _csv_values("backward", bt, bc, bo),
                 )
                 _DSATimingProfiler._paired_history[self.label] = []
 
@@ -2929,6 +2936,7 @@ class DSADenseIndexerLossFn(torch.autograd.Function):
         use_triton: bool = True,
         indexer_input_norm=None,
     ) -> torch.Tensor:
+        """Forward pass for :class:`DSADenseIndexerLossFn`."""
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
         with torch.no_grad(), _triton_dispatch_enabled(use_triton):
             with profile.record("dense_indexer_kl_fwd_total", query.device):
@@ -2995,6 +3003,7 @@ class DSADenseIndexerLossFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_loss: torch.Tensor):
+        """Backward pass for :class:`DSADenseIndexerLossFn`."""
         (
             query,
             key,
@@ -3356,6 +3365,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
         use_cudnn: bool = False,
         indexer_input_norm=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass for :class:`DSAMinMemoryGQAFn`."""
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
         key_chunk_size = _routing_key_chunk_size(key_chunk_size, key.size(0), use_triton)
         routing_topk_cache = [] if cache_routing else None
@@ -3474,6 +3484,7 @@ class DSAMinMemoryGQAFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, grad_indexer_loss: torch.Tensor):
+        """Backward pass for :class:`DSAMinMemoryGQAFn`."""
         (
             query,
             key,
@@ -4165,6 +4176,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
         cache_indexer_k: bool = False,
         use_triton: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass for :class:`DSASimplifiedMinMemoryGQAFn`."""
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
         key_chunk_size = _routing_key_chunk_size(key_chunk_size, key.size(0), use_triton)
         routing_topk_cache = [] if cache_routing else None
@@ -4247,6 +4259,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, grad_indexer_loss: torch.Tensor):
+        """Backward pass for :class:`DSASimplifiedMinMemoryGQAFn`."""
         query, key, value, hidden_states, linear_q_weight, linear_k_weight, cached_k = (
             ctx.saved_tensors
         )
@@ -4841,6 +4854,7 @@ class DSASimplifiedDenseIndexerLossFn(torch.autograd.Function):
         profile_label: str = "",
         use_triton: bool = True,
     ) -> torch.Tensor:
+        """Forward pass for :class:`DSASimplifiedDenseIndexerLossFn`."""
         profile = _DSATimingProfiler(profile_enabled, profile_rank, profile_label, query.device)
         with torch.no_grad(), _triton_dispatch_enabled(use_triton):
             with profile.record("dense_indexer_kl_fwd_total", query.device):
@@ -4887,6 +4901,7 @@ class DSASimplifiedDenseIndexerLossFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_loss: torch.Tensor):
+        """Backward pass for :class:`DSASimplifiedDenseIndexerLossFn`."""
         query, key, hidden_states, linear_q_weight, linear_k_weight = ctx.saved_tensors
         grad_linear_q_weight = (
             _grad_accumulator(linear_q_weight) if ctx.needs_input_grad[3] else None
@@ -5719,6 +5734,7 @@ class DSAMainAttentionAuxLossFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, *args):
+        """Forward pass for :class:`DSAMainAttentionAuxLossFn`."""
         ctx.set_materialize_grads(False)
         (
             query,
@@ -5883,6 +5899,7 @@ class DSAMainAttentionAuxLossFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_mass_loss, grad_output_loss, grad_captured_mass):
+        """Backward pass for :class:`DSAMainAttentionAuxLossFn`."""
         del grad_captured_mass
         (
             query,
