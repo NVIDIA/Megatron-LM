@@ -144,6 +144,7 @@ class TestGPTModel:
         ).cuda()
 
         context = {"selected_token_positions": torch.tensor([0, 2], device="cuda")}
+        created = {}
         seen = {}
 
         def output_processor(**kwargs):
@@ -158,7 +159,14 @@ class TestGPTModel:
                 dim=-1, index=kwargs["labels"].unsqueeze(-1)
             )
             token_logprobs = token_logprobs.squeeze(-1)
-            return token_logprobs.index_select(1, kwargs["context"]["selected_token_positions"])
+            result = {
+                "payload": token_logprobs.index_select(
+                    1, kwargs["context"]["selected_token_positions"]
+                ),
+                "tag": "structured",
+            }
+            created["result"] = result
+            return result
 
         with torch.no_grad():
             logits = self.gpt_model.forward(
@@ -176,10 +184,14 @@ class TestGPTModel:
                 output_processor_context=context,
             )
 
-        assert torch.allclose(output, expected)
+        assert output is created["result"]
+        assert isinstance(output, dict)
+        assert torch.allclose(output["payload"], expected)
+        assert output["tag"] == "structured"
         assert seen["context"] is context
         assert seen["output_layer"] is self.gpt_model.output_layer
         assert seen["output_weight"] is None
+        assert seen["output_layer"].weight is not None
         assert seen["labels"] is labels
         assert seen["runtime_gather_output"] is None
         assert seen["config"] is config

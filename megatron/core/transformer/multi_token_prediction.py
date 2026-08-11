@@ -26,6 +26,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.tensor_parallel.inference_layers import (
     inference_all_gather_from_tensor_model_parallel_region,
+    is_inference_column_parallel_linear,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
@@ -1011,6 +1012,13 @@ class MultiTokenPredictionLayer(MegatronModule):
             tp_group=pg_collection.tp if pg_collection is not None else None,
             name=(name + ".eh_proj") if name is not None else None,
         )
+        # eh_proj's input all-gather reuses the shared "tp" symmetric buffer right
+        # after the preceding layer's all-gather (the fused rs-add-norm-ag terminates
+        # with one, as does the previous MTP step's output all-gather), so it must
+        # barrier before overwriting. Only the inference-optimized linear implements
+        # this all-gather; other eh_proj impls have no such buffer to guard.
+        if is_inference_column_parallel_linear(self.eh_proj):
+            self.eh_proj.set_barrier_before_all_gather(True)
 
         # Build inner layers: two possible paths
         # 1. Hybrid path: use HybridStack for hybrid pattern support
@@ -1045,6 +1053,23 @@ class MultiTokenPredictionLayer(MegatronModule):
                 pg_collection=pg_collection,
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
+
+        # The MTP inner block's first all-gather reuses the same "tp" symmetric buffer
+        # that _concat_embeddings' output all-gather just wrote, with no reduce-scatter in
+        # between, so it must barrier before overwriting. Later all-gathers in the inner
+        # block are each preceded by a reduce-scatter and need no barrier. modules() yields
+        # in forward order, so the first inference column-parallel linear is that all-gather.
+        if self.mtp_layer_pattern is not None:
+            # Hybrid path: HybridStack of layers.
+            first_inner_layer = self.mtp_model_layer.layers[0]
+        else:
+            # GPT path: single TransformerLayer.
+            first_inner_layer = self.mtp_model_layer
+
+        for module in first_inner_layer.modules():
+            if is_inference_column_parallel_linear(module):
+                module.set_barrier_before_all_gather(True)
+                break
 
         self.final_layernorm = self.submodules.layer_norm(
             config=self.config,
@@ -1103,6 +1128,19 @@ class MultiTokenPredictionLayer(MegatronModule):
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
+        # Mirror the scatter in the model's own forward (see hybrid_model.py:
+        # "the embedding skips SP scatter for models whose outer wrapper
+        # scatters instead"). Multimodal LMs build LanguageModelEmbedding with
+        # scatter_to_sequence_parallel=False so they can insert media into a
+        # full-length embedding before scattering. The MTP block calls the
+        # embedding directly and so must apply the same scatter, otherwise
+        # decoder_input stays full-length while the backbone hidden_states
+        # arrive sequence-parallel sharded and _concat_embeddings fails.
+        if self.config.sequence_parallel and not getattr(
+            embedding, "scatter_to_sequence_parallel", True
+        ):
+            decoder_input = scatter_to_sequence_parallel_region(decoder_input, group=self.tp_group)
+
         if self.config.mtp_detach_heads:
             decoder_input = decoder_input.detach()
 
@@ -1132,8 +1170,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         # For tensor parallel we need to gather the tensor across the model-parallel
         # ranks after the linear projection.
         if InferenceMode.is_active():
+            # This all-gather immediately follows eh_proj's input all-gather on the
+            # same symmetric buffer (only eh_proj's local matmul runs in between), so
+            # it must barrier before overwriting the buffer's previous contents.
             hidden_states = inference_all_gather_from_tensor_model_parallel_region(
-                hidden_states, self.tp_group, self.config
+                hidden_states, self.tp_group, self.config, barrier_before=True
             )
         else:
             hidden_states = gather_from_tensor_model_parallel_region(
@@ -1816,7 +1857,7 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
-            (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
+            hidden_states, input_ids, position_ids, padding_mask = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
