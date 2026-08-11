@@ -507,6 +507,9 @@ jobs:
           owner: NVIDIA-NeMo
           repositories: Megatron-Bridge
 
+      - name: Checkout Megatron-LM
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
       - name: Checkout MBridge and create testing branch
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -524,32 +527,42 @@ jobs:
           git checkout -b ${{ env.MBRIDGE_BRANCH_NAME }} origin/main
           git push origin ${{ env.MBRIDGE_BRANCH_NAME }} --force
 
+      # Installation tokens expire after one hour. The helper mints and rotates
+      # repository-scoped tokens while a longer downstream workflow is running.
       - name: Trigger MBridge tests
-        uses: convictional/trigger-workflow-and-wait@f69fa9eedd3c62a599220f4d5745230e237904be # v1.6.5
         env:
-          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
-        with:
-          owner: NVIDIA-NeMo
-          repo: Megatron-Bridge
-          workflow_file_name: cicd-main.yml
-          github_token: ${{ steps.app-token.outputs.token }}
-          ref: ${{ env.MBRIDGE_BRANCH_NAME }}
-          wait_interval: 60
-          propagate_failure: true
-          client_payload: |
-            {
-              "mcore_ref": "${{ needs.configure.outputs.sha }}",
-              "test_suite": "${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}",
-              "triggered_by": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            }
-
-      - name: Delete testing branch
-        if: always()
-        env:
+          CLIENT_PAYLOAD: >-
+            {"mcore_ref":"${{ needs.configure.outputs.sha }}","test_suite":"${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}","triggered_by":"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}
+          GITHUB_APP_ID: ${{ vars.BOT_ID }}
+          GITHUB_APP_PRIVATE_KEY: ${{ secrets.BOT_KEY }}
           MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
         run: |
-          cd megatron-bridge
-          git push origin --delete ${{ env.MBRIDGE_BRANCH_NAME }}
+          python3 .github/scripts/trigger_workflow_and_wait.py \
+            --owner NVIDIA-NeMo \
+            --repo Megatron-Bridge \
+            --workflow cicd-main.yml \
+            --ref "${{ env.MBRIDGE_BRANCH_NAME }}" \
+            --client-payload "${CLIENT_PAYLOAD}" \
+            --wait-interval 60
+
+      - name: Generate cleanup token
+        if: always()
+        id: cleanup-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          owner: NVIDIA-NeMo
+          repositories: Megatron-Bridge
+
+      - name: Delete testing branch
+        if: always() && steps.cleanup-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.cleanup-token.outputs.token }}
+          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
+        run: |
+          gh api --method DELETE \
+            "/repos/NVIDIA-NeMo/Megatron-Bridge/git/refs/heads/${{ env.MBRIDGE_BRANCH_NAME }}"
 
   cicd-mbridge-testing-notify:
     runs-on: ubuntu-latest
