@@ -454,6 +454,21 @@ class OptimizerConfig:
                 not self.optimizer_cuda_graph
             ), "chunked optimizer state offload does not support optimizer CUDA graphs"
 
+            if self.use_precision_aware_optimizer:
+                assert self.main_params_dtype == torch.float32, (
+                    "chunked optimizer state offload with precision-aware optimizer requires "
+                    "main_params_dtype=torch.float32"
+                )
+                supported_state_dtypes = (torch.float32, torch.bfloat16)
+                assert self.exp_avg_dtype in supported_state_dtypes, (
+                    "chunked optimizer state offload with precision-aware optimizer requires "
+                    "exp_avg_dtype to be torch.float32 or torch.bfloat16"
+                )
+                assert self.exp_avg_sq_dtype in supported_state_dtypes, (
+                    "chunked optimizer state offload with precision-aware optimizer requires "
+                    "exp_avg_sq_dtype to be torch.float32 or torch.bfloat16"
+                )
+
             if self.optimizer == 'muon':
                 assert (
                     self.use_layer_wise_distributed_optimizer
