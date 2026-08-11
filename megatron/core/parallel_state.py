@@ -2505,10 +2505,14 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
-    # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
-    # process group's communicator is torn down. TE registers an atexit ep_finalize that would
-    # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
-    # Idempotent and a no-op when NCCL EP was never bootstrapped.
+    # Release flex-dispatcher contexts before their process-group communicators are torn down.
+    # The finalizers are idempotent no-ops when their corresponding backends were never used.
+    try:
+        from megatron.core.transformer.moe.fused_a2a import moonep_finalize
+
+        moonep_finalize()
+    except Exception:  # finalize must never block teardown
+        pass
     try:
         from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
 

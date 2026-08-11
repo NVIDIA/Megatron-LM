@@ -309,7 +309,52 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 | **alltoall** | NCCL-based All-to-All communication for token exchange | Standard EP > 1 setups | `--moe-token-dispatcher-type alltoall` |
 | **FlexDispatcher with [DeepEP](https://github.com/deepseek-ai/DeepEP) backend** | Removes redundant tokens during cross-node communication, fuses intra/inter-node communication into single kernel | Cross-node EP, fine-grained MoE (DeepSeek-V3) | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend deepep` |
 | **FlexDispatcher with [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) backend** | NVIDIA's optimized dispatcher using TMA and IBGDA, fewer SMs, native MNNVL support | GB200 NVL72, Multi-Node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
+| **FlexDispatcher with MoonEP backend** | Prefetches redundant experts into NVLink-visible slots while retaining Megatron grouped parameters for optimization and checkpoints | Eager BF16 training on one NVLink-connected node | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend moonep` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
+
+#### MoonEP
+
+MoonEP is an optional external dependency and is not installed by Megatron Core. Its initial
+integration supports eager BF16 training on one NVLink-connected host with expert tensor
+parallelism set to 1. Enable it with:
+
+```bash
+--moe-token-dispatcher-type flex
+--moe-flex-dispatcher-backend moonep
+--moe-grouped-gemm
+--moe-single-grouped-weight
+--use-transformer-engine-op-fuser
+--gradient-accumulation-fusion
+--disable-bias-linear
+--moe-router-dtype fp32
+```
+
+The supported expert activations are fused SwiGLU, quick-GeGLU, and weighted squared ReLU. Latent
+MoE is supported with `--moe-latent-size`; routing remains in the model hidden dimension while
+MoonEP dispatch, expert computation, and combine operate in the latent dimension. Packed and
+GLU-interleaved FC1 layouts remain one contiguous projection. The registered
+`moe_single_grouped_weight` parameters remain the optimizer and checkpoint source of truth;
+MoonEP's `E+B` runtime weights and FP32 gradient storage are mirrors, so the distributed optimizer
+and existing sharded checkpoint layout remain supported.
+
+The dispatched activation and probability tensors retain MoonEP's fixed `[NvS, H]` and `[NvS]`
+capacity through the fused expert MLP. Device-side `E+B` counts delimit the live rows; unused tail
+rows are ignored by grouped GEMM and combine. This is padding-only—the router's capacity-based
+drop-and-pad mode remains disabled, and MoonEP does not drop routed tokens. Steady-state dispatch,
+FC2 output/combine, combine-backward, and FC1 dgrad/dispatch-backward use symmetric token buffers
+directly, without full-activation boundary copies. Per-forward dispatch buffers are pooled until
+FC1 backward so multiple outstanding microbatches cannot overwrite saved activations; the pool
+grows only to the maximum in-flight depth and is then reused. Router weights remain in independent
+small tensors. Steady-state dispatch, expert compute, weight publication, and gradient reduction do
+not read routing counts back to the CPU or use device-wide synchronization.
+
+MoonEP requires fixed, equal local token counts across its ranks, top-k no greater than 32,
+128-element-aligned expert projection dimensions (including `moe_latent_size`, when set), and
+VMM-aligned per-rank expert chunks. CUDA graphs, FP8/FP4, delayed wgrad, expert
+communication/shared-expert overlap, and capacity-based dropping or padding are rejected.
+Megatron's
+`destroy_model_parallel()` tears down live MoonEP VMM buffers collectively before process-group
+teardown.
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
@@ -549,6 +594,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | Argument | Description | Default |
 |----------|-------------|---------|
 | --moe-token-dispatcher-type | Dispatcher: allgather, alltoall, flex | allgather |
+| --moe-flex-dispatcher-backend | Flex backend: deepep, hybridep, moonep, ncclep | deepep |
 | --moe-enable-deepep | Enable DeepEP (with flex) | False |
 | --moe-expert-capacity-factor | Capacity factor | None |
 | --moe-pad-expert-input-to-capacity | Pad to capacity | False |
