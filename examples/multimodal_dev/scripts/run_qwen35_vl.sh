@@ -15,7 +15,7 @@
 #   DATASET_PROVIDER: cord_v2 (default) or mock
 #   TOKENIZER_TYPE: HuggingFaceTokenizer (default) or NullTokenizer
 #   VOCAB_SIZE: required for NullTokenizer
-#   MTP_NUM_LAYERS: set to 0 to disable MTP (default 1)
+#   MTP_NUM_LAYERS: set to 0 to disable MTP (default 1; 0 for pp_proxy)
 #   SAVE_CHECKPOINT: set to 0 to skip --save/--save-interval
 #   FORCE_LOAD_BALANCING: set to 1 to enable --moe-router-force-load-balancing
 #                         (perf / mock-data only; OFF for real finetuning)
@@ -55,7 +55,8 @@ VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
 DATASET_PROVIDER=${DATASET_PROVIDER:-cord_v2}
 TOKENIZER_TYPE=${TOKENIZER_TYPE:-HuggingFaceTokenizer}
 VOCAB_SIZE=${VOCAB_SIZE:-}
-MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-1}
+# MTP_NUM_LAYERS is defaulted after the variant case block so pp_proxy can
+# pick a different default (0) than every other variant (1).
 MTP_LOSS_SCALING_FACTOR=${MTP_LOSS_SCALING_FACTOR:-0.1}
 SAVE_CHECKPOINT=${SAVE_CHECKPOINT:-1}
 
@@ -121,7 +122,10 @@ case "$MODEL_VARIANT" in
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-2}
         ;;
     pp_proxy)
-        # Minimal variant for pipeline-parallel smoke / parity runs.
+        # Minimal variant for pipeline-parallel smoke / parity runs.  MTP is
+        # off by default here so the PP smoke test isolates PP behaviour;
+        # set MTP_NUM_LAYERS explicitly to exercise MTP + PP together.
+        MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-0}
         NUM_LAYERS=${NUM_LAYERS:-4}
         NUM_EXPERTS=${NUM_EXPERTS:-4}
         HIDDEN_SIZE=${HIDDEN_SIZE:-512}
@@ -205,6 +209,8 @@ case "$MODEL_VARIANT" in
 esac
 # Upstream default for every variant except the PP proxy, which shrinks it.
 LINEAR_NUM_KEY_HEADS=${LINEAR_NUM_KEY_HEADS:-16}
+# Variants may set this above; every other variant keeps MTP on.
+MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-1}
 
 # Fail fast on inconsistent expert-parallelism configuration. Dense variants
 # (NUM_EXPERTS=0) do not emit any --num-experts / MoE args, so forwarding
