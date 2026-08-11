@@ -2695,6 +2695,7 @@ def setup_model_and_optimizer(
             reduce_scatter_with_fp32_accumulation=getattr(
                 args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
             ),
+            pad_for_alignment=getattr(args, 'gtp_remat_pad_for_alignment', None),
         )
 
         if getattr(args, 'gtp_remat_nccl_ub', False):
