@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32' and extra != 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts'",
@@ -1364,6 +1364,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/49/85/12f0a49a7c4ffb70572b6c2ef13c90c88fd190debda93b23f026b25f9634/deprecated-1.3.1.tar.gz", hash = "sha256:b1b50e0ff0c1fddaa5708a2c6b0a6588bb09b892825ab2b214ac9ea9d92a5223", size = 2932523, upload-time = "2025-10-30T08:19:02.757Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/84/d0/205d54408c08b13550c733c4b85429e7ead111c7f0014309637425520a9a/deprecated-1.3.1-py2.py3-none-any.whl", hash = "sha256:597bfef186b6f60181535a29fbe44865ce137a5079f295b479886c82729d5f3f", size = 11298, upload-time = "2025-10-30T08:19:00.758Z" },
+]
+
+[[package]]
+name = "deprecation"
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5a/d3/8ae2869247df154b64c1884d7346d412fed0c49df84db635aab2d1c40e62/deprecation-2.1.0.tar.gz", hash = "sha256:72b3bde64e5d778694b0cf68178aed03d15e15477116add3fb773e581f9518ff", size = 173788, upload-time = "2020-04-20T14:23:38.738Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/02/c3/253a89ee03fc9b9682f1541728eb66db7db22148cd94f89ab22528cd1e1b/deprecation-2.1.0-py2.py3-none-any.whl", hash = "sha256:a10811591210e1fb0e768a8c25517cabeabcba6f0bf96564f8ff45189f90b14a", size = 11178, upload-time = "2020-04-20T14:23:36.581Z" },
 ]
 
 [[package]]
@@ -2921,7 +2933,7 @@ dev = [
     { name = "flashinfer-python" },
     { name = "hypercorn" },
     { name = "mamba-ssm" },
-    { name = "megatron-energon", extra = ["av-decode"], marker = "extra == 'extra-13-megatron-core-dev'" },
+    { name = "megatron-energon", version = "7.4.1", source = { registry = "https://pypi.org/simple" }, extra = ["av-decode"], marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "multi-storage-client" },
     { name = "nvidia-cudnn-frontend", version = "1.25.0", source = { git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=0a14b7181d129d30e7bad34b8c3ed0a0c995e23d#0a14b7181d129d30e7bad34b8c3ed0a0c995e23d" }, extra = ["cutedsl"], marker = "extra == 'extra-13-megatron-core-dev'" },
     { name = "nvidia-modelopt", marker = "(sys_platform != 'darwin' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
@@ -2946,7 +2958,7 @@ lts = [
     { name = "fastapi" },
     { name = "flashinfer-python" },
     { name = "mamba-ssm" },
-    { name = "megatron-energon", extra = ["av-decode"], marker = "extra == 'extra-13-megatron-core-lts'" },
+    { name = "megatron-energon", version = "6.0.1", source = { registry = "https://pypi.org/simple" }, extra = ["av-decode"], marker = "extra == 'extra-13-megatron-core-lts'" },
     { name = "multi-storage-client" },
     { name = "nvtx" },
     { name = "onnxscript" },
@@ -3053,14 +3065,14 @@ requires-dist = [
     { name = "hypercorn", marker = "extra == 'dev'" },
     { name = "mamba-ssm", marker = "extra == 'dev'", specifier = "~=2.2" },
     { name = "mamba-ssm", marker = "extra == 'lts'", specifier = "~=2.2" },
-    { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=6.0" },
+    { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=7.0" },
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'lts'", specifier = "~=6.0" },
     { name = "multi-storage-client", marker = "extra == 'dev'", specifier = "~=0.27" },
     { name = "multi-storage-client", marker = "extra == 'lts'", specifier = "~=0.27" },
     { name = "numpy" },
     { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=0a14b7181d129d30e7bad34b8c3ed0a0c995e23d" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'" },
-    { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=0cbbaff8f02504370cb30df41f4ebfc97b242652" },
+    { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.6.0" },
     { name = "nvtx", marker = "extra == 'dev'", specifier = "~=0.2" },
     { name = "nvtx", marker = "extra == 'lts'", specifier = "~=0.2" },
     { name = "onnxscript", marker = "extra == 'dev'" },
@@ -3144,12 +3156,40 @@ test = [
 name = "megatron-energon"
 version = "6.0.1"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.11' and platform_machine != 's390x'",
+    "python_full_version < '3.11' and platform_machine == 's390x'",
+]
 dependencies = [
     { name = "braceexpand" },
     { name = "click" },
     { name = "multi-storage-client" },
-    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version < '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
     { name = "pillow" },
     { name = "pyyaml" },
     { name = "s3fs" },
@@ -3170,6 +3210,73 @@ av-decode = [
     { name = "filetype" },
     { name = "sortedcontainers" },
     { name = "soundfile" },
+]
+
+[[package]]
+name = "megatron-energon"
+version = "7.4.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'win32'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform == 'emscripten'",
+    "python_full_version == '3.11.*' and platform_machine != 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.11.*' and platform_machine == 's390x' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version < '3.11' and platform_machine != 's390x'",
+    "python_full_version < '3.11' and platform_machine == 's390x'",
+]
+dependencies = [
+    { name = "braceexpand" },
+    { name = "click" },
+    { name = "filetype" },
+    { name = "mfusepy" },
+    { name = "multi-storage-client" },
+    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "pillow" },
+    { name = "pyyaml" },
+    { name = "rapidyaml" },
+    { name = "s3fs" },
+    { name = "torch", marker = "sys_platform == 'never'" },
+    { name = "tqdm" },
+    { name = "webdataset" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/81/15/1aa34071dbb64c30f56c68b78989e2a3f11ce72583466b98b37a04206ad4/megatron_energon-7.4.1.tar.gz", hash = "sha256:31e5511bf894e235dff35dacbe130fb1283010a132b612c07e3fa841cc37d82c", size = 211270, upload-time = "2026-08-03T12:11:07.224Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/91/21/fcfffd2dbc8523412ac623da5e24096a252ff6342f97e1bddf3cce99e36e/megatron_energon-7.4.1-py3-none-any.whl", hash = "sha256:b2d96756f2825750bf51a2b2c16bd1ddfed8f50414b72bb9da174dd8ddafb7d8", size = 286847, upload-time = "2026-08-03T12:11:05.704Z" },
+]
+
+[package.optional-dependencies]
+av-decode = [
+    { name = "av" },
+]
+
+[[package]]
+name = "mfusepy"
+version = "3.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/91/47/746287c8962274f73ee25edb3840d80899464bfffbe2c435424c2d60a071/mfusepy-3.1.1.tar.gz", hash = "sha256:338ece54513d7d1a5e9492837679a0c7432ecf96a03490a2683a1ce1d19570e1", size = 34549, upload-time = "2026-03-13T00:36:52.636Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c5/d5/56bc9326bf75f7ea0f4fe1178f5c9f20d1a1e15e288ecf66088513538ccd/mfusepy-3.1.1-py3-none-any.whl", hash = "sha256:69fb70cfc7f7cce595e6ff586f8451d8298f01f18286a157f24f564b24ec5a37", size = 28264, upload-time = "2026-03-13T00:36:51.843Z" },
 ]
 
 [[package]]
@@ -4305,8 +4412,8 @@ wheels = [
 
 [[package]]
 name = "nvidia-resiliency-ext"
-version = "0.6.0.dev84+0cbbaff"
-source = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?rev=0cbbaff8f02504370cb30df41f4ebfc97b242652#0cbbaff8f02504370cb30df41f4ebfc97b242652" }
+version = "0.6.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "defusedxml" },
     { name = "grpcio" },
@@ -4320,6 +4427,14 @@ dependencies = [
     { name = "psutil" },
     { name = "pyyaml" },
     { name = "torch", marker = "sys_platform == 'never'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f2/72/3d1f92f0c3cd26d32707a393e539b3f6d2b59733e1de4442d4289766d07c/nvidia_resiliency_ext-0.6.0-cp310-cp310-manylinux_2_39_aarch64.whl", hash = "sha256:da7086be06b8359f27ac0e68fca08981d9cadfb937b4543e2164d371b59202ad", size = 769534, upload-time = "2026-05-14T21:48:38.766Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/16/253803fd02fe4265c7ae84b776be3bf445a3fed3c39830dcf4913ad8fd29/nvidia_resiliency_ext-0.6.0-cp310-cp310-manylinux_2_39_x86_64.whl", hash = "sha256:a3f251d6c189593946463def0d8649d3566c6ab2a4be02aacc75bf25017cdde3", size = 771456, upload-time = "2026-05-14T21:49:28.862Z" },
+    { url = "https://files.pythonhosted.org/packages/ac/bb/212965e51e3b2b6648f9b964c8ddd6aae8fc7805f2f240dc9edcf4761e04/nvidia_resiliency_ext-0.6.0-cp311-cp311-manylinux_2_39_aarch64.whl", hash = "sha256:d54cdcdbc3e64552910c8ff5f65c5943c6041a15772dbe5b7c3e5938cfe7079e", size = 770311, upload-time = "2026-05-14T21:50:15.746Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/5f/b0eccb1a8248f299c9e31203361da7861e254439ec6de93dc7fec34dcd36/nvidia_resiliency_ext-0.6.0-cp311-cp311-manylinux_2_39_x86_64.whl", hash = "sha256:ced5ac042f8fc1ba05b7986f47216429a8e7c63296998e5711bda208217281fb", size = 772181, upload-time = "2026-05-14T21:53:06.162Z" },
+    { url = "https://files.pythonhosted.org/packages/2d/e1/8d3be847258068862df502123f92cc76dabe869fccde893ecf9ba07168d1/nvidia_resiliency_ext-0.6.0-cp312-cp312-manylinux_2_39_aarch64.whl", hash = "sha256:a71c1a1650b32c72f7fdf7d6f73b4d275961ce5d68bd68efaff9e0d7099031cb", size = 770623, upload-time = "2026-05-14T21:51:16.523Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/0b/957a223c71959497e96ed868acb2ec869170caa95a60a0edbab8909aa98b/nvidia_resiliency_ext-0.6.0-cp312-cp312-manylinux_2_39_x86_64.whl", hash = "sha256:7d5ac6567841aef0173af3bcc0c2044971d2b225918028b99af6e4eb7e6e2f5d", size = 773595, upload-time = "2026-05-14T21:52:06.46Z" },
 ]
 
 [[package]]
@@ -4546,7 +4661,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-api"
-version = "1.42.1"
+version = "1.44.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -4566,9 +4681,9 @@ resolution-markers = [
 dependencies = [
     { name = "typing-extensions", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b4/1c/125e1c936c0873796771b7f04f6c93b9f1bf5d424cea90fda94a99f61da8/opentelemetry_api-1.42.1.tar.gz", hash = "sha256:56c63bea9f77b62856be8c47600474acad853b2924b99b1687c4cb6297166716", size = 72296, upload-time = "2026-05-21T16:32:49.335Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ee/8b/aa9e2d8b8dfa7c946f7dec5d1f8f6ba8eca062f43509a06bdb5ce93d26c0/opentelemetry_api-1.44.0.tar.gz", hash = "sha256:67647e5e9566edcf421166fdf022b3537f818635daa852b289e34604dc6fb33a", size = 72406, upload-time = "2026-07-16T15:25:32.678Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/ca/9520cc1f3dfbbd03ac5903bbf55833e257bc64b1cf30fa8b0d6df374d821/opentelemetry_api-1.42.1-py3-none-any.whl", hash = "sha256:51a69edacadbc03a8950ace1c4c21099cacc538820ac2c9e36277e78cebba714", size = 61311, upload-time = "2026-05-21T16:32:28.822Z" },
+    { url = "https://files.pythonhosted.org/packages/ca/6f/a04e900f465ff3221ccc395522503e2d10e79fa21f2723c8e177aae1e0d1/opentelemetry_api-1.44.0-py3-none-any.whl", hash = "sha256:94b98c893a91b88657eaac1e3ba89618cdb85be6918196705354f34728b2cdef", size = 60018, upload-time = "2026-07-16T15:25:11.657Z" },
 ]
 
 [[package]]
@@ -4615,7 +4730,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-exporter-prometheus"
-version = "0.63b1"
+version = "0.65b0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -4633,13 +4748,13 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 dependencies = [
-    { name = "opentelemetry-api", version = "1.42.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
-    { name = "opentelemetry-sdk", version = "1.42.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-api", version = "1.44.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-sdk", version = "1.44.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "prometheus-client", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ac/2a/dfeddff262b12eff0c72f4ad9e258aab8889f48c4dc1417a0377a13bc427/opentelemetry_exporter_prometheus-0.63b1.tar.gz", hash = "sha256:31902e22c89431058a95b6dcdb644f9309f226aa4872cc755f0a780d2895e97f", size = 15234, upload-time = "2026-05-21T16:32:57.797Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f4/85/3a1af7b90a76d6c069bcbbc86cc641c93d15057f2674cc8226f47c5260e8/opentelemetry_exporter_prometheus-0.65b0.tar.gz", hash = "sha256:2777cbf41c403c119e10f418fce5d645c956b47f673a2ee120285d1d0c6df2d5", size = 16411, upload-time = "2026-07-16T15:25:39.971Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2f/ec/d7c7435e9000fb69837cf7753b7cbbbdeb5d0585203daf1b6ebf8fa93e02/opentelemetry_exporter_prometheus-0.63b1-py3-none-any.whl", hash = "sha256:0efd00aa6b1939345ddcc6de141b83ebffa2b4401a37a68f880e54217602701d", size = 12466, upload-time = "2026-05-21T16:32:36.622Z" },
+    { url = "https://files.pythonhosted.org/packages/82/0d/d7cdc030edeed0fea03448446b88f1a1f8c4a565bad30dac0f5477ebe290/opentelemetry_exporter_prometheus-0.65b0-py3-none-any.whl", hash = "sha256:3b3d24b586d0ad9712c7b52b7d19c8a9dfbb318b9b284121b5f95e90ed019367", size = 13031, upload-time = "2026-07-16T15:25:20.906Z" },
 ]
 
 [[package]]
@@ -4698,7 +4813,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-sdk"
-version = "1.42.1"
+version = "1.44.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -4716,13 +4831,13 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 dependencies = [
-    { name = "opentelemetry-api", version = "1.42.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
-    { name = "opentelemetry-semantic-conventions", version = "0.63b1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-api", version = "1.44.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-semantic-conventions", version = "0.65b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "typing-extensions", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/40/f7/b390bd9bfd703bf98a68fea1f27786c6872331fd617164a54b8a59bdc008/opentelemetry_sdk-1.42.1.tar.gz", hash = "sha256:8c834e8f8c9ba4171d4ec843d0cb8a67e4c7394d3f9e9297e582cbd9456ddbf7", size = 239262, upload-time = "2026-05-21T16:33:04.641Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5d/77/a6592cbc7c8d9bcc9d6757a9df45e04a7c585e3e6e7a13456da522b21109/opentelemetry_sdk-1.44.0.tar.gz", hash = "sha256:cebe7f65dc12f26ead75c6064de12fd2a9052e5060c0272d402cfa203aae123b", size = 208624, upload-time = "2026-07-16T15:25:46.078Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8f/6b/4287766cfbde577ae2272e8884abac325aeaac0d64f41c61d5b8cc595105/opentelemetry_sdk-1.42.1-py3-none-any.whl", hash = "sha256:083cd4bbfaa5aa7b5a9e552430d9951219967cfb27aa61feb13a77aba1fc839d", size = 170907, upload-time = "2026-05-21T16:32:45.894Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/23/ff077e61886ee020a17ce9c8b6fa11c601c8d8345b09ea24f605445df62a/opentelemetry_sdk-1.44.0-py3-none-any.whl", hash = "sha256:df081c4c6bcfdb1211e3e86140376792643128a25f8d72d1d27675936e7e96ad", size = 137221, upload-time = "2026-07-16T15:25:29.534Z" },
 ]
 
 [[package]]
@@ -4768,7 +4883,7 @@ wheels = [
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.63b1"
+version = "0.65b0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -4786,12 +4901,12 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 dependencies = [
-    { name = "opentelemetry-api", version = "1.42.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-api", version = "1.44.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "typing-extensions", marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/93/99/4d7dd6df64795951413ce6e815f8cf1eb191daf7196ae86574589643d5f3/opentelemetry_semantic_conventions-0.63b1.tar.gz", hash = "sha256:3daf963611334b365e98a57438183eb012d3bfb40b2d931a9af613476b8701a9", size = 148340, upload-time = "2026-05-21T16:33:05.455Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8f/73/0cbdebcb4cf545fdd328da14f5137e37d0770c3f26185e478b0d15d94f50/opentelemetry_semantic_conventions-0.65b0.tar.gz", hash = "sha256:f9b2b81e9d5b64f11bc952075e7e9c7fb0aab075c7fd1c46d597f1b919852d60", size = 148774, upload-time = "2026-07-16T15:25:46.902Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cb/7a/7fe66f5f3682b1dd47d88cc4e11f1c6c0966b737de2d16671146e23c39a5/opentelemetry_semantic_conventions-0.63b1-py3-none-any.whl", hash = "sha256:dfe5ef4dee82586b746f522b818ceb298d00b3d59f660042bd79404bff8d0682", size = 203713, upload-time = "2026-05-21T16:32:47.016Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/0e/49df70d9b81fb5cbae4bbf2a49d865b09bcbcbc4eb53f5851b1027738d78/opentelemetry_semantic_conventions-0.65b0-py3-none-any.whl", hash = "sha256:1cacde7b0ad306f84c5ef08c3dbe1bbaf20165bba6f8bff43b670e555a086bcb", size = 204645, upload-time = "2026-07-16T15:25:30.688Z" },
 ]
 
 [[package]]
@@ -6023,6 +6138,62 @@ wheels = [
 ]
 
 [[package]]
+name = "rapidyaml"
+version = "0.15.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "deprecation" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8d/5e/80ea1e8ca5785ad52f835f663e8384961bdb258de71a5bd332e99a2d7b20/rapidyaml-0.15.2.tar.gz", hash = "sha256:a3b075636e6b5673ddf7a50122b029cd44623f18e84bcd4f18425df328425a09", size = 500792, upload-time = "2026-06-25T18:56:18.685Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1d/e2/e5c926fd67d3297c02921c8dce600de21a3c7a752b7d8e2a50a16dd92bde/rapidyaml-0.15.2-cp310-cp310-macosx_10_9_universal2.whl", hash = "sha256:48bc3cd84f44538d807e57e019b85f34cf43b53ddff26c6d793bc2c3fd864ef9", size = 3906188, upload-time = "2026-06-25T18:55:02.864Z" },
+    { url = "https://files.pythonhosted.org/packages/da/db/41df2ea69d7f483363781e1eee67fe22c512a9157a52011f51b24378f52f/rapidyaml-0.15.2-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:5e358ff813f82832454b1e25605a027cb81ea79b5b4433fe202a6200af63c3f9", size = 3931226, upload-time = "2026-06-25T18:55:04.52Z" },
+    { url = "https://files.pythonhosted.org/packages/94/fb/67ed5daecaf6c9ec4d09c40a4e026ff9fed6db1d8fd5b09b2e673e254b2b/rapidyaml-0.15.2-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:c566101548cdcd8112b77676357574ca12ce73c8b4685d710dcee41c04d67b38", size = 3878132, upload-time = "2026-06-25T18:55:06.243Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/39/87374e4cede1885a0cf2828e2e20be472b64a659c3ce986681be09b16f66/rapidyaml-0.15.2-cp310-cp310-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:7c3f438897138a6fb8bbb449f6b57ef175510c8c51f8b0793a20a6c00aa8ffbd", size = 299844, upload-time = "2026-06-25T18:55:07.462Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/77/b77894eea3c2b6f91d437763a9e907e950d274c5c3942a5e337b6c952e26/rapidyaml-0.15.2-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:16d1decf328f9f35935b2a7de1523c01e1e140f8433da170fed35c360e656c92", size = 600590, upload-time = "2026-06-25T18:55:08.55Z" },
+    { url = "https://files.pythonhosted.org/packages/ba/ba/f11e2dbe03c3e1f4791d4a2ed30605961ed1038cfb553e2601184d82a588/rapidyaml-0.15.2-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ef962a8a9def148817ae6350afdbb53b461c7b3d67107104bc2e381d0b9e522e", size = 613319, upload-time = "2026-06-25T18:55:09.812Z" },
+    { url = "https://files.pythonhosted.org/packages/0f/92/b72d9a5c389b9385bd98ff91fb874382019cfdb6c475d75b0911b99459d8/rapidyaml-0.15.2-cp310-cp310-win32.whl", hash = "sha256:6d5b7ba67debf276c9c828dc38d9f94a8ff6e84a00340f60d6ff66d8a128c99f", size = 314924, upload-time = "2026-06-25T18:55:11.128Z" },
+    { url = "https://files.pythonhosted.org/packages/70/42/66eab1fb9eb8c54e03076b83ed68db0a39151122e21e1494ac5dad63cc7a/rapidyaml-0.15.2-cp310-cp310-win_amd64.whl", hash = "sha256:7ab6af7ad25d6bcde97719521eb70d21b6da4d17fb0090ac37955a12f8731b4b", size = 378843, upload-time = "2026-06-25T18:55:12.151Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/50/5fb74cb07e9edbe6971201095b918d7d0a746fa06c09c33c8b9652566683/rapidyaml-0.15.2-cp310-cp310-win_arm64.whl", hash = "sha256:947eeadeecdcd39a646659c8b38b091beb290942239548074b8f27c6d098322d", size = 372882, upload-time = "2026-06-25T18:55:13.433Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/b9/07ff6c58188a0c72e35a9c5f2f9930497b35bff07dbc0f34efbe069110cc/rapidyaml-0.15.2-cp311-cp311-macosx_10_9_universal2.whl", hash = "sha256:b32d85b66f29237a881ddf293c5662f8b6af886bffd80fdeed9f0d5605978c6b", size = 4905176, upload-time = "2026-06-25T18:55:14.555Z" },
+    { url = "https://files.pythonhosted.org/packages/01/57/daa90101d90eb770147c4da9fda5d605fba621f0f112cb0d6c910143731b/rapidyaml-0.15.2-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:1a9ba9682adbc08d35bfcd5adb2e60bee3e95c1bc885fa2327c945c08c4c93a1", size = 4930210, upload-time = "2026-06-25T18:55:15.846Z" },
+    { url = "https://files.pythonhosted.org/packages/69/c8/e3e8ca412fdbd83fea39690fe1cf04bbbc10e021bcb73c85f9b4befc53de/rapidyaml-0.15.2-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:581535642dec5af8771e523174f6b8f378bfff008df0178f0d12a57fbef58c8c", size = 4905174, upload-time = "2026-06-25T18:55:17.224Z" },
+    { url = "https://files.pythonhosted.org/packages/06/8a/77f1e923a8425bcbceaef6439b8892adaa1bc00a92bf43fdf2c0f8011c05/rapidyaml-0.15.2-cp311-cp311-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:feceb1865528e5355282c9ad9f1b6c8c9f23e3e926e94b6fe998e54f54430948", size = 299882, upload-time = "2026-06-25T18:55:18.606Z" },
+    { url = "https://files.pythonhosted.org/packages/e8/d4/b83a999788b1d1982fa20da02db165b73a196aa6dc3b3488245de57a1c01/rapidyaml-0.15.2-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a1fc68f397b20a00d5a1c5b587bbbde02248500ff7cf610ee0ae0c51c9e6b92f", size = 600618, upload-time = "2026-06-25T18:55:19.539Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/1b/9054feaf23cfb28c7f5fb1e72d551baa194938218756e74a9720816956cc/rapidyaml-0.15.2-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d9f182735db604c1c2e586048cd6728beeed8f6a61b80fbfa89b516738d31ad8", size = 613369, upload-time = "2026-06-25T18:55:20.567Z" },
+    { url = "https://files.pythonhosted.org/packages/27/fb/00e0a3f38c7576ddba35558530e92a9fa83ef6f324205005726560461e83/rapidyaml-0.15.2-cp311-cp311-win32.whl", hash = "sha256:3cb85fcaa963311dbe0deb3b7c73ea7a2122e620b6fd98795b44d796314efed0", size = 315047, upload-time = "2026-06-25T18:55:22.081Z" },
+    { url = "https://files.pythonhosted.org/packages/72/66/4120ce93db6b752d765f03a2cfc8c347377e0e4003010949f0456b1c8ae1/rapidyaml-0.15.2-cp311-cp311-win_amd64.whl", hash = "sha256:d062e6d1d34bd44648c42871a94774c1c17603301c4265671c6243f412593ed4", size = 378897, upload-time = "2026-06-25T18:55:23.24Z" },
+    { url = "https://files.pythonhosted.org/packages/d7/1b/54f1555539909af639396dba59bf21c835904a5c6b0fd54acfd913cd24ab/rapidyaml-0.15.2-cp311-cp311-win_arm64.whl", hash = "sha256:5daf7f0a067904c92e919266d87dcc437560c66c4a5c25b1aad6fbdfb469c4cc", size = 372705, upload-time = "2026-06-25T18:55:24.367Z" },
+    { url = "https://files.pythonhosted.org/packages/58/cd/57cd56664362d3f77e621e88f41e5c46929a57b11c2c61be459e1519dfc3/rapidyaml-0.15.2-cp312-cp312-macosx_10_13_universal2.whl", hash = "sha256:1f11c3e1934c29ac9b3db3f460b8d119efec6bb629b18b30b31df664324251bb", size = 5105921, upload-time = "2026-06-25T18:55:25.57Z" },
+    { url = "https://files.pythonhosted.org/packages/42/e9/cdd320e5505ced82fad764f0b9ba6b61ce35813a613e6bde1e9097d6345c/rapidyaml-0.15.2-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:d50dfe1732a455ee31c8310f341041967634d208bc5321280c5cf234235a8ac5", size = 5152285, upload-time = "2026-06-25T18:55:27.325Z" },
+    { url = "https://files.pythonhosted.org/packages/80/17/18bfe2a4141443b2f24febe8337f93f3e19199da24c3495f75f5eaf8dc4c/rapidyaml-0.15.2-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:dc5bbdc38ebff5c58f8e0dd3cbbdf84db604f5e219ecf9b3ab2dab86f2036c9b", size = 5105916, upload-time = "2026-06-25T18:55:28.697Z" },
+    { url = "https://files.pythonhosted.org/packages/79/20/5d6d8e06e9a410ab71cf08043d007854a25ed3f07c0c13189964f42e9f56/rapidyaml-0.15.2-cp312-cp312-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:10b633e710e7f1790911e9592ed0848a1f3b4449cd080ace41288c284f572750", size = 298941, upload-time = "2026-06-25T18:55:29.846Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/ed/2120bc4be7f6104c01dce8f00c8eb7cddf8ae5905d78087235d1e7c361fd/rapidyaml-0.15.2-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:aff076a6c657c73ba449d4fe5865ceac19d8c9f8f435df31776acfe06ddb3628", size = 600991, upload-time = "2026-06-25T18:55:30.91Z" },
+    { url = "https://files.pythonhosted.org/packages/19/a1/6f1af855e5189d942e8845e67d014500477fd423d0dd1ec9729a3a2d86c7/rapidyaml-0.15.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bb2381f52f33cec42017361cd2fb0f7eb411527afe9273e9ce0f984584b87db1", size = 612930, upload-time = "2026-06-25T18:55:32.191Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/4d/e52475516dfec0850b8c78e6db8c9ed0e7c0fe93d455f769ebb429fe1982/rapidyaml-0.15.2-cp312-cp312-win32.whl", hash = "sha256:f2cf9bbb2f588b07977c735c16d2156adf435ce9e36b3516d17496d03239ca29", size = 315231, upload-time = "2026-06-25T18:55:33.222Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/15/915131fc32c9f2aa56a130a9933bf5cfd64064c1d9fb1cdb0c77733ee5d0/rapidyaml-0.15.2-cp312-cp312-win_amd64.whl", hash = "sha256:5cd14c077ce5183eba9a43ca93ceca1cc644eb6912f714e7972ade1de5d47770", size = 378988, upload-time = "2026-06-25T18:55:34.338Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/f9/1e38225856d750b3416d51a6e0c862e386b34b87d36d6044f39a6b5fc390/rapidyaml-0.15.2-cp312-cp312-win_arm64.whl", hash = "sha256:bd2face6f6339e9b8d269401546acc2de66ae5ee62e62e8dece84ae238139581", size = 373522, upload-time = "2026-06-25T18:55:35.367Z" },
+    { url = "https://files.pythonhosted.org/packages/5d/2a/4e5c79a06387b0a9f4e3f391e77be077ba7122c297604f577579017ac62c/rapidyaml-0.15.2-cp313-cp313-macosx_10_13_universal2.whl", hash = "sha256:59368d6a8926fc2780813525fb9cb40b52a5e5c6e345c86e67a79873c635d8ec", size = 5057817, upload-time = "2026-06-25T18:55:36.494Z" },
+    { url = "https://files.pythonhosted.org/packages/73/cd/a7c9e7e77abfd81c02c991674ee06491d0cc85984e779df5830a348c787e/rapidyaml-0.15.2-cp313-cp313-macosx_10_13_x86_64.whl", hash = "sha256:3f94e9be9067a0ef2eba4facd703ea82445e744130de4e428e8f5fb553e19116", size = 5173580, upload-time = "2026-06-25T18:55:37.882Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/e6/6820d8d060d2e622c00a4f896bcdecbb0dfca866054262246bf61d3572e6/rapidyaml-0.15.2-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:0a378be79a305026c76e98e841a054672df058bc1a5ab1552edc48323f91c68e", size = 5151913, upload-time = "2026-06-25T18:55:39.388Z" },
+    { url = "https://files.pythonhosted.org/packages/67/e2/8d3aaa4bc383108c60c016d32fe2024795dea95124a7ec0b58d94222a38f/rapidyaml-0.15.2-cp313-cp313-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:ef2c7857d445eeba9ccd078e3f0f5d838047bf283c733b075c71b74d824806f6", size = 298683, upload-time = "2026-06-25T18:55:40.64Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/fb/5e138e4d3edc7065262608d4054f68e12f7820cd09a47ff711ec2f9a4755/rapidyaml-0.15.2-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:28d577e06e6b66bb9c5ee5a33bedbaa8828ec429dacc4f346a5ca70d696024e0", size = 600748, upload-time = "2026-06-25T18:55:41.761Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/57/d32ed8b2945bd2495105b07e096f9746be58419aef0ece7c23303014efae/rapidyaml-0.15.2-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a5a3e978663f7d34f7e06bfda3444d9ada252d160d59135a6019762d76a880d6", size = 612788, upload-time = "2026-06-25T18:55:42.998Z" },
+    { url = "https://files.pythonhosted.org/packages/91/c3/7f9f826a32fa38289b3b9395ef27e879192031daf33de1c66ee45304c2db/rapidyaml-0.15.2-cp313-cp313-win32.whl", hash = "sha256:cbd761583c48ef9167e3a021bb315db41cc49f51eeda89e79c61d0af6d2f264b", size = 315150, upload-time = "2026-06-25T18:55:44.114Z" },
+    { url = "https://files.pythonhosted.org/packages/06/1a/574581636b94daf9b0d55b01573bc7f16083f5c7eb1c8d7f67aceeafd0e0/rapidyaml-0.15.2-cp313-cp313-win_amd64.whl", hash = "sha256:a025f1a39a530d1d65e3d57028b92a1163c2e580a25ec584fc080570535207f4", size = 378774, upload-time = "2026-06-25T18:55:45.246Z" },
+    { url = "https://files.pythonhosted.org/packages/af/6d/efb07b38dbeb1e5e6092dd9ef988a374dbe2941fd55e72c25a6173e90140/rapidyaml-0.15.2-cp313-cp313-win_arm64.whl", hash = "sha256:b60e80125bc198a0462e547aaa4bb32027efb036fe33f6f06db3f96ed391c3f4", size = 373310, upload-time = "2026-06-25T18:55:46.485Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/c9/4e9b60e49972cc8a5ec43965da392050ce6a2ada56e1514cb50f5516e57a/rapidyaml-0.15.2-cp314-cp314-macosx_10_15_universal2.whl", hash = "sha256:45cd97f0197647254510f7a87f396f7eec906a2a60789997501b6af107bb474d", size = 5595911, upload-time = "2026-06-25T18:55:47.807Z" },
+    { url = "https://files.pythonhosted.org/packages/48/d8/2caaee06a66cc5cbdaa85775f3667811e04712f0c7fe0fcbedd6a25d2a78/rapidyaml-0.15.2-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:0bf166372a0ffe961ce34b4dc5de8746553ac5cabc14a740fb604a0b916588fd", size = 5617870, upload-time = "2026-06-25T18:55:49.487Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/8e/00f9efbbb95865c83735ffeaa75ccbf5e93ca1d400c7452799a67635d0f9/rapidyaml-0.15.2-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:0027ebd90d0bb8ec773b34dfac45878d228211a74bd710c283927dc1d56d5955", size = 5595906, upload-time = "2026-06-25T18:55:50.869Z" },
+    { url = "https://files.pythonhosted.org/packages/97/d6/b560a34da534740bf405af7d8a7929349fe5e391366072174a9f2eeff4d3/rapidyaml-0.15.2-cp314-cp314-manylinux1_i686.manylinux_2_28_i686.manylinux_2_5_i686.whl", hash = "sha256:74ff75b2bbbad2fcdbe838b241cb7ec781c1046c469f67d18182a884650737ed", size = 298577, upload-time = "2026-06-25T18:55:52.244Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/82/434405a32cf536ca450494151126f95ec1b5c340412c03dd09ae341880a7/rapidyaml-0.15.2-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8a33e5125cb55497e8124ddcdaf554cdd6b996c154c1133c7b97aecb415b5195", size = 600970, upload-time = "2026-06-25T18:55:53.226Z" },
+    { url = "https://files.pythonhosted.org/packages/d5/c2/cf6226c805de21f7b168db20bcc0878f7a3cc5a858d4a3355146908da9e3/rapidyaml-0.15.2-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ff157603c519791c630443e13250ce10a9055281c591b24cd807ac615ea371b1", size = 612818, upload-time = "2026-06-25T18:55:54.291Z" },
+    { url = "https://files.pythonhosted.org/packages/1f/2e/76094c4723d197b535c670593f872fb2b3f2cd8d0bac6451d5e69b5e8de3/rapidyaml-0.15.2-cp314-cp314-win32.whl", hash = "sha256:433353f9fce16783157afce7065862c1ebb9e3070e963b99be05be2921464f9d", size = 326085, upload-time = "2026-06-25T18:55:55.597Z" },
+    { url = "https://files.pythonhosted.org/packages/89/56/81eca4ac9c7868a7f24df5a7f572aec0ac84bddad69678e8db31a1812421/rapidyaml-0.15.2-cp314-cp314-win_amd64.whl", hash = "sha256:3edfa1049f4d0fc2fb35cbef7690e7c05d2c79e1f8813413d84d1a07f412ed57", size = 392285, upload-time = "2026-06-25T18:55:56.737Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/d7/cbcf6d233439b857ad82306ab2d513854b197da97a9e94e2a7c02f2ca2d4/rapidyaml-0.15.2-cp314-cp314-win_arm64.whl", hash = "sha256:b64909d0c97d389f9c919e15b8a55c3ef6eff1c807b611fbefed2fb71f975a1b", size = 385299, upload-time = "2026-06-25T18:55:58.051Z" },
+]
+
+[[package]]
 name = "ray"
 version = "2.54.1"
 source = { registry = "https://pypi.org/simple" }
@@ -6062,10 +6233,10 @@ default = [
     { name = "grpcio" },
     { name = "opencensus" },
     { name = "opentelemetry-exporter-prometheus", version = "0.54b1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
-    { name = "opentelemetry-exporter-prometheus", version = "0.63b1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-exporter-prometheus", version = "0.65b0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "opentelemetry-proto" },
     { name = "opentelemetry-sdk", version = "1.33.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-13-megatron-core-dev' or extra == 'extra-13-megatron-core-lts'" },
-    { name = "opentelemetry-sdk", version = "1.42.1", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
+    { name = "opentelemetry-sdk", version = "1.44.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts') or (extra != 'extra-13-megatron-core-dev' and extra != 'extra-13-megatron-core-lts')" },
     { name = "prometheus-client" },
     { name = "py-spy" },
     { name = "pydantic" },
@@ -6770,8 +6941,8 @@ version = "0.13.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cffi" },
-    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version < '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-dev') or (python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e1/41/9b873a8c055582859b239be17902a85339bec6a30ad162f98c9b0288a2cc/soundfile-0.13.1.tar.gz", hash = "sha256:b2c68dab1e30297317080a5b43df57e302584c49e2942defdde0acccc53f0e5b", size = 46156, upload-time = "2025-01-25T09:17:04.831Z" }
 wheels = [
