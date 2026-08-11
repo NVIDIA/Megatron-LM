@@ -20,9 +20,10 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
@@ -249,9 +250,28 @@ class TestMcoreAdapterExpertParallel:
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         assert self.pg_collection.ep.size() == 2
         assert self.pg_collection.expt_dp.size() == self.world_size // 2
+        self.reference_group = torch.distributed.new_group(
+            [torch.distributed.get_rank()], use_local_synchronization=True
+        )
+        self.reference_pg_collection = ProcessGroupCollection(
+            tp=self.reference_group,
+            expt_tp=self.reference_group,
+            cp=self.reference_group,
+            pp=self.reference_group,
+            tp_cp=self.reference_group,
+            tp_dp_cp=self.reference_group,
+            ep=self.reference_group,
+            tp_ep=self.reference_group,
+            expt_dp=self.reference_group,
+            dp=self.reference_group,
+            dp_cp=self.reference_group,
+            embd=None,
+            pos_embd=None,
+        )
         model_parallel_cuda_manual_seed(1234)
 
     def teardown_method(self):
+        torch.distributed.destroy_process_group(self.reference_group)
         Utils.destroy_model_parallel()
 
     def test_build_train_and_step_with_expert_parallelism(self):
@@ -267,12 +287,24 @@ class TestMcoreAdapterExpertParallel:
             moe_router_topk=2,
             moe_grouped_gemm=True,
             moe_ffn_hidden_size=128,
-            bf16=True,
-            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+            params_dtype=torch.float32,
             attention_dropout=0.0,
             hidden_dropout=0.0,
             gradient_accumulation_fusion=False,
+            attention_backend=AttnBackend.unfused,
         )
+        torch.manual_seed(123)
+        reference_config = replace(config, expert_model_parallel_size=1)
+        reference_model = HybridModel(
+            config=reference_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=8,
+            hybrid_layer_pattern="*E",
+            pg_collection=self.reference_pg_collection,
+        ).cuda()
         model = HybridModel(
             config=config,
             hybrid_stack_spec=hybrid_stack_spec,
@@ -281,6 +313,24 @@ class TestMcoreAdapterExpertParallel:
             hybrid_layer_pattern="*E",
             pg_collection=self.pg_collection,
         ).cuda()
+        model.load_state_dict(reference_model.state_dict(), strict=False)
+        for model_layer, reference_layer in zip(
+            model.decoder.layers, reference_model.decoder.layers
+        ):
+            if not isinstance(model_layer, MoETransformerLayer):
+                continue
+            for fc in ("linear_fc1", "linear_fc2"):
+                model_fc = getattr(model_layer.mlp.experts, fc)
+                reference_fc = getattr(reference_layer.mlp.experts, fc)
+                for local, global_ in enumerate(model_layer.mlp.local_expert_indices):
+                    for parameter_name in ("weight", "bias"):
+                        model_parameter = getattr(model_fc, f"{parameter_name}{local}", None)
+                        reference_parameter = getattr(
+                            reference_fc, f"{parameter_name}{global_}", None
+                        )
+                        if model_parameter is not None:
+                            model_parameter.data.copy_(reference_parameter.data)
+        reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
         model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
@@ -289,7 +339,7 @@ class TestMcoreAdapterExpertParallel:
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
                 megatron_fsdp_main_params_dtype=torch.float32,
-                megatron_fsdp_main_grads_dtype=torch.bfloat16,
+                megatron_fsdp_main_grads_dtype=torch.float32,
                 fsdp_all_gather_in_start_param_sync=False,
             ),
             module=model,
@@ -298,38 +348,65 @@ class TestMcoreAdapterExpertParallel:
         assert isinstance(model.module, FsdpModule)
         assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
 
+        optimizer_config = OptimizerConfig(
+            lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=0.0
+        )
+        reference_optimizer = get_megatron_optimizer(
+            optimizer_config, [reference_model], use_gloo_process_groups=False
+        )
         optimizer = get_megatron_optimizer(
-            OptimizerConfig(
-                lr=1.0e-3,
-                weight_decay=0.0,
-                bf16=True,
-                use_distributed_optimizer=False,
-                clip_grad=0.0,
-            ),
-            [model],
-            use_gloo_process_groups=False,
+            replace(optimizer_config), [model], use_gloo_process_groups=False
         )
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()
 
-        input_ids = torch.randint(0, 128, (2, 8), device="cuda")
-        position_ids = torch.arange(8, device="cuda").repeat(2, 1)
+        local_batch_size = 2
+        torch.manual_seed(4321)
+        input_ids = torch.randint(0, 128, (self.world_size * local_batch_size, 8), device="cuda")
+        position_ids = torch.arange(8, device="cuda").repeat(self.world_size * local_batch_size, 1)
+        targets = torch.randn(self.world_size * local_batch_size, 8, 128, device="cuda")
+        input_slice = slice(
+            torch.distributed.get_rank() * local_batch_size,
+            (torch.distributed.get_rank() + 1) * local_batch_size,
+        )
+        reference_losses = []
+        for _ in range(5):
+            reference_optimizer.zero_grad(set_to_none=True)
+            reference_loss = torch.nn.functional.mse_loss(
+                reference_model(
+                    input_ids=input_ids, position_ids=position_ids, attention_mask=None
+                ),
+                targets,
+            )
+            reference_loss.backward()
+            reference_success, _, _ = reference_optimizer.step()
+            assert reference_success
+            reference_losses.append(reference_loss.detach())
+
         losses = []
         for _ in range(5):
             optimizer.zero_grad(set_to_none=True)
-            loss = (
-                model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
-                .float()
-                .square()
-                .mean()
+            loss = torch.nn.functional.mse_loss(
+                model(
+                    input_ids=input_ids[input_slice],
+                    position_ids=position_ids[input_slice],
+                    attention_mask=None,
+                ),
+                targets[input_slice],
             )
             loss.backward()
             success, _, _ = optimizer.step()
             assert success
-            losses.append(loss.detach())
+            loss = loss.detach()
+            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
+            losses.append(loss)
 
         losses = torch.stack(losses)
+        reference_losses = torch.stack(reference_losses)
         if torch.distributed.get_rank() == 0:
             logger.info("MFSDP v2 EP loss curve: %s", losses.tolist())
+            logger.info("MFSDP v2 EP reference loss curve: %s", reference_losses.tolist())
         assert torch.isfinite(losses).all()
+        assert torch.isfinite(reference_losses).all()
         assert losses[-1] < losses[0]
+        torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
