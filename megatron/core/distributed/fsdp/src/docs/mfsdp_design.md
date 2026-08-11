@@ -175,6 +175,13 @@ in the FlexShard proposal.
 
 ## Sharding Strategies
 
+Unlike MFSDP v1, MFSDP v2 does not special-case named strategies such as HSDP or HFSDP.
+Instead,
+`fully_shard` receives a `Placements` configuration that independently specifies the
+parameter, gradient, and optimizer placement for each data-parallel axis. The table
+below illustrates familiar configurations; it is not an exhaustive list of supported
+strategies.
+
 `N` \= size of the inner DP shard dim (`dp_shard_dim`). `M` \= size of the outer DP dim
 (`dp_outer_dim`), only present for HSDP/HFSDP. "Sharded" \= persistent state is
 partitioned across that dim; "replicated" \= each rank holds a full copy.
@@ -187,6 +194,19 @@ partitioned across that dim; "replicated" \= each rank holds a full copy.
 | **ZeRO-3 / `optim_grads_params` / FSDP** | sharded (N)                 | sharded (N)              | sharded (N)                                         |
 | **HSDP** (FSDP inner, replicate outer)   | sharded (N), replicated (M) | sharded (N), partial (M) | sharded (N), replicated (M)                         |
 | **HFSDP** (FSDP inner, `optim` outer)    | sharded (N), replicated (M) | sharded (N), partial (M) | sharded (N × M) — fully sharded across flattened DP |
+
+The per-axis representation also expresses combinations beyond those in the table. For
+example, a configuration with ZeRO-1 on the outer DP axis and ZeRO-2 on the inner axis
+uses the following placement lists, ordered to match `dp_axes` from outer to inner:
+
+```py
+placements = Placements(
+    dp_axes=[dp_outer, dp_inner],
+    parameter=[Replicate(), Replicate()],
+    gradient=[Partial(), Flat()],
+    optimizer=[Flat(), Flat()],
+)
+```
 
 ## Compatibility
 
