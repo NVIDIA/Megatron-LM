@@ -2,19 +2,19 @@
 
 Contributors: @wujingyue, @cspades, @shjwudp, @Autumn1998
 
-GitHub tracker:
-[https://github.com/orgs/NVIDIA/projects/276](https://github.com/orgs/NVIDIA/projects/276)
+GitHub tracker: https://github.com/orgs/NVIDIA/projects/276
 
 # Executive Summary
 
-This design doc proposes a new version of Megatron FSDP (MFSDP) to better satisfy
+This design doc proposes MFSDP v2 to better satisfy
 [Megatron FSDP Requirements](http://nv/mfsdp-requirements). In particular, the new
 version enables:
 
 - **Fine-grained control.** For FSDP, automatically determining the optimal bucketing
   and prefetching strategy has been challenging.
-  - The proposed high-level `fully_shard` API already provides per-module control that
-    is finer-grained than the production version.
+  - The proposed high-level `fully_shard` API, similar to
+    [PyTorch FSDP2’s `fully_shard` API](https://docs.pytorch.org/docs/main/distributed.fsdp.fully_shard.html),
+    provides per-module control that is finer-grained than the production version.
   - In addition, we also plan to expose lower-level APIs (e.g., ParameterGroup and
     DBuffer) to give users even more fine-grained control. Spatially, this allows users
     to control which parameters belong to each “bucket”. Temporally, this allows users
@@ -104,14 +104,12 @@ SubmoduleA FSDP unit
 
 SubmoduleB FSDP unit
 └── owns SubmoduleB.* params
-
 ```
 
 `fully_shard` sets each parameter in the given module to a shard. As a contract, no
 parameters can escape its lowest FsdpModule ancestor to avoid issues like
-[https://github.com/NVIDIA/Megatron-LM/pull/4899](https://github.com/NVIDIA/Megatron-LM/pull/4899).
-Without this contract, it can be unsafe to unshard or reshard a parameter at the module
-boundary.
+https://github.com/NVIDIA/Megatron-LM/pull/4899. Without this contract, it can be unsafe
+to unshard or reshard a parameter at the module boundary.
 
 The placement is similar to DTensor’s placement but for the whole **unit** and per mesh
 axis.
@@ -123,8 +121,7 @@ axis.
 - `TensorAtomic`. Don’t cut a parameter. For emerging optimizers that need full
   parameters. TBD: we may need a variation of this that stores a parameter on
   potentially multiple ranks. It’s useful for some implementations (e.g.
-  [https://github.com/NVIDIA/Megatron-LM/pull/4486](https://github.com/NVIDIA/Megatron-LM/pull/4486))
-  of FSDP Muon.
+  https://github.com/NVIDIA/Megatron-LM/pull/4486) of FSDP Muon.
 - `BlockAtomic(block_size)`. Don’t cut a block of `block_size` rows. Simplifies
   blockwise quantization support. Currently, a 32x1 mxfp8 block may be sharded across
   ranks. This introduces complex host-side logic and custom quantization kernels to
@@ -173,7 +170,7 @@ If needed, grouping can be customized via the `fully_shard` API, similar to
 [the `buckets` argument](https://github.com/pytorch/torchtitan/pull/2378/changes#diff-35ddb8c23734307a1b5fe23e06ffe8e0f2f2c84c58943380d137371e6e21e203R3289)
 in the FlexShard proposal.
 
-## Sharding Strategies {#sharding-strategies}
+## Sharding Strategies
 
 `N` \= size of the inner DP shard dim (`dp_shard_dim`). `M` \= size of the outer DP dim
 (`dp_outer_dim`), only present for HSDP/HFSDP. "Sharded" \= persistent state is
@@ -322,7 +319,7 @@ the optimizer step. Accordingly, prior to the forward pass of the first micro_ba
 also need to all-gather the sharded parameters across the entire DP domain (outer \+
 inner).
 
-## Optimizer {#optimizer}
+## Optimizer
 
 Elementwise optimizers or Muon optimizers whose parameters are already TensorAtomic can
 simply `step` on the sharded DTensor parameters. However, we may still have to provide
@@ -333,9 +330,8 @@ main_weight to model_weight’s precision.
 
 For flexibility, the user can also create their own optimizer step to manipulate
 parameters and DBuffers. For example, in
-[https://github.com/NVIDIA/Megatron-LM/pull/4486](https://github.com/NVIDIA/Megatron-LM/pull/4486),
-an allgather version of Muon optimizer, the optimizer states are tensor-atomic but the
-main weight buffer is `Flat`.
+https://github.com/NVIDIA/Megatron-LM/pull/4486, an allgather version of Muon optimizer,
+the optimizer states are tensor-atomic but the main weight buffer is `Flat`.
 
 ```py
 def step(...):
@@ -358,7 +354,7 @@ def step(...):
 
 # Implementation Plan
 
-## Separate code paths in main {#separate-code-paths-in-main}
+## Separate code paths in main
 
 ### Production
 
@@ -395,7 +391,7 @@ Current prototype features:
 - Composibility with EP
 - Double buffering (through TracePoolAllocator)
 
-## Development process {#development-process}
+## Development process
 
 We’ll follow a standard prototype-design-execute process.
 
