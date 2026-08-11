@@ -69,6 +69,31 @@ triage:linear_write:
       when: always
     - when: never
 
+triage:linear_overview:
+  extends: [.linear_triage_job]
+  needs:
+    - job: functional:x_notify
+      artifacts: true
+    - job: triage:linear_write
+      artifacts: true
+  allow_failure: true
+  script:
+    - >-
+      cerno-linear overview
+      --config "${CERNO_CONFIG}"
+      --pipeline-summaries pipeline_summaries.json
+      --failure-buckets failure_buckets.json
+      --linear-report linear_status_report.json
+      --plan linear_action_plan_post.json
+  rules:
+    - if: >-
+        ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") &&
+        $FUNCTIONAL_TEST == "yes" &&
+        $RUN_LINEAR_STATUS == "True" &&
+        $RUN_LINEAR_WRITE == "True"
+      when: always
+    - when: never
+
 triage:slack_linear_followup:
   extends: [.linear_triage_job]
   needs:
@@ -76,6 +101,8 @@ triage:slack_linear_followup:
       artifacts: true
     - job: triage:linear_write
       artifacts: true
+    - job: triage:linear_overview
+      artifacts: false
   allow_failure: true
   script:
     - >-

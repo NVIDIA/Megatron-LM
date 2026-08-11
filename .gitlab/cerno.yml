@@ -7,6 +7,8 @@ gitlab:
 modules:
   megatron_lm:
     build_module: megatron-lm
+    display_name: Megatron-LM
+    grafana_dashboard_url: https://grafana.nvidia.com/d/ccel3m7ntzqkke/megatron-lm-ci
     channel_id_env: MCORE_SLACK_CHANNEL_ID
     reconcile_proposal: true
     team_key: MCORE
