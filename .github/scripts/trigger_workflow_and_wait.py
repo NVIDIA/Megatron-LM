@@ -2,22 +2,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Trigger a GitHub workflow and wait with refreshable GitHub App authentication."""
+"""Trigger or poll a GitHub workflow using a downscoped installation token."""
 
 import argparse
-import base64
 import json
 import os
-import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from typing import Callable
 
 API_VERSION = "2022-11-28"
-TOKEN_REFRESH_MARGIN_SECONDS = 5 * 60
+JsonObject = dict[str, object]
+Request = Callable[[str, str, str, JsonObject | None], JsonObject | None]
 
 
 class GitHubApiError(RuntimeError):
@@ -28,46 +27,13 @@ class GitHubApiError(RuntimeError):
         self.status = status
 
 
-def _base64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
-
-
-def create_app_jwt(app_id: str, private_key: str, now: int) -> str:
-    """Create a short-lived GitHub App JWT without persisting the private key."""
-    header = _base64url(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
-    payload = _base64url(
-        json.dumps(
-            {"iat": now - 60, "exp": now + 9 * 60, "iss": app_id}, separators=(",", ":")
-        ).encode()
-    )
-    unsigned_token = f"{header}.{payload}"
-
-    key_path = ""
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", delete=False) as key_file:
-            key_file.write(private_key)
-            key_path = key_file.name
-        os.chmod(key_path, 0o600)
-        signature = subprocess.run(
-            ["openssl", "dgst", "-sha256", "-sign", key_path],
-            input=unsigned_token.encode(),
-            check=True,
-            capture_output=True,
-        ).stdout
-    finally:
-        if key_path:
-            os.unlink(key_path)
-
-    return f"{unsigned_token}.{_base64url(signature)}"
-
-
 def request_json(
-    api_url: str, method: str, path: str, token: str, payload: dict | None = None
-) -> dict | None:
+    token: str, method: str, url: str, payload: JsonObject | None = None
+) -> JsonObject | None:
     """Send one authenticated GitHub API request and decode its JSON response."""
     data = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(
-        f"{api_url.rstrip('/')}{path}",
+        url,
         data=data,
         method=method,
         headers={
@@ -78,91 +44,24 @@ def request_json(
         },
     )
     try:
-        with urllib.request.urlopen(request) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:
             body = response.read()
     except urllib.error.HTTPError as error:
         raise GitHubApiError(error.code, error.read().decode(errors="replace")) from error
     return json.loads(body) if body else None
 
 
-class InstallationAuth:
-    """Mint and refresh repository-scoped GitHub App installation tokens."""
-
-    def __init__(
-        self, app_id, private_key, owner, repo, api_url, clock=time.time, request=request_json
-    ):
-        self.app_id = app_id
-        self.private_key = private_key
-        self.owner = owner
-        self.repo = repo
-        self.api_url = api_url
-        self.clock = clock
-        self.request = request
-        self._token = ""
-        self._expires_at = 0.0
-
-    def invalidate(self) -> None:
-        """Force the next request to mint a new token."""
-        self._token = ""
-        self._expires_at = 0.0
-
-    def _revoke(self, token: str) -> None:
-        """Revoke one installation token without masking the workflow result."""
-        try:
-            self.request(self.api_url, "DELETE", "/installation/token", token)
-        except GitHubApiError as error:
-            print(f"Warning: failed to revoke installation token (HTTP {error.status})")
-
-    def token(self) -> str:
-        """Return a token with at least five minutes of remaining validity."""
-        now = self.clock()
-        if self._token and self._expires_at - now > TOKEN_REFRESH_MARGIN_SECONDS:
-            return self._token
-
-        if self._token:
-            self._revoke(self._token)
-            self.invalidate()
-
-        app_jwt = create_app_jwt(self.app_id, self.private_key, int(now))
-        installation = self.request(
-            self.api_url, "GET", f"/repos/{self.owner}/{self.repo}/installation", app_jwt
-        )
-        minted = self.request(
-            self.api_url,
-            "POST",
-            f"/app/installations/{installation['id']}/access_tokens",
-            app_jwt,
-            {"repositories": [self.repo]},
-        )
-        self._token = minted["token"]
-        self._expires_at = datetime.fromisoformat(
-            minted["expires_at"].replace("Z", "+00:00")
-        ).timestamp()
-        return self._token
-
-    def close(self) -> None:
-        """Revoke the current installation token."""
-        if not self._token:
-            return
-        self._revoke(self._token)
-        self.invalidate()
+def append_output(name: str, value: str) -> None:
+    """Write one GitHub Actions step output when running in Actions."""
+    if output_path := os.getenv("GITHUB_OUTPUT"):
+        with open(output_path, "a", encoding="utf-8") as output_file:
+            output_file.write(f"{name}={value}\n")
 
 
-def installation_request(
-    auth: InstallationAuth, method: str, path: str, payload: dict | None = None
-) -> dict | None:
-    """Make an installation request, refreshing once after an expired token."""
-    for attempt in range(2):
-        try:
-            return auth.request(auth.api_url, method, path, auth.token(), payload)
-        except GitHubApiError as error:
-            if error.status != 401 or attempt:
-                raise
-            auth.invalidate()
-    raise AssertionError("unreachable")
-
-
-def workflow_runs_path(owner: str, repo: str, workflow: str, ref: str, created_after: str) -> str:
+def workflow_runs_url(
+    api_url: str, owner: str, repo: str, workflow: str, ref: str, created_after: str
+) -> str:
+    """Build the URL used to discover a newly dispatched workflow run."""
     query = urllib.parse.urlencode(
         {
             "event": "workflow_dispatch",
@@ -171,98 +70,133 @@ def workflow_runs_path(owner: str, repo: str, workflow: str, ref: str, created_a
             "per_page": 100,
         }
     )
-    return f"/repos/{owner}/{repo}/actions/workflows/{urllib.parse.quote(workflow, safe='')}/runs?{query}"
+    workflow = urllib.parse.quote(workflow, safe="")
+    return f"{api_url}/repos/{owner}/{repo}/actions/workflows/{workflow}/runs?{query}"
 
 
-def append_output(name: str, value: str) -> None:
-    if output_path := os.getenv("GITHUB_OUTPUT"):
-        with open(output_path, "a", encoding="utf-8") as output_file:
-            output_file.write(f"{name}={value}\n")
+def trigger_workflow(
+    token: str,
+    api_url: str,
+    owner: str,
+    repo: str,
+    workflow: str,
+    ref: str,
+    client_payload: JsonObject,
+    wait_interval: int,
+    discovery_timeout: int,
+    request: Request = request_json,
+) -> int:
+    """Dispatch a workflow and return the newly created run ID."""
+    started_at = time.time()
+    created_after = (
+        datetime.fromtimestamp(started_at - 120).astimezone().isoformat(timespec="seconds")
+    )
+    runs_url = workflow_runs_url(api_url, owner, repo, workflow, ref, created_after)
+    old_runs_response = request(token, "GET", runs_url, None)
+    assert old_runs_response is not None
+    old_runs = old_runs_response["workflow_runs"]
+    assert isinstance(old_runs, list)
+    old_run_ids = {run["id"] for run in old_runs}
+
+    workflow_path = urllib.parse.quote(workflow, safe="")
+    dispatch_url = f"{api_url}/repos/{owner}/{repo}/actions/workflows/{workflow_path}/dispatches"
+    request(token, "POST", dispatch_url, {"ref": ref, "inputs": client_payload})
+
+    deadline = time.monotonic() + discovery_timeout
+    while time.monotonic() < deadline:
+        runs_response = request(token, "GET", runs_url, None)
+        assert runs_response is not None
+        runs = runs_response["workflow_runs"]
+        assert isinstance(runs, list)
+        new_runs = [run for run in runs if run["id"] not in old_run_ids]
+        if new_runs:
+            run = min(new_runs, key=lambda candidate: candidate["created_at"])
+            return int(run["id"])
+        time.sleep(wait_interval)
+    raise TimeoutError("Timed out waiting for the dispatched workflow run to appear")
+
+
+def poll_workflow(
+    token: str,
+    api_url: str,
+    owner: str,
+    repo: str,
+    run_id: int,
+    wait_interval: int,
+    poll_timeout: int,
+    request: Request = request_json,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[bool, str | None]:
+    """Poll one workflow for a bounded interval using one installation token."""
+    run_url = f"{api_url}/repos/{owner}/{repo}/actions/runs/{run_id}"
+    deadline = clock() + poll_timeout
+    while True:
+        run = request(token, "GET", run_url, None)
+        assert run is not None
+        status = str(run["status"])
+        conclusion = run["conclusion"]
+        print(f"Workflow status={status} conclusion={conclusion}")
+        if status == "completed":
+            return True, None if conclusion is None else str(conclusion)
+
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False, None
+        sleep(min(wait_interval, remaining))
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--owner", required=True)
     parser.add_argument("--repo", required=True)
-    parser.add_argument("--workflow", required=True)
-    parser.add_argument("--ref", required=True)
-    parser.add_argument("--client-payload", default="{}")
     parser.add_argument("--wait-interval", type=int, default=60)
-    parser.add_argument("--discovery-timeout", type=int, default=10 * 60)
-    parser.add_argument("--timeout", type=int, default=6 * 60 * 60)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    trigger = subparsers.add_parser("trigger")
+    trigger.add_argument("--workflow", required=True)
+    trigger.add_argument("--ref", required=True)
+    trigger.add_argument("--client-payload", default="{}")
+    trigger.add_argument("--discovery-timeout", type=int, default=10 * 60)
+
+    poll = subparsers.add_parser("poll")
+    poll.add_argument("--run-id", type=int, required=True)
+    poll.add_argument("--poll-timeout", type=int, default=35 * 60)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    client_payload = json.loads(args.client_payload)
-    if not isinstance(client_payload, dict):
-        raise ValueError("--client-payload must be a JSON object")
+    token = os.environ["GH_TOKEN"]
+    api_url = os.getenv("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 
-    api_url = os.getenv("GITHUB_API_URL", "https://api.github.com")
-    auth = InstallationAuth(
-        os.environ["GITHUB_APP_ID"],
-        os.environ["GITHUB_APP_PRIVATE_KEY"],
-        args.owner,
-        args.repo,
-        api_url,
-    )
-    started_at = time.time()
-    created_after = (
-        datetime.fromtimestamp(started_at - 120).astimezone().isoformat(timespec="seconds")
-    )
-    runs_path = workflow_runs_path(args.owner, args.repo, args.workflow, args.ref, created_after)
-
-    try:
-        old_runs_response = installation_request(auth, "GET", runs_path)
-        assert old_runs_response is not None
-        old_run_ids = {run["id"] for run in old_runs_response["workflow_runs"]}
-        workflow = urllib.parse.quote(args.workflow, safe="")
-        print(f"Triggering {args.owner}/{args.repo} workflow {args.workflow} on {args.ref}")
-        installation_request(
-            auth,
-            "POST",
-            f"/repos/{args.owner}/{args.repo}/actions/workflows/{workflow}/dispatches",
-            {"ref": args.ref, "inputs": client_payload},
+    if args.command == "trigger":
+        client_payload = json.loads(args.client_payload)
+        if not isinstance(client_payload, dict):
+            raise ValueError("--client-payload must be a JSON object")
+        run_id = trigger_workflow(
+            token,
+            api_url,
+            args.owner,
+            args.repo,
+            args.workflow,
+            args.ref,
+            client_payload,
+            args.wait_interval,
+            args.discovery_timeout,
         )
-
-        discovery_deadline = time.time() + args.discovery_timeout
-        run = None
-        while time.time() < discovery_deadline:
-            runs_response = installation_request(auth, "GET", runs_path)
-            assert runs_response is not None
-            runs = runs_response["workflow_runs"]
-            new_runs = [candidate for candidate in runs if candidate["id"] not in old_run_ids]
-            if new_runs:
-                run = min(new_runs, key=lambda candidate: candidate["created_at"])
-                break
-            time.sleep(args.wait_interval)
-        if run is None:
-            raise TimeoutError("Timed out waiting for the dispatched workflow run to appear")
-
-        run_id = run["id"]
-        server_url = os.getenv("GITHUB_SERVER_URL", "https://github.com")
-        workflow_url = f"{server_url}/{args.owner}/{args.repo}/actions/runs/{run_id}"
         append_output("workflow_id", str(run_id))
-        append_output("workflow_url", workflow_url)
-        print(f"Waiting for workflow {workflow_url}")
+        print(f"Triggered workflow run {run_id}")
+        return
 
-        deadline = time.time() + args.timeout
-        while time.time() < deadline:
-            run = installation_request(
-                auth, "GET", f"/repos/{args.owner}/{args.repo}/actions/runs/{run_id}"
-            )
-            assert run is not None
-            print(f"Workflow status={run['status']} conclusion={run['conclusion']}")
-            if run["status"] == "completed":
-                append_output("conclusion", str(run["conclusion"]))
-                if run["conclusion"] != "success":
-                    raise RuntimeError(f"Downstream workflow concluded with {run['conclusion']}")
-                return
-            time.sleep(args.wait_interval)
-        raise TimeoutError(f"Timed out waiting for workflow {workflow_url}")
-    finally:
-        auth.close()
+    completed, conclusion = poll_workflow(
+        token, api_url, args.owner, args.repo, args.run_id, args.wait_interval, args.poll_timeout
+    )
+    append_output("completed", str(completed).lower())
+    if conclusion is not None:
+        append_output("conclusion", conclusion)
+    if completed and conclusion != "success":
+        raise RuntimeError(f"Downstream workflow concluded with {conclusion}")
 
 
 if __name__ == "__main__":
