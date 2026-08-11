@@ -1,9 +1,15 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass
+from typing import Literal, Optional
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
+
+THD_CP_PARTITION_ROUTE_TENSOR_FIELDS = (
+    "cp_partition_route_zigzag_to_contiguous",
+    "cp_partition_route_contiguous_to_zigzag",
+)
 
 
 @dataclass
@@ -11,6 +17,10 @@ class PackedSeqParams:
     '''
     parameters to TEDotProductAttention and fused rope kernels for the
     `thd` (packed) sequence format
+
+    ``cp_partition_route_*`` tensors are per-microbatch THD CP layout
+    conversion routes. Metadata annotation helpers update the current
+    partition mode in-place while preserving these route tensor identities.
     '''
 
     qkv_format: str = None
@@ -25,7 +35,10 @@ class PackedSeqParams:
     total_tokens: int = None
     seq_idx: Tensor = None
     tokens_per_sample: int = None
-    pad_between_seqs: bool = None
+    pad_between_seqs: Optional[bool] = None
+    cp_partition_mode: Optional[Literal["zigzag", "contiguous"]] = None
+    cp_partition_route_zigzag_to_contiguous: Tensor = None
+    cp_partition_route_contiguous_to_zigzag: Tensor = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

@@ -59,6 +59,8 @@ class MambaLayer(GraphableMegatronModule):
     output of the same size.
     """
 
+    required_cp_partition_mode = "zigzag"
+
     def __init__(
         self,
         config: TransformerConfig,
