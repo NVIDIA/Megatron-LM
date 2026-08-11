@@ -1003,7 +1003,7 @@ class GTPShardedParam(torch.nn.Parameter):
         ``label`` lets the recompute chain reuse this with its own table heading.
         """
         _W = 70
-        _D = 20
+        _D = 8  # widest realistic value is "bfloat16"; MXFP8/NVFP4 are 5
         _S = 20
 
         def _layer_id(name: str) -> str:
@@ -1019,42 +1019,37 @@ class GTPShardedParam(torch.nn.Parameter):
                 return str(tuple(param.shape))
 
         def _dtype(param: "GTPShardedParam") -> str:
-            # Report the dtype of the tensor that is ACTUALLY all-gathered, not the
-            # GTPShardedParam wrapper (whose logical dtype is the high-precision model-weight
-            # shard, i.e. params_dtype — bf16 in mixed precision). When the param has an FP8
-            # representation (``param.quantized`` populated — by --fp8-param-gather's optimizer
-            # FP32->FP8 write, or by the per-forward cast otherwise), that quantized tensor is
-            # what gets gathered, yet a TE QuantizedTensor still reports a "fake" params_dtype
-            # ``.dtype``. So surface its raw storage dtype (e.g. uint8) tagged with the quantized
-            # class to make the FP8 all-gather unambiguous.
+            # ``.dtype`` lies here: the wrapper and the TE quantized tensor both report
+            # params_dtype (bf16), so read the actually-gathered format off the quantized class.
             q = getattr(param, "quantized", None)
             if getattr(param, "_gtp_native_fp8", False) and q is not None:
-                raw = getattr(q, "_rowwise_data", None)
-                if raw is None:
-                    raw = getattr(q, "_data", None)
-                raw_dt = str(raw.dtype).replace("torch.", "") if raw is not None else "?"
-                return f"{type(q).__name__}/{raw_dt}"
-            return str(getattr(param, "dtype", "-"))
+                # GTP_MXFP8Tensor -> MXFP8. Derived, not hardcoded, so NVFP4/FP8 recipes work too.
+                name = type(q).__name__
+                if name.startswith("GTP_"):
+                    name = name[len("GTP_") :]
+                for suffix in ("QTensor", "Tensor"):
+                    if name.endswith(suffix):
+                        name = name[: -len(suffix)]
+                        break
+                return name
+            return str(getattr(param, "dtype", "-")).replace("torch.", "")
 
         chain["link_node_count"] += 1
         if chain["link_node_count"] == 1:
             chain_id = getattr(curr, "chain_id", GTPChain.UNGRAPHED.value)
             chain["link_table_buffer"].append(
                 f"\n[{chain_id} {label}]\n{'node_id':>7} | {'layer_id':>8} |"
-                f" {'dtype':<{_D}} | {'shape':<{_S}} | {'curr_weight_name':<{_W}} |"
-                f" prev_weight_name\n{'-'*7}-+-{'-'*8}-+-{'-'*_D}-+-{'-'*_S}-+-"
-                f"{'-'*_W}-+-{'-'*_W}"
+                f" {'dtype':<{_D}} | {'shape':<{_S}} | weight_name\n"
+                f"{'-'*7}-+-{'-'*8}-+-{'-'*_D}-+-{'-'*_S}-+-{'-'*_W}"
             )
             # Seed weight (chain head) as row 0
             chain["link_table_buffer"].append(
                 f"{'0':>7} | {_layer_id(prev._debug_name):>8} | "
-                f"{_dtype(prev):<{_D}} | {_shape(prev):<{_S}} | "
-                f"{prev._debug_name:<{_W}} | -"
+                f"{_dtype(prev):<{_D}} | {_shape(prev):<{_S}} | {prev._debug_name}"
             )
         chain["link_table_buffer"].append(
             f"{chain['link_node_count']:>7} | {_layer_id(curr._debug_name):>8} | "
-            f"{_dtype(curr):<{_D}} | {_shape(curr):<{_S}} | "
-            f"{curr._debug_name:<{_W}} | {prev._debug_name}"
+            f"{_dtype(curr):<{_D}} | {_shape(curr):<{_S}} | {curr._debug_name}"
         )
 
     @staticmethod
