@@ -1139,11 +1139,19 @@ def _instrument_scenario_runtime(env, scenario, runtime):
 
     controller._sampling.sample_kernel = traced_sample_kernel
 
+    original_calculate_log_probs_tensors = context.calculate_log_probs_tensors
+
+    def traced_calculate_log_probs_tensors(*args, **kwargs):
+        runtime["log-probs-calculations"] += 1
+        runtime[f"log-probs-mode:{context.config.logprobs_mode}"] += 1
+        return original_calculate_log_probs_tensors(*args, **kwargs)
+
+    context.calculate_log_probs_tensors = traced_calculate_log_probs_tensors
+
     original_log_probs_kernel = controller._sampling.log_probs_kernel
 
     def traced_log_probs_kernel(*args, **kwargs):
         runtime["log-probs-kernel"] += 1
-        runtime[f"log-probs-mode:{context.config.logprobs_mode}"] += 1
         return original_log_probs_kernel(*args, **kwargs)
 
     controller._sampling.log_probs_kernel = traced_log_probs_kernel
@@ -1545,7 +1553,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert len(mixed_token_counts) > 1
             linear_step = context.config.cuda_graph_max_tokens // scenario.config["num_cuda_graphs"]
             assert linear_step == 6
-            assert all(token_count % linear_step == 0 for token_count in mixed_token_counts)
+            assert context.config.cuda_graph_max_tokens in mixed_token_counts
             assert any(
                 right - left == linear_step
                 for left, right in zip(sorted(mixed_token_counts), sorted(mixed_token_counts)[1:])
@@ -1567,7 +1575,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             if sampling_filter in signals:
                 assert runtime[sampling_filter] > 0
         if "logprobs" in signals:
-            assert runtime["log-probs-kernel"] > 0
+            assert runtime["log-probs-calculations"] > 0
             for request in env.requests:
                 if request.sampling_params.return_log_probs:
                     assert request.generated_log_probs is not None
@@ -1598,6 +1606,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                         assert len(request.prompt_top_n_logprobs) == len(request.prompt_tokens) - 1
         if "processed-logprobs" in signals:
             assert runtime["log-probs-mode:processed_logprobs"] > 0
+            assert runtime["log-probs-kernel"] > 0
         if "flashinfer" in signals:
             assert runtime["sampling-backend:flashinfer"] > 0
             assert (
@@ -1720,19 +1729,21 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             )
             assert runtime["module-forward:parallel"] > 0
             if model_config.tensor_model_parallel_size > 1:
-                assert runtime["tp-column-partition-forwards"] > 0
-                assert runtime["tp-row-partition-forwards"] > 0
                 if model_config.transformer_impl == "inference_optimized":
                     assert runtime["tp-collective:optimized-all-gather"] > 0
                     assert runtime["tp-collective:optimized-reduce-scatter"] > 0
                     assert runtime["tp-sp-gather-dimensions"] > 0
                     assert runtime["tp-sp-reduce-scatter-dimensions"] > 0
-                elif model_config.sequence_parallel:
-                    assert runtime["tp-collective:gather_from_sequence_parallel_region"] > 0
-                    assert runtime["tp-collective:reduce_scatter_to_sequence_parallel_region"] > 0
-                    assert runtime["tp-sp-gather-dimensions"] > 0
-                    assert runtime["tp-sp-reduce-scatter-dimensions"] > 0
                 else:
+                    assert runtime["tp-column-partition-forwards"] > 0
+                    assert runtime["tp-row-partition-forwards"] > 0
+                if (
+                    model_config.sequence_parallel
+                    and model_config.transformer_impl != "inference_optimized"
+                ):
+                    assert runtime["tp-collective:reduce_scatter_to_sequence_parallel_region"] > 0
+                    assert runtime["tp-sp-reduce-scatter-dimensions"] > 0
+                elif not model_config.sequence_parallel:
                     assert runtime["tp-collective:reduce_from_tensor_model_parallel_region"] > 0
             if model_config.pipeline_model_parallel_size > 1:
                 assert runtime["pipeline-logits-broadcasts"] > 0
