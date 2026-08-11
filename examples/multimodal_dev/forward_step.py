@@ -291,7 +291,8 @@ def pack_or_pad_batch(
         if get_pipeline_model_parallel_world_size() > 1:
             # The PP scheduler sizes its P2P recv buffers from
             # ``args.seq_length`` unless ``config.variable_seq_lengths`` is
-            # set, which multimodal_dev never does.  Padding to the
+            # set, which this BSHD path deliberately does not do — only the
+            # packed/THD path sets it, in ``model_provider``.  Padding to the
             # per-microbatch max would make the activation length vary between
             # microbatches and mismatch those buffers, so keep it static.
             target_seqlens = seq_length

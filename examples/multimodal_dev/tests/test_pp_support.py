@@ -137,6 +137,12 @@ def _make_batch(seed=1234, dtype=torch.bfloat16):
 @pytest.fixture(scope="module", autouse=True)
 def _init_pp():
     """Initialise PP=2 model-parallel groups for the whole module."""
+    # Guard before initialising: Utils.initialize_model_parallel raises on a
+    # world size that is not a multiple of PP_SIZE, and this fixture is
+    # autouse, so checking any later would turn the intended skip into a
+    # collection-time error under the documented 1-rank invocation.
+    if Utils.world_size != PP_SIZE:
+        pytest.skip(f"needs exactly {PP_SIZE} ranks (PP={PP_SIZE})")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=PP_SIZE
     )
@@ -148,8 +154,6 @@ def _init_pp():
 @pytest.fixture(scope="module")
 def stage_flags():
     """``(is_first, is_last)`` for this rank's PP stage."""
-    if torch.distributed.get_world_size() != PP_SIZE:
-        pytest.skip(f"needs exactly {PP_SIZE} ranks (PP={PP_SIZE})")
     return ps.is_pipeline_first_stage(), ps.is_pipeline_last_stage()
 
 
