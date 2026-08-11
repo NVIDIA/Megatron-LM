@@ -571,9 +571,7 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     bf16_size = torch.empty((), dtype=dtype).element_size()
     theoretical_optimizer_size = 2 * shard_numel * fp32_size
     # Theoretical post-forward growth.
-    theoretical_forward_size = (
-        theoretical_optimizer_size + num_tokens * dim * bf16_size
-    )
+    theoretical_forward_size = theoretical_optimizer_size + num_tokens * dim * bf16_size
 
     assert actual_optimizer_size == theoretical_optimizer_size
     actual_forward_size = torch.cuda.memory_allocated(device) - allocated_before
@@ -753,9 +751,7 @@ def test_overlaps_communication_and_compute(distributed_setup, strategy, use_sym
     def train_one_iteration() -> None:
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index in range(num_microbatches):
-            with microbatch(
-                context, is_last=microbatch_index == num_microbatches - 1
-            ):
+            with microbatch(context, is_last=microbatch_index == num_microbatches - 1):
                 model(x).sum().backward()
         optimizer.step()
 
@@ -789,12 +785,7 @@ def test_overlaps_communication_and_compute(distributed_setup, strategy, use_sym
     # microbatch. ZeRO-3 gathers for every forward and backward and reduces every
     # microbatch.
     expected = {
-        "zero1": (
-            2 * num_children,
-            num_children,
-            num_children - 1,
-            num_children - 1,
-        ),
+        "zero1": (2 * num_children, num_children, num_children - 1, num_children - 1),
         "zero2": (
             2 * num_children,
             num_microbatches * num_children,
