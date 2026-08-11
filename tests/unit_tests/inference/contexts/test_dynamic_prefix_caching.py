@@ -820,7 +820,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         # no prefill skipping
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == 0 and eff_chunk == len(prompt)
 
         ctx.add_request(req2)
@@ -976,7 +976,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[:1])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 1
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == bs and eff_chunk == len(prompt) - bs
 
         # no mamba match means no skip
@@ -985,7 +985,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx2.add_request(self._req(ctx2, p2.clone()))
         req2b = self._req(ctx2, p2.clone(), request_id=2)
         req2b._mamba_num_matched_blocks = 0
-        (m2, _, _, _, ps2, ec2) = ctx2._compute_prefix_match(req2b, len(p2))
+        m2, _, _, _, ps2, ec2 = ctx2._compute_prefix_match(req2b, len(p2))
         assert len(m2) == 3 and ps2 == 0 and ec2 == len(p2)
 
         # zero prefill for hybrid (mamba-cached, block-aligned)
@@ -995,7 +995,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx3, self._block_ids(ctx3, 0, 3))
         req3 = self._req(ctx3, p3.clone(), request_id=2)
         req3._mamba_num_matched_blocks = 3
-        (m3, _, _, _, ps3, ec3) = ctx3._compute_prefix_match(req3, len(p3))
+        m3, _, _, _, ps3, ec3 = ctx3._compute_prefix_match(req3, len(p3))
         assert len(m3) == 3 and ps3 == 2 * bs and ec3 == bs
 
         # KV-only prefix skip with non-block-aligned prompt: all 3 full blocks
@@ -1007,7 +1007,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req4a = self._req(ctx4, p4.clone())
         ctx4.add_request(req4a)
         req4b = self._req(ctx4, p4.clone(), request_id=2)
-        (m4, _, _, _, ps4, ec4) = ctx4._compute_prefix_match(req4b, len(p4))
+        m4, _, _, _, ps4, ec4 = ctx4._compute_prefix_match(req4b, len(p4))
         assert len(m4) == 3 and ps4 == 3 * bs4 and ec4 == tail
         ctx4.add_request(req4b)
 
@@ -1076,7 +1076,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 4)[:2])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 2
-        (matched, _, _, overall, prefix_skip, _) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, overall, prefix_skip, _ = ctx._compute_prefix_match(req2, len(prompt))
         # Copy block IDs to slot 1 so compute_and_store_offsets can resolve EOS block
         ctx.request_to_kv_block_ids[1] = ctx.request_to_kv_block_ids[0]
         msa.compute_and_store_offsets(
@@ -1929,7 +1929,7 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
 
         # request 2 shares the first 4 blocks, adds 2 new blocks
         req2 = self._req(ctx, self._prompt(bs * 6), request_id=2)
-        (matched, _, _, _, prefix_skip, _) = ctx._compute_prefix_match(req2, bs * 6)
+        matched, _, _, _, prefix_skip, _ = ctx._compute_prefix_match(req2, bs * 6)
         assert len(matched) == 4 and prefix_skip == bs * 4
         ctx.add_request(req2)
 
@@ -2206,7 +2206,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             min_prompt_length=prompt_length,
             max_prompt_length=prompt_length,
             num_tokens_to_generate=4,
-            max_sequence_length=prompt_length + 8,
+            max_sequence_length=(
+                prompt_length + block_size + 16 if feature == "chunked" else prompt_length + 8
+            ),
             context_buffer_size_gb=0.02,
             context_block_size_tokens=block_size,
             context_max_requests=32,
@@ -2336,6 +2338,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         saw_chunk = False
         max_mamba_matched_blocks = 0
         step_count = 0
+        cached_request_ids = set()
+        feature_seen_on_hit_step = False
+        mtp_seen_for_cached_decode = False
 
         for cycle in range(3):
             block_size = context.block_size_tokens
@@ -2347,20 +2352,31 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             ) % (config.vocab_size - 1)
             pressure = (base + 37) % (config.vocab_size - 1)
 
-            # Cached execution needs three producer blocks, one follower tail,
-            # and three divergent blocks. Cache-off needs all nine blocks.
-            target_allocatable = 7 if enable_prefix_caching or config.enable_chunked_prefill else 9
+            # Cached execution normally needs three producer blocks, one
+            # follower tail, and three divergent blocks. The chunked row gives
+            # the follower a second tail block so the hit-bearing request must
+            # itself continue prefill. Cache-off needs nine blocks normally and
+            # ten for the extended chunked follower, though those requests run
+            # serially under the chunk budget.
+            target_allocatable = (
+                8
+                if enable_prefix_caching and config.enable_chunked_prefill
+                else 7 if enable_prefix_caching or config.enable_chunked_prefill else 9
+            )
             allocatable = allocator.get_allocatable_count()
             if allocatable > target_allocatable:
                 filler = allocator.allocate_memory_blocks(allocatable - target_allocatable)
                 assert filler is not None
             assert allocator.get_allocatable_count() == target_allocatable
 
+            follower_prompt = base.clone()
+            if case["feature"] == "chunked":
+                follower_prompt = torch.cat((base, base[: block_size + 8]))
             requests = [
                 self._make_request(
                     context, 3 * cycle, base, enable_prefix_caching=enable_prefix_caching
                 ),
-                self._make_request(context, 3 * cycle + 1, base.clone(), enable_prefix_caching),
+                self._make_request(context, 3 * cycle + 1, follower_prompt, enable_prefix_caching),
                 self._make_request(context, 3 * cycle + 2, pressure, enable_prefix_caching),
             ]
             wave_ids = {request.request_id for request in requests}
@@ -2377,8 +2393,57 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             hits_before = engine._prefix_cache_hits
             blocks_this_wave = set()
             while wave_ids - finished.keys():
+                step_hits_before = engine._prefix_cache_hits
+                cached_tokens_before = {
+                    request.request_id: request.num_cached_tokens for request in requests
+                }
+                generated_before = {
+                    request.request_id: len(request.generated_tokens) for request in requests
+                }
+                feature_key = {
+                    "tp": "tp_reducing_forwards",
+                    "pp": "pipeline_forwards",
+                    "moe": "moe_dispatches",
+                    "fused-rope": "fused_rope_calls",
+                    "mamba": "mamba_restores",
+                }.get(case["feature"])
+                feature_before = evidence[feature_key] if feature_key is not None else None
+                mtp_before = int(engine._spec_tokens_proposed_per_pos.sum())
                 result = engine.step_modern()
                 step_count += 1
+                newly_cached_ids = {
+                    request.request_id
+                    for request in requests
+                    if request.num_cached_tokens > cached_tokens_before[request.request_id]
+                }
+                if engine._prefix_cache_hits > step_hits_before:
+                    assert newly_cached_ids
+                    cached_request_ids.update(newly_cached_ids)
+                    if feature_key is not None:
+                        assert evidence[feature_key] > feature_before
+                        feature_seen_on_hit_step = True
+                    elif case["feature"] == "chunked":
+                        assert any(
+                            request.request_id in newly_cached_ids
+                            and (
+                                request.finished_chunk_token_count > 0
+                                or context.chunked_prefill_request_id == request.request_id
+                            )
+                            for request in requests
+                        )
+                        feature_seen_on_hit_step = True
+
+                # MTP intentionally starts after prefill, so its request-specific
+                # witness belongs to a later decode step rather than the hit step.
+                # A cached request whose generated length grows in a step that
+                # records proposals necessarily contributed to the MTP counter.
+                mtp_after = int(engine._spec_tokens_proposed_per_pos.sum())
+                if case["feature"] == "mtp" and mtp_after > mtp_before:
+                    mtp_seen_for_cached_decode |= any(
+                        request.request_id in cached_request_ids
+                        and len(request.generated_tokens) > generated_before[request.request_id]
+                        for request in requests
+                    )
                 if baseline_follower_pending and (
                     not config.enable_chunked_prefill or context.chunked_prefill_request_id == -1
                 ):
@@ -2403,7 +2468,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             torch.cuda.synchronize()
             assert allocator.pool_size == pool_size
             assert context.memory_buffer.untyped_storage().nbytes() == storage_size
-            assert allocator.pool_avail + allocator.get_total_used() == pool_size - 1
+            assert context.total_request_count == 0
+            assert allocator.get_active_used() == 0
+            assert allocator.get_allocatable_count() == target_allocatable
             wave_block_ids.append(blocks_this_wave)
             if enable_prefix_caching:
                 assert engine._prefix_cache_hits > hits_before
@@ -2435,6 +2502,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             "mtp_tokens_proposed": int(engine._spec_tokens_proposed_per_pos.sum()),
             "min_pool_avail": min_pool_avail,
             "max_mamba_matched_blocks": max_mamba_matched_blocks,
+            "feature_seen_on_hit_step": feature_seen_on_hit_step,
+            "mtp_seen_for_cached_decode": mtp_seen_for_cached_decode,
             **evidence,
         }
 
@@ -2451,16 +2520,36 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         baseline_top_n = baseline_request.generated_top_n_logprobs
         assert cached_top_n is not None and baseline_top_n is not None
         assert len(cached_top_n) == len(cached_request.generated_tokens)
-        for token, logprob, cached_values, baseline_values in zip(
-            cached_request.generated_tokens, cached_logprobs, cached_top_n, baseline_top_n
+        for token, logprob, baseline_logprob, cached_values, baseline_values in zip(
+            cached_request.generated_tokens,
+            cached_logprobs,
+            baseline_logprobs,
+            cached_top_n,
+            baseline_top_n,
         ):
-            assert cached_values.keys() == baseline_values.keys()
             assert 0 < len(cached_values) <= 5
-            for key, value in cached_values.items():
+            assert len(cached_values) == len(baseline_values)
+            cached_keys = set(cached_values)
+            baseline_keys = set(baseline_values)
+            for key in cached_keys & baseline_keys:
+                value = cached_values[key]
                 assert value == pytest.approx(baseline_values[key], rel=2e-2, abs=5e-2)
             token_key = f"tok_{token}"
             assert token_key in cached_values
+            assert token_key in baseline_values
             assert cached_values[token_key] == pytest.approx(logprob, abs=0.1)
+            assert baseline_values[token_key] == pytest.approx(baseline_logprob, abs=0.1)
+
+            cached_ranked = sorted(cached_values.values(), reverse=True)
+            baseline_ranked = sorted(baseline_values.values(), reverse=True)
+            np.testing.assert_allclose(cached_ranked, baseline_ranked, rtol=2e-2, atol=5e-2)
+            if cached_keys != baseline_keys:
+                cached_cutoff = cached_ranked[-1]
+                baseline_cutoff = baseline_ranked[-1]
+                for key in cached_keys - baseline_keys:
+                    assert cached_values[key] == pytest.approx(baseline_cutoff, rel=2e-2, abs=5e-2)
+                for key in baseline_keys - cached_keys:
+                    assert baseline_values[key] == pytest.approx(cached_cutoff, rel=2e-2, abs=5e-2)
 
         assert not cached_request.prompt_log_probs
         assert not cached_request.prompt_top_n_logprobs
@@ -2493,6 +2582,10 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             assert stats["min_pool_avail"] == 0
             assert baseline_stats["min_pool_avail"] <= 1
             feature = case["feature"]
+            if feature == "mtp":
+                assert stats["mtp_seen_for_cached_decode"]
+            else:
+                assert stats["feature_seen_on_hit_step"]
             if feature == "tp":
                 assert stats["tp_reducing_forwards"] > 0
             elif feature == "pp":
