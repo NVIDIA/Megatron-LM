@@ -40,6 +40,11 @@ these primitives and introduce additional design considerations. We will cover t
 areas in dedicated follow-on design documents, leveraging the interfaces and mechanisms
 established here.
 
+# Subdesigns
+
+- [Optimizer](optimizer.md)
+- [Runtime schedule](runtime_schedule.md)
+
 # API
 
 ```py
@@ -217,80 +222,61 @@ operations to occur at the submodule level.
 
 ### FsdpContext
 
-- Per root FsdpModule. A root `FsdpModule` is an `FsdpModule` with no `FsdpModule`
-  ancestors. Ideally, the entire model would share a single context. In practice,
-  however, the user may not call `fully_shard` on the root model, so this serves as a
-  reasonable compromise.
-- Streams. Per-device
-  - compute_stream
-  - allgather_stream
-  - reducescatter_stream
-  - One more stream for HSDP and HFSDP’s second inter-domain gradient reduction
-- Config, e.g., global performance tuning knobs
-- Symmetric memory pool / maybe custom allocators for double buffering
+- Created by `fully_shard_context` and shared by every `FsdpModule` constructed in that
+  scope. On exit, it identifies FSDP roots and finalizes the static forward and backward
+  prefetch orders.
+- Per-device all-gather and reduce-scatter streams. Module compute runs on PyTorch’s
+  current stream.
+- Last-microbatch state for HSDP/HFSDP gradient accumulation.
+- An optional PyTorch NCCL symmetric-memory pool for communication staging buffers.
 
 ### FsdpModule
 
-A mixin attached to the original module. This way, the user doesn’t need to change the
-list of children submodules of the parent.
+A mixin attached in place to the original module, so its parent retains the same child
+module reference.
 
-- def pre_forward
-- def post_forward
-- def pre_backward
-- def post_backward
-- Optional hooks that trigger the above. Optional because users may want to trigger
-  hooks by themselves at the right time. `fully_shard` should gain a parameter
-  `register_hooks=True` to opt in for manual mode. For more flexibility, the user can
-  even create a `class MyModule(nn.Module, FsdpModule)` without registering any hooks.
-- ParameterGroups. Parameters are grouped by dtype and requires_grad.
+- Registered forward and backward hooks drive parameter materialization, resharding,
+  gradient reduction, and all-gather prefetching.
+- `phase` tracks the module lifecycle: `RESTING` outside module computation, `FORWARD`
+  between its forward hooks, and `BACKWARD` between its backward hooks. Activation
+  recomputation preserves `BACKWARD` through its nested forward hooks.
+- Parameter groups partition the module’s owned parameters by dtype and `requires_grad`.
 
 ### ParameterGroup
 
 - dtype
 - requires_grad: bool
-- A collection of sharded `nn.Parameter`s. Their `.data` is a DTensor backed by
-  `main_weight` and their `.grad` is a DTensor backed by `main_grad`. Some metadata
-  (e.g. the containing ParameterGroup) may be stored in these `nn.Parameter`s for
-  debugging purposes. This is the set of `nn.Parameter`s visible to the optimizer.
-- A collection of unsharded `nn.Parameter`s. This is the same set of nn.Parameter
-  objects as in the original module. Their `.data` is a temporary full parameter
-  allgathered from `model_weight`, and their `.grad` is usually None and occasionally a
-  temporary full gradient tensor.
-- model_weight, a persistent quantized[^1] sharded DBuffer for parameters. It’s sharded
-  as per `Placements.weight`. For mxfp8 and nvfp4, the scaling factors are sharded
-  alongside the parameters. Therefore, `BlockAtomic` is critical to ensure that scaling
-  factors are computed correctly with respect to the sharded parameters.
-- main_weight, a persistent high-precision[^2] sharded DBuffer for parameters. It’s
-  sharded as per `Placements.optimizer` because optimizer steps update it.
-- main_grad, a persistent high-precision sharded DBuffer for gradients. It’s sharded as
-  per `Placements.gradient`.
+- A sharded `nn.Parameter` for every logical parameter. Its `.data` is a DTensor backed
+  by `main_weight`, and it is the parameter visible to the optimizer.
+- The original `nn.Parameter` objects remain attached to the module. During compute,
+  their `.data` views a temporary replicated buffer materialized from `model_weight`;
+  their `.grad` is temporary full-gradient storage.
+- `model_weight`: the persistent compute-dtype buffer, sharded according to
+  `Placements.parameter`. It may alias `main_weight` when their dtype and placements
+  match.
+- `main_weight`: the persistent optimizer-dtype buffer, sharded according to
+  `Placements.optimizer`.
+- `main_grad`: the persistent gradient buffer for trainable groups, sharded according to
+  `Placements.gradient` and allocated in the configured gradient dtype.
 
 ### DBuffer
 
-Conceptually, a group of DTensors, potentially with different shapes.
+Conceptually, a group of logical tensors, potentially with different shapes, stored in
+one contiguous local buffer.
 
-- local_buffer: torch.Tensor, a flat buffer
-- mesh. In my draft implementation, this is a DP submesh. Therefore, the result of
-  get_dtensor may have to be wrapped again by the user adding other mesh axes (e.g. TP
-  and EP).
-- list\[Placement\] whose length equals the mesh rank.
-- Global shape of each parameter to calculate offsets etc
-- def redistribute(new_placements: list\[Placement\]) \-\> DBuffer. Some specializations
-  for convenience:
-  - def allgather(mesh_axis: int) \-\> DBuffer. The result ought to be in symmetric
-    memory for speed.
-  - def allreduce(mesh_axs: int) \-\> DBuffer. For HSDP
-  - def reduce_scatter(mesh_axis: int, new_placement: Placement) \-\> DBuffer
-
-  Note: A `DBuffer` can be converted from one sharded placement to another without
-  changing the global layout. For example, [this section](#optimizer) shows a use case
-  that converts between `Flat` and `TensorAtomic`.
-
-- def get_tensor(index: int) \-\> torch.Tensor. `Index` is the index of the tensor in
-  the containing ParameterGroup. Returns a slice of `local_buffer` that corresponds to
-  the requested tensor.
-- def get_dtensor(index: int) \-\> DTensor. For the optimizer and
-  torch.distributed.checkpoint.
+- `local_buffer`: a flat `torch.Tensor` holding this rank’s contiguous shard.
+- `mesh` and a per-mesh-axis `placements` tuple. The current implementation requires the
+  mesh to contain only data-parallel axes; callers extend returned DTensors with TP or
+  EP axes when needed.
+- `GlobalLayout`: global tensor shapes and stable offsets used to compute every rank’s
+  local range.
+- `redistribute(new_placements)`, with `allgather`, `allreduce`, `reduce_scatter`, and
+  `scatter` convenience operations. Redistributing between sharded placements preserves
+  the global layout; [the optimizer subdesign](optimizer.md) converts between `Flat` and
+  `TensorAtomic` this way.
+- `get_local_tensor(index)`: the local view for one logical tensor.
+- `get_dtensor(index)`: the corresponding DTensor, used by the optimizer and distributed
+  checkpointing.
 
 # Flow
 
@@ -318,39 +304,6 @@ reduce-scatters can be overlapped with backward compute instead of being exposed
 the optimizer step. Accordingly, prior to the forward pass of the first micro_batch, we
 also need to all-gather the sharded parameters across the entire DP domain (outer \+
 inner).
-
-## Optimizer
-
-Elementwise optimizers or Muon optimizers whose parameters are already TensorAtomic can
-simply `step` on the sharded DTensor parameters. However, we may still have to provide
-wrappers around existing torch.optim optimizers due to the precision mismatch between
-main_grad, main_weight and model_weight. For example, the optimizer may have to upcast
-gradients to main_weight’s precision, run the step, and downcast/quantize[^3]
-main_weight to model_weight’s precision.
-
-For flexibility, the user can also create their own optimizer step to manipulate
-parameters and DBuffers. For example, in
-https://github.com/NVIDIA/Megatron-LM/pull/4486, an allgather version of Muon optimizer,
-the optimizer states are tensor-atomic but the main weight buffer is `Flat`.
-
-```py
-def step(...):
-  for each ParameterGroup pg:
-    apply_elementwise_ema_in_place(mu, pg.main_grad, self.flat_momentum)
-    tensor_atomic_momentum: DBuffer = self.flat_momentum.redistribute(TensorAtomic())
-    tensor_atomic_update: DBuffer = tensor_atomic_grad.empty_like(...)
-    grads, updates = [], []
-    for each Parameter p under pg:
-      grads.append(tensor_atomic_grad.get_tensor(...))
-      updates.append(tensor_atomic_update.get_tensor(...))
-
-    # Could be pipelined with the above redistribute
-    self.batched_orthogonalize(new_grads, updates, ...)
-
-    # Local scatter; no communications
-    flat_update = tensor_atomic_update.redistribute(pg.main_weight.placements)
-    apply_elementwise_update_in_place(flat_update, pg.main_weight)
-```
 
 # Implementation Plan
 
@@ -408,11 +361,3 @@ We’ll follow a standard prototype-design-execute process.
    - Critical horizontal features (for example, CUDA Graphs and `torch.compile`) should
      be validated from the beginning. These integrations are easy to break and difficult
      to retrofit, so we should rely on CI coverage to catch regressions early.
-
-[^1]: Lower than fp32
-
-[^2]: The exact precision is controlled by MixedPrecisionPolicy.
-
-[^3]:
-    Quantization of all parameters can be done in a batch for speed. However, TE
-    currently does a foreach.
