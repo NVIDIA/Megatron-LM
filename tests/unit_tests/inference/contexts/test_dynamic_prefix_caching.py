@@ -2538,6 +2538,14 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         }
 
     @staticmethod
+    def _assert_scalar_logprob_close(value, expected, *, rel=2e-2, abs=5e-2):
+        """Compare one logprob while preserving matching non-finite results."""
+        if np.isnan(value) or np.isnan(expected):
+            assert np.isnan(value) and np.isnan(expected)
+        else:
+            assert value == pytest.approx(expected, rel=rel, abs=abs)
+
+    @staticmethod
     def _assert_logprob_parity(cached_request, baseline_request):
         """Check generated and top-N logprobs against the cache-off run."""
         cached_logprobs = cached_request.generated_log_probs
@@ -2568,13 +2576,18 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             cached_keys = set(cached_values)
             baseline_keys = set(baseline_values)
             for key in cached_keys & baseline_keys:
-                value = cached_values[key]
-                assert value == pytest.approx(baseline_values[key], rel=2e-2, abs=5e-2)
+                TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                    cached_values[key], baseline_values[key]
+                )
             token_key = f"tok_{token}"
             assert token_key in cached_values
             assert token_key in baseline_values
-            assert cached_values[token_key] == pytest.approx(logprob, abs=0.1)
-            assert baseline_values[token_key] == pytest.approx(baseline_logprob, abs=0.1)
+            TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                cached_values[token_key], logprob, abs=0.1
+            )
+            TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                baseline_values[token_key], baseline_logprob, abs=0.1
+            )
 
             cached_ranked = sorted(cached_values.values(), reverse=True)
             baseline_ranked = sorted(baseline_values.values(), reverse=True)
@@ -2583,9 +2596,13 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 cached_cutoff = cached_ranked[-1]
                 baseline_cutoff = baseline_ranked[-1]
                 for key in cached_keys - baseline_keys:
-                    assert cached_values[key] == pytest.approx(baseline_cutoff, rel=2e-2, abs=5e-2)
+                    TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                        cached_values[key], baseline_cutoff
+                    )
                 for key in baseline_keys - cached_keys:
-                    assert baseline_values[key] == pytest.approx(cached_cutoff, rel=2e-2, abs=5e-2)
+                    TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                        baseline_values[key], cached_cutoff
+                    )
 
         assert not cached_request.prompt_log_probs
         assert not cached_request.prompt_top_n_logprobs
