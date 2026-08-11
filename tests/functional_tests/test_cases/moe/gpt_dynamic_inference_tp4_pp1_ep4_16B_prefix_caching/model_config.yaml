@@ -1,6 +1,5 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
-  NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
@@ -25,13 +24,10 @@ MODEL_ARGS:
   --expert-tensor-parallel-size: 1
   --sequence-parallel: true
   --use-mcore-models: true
-  --inference-moe-token-dispatcher-type: nccl
   --moe-token-dispatcher-type: alltoall
   --moe-grouped-gemm: true
-  --moe-enable-routing-replay: true
   --num-experts: 64
   --moe-router-topk: 6
-  --moe-router-dtype: fp32
   --moe-z-loss-coeff: 0
   --moe-router-load-balancing-type: seq_aux_loss
   --moe-aux-loss-coeff: 1e-3
@@ -72,31 +68,17 @@ MODEL_ARGS:
   --save-interval: 2000
   --temperature: 1.0
   --top_k: 1
-  --top_p: 0
   --return-log-probs: true
-  --skip-prompt-log-probs: true
   --num-tokens-to-generate: 30
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 4096
   --output-path: ${INFERENCE_OUTPUT_PATH}
   --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
-  --incoming-requests-per-step: 1
-  --inference-repeat-n: 3
-  --inference-dynamic-batching-buffer-size-gb: 0.2
-  --inference-dynamic-batching-max-requests: 4
-  --inference-dynamic-batching-max-tokens: 512
-  --enable-chunked-prefill: true
+  --incoming-requests-per-sec: -1 # all requests arrive up front.
+  --inference-repeat-n: 8
+  --inference-dynamic-batching-buffer-size-gb: 20
   --inference-dynamic-batching-prefix-caching: true
-  --inference-dynamic-batching-prefix-caching-eviction-policy: lru
-  --prefix-cache-compare: true
-  --prefix-cache-stress-groups: 8
-  --prefix-cache-stress-copies: 2
-  --prefix-cache-stress-prompt-tokens: 512
-  --prefix-cache-stress-staged: true
-  --drain-between-batches: true
-  --batch-boundaries: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
 METRICS:
   - "generated_tokens"
-  - "generated_text"
   - "logprobs"
 LAUNCHER: ft_launcher
