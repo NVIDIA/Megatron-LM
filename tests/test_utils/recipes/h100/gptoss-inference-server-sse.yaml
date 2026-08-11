@@ -1,0 +1,58 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: '{test_case}_{environment}_{platforms}'
+  model: gpt
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 8
+  n_repeat: 1
+  platforms: dgx_a100
+  time_limit: 3600
+  script_setup: |
+    set -euo pipefail
+    unset https_proxy
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> /root/.netrc
+    trap 'rm -f /root/.netrc; unset RO_API_TOKEN' EXIT
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+    # Checkout backwards-ref
+    cd /opt
+    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin $MCORE_BACKWARDS_COMMIT
+    git checkout $MCORE_BACKWARDS_COMMIT
+    git rev-parse HEAD
+    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+    rm -f /root/.netrc
+    unset RO_API_TOKEN
+  script: |-
+    rm -f /root/.netrc
+    unset RO_API_TOKEN
+    set -euo pipefail
+    cd /opt/megatron-lm
+
+    PYTHONPATH=/opt/megatron-lm python \
+      tests/functional_tests/test_cases/gpt/gpt_inference_server_async_sched_tp2_pp2_ep2_gptoss_20b_sse/serve_sse.py \
+      --checkpoint-dir /mnt/artifacts/model/openai_gpt-oss-20b/v1 \
+      --tokenizer-model unsloth/gpt-oss-20b-BF16 \
+      --server-log-dir {assets_dir}/logs
+
+products:
+  - test_case: [gpt_inference_server_async_sched_tp2_pp2_ep2_gptoss_20b_sse]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
