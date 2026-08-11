@@ -514,6 +514,72 @@ def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setu
     )
 
 
+def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distributed_setup):
+    """Allocated memory should match sharded optimizer data plus the replicated model weight."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    dim = 4096
+    num_tokens = 256
+    dtype = torch.bfloat16
+    x = torch.ones(num_tokens, dim, device=device, dtype=dtype)
+    model = ElementwiseModel(dim).to(device=device, dtype=dtype)
+    mesh = init_device_mesh(device.type, (world_size,))
+    placements = Placements(
+        dp_axes=[0],
+        parameter=[Replicate()],
+        gradient=[Partial(dist.ReduceOp.AVG)],
+        optimizer=[Flat()],
+    )
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=placements)
+
+    (parameter_group,) = model.parameter_groups
+    (fsdp_parameter,) = parameter_group.fsdp_parameters
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, foreach=False)
+    fully_shard_optimizer(optimizer)
+
+    # Warm up and record baseline.
+    with torch.no_grad():
+        for _ in range(2):
+            model(x)
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    allocated_before = torch.cuda.memory_allocated(device)
+
+    # Initialize sharded Adam states.
+    model(x).sum().backward()
+    optimizer.step()
+    assert parameter_group.model_weight.placements == (Flat(),)
+
+    # Restore replicated model weight.
+    with torch.no_grad():
+        output = model(x)
+    torch.cuda.synchronize(device)
+    assert parameter_group.model_weight.placements == (Replicate(),)
+
+    state = optimizer.state[fsdp_parameter.sharded]
+    actual_optimizer_size = (
+        state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes
+    )
+
+    # Theoretical sharded Adam size.
+    shard_numel = dim * dim // world_size
+    fp32_size = torch.empty((), dtype=torch.float32).element_size()
+    bf16_size = torch.empty((), dtype=dtype).element_size()
+    theoretical_optimizer_size = 2 * shard_numel * fp32_size
+    # Theoretical post-forward growth.
+    theoretical_forward_size = (
+        theoretical_optimizer_size + num_tokens * dim * bf16_size
+    )
+
+    assert actual_optimizer_size == theoretical_optimizer_size
+    actual_forward_size = torch.cuda.memory_allocated(device) - allocated_before
+    assert abs(actual_forward_size - theoretical_forward_size) < 1024**2
+
+
 def test_deleted_model_releases_fsdp_storage(distributed_setup):
     """Deleting an FSDP model should release its persistent storage."""
     world_size = distributed_setup.world_size
@@ -615,9 +681,10 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     )
 
 
+@pytest.mark.parametrize("strategy", ["zero1", "zero2", "zero3"])
 @pytest.mark.parametrize("use_symm_mem", [False, True], ids=["default", "symmetric_memory"])
-def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
-    """Forward and backward communication should overlap GEMM compute."""
+def test_overlaps_communication_and_compute(distributed_setup, strategy, use_symm_mem):
+    """ZeRO-1/2/3 communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
@@ -632,7 +699,14 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     # overlap becomes deterministic. (dim=8192 was flaky under coverage.)
     dim = 16384
     num_children = 4
+    num_microbatches = 3
     dtype = torch.bfloat16
+    placements = Placements(
+        dp_axes=[0],
+        parameter=[Flat() if strategy == "zero3" else Replicate()],
+        gradient=[Partial(dist.ReduceOp.AVG) if strategy == "zero1" else Flat()],
+        optimizer=[Flat()],
+    )
 
     # new_group requires a default process group. Initialize it here so this test works
     # in isolation. Do not eagerly initialize it with device_id in the shared fixture:
@@ -661,9 +735,8 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
 
     mesh = DeviceMesh.from_group(dp_group, device.type)
     model = MultiChildModel(dim=dim, num_children=num_children).to(device=device, dtype=dtype)
-    placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device) as context:
         for layer in model.layers:
             fully_shard(
                 layer,
@@ -673,17 +746,26 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
                 use_symm_mem=use_symm_mem,
             )
 
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
+    fully_shard_optimizer(optimizer)
     x = torch.randn(4096, dim, device=device, dtype=dtype, requires_grad=True)
 
     def train_one_iteration() -> None:
-        model.zero_grad(set_to_none=True)
-        model(x).sum().backward()
+        optimizer.zero_grad(set_to_none=True)
+        for microbatch_index in range(num_microbatches):
+            with microbatch(
+                context, is_last=microbatch_index == num_microbatches - 1
+            ):
+                model(x).sum().backward()
+        optimizer.step()
 
     train_one_iteration()
     torch.cuda.synchronize(device)
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         train_one_iteration()
+        with torch.no_grad():
+            model(x)
         # Synchronize inside the profiler context so in-flight device kernels
         # complete and get recorded before the profiler stops on __exit__.
         # Synchronizing after the context would finalize the trace first and
@@ -691,26 +773,52 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
         torch.cuda.synchronize(device)
 
     gemm_kernels = collect_linked_kernels(prof, _GEMM_OP_NAME_SUBSTRING)
-    # Each child Linear runs one forward and two backward matmuls. aten::mm may also
-    # launch auxiliary kernels, so check only the matmul lower bound.
-    assert len(gemm_kernels) >= 3 * num_children, (
-        f"Expected at least {3 * num_children} kernels linked to GEMMs, got "
+    # Each child Linear runs one forward and two backward matmuls per microbatch.
+    # aten::mm may also launch auxiliary kernels, so check only the matmul lower bound.
+    expected_gemm_count = 3 * num_microbatches * num_children
+    assert len(gemm_kernels) >= expected_gemm_count, (
+        f"Expected at least {expected_gemm_count} kernels linked to GEMMs, got "
         f"{len(gemm_kernels)}: "
         f"{[kernel.name for kernel in gemm_kernels]}"
     )
 
     allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
     reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
-    # Each child layer does a forward and a backward all-gather and one
-    # reduce-scatter. Zero-CTA moves the all-gather to copy-engine memcpys, so it
-    # should not emit all-gather kernels.
-    expected_allgather_kernel_count = 0 if use_symm_mem else 2 * num_children
+    # The profile covers one iteration plus the next forward. ZeRO-1/2 all-gather once
+    # per iteration. ZeRO-1 reduces only the last microbatch; ZeRO-2 reduces every
+    # microbatch. ZeRO-3 gathers for every forward and backward and reduces every
+    # microbatch.
+    expected = {
+        "zero1": (
+            2 * num_children,
+            num_children,
+            num_children - 1,
+            num_children - 1,
+        ),
+        "zero2": (
+            2 * num_children,
+            num_microbatches * num_children,
+            num_children - 1,
+            num_microbatches * (num_children - 1),
+        ),
+        "zero3": (
+            (2 * num_microbatches + 1) * num_children,
+            num_microbatches * num_children,
+            (2 * num_microbatches + 1) * (num_children - 1),
+            num_microbatches * (num_children - 1),
+        ),
+    }
+    expected_ag, expected_rs, expected_ag_overlap, expected_rs_overlap = expected[strategy]
+
+    expected_allgather_kernel_count = 0 if use_symm_mem else expected_ag
+    # Zero-CTA moves the all-gather to copy-engine memcpys, so it should not emit
+    # all-gather kernels.
     assert len(allgather_kernels) == expected_allgather_kernel_count, (
         f"Expected {expected_allgather_kernel_count} all-gather kernels, got "
         f"{len(allgather_kernels)}: {[kernel.name for kernel in allgather_kernels]}"
     )
-    assert len(reduce_scatter_kernels) == num_children, (
-        f"Expected {num_children} reduce-scatter kernels, got "
+    assert len(reduce_scatter_kernels) == expected_rs, (
+        f"Expected {expected_rs} reduce-scatter kernels, got "
         f"{len(reduce_scatter_kernels)}: {[kernel.name for kernel in reduce_scatter_kernels]}"
     )
 
@@ -731,15 +839,13 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
         any(events_overlap(kernel, gemm) for gemm in gemm_kernels)
         for kernel in reduce_scatter_kernels
     )
-    expected_allgather_overlap = 2 * (num_children - 1)
-    expected_reduce_scatter_overlap = num_children - 1
     if not use_symm_mem:
-        assert allgather_overlap_count >= expected_allgather_overlap, (
-            f"Expected at least {expected_allgather_overlap} all-gathers to "
+        assert allgather_overlap_count >= expected_ag_overlap, (
+            f"Expected at least {expected_ag_overlap} all-gathers to "
             f"overlap compute, got {allgather_overlap_count}/{len(allgather_kernels)}."
         )
-    assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap, (
-        f"Expected at least {expected_reduce_scatter_overlap} reduce-scatters to overlap "
+    assert reduce_scatter_overlap_count >= expected_rs_overlap, (
+        f"Expected at least {expected_rs_overlap} reduce-scatters to overlap "
         f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_kernels)}."
     )
 
