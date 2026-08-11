@@ -1580,6 +1580,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert (
                 context.config.cuda_graph_sizing_distribution == CudaGraphSizingDistribution.LINEAR
             )
+            assert context.config.cuda_graph_all_prefills
+            assert context.config.cuda_graph_max_tokens == 24
             assert runtime["cuda-graph-scope:layer"] > 0
             mixed_token_counts = {
                 token_count
@@ -1587,9 +1589,9 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 if prefill_count > 0
             }
             assert len(mixed_token_counts) > 1
-            linear_step = context.config.cuda_graph_max_tokens // scenario.config["num_cuda_graphs"]
-            assert linear_step == 6
-            assert context.config.cuda_graph_max_tokens in mixed_token_counts
+            linear_step = context.max_tokens // scenario.config["num_cuda_graphs"]
+            assert linear_step == 8
+            assert context.max_tokens in mixed_token_counts
             configured_mixed_token_counts = sorted(
                 {
                     dimensions.token_count
