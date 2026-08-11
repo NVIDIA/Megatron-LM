@@ -360,8 +360,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         chunk_params: List[torch.nn.Parameter] = []
         chunk_numel = 0
         chunk_max_param = 0
-        # Mirror _emit_bucket's greedy LPT placement incrementally so we can
-        # decide, per param, whether it still fits in the current bucket.
+        # Approximate _emit_bucket's placement so we can decide, per param,
+        # whether it still fits in the current bucket. _emit_bucket assigns by
+        # Newton-Schulz compute cost while this tracks numel, so the two can
+        # disagree. The estimate errs optimistic, which makes a bucket slightly
+        # larger than predicted rather than producing an invalid layout.
         shard_loads = [0] * dp_size
 
         def _absorbs(numel: int) -> bool:

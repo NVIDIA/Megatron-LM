@@ -427,3 +427,56 @@ class TestLayerwiseFullParamLayout:
         cfg = _make_ddp_config()
         layout = _LWO.compute_full_param_layout([dense, expert], None, dp_size, cfg)
         assert len(layout.layouts) == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests for compute-balanced LPT (Newton-Schulz cost, not numel)
+# ---------------------------------------------------------------------------
+
+
+class TestComputeBalancedLayout:
+    """Placement keys on Newton-Schulz cost, so GTP-sharded params spread out.
+
+    A GTP-sharded param has the numel of its local shard but Newton-Schulz runs on
+    the full all-gathered matrix, so its cost is far higher than numel suggests.
+    """
+
+    def _ns_cost(self, param):
+        rows, cols = param.data.shape
+        rows *= getattr(param, 'gtp_remat_size', 1)
+        big, small = max(rows, cols), min(rows, cols)
+        return big * small * small
+
+    def _shard_compute_loads(self, layout, params, dp_size):
+        loads = [0] * dp_size
+        for param in params:
+            loads[_get_shard_for_param(layout, param, dp_size)] += self._ns_cost(param)
+        return loads
+
+    def test_gtp_params_balanced_by_compute_not_numel(self):
+        """GTP-sharded params dominate cost while having the smallest numel.
+
+        Sorting by numel puts the three cheap-but-large params first and leaves the
+        expensive GTP ones to fill in, which piles them onto shards that are already
+        loaded. Sorting by compute cost spreads them instead.
+        """
+        dp_size = 4
+        gtp = [
+            _make_param((64, 256), is_gtp_weight_remat=True, gtp_remat_size=64) for _ in range(3)
+        ]
+        dense = [_make_param((128, 1024)), _make_param((256, 256)), _make_param((256, 256))]
+        tail = [_make_param((64, 256))]
+        params = dense + gtp + tail
+        cfg = _make_ddp_config()
+
+        layout = _LWO._compute_per_buffer_param_layout(params, None, dp_size, cfg)
+
+        # Each GTP param costs 268M against 16.8M for the largest dense param, so no
+        # two of the three may share a shard.
+        gtp_shards = [_get_shard_for_param(layout, param, dp_size) for param in gtp]
+        assert len(set(gtp_shards)) == len(gtp), f"GTP params clustered onto {gtp_shards}"
+
+        loads = self._shard_compute_loads(layout, params, dp_size)
+        imbalance = max(loads) / (sum(loads) / dp_size)
+        # Numel-ordered placement gives 3.77x on this input.
+        assert imbalance < 1.5, f"compute imbalance {imbalance:.2f}x too high: {loads}"
