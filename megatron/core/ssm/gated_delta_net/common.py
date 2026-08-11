@@ -71,8 +71,7 @@ class GatedDeltaNetSubmodules:
 
 class GatedDeltaRuleInterface(Protocol):
     """
-    Unified typing protocol for GDN core computation interfaces.
-    Including interfaces from FLA, and deterministic torch-native implementations for GDN.
+    Unified typing protocol for linear attention interfaces, compliant to upstream FLA interfaces.
 
     ``beta`` is passed as a keyword argument because its positional location differs
     across backend implementations.
