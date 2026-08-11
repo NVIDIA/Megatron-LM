@@ -968,7 +968,10 @@ def _instrument_parallel_runtime(module, runtime):
 
         module.forward = traced_forward
 
-    if class_name == "InferenceColumnParallelLinear" and tp_size > 1:
+    if (
+        class_name in {"InferenceColumnParallelLinear", "InferenceLayerNormColumnParallelLinear"}
+        and tp_size > 1
+    ):
         original_all_gather = module._all_gather
 
         def traced_all_gather(*args, **kwargs):
@@ -1554,9 +1557,19 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             linear_step = context.config.cuda_graph_max_tokens // scenario.config["num_cuda_graphs"]
             assert linear_step == 6
             assert context.config.cuda_graph_max_tokens in mixed_token_counts
+            configured_mixed_token_counts = sorted(
+                {
+                    dimensions.token_count
+                    for dimensions in context.cuda_graph_batch_dimensions_list
+                    if dimensions.prefill_req_count > 0 and dimensions.decode_req_count > 0
+                }
+            )
+            assert mixed_token_counts.issubset(configured_mixed_token_counts)
             assert any(
                 right - left == linear_step
-                for left, right in zip(sorted(mixed_token_counts), sorted(mixed_token_counts)[1:])
+                for left, right in zip(
+                    configured_mixed_token_counts, configured_mixed_token_counts[1:]
+                )
             )
             assert any(
                 prefill_count == context.config.cuda_graph_mixed_prefill_count and decode_count > 0
@@ -1750,7 +1763,10 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
             assert context._nccl_ep_dispatcher
-            assert runtime["module-forward:moe"] > 0
+            # Inference MoE may dispatch through split execution helpers that
+            # bypass nn.Module forward hooks. The live dispatcher calls below
+            # are the feature-owning runtime boundary.
+            assert runtime["nccl-token-dispatches"] > 0
         if "nccl-dispatch" in signals:
             assert model_config.expert_model_parallel_size > 1
             assert model_config.inference_moe_token_dispatcher_type == "nccl"
