@@ -64,8 +64,10 @@ class GatedDeltaNet(_GDNBase):
 
         if self.config.deterministic_mode:
             self.gated_delta_rule = torch_chunk_gated_delta_rule
+            self.gated_delta_rule_input_names = ("query", "key", "value")
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
+            self.gated_delta_rule_input_names = ("q", "k", "v")
 
     def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int, int]:
         """Return GDN1 qkv/z/beta/alpha split sizes for a runtime headwise CP size."""
@@ -343,15 +345,7 @@ class GatedDeltaNet(_GDNBase):
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        gated_delta_rule_inputs = kernel_inputs
-        if self.gated_delta_rule is torch_chunk_gated_delta_rule:
-            gated_delta_rule_inputs = {
-                "query": kernel_inputs["q"],
-                "key": kernel_inputs["k"],
-                "value": kernel_inputs["v"],
-                "g": kernel_inputs["g"],
-                "beta": kernel_inputs["beta"],
-            }
+        gated_delta_rule_inputs = self._get_gated_delta_rule_inputs(kernel_inputs)
         core_attn_out, _ = self.gated_delta_rule(
             **gated_delta_rule_inputs,
             initial_state=None,
@@ -362,7 +356,7 @@ class GatedDeltaNet(_GDNBase):
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
-        if self.recompute_norm_out:
+        if self.recompute_norm_out and self.training:
             self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             norm_func = partial(
                 self._gated_norm_and_layout_restore,
@@ -397,10 +391,22 @@ class GatedDeltaNet(_GDNBase):
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
 
-        if self.recompute_norm_out:
+        if self.recompute_norm_out and self.training:
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
+
+    def _get_gated_delta_rule_inputs(
+        self, kernel_inputs: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        q_name, k_name, v_name = self.gated_delta_rule_input_names
+        return {
+            q_name: kernel_inputs["q"],
+            k_name: kernel_inputs["k"],
+            v_name: kernel_inputs["v"],
+            "g": kernel_inputs["g"],
+            "beta": kernel_inputs["beta"],
+        }
 
     def _gated_norm_and_layout_restore(
         self,

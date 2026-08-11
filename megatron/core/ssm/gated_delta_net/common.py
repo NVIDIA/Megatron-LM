@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
@@ -65,6 +65,7 @@ __all__ = [
     "causal_conv1d",
     "chunk_gated_delta_rule",
     "get_parameter_local_cp",
+    "get_parameter_local_cp_headwise",
     "l2norm",
     "tensor_a2a_cp2hp",
     "tensor_a2a_hp2cp",
@@ -121,6 +122,7 @@ class _GDNBase(MegatronModule):
     A_log: nn.Parameter
 
     gated_delta_rule: GatedDeltaRuleInterface
+    gated_delta_rule_input_names: tuple[str, str, str]
 
     def __init__(
         self,
@@ -151,7 +153,7 @@ class _GDNBase(MegatronModule):
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
-            name (str | None): module instance name passed top-down from its paranet module
+            name (str | None): Optional module path prefix used for child module names.
             cp_comm_type (Optional[str]): Accepted for TransformerLayer compatibility and
                 ignored; GDN implements context parallelism with its own all-to-alls rather
                 than the attention CP communication schemes.
@@ -217,7 +219,6 @@ class _GDNBase(MegatronModule):
             )
 
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
-        self.num_k_heads_local_tp = self.num_key_heads // self.tp_size
 
         attrs_to_check = (
             "dt_bias_dim",
@@ -226,11 +227,13 @@ class _GDNBase(MegatronModule):
             "in_proj_split_names",
             "in_proj_split_sections",
             "gated_delta_rule",
+            "gated_delta_rule_input_names",
         )
         self._setup_variant_attrs()
         for attr in attrs_to_check:
-            assert getattr(self, attr, None) is not None, f"Attribute {attr} for GDN is not set"
-        # QK, V, and gate sections shared by the GDN input projection.
+            assert hasattr(self, attr), f"Attribute {attr} for GDN is not set"
+            assert getattr(self, attr) is not None, f"Attribute {attr} for GDN is not set"
+        # Full input projection width: q, k, v, output gate, and variant-specific gate features.
         self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
 
         if self.config.fp8:
@@ -379,29 +382,6 @@ class _GDNBase(MegatronModule):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # pylint: disable=missing-function-docstring
         raise NotImplementedError
-
-    def _gated_norm_and_a2a(
-        self,
-        core_attn_out: torch.Tensor,
-        gate: torch.Tensor,
-        thd_cp_a2a_inv: torch.Tensor | None,
-        batch: int,
-        seq_len: int,
-        packed_seq_params: PackedSeqParams | None = None,
-    ) -> torch.Tensor:
-        # RMSNorm
-        nvtx_range_push(suffix="gated_norm")
-        norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix="gated_norm")
-
-        # Transpose: b s x --> s b x
-        # From bshd back to sbhd format
-        norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
-        norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
-
-        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
-        cp_size = cp_group.size() if cp_group is not None else 1
-        return a2a_hp_to_cp(norm_out_hp, cp_size, cp_group, packed_seq_params, thd_cp_a2a_inv)
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
@@ -725,6 +705,9 @@ def get_parameter_local_cp(
     slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
     param = param[slices]
     return param
+
+
+get_parameter_local_cp_headwise = get_parameter_local_cp
 
 
 def tensor_a2a_cp2hp(
