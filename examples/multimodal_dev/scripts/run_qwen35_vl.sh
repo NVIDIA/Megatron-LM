@@ -207,8 +207,12 @@ case "$MODEL_VARIANT" in
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
 esac
-# Upstream default for every variant except the PP proxy, which shrinks it.
-LINEAR_NUM_KEY_HEADS=${LINEAR_NUM_KEY_HEADS:-16}
+# The PP proxy shrinks this in its case branch above.  Every other variant
+# pins the value that was hardcoded before the proxy needed the knob, so
+# the environment cannot override it there.
+if [ "$MODEL_VARIANT" != "pp_proxy" ]; then
+    LINEAR_NUM_KEY_HEADS=16
+fi
 # Variants may set this above; every other variant keeps MTP on.
 MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-1}
 

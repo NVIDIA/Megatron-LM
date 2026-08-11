@@ -67,6 +67,24 @@ def model_provider(
 
     # --- language config (generic + model-specific post-processing) ---
     language_config = core_transformer_config_from_args(args)
+    if getattr(args, "use_packed_sequence", False):
+        # THD activations are ``[total_padded_tokens, 1, H]`` and their length
+        # varies per microbatch, so the pipeline scheduler has to negotiate
+        # shapes at each send/recv instead of sizing its P2P buffers from
+        # --seq-length.  Mirrors TransformerConfig's own sequence-packing path.
+        # ``variable_seq_lengths`` has no CLI flag, and setting it here runs
+        # after TransformerConfig.__post_init__, so its dispatcher check has
+        # to be repeated.
+        language_config.variable_seq_lengths = True
+        if (
+            language_config.num_moe_experts is not None
+            and language_config.moe_token_dispatcher_type == "allgather"
+        ):
+            raise ValueError(
+                "--use-packed-sequence requires an alltoall MoE token "
+                "dispatcher; the allgather dispatcher does not support "
+                "variable sequence lengths."
+            )
     post_language_config_fn = registry.get("post_language_config_fn")
     if post_language_config_fn is not None:
         post_language_config_fn(language_config, args)
