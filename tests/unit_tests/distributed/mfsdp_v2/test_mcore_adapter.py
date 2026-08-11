@@ -164,7 +164,7 @@ class TestMcoreAdapter:
                 torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
                 for _ in range(2)
             ]
-            for _ in range(3)
+            for _ in range(10)
         ]
 
         reference_losses = []
@@ -198,4 +198,4 @@ class TestMcoreAdapter:
         reference_losses = torch.stack(reference_losses)
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
-        torch.testing.assert_close(losses, reference_losses, rtol=1e-2, atol=0)
+        torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
