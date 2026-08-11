@@ -597,6 +597,7 @@ class TestMultiTokenPrediction:
         args.no_save_optim = True
         args.no_load_optim = True
         args.no_load_rng = True
+        args.save_tokenizer_assets = False
         if HAVE_TE:
             # only use grouped gemm if there is TE
             args.moe_grouped_gemm = True
@@ -1431,6 +1432,7 @@ class TestMultiTokenPredictionHybrid:
         args.no_load_optim = True
         args.no_load_rng = True
         args.bf16 = True
+        args.save_tokenizer_assets = False
         # Unified pattern: "main/mtp/mtp" - main decoder "M*M*", MTP pattern "M*" with 2 depths
         args.hybrid_layer_pattern = "M*M*/M*/M*"
 
