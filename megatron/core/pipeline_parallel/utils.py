@@ -1,8 +1,8 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Callable, Optional
 
 import torch
@@ -221,6 +221,9 @@ class ScheduleNode:
         self.ncclep_zero_copy = ncclep_zero_copy
         self.inputs = None
         self.outputs = None
+        # When True, the forward runs under torch.no_grad() so no autograd graph is
+        # retained; the layer-level full recompute path replays it with grad at backward.
+        self.forward_no_grad = False
 
     def default_backward_func(self, outputs, output_grad):
         """Default backward function"""
@@ -252,7 +255,10 @@ class ScheduleNode:
                     input.requires_grad = inputs[i].requires_grad
 
             data = tuple(self.inputs)
-            data = self.forward_func(*data)
+            # Full recompute: skip the graph now, rebuild it by re-running at backward.
+            grad_ctx = torch.no_grad() if self.forward_no_grad else nullcontext()
+            with grad_ctx:
+                data = self.forward_func(*data)
 
             if not isinstance(data, tuple):
                 data = make_viewless(data)
