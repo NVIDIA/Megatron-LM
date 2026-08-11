@@ -663,7 +663,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 actual_ep_size = None if pg_collection.ep is None else pg_collection.ep.size()
                 raise ValueError(
                     "MFSDP v2 requires an EP process group matching "
-                    f"expert_model_parallel_size={config.expert_model_parallel_size}, got {actual_ep_size}."
+                    f"expert_model_parallel_size={config.expert_model_parallel_size}, "
+                    f"got {actual_ep_size}."
                 )
             if pg_collection.expt_dp is None:
                 raise ValueError("MFSDP v2 with EP requires an explicit expert-DP process group.")
