@@ -1,7 +1,3 @@
----
-orphan: true
----
-
 <!---
    Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -16,16 +12,6 @@ orphan: true
 Megatron-LM is instrumented with [OpenTelemetry](https://opentelemetry.io/) via the [`nemo-lens`](https://github.com/NVIDIA-NeMo/Lens) library, emitting **traces** at training-framework boundaries and **metrics** for loss, throughput, and gradient norm.
 
 Telemetry exports to any OTLP-compatible backend (Jaeger, Grafana Tempo, W&B Weave, Honeycomb, Datadog, ...).
-
-```{note}
-These pages are being landed ahead of the instrumentation they describe. The
-span-group and metric definitions in `megatron/core/telemetry/` are available
-now; the `--otel-*` CLI flags, the `MEGATRON_OTEL_*` environment variables, and
-the call-site spans arrive with
-[#6385](https://github.com/NVIDIA/Megatron-LM/pull/6385). Until then, treat this
-section as a description of the intended interface rather than of what a
-released Megatron-LM does.
-```
 
 ## What's in this section
 

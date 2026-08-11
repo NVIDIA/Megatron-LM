@@ -97,6 +97,7 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "multi-storage-client~=0.50",
     "opentelemetry-api~=1.33.1",
+    "nemo-lens @ git+https://github.com/NVIDIA-NeMo/Lens.git@ecb0d15a93a49c45cb7189e792a91087f8fe1ace",
     "flash-linear-attention==0.5.1",
     "megatron-energon[av_decode]~=7.0",
     "av",
@@ -113,6 +114,10 @@ dev = [
     "orjson",
     "fast-hadamard-transform",
     "zstandard",
+]
+
+otel = [
+    "nemo-lens[sdk] @ git+https://github.com/NVIDIA-NeMo/Lens.git@ecb0d15a93a49c45cb7189e792a91087f8fe1ace",
 ]
 
 ### 'lts' extra is deprecated                                                   ###

@@ -26,6 +26,7 @@ _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
+_GLOBAL_TELEMETRY_HANDLE = None
 
 def get_args():
     """Return arguments."""
@@ -77,6 +78,11 @@ def get_signal_handler():
     return _GLOBAL_SIGNAL_HANDLER
 
 
+def get_telemetry():
+    """Return the telemetry handle. It can be None so no need to check if initialized."""
+    return _GLOBAL_TELEMETRY_HANDLE
+
+
 def _set_signal_handler(exit_signal):
 
     global _GLOBAL_SIGNAL_HANDLER
@@ -91,6 +97,7 @@ def _graceful_shutdown(signum, frame):
     This handler attempts a best-effort graceful shutdown:
       - Logs a single termination message from rank 0
       - Synchronizes all ranks (barrier)
+      - Flushes and shuts down telemetry
       - Destroys the distributed process group
       - Exits the process cleanly
     """
@@ -107,6 +114,20 @@ def _graceful_shutdown(signum, frame):
                 pass
 
             torch.distributed.destroy_process_group()
+    except Exception:
+        pass
+
+    # Without this, any spans/metrics still sitting in the BatchSpanProcessor's
+    # queue (which only flushes on a timer or on shutdown(), never automatically
+    # on process exit) are silently dropped -- including the just-closed
+    # top-level job span on this exit path. sys.exit() below unwinds the call
+    # stack via SystemExit, so any span opened with `with managed_span(...)`/
+    # `@trace_fn` still gets its __exit__ run and end_time set correctly; this
+    # call is what makes sure that data actually reaches the exporter.
+    try:
+        _otel_handle = get_telemetry()
+        if _otel_handle is not None:
+            _otel_handle.shutdown()
     except Exception:
         pass
 
@@ -142,6 +163,7 @@ def set_global_variables(args, build_tokenizer=True):
     _set_adlr_autoresume(args)
     _set_timers(args)
     _set_energy_monitor(args)
+    _set_telemetry(args)
 
     if args.enable_experimental:
         set_experimental_flag(True)
@@ -173,6 +195,7 @@ def unset_global_variables():
     global _GLOBAL_TIMERS
     global _GLOBAL_ENERGY_MONITOR
     global _GLOBAL_SIGNAL_HANDLER
+    global _GLOBAL_TELEMETRY_HANDLE
 
     _GLOBAL_ARGS = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
@@ -184,6 +207,7 @@ def unset_global_variables():
     _GLOBAL_TIMERS = None
     _GLOBAL_ENERGY_MONITOR = None
     _GLOBAL_SIGNAL_HANDLER = None
+    _GLOBAL_TELEMETRY_HANDLE = None
 
     unset_num_microbatches_calculator()
 
@@ -323,6 +347,213 @@ def _ensure_var_is_not_initialized(var, name):
     """Make sure the input variable is not None."""
     assert var is None, '{} is already initialized.'.format(name)
 
+def _detect_gpu_identity(local_rank):
+    """Best-effort physical GPU identity for this rank: index/name/UUID/serial/PCI.
+
+    Uses ``local_rank`` directly (not ``torch.cuda.current_device()``) because
+    this runs from ``set_global_variables`` during arg parsing, before
+    ``torch.cuda.set_device(args.local_rank)`` happens in
+    ``_initialize_distributed`` -- ``current_device()`` would still read back
+    the default (always 0) at this point. ``local_rank`` is resolved against
+    ``CUDA_VISIBLE_DEVICES`` the same way ``set_device`` will later resolve it,
+    so the reported index matches reality. Returns {} on any failure (no NVML,
+    no visible GPU, MIG/UUID-style CUDA_VISIBLE_DEVICES entries we can't map
+    positionally, etc.) -- this is best-effort metadata, never load-bearing.
+    """
+    cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '').strip()
+    if cuda_visible:
+        visible_list = cuda_visible.split(',')
+        if local_rank >= len(visible_list):
+            return {}
+        try:
+            physical_index = int(visible_list[local_rank])
+        except ValueError:
+            return {}
+    else:
+        physical_index = local_rank
+
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(physical_index)
+            attrs = {
+                'dl.gpu.index': physical_index,
+                'dl.gpu.name': pynvml.nvmlDeviceGetName(handle),
+                'dl.gpu.uuid': pynvml.nvmlDeviceGetUUID(handle),
+            }
+            try:
+                attrs['dl.gpu.serial'] = pynvml.nvmlDeviceGetSerial(handle)
+            except Exception:
+                pass  # not supported on most modern datacenter GPUs.
+            try:
+                attrs['dl.gpu.pci_bus_id'] = pynvml.nvmlDeviceGetPciInfo(handle).busId
+            except Exception:
+                pass
+            return {
+                k: (v.decode() if isinstance(v, bytes) else v) for k, v in attrs.items()
+            }
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        return {}
+
+
+def build_telemetry_resource_attrs(args):
+    """Build the OTel resource-attribute dict from training config.
+
+    Shared by _set_telemetry() (the main process) and
+    megatron.training.async_utils.build_otel_worker_bootstrap() (the persistent
+    checkpoint worker process) so both end up with identical resource attributes
+    by construction, rather than two independently-written implementations that
+    could silently drift apart as args evolve.
+    """
+    # Attach training config as resource attributes so they appear as
+    # Process tags in Jaeger, making it easy to identify and compare runs.
+    resource_attrs = {}
+    for attr, arg_name in [
+        ('dl.local_rank', 'local_rank'),
+        ('dl.tensor_parallel.size', 'tensor_model_parallel_size'),
+        ('dl.pipeline_parallel.size', 'pipeline_model_parallel_size'),
+        ('dl.data_parallel.size', 'data_parallel_size'),
+        ('dl.batch_size', 'global_batch_size'),
+        ('dl.sequence_length', 'seq_length'),
+        ('megatron.num_layers', 'num_layers'),
+        ('megatron.hidden_size', 'hidden_size'),
+        ('megatron.num_attention_heads', 'num_attention_heads'),
+        ('megatron.train_iters', 'train_iters'),
+        ('megatron.micro_batch_size', 'micro_batch_size'),
+        ('megatron.ckpt_format', 'ckpt_format'),
+    ]:
+        val = getattr(args, arg_name, None)
+        if val is not None:
+            resource_attrs[attr] = val
+
+    # Derive precision from flags
+    if getattr(args, 'fp16', False):
+        resource_attrs['megatron.precision'] = 'fp16'
+    elif getattr(args, 'bf16', False):
+        resource_attrs['megatron.precision'] = 'bf16'
+    else:
+        resource_attrs['megatron.precision'] = 'fp32'
+
+    resource_attrs.update(_detect_gpu_identity(getattr(args, 'local_rank', None) or 0))
+
+    # SLURM identity, so EVERY span can be correlated with the out-of-band reckoner (which keys
+    # on SLUID). SLUID is not in the job env, so the launch script fetches it from sacct (it's
+    # assigned at submit) and exports it as LENS_SLURM_SLUID; the rest are standard env vars.
+    # SLUID is unique per (array element x requeue attempt) -- the finest execution-episode key.
+    # array.job_id/task_id (empty on non-array jobs -> self-skip) reconstruct the array structure.
+    for attr, env in (('slurm.job.id', 'SLURM_JOB_ID'), ('slurm.sluid', 'LENS_SLURM_SLUID'),
+                      ('slurm.cluster', 'SLURM_CLUSTER_NAME'),
+                      ('slurm.array.job_id', 'SLURM_ARRAY_JOB_ID'),
+                      ('slurm.array.task_id', 'SLURM_ARRAY_TASK_ID'),
+                      ('slurm.array.sluid', 'LENS_SLURM_ARRAY_SLUID'),
+                      ('slurm.restart_count', 'SLURM_RESTART_COUNT'),
+                      # NVRx cycle identity (per-cohort from the ft_launcher agent) -> trainer AND
+                      # async-ckpt spans self-locate to a restart cycle + physical node.
+                      ('nvrx.cycle', 'NVRX_CYCLE'),
+                      ('nvrx.infra_rank', 'NVRX_INFRA_RANK'),
+                      ('nvrx.membership', 'NVRX_MEMBERSHIP')):
+        val = os.environ.get(env)
+        if val:
+            resource_attrs[attr] = val
+
+    # ---- Run identity: deterministic UUIDs shared by every rank AND the ckpt worker with ZERO
+    # communication (both compute from the same inherited env). No sacct -> scales to 12k ranks.
+    #   job_uuid = the logical training job, stable across every restart/requeue.
+    #   run_uuid = one incarnation, bumps per restart. Built topology-adaptively: each restart
+    #   counter is folded in ONLY where it is rank-invariant --
+    #     * SLURM_RESTART_COUNT is global only for NON-array jobs (arrays requeue per-element ->
+    #       the count desyncs across elements, so it is EXCLUDED for arrays);
+    #     * TORCHELASTIC_RESTART_COUNT is global & monotonic via nvrx's persistent rendezvous
+    #       TCPStore (its presence also signals nvrx is in use).
+    #   Cases: A plain / B plain+requeue / C nvrx+plain+requeue / D nvrx+array. For arrays the
+    #   anchor is the BASE array job id (SLURM_ARRAY_JOB_ID), never the per-element SLURM_JOB_ID.
+    import uuid
+    cluster = os.environ.get('SLURM_CLUSTER_NAME', 'nocluster')
+    is_array = 'SLURM_ARRAY_TASK_ID' in os.environ
+    job_key = (os.environ.get('SLURM_ARRAY_JOB_ID') if is_array
+               else os.environ.get('SLURM_JOB_ID')) or 'nojob'
+    run_parts = [cluster, job_key]
+    if not is_array:  # SLURM requeue is global (rank-invariant) only for non-array jobs
+        run_parts.append('sr' + os.environ.get('SLURM_RESTART_COUNT', '0'))
+    te = os.environ.get('TORCHELASTIC_RESTART_COUNT')  # nvrx store-backed global monotonic count
+    if te is not None:
+        run_parts.append('te' + te)
+        resource_attrs['slurm.torchelastic.restart_count'] = te
+    resource_attrs['nemo.lens.job_uuid'] = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, 'nemo.lens.job/' + f'{cluster}/{job_key}'))
+    resource_attrs['nemo.lens.run_uuid'] = str(
+        uuid.uuid5(uuid.NAMESPACE_URL, 'nemo.lens.run/' + '/'.join(run_parts)))
+    return resource_attrs
+
+
+def _set_telemetry(args):
+    """Initialise OTel telemetry handle following the wandb/tensorboard pattern."""
+    global _GLOBAL_TELEMETRY_HANDLE
+    try:
+        from nemo.lens import NemoLensConfig, setup_telemetry
+    except ImportError:
+        # nemo-lens absent -> telemetry is a no-op (get_telemetry() handles None); do NOT
+        # crash set_global_variables/startup. Every other telemetry site already degrades this way.
+        _GLOBAL_TELEMETRY_HANDLE = None
+        return
+    from megatron.core.telemetry.span_groups import MegatronSpanGroup
+
+    config = NemoLensConfig.from_env(
+        prefix='MEGATRON_OTEL', fallback_prefix='NEMO_LENS',
+        span_group_cls=MegatronSpanGroup,
+    )
+    if not os.environ.get('OTEL_SERVICE_NAME', '').strip():
+        config.service_name = 'megatron-lm'
+    if getattr(args, 'otel_enabled', False):
+        config.enabled = True
+    if getattr(args, 'otel_service_name', None):
+        config.service_name = args.otel_service_name
+    if getattr(args, 'otel_span_groups', None):
+        config.span_groups = args.otel_span_groups
+
+    if config.enabled:
+        # OTel's default RandomIdGenerator draws span/trace IDs from Python's `random`, which
+        # Megatron seeds IDENTICALLY across data-parallel ranks (_set_random_seed with
+        # data_parallel_random_init off) -> every rank emits the SAME span/trace ID sequence, so a
+        # backend sees many spans sharing one span ID and parent links resolve to the wrong span
+        # (Honeycomb: "multiple spans sharing the same non-null span ID", broken checkpoint
+        # parents). Patch the default generator to os.urandom.
+        # NOTE: this is the IMMEDIATE, mounted stopgap for THE TRAINER PROCESS only. The ckpt worker
+        # and nvrx set up telemetry in their OWN process (nemo-lens from_env, forkserver) and never
+        # run this, so they are covered by the seed-independent id_generator baked into nemo-lens
+        # providers.py -- which is the real fix (effective on the next image rebuild; then this
+        # becomes a harmless no-op).
+        # It patches a class on an SDK module process-globally, so it is deliberately confined to
+        # the telemetry-enabled path: a run with telemetry off must not have its OTel SDK mutated
+        # just because nemo-lens happens to be importable.
+        from opentelemetry.sdk.trace import id_generator as _idg
+        _idg.RandomIdGenerator.generate_span_id = (
+            lambda self: int.from_bytes(os.urandom(8), 'big') or 1
+        )
+        _idg.RandomIdGenerator.generate_trace_id = (
+            lambda self: int.from_bytes(os.urandom(16), 'big') or 1
+        )
+
+    # Only pay for the resource-attribute build on the enabled path. It is not free:
+    # _detect_gpu_identity() does an nvmlInit()/nvmlShutdown() round trip, and a run with
+    # telemetry off must not touch NVML (or anything else) just because nemo-lens is importable.
+    # setup_telemetry() ignores resource_attributes for a disabled config, so {} is equivalent.
+    resource_attrs = build_telemetry_resource_attrs(args) if config.enabled else {}
+
+    _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
+        config, rank=args.rank, world_size=args.world_size,
+        resource_attributes=resource_attrs,
+    )
+
+    # Bridge Python logging to OTel so logs get exported with trace correlation.
+    if config.enabled and config.logs_enabled and _GLOBAL_TELEMETRY_HANDLE.is_exporting:
+        from nemo.lens.logging_bridge import setup_logging_bridge
+        setup_logging_bridge()
+
+
 def destroy_global_vars():
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = None
@@ -350,3 +581,6 @@ def destroy_global_vars():
 
     global _GLOBAL_SIGNAL_HANDLER
     _GLOBAL_SIGNAL_HANDLER = None
+
+    global _GLOBAL_TELEMETRY_HANDLE
+    _GLOBAL_TELEMETRY_HANDLE = None
