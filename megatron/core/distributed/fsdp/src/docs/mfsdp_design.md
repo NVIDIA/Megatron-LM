@@ -124,9 +124,7 @@ axis.
   only partially accumulated; not user-facing.
 - `Flat`. The current per-unit, dim-0 flat sharding. Good for elementwise optimizers.
 - `TensorAtomic`. Don’t cut a parameter. For emerging optimizers that need full
-  parameters. TBD: we may need a variation of this that stores a parameter on
-  potentially multiple ranks. It’s useful for some implementations (e.g.
-  https://github.com/NVIDIA/Megatron-LM/pull/4486) of FSDP Muon.
+  parameters.
 - `BlockAtomic(block_size)`. Don’t cut a block of `block_size` rows. Simplifies
   blockwise quantization support. Currently, a 32x1 mxfp8 block may be sharded across
   ranks. This introduces complex host-side logic and custom quantization kernels to
