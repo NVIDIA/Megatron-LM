@@ -99,13 +99,15 @@ def chunk_metadata_by_fqn(model: nn.Module) -> dict[str, ChunkStorageMetadata]:
     """
     # Parameters key this map by identity because tensor equality is elementwise. The map is
     # consumed below while ``model`` still holds every parameter, so the ids stay valid.
-    metadata_by_parameter = {
-        id(fsdp_parameter.sharded): _dbuffer_chunk_metadata(parameter_group.main_weight, index)
-        for module in model.modules()
-        if isinstance(module, FsdpModule)
-        for parameter_group in module.parameter_groups
-        for index, fsdp_parameter in enumerate(parameter_group.fsdp_parameters)
-    }
+    metadata_by_parameter: dict[int, ChunkStorageMetadata] = {}
+    for module in model.modules():
+        if not isinstance(module, FsdpModule):
+            continue
+        for parameter_group in module.parameter_groups:
+            for index, fsdp_parameter in enumerate(parameter_group.fsdp_parameters):
+                metadata_by_parameter[id(fsdp_parameter.sharded)] = _dbuffer_chunk_metadata(
+                    parameter_group.main_weight, index
+                )
     # Tied parameters share one nn.Parameter under several FQNs, and the state dict carries an
     # entry for each of them, so iterate without deduplicating.
     return {
@@ -131,8 +133,8 @@ def attach_uneven_dtensor_metadata(
             :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict`.
     """
     metadata_by_fqn = chunk_metadata_by_fqn(model)
-    _attach_to_parameter_state(model_state_dict, metadata_by_fqn)
-    _attach_to_parameter_state(optimizer_state_dict[_OPTIMIZER_STATE_KEY], metadata_by_fqn)
+    _attach_by_fqn(model_state_dict, metadata_by_fqn)
+    _attach_by_fqn(optimizer_state_dict[_OPTIMIZER_STATE_KEY], metadata_by_fqn)
 
 
 def _chunk(row_offset: int, rows: int, shape: torch.Size) -> ChunkStorageMetadata:
@@ -143,15 +145,15 @@ def _chunk(row_offset: int, rows: int, shape: torch.Size) -> ChunkStorageMetadat
     )
 
 
-def _attach_to_parameter_state(
-    state: dict[str, Any], metadata_by_fqn: dict[str, ChunkStorageMetadata]
+def _attach_by_fqn(
+    state_dict: dict[str, Any], metadata_by_fqn: dict[str, ChunkStorageMetadata]
 ) -> None:
     """Attach chunk metadata to the DTensors of a parameter-FQN-keyed state dict.
 
     Each value is either a parameter's tensor, as in a model state dict, or a mapping of that
-    parameter's state tensors, as in an optimizer state dict.
+    parameter's state tensors, as in the per-parameter entries of an optimizer state dict.
     """
-    for fqn, value in state.items():
+    for fqn, value in state_dict.items():
         tensors = value.values() if isinstance(value, dict) else (value,)
         for tensor in tensors:
             if not isinstance(tensor, DTensor):
