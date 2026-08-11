@@ -136,6 +136,11 @@ except ImportError:
 
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
+# See _resolve_flash_version: benchmarking-only override for a config field that
+# has no CLI flag. Empty means "leave the config's choice alone".
+_FA_VERSION_ENV = os.environ.get("MCORE_FLASH_ATTN_VERSION", "")
+
+
 try:
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 except:
@@ -1029,6 +1034,10 @@ class Attention(MegatronModule, ABC):
         when both are False the FA2 kernel is used.
         """
         pinned = self.flash_attention_version
+        # Benchmarking override: `flash_attention_version` has no CLI flag, so this
+        # is the only way to A/B generations from a launch script. Config wins.
+        if pinned is None and _FA_VERSION_ENV:
+            pinned = int(_FA_VERSION_ENV)
         if pinned == 4:
             assert (
                 HAVE_FA4
