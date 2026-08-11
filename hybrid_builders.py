@@ -46,10 +46,6 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
         print_rank_0(f" == params layer {l}: {layer_params}")
 
-    # NB: DSA forward-pass timing is attached in pretrain_hybrid.forward_step, not
-    # here — the config-container model provider does not reliably route through
-    # this builder, so attaching here would silently no-op.
-
     return model
 
 

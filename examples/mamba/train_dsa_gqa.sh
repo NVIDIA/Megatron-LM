@@ -13,7 +13,6 @@
 #   DSA_GQA_KERNEL=min_memory     -> --dsa-gqa-kernel (default) | reference
 #   DATA=mock (default) | real    real needs BLEND_FILE + TOKENIZER_MODEL
 #   PRECISION=bf16 (default) | fp32
-#   DSA_TIMING=1                  per-DSA-layer forward ms
 #   WANDB_PROJECT=<project>       opt-in wandb logging
 #
 # Needs 4 GPUs (TP=4, DP=1). Example:
