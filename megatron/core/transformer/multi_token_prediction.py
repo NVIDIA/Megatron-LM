@@ -464,6 +464,52 @@ else:
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 
+@dataclass(frozen=True)
+class MTPDSASharedTensors:
+    """DSA tensors produced by the first repeated MTP iteration and reused thereafter."""
+
+    key: Tensor
+    topk_indices: Tensor
+    topk_length: Tensor
+
+    def optional_topk_length(self) -> Optional[Tensor]:
+        """Return ``None`` when the producer did not emit per-row top-k lengths."""
+        return None if self.topk_length.numel() == 0 else self.topk_length
+
+
+@dataclass
+class MTPDSAIterationContext:
+    """Per-iteration carrier for explicit MTP DSA IndexShare and KVShare tensors."""
+
+    iteration: int
+    shared_tensors: Optional[MTPDSASharedTensors] = None
+    produced_tensors: Optional[MTPDSASharedTensors] = None
+
+    @property
+    def is_source(self) -> bool:
+        """Whether this iteration computes the shared tensors."""
+        return self.iteration == 0
+
+    @property
+    def reuses_source(self) -> bool:
+        """Whether this iteration consumes tensors from the source iteration."""
+        return self.iteration > 0
+
+    def capture(self, key: Tensor, topk_indices: Tensor, topk_length: Optional[Tensor]) -> None:
+        """Capture source tensors without detaching their autograd graph."""
+        if not self.is_source:
+            raise RuntimeError("Only MTP iteration 0 may produce shared DSA tensors.")
+        if topk_length is None:
+            topk_length = topk_indices.new_empty((0,), dtype=torch.int32)
+        self.produced_tensors = MTPDSASharedTensors(key, topk_indices, topk_length)
+
+    def require_source_tensors(self) -> MTPDSASharedTensors:
+        """Return the tensors captured by iteration 0 or fail at the producer boundary."""
+        if self.produced_tensors is None:
+            raise RuntimeError("MTP iteration 0 did not produce DSA KV/top-k tensors.")
+        return self.produced_tensors
+
+
 def tie_word_embeddings_state_dict(
     sharded_state_dict: ShardedStateDict,
     word_emb_weight: Tensor,
@@ -1918,6 +1964,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
+        if self.config.dsa_mtp_index_kv_share and mtp_layer_pattern is not None:
+            raise ValueError(
+                "dsa_mtp_index_kv_share currently supports the GPT MTP path only, "
+                "not a hybrid MTP layer pattern."
+            )
 
         # Validate attention mask type if using transformer-based inner layers
         if self.submodules.mtp_model_layer is not None and hasattr(
@@ -2227,6 +2278,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[torch.Tensor] = None,
+        mtp_dsa_context: Optional[MTPDSAIterationContext] = None,
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
@@ -2280,6 +2332,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         sequence_len_offset=sequence_len_offset,
                         padding_mask=padding_mask,
                         input_ids=input_ids,
+                        mtp_dsa_context=mtp_dsa_context,
                     )
 
         if not self.mhc_enabled:
@@ -2373,6 +2426,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        mtp_dsa_context: Optional[MTPDSAIterationContext] = None,
     ):
         """Forward through ``_proj_and_transformer_layer`` with activation
         recomputation.
@@ -2407,8 +2461,22 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_cos,
             rotary_pos_sin,
             sequence_len_offset,
+            shared_key,
+            shared_topk_indices,
+            shared_topk_length,
         ):
-            return self._proj_and_transformer_layer(
+            recompute_context = None
+            if mtp_dsa_context is not None:
+                shared_tensors = None
+                if mtp_dsa_context.reuses_source:
+                    shared_tensors = MTPDSASharedTensors(
+                        shared_key, shared_topk_indices, shared_topk_length
+                    )
+                recompute_context = MTPDSAIterationContext(
+                    iteration=mtp_dsa_context.iteration, shared_tensors=shared_tensors
+                )
+
+            outputs = self._proj_and_transformer_layer(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 input_ids=input_ids,
@@ -2423,7 +2491,24 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                mtp_dsa_context=recompute_context,
             )
+            if recompute_context is not None and recompute_context.is_source:
+                produced = recompute_context.require_source_tensors()
+                return outputs, produced.key, produced.topk_indices, produced.topk_length
+            return outputs
+
+        if mtp_dsa_context is not None and mtp_dsa_context.reuses_source:
+            if mtp_dsa_context.shared_tensors is None:
+                raise RuntimeError(
+                    f"MTP iteration {mtp_dsa_context.iteration} requires iteration-0 "
+                    "DSA KV/top-k tensors."
+                )
+            shared_key = mtp_dsa_context.shared_tensors.key
+            shared_topk_indices = mtp_dsa_context.shared_tensors.topk_indices
+            shared_topk_length = mtp_dsa_context.shared_tensors.topk_length
+        else:
+            shared_key = shared_topk_indices = shared_topk_length = None
 
         # Decide the outer quantization context, matching
         # ``transformer_block._checkpointed_forward``. Only ``fp8 + delayed
@@ -2468,6 +2553,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                     rotary_pos_cos,
                     rotary_pos_sin,
                     sequence_len_offset,
+                    shared_key,
+                    shared_topk_indices,
+                    shared_topk_length,
                 )
             else:
                 # tensor_parallel.checkpoint stashes args via autograd's
@@ -2489,6 +2577,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                     rotary_pos_cos,
                     rotary_pos_sin,
                     sequence_len_offset,
+                    shared_key,
+                    shared_topk_indices,
+                    shared_topk_length,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -2520,10 +2611,20 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                mtp_dsa_context=mtp_dsa_context,
             )
         else:
             raise ValueError("Invalid activation recompute method.")
 
+        if mtp_dsa_context is not None and mtp_dsa_context.is_source:
+            if isinstance(outputs, torch.Tensor):
+                return outputs, mtp_dsa_context.require_source_tensors()
+            hidden_states, shared_key, shared_topk_indices, shared_topk_length = outputs
+            return hidden_states, MTPDSASharedTensors(
+                shared_key, shared_topk_indices, shared_topk_length
+            )
+        if mtp_dsa_context is not None:
+            return outputs, mtp_dsa_context.shared_tensors
         return outputs
 
     def forward(
@@ -2545,6 +2646,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         roll_depth: int = 0,
         sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
+        mtp_dsa_context: Optional[MTPDSAIterationContext] = None,
     ):
         """
         Execute the forward pass through the Multi-Token Prediction (MTP) layer.
@@ -2587,7 +2689,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
 
         if self.config.recompute_granularity == 'full' and self.training:
-            hidden_states = self._checkpointed_forward(
+            checkpoint_outputs = self._checkpointed_forward(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 input_ids=input_ids,
@@ -2602,7 +2704,13 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                mtp_dsa_context=mtp_dsa_context,
             )
+            if mtp_dsa_context is not None:
+                hidden_states, shared_tensors = checkpoint_outputs
+            else:
+                hidden_states = checkpoint_outputs
+                shared_tensors = None
         else:
             hidden_states = self._proj_and_transformer_layer(
                 hidden_states=hidden_states,
@@ -2619,9 +2727,18 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                mtp_dsa_context=mtp_dsa_context,
             )
+            if mtp_dsa_context is not None and mtp_dsa_context.is_source:
+                shared_tensors = mtp_dsa_context.require_source_tensors()
+            elif mtp_dsa_context is not None:
+                shared_tensors = mtp_dsa_context.shared_tensors
+            else:
+                shared_tensors = None
 
         self.cp_group = _orig_cp_group
+        if mtp_dsa_context is not None:
+            return hidden_states, input_ids, position_ids, padding_mask, shared_tensors
         return hidden_states, input_ids, position_ids, padding_mask
 
     def sharded_state_dict(
@@ -2930,9 +3047,15 @@ class MultiTokenPredictionBlock(MegatronModule):
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
 
+        shared_dsa_tensors = None
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
-            (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
+            mtp_dsa_context = None
+            if self.config.dsa_mtp_index_kv_share:
+                mtp_dsa_context = MTPDSAIterationContext(
+                    iteration=iteration, shared_tensors=shared_dsa_tensors
+                )
+            layer_outputs = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -2947,8 +3070,15 @@ class MultiTokenPredictionBlock(MegatronModule):
                 roll_depth=iteration,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
+                mtp_dsa_context=mtp_dsa_context,
                 **(extra_block_kwargs or {}),
             )
+            if mtp_dsa_context is not None:
+                (hidden_states, input_ids, position_ids, padding_mask, shared_dsa_tensors) = (
+                    layer_outputs
+                )
+            else:
+                hidden_states, input_ids, position_ids, padding_mask = layer_outputs
 
             if mhc_multistream is not None:
                 mhc_chunks.append(hidden_states)
