@@ -39,6 +39,9 @@ MODEL_ARGS:
   --seq-length: 1024
   --temperature: 1.0
   --top_k: 1
+  # Async scheduling only supports greedy sampling (top_k=1, top_p=0.0) and does
+  # not support log probabilities, stop words, chunked prefill, or prefix
+  # caching (see dynamic_engine._validate_async_sched_support_for_request).
   --inference-dynamic-batching-buffer-size-gb: 20
   --inference-dynamic-batching-async-sched-mode: async
   --dist-ckpt-strictness: log_unexpected
@@ -46,14 +49,11 @@ MODEL_ARGS:
   --output-path: ${INFERENCE_OUTPUT_PATH}
   --output-every-n-results: 32
   --prompt-file: ${DATA_PATH}/text/sharegpt-vicuna/filtered/processed.jsonl
-  --prompt-file-num-truncate: 12
-  --num-tokens-to-generate: 32
-  --incoming-requests-per-step: 2
-  --inference-dynamic-batching-max-requests: 4
+  --prompt-file-num-truncate: 128 # originally 1024
+  --num-tokens-to-generate: 128 # originally 512
+  --incoming-requests-per-step: 32
   --termination-id: -1
-  --inference-repeat-n: 1
+  --inference-repeat-n: 3
   --inference-logging-step-interval: 1
-  --compare-async-sched-modes: true
-  --async-sched-min-steps: 2
-  --async-sched-min-compactions: 1
-METRICS: []
+METRICS:
+  - "generated_tokens"

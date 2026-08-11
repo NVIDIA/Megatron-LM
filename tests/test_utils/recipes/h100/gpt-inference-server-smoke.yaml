@@ -10,7 +10,6 @@ spec:
   gpus: 8
   n_repeat: 1
   platforms: dgx_a100
-  time_limit: 3600
   script_setup: |
     unset https_proxy
     umask 077
@@ -42,15 +41,15 @@ spec:
     unset RO_API_TOKEN
     cd /opt/megatron-lm
 
-    PYTHONPATH=/opt/megatron-lm python \
+    python \
       tests/functional_tests/test_cases/gpt/gpt_inference_server_smoke_tp1_pp1_dp8_583m/serve_smoke.py \
-      --checkpoint-dir /mnt/artifacts/model/openai_gpt-oss-20b/v1 \
-      --tokenizer-model unsloth/gpt-oss-20b-BF16 \
-      --server-log-dir {assets_dir}/logs
+      --checkpoint-dir /mnt/artifacts/model/mcore_mistral/nemo_minitron-0.5b/v1 \
+      --tokenizer-model /mnt/artifacts/model/mcore_mistral/nemo_minitron-0.5b/v1/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json \
+      --server-log-dir {assets_dir}/logs/1
 
 products:
-  - test_case: [gpt_inference_server_async_sched_tp2_pp2_ep2_gptoss_20b]
+  - test_case: [gpt_inference_server_smoke_tp1_pp1_dp8_583m]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]

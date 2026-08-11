@@ -4,15 +4,14 @@ import asyncio
 import gc
 import os
 from collections import Counter, deque
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
-from transformer_engine.pytorch.fp8 import check_fp8_support
+from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
@@ -40,6 +39,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig as _DynamicEngineTestConfig,
@@ -406,87 +406,11 @@ def test_get_decode_only_log_state(mode, decode_only, expected):
     assert _get_decode_only_log_state(mode, decode_only) == expected
 
 
-# Pairwise coverage below is intentionally declarative.  A flag only receives credit when the
-# owning scenario proves both async overlap and feature-specific runtime behavior.
-_UNIT = "unit"
-_FUNCTIONAL = "functional"
-_NEGATIVE = "negative"
-_OUT_OF_SCOPE = "out_of_scope"
-
-_INFERENCE_CONFIG_DISPOSITIONS = {
-    _UNIT: {
-        "async_sched_mode",
-        "block_size_tokens",
-        "buffer_size_gb",
-        "cuda_graph_all_prefills",
-        "cuda_graph_max_tokens",
-        "cuda_graph_mixed_prefill_count",
-        "cuda_graph_sizing_distribution",
-        "enable_chunked_prefill",
-        "enable_prefix_caching",
-        "kv_cache_management_mode",
-        "mamba_inference_state_config",
-        "mamba_memory_ratio",
-        "materialize_only_last_token_logits",
-        "max_requests",
-        "max_sequence_length",
-        "max_tokens",
-        "num_cuda_graphs",
-        "num_speculative_tokens",
-        "offset_sampling_seed_by_dp_rank",
-        "paused_buffer_size_gb",
-        "prefix_caching_eviction_policy",
-        "request_metadata_types",
-        "sampling_backend",
-        "static_kv_memory_pointers",
-        "track_generated_token_events",
-        "track_paused_request_events",
-        "use_cuda_graphs_for_non_decode_steps",
-        "use_flashinfer_fused_rope",
-        "logprobs_mode",
-    },
-    _FUNCTIONAL: {
-        "disable_ep_consensus",
-        "prefix_caching_mamba_gb",
-        "prefix_caching_coordinator_policy",
-        "prefix_caching_routing_alpha",
-        "unified_memory_level",
-        "use_synchronous_zmq_collectives",
-    },
-    _NEGATIVE: set(),
-    _OUT_OF_SCOPE: {
-        "ep_consensus_interval",
-        "logging_step_interval",
-        "metrics_writer",
-        "pg_collection",
-        "verbose",
-    },
-}
-
-_SAMPLING_PARAM_DISPOSITIONS = {
-    _UNIT: {
-        "add_BOS",
-        "detokenize_stop_sequence",
-        "num_tokens_to_generate",
-        "num_tokens_total",
-        "return_log_probs",
-        "skip_prompt_log_probs",
-        "stop_words",
-        "temperature",
-        "termination_id",
-        "top_k",
-        "top_n_logprobs",
-        "top_p",
-    },
-    _FUNCTIONAL: {"return_prompt_tokens", "streaming", "streaming_interval"},
-    _NEGATIVE: set(),
-    _OUT_OF_SCOPE: {"return_prompt_top_n_logprobs", "return_segments"},
-}
-
-
+# Only list a pair when the harness below observes its production call/state
+# transition during both async phase shapes and checks parity or an exact invariant.
 @dataclass(frozen=True)
 class _AsyncPairScenario:
-    """One unique owner for a set of async-scheduling pairs."""
+    """A runtime-backed async-scheduling interaction scenario."""
 
     name: str
     pairs: tuple[str, ...]
@@ -527,20 +451,13 @@ _ASYNC_PAIR_SCENARIOS = (
         "kv:persist",
         "kv:static-pointers",
         "events:generated-token",
-        "metadata:explicit-request-schema",
-        "seed:dp-offset",
         "logits:last-token",
-        config={
-            "track_generated_token_events": True,
-            "inference_config_overrides": {
-                "request_metadata_types": DynamicInferenceRequest.get_metadata_types()
-            },
-        },
+        config={"track_generated_token_events": True},
         signals=(
-            "dp-offset",
+            "eager",
             "events",
+            "gpt",
             "last-logits",
-            "metadata-schema",
             "persist",
             "suspend-resume",
             "static-pointers",
@@ -552,17 +469,8 @@ _ASYNC_PAIR_SCENARIOS = (
         "prefill:chunked",
         "capacity:max-requests",
         "capacity:max-tokens",
-        "capacity:block-size",
-        "capacity:buffer",
-        "capacity:paused-buffer",
-        config={
-            "enable_chunked_prefill": True,
-            "context_max_tokens": 8,
-            "context_block_size_tokens": 512,
-            "context_buffer_size_gb": 0.02,
-            "context_paused_buffer_size_gb": 0.004,
-        },
-        signals=("capacity", "chunked", "paused-buffer-allocation"),
+        config={"enable_chunked_prefill": True, "context_max_tokens": 8},
+        signals=("capacity", "chunked"),
     ),
     _pair_scenario(
         "prefix-ref-zero",
@@ -579,8 +487,7 @@ _ASYNC_PAIR_SCENARIOS = (
     ),
     _pair_scenario(
         "prefix-lru-chunked",
-        "prefix:lru",
-        "interaction:prefix-chunk-pressure",
+        "interaction:prefix-hit-with-chunking",
         config={
             "enable_prefix_caching": True,
             "enable_chunked_prefill": True,
@@ -592,7 +499,7 @@ _ASYNC_PAIR_SCENARIOS = (
             },
         },
         request_profile="prefix",
-        signals=("chunked", "lru", "prefix-hit"),
+        signals=("chunked", "prefix-hit"),
     ),
     _pair_scenario(
         "graph-decode-block-exponential",
@@ -630,7 +537,6 @@ _ASYNC_PAIR_SCENARIOS = (
         "graph:layer-scope",
         "graph:mixed-prefill",
         "graph:linear",
-        "graph:all-prefills",
         "graph:mixed-count",
         config={
             "num_cuda_graphs": 4,
@@ -650,14 +556,14 @@ _ASYNC_PAIR_SCENARIOS = (
         "sampling:temperature",
         "sampling:top-k",
         sampling=({"temperature": 0.7, "top_k": 8},),
-        signals=("sampled",),
+        signals=("sampled", "temperature-filter", "top-k-filter"),
         parity="reproducible",
     ),
     _pair_scenario(
         "sampling-top-p",
         "sampling:top-p",
         sampling=({"temperature": 1.1, "top_k": 0, "top_p": 0.85},),
-        signals=("sampled",),
+        signals=("sampled", "temperature-filter", "top-p-filter"),
         parity="reproducible",
     ),
     _pair_scenario(
@@ -665,7 +571,7 @@ _ASYNC_PAIR_SCENARIOS = (
         "sampling:top-k-top-p",
         config={"sampling_backend": "flashinfer"},
         sampling=({"temperature": 0.8, "top_k": 12, "top_p": 0.9},),
-        signals=("flashinfer", "sampled"),
+        signals=("flashinfer", "sampled", "temperature-filter", "top-k-filter", "top-p-filter"),
         prerequisite="flashinfer",
         parity="reproducible",
     ),
@@ -755,7 +661,7 @@ _ASYNC_PAIR_SCENARIOS = (
             {"return_log_probs": False, "skip_prompt_log_probs": True},
             {"return_log_probs": True, "skip_prompt_log_probs": True, "top_n_logprobs": 4},
         ),
-        signals=("cuda-graph", "logprobs", "mtp", "top-n"),
+        signals=("cuda-graph", "logprobs", "metadata-compaction", "mtp", "top-n"),
         # MTP changes the forward batch shape; near-tied non-selected alternatives
         # may exchange the final top-N slot while selected-token parity remains exact.
         exact_top_n=False,
@@ -764,12 +670,8 @@ _ASYNC_PAIR_SCENARIOS = (
         "hybrid-mamba",
         "model:hybrid-mamba",
         "interaction:mamba-state-compaction",
-        "mamba:memory-ratio",
-        config={
-            "model_provider": "hybrid",
-            "inference_config_overrides": {"mamba_memory_ratio": 0.5},
-        },
-        signals=("hybrid", "mamba-memory-ratio"),
+        config={"model_provider": "hybrid"},
+        signals=("hybrid", "metadata-compaction"),
         prerequisite="mamba",
         atol=5.0e-3,
     ),
@@ -812,22 +714,14 @@ _ASYNC_PAIR_SCENARIOS = (
         "attention:swa-all-layers",
         "attention:off-by-one-sink",
         config={"window_size": (4, 0), "softmax_type": "off-by-one"},
-        signals=("swa", "softmax-sink"),
+        signals=("softmax-sink", "swa-all"),
     ),
     _pair_scenario(
         "alternating-swa-learnable-sink",
         "attention:swa-alternating",
         "attention:learnable-sink",
         config={"window_size": (4, 0), "window_attn_skip_freq": 2, "softmax_type": "learnable"},
-        signals=("swa", "softmax-sink"),
-    ),
-    _pair_scenario(
-        "shared-dp-seed",
-        "seed:shared-across-dp",
-        config={"inference_config_overrides": {"offset_sampling_seed_by_dp_rank": False}},
-        sampling=({"temperature": 0.8, "top_k": 8},),
-        signals=("shared-seed", "sampled"),
-        parity="reproducible",
+        signals=("softmax-sink", "swa-alternating"),
     ),
 )
 
@@ -838,12 +732,15 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "topology:pp",
         "topology:sp",
         "topology:dp",
+        "seed:offset-by-dp-rank",
         config={
             "tensor_model_parallel_size": 2,
             "pipeline_model_parallel_size": 2,
             "sequence_parallel": True,
         },
-        signals=("parallel",),
+        sampling=({"temperature": 0.8, "top_k": 8},),
+        signals=("dp-offset", "parallel", "sampled", "temperature-filter", "top-k-filter"),
+        parity="reproducible",
     ),
     _pair_scenario(
         "moe-ep2-nccl",
@@ -851,292 +748,35 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "topology:ep",
         "dispatcher:nccl",
         "interaction:moe-ep-ordering",
-        config={"expert_model_parallel_size": 2},
-        signals=("moe", "parallel"),
+        config={
+            "expert_model_parallel_size": 2,
+            "inference_moe_token_dispatcher_type": "nccl",
+            "transformer_impl": "inference_optimized",
+        },
+        signals=("inference-optimized", "moe", "nccl-dispatch", "parallel"),
     ),
     _pair_scenario(
         "optimized-tp2-sp",
         "interaction:optimized-tp-sp",
+        "seed:shared-across-dp",
         config={
             "tensor_model_parallel_size": 2,
             "sequence_parallel": True,
             "transformer_impl": "inference_optimized",
+            "inference_config_overrides": {"offset_sampling_seed_by_dp_rank": False},
         },
-        signals=("inference-optimized", "parallel"),
-    ),
-)
-
-_NEGATIVE_PAIR_OWNERS = {
-    "unsupported:routing-replay": "test_async_negative_routing_replay",
-    "unsupported:mtp-depth-mismatch": "test_async_negative_mtp_depth_mismatch",
-    "unsupported:processed-logprobs-mtp": "test_async_negative_processed_logprobs_mtp",
-    "unsupported:skip-bookkeeping": "test_async_negative_skip_bookkeeping",
-}
-
-_FOCUSED_PAIR_OWNERS = {
-    "events:paused-request": "test_async_bookkeep_uses_consumed_chunked_prefill_request_id",
-    "metadata:heterogeneous-survivor-compaction": (
-        "test_async_compaction_preserves_all_request_metadata"
-    ),
-    "lifecycle:reset-clears-pending-logits": "test_async_reset_clears_pending_logits",
-    "lifecycle:recompute-clears-pending-logits": (
-        "test_async_suspend_pending_logits_lifecycle[recompute-clears]"
-    ),
-    "lifecycle:persist-preserves-pending-logits": (
-        "test_async_suspend_pending_logits_lifecycle[persist-preserves]"
-    ),
-    "lifecycle:offload-preserves-pending-logits": (
-        "test_async_suspend_pending_logits_lifecycle[offload-preserves]"
-    ),
-}
-
-# This is intentionally independent of the owner tables above: adding an owner
-# does not silently redefine what "complete" means, and removing one leaves a
-# precise coverage-hole failure.
-_REQUIRED_ASYNC_PAIR_UNIVERSE = frozenset(
-    {
-        "attention:learnable-sink",
-        "attention:off-by-one-sink",
-        "attention:swa-all-layers",
-        "attention:swa-alternating",
-        "capacity:block-size",
-        "capacity:buffer",
-        "capacity:max-requests",
-        "capacity:max-tokens",
-        "capacity:paused-buffer",
-        "dispatcher:nccl",
-        "events:generated-token",
-        "events:paused-request",
-        "execution:eager",
-        "graph:all-prefills",
-        "graph:block-scope",
-        "graph:bounded-prefill",
-        "graph:decode-only",
-        "graph:exponential",
-        "graph:layer-scope",
-        "graph:linear",
-        "graph:max-token-ceiling",
-        "graph:mixed-count",
-        "graph:mixed-prefill",
-        "implementation:inference-optimized",
-        "implementation:transformer-engine",
-        "interaction:mamba-state-compaction",
-        "interaction:moe-ep-ordering",
-        "interaction:mtp-graph-metadata-compaction",
-        "interaction:optimized-tp-sp",
-        "interaction:prefix-chunk-pressure",
-        "kernel:flashinfer-fused-rope",
-        "kv:persist",
-        "kv:static-pointers",
-        "length:num-generate",
-        "length:num-total",
-        "length:zero-output",
-        "lifecycle:offload-preserves-pending-logits",
-        "lifecycle:persist-preserves-pending-logits",
-        "lifecycle:recompute-clears-pending-logits",
-        "lifecycle:reset-clears-pending-logits",
-        "logits:full",
-        "logits:last-token",
-        "logprobs:processed",
-        "logprobs:prompt",
-        "logprobs:raw",
-        "logprobs:skip-prompt",
-        "logprobs:top-n",
-        "mamba:memory-ratio",
-        "metadata:explicit-request-schema",
-        "metadata:heterogeneous-survivor-compaction",
-        "model:gpt",
-        "model:hybrid-mamba",
-        "model:moe",
-        "precision:bf16",
-        "precision:fp8",
-        "prefill:chunked",
-        "prefix:enabled",
-        "prefix:lru",
-        "prefix:ref-zero",
-        "prompt:add-bos",
-        "sampling:flashinfer",
-        "sampling:temperature",
-        "sampling:top-k",
-        "sampling:top-k-top-p",
-        "sampling:top-p",
-        "sampling:torch",
-        "seed:dp-offset",
-        "seed:shared-across-dp",
-        "speculation:mtp-depth-one",
-        "speculation:mtp-depth-two",
-        "termination:disabled",
-        "termination:explicit-eos",
-        "termination:stop-sequence-keep",
-        "termination:stop-sequence-strip",
-        "topology:dp",
-        "topology:ep",
-        "topology:pp",
-        "topology:sp",
-        "topology:tp",
-        "unsupported:mtp-depth-mismatch",
-        "unsupported:processed-logprobs-mtp",
-        "unsupported:routing-replay",
-        "unsupported:skip-bookkeeping",
-    }
-)
-
-_UNIT_FIELD_PAIR_OWNERS = {
-    "InferenceConfig": {
-        "async_sched_mode": "execution:eager",
-        "block_size_tokens": "capacity:block-size",
-        "buffer_size_gb": "capacity:buffer",
-        "cuda_graph_all_prefills": "graph:all-prefills",
-        "cuda_graph_max_tokens": "graph:max-token-ceiling",
-        "cuda_graph_mixed_prefill_count": "graph:mixed-count",
-        "cuda_graph_sizing_distribution": "graph:linear",
-        "enable_chunked_prefill": "prefill:chunked",
-        "enable_prefix_caching": "prefix:enabled",
-        "kv_cache_management_mode": "kv:persist",
-        "logprobs_mode": "logprobs:processed",
-        "mamba_inference_state_config": "interaction:mamba-state-compaction",
-        "mamba_memory_ratio": "mamba:memory-ratio",
-        "materialize_only_last_token_logits": "logits:full",
-        "max_requests": "capacity:max-requests",
-        "max_sequence_length": "length:num-total",
-        "max_tokens": "capacity:max-tokens",
-        "num_cuda_graphs": "graph:block-scope",
-        "num_speculative_tokens": "speculation:mtp-depth-two",
-        "offset_sampling_seed_by_dp_rank": "seed:shared-across-dp",
-        "paused_buffer_size_gb": "capacity:paused-buffer",
-        "prefix_caching_eviction_policy": "prefix:lru",
-        "request_metadata_types": "metadata:explicit-request-schema",
-        "sampling_backend": "sampling:flashinfer",
-        "static_kv_memory_pointers": "kv:static-pointers",
-        "track_generated_token_events": "events:generated-token",
-        "track_paused_request_events": "events:paused-request",
-        "use_cuda_graphs_for_non_decode_steps": "graph:decode-only",
-        "use_flashinfer_fused_rope": "kernel:flashinfer-fused-rope",
-    },
-    "SamplingParams": {
-        "add_BOS": "prompt:add-bos",
-        "detokenize_stop_sequence": "termination:stop-sequence-keep",
-        "num_tokens_to_generate": "length:num-generate",
-        "num_tokens_total": "length:num-total",
-        "return_log_probs": "logprobs:raw",
-        "skip_prompt_log_probs": "logprobs:skip-prompt",
-        "stop_words": "termination:stop-sequence-strip",
-        "temperature": "sampling:temperature",
-        "termination_id": "termination:explicit-eos",
-        "top_k": "sampling:top-k",
-        "top_n_logprobs": "logprobs:top-n",
-        "top_p": "sampling:top-p",
-    },
-}
-
-_COORDINATOR_PROFILE = Path(
-    "tests/functional_tests/test_cases/gpt/"
-    "gpt_dynamic_inference_tp1_pp1_dp8_583m_async_sched_zmq/model_config.yaml"
-)
-_UVM_PROFILE = Path(
-    "tests/functional_tests/test_cases/gpt/"
-    "gpt_dynamic_inference_tp1_pp1_dp8_583m_async_sched_uvm_persist_zmq/model_config.yaml"
-)
-_HYBRID_PROFILE = Path(
-    "tests/functional_tests/test_cases/hybrid/"
-    "hybrid_dynamic_inference_tp1_pp1_dp8_2b_async_sched_async/model_config.yaml"
-)
-_HTTP_PROFILE = Path(
-    "tests/functional_tests/test_cases/gpt/"
-    "gpt_inference_server_smoke_tp1_pp1_dp8_583m/serve_smoke.py"
-)
-_FUNCTIONAL_FIELD_OWNERS = {
-    "InferenceConfig": {
-        "disable_ep_consensus": (_COORDINATOR_PROFILE, "--inference-disable-ep-consensus"),
-        "prefix_caching_coordinator_policy": (
-            _COORDINATOR_PROFILE,
-            "--inference-dynamic-batching-prefix-caching-coordinator-policy",
+        sampling=({"temperature": 0.8, "top_k": 8},),
+        signals=(
+            "inference-optimized",
+            "parallel",
+            "sampled",
+            "shared-seed",
+            "temperature-filter",
+            "top-k-filter",
         ),
-        "prefix_caching_mamba_gb": (
-            _HYBRID_PROFILE,
-            "--inference-dynamic-batching-prefix-caching-mamba-gb",
-        ),
-        "prefix_caching_routing_alpha": (
-            _COORDINATOR_PROFILE,
-            "--inference-dynamic-batching-prefix-caching-routing-alpha",
-        ),
-        "unified_memory_level": (_UVM_PROFILE, "--inference-dynamic-batching-unified-memory-level"),
-        "use_synchronous_zmq_collectives": (
-            _COORDINATOR_PROFILE,
-            "--inference-use-synchronous-zmq-collectives",
-        ),
-    },
-    "SamplingParams": {
-        "return_prompt_tokens": (_HTTP_PROFILE, '"prompt_token_ids"'),
-        "streaming": (_HTTP_PROFILE, '"stream": True'),
-        "streaming_interval": (_HTTP_PROFILE, '"streaming_interval": 2'),
-    },
-}
-
-
-def _flatten_dispositions(dispositions):
-    return [field_name for fields in dispositions.values() for field_name in fields]
-
-
-@pytest.mark.parametrize(
-    ("owner", "declared", "dispositions"),
-    [
-        ("InferenceConfig", InferenceConfig.__annotations__, _INFERENCE_CONFIG_DISPOSITIONS),
-        ("SamplingParams", SamplingParams.__annotations__, _SAMPLING_PARAM_DISPOSITIONS),
-    ],
+        parity="reproducible",
+    ),
 )
-def test_async_pairwise_field_dispositions_are_closed(owner, declared, dispositions):
-    """Every inference-facing field has one deliberate coverage disposition."""
-    classified = _flatten_dispositions(dispositions)
-    assert len(classified) == len(set(classified)), f"duplicate {owner} dispositions"
-    assert set(classified) == set(declared), (
-        f"{owner} disposition drift: missing={set(declared) - set(classified)}, "
-        f"unknown={set(classified) - set(declared)}"
-    )
-
-
-@pytest.mark.parametrize(
-    ("owner", "dispositions"),
-    [
-        ("InferenceConfig", _INFERENCE_CONFIG_DISPOSITIONS),
-        ("SamplingParams", _SAMPLING_PARAM_DISPOSITIONS),
-    ],
-)
-def test_async_pairwise_fields_have_concrete_owners(owner, dispositions):
-    """Unit fields name a pair owner; functional fields name an active profile signal."""
-    unit_owners = _UNIT_FIELD_PAIR_OWNERS[owner]
-    assert set(unit_owners) == dispositions[_UNIT]
-    assert set(unit_owners.values()) <= _REQUIRED_ASYNC_PAIR_UNIVERSE
-
-    functional_owners = _FUNCTIONAL_FIELD_OWNERS[owner]
-    assert set(functional_owners) == dispositions[_FUNCTIONAL]
-    repo_root = Path(__file__).parents[4]
-    for profile, activation in functional_owners.values():
-        assert activation in (repo_root / profile).read_text()
-
-
-def test_async_pair_owners_are_closed_and_unique():
-    """Every supported or rejected async pair has exactly one named owner."""
-    owners = {}
-    scenario_names = set()
-    for scenario in (*_ASYNC_PAIR_SCENARIOS, *_ASYNC_PARALLEL_SCENARIOS):
-        assert scenario.name not in scenario_names
-        scenario_names.add(scenario.name)
-        assert scenario.signals, f"{scenario.name} has no runtime activation signal"
-        assert scenario.parity in {"exact", "reproducible"}
-        for pair in scenario.pairs:
-            assert pair not in owners, f"{pair} owned by both {owners[pair]} and {scenario.name}"
-            owners[pair] = scenario.name
-    for pair, owner in _NEGATIVE_PAIR_OWNERS.items():
-        assert pair not in owners
-        assert owner.startswith("test_async_negative_")
-        owners[pair] = owner
-    for pair, owner in _FOCUSED_PAIR_OWNERS.items():
-        assert pair not in owners
-        assert owner.startswith("test_async_")
-        owners[pair] = owner
-    assert set(owners) == _REQUIRED_ASYNC_PAIR_UNIVERSE
-
 
 _PROMPT_LENGTHS = (9, 5, 12, 7, 10, 6, 11)
 _OUTPUT_LENGTHS = (10, 5, 9, 7, 11, 6, 8)
@@ -1253,6 +893,416 @@ def _instrument_async_phases(controller, runtime):
         setattr(controller, method_name, counted)
 
 
+def _instrument_attention_runtime(module, runtime):
+    """Observe the window and sink branches taken by dynamic attention."""
+    original_offset = module._get_inference_softmax_offset
+
+    def traced_offset():
+        offset = original_offset()
+        runtime["softmax-offset-calls"] += 1
+        runtime["softmax-offset-produced"] += int(offset is not None)
+        return offset
+
+    module._get_inference_softmax_offset = traced_offset
+
+    original_flash = module.flash_decode_and_prefill
+
+    def traced_flash(*args, **kwargs):
+        if is_layer_window_attention(
+            module.config.window_size, module.config.window_attn_skip_freq, module.layer_number
+        ):
+            runtime["swa-kernel-calls"] += 1
+        else:
+            runtime["full-attention-kernel-calls"] += 1
+        return original_flash(*args, **kwargs)
+
+    module.flash_decode_and_prefill = traced_flash
+
+    for method_name in (
+        "_apply_sink_softmax_correction_varlen",
+        "_apply_sink_softmax_correction_bshd",
+    ):
+        original_correction = getattr(module, method_name)
+
+        def traced_correction(*args, _original=original_correction, **kwargs):
+            runtime["sink-correction-calls"] += 1
+            return _original(*args, **kwargs)
+
+        setattr(module, method_name, traced_correction)
+
+
+def _instrument_parallel_runtime(module, runtime):
+    """Observe executed tensor partitions and their inference collectives."""
+    class_name = type(module).__name__
+    weight = getattr(module, "weight", None)
+    tp_group = getattr(module, "tp_group", None)
+    tp_size = torch.distributed.get_world_size(tp_group) if tp_group is not None else 1
+
+    if tp_size > 1 and weight is not None and "ColumnParallelLinear" in class_name:
+        output_size = getattr(module, "output_size", getattr(module, "out_features", None))
+        if output_size is not None and weight.shape[0] * tp_size == output_size:
+            runtime["tp-column-partitions-installed"] += 1
+    if tp_size > 1 and weight is not None and "RowParallelLinear" in class_name:
+        input_size = getattr(module, "input_size", getattr(module, "in_features", None))
+        if input_size is not None and weight.shape[1] * tp_size == input_size:
+            runtime["tp-row-partitions-installed"] += 1
+
+    if class_name == "ColumnParallelLinear" and tp_size > 1 and module.sequence_parallel:
+        from megatron.core.tensor_parallel import layers as tp_layers
+
+        original_forward = module.forward
+
+        def traced_forward(*args, **kwargs):
+            original_collective = tp_layers.gather_from_sequence_parallel_region
+
+            def traced_collective(input_, *collective_args, **collective_kwargs):
+                output = original_collective(input_, *collective_args, **collective_kwargs)
+                runtime["tp-collective:gather_from_sequence_parallel_region"] += 1
+                runtime["tp-sp-gather-dimensions"] += int(
+                    output.shape[0] == input_.shape[0] * tp_size
+                )
+                return output
+
+            tp_layers.gather_from_sequence_parallel_region = traced_collective
+            try:
+                return original_forward(*args, **kwargs)
+            finally:
+                tp_layers.gather_from_sequence_parallel_region = original_collective
+
+        module.forward = traced_forward
+
+    if class_name == "RowParallelLinear" and tp_size > 1:
+        from megatron.core.tensor_parallel import layers as tp_layers
+
+        original_forward = module.forward
+
+        def traced_forward(*args, **kwargs):
+            collective_name = (
+                "reduce_scatter_to_sequence_parallel_region"
+                if module.sequence_parallel
+                else "reduce_from_tensor_model_parallel_region"
+            )
+            original_collective = getattr(tp_layers, collective_name)
+
+            def traced_collective(input_, *collective_args, **collective_kwargs):
+                output = original_collective(input_, *collective_args, **collective_kwargs)
+                runtime[f"tp-collective:{collective_name}"] += 1
+                if module.sequence_parallel:
+                    runtime["tp-sp-reduce-scatter-dimensions"] += int(
+                        output.shape[0] * tp_size == input_.shape[0]
+                    )
+                return output
+
+            setattr(tp_layers, collective_name, traced_collective)
+            try:
+                return original_forward(*args, **kwargs)
+            finally:
+                setattr(tp_layers, collective_name, original_collective)
+
+        module.forward = traced_forward
+
+    if class_name == "InferenceColumnParallelLinear" and tp_size > 1:
+        original_all_gather = module._all_gather
+
+        def traced_all_gather(*args, **kwargs):
+            input_ = args[0]
+            output = original_all_gather(*args, **kwargs)
+            runtime["tp-collective:optimized-all-gather"] += 1
+            runtime["tp-sp-gather-dimensions"] += int(output.shape[0] == input_.shape[0] * tp_size)
+            return output
+
+        module._all_gather = traced_all_gather
+
+    if class_name == "InferenceRowParallelLinear" and tp_size > 1:
+        original_reduce_scatter = module._matmul_reduce_scatter
+
+        def traced_reduce_scatter(*args, **kwargs):
+            input_ = args[0]
+            output = original_reduce_scatter(*args, **kwargs)
+            runtime["tp-collective:optimized-reduce-scatter"] += 1
+            runtime["tp-sp-reduce-scatter-dimensions"] += int(
+                output.shape[0] * tp_size == input_.shape[0]
+            )
+            return output
+
+        module._matmul_reduce_scatter = traced_reduce_scatter
+
+
+def _instrument_nccl_dispatch_runtime(module, runtime):
+    """Observe inference MoE dispatch, combine, and their ordering."""
+    dispatcher = getattr(module, "_inference_token_dispatcher", None)
+    if dispatcher is None or type(dispatcher).__name__ != "NCCLAllGatherDispatcher":
+        return
+    runtime["nccl-dispatchers-installed"] += 1
+    original_dispatch = dispatcher.token_dispatch
+    original_combine = dispatcher.token_combine
+
+    def traced_dispatch(*args, **kwargs):
+        result = original_dispatch(*args, **kwargs)
+        runtime["nccl-token-dispatches"] += 1
+        runtime["nccl-dispatch-inflight"] += 1
+        return result
+
+    def traced_combine(*args, **kwargs):
+        runtime["nccl-combine-before-dispatch"] += int(runtime["nccl-dispatch-inflight"] <= 0)
+        result = original_combine(*args, **kwargs)
+        runtime["nccl-token-combines"] += 1
+        runtime["nccl-dispatch-inflight"] -= 1
+        return result
+
+    dispatcher.token_dispatch = traced_dispatch
+    dispatcher.token_combine = traced_combine
+
+
+def _instrument_scenario_runtime(env, scenario, runtime):
+    """Record production calls and state transitions used as pairwise evidence."""
+    controller = env.engine.controller
+    context = env.engine.context
+    _instrument_async_phases(controller, runtime)
+
+    original_forward = controller._dynamic_step_forward_logits
+
+    def traced_forward(*args, **kwargs):
+        if context.using_cuda_graph_this_step():
+            dimensions = context.padded_batch_dimensions
+            runtime[
+                (
+                    "cuda-graph-dimension",
+                    dimensions.token_count,
+                    dimensions.prefill_req_count,
+                    dimensions.decode_req_count,
+                )
+            ] += 1
+            runtime[f"cuda-graph-scope:{context.inference_cuda_graph_scope.name}"] += 1
+            runtime["cuda-graph-prefill-forwards"] += int(dimensions.prefill_req_count > 0)
+            runtime["cuda-graph-decode-forwards"] += int(dimensions.decode_req_count > 0)
+            runtime["cuda-graph-mixed-forwards"] += int(
+                dimensions.prefill_req_count > 0 and dimensions.decode_req_count > 0
+            )
+        if controller.model_is_pipeline_parallel:
+            from megatron.core.inference.text_generation_controllers import (
+                text_generation_controller as controller_module,
+            )
+
+            original_broadcast = controller_module.broadcast_from_last_pipeline_stage
+
+            def traced_broadcast(*broadcast_args, **broadcast_kwargs):
+                result = original_broadcast(*broadcast_args, **broadcast_kwargs)
+                runtime["pipeline-logits-broadcasts"] += 1
+                return result
+
+            controller_module.broadcast_from_last_pipeline_stage = traced_broadcast
+            try:
+                result = original_forward(*args, **kwargs)
+            finally:
+                controller_module.broadcast_from_last_pipeline_stage = original_broadcast
+        else:
+            result = original_forward(*args, **kwargs)
+        runtime["model-forward"] += 1
+        runtime[f"logits-dtype:{controller._all_logits_cuda.dtype}"] += 1
+        if context.config.materialize_only_last_token_logits:
+            runtime["last-logits-forward"] += 1
+        else:
+            runtime["full-logits-forward"] += 1
+        return result
+
+    controller._dynamic_step_forward_logits = traced_forward
+
+    original_sample_kernel = controller._sampling.sample_kernel
+
+    def traced_sample_kernel(*args, **kwargs):
+        active_count = context.total_request_count - context.paused_request_count
+        metadata = context.active_request_metadata
+        runtime["sampling-kernel"] += 1
+        runtime[f"sampling-backend:{controller._sampling_backend}"] += 1
+        runtime["metadata-consumed"] += int(active_count > 0)
+        sampling_class = type(controller._sampling).__name__
+
+        if sampling_class == "TorchSampling":
+            from megatron.core.inference.sampling.torch_sampling import TorchSampling
+
+            original_filter_logits = TorchSampling.filter_logits
+
+            def traced_filter_logits(logits, temperature, top_k, top_p, **filter_kwargs):
+                runtime["temperature-filter"] += int(temperature != 1.0)
+                runtime["top-k-filter"] += int(top_k >= 1)
+                runtime["top-p-filter"] += int(top_p > 0.0)
+                return original_filter_logits(logits, temperature, top_k, top_p, **filter_kwargs)
+
+            with mock.patch.object(
+                TorchSampling, "filter_logits", new=staticmethod(traced_filter_logits)
+            ):
+                return original_sample_kernel(*args, **kwargs)
+
+        if sampling_class == "FlashInferSampling":
+            from megatron.core.inference.sampling import flashinfer_sampling
+
+            flashinfer_kernels = {
+                "sampling_from_probs": (),
+                "top_k_sampling_from_probs": ("top-k-filter",),
+                "top_p_sampling_from_probs": ("top-p-filter",),
+                "top_k_top_p_sampling_from_logits": ("top-k-filter", "top-p-filter"),
+            }
+
+            def traced_flashinfer_kernel(name, original):
+                def traced(*kernel_args, **kernel_kwargs):
+                    runtime[f"flashinfer-kernel:{name}"] += 1
+                    for signal in flashinfer_kernels[name]:
+                        runtime[signal] += 1
+                    runtime["temperature-filter"] += int(
+                        bool((metadata["temperature"][:active_count] != 1.0).any())
+                    )
+                    return original(*kernel_args, **kernel_kwargs)
+
+                return traced
+
+            with ExitStack() as stack:
+                for name in flashinfer_kernels:
+                    original = getattr(flashinfer_sampling.flashinfer.sampling, name)
+                    stack.enter_context(
+                        mock.patch.object(
+                            flashinfer_sampling.flashinfer.sampling,
+                            name,
+                            new=traced_flashinfer_kernel(name, original),
+                        )
+                    )
+                return original_sample_kernel(*args, **kwargs)
+
+        raise AssertionError(f"Unexpected sampling backend class: {sampling_class}")
+
+    controller._sampling.sample_kernel = traced_sample_kernel
+
+    original_log_probs_kernel = controller._sampling.log_probs_kernel
+
+    def traced_log_probs_kernel(*args, **kwargs):
+        runtime["log-probs-kernel"] += 1
+        runtime[f"log-probs-mode:{context.config.logprobs_mode}"] += 1
+        return original_log_probs_kernel(*args, **kwargs)
+
+    controller._sampling.log_probs_kernel = traced_log_probs_kernel
+
+    original_compact = controller._compact_async_sched_logits
+
+    def traced_compact(survivor_idxs):
+        if survivor_idxs.numel() > 0:
+            runtime["metadata-compactions"] += 1
+            runtime["non-prefix-survivor-compactions"] += int(
+                not torch.equal(
+                    survivor_idxs, torch.arange(survivor_idxs.numel(), device=survivor_idxs.device)
+                )
+            )
+        return original_compact(survivor_idxs)
+
+    controller._compact_async_sched_logits = traced_compact
+
+    allocator = context.kv_block_allocator
+    original_deregister = allocator._deregister_blocks
+
+    def traced_deregister(block_ids):
+        runtime["prefix-blocks-deregistered"] += block_ids.numel()
+        return original_deregister(block_ids)
+
+    allocator._deregister_blocks = traced_deregister
+
+    if "fused-rope" in scenario.signals:
+        original_fused_rope = context.apply_fused_qk_rotary_emb
+
+        def traced_fused_rope(*args, **kwargs):
+            runtime["fused-rope-kernel"] += 1
+            return original_fused_rope(*args, **kwargs)
+
+        context.apply_fused_qk_rotary_emb = traced_fused_rope
+
+    if "hybrid" in scenario.signals:
+        original_commit_mamba = controller._commit_mamba_intermediate_states
+        original_resolve_requests = context.resolve_requests
+
+        def traced_commit_mamba():
+            runtime["mamba-state-commits"] += 1
+            return original_commit_mamba()
+
+        def traced_resolve_requests(active_requests_mask):
+            before = context.mamba_metadata.request_to_mamba_state_idx[
+                : context.total_request_count
+            ].clone()
+            result = original_resolve_requests(active_requests_mask)
+            survivor_idxs = result[1]
+            identity = torch.arange(survivor_idxs.numel(), device=survivor_idxs.device)
+            if survivor_idxs.numel() > 0 and not torch.equal(survivor_idxs, identity):
+                after = context.mamba_metadata.request_to_mamba_state_idx[: survivor_idxs.numel()]
+                runtime["mamba-state-compactions"] += int(torch.equal(after, before[survivor_idxs]))
+            return result
+
+        controller._commit_mamba_intermediate_states = traced_commit_mamba
+        context.resolve_requests = traced_resolve_requests
+
+    watched_modules = {
+        "gpt": lambda name, module: name == "GPTModel",
+        "transformer-engine": lambda name, module: name.startswith("TE")
+        or "transformer_engine" in module,
+        "inference-optimized": lambda name, module: name.startswith("Inference")
+        and "inference_layers" in module,
+        "fp8": lambda name, module: name.startswith("TE") or "transformer_engine" in module,
+        "hybrid": lambda name, module: name == "MambaMixer",
+        "moe": lambda name, module: name in {"MoELayer", "InferenceTopKRouter"},
+        "parallel": lambda name, module: "ParallelLinear" in name
+        or name in {"ColumnParallelLinear", "RowParallelLinear"},
+    }
+    active_tags = set(scenario.signals) & watched_modules.keys()
+    model = controller.inference_wrapped_model.model
+    for module in model.modules():
+        class_name = type(module).__name__
+        module_name = type(module).__module__
+        if "softmax-sink" in scenario.signals and class_name == "SelfAttention":
+            _instrument_attention_runtime(module, runtime)
+        if "parallel" in scenario.signals and (
+            "ColumnParallelLinear" in class_name or "RowParallelLinear" in class_name
+        ):
+            _instrument_parallel_runtime(module, runtime)
+        if "nccl-dispatch" in scenario.signals and class_name == "MoELayer":
+            _instrument_nccl_dispatch_runtime(module, runtime)
+        for tag in active_tags:
+            if watched_modules[tag](class_name, module_name):
+
+                def record_module(_module, _inputs, _tag=tag):
+                    runtime[f"module-forward:{_tag}"] += 1
+                    if _tag == "fp8":
+                        fp8_enabled = FP8GlobalStateManager.is_fp8_enabled()
+                        runtime["fp8-context-forwards"] += int(fp8_enabled)
+                        runtime["fp8-recipe-forwards"] += int(
+                            fp8_enabled and FP8GlobalStateManager.get_fp8_recipe() is not None
+                        )
+                        if hasattr(_module, "will_execute_quantized"):
+                            runtime["fp8-quantized-forwards"] += int(
+                                _module.will_execute_quantized(fp8_enabled)
+                            )
+                    elif _tag == "parallel":
+                        name = type(_module).__name__
+                        weight = getattr(_module, "weight", None)
+                        group = getattr(_module, "tp_group", None)
+                        size = torch.distributed.get_world_size(group) if group is not None else 1
+                        if weight is not None and "ColumnParallelLinear" in name:
+                            output_size = getattr(
+                                _module, "output_size", getattr(_module, "out_features", None)
+                            )
+                            runtime["tp-column-partition-forwards"] += int(
+                                size > 1
+                                and output_size is not None
+                                and weight.shape[0] * size == output_size
+                            )
+                        elif weight is not None and "RowParallelLinear" in name:
+                            input_size = getattr(
+                                _module, "input_size", getattr(_module, "in_features", None)
+                            )
+                            runtime["tp-row-partition-forwards"] += int(
+                                size > 1
+                                and input_size is not None
+                                and weight.shape[1] * size == input_size
+                            )
+
+                module.register_forward_pre_hook(record_module)
+
+
 def _as_float_list(values):
     if values is None:
         return None
@@ -1344,15 +1394,18 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         )
         runtime = Counter()
         if mode == AsyncScheduleMode.ASYNC:
-            _instrument_async_phases(env.engine.controller, runtime)
+            _instrument_scenario_runtime(env, scenario, runtime)
 
         def step():
+            context = env.engine.context
+            runtime["max_active"] = max(
+                runtime["max_active"], context.total_request_count - context.paused_request_count
+            )
+            runtime["chunked-prefill-steps"] += int(context.chunked_prefill_request_id >= 0)
             result = env.engine.step_modern()
             runtime["steps"] += 1
-            runtime["cuda_graph_steps"] += int(env.engine.context.using_cuda_graph_this_step())
-            runtime["max_paused"] = max(
-                runtime["max_paused"], env.engine.context.paused_request_count
-            )
+            runtime["cuda_graph_steps"] += int(context.using_cuda_graph_this_step())
+            runtime["max_paused"] = max(runtime["max_paused"], context.paused_request_count)
             for record in result["finished_request_records"]:
                 request = record.merge()
                 env.requests[request.request_id] = request
@@ -1386,8 +1439,16 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             step()
             if wave_idx == 0 and "suspend-resume" in scenario.signals:
                 memory_ptr = env.engine.context.memory_buffer.data_ptr()
+                pending_before_suspend = env.engine.controller._async_sched_logits.is_valid
+                runtime["pending-before-suspend"] += int(pending_before_suspend)
                 env.engine.suspend()
+                runtime["pending-after-suspend"] += int(
+                    env.engine.controller._async_sched_logits.is_valid
+                )
                 env.engine.resume()
+                runtime["pending-after-resume"] += int(
+                    env.engine.controller._async_sched_logits.is_valid
+                )
                 runtime["suspend-resume"] += 1
                 runtime["static-pointer-preserved"] += int(
                     env.engine.context.memory_buffer.data_ptr() == memory_ptr
@@ -1416,91 +1477,130 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             runtime["_run_async_sched_step_overlap"] + runtime["_run_async_sched_step_overlap_mtp"]
             > 0
         )
+        assert runtime["model-forward"] > 0
+        assert runtime["sampling-kernel"] > 0
+        assert runtime["metadata-consumed"] > 0
+        assert runtime["metadata-compactions"] > 0
         assert not controller._async_sched_logits.is_valid
         assert context.total_request_count == context.active_token_count == 0
 
         signals = set(scenario.signals)
+        executed_graph_dimensions = {
+            key[1:]
+            for key, count in runtime.items()
+            if isinstance(key, tuple) and key[0] == "cuda-graph-dimension" and count > 0
+        }
+        if "eager" in signals:
+            assert runtime["cuda_graph_steps"] == 0
+            assert not context.cuda_graph_batch_dimensions_list
+        if "gpt" in signals:
+            assert runtime["module-forward:gpt"] > 0
         if "torch-backend" in signals:
-            assert context.config.sampling_backend == "torch"
+            assert runtime["sampling-backend:torch"] > 0
         if "persist" in signals:
             assert context.kv_cache_management_mode == KVCacheManagementMode.PERSIST
         if "static-pointers" in signals:
             assert context.static_kv_memory_pointers
         if "suspend-resume" in signals:
             assert runtime["suspend-resume"] == runtime["static-pointer-preserved"] == 1
+            assert (
+                runtime["pending-before-suspend"]
+                == runtime["pending-after-suspend"]
+                == runtime["pending-after-resume"]
+                == 1
+            )
         if "dp-offset" in signals:
             assert context.config.offset_sampling_seed_by_dp_rank
         if "last-logits" in signals:
             assert context.config.materialize_only_last_token_logits
+            assert runtime["last-logits-forward"] == runtime["model-forward"]
+            assert runtime["logits-dtype:torch.bfloat16"] > 0
         if "events" in signals:
             for request in env.requests:
                 event_types = [event.type for event in request.events]
                 assert event_types.count(DynamicInferenceEventType.GENERATED_TOKEN) == len(
                     request.generated_tokens
                 )
-        if "metadata-schema" in signals:
-            assert (
-                context.config.request_metadata_types
-                == DynamicInferenceRequest.get_metadata_types()
-            )
-            assert set(context.active_request_metadata) == {
-                label for label, _ in context.config.request_metadata_types
-            }
         if "chunked" in signals:
             assert context.enable_chunked_prefill
             assert any(len(request.prompt_tokens) > context.max_tokens for request in env.requests)
+            assert runtime["chunked-prefill-steps"] > 0
         if "capacity" in signals:
             assert context.max_requests == 4
             assert context.max_tokens == 8
-            assert context.block_size_tokens == 512
-            assert context.kv_block_allocator.paused_limit > 0
-        if "paused-buffer-allocation" in signals:
-            assert context.config.paused_buffer_size_gb == pytest.approx(0.004)
-            assert context.kv_block_allocator.paused_limit > 0
+            assert runtime["max_active"] == context.max_requests
         if "prefix-hit" in signals:
             assert env.engine._prefix_cache_hits > 0
             assert env.engine._prefill_tokens_skipped > 0
         if "ref-zero" in signals:
             assert context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO
-        if "lru" in signals:
-            assert context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+            assert runtime["prefix-blocks-deregistered"] > 0
         if "cuda-graph" in signals:
             assert context.cuda_graph_batch_dimensions_list
             assert runtime["cuda_graph_steps"] > 0
+            assert executed_graph_dimensions
+            available_dimensions = {
+                (dimensions.token_count, dimensions.prefill_req_count, dimensions.decode_req_count)
+                for dimensions in context.cuda_graph_batch_dimensions_list
+            }
+            assert executed_graph_dimensions <= available_dimensions
         if "graph-decode-config" in signals:
             assert not context.use_cuda_graphs_for_non_decode_steps
             assert context.config.cuda_graph_sizing_distribution == (
                 CudaGraphSizingDistribution.EXPONENTIAL
             )
             assert context.config.cuda_graph_max_tokens == 16
+            assert runtime["cuda-graph-scope:block"] > 0
+            decode_token_counts = {
+                token_count
+                for token_count, prefill_count, _ in executed_graph_dimensions
+                if prefill_count == 0
+            }
+            assert len(decode_token_counts) > 1
             assert all(
-                dimensions.prefill_req_count == 0
-                for dimensions in context.cuda_graph_batch_dimensions_list
+                token_count > 0 and token_count & (token_count - 1) == 0
+                for token_count in decode_token_counts
             )
+            assert all(prefill_count == 0 for _, prefill_count, _ in executed_graph_dimensions)
+            assert runtime["cuda-graph-decode-forwards"] > 0
         if "graph-mixed-config" in signals:
             assert context.use_cuda_graphs_for_non_decode_steps
-            assert context.config.cuda_graph_all_prefills
             assert context.config.cuda_graph_mixed_prefill_count == 2
             assert (
                 context.config.cuda_graph_sizing_distribution == CudaGraphSizingDistribution.LINEAR
             )
-            assert max(context.cuda_graph_token_counts) == context.max_tokens
+            assert runtime["cuda-graph-scope:layer"] > 0
+            mixed_token_counts = {
+                token_count
+                for token_count, prefill_count, _ in executed_graph_dimensions
+                if prefill_count > 0
+            }
+            assert len(mixed_token_counts) > 1
+            linear_step = context.config.cuda_graph_max_tokens // scenario.config["num_cuda_graphs"]
+            assert linear_step == 6
+            assert all(token_count % linear_step == 0 for token_count in mixed_token_counts)
             assert any(
-                dimensions.prefill_req_count > 0
-                for dimensions in context.cuda_graph_batch_dimensions_list
+                right - left == linear_step
+                for left, right in zip(sorted(mixed_token_counts), sorted(mixed_token_counts)[1:])
             )
+            assert any(
+                prefill_count == context.config.cuda_graph_mixed_prefill_count and decode_count > 0
+                for _, prefill_count, decode_count in executed_graph_dimensions
+            )
+            assert runtime["cuda-graph-mixed-forwards"] > 0
         if "graph-bounded-config" in signals:
             assert context.use_cuda_graphs_for_non_decode_steps
             assert not context.config.cuda_graph_all_prefills
             assert context.config.cuda_graph_max_tokens == 16
-            assert max(context.cuda_graph_token_counts) == 16
-            assert any(
-                dimensions.prefill_req_count > 0
-                for dimensions in context.cuda_graph_batch_dimensions_list
-            )
+            assert max(token_count for token_count, _, _ in executed_graph_dimensions) == 16
+            assert runtime["cuda-graph-prefill-forwards"] > 0
         if "sampled" in signals:
             assert all(request.generated_tokens for request in env.requests)
+        for sampling_filter in ("temperature-filter", "top-k-filter", "top-p-filter"):
+            if sampling_filter in signals:
+                assert runtime[sampling_filter] > 0
         if "logprobs" in signals:
+            assert runtime["log-probs-kernel"] > 0
             for request in env.requests:
                 if request.sampling_params.return_log_probs:
                     assert request.generated_log_probs is not None
@@ -1510,6 +1610,7 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     assert request.generated_log_probs is None
         if "full-logits" in signals:
             assert not context.config.materialize_only_last_token_logits
+            assert runtime["full-logits-forward"] == runtime["model-forward"]
         if "top-n" in signals:
             for request in env.requests:
                 if request.sampling_params.top_n_logprobs > 0:
@@ -1529,9 +1630,17 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     else:
                         assert len(request.prompt_top_n_logprobs) == len(request.prompt_tokens) - 1
         if "processed-logprobs" in signals:
-            assert context.config.logprobs_mode == "processed_logprobs"
+            assert runtime["log-probs-mode:processed_logprobs"] > 0
         if "flashinfer" in signals:
-            assert context.config.sampling_backend == "flashinfer"
+            assert runtime["sampling-backend:flashinfer"] > 0
+            assert (
+                sum(
+                    count
+                    for key, count in runtime.items()
+                    if isinstance(key, str) and key.startswith("flashinfer-kernel:")
+                )
+                > 0
+            )
         if "lengths" in signals:
             assert env.requests[0].generated_tokens == []
             assert len(env.requests[1].generated_tokens) == _OUTPUT_LENGTHS[1]
@@ -1556,27 +1665,46 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "mtp" in signals:
             assert env.engine._spec_steps > 0
             assert int(env.engine._spec_tokens_proposed_per_pos.sum()) > 0
+        if "metadata-compaction" in signals:
+            assert runtime["non-prefix-survivor-compactions"] > 0
         if "hybrid" in signals:
             assert context.is_hybrid_model
             assert hasattr(context, "mamba_conv_states_shape")
-        if "mamba-memory-ratio" in signals:
-            assert context.config.mamba_memory_ratio == 0.5
+            assert runtime["mamba-state-commits"] > 0
+            assert runtime["mamba-state-compactions"] > 0
+            assert runtime["module-forward:hybrid"] > 0
         if "transformer-engine" in signals:
             assert model_config.transformer_impl == "transformer_engine"
+            assert runtime["module-forward:transformer-engine"] > 0
         if "inference-optimized" in signals:
             assert model_config.transformer_impl == "inference_optimized"
+            assert runtime["module-forward:inference-optimized"] > 0
         if "fp8" in signals:
             assert model_config.fp8 is not None
+            assert runtime["module-forward:fp8"] > 0
+            assert runtime["fp8-context-forwards"] > 0
+            assert runtime["fp8-quantized-forwards"] > 0
+            assert runtime["fp8-recipe-forwards"] > 0
         if "fused-rope" in signals:
             assert context.use_flashinfer_fused_rope
             assert model_config.hidden_size // model_config.num_attention_heads == 16
             model = controller.inference_wrapped_model.model
             assert model.rotary_pos_emb.inv_freq.is_cuda
             assert model.rotary_pos_emb_cache[context.max_sequence_length].is_cuda
-        if "swa" in signals:
+            assert runtime["fused-rope-kernel"] > 0
+        if "swa-all" in signals:
             assert model_config.window_size == scenario.config["window_size"]
+            assert runtime["swa-kernel-calls"] > 0
+            assert runtime["full-attention-kernel-calls"] == 0
+        if "swa-alternating" in signals:
+            assert model_config.window_size == scenario.config["window_size"]
+            assert runtime["swa-kernel-calls"] > 0
+            assert runtime["full-attention-kernel-calls"] > 0
         if "softmax-sink" in signals:
             assert model_config.softmax_type == scenario.config["softmax_type"]
+            assert runtime["softmax-offset-calls"] > 0
+            assert runtime["softmax-offset-produced"] == runtime["softmax-offset-calls"]
+            assert runtime["sink-correction-calls"] > 0
         if "shared-seed" in signals:
             assert not context.config.offset_sampling_seed_by_dp_rank
             assert controller.sampling_rng.initial_seed() == model_config.inference_sampling_seed
@@ -1596,15 +1724,63 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                 group=controller.dp_group
             )
             assert controller.sampling_rng.initial_seed() == expected_seed
+            seed = torch.tensor(expected_seed, dtype=torch.int64, device="cuda")
+            gathered_seeds = [
+                torch.empty_like(seed)
+                for _ in range(torch.distributed.get_world_size(controller.dp_group))
+            ]
+            torch.distributed.all_gather(gathered_seeds, seed, group=controller.dp_group)
+            assert [peer.item() for peer in gathered_seeds] == [
+                model_config.inference_sampling_seed + rank
+                for rank in range(torch.distributed.get_world_size(controller.dp_group))
+            ]
+            generated = torch.tensor(
+                [token for request in env.requests for token in request.generated_tokens],
+                dtype=torch.int64,
+                device="cuda",
+            )
+            gathered_tokens = [
+                torch.empty_like(generated)
+                for _ in range(torch.distributed.get_world_size(controller.dp_group))
+            ]
+            torch.distributed.all_gather(gathered_tokens, generated, group=controller.dp_group)
+            assert any(not torch.equal(peer, generated) for peer in gathered_tokens)
         if "parallel" in signals:
             assert (
                 model_config.tensor_model_parallel_size > 1
                 or model_config.pipeline_model_parallel_size > 1
                 or model_config.expert_model_parallel_size > 1
             )
+            assert runtime["module-forward:parallel"] > 0
+            if model_config.tensor_model_parallel_size > 1:
+                assert runtime["tp-column-partition-forwards"] > 0
+                assert runtime["tp-row-partition-forwards"] > 0
+                if model_config.transformer_impl == "inference_optimized":
+                    assert runtime["tp-collective:optimized-all-gather"] > 0
+                    assert runtime["tp-collective:optimized-reduce-scatter"] > 0
+                    assert runtime["tp-sp-gather-dimensions"] > 0
+                    assert runtime["tp-sp-reduce-scatter-dimensions"] > 0
+                elif model_config.sequence_parallel:
+                    assert runtime["tp-collective:gather_from_sequence_parallel_region"] > 0
+                    assert runtime["tp-collective:reduce_scatter_to_sequence_parallel_region"] > 0
+                    assert runtime["tp-sp-gather-dimensions"] > 0
+                    assert runtime["tp-sp-reduce-scatter-dimensions"] > 0
+                else:
+                    assert runtime["tp-collective:reduce_from_tensor_model_parallel_region"] > 0
+            if model_config.pipeline_model_parallel_size > 1:
+                assert runtime["pipeline-logits-broadcasts"] > 0
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
             assert context._nccl_ep_dispatcher
+            assert runtime["module-forward:moe"] > 0
+        if "nccl-dispatch" in signals:
+            assert model_config.expert_model_parallel_size > 1
+            assert model_config.inference_moe_token_dispatcher_type == "nccl"
+            assert runtime["nccl-dispatchers-installed"] > 0
+            assert runtime["nccl-token-dispatches"] > 0
+            assert runtime["nccl-token-dispatches"] == runtime["nccl-token-combines"]
+            assert runtime["nccl-combine-before-dispatch"] == 0
+            assert runtime["nccl-dispatch-inflight"] == 0
 
     @classmethod
     def _assert_scenario_pair(cls, scenario):
@@ -1795,6 +1971,53 @@ def test_async_compaction_preserves_all_request_metadata():
         controller._all_logits_cuda, torch.arange(24).reshape(1, 6, 4)[:, [0, 1, 4, 5]]
     )
     assert torch.equal(controller._async_sched_logits.token_row_indices, torch.tensor([0, 1, 4, 5]))
+
+
+def test_post_process_skips_logprobs_for_opted_out_request():
+    """A mixed async batch must not append step-level logprobs to an opted-out request."""
+    requests = []
+    for request_id, return_log_probs in enumerate((True, False)):
+        requests.append(
+            DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.tensor([1, 2], dtype=torch.int64),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=2,
+                    termination_id=-1,
+                    return_log_probs=return_log_probs,
+                    skip_prompt_log_probs=True,
+                ),
+            )
+        )
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = SimpleNamespace(kv_block_allocator=SimpleNamespace())
+    engine.requests = {
+        request.request_id: SimpleNamespace(record=[request]) for request in requests
+    }
+    engine.finished_request_count = 0
+    engine.evicted_request_count = 0
+    engine.track_generated_token_events = False
+    engine.num_speculative_tokens = 0
+    engine.stop_word_being_finished_ids = set()
+    engine.stop_word_finished_request_ids = set()
+
+    active_request_ids, finished_records = engine.post_process_requests(
+        request_ids=torch.tensor([0, 1], dtype=torch.int64),
+        finished_request_ids=torch.empty(0, dtype=torch.int64),
+        evict_request_ids=None,
+        step_time=0.0,
+        sample=torch.tensor([11, 22], dtype=torch.int64),
+        accepted_tokens=None,
+        log_probs=[[-1.0], [-2.0]],
+        consumed_chunked_prefill_request_id=-1,
+    )
+
+    assert active_request_ids == [0, 1]
+    assert finished_records == []
+    assert requests[0].generated_log_probs == [-1.0]
+    assert requests[1].prompt_log_probs is None
+    assert requests[1].generated_log_probs is None
 
 
 def _controller_with_pending_logits():

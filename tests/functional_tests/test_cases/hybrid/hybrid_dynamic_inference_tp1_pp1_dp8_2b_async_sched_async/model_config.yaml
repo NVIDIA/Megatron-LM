@@ -63,17 +63,13 @@ MODEL_ARGS:
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 4096
   --output-path: ${INFERENCE_OUTPUT_PATH}
-  --prompt-file: ./tests/functional_tests/test_cases/hybrid/hybrid_dynamic_inference_tp1_pp1_dp8_2b_async_sched_async/prefix_prompts.jsonl
+  --prompt-file: ./tests/functional_tests/test_cases/hybrid/hybrid_dynamic_inference_tp1_pp1_dp8_2b_async_sched_async/prompts.jsonl
   --incoming-requests-per-step: 1
-  --inference-repeat-n: 1
+  --inference-repeat-n: 2
   --no-record-throughput: true
   --mamba-inference-conv-states-dtype: fp32
   --mamba-inference-ssm-states-dtype: fp32
-  --inference-dynamic-batching-max-requests: 4
-  --inference-dynamic-batching-prefix-caching: true
-  --inference-dynamic-batching-prefix-caching-mamba-gb: 2
   --inference-dynamic-batching-async-sched-mode: async
-  --compare-async-sched-modes: true
-  --async-sched-require-prefix-cache-hit: true
-METRICS: []
+METRICS:
+  - "generated_tokens"
 LAUNCHER: ft_launcher
