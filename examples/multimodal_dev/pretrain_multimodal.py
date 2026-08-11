@@ -113,12 +113,15 @@ def _resolve_provider_fn(provider_fn):
     return provider_fn
 
 
-def datasets_provider(train_val_test_num_samples):
+def datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Dataset provider dispatcher.
 
     Routes to the dataset factory registered for the current
-    ``(--model-arch, --dataset-provider)`` combination.
+    ``(--model-arch, --dataset-provider)`` combination. ``vp_stage`` is
+    accepted for the virtual-pipeline dataset-provider contract; the
+    registered datasets are stage-independent.
     """
+    del vp_stage
     args = get_args()
     model_arch = getattr(args, "model_arch", "qwen35_vl")
     provider = getattr(args, "dataset_provider", "mock")

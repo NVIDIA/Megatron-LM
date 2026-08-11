@@ -19,6 +19,7 @@ from megatron.core.parallel_state import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.training import get_args
 
 # -------------------------------------------------------------------
@@ -175,6 +176,7 @@ def pack_or_pad_batch(
     use_packed_sequence: bool = False,
     seq_length: Optional[int] = None,
     device="cuda",
+    include_pixel_values: bool = True,
 ) -> Dict[str, Any]:
     """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD or ``[B, S]`` BSHD.
 
@@ -223,7 +225,8 @@ def pack_or_pad_batch(
                 loss_mask_list.append(F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0))
                 seqlens_list.append(seqlen)
                 seqlens_padded_list.append(target_len)
-                pixel_values_list.append(sample["pixel_values"])
+                if include_pixel_values:
+                    pixel_values_list.append(sample["pixel_values"])
                 image_grid_thw_list.append(sample["image_grid_thw"])
 
             cu_seqlens = list(accumulate(seqlens_list, initial=0))
@@ -246,7 +249,8 @@ def pack_or_pad_batch(
             packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
             packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
             packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
-            packed_batch["pixel_values"] = torch.concat(pixel_values_list)
+            if include_pixel_values:
+                packed_batch["pixel_values"] = torch.concat(pixel_values_list)
             packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
             # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
             # so each rank can build an identical PackedSeqParams.
@@ -316,7 +320,8 @@ def pack_or_pad_batch(
         if has_padding:
             positions = torch.arange(target_seqlens).unsqueeze(0)
             padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
-        padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
+        if include_pixel_values:
+            padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
 
     return broadcast_data_batch(padded_batch, device=device)
@@ -327,10 +332,11 @@ def pack_or_pad_batch(
 # -------------------------------------------------------------------
 
 
-def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
+def get_batch(data_iterator: Iterator[list[Dict[str, Any]]], vp_stage: Optional[int] = None):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
+    include_pixel_values = is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
 
     if get_tensor_model_parallel_rank() == 0:
         try:
@@ -351,7 +357,13 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
         return None
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
-    batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
+    batch = pack_or_pad_batch(
+        data,
+        args.use_packed_sequence,
+        args.seq_length,
+        device=device,
+        include_pixel_values=include_pixel_values,
+    )
 
     # Fix shapes produced by default_collate.
     if "position_ids" in batch and batch["position_ids"] is not None:
@@ -397,19 +409,18 @@ def loss_func(loss_mask, output_tensor):
 
 def forward_step(data_iterator, model):
     """Forward step for multimodal_dev training."""
-    batch = get_batch(data_iterator)
+    vp_stage = get_attr_wrapped_model(model, "vp_stage")
+    batch = get_batch(data_iterator, vp_stage=vp_stage)
 
     if batch is None:
         return None, None
 
-    # ``pixel_values`` is the heavy vision tensor and is only consumed
-    # on the first PP stage; drop it elsewhere.  ``image_grid_thw`` is
-    # small and is needed on every PP stage by ``compute_position_ids``
-    # (MRoPE freqs are computed per-stage from position_ids).
-    is_first = is_pipeline_first_stage()
-    is_last = is_pipeline_last_stage()
+    # ``pixel_values`` was omitted from the batch before TP broadcast on
+    # non-first logical pipeline stages. ``input_ids`` and ``image_grid_thw``
+    # remain available on every stage for MRoPE position construction.
+    is_last = is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
 
-    pixel_values = batch.get("pixel_values", None) if is_first else None
+    pixel_values = batch.get("pixel_values", None)
     image_grid_thw = batch.get("image_grid_thw", None)
     if (
         pixel_values is not None
