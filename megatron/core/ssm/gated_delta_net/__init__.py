@@ -9,6 +9,8 @@ at the same import path; the names below preserve that module's public surface.
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
     GatedDeltaNetSubmodules,
+    _build_head_perm_for_split_sections,
+    _build_thd_cp_a2a_perm,
     _split_tensor_factory,
     causal_conv1d,
     chunk_gated_delta_rule,
