@@ -401,6 +401,12 @@ class DynamicInferenceEngineTestBase:
                     else InferenceCudaGraphScope.none
                 ),
                 transformer_impl=test_config.transformer_impl,
+                moe_router_dtype=(
+                    "fp32"
+                    if test_config.transformer_impl == "inference_optimized"
+                    and test_config.expert_model_parallel_size > 1
+                    else None
+                ),
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
