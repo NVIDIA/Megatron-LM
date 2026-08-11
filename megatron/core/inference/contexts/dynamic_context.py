@@ -3096,18 +3096,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Block allocation + prefix matching + prefill skipping
         # =========================================================================
         (
+            # Pool ids of the blocks served from the prefix cache, in table order.
             matched_block_ids,
+            # Blocks this chunk must take from the free pool, beyond the matched ones.
             num_blocks_from_pool,
+            # Block position where this chunk's blocks begin: ceil(finished / block_size).
             chunk_start_block,
+            # Blocks the request owns once this chunk lands: ceil((finished + chunk) / block_size).
             overall_required_blocks,
+            # Leading chunk tokens whose prefill is skipped; 0 unless finished is block-aligned.
             prefix_skip_tokens,
+            # Tokens this chunk actually computes: prefill_chunk_length - prefix_skip_tokens.
             effective_prefill_chunk_length,
         ) = self._compute_prefix_match(req, prefill_chunk_length, record_mamba_match=True)
-        # _compute_prefix_match calls this already_allocated_blocks, which describes
-        # the state on entry. Below, this chunk's own blocks have been allocated by
-        # the time it is read, so what it denotes here is the block position where
-        # this chunk's blocks begin -- i.e. ceil(finished_chunk_token_count / block).
+        # Blocks matched from the cache, occupying table positions
+        # [chunk_start_block, chunk_start_block + num_matched_blocks).
         num_matched_blocks = len(matched_block_ids)
+        # Position, within the request's prompt, of the first token this chunk computes.
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
         # Track prefix cache hits. num_cached_tokens accumulates across prefill
