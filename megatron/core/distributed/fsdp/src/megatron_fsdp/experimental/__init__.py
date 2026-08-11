@@ -18,7 +18,6 @@ from .checkpoint import load_checkpoint, save_checkpoint
 from .dbuffer import DBuffer
 from .fully_shard import fully_shard, fully_shard_context, microbatch
 from .optimizer import fully_shard_optimizer
-from .orthogonalized_optimizer import FsdpMuon, FsdpOrthogonalizedOptimizer
 from .placement import Flat, Partial, Placement, Placements, Replicate
 
 __all__ = [
