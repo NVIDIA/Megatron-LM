@@ -2,6 +2,8 @@
 
 """MCore adapter and optimizer integration tests for experimental MFSDP v2."""
 
+import logging
+import os
 from dataclasses import replace
 
 import pytest
@@ -12,6 +14,8 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -20,6 +24,8 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
+
+logger = logging.getLogger(__name__)
 
 
 def _build_layer(config: TransformerConfig) -> TransformerLayer:
@@ -37,13 +43,11 @@ def _build_block(config: TransformerConfig) -> TransformerBlock:
     )
 
 
-class TestMcoreAdapter:
+class TestMcoreAdapterDense:
     """Exercise a dense MCore transformer block over two data-parallel ranks."""
 
     def setup_method(self):
         Utils.initialize_model_parallel(1, 1)
-        if torch.distributed.get_world_size() < 2:
-            pytest.skip("MFSDP v2 MCore integration test requires at least two ranks.")
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model_parallel_cuda_manual_seed(1234)
 
@@ -232,3 +236,100 @@ class TestMcoreAdapter:
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
+
+
+class TestMcoreAdapterExpertParallel:
+    """Exercise the MFSDP v2 adapter over an MoE model with EP=2."""
+
+    def setup_method(self):
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if self.world_size < 2 or self.world_size % 2:
+            pytest.skip("MFSDP v2 EP adapter test requires an even world size of at least two.")
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        assert self.pg_collection.ep.size() == 2
+        assert self.pg_collection.expt_dp.size() == self.world_size // 2
+        model_parallel_cuda_manual_seed(1234)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def test_build_train_and_step_with_expert_parallelism(self):
+        """Shard experts over expert-DP and dense parameters over full DP."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            expert_model_parallel_size=2,
+            moe_layer_freq=[0, 1],
+            moe_token_dispatcher_type="alltoall",
+            moe_router_topk=2,
+            moe_grouped_gemm=True,
+            moe_ffn_hidden_size=128,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            gradient_accumulation_fusion=False,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=8,
+            hybrid_layer_pattern="*E",
+            pg_collection=self.pg_collection,
+        ).cuda()
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.bfloat16,
+                fsdp_all_gather_in_start_param_sync=False,
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+        assert isinstance(model.module, FsdpModule)
+        assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
+
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                lr=1.0e-3,
+                weight_decay=0.0,
+                bf16=True,
+                use_distributed_optimizer=False,
+                clip_grad=0.0,
+            ),
+            [model],
+            use_gloo_process_groups=False,
+        )
+        assert isinstance(optimizer, FullyShardedOptimizer)
+        optimizer.reload_model_params()
+
+        input_ids = torch.randint(0, 128, (2, 8), device="cuda")
+        position_ids = torch.arange(8, device="cuda").repeat(2, 1)
+        losses = []
+        for _ in range(5):
+            optimizer.zero_grad(set_to_none=True)
+            loss = (
+                model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
+                .float()
+                .square()
+                .mean()
+            )
+            loss.backward()
+            success, _, _ = optimizer.step()
+            assert success
+            losses.append(loss.detach())
+
+        losses = torch.stack(losses)
+        if torch.distributed.get_rank() == 0:
+            logger.info("MFSDP v2 EP loss curve: %s", losses.tolist())
+        assert torch.isfinite(losses).all()
+        assert losses[-1] < losses[0]
