@@ -15,6 +15,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     fully_shard,
     fully_shard_context,
+    fully_shard_optimizer,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,7 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
         fully_shard(model, mesh=mesh, placements=placements)
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
+    fully_shard_optimizer(optimizer)
 
     def train_iteration() -> torch.Tensor:
         optimizer.zero_grad(set_to_none=False)
