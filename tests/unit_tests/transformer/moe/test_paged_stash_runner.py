@@ -16,6 +16,7 @@ class _FakeTokenDispatcher:
     def __init__(self, config):
         self.config = config
         self._comm_manager = SimpleNamespace(moe_expert_rank_capacity_factor=1.5)
+        self.invalidate_count = 0
         self.reset_count = 0
 
     def check_over_budget(self):
@@ -23,6 +24,9 @@ class _FakeTokenDispatcher:
 
     def reset_over_budget(self):
         self.reset_count += 1
+
+    def invalidate_ep_bootstrap(self):
+        self.invalidate_count += 1
 
 
 class _FakeMoELayer(torch.nn.Module):
@@ -153,6 +157,8 @@ def test_retry_preserves_shared_root_config_behavior(monkeypatch):
     assert len(run.release_stash_buffer_calls) == 1
     assert run.decoder_moe.token_dispatcher.reset_count == 1
     assert run.mtp_moe.token_dispatcher.reset_count == 1
+    assert run.decoder_moe.token_dispatcher.invalidate_count == 2
+    assert run.mtp_moe.token_dispatcher.invalidate_count == 2
     assert run.decoder_moe.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor == 1.5
     assert run.mtp_moe.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor == 1.5
     assert training_config.moe_paged_stash is True
@@ -188,6 +194,8 @@ def test_retry_disables_and_restores_per_module_configs(monkeypatch):
     assert len(run.release_stash_buffer_calls) == 1
     assert run.decoder_moe.token_dispatcher.reset_count == 1
     assert run.mtp_moe.token_dispatcher.reset_count == 0
+    assert run.decoder_moe.token_dispatcher.invalidate_count == 2
+    assert run.mtp_moe.token_dispatcher.invalidate_count == 0
     assert run.decoder_moe.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor == 1.5
     assert run.mtp_moe.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor == 1.5
     assert (

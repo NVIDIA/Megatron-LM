@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
+
 import gc
 import logging
 from operator import itemgetter
@@ -218,7 +219,7 @@ def make_sharded_object_for_checkpoint(
 
 
 def _get_extra_state_offsets(
-    sharded_offsets: Iterable[Tuple[int, int, int]]
+    sharded_offsets: Iterable[Tuple[int, int, int]],
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
     """Turns ShardedTensor offsets into offsets suitable for ShardedObject."""
     if sharded_offsets:
@@ -298,6 +299,41 @@ def sharded_state_dict_default(
 
 # Initialize cache for sequence parallel modules
 _sequence_parallel_attr_cache = None
+
+
+def set_model_config_attribute(model: Any, attribute: str, value: Any) -> None:
+    """Set a config attribute on a model and all distinct child-module configs.
+
+    Some models give individual layers separate config objects. Runtime model-wide
+    toggles must update those configs just as they did when every layer shared the
+    model's root config.
+
+    Args:
+        model: Model whose configs should be updated.
+        attribute: Config attribute to set.
+        value: Value to assign. The same value object is assigned to every config.
+    """
+    root_config = model.config
+    setattr(root_config, attribute, value)
+    updated_config_ids = {id(root_config)}
+
+    module_root = model
+    visited_wrapper_ids = set()
+    while not isinstance(module_root, torch.nn.Module) or not hasattr(module_root, "_modules"):
+        visited_wrapper_ids.add(id(module_root))
+        module_root = getattr(module_root, "module", None)
+        if module_root is None or id(module_root) in visited_wrapper_ids:
+            return
+
+    for module in module_root.modules():
+        config = getattr(module, "config", None)
+        if (
+            config is not None
+            and id(config) not in updated_config_ids
+            and hasattr(config, attribute)
+        ):
+            setattr(config, attribute, value)
+            updated_config_ids.add(id(config))
 
 
 def _init_sequence_parallel_cache(model, exclude_modules):
