@@ -1414,9 +1414,9 @@ class TestRLUtils:
         rewards = [[1, 1], [-1, 2]]
         num_turns = [[42, 2], [10, 8]]
         advantages = [0, 1]
-        # Per-token epoch stamps, grouped by group then rollout
-        policy_epoch = [[[4, 5], [2, 3]], [[5], [0, 1]]]
-        kv_cache_epoch = [[[4, 5], [3, 4]], [[5], [1, 2]]]
+        # Per-rollout (epoch, token_count) segments, grouped by group then rollout
+        policy_epoch = [[[(4, 1), (5, 2)], [(2, 2), (3, 1)]], [[(5, 1)], [(0, 3), (1, 1)]]]
+        kv_cache_epoch = [[[(4, 2), (5, 1)], [(3, 1), (4, 2)]], [[(5, 1)], [(1, 2), (2, 2)]]]
         # Per-turn max epoch stamps (when each turn completed)
         completed_epochs = [[5, 3], [5, 1]]
         num_evictions = [[0, 1], [0, 0]]
@@ -1519,6 +1519,9 @@ class TestRLUtils:
         assert len(rollout_table_calls) == 1
         rows = rollout_table_calls[0].kwargs["data"]
         assert [r[3] for r in rows] == [2, 4, 1, 6]  # policy_staleness column
+        # policy_avg_staleness column is token-weighted: rollout 4 covers epochs
+        # (0 x3 tokens, 1 x1 token) -> 6 - 1/4 = 5.75.
+        assert rows[3][7] == 5.75
         assert metrics["nonzero_groups_ratio"] == 0.5
         assert metrics["max_traj_length"] == 3
         assert metrics["min_traj_length"] == 1
