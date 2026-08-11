@@ -65,6 +65,18 @@ class MHAMetadata(MetadataBase):
             "max_seqlen_k": max_seqlen_k,
         }
 
+    def restore_state_data(self, state_data: dict, max_seqlen_q: int, max_seqlen_k: int) -> None:
+        """Re-bind a previously built ``state_data`` after ``reset()``.
+
+        Equivalent to ``set_state_data`` called with the arguments that produced
+        ``state_data``, minus the re-slicing. Used by the incremental decode
+        path in ``DynamicInferenceContext``, where the padded request count and
+        therefore every slice is provably unchanged from the previous step.
+        """
+        self._max_seqlen_q = max_seqlen_q
+        self._max_seqlen_k = max_seqlen_k
+        self.state_data = state_data
+
     def reset(self):
         """Reset the metadata for the next batch.
 
