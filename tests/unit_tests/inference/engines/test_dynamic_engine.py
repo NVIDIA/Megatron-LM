@@ -19,6 +19,7 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.activations import squared_relu
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     InferenceConfig,
@@ -401,6 +402,12 @@ class DynamicInferenceEngineTestBase:
                     else InferenceCudaGraphScope.none
                 ),
                 transformer_impl=test_config.transformer_impl,
+                activation_func=(
+                    squared_relu
+                    if test_config.transformer_impl == "inference_optimized"
+                    and test_config.expert_model_parallel_size > 1
+                    else torch.nn.functional.gelu
+                ),
                 moe_router_dtype=(
                     "fp32"
                     if test_config.transformer_impl == "inference_optimized"
