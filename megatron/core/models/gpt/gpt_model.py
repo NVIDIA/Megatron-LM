@@ -531,9 +531,9 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        output_processor: Optional[Callable[..., Tensor]] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
-    ) -> Tensor:
+    ) -> Any:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
@@ -810,7 +810,7 @@ class GPTModel(LanguageModule):
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         *,
-        output_processor: Optional[Callable[..., Tensor]] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ):
         """Builds a computation schedule plan for the model.
