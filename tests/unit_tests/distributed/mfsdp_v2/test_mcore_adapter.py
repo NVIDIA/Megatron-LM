@@ -276,6 +276,8 @@ class TestMcoreAdapterExpertParallel:
 
     def test_build_train_and_step_with_expert_parallelism(self):
         """Shard experts over expert-DP and dense parameters over full DP."""
+        # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
+        # initialization instead uses the globally configured EP=2 rank in its RNG seed.
         config = TransformerConfig(
             num_layers=2,
             hidden_size=64,
@@ -295,6 +297,7 @@ class TestMcoreAdapterExpertParallel:
             gradient_accumulation_fusion=False,
             attention_backend=AttnBackend.unfused,
         )
+        # Pair CPU initialization with an explicit common seed for the reference and EP model.
         torch.manual_seed(123)
         reference_config = replace(config, expert_model_parallel_size=1)
         reference_model = HybridModel(
