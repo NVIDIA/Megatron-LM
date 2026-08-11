@@ -20,6 +20,7 @@ from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimize
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -29,19 +30,39 @@ SOURCE_STEPS = 3
 DESTINATION_STEPS = 1
 
 
-def _build_model_and_optimizer(
-    config: TransformerConfig, pg_collection: ProcessGroupCollection, *, zero_init: bool
-) -> tuple[FullyShardedDataParallel, FullyShardedOptimizer]:
-    """Build an MFSDP v2 sharded transformer block and its :class:`FullyShardedOptimizer`."""
-    block = TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
-        device="cuda", dtype=config.params_dtype
+def _transformer_config() -> TransformerConfig:
+    """Return the small bf16 configuration both round-trip tests are built on."""
+    return TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
     )
-    if zero_init:
-        # Zero the destination weights so they are obviously different from the saved
-        # (trained) source; a correct load must overwrite them.
-        with torch.no_grad():
-            for parameter in block.parameters():
-                parameter.zero_()
+
+
+class _TiedLinears(MegatronModule):
+    """Two Linears sharing one weight, so one ``nn.Parameter`` is reachable under two FQNs."""
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__(config=config)
+        self.fc1 = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.fc2 = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.fc2.weight = self.fc1.weight
+
+    def forward(self, hidden_states: torch.Tensor, attention_mask=None) -> torch.Tensor:
+        """Run both Linears; ``attention_mask`` is accepted so the shared train step fits."""
+        del attention_mask
+        return self.fc2(torch.relu(self.fc1(hidden_states)))
+
+
+def _shard_and_build_optimizer(
+    config: TransformerConfig, pg_collection: ProcessGroupCollection, module: torch.nn.Module
+) -> tuple[FullyShardedDataParallel, FullyShardedOptimizer]:
+    """Shard ``module`` with MFSDP v2 and build its :class:`FullyShardedOptimizer`."""
     model = FullyShardedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
@@ -53,7 +74,7 @@ def _build_model_and_optimizer(
             megatron_fsdp_main_grads_dtype=torch.bfloat16,
             fsdp_all_gather_in_start_param_sync=False,
         ),
-        module=block,
+        module=module,
         pg_collection=pg_collection,
     )
     optimizer_config = OptimizerConfig(
@@ -75,6 +96,37 @@ def _build_model_and_optimizer(
     return model, optimizer
 
 
+def _zero_parameters(module: torch.nn.Module) -> None:
+    """Zero every weight so a correct load has to overwrite them."""
+    with torch.no_grad():
+        for parameter in module.parameters():
+            parameter.zero_()
+
+
+def _build_model_and_optimizer(
+    config: TransformerConfig, pg_collection: ProcessGroupCollection, *, zero_init: bool
+) -> tuple[FullyShardedDataParallel, FullyShardedOptimizer]:
+    """Build an MFSDP v2 sharded transformer block and its :class:`FullyShardedOptimizer`."""
+    block = TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
+        device="cuda", dtype=config.params_dtype
+    )
+    if zero_init:
+        # Zero the destination weights so they are obviously different from the saved
+        # (trained) source; a correct load must overwrite them.
+        _zero_parameters(block)
+    return _shard_and_build_optimizer(config, pg_collection, block)
+
+
+def _build_tied_model_and_optimizer(
+    config: TransformerConfig, pg_collection: ProcessGroupCollection, *, zero_init: bool
+) -> tuple[FullyShardedDataParallel, FullyShardedOptimizer]:
+    """Build an MFSDP v2 sharded :class:`_TiedLinears` and its :class:`FullyShardedOptimizer`."""
+    module = _TiedLinears(config).to(device="cuda", dtype=config.params_dtype)
+    if zero_init:
+        _zero_parameters(module)
+    return _shard_and_build_optimizer(config, pg_collection, module)
+
+
 def _train_step(
     config: TransformerConfig, model: FullyShardedDataParallel, optimizer: FullyShardedOptimizer
 ) -> None:
@@ -85,6 +137,14 @@ def _train_step(
     model(hidden_states=batch, attention_mask=None).square().mean().backward()
     success, _, _ = optimizer.step()
     assert success
+
+
+def _tied_parameter_names(model: FullyShardedDataParallel) -> set[str]:
+    """Return every name a parameter of ``model`` is reachable under more than once."""
+    names_by_parameter: dict[int, set[str]] = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        names_by_parameter.setdefault(id(parameter), set()).add(name)
+    return {name for names in names_by_parameter.values() if len(names) > 1 for name in names}
 
 
 def _local_numel(value: torch.Tensor) -> int:
@@ -211,16 +271,7 @@ class TestOptimizerCheckpoint:
         empty-local shards out of the base optimizer per rank, so the placeholders are what
         keep the DTensor keyspace identical across ranks.
         """
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=16,
-            num_attention_heads=4,
-            ffn_hidden_size=32,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-        )
+        config = _transformer_config()
         world_size = torch.distributed.get_world_size()
 
         source_model, source_optimizer = _build_model_and_optimizer(
@@ -286,3 +337,66 @@ class TestOptimizerCheckpoint:
         nonempty_flags = [None] * world_size
         torch.distributed.all_gather_object(nonempty_flags, local_nonempty)
         assert any(nonempty_flags), "All ranks had empty local shards."
+
+    def test_tied_parameter_roundtrip(self, tmp_path_dist_ckpt: Path) -> None:
+        """A tied weight is saved once, under one of its FQNs, and restored bit-exactly.
+
+        Two Linears sharing one ``nn.Parameter`` give the model state dict two keys but the
+        optimizer exactly one state entry. ``_param_fqn`` keys by parameter identity, so the
+        tie resolves to a single name -- the same one on save and on load, and the same one
+        :class:`DistributedOptimizer`'s ``param_to_name`` picks for v1. This asserts the
+        optimizer subtree really is singular while the model subtree carries both names, and
+        that the shared weight and its momentum survive the round trip.
+        """
+        config = _transformer_config()
+
+        source_model, source_optimizer = _build_tied_model_and_optimizer(
+            config, self.pg_collection, zero_init=False
+        )
+        for _ in range(SOURCE_STEPS):
+            _train_step(config, source_model, source_optimizer)
+
+        model_snapshot = _snapshot_model_state(source_model)
+        state_snapshot = _snapshot_optimizer_state(source_optimizer)
+        param_group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
+
+        with TempNamedDir(tmp_path_dist_ckpt / "fsdp_dtensor_tied", sync=True) as ckpt_dir:
+            optimizer_state_dict = source_optimizer.sharded_state_dict({})
+            save_state_dict = {
+                "model": source_model.state_dict_for_save_checkpoint(),
+                "optimizer": optimizer_state_dict,
+            }
+
+            tied_fqns = _tied_parameter_names(source_model)
+            assert (
+                len(tied_fqns) == 2
+            ), f"The weight should be tied under two names, got {tied_fqns}"
+            # The model subtree is keyed by the wrapped module's own names, without the
+            # ``module.`` prefix the optimizer's FQNs carry.
+            model_keys = save_state_dict["model"].keys()
+            assert {"fc1.weight", "fc2.weight"} <= model_keys, "The tie should surface twice"
+            assert (
+                len(tied_fqns & optimizer_state_dict["state"].keys()) == 1
+            ), "A tied parameter has one optimizer state entry, so it must be saved under one FQN"
+
+            preprocess_state_dict_for_uneven_dtensor(save_state_dict)
+            dcp.save(save_state_dict, checkpoint_id=ckpt_dir)
+
+            destination_model, destination_optimizer = _build_tied_model_and_optimizer(
+                config, self.pg_collection, zero_init=True
+            )
+            for _ in range(DESTINATION_STEPS):
+                _train_step(config, destination_model, destination_optimizer)
+
+            load_state_dict = {
+                "model": destination_model.state_dict_for_save_checkpoint(),
+                "optimizer": destination_optimizer.sharded_state_dict({}, is_loading=True),
+            }
+            preprocess_state_dict_for_uneven_dtensor(load_state_dict)
+            dcp.load(load_state_dict, checkpoint_id=ckpt_dir)
+            destination_optimizer.load_state_dict(load_state_dict["optimizer"])
+
+        _assert_model_matches_snapshot(destination_model, model_snapshot)
+        _assert_optimizer_matches_snapshot(
+            destination_optimizer, state_snapshot, param_group_snapshot
+        )

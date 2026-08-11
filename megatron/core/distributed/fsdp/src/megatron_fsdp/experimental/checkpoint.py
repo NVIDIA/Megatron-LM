@@ -41,37 +41,10 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from ..uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
+from .optimizer import init_optimizer_state
 from .parameter_group import sync_model_weights_from_main_weights
 
-__all__ = ["save_checkpoint", "load_checkpoint", "init_optimizer_state"]
-
-
-def init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
-    """Allocate optimizer state so a DCP load has DTensors to fill.
-
-    :func:`get_optimizer_state_dict` initializes empty optimizer state via torch's
-    ``_init_optim_state``, but that assigns a parameter-dtype gradient. A Megatron-FSDP sharded
-    parameter advertises the FSDP gradient dtype through ``grad_dtype``, which differs from the
-    (main-weight) parameter dtype under mixed precision, and rejects a mismatched gradient. So
-    initialize the state here with a ``grad_dtype``-matched zero gradient; the subsequent load
-    overwrites it. This is a no-op once the state exists (for example after a training step).
-
-    TODO: this function becomes unnecessary once torch's ``_init_optim_state`` honors a parameter's
-    ``grad_dtype`` when it allocates the placeholder gradient (``torch.zeros_like(param)`` in
-    ``torch/distributed/checkpoint/state_dict.py``); an upstream issue is being filed.
-
-    Args:
-        optimizer: Optimizer whose (possibly empty) state should be materialized.
-    """
-    if optimizer.state:
-        return
-    for group in optimizer.param_groups:
-        for param in group["params"]:
-            if param.grad is None:
-                grad_dtype = getattr(param, "grad_dtype", None) or param.dtype
-                param.grad = torch.zeros_like(param, dtype=grad_dtype)
-    optimizer.step()
-    optimizer.zero_grad()
+__all__ = ["save_checkpoint", "load_checkpoint"]
 
 
 def save_checkpoint(
