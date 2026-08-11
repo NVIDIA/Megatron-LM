@@ -77,8 +77,6 @@ class TestMcoreAdapterDense:
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
-                megatron_fsdp_main_params_dtype=torch.float32,
-                megatron_fsdp_main_grads_dtype=torch.float32,
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer],
@@ -165,8 +163,6 @@ class TestMcoreAdapterDense:
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
-                megatron_fsdp_main_params_dtype=torch.float32,
-                megatron_fsdp_main_grads_dtype=torch.bfloat16,
             ),
             module=model,
             pg_collection=self.pg_collection,
@@ -236,7 +232,7 @@ class TestMcoreAdapterDense:
         reference_losses = torch.stack(reference_losses)
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
-        torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
+        torch.testing.assert_close(losses, reference_losses)
 
 
 class TestMcoreAdapterExpertParallel:
@@ -274,7 +270,7 @@ class TestMcoreAdapterExpertParallel:
         torch.distributed.destroy_process_group(self.reference_group)
         Utils.destroy_model_parallel()
 
-    def test_build_train_and_step_with_expert_parallelism(self):
+    def test_build_train_and_step(self):
         """Shard experts over expert-DP and dense parameters over full DP."""
         # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
         # initialization instead uses the globally configured EP=2 rank in its RNG seed.
@@ -341,8 +337,6 @@ class TestMcoreAdapterExpertParallel:
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
-                megatron_fsdp_main_params_dtype=torch.float32,
-                megatron_fsdp_main_grads_dtype=torch.float32,
                 fsdp_all_gather_in_start_param_sync=False,
             ),
             module=model,
@@ -412,4 +406,4 @@ class TestMcoreAdapterExpertParallel:
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
         assert losses[-1] < losses[0]
-        torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
+        torch.testing.assert_close(losses, reference_losses)
