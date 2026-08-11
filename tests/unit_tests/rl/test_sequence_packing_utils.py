@@ -431,7 +431,7 @@ def test_pack_inference_logprobs_multi_region():
     )
     inference_logprobs = [torch.tensor([0.1, 0.2]), torch.tensor([0.3, 0.4])]
 
-    packed = sequence_packing_utils.pack_inference_logprobs(
+    packed, filled_mask = sequence_packing_utils.pack_inference_logprobs(
         inference_logprobs, packing_info, generation_masks, bin_size
     )
 
@@ -440,6 +440,8 @@ def test_pack_inference_logprobs_multi_region():
     expected = torch.tensor([[0.1, 0.0, 0.2, 0.0, 0.3, 0.4, 0.0]])
     assert packed.shape == (1, bin_size - 1)
     torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+    # The filled mask marks exactly the scattered targets.
+    assert filled_mask.tolist() == [[True, False, True, False, True, True, False]]
 
 
 def test_packing_observability_metrics():
