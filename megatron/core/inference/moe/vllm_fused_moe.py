@@ -1000,6 +1000,71 @@ def _moe_sum_kernel(
             tl.store(output_ptr + token_id_i64 * K + offs_k, acc, mask=k_mask)
 
 
+@triton.jit
+def _moe_sum_kernel_fast(
+    input_ptr,
+    output_ptr,
+    topk_weights_ptr,
+    valid_tokens_ptr,
+    routing_map_ptr,
+    local_expert_start,
+    num_local_experts: tl.constexpr,
+    K,
+    topk: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_K_BLOCKS: tl.constexpr,
+):
+    """``_moe_sum_kernel`` with the locality test predicated instead of branched.
+
+    Same reduction, same order, same fp32 arithmetic — so bit-exact — but the
+    ``if lid >= 0 and lid < num_local_experts`` guard becomes a load mask. In the
+    branched form each of the ``topk`` iterations is a uniform scalar branch
+    gated on a dependent global load of ``routing_map``, so the compiler cannot
+    overlap iteration ``t``'s data load with iteration ``t+1``'s index load and
+    the CTA walks the topk slots serially. Predicating lets all ``topk`` data
+    loads issue back to back; masked-off lanes read nothing and contribute an
+    exact fp32 zero.
+
+    Measured cost of the branched form in the BS256 decode graph: 7.79 us per
+    layer to move ~6.3 MB, i.e. 7x its own ~1.05 us bandwidth floor at the
+    6.08 TB/s measured in QWEN-012.
+    """
+    pid = tl.program_id(0)
+    valid_tokens = tl.load(valid_tokens_ptr)
+
+    for token_id in tl.range(pid, valid_tokens, BLOCK_M):
+        token_id_i64 = token_id.to(tl.int64)
+        base = token_id_i64 * topk * K
+
+        for k_idx in range(NUM_K_BLOCKS):
+            offs_k = k_idx * BLOCK_K + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < K
+
+            acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+            for t in tl.static_range(topk):
+                eid = tl.load(routing_map_ptr + token_id * topk + t)
+                lid = eid - local_expert_start
+                is_local = (lid >= 0) & (lid < num_local_experts)
+                v = tl.load(
+                    input_ptr + base + t * K + offs_k, mask=k_mask & is_local, other=0.0
+                )
+                w = tl.load(topk_weights_ptr + token_id * topk + t)
+                acc += v.to(tl.float32) * tl.where(is_local, w, 0.0)
+
+            tl.store(output_ptr + token_id_i64 * K + offs_k, acc, mask=k_mask)
+
+
+# Use the predicated `_moe_sum_kernel_fast` (bit-exact) with a full-K tile in the
+# decode topk reduction. Env-toggleable for A/B; default off.
+_USE_FAST_MOE_SUM: bool = os.environ.get("MCORE_MOE_SUM_FAST", "0") == "1"
+
+
+# Full hidden-size K tile: one pass over topk per token instead of NUM_K_BLOCKS
+# passes, so the per-token routing_map/prob index loads are issued once.
+_FAST_MOE_SUM_MAX_BLOCK_K = 2048
+
+
 def _moe_sum(
     input: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -1025,9 +1090,28 @@ def _moe_sum(
     """
     if out is None:
         out = torch.empty(max_tokens, K, dtype=torch.float32, device=input.device)
+    BLOCK_M = _get_num_sms(input.device)
+    if _USE_FAST_MOE_SUM:
+        BLOCK_K = min(triton.next_power_of_2(K), _FAST_MOE_SUM_MAX_BLOCK_K)
+        NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
+        _moe_sum_kernel_fast[(BLOCK_M,)](
+            input,
+            out,
+            topk_weights,
+            valid_tokens,
+            routing_map,
+            local_expert_start,
+            num_local_experts,
+            K,
+            topk=topk,
+            BLOCK_M=BLOCK_M,
+            BLOCK_K=BLOCK_K,
+            NUM_K_BLOCKS=NUM_K_BLOCKS,
+            num_warps=8,
+        )
+        return out
     BLOCK_K = min(triton.next_power_of_2(K), 1024)
     NUM_K_BLOCKS = _ceil_div(K, BLOCK_K)
-    BLOCK_M = _get_num_sms(input.device)
     _moe_sum_kernel[(BLOCK_M,)](
         input,
         out,
