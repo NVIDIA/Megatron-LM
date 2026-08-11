@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
+    get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
@@ -287,7 +288,15 @@ def pack_or_pad_batch(
     if is_src:
         assert batch is not None, "source TP rank must provide a batch"
         max_seqlens = max(x["input_ids"].shape[0] for x in batch)
-        target_seqlens = min(max_seqlens, seq_length)
+        if get_pipeline_model_parallel_world_size() > 1:
+            # The PP scheduler sizes its P2P recv buffers from
+            # ``args.seq_length`` unless ``config.variable_seq_lengths`` is
+            # set, which multimodal_dev never does.  Padding to the
+            # per-microbatch max would make the activation length vary between
+            # microbatches and mismatch those buffers, so keep it static.
+            target_seqlens = seq_length
+        else:
+            target_seqlens = min(max_seqlens, seq_length)
         # Round target seqlen up to the parallelism alignment factor so the
         # batched tensor is divisible for CP (+SP) splitting downstream.
         if divisible_by > 1:
@@ -418,7 +427,7 @@ def forward_step(data_iterator, model):
     # ``pixel_values`` was omitted from the batch before TP broadcast on
     # non-first logical pipeline stages. ``input_ids`` and ``image_grid_thw``
     # remain available on every stage for MRoPE position construction.
-    is_last = is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
+    is_last_pipeline_stage = is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
 
     pixel_values = batch.get("pixel_values", None)
     image_grid_thw = batch.get("image_grid_thw", None)
@@ -451,7 +460,7 @@ def forward_step(data_iterator, model):
     # so the slicing rule lives in one place.  The PP scheduler only
     # invokes the loss closure on the last PP stage, so on non-last
     # stages the mask is left untouched.
-    if is_last:
+    if is_last_pipeline_stage:
         from examples.multimodal_dev.models.base import MultimodalModel
 
         loss_mask = MultimodalModel.cp_split_loss_mask(
