@@ -16,7 +16,6 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     InferenceConfig,
@@ -80,7 +79,6 @@ class TextGenerationControllerTestBase:
         hybrid_layer_pattern: str = None,
         sampling_backend: str = 'torch',
         cuda_graph_impl: str = 'none',
-        logit_dtype: torch.dtype = None,
     ):
         if use_training_random_init:
             # This is necessary to induce the training behavior which permutes the random seed
@@ -132,7 +130,6 @@ class TextGenerationControllerTestBase:
                 hybrid_layer_pattern=hybrid_layer_pattern,
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
-                logit_dtype=logit_dtype,
             ).cuda()
             mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
         else:
@@ -153,11 +150,7 @@ class TextGenerationControllerTestBase:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
                 mtp_block_spec=mtp_block_spec,
-                logit_dtype=logit_dtype,
             ).cuda()
-
-        # `logit_dtype` defaults to the dtype the model computes in.
-        self.logit_dtype = logit_dtype or dtype
 
         model.eval()
         if dtype == torch.bfloat16:
@@ -3269,7 +3262,6 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
         expert_model_parallel_size: int = 1,
         num_moe_experts: int = None,
         hybrid_layer_pattern: str = None,
-        logit_dtype: torch.dtype = None,
     ):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_model_parallel_size,
@@ -3295,138 +3287,7 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
             expert_model_parallel_size=expert_model_parallel_size,
             num_moe_experts=num_moe_experts,
             hybrid_layer_pattern=hybrid_layer_pattern,
-            logit_dtype=logit_dtype,
         )
-
-    @pytest.mark.parametrize("static", [True, False])
-    @pytest.mark.parametrize(
-        "logit_dtype",
-        [
-            # Unset: logits stay in the model's bf16 compute dtype.
-            pytest.param(None, id="bf16-logits"),
-            pytest.param(
-                torch.float32,
-                id="fp32-logits",
-                marks=pytest.mark.skipif(
-                    te_general_gemm is None,
-                    reason="Transformer Engine general_gemm is not available",
-                ),
-            ),
-        ],
-    )
-    def test_logit_dtype_with_pipeline_parallelism(self, static, logit_dtype):
-        """Logits whose dtype differs from `params_dtype` must not deadlock under PP.
-
-        Every rank sizes its `broadcast_from_last_pipeline_stage` buffer from its own model, so
-        a rank that resolved the logit dtype differently would post a mismatched byte count and
-        hang. Non-last PP stages have no output layer, so they must still agree on the dtype.
-        """
-        if not static and not is_fa_min_version("2.7.3"):
-            pytest.skip(reason="Need latest flash attn for dynamic batching")
-
-        self.setup_model(
-            dtype=torch.bfloat16,
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=2,
-            static=static,
-            use_training_random_init=True,
-            logit_dtype=logit_dtype,
-        )
-
-        expected_logit_dtype = logit_dtype or torch.bfloat16
-        assert self.logit_dtype == expected_logit_dtype
-        # Must hold on every PP rank, including those without an output layer.
-        assert self.text_generation_controller.logit_dtype == expected_logit_dtype
-        assert (
-            self.text_generation_controller.inference_wrapped_model.logit_dtype
-            == expected_logit_dtype
-        )
-        # The dtype knob is independent of the params/pipeline dtype.
-        assert self.text_generation_controller.model_config.params_dtype == torch.bfloat16
-
-        self.mock_tokenizer.vocab_size = self.vocab_size
-        self.mock_tokenizer.eod = self.vocab_size - 1
-        self.mock_tokenizer.detokenize.side_effect = lambda x, skip_special_tokens=False: ' '.join(
-            [
-                ''.join(random.choices(string.ascii_letters, k=random.randint(4, 10)))
-                for _ in range(len(x))
-            ]
-        )
-        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
-            i for i, c in enumerate(s) if c == ' '
-        ] + [len(s)]
-
-        num_tokens_to_generate = 10
-        active_requests: Dict[str, InferenceRequest] = OrderedDict()
-        for i in range(self.batch_size):
-            prompt = "sample" * (i + 1)
-            prompt_tokens = torch.randint(
-                low=0, high=self.vocab_size - 1, size=(len(prompt),)
-            ).tolist()
-            request_id = str(i)
-            active_requests[request_id] = InferenceRequest(
-                request_id=request_id,
-                prompt=prompt,
-                sampling_params=SamplingParams(
-                    top_k=10, num_tokens_to_generate=num_tokens_to_generate
-                ),
-                arrival_time=time.time(),
-                prompt_tokens=prompt_tokens,
-                status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
-            )
-
-        # Generation completes only if every PP rank agrees on the broadcast dtype.
-        if static:
-            requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
-                active_requests
-            )
-            generated_tokens = [req.generated_tokens.tolist() for req in requests.values()]
-        else:
-            generated_tokens = [[] for _ in range(len(active_requests))]
-            context = self.text_generation_controller.inference_wrapped_model.inference_context
-            for request_id, request in active_requests.items():
-                context.add_request(
-                    DynamicInferenceRequest(
-                        request_id=int(request_id),
-                        prompt_tokens=torch.tensor(
-                            request.prompt_tokens,
-                            dtype=torch.long,
-                            device=torch.cuda.current_device(),
-                        ),
-                        sampling_params=SamplingParams(
-                            top_k=10, num_tokens_to_generate=num_tokens_to_generate
-                        ),
-                    )
-                )
-            while context.has_unfinished_requests():
-                result = self.text_generation_controller.generate_output_tokens_dynamic_batch()
-                for i, token in enumerate(result["sample"].tolist()):
-                    generated_tokens[i].append(token)
-
-        torch.distributed.barrier()
-
-        # A dtype disagreement that did not deadlock would still corrupt the broadcast payload,
-        # so require the first and last PP stages to have sampled identical tokens.
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
-        last_pp_rank = torch.distributed.get_process_group_ranks(pp_group)[-1]
-        flat_tokens = torch.tensor(
-            [token for request_tokens in generated_tokens for token in request_tokens],
-            dtype=torch.long,
-            device=torch.cuda.current_device(),
-        )
-
-        # Compare counts first, using a fixed-size buffer: if the ranks disagree they all fail
-        # this assert rather than deadlocking on a mismatched second broadcast.
-        token_count = torch.tensor(
-            [flat_tokens.numel()], dtype=torch.long, device=torch.cuda.current_device()
-        )
-        expected_count = token_count.clone()
-        torch.distributed.broadcast(expected_count, src=last_pp_rank, group=pp_group)
-        assert token_count.item() == expected_count.item(), "PP ranks generated differing counts"
-
-        expected_tokens = flat_tokens.clone()
-        torch.distributed.broadcast(expected_tokens, src=last_pp_rank, group=pp_group)
-        assert torch.equal(flat_tokens, expected_tokens), "PP ranks sampled different tokens"
 
     @pytest.mark.parametrize("static", [True, False])
     @pytest.mark.parametrize("tp_size", [1, 2])

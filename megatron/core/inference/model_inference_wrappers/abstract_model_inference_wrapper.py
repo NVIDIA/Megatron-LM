@@ -13,10 +13,8 @@ from megatron.core.inference.communication_utils import (
     send_to_next_pipeline_rank,
 )
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference.utils import get_logit_dtype
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import deprecate_args, get_attr_wrapped_model, get_model_config
 
 DEPRECATED_ARGS = ["inference_wrapper_config", "pg_collection"]
@@ -48,7 +46,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
         ), 'interleaving schedule is not supported for inference'
         self.model = model
         self.config = get_model_config(self.model)
-        self.logit_dtype = get_logit_dtype(self.model)
         self.pipeline_communication_dtype = (
             torch.float if self.config.fp32_residual_connection else self.config.params_dtype
         )
@@ -121,14 +118,13 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
-        kwargs = dict(
+        return self.model(
+            tokens,
+            position_ids,
+            attention_mask,
             inference_context=self.inference_context,
             runtime_gather_output=True,  # Inference should always gather the logits
         )
-        if isinstance(self.model, Float16Module):
-            # Skip Float16Module's unconditional fp32 upcast unless fp32 logits were requested.
-            kwargs["fp32_output"] = self.logit_dtype == torch.float32
-        return self.model(tokens, position_ids, attention_mask, **kwargs)
 
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None
@@ -224,7 +220,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             logits = output_tensor
 
             # Explicitly cast logits to expected dtype
-            logits = logits.to(self.logit_dtype)
+            logits = logits.to(self.config.params_dtype)
 
         return logits
 

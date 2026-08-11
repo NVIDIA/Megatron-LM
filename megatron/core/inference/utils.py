@@ -9,7 +9,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 import torch
 
-from megatron.core.utils import get_attr_wrapped_model, get_model_config
+from megatron.core.utils import get_model_config
 
 try:
     FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
@@ -105,42 +105,6 @@ def get_attention_mask(seq_length: int) -> torch.Tensor:
     attention_mask = attention_mask < 0.5
 
     return attention_mask
-
-
-def get_logit_dtype(model) -> torch.dtype:
-    """Returns the dtype of the language-model output logits.
-
-    Models may expose a `logit_dtype` attribute (see `--output-logit-dtype`) that overrides
-    the dtype of the output-layer GEMM result. When it is unset, the logits keep the
-    output-layer input dtype, i.e. the dtype the model computes in.
-
-    Args:
-        model: The model, optionally wrapped (e.g. in `Float16Module` or DDP).
-
-    Returns:
-        The dtype that the model's logits are produced in.
-    """
-    try:
-        logit_dtype = get_attr_wrapped_model(model, "logit_dtype")
-    except RuntimeError:
-        # Model types that predate `logit_dtype` always emit logits in the input dtype.
-        logit_dtype = None
-
-    if logit_dtype is not None:
-        return logit_dtype
-
-    # Deferred to avoid a circular import: `megatron.core.transformer` imports this module.
-    from megatron.core.transformer.module import Float16Module
-
-    # `Float16Module` casts the wrapped module to fp16/bf16 irrespective of `params_dtype`, so
-    # its precision - not `params_dtype` - is what the output layer actually receives.
-    module = model
-    while module is not None:
-        if isinstance(module, Float16Module):
-            return torch.float16 if module.fp16 else torch.bfloat16
-        module = getattr(module, "module", None)
-
-    return get_model_config(model).params_dtype
 
 
 # Initialize cache for sequence parallel modules

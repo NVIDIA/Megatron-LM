@@ -12,7 +12,6 @@ from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.transformer.module import Float16Module
 
 
 # pylint: disable=line-too-long
@@ -138,17 +137,15 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         position_ids = inference_input["position_ids"]
         num_image_tiles = inference_input["num_tiles"]
 
-        kwargs = dict(
+        output = self.model(
+            images,
+            tokens,
             position_ids=position_ids,
             attention_mask=None,
             inference_context=self.inference_context,
             num_image_tiles=num_image_tiles,
             runtime_gather_output=True,
         )
-        if isinstance(self.model, Float16Module):
-            # Skip Float16Module's unconditional fp32 upcast unless fp32 logits were requested.
-            kwargs["fp32_output"] = self.logit_dtype == torch.float32
-        output = self.model(images, tokens, **kwargs)
         if isinstance(output, tuple):
             logits, _ = output
         else:
