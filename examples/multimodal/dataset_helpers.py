@@ -145,6 +145,36 @@ def greedy_knapsack(item_sizes: List[int], samples: List, max_capacity: int) -> 
 class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked, dict]):
     """A simple task encoder for VLMs."""
 
+    @staticmethod
+    def _content_parts_from_image_tokens(content: str) -> List[Dict[str, str]]:
+        """Convert legacy structural image tokens into tokenizer content parts."""
+        parts: List[Dict[str, str]] = []
+        segments = content.split(IMAGE_TOKEN)
+        for idx, segment in enumerate(segments):
+            if segment:
+                parts.append({"type": "text", "text": segment})
+            if idx < len(segments) - 1:
+                parts.append({"type": "image"})
+        return parts or [{"type": "text", "text": ""}]
+
+    def _content_with_image_slot(self, content: str) -> List[Dict[str, str]]:
+        """Return structured content with an image slot at its legacy position or at the front."""
+        if IMAGE_TOKEN in content:
+            return self._content_parts_from_image_tokens(content)
+        return [{"type": "image"}, {"type": "text", "text": "\n" + content}]
+
+    def _conversation_with_structured_image_parts(
+        self, conversation: List[Dict]
+    ) -> List[Dict]:
+        """Convert legacy image markers in user turns to structured image parts."""
+        structured_conversation = []
+        for turn in conversation:
+            content = turn["content"]
+            if turn["role"] == "user" and isinstance(content, str) and IMAGE_TOKEN in content:
+                turn = {**turn, "content": self._content_parts_from_image_tokens(content)}
+            structured_conversation.append(turn)
+        return structured_conversation
+
     def __init__(
         self
     ):
@@ -181,7 +211,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         self.txt_to_token_dict = {}
 
         self.img_h, self.img_w = self.args.img_h, self.args.img_w
-        self.img_token_id = self.tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
+        self.img_token_id = self.tokenizer.image_token_index
         # This map is used to reduce the number of tiles used per image if the number of tokens is
         # larger than the decoder_seq_length.
         self.num_tiles_degradation_map = {12:8, 8:6, 6:4, 4:2, 2:1, 1:1}
@@ -258,7 +288,6 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         prompt_idx = np.random.randint(len(prompt_list))
         cur_prompt = prompt_list[prompt_idx]
-        cur_prompt = IMAGE_TOKEN + "\n" + cur_prompt + "\n"
 
         caption = sample.caption.strip()
 
@@ -269,7 +298,13 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         conv = [
             # Note: no system message.
-            {"role": "user", "content": cur_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "\n" + cur_prompt + "\n"},
+                ],
+            },
             {"role": "assistant", "content": caption},
         ]
 
@@ -303,7 +338,10 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         # LLAVA training: override text-prompt with just the image.
         conv = [
             # Note: no system message.
-            {"role": "user", "content": IMAGE_TOKEN + "\n"},
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": "\n"}],
+            },
             {"role": "assistant", "content": sample.answers},
         ]
 
@@ -422,7 +460,10 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                     turn["content"] = IMAGE_TOKEN*(number_of_images-number_image_tags) + "\n" + turn["content"]
                     break
 
-        input_ids, target = self.tokenizer.tokenize_conversation(conversation, True, False)
+        structured_conversation = self._conversation_with_structured_image_parts(conversation)
+        input_ids, target = self.tokenizer.tokenize_conversation(
+            structured_conversation, True, False
+        )
 
         if has_image:
             imgs = []
@@ -639,7 +680,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         conversation = [
             {"role": "system", "content": "Answer the questions."},
-            {"role": "user", "content": cur_prompt},
+            {"role": "user", "content": self._content_with_image_slot(cur_prompt)},
             {"role": "assistant", "content": str(cur_answer)},
         ]
 
@@ -679,7 +720,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         conversation = [
             {"role": "system", "content": "Answer the questions."},
-            {"role": "user", "content": cur_prompt},
+            {"role": "user", "content": self._content_with_image_slot(cur_prompt)},
             {"role": "assistant", "content": str(cur_answer)},
         ]
 

@@ -13,6 +13,7 @@ from megatron.core.models.multimodal.llava_model import (
 from megatron.core.tokenizers.vision.libraries.multimodal_tokenizer import (
     MegatronMultimodalTokenizer,
 )
+from megatron.core.tokenizers.vision.vision_tokenizer import MegatronTokenizerVision
 
 
 class _FakeTokenizer:
@@ -66,6 +67,24 @@ def test_render_and_encode_structured_parts(tokenizer):
         DEFAULT_SOUND_TOKEN_INDEX,
         1002,
     ]
+
+
+def test_render_structured_image_with_prompt_tags(tokenizer):
+    """Image prompt tags should wrap the sentinel without changing its ID."""
+    tokenizer._image_tag = ("<Image>", "</Image>")
+
+    rendered, replacements = tokenizer._render_parts([{"type": "image"}])
+
+    assert rendered == f"<Image>{tokenizer._MM_MARKER}</Image>"
+    assert replacements == [[DEFAULT_IMAGE_TOKEN_INDEX]]
+
+
+def test_vision_wrapper_exposes_image_sentinel(tokenizer):
+    """The public vision wrapper should expose the inner tokenizer's image sentinel."""
+    wrapper = object.__new__(MegatronTokenizerVision)
+    wrapper._tokenizer = tokenizer
+
+    assert wrapper.image_token_index == DEFAULT_IMAGE_TOKEN_INDEX
 
 
 def test_render_parts_validates_reserved_marker_and_audio_length(tokenizer):
