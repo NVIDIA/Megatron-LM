@@ -8,7 +8,7 @@
 import inspect
 import logging
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -27,7 +27,11 @@ from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.mamba_ssm import selective_state_update
-from megatron.core.ssm.utils import _split_tensor_factory
+from megatron.core.ssm.utils import (
+    _gtp_gather_rows_for_save,
+    _gtp_slice_rows_on_load,
+    _split_tensor_factory,
+)
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
@@ -44,7 +48,6 @@ from megatron.core.utils import (
     is_mamba_min_version,
     is_using_quantization_scales,
     log_single_rank,
-    make_tp_sharded_tensor_for_checkpoint,
 )
 
 if HAVE_GTP:
@@ -1386,32 +1389,23 @@ class MambaMixer(MegatronModule):
         # don't line up with GTP slice boundaries, so gather the shards back to TP-local size
         # (strip the trailing pad rows from the gathered tail) and fall through to the same
         # split path the non-GTP run uses — saved ckpt format matches a non-GTP run.
-        in_proj_gtp_remat_size = getattr(self.in_proj.weight, "gtp_remat_size", 1)
-        if in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight):
-            gtp_remat_group = self.in_proj.weight.group
-            # in_proj.weight was already built at the sharded size by the submodule
-            # sharded_state_dict above — and, for native-FP8 GTP, dequantized to BF16 there
-            # (make_tp_sharded_tensor_for_checkpoint). Gather those (BF16) shards back to the
-            # full TP-local size so the [z|x|B|C|dt] split below matches a non-GTP run.
-            local = sharded_state_dict[f"{prefix}in_proj.weight"].data.contiguous()
-            gathered = torch.empty(
-                (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
-                dtype=local.dtype,
-                device=local.device,
-            )
-            torch.distributed.all_gather_into_tensor(gathered, local, group=gtp_remat_group)
-            if gathered.shape[0] != in_proj_dim:
-                gathered = gathered[:in_proj_dim].contiguous()
-            # Gathered weight is replicated across full dp_cp; replica_id needs only the DP slot.
-            dp_cp_rank = torch.distributed.get_rank(metadata['dp_cp_group'])
-            sharded_state_dict[f"{prefix}in_proj.weight"] = make_tp_sharded_tensor_for_checkpoint(
-                gathered,
+        # in_proj.weight was already built at the sharded size by the submodule
+        # sharded_state_dict above — and, for native-FP8 GTP, dequantized to BF16 there
+        # (make_tp_sharded_tensor_for_checkpoint).
+        in_proj_uses_gtp = (
+            getattr(self.in_proj.weight, "gtp_remat_size", 1) > 1
+            and HAVE_GTP
+            and is_gtp_param(self.in_proj.weight)
+        )
+        if in_proj_uses_gtp:
+            sharded_state_dict[f"{prefix}in_proj.weight"] = _gtp_gather_rows_for_save(
+                sharded_state_dict[f"{prefix}in_proj.weight"],
                 f"{prefix}in_proj.weight",
-                tp_axis=0,
-                replica_id=(0, 0, dp_cp_rank),
-                prepend_offsets=sharded_offsets,
-                tp_group=self.tp_group,
-                dp_cp_group=metadata['dp_cp_group'],
+                self.in_proj.weight,
+                in_proj_dim,
+                self.tp_group,
+                metadata['dp_cp_group'],
+                sharded_offsets,
             )
 
         assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
@@ -1433,37 +1427,10 @@ class MambaMixer(MegatronModule):
         )
 
         # GTP load-side inverse of the save-time all-gather (see
-        # docs/api-guide/core/generalized_tensor_parallel.md §3.3, in_proj
-        # note): the checkpoint stores the FULL TP-local in_proj.weight (pad stripped) under the
-        # 5 split keys [z|x|B|C|dt], so the default merge_fn cats them back to ``in_proj_dim``
-        # rows with no padding. To reload into the live GTP param we must mirror init
-        # (``_gtp_slice_one_param``): F.pad the merged tensor with zeros up to
-        # ``gtp_local_size * gtp_remat_size``, then slice by ``gtp_rank``. GTP_remat_size=1 has no
-        # pad/slice.
-        if in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight):
-            factory = sharded_state_dict[f"{prefix}in_proj.weight"]
-            gtp_local_rank = torch.distributed.get_rank(self.in_proj.weight.group)
-            gtp_local_size = self.in_proj.weight.data.size(0)
-            original_merge_fn = factory.merge_fn
-
-            @torch.no_grad()
-            def _gtp_slice_after_cat(
-                sub_state_dict,
-                _orig=original_merge_fn,
-                _rank=gtp_local_rank,
-                _size=gtp_local_size,
-                _gtp_remat_size=in_proj_gtp_remat_size,
-            ):
-                full = _orig(sub_state_dict)
-                aligned_total = _size * _gtp_remat_size
-                pad_rows = aligned_total - full.shape[0]
-                if pad_rows > 0:
-                    full = torch.nn.functional.pad(full, (0, 0, 0, pad_rows))
-                start = _rank * _size
-                return full[start : start + _size].contiguous()
-
-            sharded_state_dict[f"{prefix}in_proj.weight"] = replace(
-                factory, merge_fn=_gtp_slice_after_cat
+        # docs/api-guide/core/generalized_tensor_parallel.md §3.3, in_proj note).
+        if in_proj_uses_gtp:
+            sharded_state_dict[f"{prefix}in_proj.weight"] = _gtp_slice_rows_on_load(
+                sharded_state_dict[f"{prefix}in_proj.weight"], self.in_proj.weight
             )
 
         conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state
