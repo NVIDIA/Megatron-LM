@@ -33,6 +33,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_reduce_scatter_v,
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, batch_invariant
+from megatron.core.inference.moe import router_topk as _fused_topk
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -503,6 +504,11 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # the routing map along. Base class self.tp_rank is the expt_tp rank,
         # which is not what we want for the SP padding offset.
         self.sp_rank = get_pg_rank(pg_collection.tp)
+        # Unsharded rows let the router fold the padding sentinel into its selection
+        # kernel: local and global row indices coincide, so no row offset is needed.
+        # Requiring group size 1 rather than rank 0 keeps every rank on the same
+        # branch, which matters because the NVLS path barriers across ranks.
+        self._rows_unsharded = get_pg_size(pg_collection.tp) == 1
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
         # When shared_expert_overlap is enabled, the shared expert forward is launched
@@ -568,7 +574,17 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # shift local rows into the global frame for the comparison. When unset
         # (standalone dispatcher use without a context) all rows are real, so
         # skip the mask.
-        if self.__class__._real_token_count_tensor is not None:
+        #
+        # Publishing the count lets the router's selection kernel emit the sentinel
+        # itself and retires this launch. The skip below keys off the tag the router
+        # leaves on the tensor it actually masked, so it is evidence that the fused
+        # path ran rather than a second copy of the gate.
+        if self.__class__._real_token_count_tensor is not None and self._rows_unsharded:
+            _fused_topk.publish_graph_padding(self.__class__._real_token_count_tensor)
+
+        if self.__class__._real_token_count_tensor is not None and not getattr(
+            self.routing_map, "_mcore_padding_masked", False
+        ):
             mask_routing_padding(
                 self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
             )

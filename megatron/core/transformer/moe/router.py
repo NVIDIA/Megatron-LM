@@ -5,7 +5,11 @@ from typing import Optional, Union
 
 import torch
 
-from megatron.core.inference.moe.router_topk import can_use_fused_softmax_topk, fused_softmax_topk
+from megatron.core.inference.moe.router_topk import (
+    can_fuse_route_mask,
+    can_use_fused_softmax_topk,
+    fused_softmax_topk,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -977,7 +981,7 @@ class InferenceTopKRouter(TopKRouter):
             )
             and not is_batch_invariant_mode_enabled()
         ):
-            return fused_softmax_topk(logits, self.topk)
+            return fused_softmax_topk(logits, self.topk, mask_padding=can_fuse_route_mask())
 
         routing = (
             topk_routing_with_score_function
