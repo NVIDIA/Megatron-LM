@@ -133,9 +133,20 @@ RUN groupadd --gid "${RUNTIME_GID}" nemo-runtime && \
     useradd --no-log-init --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
         --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime && \
     install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" \
-        /opt/megatron-lm /home/gitlab-runner/data/gpt3_data
+        /home/gitlab-runner/data/gpt3_data \
+        /opt/megatron-lm \
+        /tmp/regent-cache/pip \
+        /tmp/regent-cache/uv \
+        /tmp/regent-cache/xdg \
+        /workspace/data/cache && \
+    venv_site_packages="$("${UV_PROJECT_ENVIRONMENT}/bin/python" -c \
+        'import site; print(site.getsitepackages()[0])')" && \
+    touch "${venv_site_packages}/.nonroot-uninstall-probe" && \
+    find "${UV_PROJECT_ENVIRONMENT}" -type d \
+        -exec chown "${RUNTIME_UID}:${RUNTIME_GID}" {} +
 
 ENV HOME=/home/nemo-runtime \
+    PIP_CACHE_DIR=/tmp/regent-cache/pip \
     XDG_CACHE_HOME=/tmp/regent-cache/xdg \
     UV_CACHE_DIR=/tmp/regent-cache/uv
 
@@ -147,7 +158,12 @@ USER ${RUNTIME_UID}:${RUNTIME_GID}
 RUN test "$(id -u)" = "${RUNTIME_UID}" && \
     test -x /usr/local/bin/uv && \
     test -x /opt/venv/bin/python && \
-    mkdir -p "${XDG_CACHE_HOME}" "${UV_CACHE_DIR}" && \
+    venv_site_packages="$(python -c 'import site; print(site.getsitepackages()[0])')" && \
+    rm "${venv_site_packages}/.nonroot-uninstall-probe" && \
+    touch "${venv_site_packages}/.nonroot-write-probe" && \
+    rm "${venv_site_packages}/.nonroot-write-probe" && \
+    touch /workspace/data/cache/.nonroot-write-probe && \
+    rm /workspace/data/cache/.nonroot-write-probe && \
     touch /opt/megatron-lm/.nonroot-write-probe && \
     rm /opt/megatron-lm/.nonroot-write-probe
 
