@@ -213,6 +213,7 @@ class DynamicInferenceEngineTestBase:
         assert env.engine.cuda_graph_impl == "full_iteration"
         assert env.engine.inference_cuda_graph_scope == InferenceCudaGraphScope.none
         assert env.engine.capture_stats is None
+        assert not hasattr(model, 'cudagraph_manager')
         assert not hasattr(model.decoder, 'cudagraph_manager')
         for layer in model.decoder.layers:
             assert not hasattr(layer, 'cudagraph_manager')
@@ -845,11 +846,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert env.engine.context.cuda_graph_batch_dimensions_list
             model = env.engine.controller.inference_wrapped_model.model
             if inference_cuda_graph_scope == InferenceCudaGraphScope.block:
-                # hybrid models attach cudagraph_manager to the model; others attach to the decoder
-                if model_provider == "hybrid":
-                    assert model.cudagraph_manager.cudagraph_runners
-                else:
-                    assert model.decoder.cudagraph_manager.cudagraph_runners
+                # GPT and hybrid models both own the block-scope graph at model level;
+                # GPT removes the decoder's fallback manager at construction.
+                assert model.cudagraph_manager.cudagraph_runners
+                assert not hasattr(model.decoder, 'cudagraph_manager')
             else:
                 # check if cudagraph runners are created at the layer level
                 for layer in model.decoder.layers:
