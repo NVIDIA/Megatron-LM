@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
@@ -180,6 +180,8 @@ class _GDNBase(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
+        # Static/max CP size from model construction. Runtime dynamic CP paths must resolve
+        # the effective group from packed_seq_params instead of using this value.
         self.cp_size = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
@@ -397,9 +399,9 @@ class _GDNBase(MegatronModule):
         norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
         norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
 
-        return a2a_hp_to_cp(
-            norm_out_hp, self.cp_size, self.pg_collection.cp, packed_seq_params, thd_cp_a2a_inv
-        )
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        cp_size = cp_group.size() if cp_group is not None else 1
+        return a2a_hp_to_cp(norm_out_hp, cp_size, cp_group, packed_seq_params, thd_cp_a2a_inv)
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
@@ -437,7 +439,7 @@ class _GDNBase(MegatronModule):
             ``k``, ``v``, ``g``, and ``beta``), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
-        cp_size = self.cp_size if cp_size_headwise is None else cp_size_headwise
+        cp_size = 1 if cp_size_headwise is None else cp_size_headwise
 
         # Split qkv into query_key and value
         query_key, value = torch.split(

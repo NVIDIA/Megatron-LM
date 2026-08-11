@@ -131,6 +131,7 @@ class GatedDeltaNet(_GDNBase):
             )
         cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
         cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
+        cp_size_runtime = cp_group.size()
 
         seq_len_local, batch, _ = hidden_states.shape
         seq_len_post_headwise = seq_len_local * self.sp_size * cp_size_headwise
@@ -156,14 +157,14 @@ class GatedDeltaNet(_GDNBase):
                 packed_seq_params.cu_seqlens_q,
                 seq_len_global,
                 "cu_seqlens_q",
-                cp_size=self.cp_size,
+                cp_size=cp_size_runtime,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
                 seq_len_global,
                 "cu_seqlens_kv",
-                cp_size=self.cp_size,
+                cp_size=cp_size_runtime,
             )
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
