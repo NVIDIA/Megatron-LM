@@ -2037,7 +2037,12 @@ class GTPShardedParam(torch.nn.Parameter):
             None or tuple of Nones for async — backward returns this.
         """
         batched = isinstance(wgrad, (list, tuple))
-        wgrads = list(wgrad) if batched else [wgrad]
+        # Keep the pool-owned full-wgrad INPUTS distinct from the reduce-scatter OUTPUTS.
+        # _wgrad_pool_get() hands out full (unsharded) wgrad buffers; the collective returns
+        # shard-sized tensors. Rebinding one name to both means the sync path below recycles
+        # shard-sized outputs into a pool whose buffers are expected to be full-sized, and a
+        # later get() hands back a too-small buffer.
+        wgrad_inputs = list(wgrad) if batched else [wgrad]
         weights = self._weights
 
         # MTP feeds embedding and output_layer into more than one GEMM per forward, so they get
@@ -2056,25 +2061,28 @@ class GTPShardedParam(torch.nn.Parameter):
         if GTP_CONFIG.async_reduction and self.prev_w is not None:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
             # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
-            _, rs_handle = self._reduce_scatter(wgrads, async_op=True, nvtx_label=nvtx_label)
+            _, rs_handle = self._reduce_scatter(wgrad_inputs, async_op=True, nvtx_label=nvtx_label)
             self._wgrad_rs_handle = GTPShardHandle(rs_handle, weights, reduce_scatter=True)
             # Stash wgrad input buffers — cannot recycle yet because the async RS
             # kernel is still reading them on rs_stream.
-            self._wgrad_input_bufs = wgrads
-            ret = tuple([None] * len(wgrads)) if batched else None
+            self._wgrad_input_bufs = wgrad_inputs
+            ret = tuple([None] * len(wgrad_inputs)) if batched else None
         else:
             # Sync reduce-scatter — reached as the natural chain-head case, recycle immediately
-            wgrads, _ = self._reduce_scatter(wgrads, async_op=False, nvtx_label=nvtx_label)
+            reduced_wgrads, _ = self._reduce_scatter(
+                wgrad_inputs, async_op=False, nvtx_label=nvtx_label
+            )
             nvtx_range_push(f"{nvtx_label}.gtp_wgrad_accum")
             if len(weights) == 1:
-                weights[0].main_grad.add_(wgrads[0])
+                weights[0].main_grad.add_(reduced_wgrads[0])
             else:
-                torch._foreach_add_([p.main_grad for p in weights], wgrads)
+                torch._foreach_add_([p.main_grad for p in weights], reduced_wgrads)
             nvtx_range_pop(f"{nvtx_label}.gtp_wgrad_accum")
             result = [self._handle_megatron_grad_accum(p) for p in weights]
 
+            # Recycle the pool-owned INPUTS, never the shard-sized collective outputs.
             if poolable:
-                for buf in wgrads:
+                for buf in wgrad_inputs:
                     _wgrad_pool_put(buf)
             ret = result if batched else result[0]
 
