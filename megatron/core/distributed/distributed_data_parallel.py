@@ -389,7 +389,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 # One readiness callback per bucket group, stamped on all its params, so a
                 # consumer reading param.data outside the owning module's pre-hook can publish it
                 # first. Backend-agnostic: DDP never learns which consumers use it.
-                readiness = (
+                ready_callback = (
                     _BucketParamReadiness(self, bucket_group)
                     if self.ddp_config.overlap_param_gather
                     else None
@@ -397,8 +397,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 for bucket in bucket_group.buckets:
                     for param in bucket.params_list:
                         self.param_to_bucket_group[param] = bucket_group
-                        if readiness is not None:
-                            setattr(param, PARAM_READY_ATTR, readiness)
+                        if ready_callback is not None:
+                            setattr(param, PARAM_READY_ATTR, ready_callback)
                         elif hasattr(param, PARAM_READY_ATTR):
                             # Re-wrapping a model chunk: a previous DDP may have left a marker
                             # pointing at ITS bucket group. This DDP owns the parameter now and
