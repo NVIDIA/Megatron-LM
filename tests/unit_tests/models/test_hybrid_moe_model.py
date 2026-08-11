@@ -211,6 +211,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_hybridep_num_blocks_unpermute": None,
     "moe_input_jitter_eps": None,
     "moe_latent_size": None,
+    "moe_latent_output_norm": False,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
     "moe_n_hash_layers": 0,
