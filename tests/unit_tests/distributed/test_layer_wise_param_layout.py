@@ -106,6 +106,15 @@ def _assert_param_within_shard(layout, param, dp_size):
 
 
 class TestSizeMatchingLayout:
+    """Packing and bucketing rules, exercised with 1-D params.
+
+    Every param here is 1-D, so ``_ns_compute_cost`` falls back to ``nelement()``
+    and Newton-Schulz cost equals numel. That keeps these cases focused on the
+    packing and bucketing rules, but it also means they cannot tell
+    compute-balanced placement apart from numel-balanced placement: both order
+    and assign identically when the two metrics agree. ``TestComputeBalancedLayout``
+    covers that distinction with 2-D GTP-sharded params, where the metrics diverge.
+    """
 
     # -- uniform params: all same size, dp_size divides count --
 
