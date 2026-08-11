@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
 import os
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from torch.optim import SGD, Adam
 # FP8 recipe will be used to test precision-aware-optimizer.
 from transformer_engine.pytorch.fp8 import fp8_autocast
 
+from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import (
     ChainedOptimizer,
@@ -23,6 +25,7 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     get_standard_config_overrides,
 )
+from megatron.core.optimizer.optimizer import copy_optimizer_param_metadata
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -67,6 +70,81 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+def test_copy_optimizer_param_metadata_preserves_allreduce():
+    source = torch.empty(1)
+    destination = torch.empty_like(source)
+    source.allreduce = False
+
+    copy_optimizer_param_metadata(destination, source)
+
+    assert destination.allreduce is False
+
+
+@pytest.mark.skipif(
+    int(os.getenv('WORLD_SIZE', '1')) < 2, reason="test requires at least two distributed ranks"
+)
+@pytest.mark.parametrize("use_distributed_optimizer", (False, True), ids=("optimizer", "distopt"))
+def test_expert_grad_stats_use_expert_tp_group(use_distributed_optimizer: bool):
+    """Expert grad stats must deduplicate over ETP, not dense TP."""
+    world_size = int(os.environ['WORLD_SIZE'])
+    rank = int(os.environ['RANK'])
+    _init_distributed(world_size, rank)
+
+    class DenseAndExpertParameters(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dense = nn.Parameter(torch.ones(1, dtype=torch.bfloat16, device='cuda'))
+            self.expert = nn.Parameter(torch.ones(1, dtype=torch.bfloat16, device='cuda'))
+            self.expert.allreduce = False
+
+    try:
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=world_size,
+            expert_model_parallel_size=world_size,
+            expert_tensor_parallel_size=1,
+        )
+        model = DenseAndExpertParameters()
+        transformer_config = TransformerConfig(num_attention_heads=1, num_layers=1)
+        model = DistributedDataParallel(
+            transformer_config,
+            DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer),
+            model,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer='adam',
+                lr=0.0,
+                bf16=True,
+                clip_grad=0.0,
+                log_num_zeros_in_grad=True,
+                use_distributed_optimizer=use_distributed_optimizer,
+            ),
+            [model],
+            use_gloo_process_groups=False,
+        )
+
+        dense_optimizer, expert_optimizer = optimizer.chained_optimizers
+        assert dense_optimizer.tp_group is parallel_state.get_tensor_model_parallel_group()
+        assert expert_optimizer.expert_tp_group is parallel_state.get_expert_tensor_parallel_group()
+
+        for param in model.parameters():
+            param.main_grad.fill_(1.0)
+        assert optimizer.prepare_grads() is False
+
+        expected_grad_norm = math.sqrt(1 + world_size)
+        actual_grad_norm = optimizer.get_grad_norm()
+        if isinstance(actual_grad_norm, torch.Tensor):
+            actual_grad_norm = actual_grad_norm.item()
+        assert actual_grad_norm == pytest.approx(expected_grad_norm)
+
+        for param in model.parameters():
+            param.main_grad.zero_()
+        assert optimizer.prepare_grads() is False
+        assert optimizer.count_zeros() == 1 + world_size
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
