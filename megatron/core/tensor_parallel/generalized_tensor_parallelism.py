@@ -960,10 +960,15 @@ class GTPShardedParam(torch.nn.Parameter):
         Call only where the chains are complete -- NOT on "this weight is already linked", which
         MTP hits mid-forward while later links are still being created.
         """
+        # Clear each buffer on emit: the latch alone is not enough, since the dynamic GTP_*
+        # subclasses each carry their own copy of it over this one shared buffer set.
+        emitted = False
         for chain in cls._chain_state.values():
             if chain["link_table_buffer"]:
                 log_single_rank(logger, logging.INFO, "\n".join(chain["link_table_buffer"]) + "\n")
-        cls._link_tables_flushed = True
+                chain["link_table_buffer"] = []
+                emitted = True
+        cls._link_tables_flushed = emitted
 
     @classmethod
     def flush_recompute_link_tables(cls) -> None:
