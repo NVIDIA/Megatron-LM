@@ -164,6 +164,8 @@ def check_checkpoint_args(checkpoint_args):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
+    if hasattr(args, 'gdp_num_householder'):
+        _compare('gdp_num_householder', default=3)
     _compare('add_position_embedding', default=True)
     if args.vocab_file:
         _compare('max_position_embeddings')
@@ -1942,6 +1944,10 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('mamba_head_dim', force=True)
     _set_arg('mamba_num_groups', force=True)
     _set_arg('mamba_num_heads', force=True)
+    # GDP checkpoints created before this argument existed always used three reflections.
+    if not hasattr(checkpoint_args, 'gdp_num_householder'):
+        setattr(checkpoint_args, 'gdp_num_householder', 3)
+    _set_arg('gdp_num_householder', force=True)
     # We need to be able to override hybrid_layer_pattern from the command-line so that different
     # pipelining can be specified when re-loading a model (e.g. for inference or post-training).
     _set_arg('hybrid_layer_pattern')

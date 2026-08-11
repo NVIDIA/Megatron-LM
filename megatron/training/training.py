@@ -658,6 +658,38 @@ def num_floating_point_operations(
             + (2 * total_tokens * d_in * hidden_size)  # out_proj
         )
 
+    def gated_delta_product_layer_flops(
+        total_tokens,
+        hidden_size,
+        num_householder,
+        state_dim=128,
+        head_dim=64,
+        num_groups=8,
+        num_heads=None,
+        conv_kernel_dim=4,
+    ):
+        """Calculate FLOPs for a Gated Delta Product (GDP) layer."""
+        if num_heads is None:
+            d_inner = 2 * hidden_size
+            num_heads = d_inner // head_dim
+        else:
+            d_inner = num_heads * head_dim
+        in_proj_dim = (
+            d_inner * (1 + num_householder)
+            + num_groups * state_dim * (1 + num_householder)
+            + num_heads * (1 + num_householder)
+        )
+        conv_dim = d_inner * num_householder + num_groups * state_dim * (1 + num_householder)
+        non_core_flops = (
+            2
+            * total_tokens
+            * (hidden_size * in_proj_dim + conv_kernel_dim * conv_dim + d_inner * hidden_size)
+        )
+        # Best-case recurrent GDP core estimate. The FLA chunk kernel may do additional
+        # score/solve/WY work, but this keeps the implementation-agnostic lower bound explicit.
+        core_flops = (4 * num_householder + 3) * total_tokens * d_inner * state_dim
+        return non_core_flops + core_flops
+
     def gdn_layer_flops(
         total_tokens,
         hidden_size,
@@ -693,6 +725,7 @@ def num_floating_point_operations(
         num_mamba_layers,
         num_mlp_layers,
         num_moe_layers,
+        gdp_num_householder,
         num_gdn_layers=0,
         mamba_state_dim=128,
         mamba_head_dim=64,
@@ -708,6 +741,7 @@ def num_floating_point_operations(
         moe_ffn_hidden_size=2048,
         shared_expert_ffn_hidden_size=2048,
         num_experts_routed_to=1,
+        use_gated_delta_product=False,
         gdn_qk_head_dim=128,
         gdn_v_head_dim=128,
         gdn_num_qk_heads=16,
@@ -734,6 +768,26 @@ def num_floating_point_operations(
         dsa_indexer_topk=None,
     ):
         """Calculate total FLOPs for the hybrid model."""
+        mamba_flops = (
+            gated_delta_product_layer_flops(
+                total_tokens,
+                hidden_size,
+                gdp_num_householder,
+                mamba_state_dim,
+                mamba_head_dim,
+                mamba_num_groups,
+                mamba_num_heads,
+            )
+            if use_gated_delta_product
+            else mamba_layer_flops(
+                total_tokens,
+                hidden_size,
+                mamba_state_dim,
+                mamba_head_dim,
+                mamba_num_groups,
+                mamba_num_heads,
+            )
+        )
         # Self-attention (already summed over all attention layers, fwd-equivalent
         # with the FMA factor baked in; the global ``* 3`` below adds fwd+bwd).
         if experimental_attention_variant == "dsv4_hybrid":
@@ -785,15 +839,7 @@ def num_floating_point_operations(
         flops_fwd = (
             attn_flops_total
             + num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size, mlp_expansion, swiglu)
-            + num_mamba_layers
-            * mamba_layer_flops(
-                total_tokens,
-                hidden_size,
-                mamba_state_dim,
-                mamba_head_dim,
-                mamba_num_groups,
-                mamba_num_heads,
-            )
+            + num_mamba_layers * mamba_flops
             + num_moe_layers
             * moe_layer_flops(
                 total_tokens,
@@ -1167,6 +1213,24 @@ def num_floating_point_operations(
         )
         return total_floating_point_operations
 
+    def _uses_gated_delta_product_spec(args):
+        """Return True when the selected hybrid stack spec swaps Mamba layers to GDP."""
+        def _split_spec_part(part):
+            return str(part).replace('[', ' ').replace(']', ' ').replace(',', ' ').split()
+
+        spec = getattr(args, 'spec', None)
+        if spec is None:
+            return False
+        if isinstance(spec, str):
+            spec_parts = _split_spec_part(spec)
+        else:
+            spec_parts = []
+            for part in spec:
+                spec_parts.extend(_split_spec_part(part))
+        if not spec_parts:
+            return False
+        return spec_parts[-1] in {'gdp_stack_spec', 'gated_delta_product_stack_spec'}
+
     # Main entrypoint for FLOPs calculation.
     if is_hybrid_model(args):
         # Calculate the number of each type of layer.
@@ -1220,12 +1284,14 @@ def num_floating_point_operations(
             mamba_head_dim=args.mamba_head_dim,
             mamba_num_groups=args.mamba_num_groups,
             mamba_num_heads=args.mamba_num_heads,
+            gdp_num_householder=args.gdp_num_householder,
             num_attn_heads=args.num_attention_heads,
             gqa=args.group_query_attention,
             gqa_groups=args.num_query_groups,
             kv_channels=args.kv_channels,
             mlp_expansion=args.ffn_hidden_size / args.hidden_size,
             swiglu=args.swiglu,
+            use_gated_delta_product=_uses_gated_delta_product_spec(args),
             moe_latent_size=args.moe_latent_size,
             moe_ffn_hidden_size=(
                 args.moe_ffn_hidden_size
