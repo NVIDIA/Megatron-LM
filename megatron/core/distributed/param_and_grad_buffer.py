@@ -1102,9 +1102,7 @@ class _ParamAndGradBuffer:
     ):
 
         if pg_collection is None:
-            self.dp_cp_group = parallel_state.get_data_and_context_parallel_group(
-                with_context_parallel=True
-            )
+            self.dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
             self.tp_group = parallel_state.get_tensor_model_parallel_group()
         else:
             assert hasattr(pg_collection, 'tp') and hasattr(pg_collection, 'dp_cp')
