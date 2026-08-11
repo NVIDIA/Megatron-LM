@@ -564,9 +564,11 @@ class CheckpointConfig:
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
     ckpt_load_validate_sharding_integrity: bool = True
-    """Whether to validate sharding access integrity when loading a distributed checkpoint.
-    When True (default), each tensor shard is checked to be accessed exactly once as main
-    replica by some rank. Disabling skips this validation"""
+    """Whether to validate sharding access integrity when loading *and saving* a distributed
+    checkpoint. When True (default), each tensor shard is checked to be accessed exactly once as
+    main replica by some rank. Disabling skips this validation; on save this also skips the
+    world-wide determine_global_metadata all_gather_object (otherwise run on the first save of a
+    job)."""
 
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
@@ -615,13 +617,6 @@ class CheckpointConfig:
 
     verify_integrity: bool = False
     """Whether to hash checkpointing files during save and validate their integrity during load."""
-
-    stream_ckpt_dequant: bool = True
-    """Per-tensor streaming dequantize when loading checkpoints with quantized model params
-    (FP8, MXFP8, blockwise FP8, NVFP4). The LoadPlanner dequantizes one destination at a time,
-    instead of dequantizing the entire state dict to high precision before the load starts
-    (which allocates N simultaneous scratch tensors and can OOM on large models). On by
-    default; pass --no-stream-ckpt-dequant to fall back to the legacy upfront pass."""
 
     def __post_init__(self):
         from megatron.training.utils import has_nvrx_checkpointing_async_support

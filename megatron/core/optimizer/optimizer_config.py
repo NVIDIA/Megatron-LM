@@ -282,6 +282,9 @@ class OptimizerConfig:
     muon_tp_mode: str = "blockwise"
     """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
 
+    muon_use_syrk: bool = False
+    """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
+
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 

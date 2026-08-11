@@ -133,7 +133,7 @@ jobs:
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@6a2f81195fd910ae91d3c001d2e32ceb6d82e975 # v1.0.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
 
   configure:
     runs-on: ubuntu-latest
@@ -356,6 +356,9 @@ jobs:
 
       - name: Test CI cache keys
         run: .github/scripts/test_cache_keys.sh
+
+      - name: Test queue approval topology
+        run: .github/scripts/test_approve_test_queue.sh
 
       - name: Get PR info
         id: get-pr-info

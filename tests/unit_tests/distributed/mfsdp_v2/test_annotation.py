@@ -14,6 +14,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
     fully_shard,
+    fully_shard_context,
 )
 
 _NVTX_LABEL_PATTERN = re.compile(r"MFSDP (.+) (forward|backward)")
@@ -49,6 +50,19 @@ class FrozenFirstLayerModel(nn.Module):
         return torch.relu(self.layers[1](x + self.bias))
 
 
+class TiedLM(nn.Module):
+    """Tiny language model with shared input and output embedding weights."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(8, 4, dtype=torch.bfloat16)
+        self.lm_head = nn.Linear(4, 8, bias=False, dtype=torch.bfloat16)
+        self.lm_head.weight = self.embed_tokens.weight
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(self.embed_tokens(token_ids)).float().sum()
+
+
 def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
@@ -82,8 +96,9 @@ def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(
     _setup_nvtx_recording(monkeypatch, events)
     model = NestedLinearModel(dim=4).to(distributed_setup.device)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
-    fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
@@ -105,9 +120,10 @@ def test_fsdp_training_hooks_emit_stacked_nvtx_ranges(distributed_setup, monkeyp
     _setup_nvtx_recording(monkeypatch, events)
     model = NestedLinearModel(dim=4).to(distributed_setup.device)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
-    fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
@@ -135,7 +151,8 @@ def test_fsdp_frozen_parameters_emit_balanced_backward_nvtx_range(distributed_se
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     x = torch.ones(2, 4, device=distributed_setup.device, requires_grad=True)
     model(x).sum().backward()
@@ -158,9 +175,10 @@ def test_fsdp_frozen_child_without_grad_inputs_skips_backward_nvtx_range(
     for parameter in model.layers[0].parameters():
         parameter.requires_grad_(False)
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
-    fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
+        fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
@@ -174,5 +192,31 @@ def test_fsdp_frozen_child_without_grad_inputs_skips_backward_nvtx_range(
         ("push", "<root>", "backward"),
         ("push", "layers.1", "backward"),
         ("pop", "layers.1", "backward"),
+        ("pop", "<root>", "backward"),
+    ]
+
+
+def test_tied_child_parameters_complete_backward_once_per_cycle(distributed_setup, monkeypatch):
+    """Tied parameters should complete balanced backward ranges across training cycles."""
+    events: list[NvtxEvent] = []
+    _setup_nvtx_recording(monkeypatch, events)
+    model = TiedLM()
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    token_ids = torch.arange(8, device=distributed_setup.device).reshape(2, 4)
+    for _ in range(2):
+        model.zero_grad(set_to_none=True)
+        model(token_ids).backward()
+
+    assert [(event.kind, event.name, event.phase) for event in events] == [
+        ("push", "<root>", "forward"),
+        ("pop", "<root>", "forward"),
+        ("push", "<root>", "backward"),
+        ("pop", "<root>", "backward"),
+        ("push", "<root>", "forward"),
+        ("pop", "<root>", "forward"),
+        ("push", "<root>", "backward"),
         ("pop", "<root>", "backward"),
     ]
