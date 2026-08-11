@@ -22,9 +22,13 @@ try:
     from megatron.core.inference.fused_add_rmsnorm import (
         can_use_fused_add_rmsnorm as _can_use_fused_add_rmsnorm,
     )
+    from megatron.core.inference.fused_add_rmsnorm import (
+        can_use_fused_add_rmsnorm_qkv as _can_use_fused_add_rmsnorm_qkv,
+    )
     from megatron.core.inference.fused_add_rmsnorm import fused_add_rmsnorm as _fused_add_rmsnorm
 except Exception:  # keep the layer importable if the inference helper is unavailable
     _can_use_fused_add_rmsnorm = None
+    _can_use_fused_add_rmsnorm_qkv = None
     _fused_add_rmsnorm = None
 
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -449,6 +453,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
+
+        # Holds the *next* layer's linear_qkv so this layer's mlp_bda add can absorb
+        # that layer's input RMSNorm. Wired by TransformerBlock. Deliberately a list:
+        # assigning a Module straight to an attribute would register it as a child
+        # here too, duplicating those parameters in state_dict and named_parameters.
+        self._next_layer_qkv: list = []
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
 
@@ -1022,10 +1032,41 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
         else:
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                    mlp_output_with_bias, residual, self.hidden_dropout
+            next_qkv = self._next_layer_qkv[0] if self._next_layer_qkv else None
+            mlp_out = mlp_output_with_bias[0]
+            if (
+                next_qkv is not None
+                and _fused_add_rmsnorm is not None
+                and not self.training
+                and self.config.normalization == "RMSNorm"
+                and mlp_output_with_bias[1] is None
+                and self.mlp_norm_manager is None
+                # _te_rms_norm_kernel hardcodes zero_centered_gamma=False, so this
+                # fusion may only stand in for it when the config agrees.
+                and not self.config.layernorm_zero_centered_gamma
+                and _can_use_fused_add_rmsnorm_qkv(
+                    getattr(next_qkv, "layer_norm_weight", None), mlp_out, residual
                 )
+            ):
+                # Fuse this layer's residual add with the *next* layer's QKV input
+                # RMSNorm: one kernel yields both the residual stream and that
+                # layer's normalized QKV input, removing a launch and a graph node
+                # per boundary. This is the half of the block boundaries the
+                # pre-MLP fusion could not reach, because the input norm lives
+                # inside linear_qkv rather than as a standalone module.
+                prenormed, hidden_states = _fused_add_rmsnorm(
+                    mlp_out,
+                    residual,
+                    next_qkv.layer_norm_weight,
+                    next_qkv.eps,
+                    False,
+                )
+                next_qkv.prenormed_input = prenormed
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                        mlp_output_with_bias, residual, self.hidden_dropout
+                    )
         nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
