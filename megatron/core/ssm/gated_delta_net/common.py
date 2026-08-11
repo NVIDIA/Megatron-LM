@@ -11,7 +11,7 @@ from typing import Optional, Protocol, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn as nn
 
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -35,7 +35,6 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 try:
     from fla.modules.convolution import causal_conv1d
