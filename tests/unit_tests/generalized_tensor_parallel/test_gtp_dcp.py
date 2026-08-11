@@ -12,6 +12,7 @@ is present in the input state_dict.
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import ShardedTensor
@@ -31,17 +32,21 @@ from megatron.core.dist_checkpointing.mapping import (  # noqa: E402
 )
 from megatron.core.extensions.transformer_engine import (  # noqa: E402
     TELayerNormColumnParallelLinear,
+    TENorm,
     TERowParallelLinear,
 )
 from megatron.core.fp8_utils import is_float8tensor  # noqa: E402
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add  # noqa: E402
 from megatron.core.process_groups_config import ProcessGroupCollection  # noqa: E402
+from megatron.core.ssm.gated_delta_net import HAVE_FLA as HAVE_GDN_FLA  # noqa: E402
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules  # noqa: E402
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules  # noqa: E402
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules  # noqa: E402
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (  # noqa: E402
     GTP_CONFIG,
     GTPShardedParam,
     make_sharded_tensors_for_checkpoint_with_gtp_remat,
+    reset_gtp_state,
     update_gtp_config,
     wrap_module_params_gtp,
 )
@@ -1365,3 +1370,142 @@ class TestGtpDcpHelper:
     def test_save_then_load_offsets_symmetric(self):
         _require_world_size(4)
         _worker_save_then_load_offsets_symmetric(dist.get_rank(), 4, None)
+
+
+def _worker_gdn_inproj_checkpoint(rank, world_size, port):
+    """GDN fused in_proj must save logical TP splits and load into the physical GTP shard.
+
+    Runs with nonzero GTP alignment padding (the module-level fixture disables it) so the
+    save-side pad strip and the load-side re-pad + slice branches are actually exercised:
+    in_proj_dim_local_tp = 1552/2 = 776, alignment 16*2 = 32 -> pad 24, per-rank shard 400.
+    """
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=2, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    model_parallel_cuda_manual_seed(42)
+    original_pad = GTP_CONFIG.pad_for_alignment
+    update_gtp_config(pad_for_alignment=16)
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=8,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+            normalization='RMSNorm',
+            activation_func=F.silu,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=2,
+            pipeline_model_parallel_size=1,
+            experimental_attention_variant='gated_delta_net',
+            linear_attention_freq=[1],
+            transformer_impl='transformer_engine',
+        )
+        gdn = GatedDeltaNet(
+            config,
+            GatedDeltaNetSubmodules(
+                in_proj=TELayerNormColumnParallelLinear,
+                out_norm=TENorm,
+                out_proj=TERowParallelLinear,
+            ),
+            layer_number=1,
+            bias=False,
+            conv_bias=False,
+            pg_collection=pg,
+        ).cuda()
+
+        assert isinstance(gdn.in_proj.weight, GTPShardedParam)
+        assert isinstance(gdn.out_proj.weight, GTPShardedParam)
+
+        metadata = {'dp_cp_group': ps.get_data_parallel_group(with_context_parallel=True)}
+        sharded_sd = gdn.sharded_state_dict(prefix='gdn.', metadata=metadata)
+        tp_rank = dist.get_rank(pg.tp)
+        gtp_rank = dist.get_rank(pg.gtp_remat)
+
+        factory = sharded_sd['gdn.in_proj.weight']
+        assert isinstance(factory, ShardedTensorFactory)
+        assert tuple(factory.data.shape) == (gdn.in_proj_dim // 2, config.hidden_size)
+
+        parts = factory.build()
+        assert [part.key.rsplit('.', 1)[-1] for part in parts] == [
+            'query',
+            'key',
+            'value',
+            'z',
+            'beta',
+            'alpha',
+        ]
+        local_sizes = [
+            gdn.qk_dim_local_tp,
+            gdn.qk_dim_local_tp,
+            gdn.v_dim_local_tp,
+            gdn.v_dim_local_tp,
+            gdn.num_value_heads // 2,
+            gdn.num_value_heads // 2,
+        ]
+        global_sizes = [
+            gdn.qk_dim,
+            gdn.qk_dim,
+            gdn.v_dim,
+            gdn.v_dim,
+            gdn.num_value_heads,
+            gdn.num_value_heads,
+        ]
+        for part, local_size, global_size in zip(parts, local_sizes, global_sizes):
+            assert tuple(part.local_shape) == (local_size, config.hidden_size)
+            assert tuple(part.global_shape) == (global_size, config.hidden_size)
+            assert tuple(part.global_offset) == (tp_rank * local_size, 0)
+
+        # The load-side merge must reconstruct this rank's live physical GTP shard. The
+        # alignment-pad rows (tail of the LAST GTP rank's shard) are re-zeroed on load rather
+        # than round-tripped — the live shard holds TE-initialized values there, so compare
+        # the real rows exactly and the pad rows against zero.
+        merged = factory.merge_fn([part.data for part in parts])
+        assert tuple(merged.shape) == tuple(gdn.in_proj.weight.shape)
+        pad_rows = gdn.in_proj.weight.pad_length
+        assert pad_rows == 24, f"expected 24 alignment-pad rows, got {pad_rows}"
+        gtp_size = dist.get_world_size(pg.gtp_remat)
+        valid_rows = merged.shape[0] - (pad_rows if gtp_rank == gtp_size - 1 else 0)
+        torch.testing.assert_close(merged[:valid_rows], gdn.in_proj.weight[:valid_rows])
+        assert torch.count_nonzero(merged[valid_rows:]) == 0
+
+        # Both GTP peers describe the same logical TP chunks, but exactly one is a DCP writer.
+        local_metadata = [
+            (part.key, tuple(part.global_offset), tuple(part.replica_id)) for part in parts
+        ]
+        all_metadata = [None] * world_size
+        dist.all_gather_object(all_metadata, local_metadata)
+        if rank == 0:
+            by_chunk = {}
+            for rank_metadata in all_metadata:
+                for key, offset, replica_id in rank_metadata:
+                    by_chunk.setdefault((key, offset), []).append(replica_id)
+            for replica_ids in by_chunk.values():
+                assert len(replica_ids) == 2
+                assert len(set(replica_ids)) == 2
+                assert sum(is_main_replica(replica_id) for replica_id in replica_ids) == 1
+
+        out_proj = sharded_sd['gdn.out_proj.weight']
+        assert isinstance(out_proj, ShardedTensor)
+        assert tuple(out_proj.local_shape) == (128, 256)
+        assert tuple(out_proj.global_shape) == (256, 512)
+        assert tuple(out_proj.global_offset) == (gtp_rank * 128, tp_rank * 256)
+        assert tuple(out_proj.axis_fragmentations) == (2, 2)
+    finally:
+        update_gtp_config(pad_for_alignment=original_pad)
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+        reset_gtp_state()
+
+
+@pytest.mark.skipif(not HAVE_GDN_FLA, reason="FLA is not installed.")
+class TestGtpGdnDcp:
+    def test_gdn_inproj_checkpoint(self):
+        _require_world_size(4)
+        _worker_gdn_inproj_checkpoint(dist.get_rank(), 4, None)
