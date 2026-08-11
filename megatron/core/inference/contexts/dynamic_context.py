@@ -30,8 +30,15 @@ from megatron.core.inference.unified_memory import (
 from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
@@ -436,16 +443,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Convert each global layer index to the corresponding attention or
             # Mamba cache index. Keep the attention variants in separate maps to
             # preserve the legacy cache-indexing behavior.
-            from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
-            from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
-            from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
-            from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
-            from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import (
-                DSALayerConfig,
-            )
-            from megatron.core.transformer.mla_layer_config import MLALayerConfig
-            from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
-
             attention_layer_map = {}
             dsa_layer_map = {}
             mamba_layer_map = {}
