@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+from functools import partial
 from typing import Optional
 
 import torch
@@ -63,10 +64,8 @@ class GatedDeltaNet(_GDNBase):
 
         if self.config.deterministic_mode:
             self.gated_delta_rule = torch_chunk_gated_delta_rule
-            self.gated_delta_rule_input_names = ("query", "key", "value")
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
-            self.gated_delta_rule_input_names = ("q", "k", "v")
 
     def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int, int]:
         """Return GDN1 qkv/z/beta/alpha split sizes for a runtime headwise CP size."""
@@ -344,7 +343,15 @@ class GatedDeltaNet(_GDNBase):
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        gated_delta_rule_inputs = self._get_gated_delta_rule_inputs(kernel_inputs)
+        gated_delta_rule_inputs = kernel_inputs
+        if self.gated_delta_rule is torch_chunk_gated_delta_rule:
+            gated_delta_rule_inputs = {
+                "query": kernel_inputs["q"],
+                "key": kernel_inputs["k"],
+                "value": kernel_inputs["v"],
+                "g": kernel_inputs["g"],
+                "beta": kernel_inputs["beta"],
+            }
         core_attn_out, _ = self.gated_delta_rule(
             **gated_delta_rule_inputs,
             initial_state=None,
@@ -357,28 +364,33 @@ class GatedDeltaNet(_GDNBase):
 
         if self.recompute_norm_out and self.training:
             self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            nvtx_range_push(suffix="gated_norm")
-            norm_out = self.norm_out_checkpoint.checkpoint(
-                self._apply_gated_norm, core_attn_out, gate
+            norm_func = partial(
+                self._gated_norm_and_layout_restore,
+                thd_cp_a2a_inv=thd_cp_a2a_inv,
+                batch=batch,
+                seq_len=seq_len_post_headwise,
+                packed_seq_params=packed_seq_params,
+                cp_size_headwise=cp_size_headwise,
+                cp_group_headwise=cp_group_headwise,
+                cp_size_chunkwise=cp_size_chunkwise,
+                cp_group_chunkwise=cp_group_chunkwise,
+                cu_seqlens_q=cu_seqlens_q,
             )
-            nvtx_range_pop(suffix="gated_norm")
+            norm_out = self.norm_out_checkpoint.checkpoint(norm_func, core_attn_out, gate)
         else:
-            nvtx_range_push(suffix="gated_norm")
-            norm_out = self._apply_gated_norm(core_attn_out, gate)
-            nvtx_range_pop(suffix="gated_norm")
-
-        norm_out = self._restore_gated_norm_layout(
-            norm_out,
-            thd_cp_a2a_inv,
-            batch,
-            seq_len_post_headwise,
-            packed_seq_params,
-            cp_size_headwise,
-            cp_group_headwise,
-            cp_size_chunkwise,
-            cp_group_chunkwise,
-            cu_seqlens_q,
-        )
+            norm_out = self._gated_norm_and_layout_restore(
+                core_attn_out,
+                gate,
+                thd_cp_a2a_inv,
+                batch,
+                seq_len_post_headwise,
+                packed_seq_params,
+                cp_size_headwise,
+                cp_group_headwise,
+                cp_size_chunkwise,
+                cp_group_chunkwise,
+                cu_seqlens_q,
+            )
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
@@ -390,21 +402,10 @@ class GatedDeltaNet(_GDNBase):
 
         return out, out_bias
 
-    def _get_gated_delta_rule_inputs(
-        self, kernel_inputs: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        q_name, k_name, v_name = self.gated_delta_rule_input_names
-        return {
-            q_name: kernel_inputs["q"],
-            k_name: kernel_inputs["k"],
-            v_name: kernel_inputs["v"],
-            "g": kernel_inputs["g"],
-            "beta": kernel_inputs["beta"],
-        }
-
-    def _restore_gated_norm_layout(
+    def _gated_norm_and_layout_restore(
         self,
-        norm_out: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        gate: torch.Tensor,
         thd_cp_a2a_inv: torch.Tensor | None,
         batch: int,
         seq_len: int,
@@ -415,6 +416,10 @@ class GatedDeltaNet(_GDNBase):
         cp_group_chunkwise: torch.distributed.ProcessGroup | None,
         cu_seqlens_q: torch.Tensor | None,
     ) -> torch.Tensor:
+        nvtx_range_push(suffix="gated_norm")
+        norm_out = self._apply_gated_norm(core_attn_out, gate)
+        nvtx_range_pop(suffix="gated_norm")
+
         norm_out = norm_out.reshape(batch, seq_len, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
 

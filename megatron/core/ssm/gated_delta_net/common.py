@@ -65,7 +65,6 @@ __all__ = [
     "causal_conv1d",
     "chunk_gated_delta_rule",
     "get_parameter_local_cp",
-    "get_parameter_local_cp_headwise",
     "l2norm",
     "tensor_a2a_cp2hp",
     "tensor_a2a_hp2cp",
@@ -122,7 +121,6 @@ class _GDNBase(MegatronModule):
     A_log: nn.Parameter
 
     gated_delta_rule: GatedDeltaRuleInterface
-    gated_delta_rule_input_names: tuple[str, str, str]
 
     def __init__(
         self,
@@ -227,7 +225,6 @@ class _GDNBase(MegatronModule):
             "in_proj_split_names",
             "in_proj_split_sections",
             "gated_delta_rule",
-            "gated_delta_rule_input_names",
         )
         self._setup_variant_attrs()
         for attr in attrs_to_check:
@@ -705,10 +702,6 @@ def get_parameter_local_cp(
     slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
     param = param[slices]
     return param
-
-
-get_parameter_local_cp_headwise = get_parameter_local_cp
-
 
 def tensor_a2a_cp2hp(
     tensor: torch.Tensor,
