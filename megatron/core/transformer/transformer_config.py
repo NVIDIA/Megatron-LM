@@ -1706,15 +1706,6 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError("dsa_mtp_index_kv_share requires mtp_use_repeated_layer=True.")
                 if self.mtp_num_layers is None or self.mtp_num_layers <= 1:
                     raise ValueError("dsa_mtp_index_kv_share requires mtp_num_layers > 1.")
-                if self.recompute_granularity == "selective" and "mla_up_proj" in (
-                    self.recompute_modules or []
-                ):
-                    raise ValueError(
-                        "dsa_mtp_index_kv_share is not compatible with selective "
-                        "mla_up_proj recompute because the iteration-0 latent KV must remain "
-                        "available to later MTP iterations. Use full recompute or omit "
-                        "mla_up_proj from recompute_modules."
-                    )
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if self.context_parallel_size > 1:
                 cp_comm_types = (

@@ -34,9 +34,9 @@ The following table summarizes MTP configuration fields:
 
 Set `mtp_use_repeated_layer: true`, choose more than one MTP iteration, and enable `dsa_mtp_index_kv_share` to use GLM-5.2-style sharing across MTP iterations. The physical MTP layer must be a DSA indexer-compute layer under the model's `dsa_indexer_topk_freq` and `dsa_indexer_skip_topk_offset` schedule.
 
-Iteration 0 produces the post-RoPE, post-TP/CP-gather latent key and top-k indices. Later iterations reuse those tensors while recomputing the query and running sparse attention. The shared key remains attached to autograd. Under full activation recomputation it is an explicit checkpoint output from iteration 0 and an explicit checkpoint input to later iterations, so gradients from all sparse-attention consumers accumulate into the iteration-0 KV projection.
+Iteration 0 produces the post-RoPE, post-TP/CP-gather latent key and top-k indices. Later iterations reuse those tensors while recomputing the query and running sparse attention. The shared key remains attached to autograd. Under full activation recomputation it is an explicit checkpoint output from iteration 0 and an explicit checkpoint input to later iterations, so gradients from all sparse-attention consumers accumulate into the iteration-0 KV projection. Under selective `mla_up_proj` recompute, only the query up-projection is checkpointed; the source key is constructed outside that checkpoint and stays available to every consumer iteration.
 
-The current implementation uses the split indexer-top-k and sparse-attention path because the combined DSA kernel does not expose top-k for reuse. Fused top-k and fused sparse-attention kernels remain available independently. Selective `mla_up_proj` recompute and CUDA graph scopes that capture attention are not supported with MTP iteration sharing; MoE-only CUDA graph scopes remain supported.
+The current implementation uses the split indexer-top-k and sparse-attention path because the combined DSA kernel does not expose top-k for reuse. Fused top-k and fused sparse-attention kernels remain available independently. CUDA graph scopes that capture attention are not supported with MTP iteration sharing; MoE-only CUDA graph scopes remain supported.
 
 ## Pipeline Parallel Layout for MTP
 
