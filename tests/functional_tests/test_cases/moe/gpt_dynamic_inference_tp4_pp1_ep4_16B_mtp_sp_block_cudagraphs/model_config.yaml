@@ -1,0 +1,118 @@
+# Inference functional test: MTP + sequence parallelism + block-scope CUDA graphs.
+#
+# Regression guard for the SP + MTP all-gather fixes in
+# https://github.com/NVIDIA/Megatron-LM/pull/5748:
+#   1. MTP's standalone NVLS all-gather now barriers before reusing the shared
+#      symmetric-memory buffer (exercised on GB200/NVLS hardware).
+#   2. Under block-scope CUDA graphs, MTP slices each rank's valid local SP
+#      shard before gathering (exercised on both H100 and GB200).
+#
+# This is a small self-contained proxy: a tiny DeepSeek-style MoE model with an
+# MTP layer, whose (randomly-initialized) checkpoint is staged at
+# model/mtp_proxy_moe_pyt in the CI artifacts tree. That checkpoint was produced
+# by a 1-step mock-data pretrain (pretrain_gpt.py --mock-data --mtp-num-layers 1
+# --ckpt-format torch_dist --save) at world size 4 (TP4/PP1/EP4/ETP1); torch_dist
+# is parallelism-agnostic on load, so this test reloads it at world size 8 (DP2,
+# weights replicated). Because the weights are random, the golden values are
+# arbitrary-but-deterministic: the test guards that the MTP + sequence-parallel +
+# block-CUDA-graph inference code path runs and stays bit-reproducible, not that
+# the model produces meaningful text. The arch args below MUST stay in lockstep
+# with the checkpoint-generation args.
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+TEST_TYPE: frozen-start
+MODE: inference
+MODEL_ARGS:
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --timing-log-level: 0
+  # Small dummy MoE+MTP checkpoint generated into the artifacts tree.
+  --load: ${CHECKPOINT_LOAD_PATH}/model/mtp_proxy_moe_pyt/dcp/mcore-v1_bf16/checkpoints
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --tokenizer-type: TikTokenizer
+  --tiktoken-pattern: v2
+  --distributed-backend: nccl
+  --log-interval: 1
+  --transformer-impl: transformer_engine
+  # Parallelism (world size = TP*PP = 4, DP = 2 over 8 GPUs).
+  --tensor-model-parallel-size: 4
+  --pipeline-model-parallel-size: 1
+  --expert-model-parallel-size: 4
+  --expert-tensor-parallel-size: 1
+  --sequence-parallel: true
+  --use-mcore-models: true
+  # MoE (kept in lockstep with the checkpoint-generation args).
+  --moe-token-dispatcher-type: alltoall
+  --moe-grouped-gemm: true
+  --num-experts: 8
+  --moe-router-topk: 2
+  --moe-ffn-hidden-size: 512
+  --moe-shared-expert-intermediate-size: 512
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-aux-loss-coeff: 1e-3
+  --moe-router-score-function: sigmoid
+  --untie-embeddings-and-output-weights: true
+  --disable-bias-linear: true
+  --init-method-std: 0.014
+  --position-embedding-type: rope
+  --rotary-base: 1000000
+  --rotary-percent: 1.0
+  # Small architecture.
+  --num-layers: 4
+  --hidden-size: 512
+  --ffn-hidden-size: 512
+  --num-attention-heads: 8
+  --kv-channels: 64
+  --normalization: RMSNorm
+  --swiglu: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --seq-length: 256
+  --max-position-embeddings: 256
+  --micro-batch-size: 1
+  # Multi-token prediction: builds the MTP module so the serial-MTP sampling
+  # path (text_generation_controller._compute_serial_mtp_and_sample) runs.
+  --mtp-num-layers: 1
+  # Block-scope CUDA graphs so context.inference_cuda_graph_scope == block and
+  # the SP-shard-slicing fix is exercised.
+  --cuda-graph-impl: local
+  --inference-cuda-graph-scope: block
+  --te-rng-tracker: true
+  --inference-rng-tracker: true
+  --moe-pad-experts-for-cuda-graph-inference: true
+  --ckpt-format: torch_dist
+  --ckpt-fully-parallel-save: true
+  --ckpt-fully-parallel-load: true
+  --ckpt-assume-constant-structure: true
+  --dist-ckpt-strictness: log_all
+  --bf16: true
+  --attention-backend: flash
+  --no-create-attention-mask-in-dataloader: true
+  --num-workers: 8
+  --use-checkpoint-args: true
+  --no-use-tokenizer-model-from-checkpoint-args: true
+  --no-load-optim: true
+  --inference-ckpt-non-strict: true
+  --deterministic-mode: true
+  --save-interval: 2000
+  --temperature: 1.0
+  --top_k: 1
+  --return-log-probs: true
+  --num-tokens-to-generate: 30
+  --max-tokens-to-oom: 3600000
+  --inference-max-seq-length: 256
+  --output-path: ${INFERENCE_OUTPUT_PATH}
+  --prompts: "The capital of France is"
+  --incoming-requests-per-sec: -1
+  --inference-repeat-n: 8
+  --inference-dynamic-batching-buffer-size-gb: 4
+  --inference-dynamic-batching-num-cuda-graphs: 1
+  --inference-dynamic-batching-max-requests: 8
+METRICS:
+  - "generated_tokens"
+  - "logprobs"

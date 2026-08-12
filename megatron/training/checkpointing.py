@@ -15,7 +15,7 @@ import types
 from argparse import Namespace
 from datetime import datetime
 from enum import Enum, auto
-from logging import getLogger
+from logging import DEBUG, getLogger
 from pathlib import Path
 from time import time
 from typing import Any, Dict, List, Optional, Union
@@ -104,9 +104,13 @@ def finalize_deletion_processes(blocking=False):
     finished = []
     for proc in _deletion_processes:
         if not proc.is_alive() or blocking:
-            logger.debug(
-                f'Joining deletion process {proc.pid} (blocking={blocking}, is_alive={proc.is_alive()})'
-            )
+            if logger.isEnabledFor(DEBUG):
+                logger.debug(
+                    "Joining deletion process %s (blocking=%s, is_alive=%s)",
+                    proc.pid,
+                    blocking,
+                    proc.is_alive(),
+                )
             proc.join()
             finished.append(proc)
     for proc in finished:
@@ -169,6 +173,8 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
+    if hasattr(args, 'gdp_num_householder'):
+        _compare('gdp_num_householder', default=3)
     _compare('add_position_embedding', default=True)
     if args.vocab_file:
         _compare('max_position_embeddings')
@@ -1742,7 +1748,12 @@ def _load_global_dist_base_checkpoint(
             )
 
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, process_group, exchange_algo=args.ckpt_fully_parallel_load_exchange_algo
+            load_strategy,
+            process_group,
+            exchange_algo=args.ckpt_fully_parallel_load_exchange_algo,
+            per_rank_object_load=getattr(
+                args, 'ckpt_fully_parallel_load_per_rank_objects', False
+            ),
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
@@ -2101,6 +2112,10 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('mamba_head_dim', force=True)
     _set_arg('mamba_num_groups', force=True)
     _set_arg('mamba_num_heads', force=True)
+    # GDP checkpoints created before this argument existed always used three reflections.
+    if not hasattr(checkpoint_args, 'gdp_num_householder'):
+        setattr(checkpoint_args, 'gdp_num_householder', 3)
+    _set_arg('gdp_num_householder', force=True)
     # We need to be able to override hybrid_layer_pattern from the command-line so that different
     # pipelining can be specified when re-loading a model (e.g. for inference or post-training).
     _set_arg('hybrid_layer_pattern')
