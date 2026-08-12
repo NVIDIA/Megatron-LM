@@ -1706,6 +1706,25 @@ def _layer_is_graphable(layer, config):
     return False
 
 
+class _DynamicCPCaptureCallable(torch.nn.Module):
+    """Set one dynamic-CP context immediately before capturing a wrapped layer."""
+
+    def __init__(self, module, context_setter, context):
+        super().__init__()
+        self.module = module
+        self._context_setter = context_setter
+        self._capture_context = context
+        self.training = module.training
+
+    def forward(self, *args, **kwargs):
+        self._context_setter(self._capture_context)
+        outputs = self.module(*args, **kwargs)
+        mlp_norm_manager = getattr(self.module, 'mlp_norm_manager', None)
+        if mlp_norm_manager is not None and not mlp_norm_manager.offload:
+            self.module.mlp_norm_manager = None
+        return outputs
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
@@ -1754,8 +1773,10 @@ class TECudaGraphHelper:
         self.p2p_communicator = P2PCommunicator(pp_group=self.pp_group, config=self.config)
         self.num_model_chunks = len(model)
 
-        # Number of microbatches to capture. The value will be set in _get_cuda_graph_input_data().
+        # Number of microbatch graph slots to capture. The value is set in
+        # _get_cuda_graph_input_data().
         self.num_microbatches = None
+        self._dynamic_slot_liveness_limit = None
 
         self._discover_layers()
 
@@ -1821,6 +1842,26 @@ class TECudaGraphHelper:
                         "windows overlap in the capture order; aliasing them would "
                         "corrupt the recompute direct-write replay"
                     )
+
+        # TE graph capture happens after the configured eager warmup iterations. Route
+        # those iterations through the same parent transport as capture, otherwise the
+        # logical CP communicators are initialized before they can be avoided.
+        self._reuse_parent_cp_transport = self._should_share_dynamic_cp_pool()
+        self._dynamic_cp_transport_contexts = ()
+        if self._reuse_parent_cp_transport:
+            self._dynamic_cp_transport_contexts = tuple(self._get_dynamic_cp_capture_contexts())
+            try:
+                self._set_dynamic_cp_p2p_transport(
+                    self._dynamic_cp_transport_contexts, self.dp_cp_group
+                )
+                self._warmup_dynamic_cp_communicators(
+                    self._dynamic_cp_transport_contexts, self.dp_cp_group
+                )
+            except BaseException:
+                self._set_dynamic_cp_p2p_transport(self._dynamic_cp_transport_contexts, None)
+                self._dynamic_cp_transport_contexts = ()
+                self._reuse_parent_cp_transport = False
+                raise
 
     def _discover_layers(self):
         """Discover captureable layers from the model and populate internal data structures."""
@@ -2209,22 +2250,33 @@ class TECudaGraphHelper:
                 return self.pg_collection.tp
 
     def _should_use_dynamic_microbatch_slots(self) -> bool:
-        """Whether to capture a bounded number of graph slots and reuse them by modulo."""
+        """Whether to capture a schedule that supports a varying microbatch count."""
         return bool(getattr(self.config, "cuda_graph_dynamic_microbatches", False))
+
+    def _should_share_dynamic_cp_pool(self) -> bool:
+        """Whether DCP branches should share one TE graph pool and slot arenas."""
+        return (
+            self.config.dynamic_context_parallel
+            and self._should_use_dynamic_microbatch_slots()
+            and not self.config.overlap_moe_expert_parallel_comm
+            and not self.config.delay_wgrad_compute
+        )
+
+    def _publish_dynamic_cp_graph_microbatch_limit(self) -> None:
+        """Publish the logical PP range proved safe for the physical graph-slot ring."""
+        if self.config.dynamic_context_parallel and self.pp_group.size() > 1:
+            self.config._cuda_graph_num_microbatches = (
+                self._dynamic_slot_liveness_limit or self.num_microbatches
+            )
 
     def _needs_full_local_padding_mask(self, layer, chunk, static_inputs) -> bool:
         """Whether this layer's static padding_mask needs full max_seqlen_per_dp_cp_rank.
 
-        For the post_process chunk (last PP/VPP chunk that holds labels),
-        padding_mask arrives at the full CP-local length because:
-          1. labels are present -> actual_T_is_local=True -> no CP re-partition;
-          2. pre_process=False  -> _preprocess does not scatter under SP.
-        Other non-pre_process chunks (intermediate VPP) have no data, so their
-        captured padding_mask stays at the default scattered size from
-        `get_layer_static_inputs` (~max_seqlen/CP/TP).
+        Sequence packing broadcasts the CP-local padding mask to every PP stage. The
+        pre-process stage scatters it across TP ranks under sequence parallelism, while
+        every later stage passes the full mask directly to its transformer layers.
 
-        Returns True only for that post_process-with-data case under THD CUDA
-        Graph + SP + PP>1.
+        Returns True for every non-pre-process PP/VPP chunk under THD CUDA Graph + SP + PP>1.
         """
         return (
             hasattr(layer, "_is_thd_cuda_graph")
@@ -2232,7 +2284,6 @@ class TECudaGraphHelper:
             and self.config.sequence_parallel
             and self.config.pipeline_model_parallel_size > 1
             and not getattr(chunk, "pre_process", True)
-            and getattr(chunk, "post_process", False)
             and "padding_mask" in static_inputs
         )
 
@@ -2286,6 +2337,25 @@ class TECudaGraphHelper:
         )
 
     @staticmethod
+    def _get_dynamic_slot_liveness_microbatch_counts(
+        max_num_microbatches, microbatch_group_size_per_vp_stage=None
+    ):
+        """Return scheduler-reachable microbatch counts for the liveness union."""
+        assert max_num_microbatches >= 1
+        if microbatch_group_size_per_vp_stage is None:
+            return tuple(range(1, max_num_microbatches + 1))
+
+        multiple = int(microbatch_group_size_per_vp_stage)
+        if multiple <= 1:
+            return tuple(range(1, max_num_microbatches + 1))
+        if max_num_microbatches % multiple:
+            raise ValueError(
+                f"Dynamic CUDA graph microbatch limit {max_num_microbatches} is not "
+                f"aligned to the VPP microbatch group size {multiple}."
+            )
+        return tuple(range(multiple, max_num_microbatches + 1, multiple))
+
+    @staticmethod
     def _get_dp_balanced_thd_max_num_microbatches(
         global_batch_size,
         dp_size,
@@ -2316,21 +2386,70 @@ class TECudaGraphHelper:
         num_packed_sequences = math.ceil(num_packed_sequences / multiple) * multiple
         return max(1, num_packed_sequences // dp_size)
 
+    @staticmethod
+    def _get_default_dynamic_cp_thd_max_num_microbatches(
+        global_batch_size,
+        total_dcp_gpus,
+        max_seqlen_per_dp_cp_rank,
+        max_sequence_length,
+        min_cp_size=1,
+        max_subsamples_per_item=1,
+        microbatch_group_size_per_vp_stage=None,
+    ):
+        """Return the scheduler-derived microbatch upper bound for dynamic CP.
+
+        The dynamic scheduler fills every DPxCP rank in each returned microbatch. Since
+        samples are processed longest-first, each non-final microbatch consumes at least
+        ``total_dcp_gpus / max_required_cp_size`` subsamples. The final partial placement is
+        expanded across otherwise-empty ranks. Account for pre-packed dataset items and VPP
+        group alignment before publishing the CUDA graph schedule limit.
+        """
+        assert global_batch_size >= 1
+        assert total_dcp_gpus >= 1
+        assert max_seqlen_per_dp_cp_rank >= 1
+        assert max_sequence_length >= 1
+        assert min_cp_size >= 1
+        assert max_subsamples_per_item >= 1
+
+        raw_required_cp_size = math.ceil(max_sequence_length / max_seqlen_per_dp_cp_rank)
+        rounded_required_cp_size = 1 << (raw_required_cp_size - 1).bit_length()
+        max_required_cp_size = min(total_dcp_gpus, max(min_cp_size, rounded_required_cp_size))
+        subsamples_per_microbatch = max(1, total_dcp_gpus // max_required_cp_size)
+        max_subsamples = global_batch_size * max_subsamples_per_item
+        max_num_microbatches = math.ceil(max_subsamples / subsamples_per_microbatch)
+
+        if microbatch_group_size_per_vp_stage is not None:
+            multiple = int(microbatch_group_size_per_vp_stage)
+            max_num_microbatches = math.ceil(max_num_microbatches / multiple) * multiple
+        return max(1, max_num_microbatches)
+
     def _get_thd_varlen_max_num_microbatches(
         self, runtime_num_microbatches, microbatch_group_size_per_vp_stage
     ):
         """Return the THD packing upper bound used for dynamic CUDA graph capture."""
         if self.config.sequence_packing_scheduler == 'default_dynamic_cp':
-            max_num_microbatches = runtime_num_microbatches * self.micro_batch_size
-            max_num_microbatches *= self.dp_group.size() * getattr(
-                self.config,
-                'thd_max_subsamples_per_item',
-                self.config.thd_max_packed_sequences,
+            global_batch_size = (
+                runtime_num_microbatches * self.micro_batch_size * self.dp_group.size()
             )
-            return (
-                max(1, max_num_microbatches),
-                "dynamic_cp_global_subsample_upper_bound",
+            max_sequence_length = (
+                self.thd_sequence_length_upper_bound
+                if self.thd_sequence_length_upper_bound is not None
+                else self.seq_length
             )
+            max_num_microbatches = self._get_default_dynamic_cp_thd_max_num_microbatches(
+                global_batch_size,
+                self.dp_cp_group.size(),
+                int(self.config.max_seqlen_per_dp_cp_rank),
+                int(max_sequence_length),
+                min_cp_size=int(self.config.min_dynamic_context_parallel_size),
+                max_subsamples_per_item=int(getattr(self.config, 'thd_max_subsamples_per_item', 1)),
+                microbatch_group_size_per_vp_stage=(
+                    None
+                    if self.config.virtual_pipeline_model_parallel_size is None
+                    else microbatch_group_size_per_vp_stage
+                ),
+            )
+            return (max_num_microbatches, "dynamic_cp_scheduler_upper_bound")
         if self.config.sequence_packing_scheduler != 'dp_balanced':
             return runtime_num_microbatches, "runtime"
         if self.config.max_seqlen_per_dp_cp_rank is None:
@@ -2440,6 +2559,47 @@ class TECudaGraphHelper:
                 self.num_microbatches = runtime_num_microbatches
                 capture_mode = "runtime"
                 fallback_reason = "overlap_moe_expert_parallel_comm/delay_wgrad_compute"
+            elif self._should_share_dynamic_cp_pool():
+                # A callable can be replayed after its matching backward has completed. Capture
+                # only the topology-sized ring, and prove its saved-tensor aliases against every
+                # microbatch count the dynamic scheduler may produce.
+                liveness_num_microbatches = max(runtime_num_microbatches, max_num_microbatches)
+                self._dynamic_slot_liveness_limit = liveness_num_microbatches
+                self.num_microbatches = auto_num_slots
+                possible_orders = []
+                candidate_num_microbatches_values = (
+                    self._get_dynamic_slot_liveness_microbatch_counts(
+                        liveness_num_microbatches,
+                        (
+                            None
+                            if self.config.virtual_pipeline_model_parallel_size is None
+                            else microbatch_group_size_per_vp_stage
+                        ),
+                    )
+                )
+                for candidate_num_microbatches in candidate_num_microbatches_values:
+                    _, _, candidate_warmup, _ = get_pp_rank_microbatches(
+                        candidate_num_microbatches,
+                        self.num_model_chunks,
+                        microbatch_group_size_per_vp_stage,
+                        False,
+                        overlap_moe_expert_parallel_comm=False,
+                    )
+                    candidate_schedule = get_schedule_table(
+                        candidate_num_microbatches,
+                        self.num_model_chunks,
+                        microbatch_group_size_per_vp_stage,
+                    )
+                    possible_orders.append(
+                        tuple(
+                            convert_schedule_table_to_order(
+                                candidate_warmup, self.num_model_chunks, candidate_schedule
+                            )
+                        )
+                    )
+                self._dynamic_slot_liveness_orders = tuple(possible_orders)
+                capture_mode = f"{capture_mode}_physical_slots"
+                fallback_reason = None
             else:
                 # auto_num_slots is a topology-only theoretical lower bound for PP/VPP graph
                 # slot liveness. THD varlen packing can produce different real microbatch
@@ -2600,16 +2760,38 @@ class TECudaGraphHelper:
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
+            post_warmup_hooks = []
             # TE CUDA graph warmup should establish graph state without launching
             # activation D2H copies; the post-warmup hook restores offloading for
             # the measured/replay iterations.
             if self.config.fine_grained_activation_offloading:
                 kwargs['pre_warmup_hook'] = off_interface.disable_offload
-                kwargs['post_warmup_hook'] = off_interface.enable_offload
+                post_warmup_hooks.append(off_interface.enable_offload)
+            if self._should_share_dynamic_cp_pool():
+                post_warmup_hooks.append(self._clear_moe_cudagraph_tensor_attrs)
+            if post_warmup_hooks:
+
+                def post_warmup_hook():
+                    for hook in post_warmup_hooks:
+                        hook()
+
+                kwargs['post_warmup_hook'] = post_warmup_hook
             return kwargs
 
         kwargs = get_make_graphed_callables_kwargs()
         return sample_args, kwargs
+
+    def _clear_moe_cudagraph_tensor_attrs(self) -> None:
+        """Drop eager dispatcher outputs after each TE warmup forward/backward."""
+        seen_dispatchers = set()
+        for layer in self.flattened_callables:
+            for module in layer.modules():
+                dispatcher = getattr(module, 'token_dispatcher', None)
+                if dispatcher is None or id(dispatcher) in seen_dispatchers:
+                    continue
+                seen_dispatchers.add(id(dispatcher))
+                for attr_name in dispatcher.cudagraph_attrs:
+                    dispatcher.set_cudagraph_attr(attr_name, None)
 
     def _get_dynamic_cp_capture_contexts(self):
         """Return ``(local_cp_size, process_group)`` contexts to capture eagerly."""
@@ -2627,6 +2809,366 @@ class TECudaGraphHelper:
             (size, parallel_state.get_dynamic_data_context_parallel_groups(group_size=size))
             for size in (2**exponent for exponent in range(largest, smallest - 1, -1))
         ]
+
+    @staticmethod
+    def _set_dynamic_cp_p2p_transport(capture_contexts, transport_group):
+        """Route logical dynamic-CP rings through one parent communicator."""
+        from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
+            set_cp_p2p_transport_group,
+        )
+
+        for cp_size, cp_group in capture_contexts:
+            if cp_group is not None and cp_size is not None and cp_size > 1:
+                set_cp_p2p_transport_group(cp_group, transport_group)
+
+    def _release_dynamic_cp_p2p_transport(self):
+        """Release transport overrides after a failed setup or capture."""
+        if not self._reuse_parent_cp_transport:
+            return
+        self._set_dynamic_cp_p2p_transport(self._dynamic_cp_transport_contexts, None)
+        self._dynamic_cp_transport_contexts = ()
+        self._reuse_parent_cp_transport = False
+
+    @staticmethod
+    def _warmup_dynamic_cp_communicators(capture_contexts, transport_group=None):
+        """Initialize every dynamic-CP NCCL P2P path before capture."""
+        if not torch.distributed.is_initialized():
+            return
+
+        send_token = torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device())
+        recv_token = torch.empty_like(send_token)
+        for cp_size, cp_group in capture_contexts:
+            if cp_group is None or cp_size is None or cp_size <= 1:
+                continue
+
+            group_ranks = torch.distributed.get_process_group_ranks(cp_group)
+            if len(group_ranks) != cp_size:
+                raise RuntimeError(
+                    f"Dynamic-CP group has {len(group_ranks)} ranks, expected cp_size={cp_size}."
+                )
+            group_rank = torch.distributed.get_rank(group=cp_group)
+            p2p_group = transport_group if transport_group is not None else cp_group
+            batch_p2p_comm = (
+                transport_group is not None
+                or bool(int(os.getenv('NVTE_BATCH_MHA_P2P_COMM', '0')))
+                or (torch.cuda.get_device_capability() < (10, 0) and cp_size == 2)
+            )
+
+            # TE's CP attention sends clockwise in forward and counter-clockwise in
+            # backward. Warm both paths in the same even-send/odd-recv order used by TE
+            # so lazy NCCL P2P setup is complete before TP/EP/CP operations can overlap.
+            for direction in (1, -1):
+                send_peer = group_ranks[(group_rank + direction) % cp_size]
+                recv_peer = group_ranks[(group_rank - direction) % cp_size]
+                op_specs = (
+                    (torch.distributed.isend, send_token, send_peer),
+                    (torch.distributed.irecv, recv_token, recv_peer),
+                )
+                if group_rank % 2:
+                    op_specs = tuple(reversed(op_specs))
+                if batch_p2p_comm:
+                    ops = [
+                        torch.distributed.P2POp(op, tensor, peer, p2p_group)
+                        for op, tensor, peer in op_specs
+                    ]
+                    requests = torch.distributed.batch_isend_irecv(ops)
+                else:
+                    requests = [op(tensor, peer, p2p_group) for op, tensor, peer in op_specs]
+                for request in requests:
+                    request.wait()
+
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+    def _set_dynamic_cp_capture_context(self, context):
+        """Propagate the temporary capture context to every layer config copy."""
+        configs = {id(self.config): self.config}
+        for layers in self.callables_per_chunk:
+            for layer in layers:
+                layer_config = getattr(layer, 'config', None)
+                if layer_config is not None:
+                    configs[id(layer_config)] = layer_config
+
+        for config in configs.values():
+            if context is None:
+                vars(config).pop('_cuda_graph_capture_dynamic_cp', None)
+            else:
+                config._cuda_graph_capture_dynamic_cp = context
+
+    @staticmethod
+    def _build_slot_aliased_variant_order(
+        order, num_variants, num_model_chunks, canonical_variant=None
+    ):
+        """Capture same-slot CP alternatives in lockstep with the PP/VPP schedule."""
+        if num_variants < 1:
+            raise ValueError("Dynamic-CP CUDA graph capture requires at least one CP variant.")
+
+        if canonical_variant is None:
+            canonical_variant = num_variants - 1
+        if canonical_variant < 0 or canonical_variant >= num_variants:
+            raise ValueError(
+                f"Canonical dynamic-CP variant {canonical_variant} is outside "
+                f"[0, {num_variants})."
+            )
+
+        variant_order = [
+            canonical_variant,
+            *(variant for variant in range(num_variants) if variant != canonical_variant),
+        ]
+
+        def remap(c_id, variant):
+            chunk = abs(int(c_id)) + variant * num_model_chunks
+            return chunk if c_id > 0 else -chunk
+
+        combined_order = []
+        for c_id in order:
+            if ceil(c_id) != c_id:
+                raise ValueError(
+                    "Slot-aliased dynamic-CP capture does not support delayed wgrad order "
+                    f"entries, got {c_id}."
+                )
+
+            combined_order.extend(remap(c_id, variant) for variant in variant_order)
+        return combined_order
+
+    @staticmethod
+    def _build_saved_tensor_liveness_colors(
+        orders, num_slots, num_layers_per_chunk, return_conflicts=False
+    ):
+        """Color saved tensors over possible PP/VPP schedules.
+
+        Dynamic sequence packing changes the microbatch count between iterations, which also
+        changes PP/VPP warmup and cooldown interleaving. A valid reuse color must therefore be
+        non-overlapping in every possible schedule, not just in one long topology probe.
+        """
+        if num_slots < 1:
+            raise ValueError("Saved-tensor liveness coloring requires at least one slot.")
+        if not orders:
+            raise ValueError("Saved-tensor liveness coloring requires at least one PP/VPP order.")
+        if isinstance(orders[0], (int, float)):
+            orders = (orders,)
+
+        num_model_chunks = len(num_layers_per_chunk)
+        frames = [
+            (model_chunk, slot, layer)
+            for model_chunk, num_layers in enumerate(num_layers_per_chunk)
+            for slot in range(num_slots)
+            for layer in range(num_layers)
+        ]
+        conflicts = {frame: set() for frame in frames}
+        for order in orders:
+            live_frames = set()
+            forward_idx = [0] * num_model_chunks
+            backward_idx = [0] * num_model_chunks
+
+            for c_id in order:
+                if ceil(c_id) != c_id:
+                    continue
+                model_chunk = abs(int(c_id)) - 1
+                if model_chunk < 0 or model_chunk >= num_model_chunks:
+                    raise ValueError(f"Invalid model chunk {c_id} in CUDA graph liveness order.")
+
+                logical_microbatch = (
+                    forward_idx[model_chunk] if c_id > 0 else backward_idx[model_chunk]
+                )
+                slot = logical_microbatch % num_slots
+                event_frames = [
+                    (model_chunk, slot, layer) for layer in range(num_layers_per_chunk[model_chunk])
+                ]
+
+                if c_id > 0:
+                    collisions = live_frames.intersection(event_frames)
+                    if collisions:
+                        raise RuntimeError(
+                            "CUDA graph slot period is shorter than the PP/VPP saved-tensor "
+                            f"liveness for frames {sorted(collisions)}."
+                        )
+                    # Frames already live are pairwise-connected from earlier events, so only
+                    # the newly-live frames need edges to everything currently live.
+                    for index, frame in enumerate(event_frames):
+                        for other in chain(live_frames, event_frames[index + 1 :]):
+                            conflicts[frame].add(other)
+                            conflicts[other].add(frame)
+                    live_frames.update(event_frames)
+                    forward_idx[model_chunk] += 1
+                else:
+                    missing = set(event_frames).difference(live_frames)
+                    if missing:
+                        raise RuntimeError(
+                            "CUDA graph PP/VPP order ended saved-tensor liveness before its "
+                            f"forward for frames {sorted(missing)}."
+                        )
+                    live_frames.difference_update(event_frames)
+                    backward_idx[model_chunk] += 1
+
+            if live_frames or forward_idx != backward_idx:
+                raise RuntimeError(
+                    "CUDA graph PP/VPP order did not drain saved-tensor liveness: "
+                    f"live={sorted(live_frames)}, forward={forward_idx}, "
+                    f"backward={backward_idx}."
+                )
+
+        # DSATUR keeps the number of physical ranges low for the circular/modulo conflict graph.
+        colors = {}
+        uncolored = set(frames)
+        while uncolored:
+            frame = max(
+                uncolored,
+                key=lambda candidate: (
+                    len({colors[n] for n in conflicts[candidate] if n in colors}),
+                    len(conflicts[candidate]),
+                    tuple(-value for value in candidate),
+                ),
+            )
+            unavailable = {colors[n] for n in conflicts[frame] if n in colors}
+            color = 0
+            while color in unavailable:
+                color += 1
+            colors[frame] = color
+            uncolored.remove(frame)
+
+        if return_conflicts:
+            return colors, conflicts
+        return colors
+
+    def _get_dynamic_cp_variant_capture_data(self, capture_banks):
+        """Combine CP alternatives into one slot-branched TE capture call and pool."""
+        callables = []
+        sample_args = []
+        sample_kwargs = []
+        fp8_enabled = []
+        has_sample_kwargs = False
+        base_order = None
+
+        for variant, (cp_size, cp_group, bank_sample_args, bank_kwargs) in enumerate(capture_banks):
+            context = (cp_size, cp_group)
+            callables.extend(
+                _DynamicCPCaptureCallable(layer, self._set_dynamic_cp_capture_context, context)
+                for layer in self.flattened_callables
+            )
+            sample_args.extend(bank_sample_args)
+            if 'sample_kwargs' in bank_kwargs:
+                has_sample_kwargs = True
+                sample_kwargs.extend(bank_kwargs['sample_kwargs'])
+            if base_order is None:
+                base_order = bank_kwargs['_order']
+            elif bank_kwargs['_order'] != base_order:
+                raise RuntimeError("Dynamic-CP variants produced different PP/VPP graph orders.")
+
+            enabled = bank_kwargs.get('fp8_enabled', False)
+            if isinstance(enabled, tuple):
+                fp8_enabled.extend(enabled)
+            elif enabled:
+                fp8_enabled.extend([True] * len(self.flattened_callables))
+
+        # The PP/VPP liveness proof guarantees that frames separated by this physical period are
+        # never simultaneously live, while CP alternatives for one frame are mutually exclusive.
+        graph_memory_slots = []
+        liveness_orders = getattr(self, '_dynamic_slot_liveness_orders', (base_order,))
+        saved_tensor_liveness_colors, saved_tensor_liveness_conflicts = (
+            self._build_saved_tensor_liveness_colors(
+                liveness_orders,
+                self.num_microbatches,
+                self.num_layers_per_chunk,
+                return_conflicts=True,
+            )
+        )
+        frame_ids = {
+            frame: frame_id
+            for frame_id, frame in enumerate(sorted(saved_tensor_liveness_conflicts))
+        }
+        conflict_masks = {
+            frame: sum(1 << frame_ids[other] for other in conflicts)
+            for frame, conflicts in saved_tensor_liveness_conflicts.items()
+        }
+        num_saved_tensor_frames = self.num_microbatches * sum(self.num_layers_per_chunk)
+        for variant in range(len(capture_banks)):
+            layer_offset = 0
+            for model_chunk, num_layers in enumerate(self.num_layers_per_chunk):
+                for physical_slot in range(self.num_microbatches):
+                    io_branch_id = variant * self.num_microbatches + physical_slot
+                    for layer in range(num_layers):
+                        frame_id = (layer_offset + layer) * self.num_microbatches + physical_slot
+                        saved_branch_id = variant * num_saved_tensor_frames + frame_id
+                        saved_arena_id = saved_tensor_liveness_colors[
+                            (model_chunk, physical_slot, layer)
+                        ]
+                        frame = (model_chunk, physical_slot, layer)
+                        graph_memory_slots.append(
+                            (
+                                saved_arena_id,
+                                saved_branch_id,
+                                physical_slot,
+                                io_branch_id,
+                                model_chunk,
+                                layer,
+                                variant * len(self.flattened_callables) + layer_offset + layer,
+                                frame_ids[frame],
+                                conflict_masks[frame],
+                            )
+                        )
+                layer_offset += num_layers
+
+        canonical_variant = min(
+            range(len(capture_banks)), key=lambda index: capture_banks[index][0]
+        )
+        combined_kwargs = capture_banks[0][3].copy()
+        if not combined_kwargs.get('_reuse_graph_input_output_buffers', False):
+            raise RuntimeError(
+                "Slot-aliased dynamic-CP capture requires TE graph input/output buffer reuse."
+            )
+        # TE's generic input queue follows the synthetic capture order. Noncanonical CP
+        # branches complete backward immediately in that order, but remain live until the
+        # real PP/VPP backward at replay time, so queue-based reuse would overwrite them.
+        combined_kwargs['_graph_memory_slots'] = tuple(graph_memory_slots)
+        combined_kwargs['_order'] = self._build_slot_aliased_variant_order(
+            base_order,
+            len(capture_banks),
+            self.num_model_chunks,
+            canonical_variant=canonical_variant,
+        )
+        combined_kwargs['_num_layers_per_chunk'] = self.num_layers_per_chunk * len(capture_banks)
+        if has_sample_kwargs:
+            if len(sample_kwargs) != len(sample_args):
+                raise RuntimeError(
+                    f"Dynamic-CP capture has {len(sample_kwargs)} kwargs for "
+                    f"{len(sample_args)} argument tuples."
+                )
+            combined_kwargs['sample_kwargs'] = tuple(sample_kwargs)
+        else:
+            combined_kwargs.pop('sample_kwargs', None)
+        if fp8_enabled:
+            combined_kwargs['fp8_enabled'] = tuple(fp8_enabled)
+
+        if len(sample_args) != len(graph_memory_slots):
+            raise RuntimeError(
+                f"Dynamic-CP capture built {len(sample_args)} inputs for "
+                f"{len(graph_memory_slots)} memory slots."
+            )
+        return tuple(callables), tuple(sample_args), combined_kwargs
+
+    def _capture_dynamic_cp_variants(self, capture_banks, captured_graphs):
+        """Capture same-slot CP alternatives as branches in one TE memory pool."""
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=None,
+            dp_cp_group=None,
+            level=logging.INFO,
+            msg=f'Rank {torch.distributed.get_rank()}: capturing {len(capture_banks)} '
+            f'dynamic-CP variants over {self.num_microbatches} slot-aliased physical TE pool '
+            'slots; one CP branch follows the canonical liveness schedule.',
+        )
+        callables, sample_args, kwargs = self._get_dynamic_cp_variant_capture_data(capture_banks)
+        variant_graphs = tuple(self._capture_graph_bank(callables, sample_args, kwargs))
+        start = 0
+        for cp_size, _, bank_sample_args, _ in capture_banks:
+            stop = start + len(bank_sample_args)
+            captured_graphs[cp_size] = variant_graphs[start:stop]
+            start = stop
+        if start != len(variant_graphs):
+            raise RuntimeError(
+                f"Dynamic-CP capture returned {len(variant_graphs)} graphs, expected {start}."
+            )
 
     @staticmethod
     def _clear_cuda_graph_state(layer):
@@ -2760,13 +3302,30 @@ class TECudaGraphHelper:
 
         self._graphs_created = True
 
+    def _capture_graph_bank(self, callables, sample_args, kwargs):
+        """Capture one CP bank with the standard TE graph schedule."""
+        rng_context = (
+            get_cuda_rng_tracker().fork() if self.config.sequence_parallel else nullcontext()
+        )
+
+        with rng_context:
+            return make_graphed_callables(tuple(callables), sample_args, **kwargs)
+
     def create_cudagraphs(self):
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
         captured_graphs = {}
         captured_sample_args = {} if self._uses_mhc_direct_write_arena() else None
+        reuse_parent_cp_transport = self._reuse_parent_cp_transport
         try:
+            capture_contexts = self._get_dynamic_cp_capture_contexts()
+            if self._should_share_dynamic_cp_pool():
+                if reuse_parent_cp_transport:
+                    self._set_dynamic_cp_p2p_transport(capture_contexts, self.dp_cp_group)
+                self._warmup_dynamic_cp_communicators(
+                    capture_contexts, self.dp_cp_group if reuse_parent_cp_transport else None
+                )
             start_time = self._start_capturing()
             has_graphable_layers = bool(self.flattened_callables)
             if not has_graphable_layers:
@@ -2776,44 +3335,66 @@ class TECudaGraphHelper:
                     'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
                 )
             # Keep variants helper-local so later captures cannot replay earlier ones.
-            capture_contexts = self._get_dynamic_cp_capture_contexts()
             try:
-                for capture_idx, (cp_size, cp_group) in enumerate(capture_contexts):
-                    if cp_size is not None:
-                        self.config._cuda_graph_capture_dynamic_cp = (cp_size, cp_group)
+                if self._should_share_dynamic_cp_pool():
+                    capture_banks = []
+                    expected_num_microbatches = None
+                    for cp_size, cp_group in capture_contexts:
+                        self._set_dynamic_cp_capture_context((cp_size, cp_group))
 
-                    # This call contains PP-group collectives when dynamic graph
-                    # slots are enabled, so all PP stages must participate.
-                    sample_args, kwargs = self._get_cuda_graph_input_data()
+                        # This call contains PP-group collectives, so every PP stage must
+                        # prepare banks in the same order even if it has no graphable layers.
+                        sample_args, kwargs = self._get_cuda_graph_input_data()
+                        if expected_num_microbatches is None:
+                            expected_num_microbatches = self.num_microbatches
+                        elif self.num_microbatches != expected_num_microbatches:
+                            raise RuntimeError(
+                                "Dynamic-CP capture changed slot count across variants: "
+                                f"{expected_num_microbatches} -> {self.num_microbatches}."
+                            )
+                        capture_banks.append((cp_size, cp_group, sample_args, kwargs))
+
                     if has_graphable_layers:
-                        if self.config.sequence_parallel:
-                            rng_context = get_cuda_rng_tracker().fork()
-                        else:
-                            rng_context = nullcontext()
-                        with rng_context:
-                            captured_graphs[cp_size] = make_graphed_callables(
-                                tuple(self.flattened_callables), sample_args, **kwargs
+                        self._capture_dynamic_cp_variants(capture_banks, captured_graphs)
+                        for cp_size, _, bank_sample_args, _ in capture_banks:
+                            self._validate_mhc_static_hidden_inputs(bank_sample_args)
+                            if captured_sample_args is not None:
+                                captured_sample_args[cp_size] = bank_sample_args
+                    # Drop construction-time bank lists before final GC so graph inputs replaced
+                    # by either cross-CP aliases or TE-owned surfaces do not stay pinned.
+                    del capture_banks, sample_args, kwargs
+                else:
+                    for capture_idx, (cp_size, cp_group) in enumerate(capture_contexts):
+                        if cp_size is not None:
+                            self._set_dynamic_cp_capture_context((cp_size, cp_group))
+
+                        # This call contains PP-group collectives when dynamic graph
+                        # slots are enabled, so all PP stages must participate.
+                        sample_args, kwargs = self._get_cuda_graph_input_data()
+                        if has_graphable_layers:
+                            captured_graphs[cp_size] = self._capture_graph_bank(
+                                self.flattened_callables, sample_args, kwargs
                             )
                         self._validate_mhc_static_hidden_inputs(sample_args)
                         if captured_sample_args is not None:
                             captured_sample_args[cp_size] = sample_args
 
-                    if capture_idx + 1 < len(capture_contexts):
-                        torch.cuda.synchronize()
-                        torch.distributed.barrier()
-                        self._reset_after_capture()
+                        if capture_idx + 1 < len(capture_contexts):
+                            torch.cuda.synchronize()
+                            torch.distributed.barrier()
+                            self._reset_after_capture()
             finally:
-                vars(self.config).pop('_cuda_graph_capture_dynamic_cp', None)
+                self._set_dynamic_cp_capture_context(None)
 
             if has_graphable_layers:
                 self._install_captured_graphs(
                     capture_contexts, captured_graphs, captured_sample_args
                 )
             self._finish_capturing(start_time)
-            if self.config.dynamic_context_parallel and self.pp_group.size() > 1:
-                self.config._cuda_graph_num_microbatches = self.num_microbatches
+            self._publish_dynamic_cp_graph_microbatch_limit()
         except BaseException:
             self._abort_capturing(captured_graphs)
+            self._release_dynamic_cp_p2p_transport()
             raise
 
     def cuda_graph_set_manual_hooks(self):

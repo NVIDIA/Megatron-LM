@@ -82,7 +82,7 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
 
 
-def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
+def test_scheduler_reroute_reuses_equivalent_dp_cp_group(monkeypatch):
     class _Group:
         def __init__(self, size, rank):
             self._size = size
@@ -161,7 +161,7 @@ def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
     assert torch.equal(received[2]['position_ids'], torch.tensor([0, 1, 2, 3]))
     assert torch.equal(received[2]['original_seq_len'], torch.tensor([4], dtype=torch.int32))
     assert torch.equal(received[2]['padded_seq_len'], torch.tensor([4], dtype=torch.int32))
-    assert gather_groups == [dp_group] * 6
+    assert gather_groups == [dp_cp_group] * 6
 
 
 def test_scheduler_reroute_rejects_unsupported_sample_keys():

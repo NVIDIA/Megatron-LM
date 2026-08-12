@@ -279,9 +279,9 @@ class TestResolveThdPaddingLengths:
         expected_local_actual = get_thd_partitioned_indices(
             psp.cu_seqlens_q, 140, cp_size, cp_rank
         ).numel()
-        expected_local_target = get_thd_partitioned_indices(
-            psp.cu_seqlens_q, expected_global_target, cp_size, cp_rank
-        ).numel()
+        expected_local_target = target_len or (
+            (expected_local_actual + alignment - 1) // alignment * alignment
+        )
 
         local_actual, global_actual, local_target, global_target, mask_device = (
             _resolve_thd_padding_lengths(
@@ -296,6 +296,40 @@ class TestResolveThdPaddingLengths:
             expected_global_target,
         )
         assert mask_device == psp.cu_seqlens_q.device
+
+    @pytest.mark.internal
+    @_REQUIRES_TWO_RANKS
+    def test_cp_no_tensor_alignment_matches_local_tensor_path(self):
+        """Intermediate PP stages apply alignment to the CP-local length."""
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        from megatron.core import parallel_state
+        from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
+
+        global_actual = 2048
+        alignment = 2048
+        psp = _make_psp([global_actual])
+        cp_size = parallel_state.get_context_parallel_world_size()
+        cp_rank = parallel_state.get_context_parallel_rank()
+        local_actual = get_thd_partitioned_indices(
+            psp.cu_seqlens_q, global_actual, cp_size, cp_rank
+        ).numel()
+        metadata_lengths = _resolve_thd_padding_lengths(
+            None, None, None, None, psp, target_len=None, alignment=alignment
+        )[:4]
+        tensor_lengths = _resolve_thd_padding_lengths(
+            torch.ones(1, local_actual, device="cuda"),
+            None,
+            None,
+            None,
+            psp,
+            target_len=None,
+            alignment=alignment,
+        )[:4]
+
+        assert metadata_lengths == tensor_lengths
+        assert metadata_lengths == (local_actual, global_actual, alignment, alignment * cp_size)
 
 
 class TestPadSequenceForThd:
@@ -1116,6 +1150,289 @@ class TestDynamicMicrobatchSlots:
             )
             == 16
         )
+
+    @pytest.mark.internal
+    def test_dynamic_cp_capture_upper_bound_uses_scheduler_rank_fill(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        get_bound = TECudaGraphHelper._get_default_dynamic_cp_thd_max_num_microbatches
+
+        assert get_bound(64, 8, 8192, 8192, microbatch_group_size_per_vp_stage=4) == 8
+        assert get_bound(64, 8, 8192, 16384, microbatch_group_size_per_vp_stage=4) == 16
+        assert get_bound(64, 8, 8192, 65536, microbatch_group_size_per_vp_stage=4) == 64
+        assert (
+            get_bound(
+                64, 8, 8192, 8192, max_subsamples_per_item=2, microbatch_group_size_per_vp_stage=4
+            )
+            == 16
+        )
+        assert get_bound(9, 8, 8192, 8192, microbatch_group_size_per_vp_stage=8) == 8
+
+    @pytest.mark.internal
+    def test_dynamic_cp_capture_upper_bound_covers_scheduler_outputs(self):
+        from megatron.core.datasets.data_schedule_utils import (
+            align_sample_id_groups,
+            next_hdp_group_packing_aware,
+        )
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        length_sets = (
+            [8192] * 64,
+            [128] * 64,
+            [8192 if index % 2 else 128 for index in range(64)],
+            [128 + (index * 7919) % 8065 for index in range(64)],
+            list(range(128, 8193, 128)),
+        )
+        bound = TECudaGraphHelper._get_default_dynamic_cp_thd_max_num_microbatches(
+            64, 8, 8192, 8192, microbatch_group_size_per_vp_stage=4
+        )
+
+        for lengths in length_sets:
+            remaining = list(enumerate(lengths))
+            groups = []
+            while remaining:
+                _, remaining, _, sample_ids = next_hdp_group_packing_aware(
+                    remaining,
+                    total_gpus=8,
+                    max_seq_len_per_rank=8192,
+                    min_cp_size=1,
+                    max_num_seqs=31,
+                )
+                groups.append(sample_ids)
+            aligned_groups = align_sample_id_groups(groups, 4)
+            assert len(aligned_groups) <= bound
+
+    @pytest.mark.internal
+    def test_dynamic_slot_liveness_only_includes_vpp_aligned_counts(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        get_counts = TECudaGraphHelper._get_dynamic_slot_liveness_microbatch_counts
+
+        assert get_counts(4) == (1, 2, 3, 4)
+        assert get_counts(8, 4) == (4, 8)
+        assert get_counts(16, 8) == (8, 16)
+        with pytest.raises(ValueError, match="not aligned"):
+            get_counts(10, 4)
+
+    @pytest.mark.internal
+    def test_pp4_vpp4_liveness_union_matches_fixed_cp4_schedule(self, monkeypatch):
+        from megatron.core import parallel_state
+        from megatron.core.pipeline_parallel.schedules import (
+            get_pp_rank_microbatches,
+            get_schedule_table,
+        )
+        from megatron.core.transformer.cuda_graphs import (
+            TECudaGraphHelper,
+            convert_schedule_table_to_order,
+        )
+
+        monkeypatch.setattr(parallel_state, "get_pipeline_model_parallel_world_size", lambda: 4)
+        monkeypatch.setattr(
+            parallel_state, "get_virtual_pipeline_model_parallel_world_size", lambda: 4
+        )
+
+        expected_color_counts = (60, 60, 48, 48)
+        for pp_rank, expected_colors in enumerate(expected_color_counts):
+            monkeypatch.setattr(
+                parallel_state, "get_pipeline_model_parallel_rank", lambda rank=pp_rank: rank
+            )
+            conflicts_by_count = {}
+            colors_by_count = {}
+            for num_microbatches in range(4, 65, 4):
+                _, _, warmup, _ = get_pp_rank_microbatches(
+                    num_microbatches, 4, 4, forward_only=False
+                )
+                order = convert_schedule_table_to_order(
+                    warmup, 4, get_schedule_table(num_microbatches, 4, 4)
+                )
+                colors, conflicts = TECudaGraphHelper._build_saved_tensor_liveness_colors(
+                    order, 8, [3, 3, 3, 3], return_conflicts=True
+                )
+                colors_by_count[num_microbatches] = colors
+                conflicts_by_count[num_microbatches] = conflicts
+
+            union_conflicts = {
+                frame: set().union(*(conflicts[frame] for conflicts in conflicts_by_count.values()))
+                for frame in conflicts_by_count[4]
+            }
+            for num_microbatches in range(12, 65, 4):
+                assert conflicts_by_count[num_microbatches] == union_conflicts
+            assert conflicts_by_count[32] == union_conflicts
+            assert len(set(colors_by_count[32].values())) == expected_colors
+
+    @pytest.mark.internal
+    def test_dynamic_cp_variant_order_locksteps_branches_with_schedule(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        order = [1, 2, 1, 2, -1, -2, -1, -2]
+        combined = TECudaGraphHelper._build_slot_aliased_variant_order(order, 2, 2)
+
+        assert combined == [1, 3, 2, 4, 1, 3, 2, 4, -1, -3, -2, -4, -1, -3, -2, -4]
+
+    @pytest.mark.internal
+    def test_slot_memory_colors_follow_pp_vpp_liveness(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        sequential = TECudaGraphHelper._build_saved_tensor_liveness_colors(
+            [1, 1, -1, -1, 2, 2, -2, -2], 2, [1, 1]
+        )
+        overlapping = TECudaGraphHelper._build_saved_tensor_liveness_colors(
+            [1, 1, 2, 2, -2, -2, -1, -1], 2, [1, 1]
+        )
+
+        assert sequential[(0, 0, 0)] != sequential[(0, 1, 0)]
+        assert overlapping[(0, 0, 0)] != overlapping[(0, 1, 0)]
+        assert len(set(overlapping.values())) > len(set(sequential.values()))
+        with pytest.raises(RuntimeError, match="slot period is shorter"):
+            TECudaGraphHelper._build_saved_tensor_liveness_colors([1, 1, -1, -1], 1, [1])
+
+    @pytest.mark.internal
+    def test_dynamic_cp_variants_emit_one_compact_slot_plan(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper.num_microbatches = 2
+        helper.num_model_chunks = 1
+        helper.num_layers_per_chunk = [1]
+        helper.flattened_callables = [torch.nn.Identity()]
+        helper._set_dynamic_cp_capture_context = lambda context: None
+        order = [1, 1, -1, 1, -1, 1, -1, -1]
+
+        def make_bank(cp_size, offset):
+            return (
+                cp_size,
+                object(),
+                [(offset + index,) for index in range(2)],
+                {
+                    '_order': order,
+                    '_num_layers_per_chunk': [1],
+                    '_reuse_graph_input_output_buffers': True,
+                },
+            )
+
+        banks = [make_bank(2, 0), make_bank(1, 10)]
+        callables, sample_args, kwargs = helper._get_dynamic_cp_variant_capture_data(banks)
+        colors = TECudaGraphHelper._build_saved_tensor_liveness_colors(order, 2, [1])
+        _, conflicts = TECudaGraphHelper._build_saved_tensor_liveness_colors(
+            order, 2, [1], return_conflicts=True
+        )
+        frames = sorted(conflicts)
+        frame_ids = {frame: index for index, frame in enumerate(frames)}
+        expected_slots = tuple(
+            (
+                colors[(0, logical_slot % 2, 0)],
+                variant * 2 + logical_slot,
+                logical_slot,
+                variant * 2 + logical_slot,
+                0,
+                0,
+                variant,
+                frame_ids[(0, logical_slot, 0)],
+                sum(1 << frame_ids[other] for other in conflicts[(0, logical_slot, 0)]),
+            )
+            for variant in range(2)
+            for logical_slot in range(2)
+        )
+
+        assert len(callables) == 2
+        assert sample_args == tuple((index,) for index in range(2)) + tuple(
+            (10 + index,) for index in range(2)
+        )
+        assert kwargs['_graph_memory_slots'] == expected_slots
+        assert kwargs['_num_layers_per_chunk'] == [1, 1]
+        assert not any(
+            key in kwargs
+            for key in (
+                '_saved_tensor_memory_alias_groups',
+                '_slot_io_memory_alias_groups',
+                '_slot_io_liveness_groups',
+                '_warmup_plan_alias_groups',
+            )
+        )
+
+    @pytest.mark.internal
+    def test_shared_slots_publish_logical_not_physical_microbatch_limit(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            dynamic_context_parallel=True,
+            cuda_graph_dynamic_microbatches=True,
+            _cuda_graph_num_microbatches=32,
+        )
+        helper.pp_group = SimpleNamespace(size=lambda: 8)
+        helper.num_microbatches = 16
+        helper._dynamic_slot_liveness_limit = 64
+
+        helper._publish_dynamic_cp_graph_microbatch_limit()
+        assert helper.config._cuda_graph_num_microbatches == 64
+
+        helper._dynamic_slot_liveness_limit = None
+        helper.num_microbatches = 32
+        helper._publish_dynamic_cp_graph_microbatch_limit()
+        assert helper.config._cuda_graph_num_microbatches == 32
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "fallback", ("overlap_moe_expert_parallel_comm", "delay_wgrad_compute")
+    )
+    def test_shared_slots_fall_back_for_unsupported_graph_orders(self, fallback):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            dynamic_context_parallel=True,
+            cuda_graph_dynamic_microbatches=True,
+            overlap_moe_expert_parallel_comm=False,
+            delay_wgrad_compute=False,
+        )
+        setattr(helper.config, fallback, True)
+
+        assert not helper._should_share_dynamic_cp_pool()
+
+    @pytest.mark.internal
+    def test_pp8_vpp4_uses_sixteen_noncolliding_slots(self):
+        from megatron.core.pipeline_parallel.schedules import get_schedule_table
+        from megatron.core.transformer.cuda_graphs import (
+            TECudaGraphHelper,
+            convert_schedule_table_to_order,
+        )
+
+        pp_size = 8
+        num_model_chunks = 4
+        microbatch_group_size = 8
+        num_microbatches = pp_size * num_model_chunks * 4
+        schedule_table = get_schedule_table(
+            num_microbatches, num_model_chunks, microbatch_group_size
+        )
+        forward_ops = list(schedule_table)
+        backward_ops = [
+            (microbatch, num_model_chunks - chunk - 1) for microbatch, chunk in schedule_table
+        ]
+
+        for pp_rank in range(pp_size):
+            num_warmup = (pp_size - pp_rank - 1) * 2
+            num_warmup += (num_model_chunks - 1) * microbatch_group_size
+            order = convert_schedule_table_to_order(num_warmup, num_model_chunks, schedule_table)
+            num_slots = TECudaGraphHelper._get_required_num_microbatch_slots_from_order(
+                order, num_model_chunks
+            )
+            assert num_slots == 16
+
+            events = [('forward', *op) for op in forward_ops[:num_warmup]]
+            for index in range(num_warmup, len(forward_ops)):
+                events.append(('forward', *forward_ops[index]))
+                events.append(('backward', *backward_ops[index - num_warmup]))
+            events.extend(('backward', *op) for op in backward_ops[-num_warmup:])
+            live_slots = [dict() for _ in range(num_model_chunks)]
+            for phase, microbatch, chunk in events:
+                slot = microbatch % num_slots
+                if phase == 'forward':
+                    assert slot not in live_slots[chunk]
+                    live_slots[chunk][slot] = microbatch
+                else:
+                    assert live_slots[chunk].pop(slot) == microbatch
+            assert all(not slots for slots in live_slots)
 
 
 # =============================================================================

@@ -364,7 +364,8 @@ def reroute_samples_to_dcp_ranks(
     Each CP lane gathers the samples from its DP group, then keeps only the
     samples assigned to its DPxCP rank. Gathering within ``dp_group`` avoids
     collecting the identical input held by every CP sibling and avoids the
-    fully connected P2P transport created by NCCL all-to-all.
+    fully connected P2P transport created by NCCL all-to-all. When DP and
+    DPxCP are equivalent, the already-warmed DPxCP communicator is reused.
 
     All ranks in ``dp_group`` must provide the same set of data keys. CP siblings
     that share a non-CP DP rank must additionally provide byte-identical sample
@@ -380,6 +381,10 @@ def reroute_samples_to_dcp_ranks(
     dcp_rank = dp_cp_group.rank()
     dp_rank = dp_group.rank()
     dp_size = dp_group.size()
+    gather_group = dp_group
+    if dp_size == dp_cp_group.size():
+        assert dp_rank == dcp_rank, "Equivalent DP and DPxCP groups must use the same rank order."
+        gather_group = dp_cp_group
 
     # Keep collective ordering independent of dictionary insertion order. Unknown
     # keys require an explicit layout classification rather than being silently dropped.
@@ -462,7 +467,9 @@ def reroute_samples_to_dcp_ranks(
             gathered_tensor = gather_input
         else:
             gathered_tensor = local_tensor.new_empty(dp_size * max_rank_numel)
-            torch.distributed.all_gather_into_tensor(gathered_tensor, gather_input, group=dp_group)
+            torch.distributed.all_gather_into_tensor(
+                gathered_tensor, gather_input, group=gather_group
+            )
 
         for gid in recv_ids:
             start, sample_numel = sample_slices[gid]

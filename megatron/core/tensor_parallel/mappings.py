@@ -37,6 +37,28 @@ def _reduce(input_, group):
     return input_
 
 
+def _reduce_dynamic_cp_subgroup_via_parent(input_, subgroup, parent_group):
+    """Reduce a contiguous dynamic-CP subgroup through one parent communicator."""
+    assert subgroup is not None, "subgroup should not be None"
+    assert parent_group is not None, "parent_group should not be None"
+
+    parent_ranks = torch.distributed.get_process_group_ranks(parent_group)
+    subgroup_ranks = torch.distributed.get_process_group_ranks(subgroup)
+    subgroup_start = parent_ranks.index(subgroup_ranks[0])
+    if parent_ranks[subgroup_start : subgroup_start + len(subgroup_ranks)] != subgroup_ranks:
+        raise RuntimeError(
+            "Dynamic-CP subgroup ranks must be a contiguous slice of the parent group: "
+            f"subgroup={subgroup_ranks}, parent={parent_ranks}."
+        )
+
+    # Every dynamic-CP variant uses this parent-sized shape. Distinct subgroups write
+    # distinct lanes, so ranks may replay different CP-size graphs in the same step.
+    reduction_lanes = input_.new_zeros((len(parent_ranks), *input_.shape))
+    reduction_lanes[subgroup_start].copy_(input_)
+    torch.distributed.all_reduce(reduction_lanes, group=parent_group)
+    return reduction_lanes[subgroup_start].clone()
+
+
 def _split_along_last_dim(input_, group):
     """Split the tensor along its last dimension and keep the
     corresponding slice."""
@@ -235,6 +257,20 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward function."""
         return grad_output, None
+
+
+class _ReduceFromDynamicCPSubgroup(torch.autograd.Function):
+    """Dynamic-CP subgroup sum in forward and identity in backward."""
+
+    @staticmethod
+    def forward(ctx, input_, subgroup, parent_group):
+        """Reduce through a fixed-shape parent-group collective."""
+        return _reduce_dynamic_cp_subgroup_via_parent(input_, subgroup, parent_group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward function."""
+        return grad_output, None, None
 
 
 class _ScatterToModelParallelRegion(torch.autograd.Function):
@@ -544,6 +580,11 @@ def reduce_from_tensor_model_parallel_region(input_, group=None):
     """Wrapper for autograd function: forward: all reduce, backward copy"""
     group = get_tensor_model_parallel_group_if_none(group)
     return _ReduceFromModelParallelRegion.apply(input_, group)
+
+
+def reduce_from_dynamic_cp_subgroup(input_, subgroup, parent_group):
+    """Reduce a dynamic-CP subgroup without creating a subgroup communicator."""
+    return _ReduceFromDynamicCPSubgroup.apply(input_, subgroup, parent_group)
 
 
 def scatter_to_tensor_model_parallel_region(input_, group=None):

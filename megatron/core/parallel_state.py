@@ -565,6 +565,7 @@ def initialize_model_parallel(
     sharp_enabled_group: Optional[str] = None,
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
+    eager_initialize_dynamic_cp_communicators: bool = True,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -942,10 +943,15 @@ def initialize_model_parallel(
         ]
         if data_parallel_size_with_cp not in group_sizes:
             group_sizes.append(data_parallel_size_with_cp)
-        for group_size in group_sizes:
-            group = get_dynamic_data_context_parallel_groups(group_size=group_size)
-            torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
-            torch.cuda.synchronize()
+        if eager_initialize_dynamic_cp_communicators:
+            for group_size in group_sizes:
+                # A singleton group has no communication to initialize. Forcing a NCCL
+                # barrier here creates a persistent communicator that CP=1 never uses.
+                if group_size == 1:
+                    continue
+                group = get_dynamic_data_context_parallel_groups(group_size=group_size)
+                torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+                torch.cuda.synchronize()
 
     for ranks in decoder_rank_generator.get_ranks('dp'):
         group = create_group(

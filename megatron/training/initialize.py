@@ -370,6 +370,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 dynamic_context_parallel=args.dynamic_context_parallel,
                 min_dynamic_context_parallel_size=args.min_dynamic_context_parallel_size,
+                eager_initialize_dynamic_cp_communicators=(
+                    not args.dynamic_context_parallel
+                    or args.cuda_graph_impl != 'transformer_engine'
+                ),
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,

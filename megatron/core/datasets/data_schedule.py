@@ -263,6 +263,12 @@ class DpBalancedScheduler(BasePackingScheduler):
         """
 
         total_dcp_gpus = dp_cp_group.size()
+        scheduler_dp_group = dp_group
+        if dp_group.size() == total_dcp_gpus:
+            assert dp_group.rank() == dp_cp_group.rank(), (
+                "Equivalent DP and DPxCP groups must use the same rank order."
+            )
+            scheduler_dp_group = dp_cp_group
         is_first_pp = pp_group.rank() == 0
         is_last_pp = pp_group.rank() == pp_group.size() - 1
 
@@ -308,7 +314,7 @@ class DpBalancedScheduler(BasePackingScheduler):
 
             # Step 1: Fetch batches and gather global sequence lengths
             batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
-                get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group)
+                get_batch_and_global_seqlens(data_iterator, num_microbatches, scheduler_dp_group)
             )
 
             # Step 2: Check required sample keys
@@ -352,7 +358,7 @@ class DpBalancedScheduler(BasePackingScheduler):
                 global_id_seqlens,
                 sample_id_groups,
                 offsets,
-                dp_group,
+                scheduler_dp_group,
                 dp_cp_group,
             )
 

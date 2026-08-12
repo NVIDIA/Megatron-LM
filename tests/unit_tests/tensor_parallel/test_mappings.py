@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.tensor_parallel import mappings
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 from tests.unit_tests.test_utilities import Utils
@@ -50,6 +51,36 @@ def test_ReduceFromModelParallelRegion():
     output_data, _ = mappings._ReduceFromModelParallelRegion.backward(Ctx(), input_data)
     assert torch.equal(input_data, output_data)
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+def test_ReduceFromMixedDynamicCPSubgroupsViaParent():
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+        dynamic_context_parallel=True,
+    )
+    try:
+        parent_group = torch.distributed.group.WORLD
+        parent_rank = parent_group.rank()
+        if parent_group.size() >= 8:
+            subgroup_size = 4 if parent_rank < 4 else 2 if parent_rank < 6 else 1
+        else:
+            subgroup_size = 2 if parent_rank < 2 else 1
+        subgroup = parallel_state.get_dynamic_data_context_parallel_groups(group_size=subgroup_size)
+
+        input_data = torch.tensor([parent_rank + 1.0], device='cuda', requires_grad=True)
+        actual = mappings.reduce_from_dynamic_cp_subgroup(input_data, subgroup, parent_group)
+
+        expected = input_data.detach().clone()
+        torch.distributed.all_reduce(expected, group=subgroup)
+        torch.testing.assert_close(actual, expected)
+
+        actual.sum().backward()
+        torch.testing.assert_close(input_data.grad, torch.ones_like(input_data))
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.internal

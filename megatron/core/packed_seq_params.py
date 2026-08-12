@@ -366,14 +366,8 @@ def _resolve_thd_padding_lengths(
         global_target_len = local_target_len * cp_size
         return local_actual_T, global_actual_T, local_target_len, global_target_len, mask_device
 
-    # Metadata-only path: resolve the global padded endpoint first.
-    global_target_len = (
-        int(target_len) * cp_size
-        if target_len is not None
-        else _round_up_to_alignment(global_actual_T, alignment)
-    )
-
-    # Under CP, ask TE which packed rows this rank would receive.
+    # Metadata-only path: first recover the already-sliced local length. Padding
+    # targets and alignment are CP-local, just as they are in the tensor path.
     if cp_size > 1:
         from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 
@@ -388,16 +382,16 @@ def _resolve_thd_padding_lengths(
                 partition_cu_seqlens, global_actual_T, cp_size, cp_rank
             ).numel()
         )
-        # Do the same for the padded endpoint; THD CP is not simple equal split.
-        local_target_len = int(
-            get_thd_partitioned_indices(
-                partition_cu_seqlens, global_target_len, cp_size, cp_rank
-            ).numel()
-        )
     else:
         # Without CP, local and global metadata lengths are identical.
         local_actual_T = global_actual_T
-        local_target_len = global_target_len
+
+    local_target_len = (
+        int(target_len)
+        if target_len is not None
+        else _round_up_to_alignment(local_actual_T, alignment)
+    )
+    global_target_len = local_target_len * cp_size
 
     return local_actual_T, global_actual_T, local_target_len, global_target_len, mask_device
 
