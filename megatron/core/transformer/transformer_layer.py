@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 if TYPE_CHECKING:
-    from megatron.core.tensor_parallel.random import CheckpointManager
+    from megatron.core.tensor_parallel.random import MHCCheckpointManager
 
 import torch
 import torch.distributed
@@ -1778,7 +1778,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
     def __call__(self, *args, **kwargs):
         # Extract mhc_recompute_manager before CUDA graph manager processes kwargs,
-        # since CheckpointManager is not a CUDA-graph-supported type.
+        # since MHCCheckpointManager is not a CUDA-graph-supported type.
         self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
         kwargs.pop("is_last_layer_in_recompute_block", None)
 
@@ -2184,7 +2184,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
-        mhc_recompute_manager: Optional['CheckpointManager'] = None,
+        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -2281,7 +2281,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         padding_mask=None,
         input_ids=None,
         packed_seq_params: Optional[PackedSeqParams] = None,
-        mhc_recompute_manager: Optional['CheckpointManager'] = None,
+        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
     ):
         """Forward MLP with hyper connection pre/post processing."""
         is_last_in_recompute_block = bool(
@@ -2396,7 +2396,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         mlp_h_res,
         residual,
         mlp_hc_h_post,
-        mhc_mlp_bda_recompute_manager: Optional['CheckpointManager'] = None,
+        mhc_mlp_bda_recompute_manager: Optional['MHCCheckpointManager'] = None,
     ):
         """Run the fused mHC post-MLP H_res/H_post/BDA computation."""
         nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
@@ -2420,7 +2420,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         mlp_h_res,
         residual,
         mlp_hc_h_post,
-        mhc_mlp_bda_recompute_manager: Optional['CheckpointManager'] = None,
+        mhc_mlp_bda_recompute_manager: Optional['MHCCheckpointManager'] = None,
     ):
         """Run mHC post-MLP fused H_res/H_post/BDA without MLP norm offload."""
         return self._forward_mhc_mlp_post_core(
@@ -2433,7 +2433,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         mlp_h_res,
         residual,
         mlp_hc_h_post,
-        mhc_mlp_bda_recompute_manager: Optional['CheckpointManager'] = None,
+        mhc_mlp_bda_recompute_manager: Optional['MHCCheckpointManager'] = None,
     ):
         """
         Perform operations after the MLP computation with fused hyper connection kernel.
@@ -2445,7 +2445,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             mlp_h_res (Tensor): [s, b, n, n] - residual mixing matrix from hyper connection.
             residual (Tensor): [s, b, n*C] - original residual (n-stream hidden states).
             mlp_hc_h_post (Tensor): [s, b, n] - expansion weights from hyper connection.
-            mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
+            mhc_recompute_manager: Optional MHCCheckpointManager for checkpoint management.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].

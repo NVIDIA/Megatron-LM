@@ -122,7 +122,7 @@ class TransformerLayerSchedulePlan:
             # The schedule installs _mhc_recompute_manager on the layer directly,
             # bypassing TransformerLayer.__call__, which is what would otherwise
             # refresh or clear it each forward. Left in place it pins this
-            # iteration's CheckpointManager -- and every saved tensor it still
+            # iteration's MHCCheckpointManager -- and every saved tensor it still
             # holds -- on the module, and a later replay that arrives without a
             # fresh assignment would bind arena slots against an already
             # recomputed checkpoint set.
@@ -555,7 +555,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         if module is None:
             return
 
-        from megatron.core.tensor_parallel.random import CheckpointManager
+        from megatron.core.tensor_parallel.random import MHCCheckpointManager
 
         num_layers = len(module.layers)
         config = module.config
@@ -568,7 +568,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         )
         group_size = config.mhc_recompute_layer_num or num_layers
         mhc_recompute_manager = (
-            CheckpointManager() if use_mhc_recompute and num_layers > 0 else None
+            MHCCheckpointManager() if use_mhc_recompute and num_layers > 0 else None
         )
         group_index = 0
 
@@ -597,7 +597,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
             if is_group_end and layer_idx != num_layers - 1:
                 group_index += 1
-                mhc_recompute_manager = CheckpointManager()
+                mhc_recompute_manager = MHCCheckpointManager()
 
     @property
     def event(self):

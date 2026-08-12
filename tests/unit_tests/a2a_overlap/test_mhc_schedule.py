@@ -13,8 +13,8 @@ from megatron.core.models.common.model_chunk_schedule_plan import (
 )
 from megatron.core.pipeline_parallel.utils import get_comp_stream, set_streams
 from megatron.core.tensor_parallel.random import (
-    CheckpointManager,
     CheckpointWithoutOutput,
+    MHCCheckpointManager,
     initialize_rng_tracker,
 )
 from megatron.core.transformer.module import float16_to_fp32
@@ -178,15 +178,15 @@ def test_release_state_clears_the_mhc_manager_on_the_mtp_inner_layer():
     # build_mtp_layer_callables builds over layer.mtp_model_layer, so the schedule
     # installs _mhc_recompute_manager on the inner transformer layer. Clearing it
     # on the MultiTokenPredictionLayer wrapper instead leaves the iteration's
-    # CheckpointManager -- and every tensor it still holds -- pinned on the inner
+    # MHCCheckpointManager -- and every tensor it still holds -- pinned on the inner
     # module, and lets a later replay bind arena slots against an already
     # recomputed checkpoint set. Both failures are silent.
     from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
-    inner = SimpleNamespace(_mhc_recompute_manager=CheckpointManager())
+    inner = SimpleNamespace(_mhc_recompute_manager=MHCCheckpointManager())
     wrapper = MultiTokenPredictionLayer.__new__(MultiTokenPredictionLayer)
     wrapper.mtp_model_layer = inner
-    wrapper._mhc_recompute_manager = CheckpointManager()
+    wrapper._mhc_recompute_manager = MHCCheckpointManager()
 
     plan = TransformerLayerSchedulePlan.__new__(TransformerLayerSchedulePlan)
     plan.layer = wrapper
@@ -197,7 +197,7 @@ def test_release_state_clears_the_mhc_manager_on_the_mtp_inner_layer():
 
 def test_release_state_clears_the_mhc_manager_on_a_plain_layer():
     # The non-MTP path must keep working: the manager lives on the layer itself.
-    layer = SimpleNamespace(_mhc_recompute_manager=CheckpointManager())
+    layer = SimpleNamespace(_mhc_recompute_manager=MHCCheckpointManager())
     plan = TransformerLayerSchedulePlan.__new__(TransformerLayerSchedulePlan)
     plan.layer = layer
     plan.release_state()
@@ -286,7 +286,7 @@ def test_checkpoint_manager_explicit_recompute_is_idempotent_and_restores_gradie
     reference_loss = reference_output.square().sum()
     reference_loss.backward()
 
-    manager = CheckpointManager()
+    manager = MHCCheckpointManager()
     checkpoint = CheckpointWithoutOutput(ckpt_manager=manager)
     output = checkpoint.checkpoint(run_function, input_tensor)
     expected_output = output.detach().clone()

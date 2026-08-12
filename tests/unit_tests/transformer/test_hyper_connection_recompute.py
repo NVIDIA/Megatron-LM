@@ -5,8 +5,8 @@ Unit tests for HyperConnection block-level recomputation.
 
 Tests the following functionality:
 1. HyperConnectionModule._forward_with_checkpoint correctness
-2. HyperConnectionModule.apply_h_post with CheckpointManager
-3. Multiple HyperConnectionModules chained with a single CheckpointManager
+2. HyperConnectionModule.apply_h_post with MHCCheckpointManager
+3. Multiple HyperConnectionModules chained with a single MHCCheckpointManager
 4. Partial checkpoint (last layer not checkpointed)
 5. TransformerConfig 'mhc' in recompute_modules option
 """
@@ -18,8 +18,8 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.tensor_parallel.random import (
-    CheckpointManager,
     CheckpointWithoutOutput,
+    MHCCheckpointManager,
     get_all_rng_states,
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
@@ -122,7 +122,7 @@ class TestHyperConnectionCheckpoint:
         # Forward with checkpoint
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = CheckpointManager()
+        manager = MHCCheckpointManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt_out = (
             module._forward_with_checkpoint(hidden_states_ckpt, manager)
         )
@@ -182,7 +182,7 @@ class TestHyperConnectionCheckpoint:
 
         # With checkpoint (manager provided)
         torch.manual_seed(42)
-        manager = CheckpointManager()
+        manager = MHCCheckpointManager()
         x_out_ckpt, bias_out_ckpt = module.apply_h_post(
             (x_ckpt, bias), h_post_ckpt, manager=manager
         )
@@ -231,7 +231,7 @@ class TestHyperConnectionCheckpoint:
         # With manager (uses _forward_with_checkpoint)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = CheckpointManager()
+        manager = MHCCheckpointManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt, _ = module.forward(
             hidden_states_ckpt, mhc_recompute_manager=manager
         )
@@ -246,7 +246,7 @@ class TestHyperConnectionCheckpoint:
 
 
 class TestMHCBlockRecomputeIntegration:
-    """Test CheckpointManager integration with HyperConnection."""
+    """Test MHCCheckpointManager integration with HyperConnection."""
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -258,7 +258,7 @@ class TestMHCBlockRecomputeIntegration:
     def test_multiple_hyper_connections_in_chain(self):
         """
         Test that multiple HyperConnectionModules can be chained together
-        with a single CheckpointManager.
+        with a single MHCCheckpointManager.
         """
         hidden_size = 64
         num_streams = 4
@@ -315,7 +315,7 @@ class TestMHCBlockRecomputeIntegration:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
-        manager = CheckpointManager()
+        manager = MHCCheckpointManager()
 
         h = hidden_states_ckpt
         r = residual_ckpt
@@ -396,7 +396,7 @@ class TestMHCBlockRecomputeIntegration:
         # With manager - checkpoint everything except final output
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = CheckpointManager()
+        manager = MHCCheckpointManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt, _ = module.forward(
             hidden_states_ckpt, mhc_recompute_manager=manager
         )
@@ -742,7 +742,7 @@ class TestCheckpointRngReplay:
 
     def _roundtrip(self, run_function):
         x = torch.randn(4096, device="cuda", requires_grad=True)
-        manager = CheckpointManager()
+        manager = MHCCheckpointManager()
         checkpoint = CheckpointWithoutOutput(ckpt_manager=manager)
         output = checkpoint.checkpoint(run_function, x)
         forward_values = output.detach().clone()
@@ -824,7 +824,7 @@ class TestCheckpointRecomputeUnderFullGraphCapture:
         )
 
         def run_step(x):
-            manager = CheckpointManager()
+            manager = MHCCheckpointManager()
             aggregated, _h_res, h_post, _residual = module.forward(x, mhc_recompute_manager=manager)
             loss = aggregated.square().mean() + h_post.square().mean()
             manager.discard_all_outputs_and_register_unified_recompute(loss)

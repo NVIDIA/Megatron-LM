@@ -13,7 +13,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
 if TYPE_CHECKING:
-    from megatron.core.tensor_parallel.random import CheckpointManager
+    from megatron.core.tensor_parallel.random import MHCCheckpointManager
     from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot
 
 _MHC_SINKHORN_EPS = 1e-6
@@ -459,7 +459,7 @@ class HyperConnectionModule(MegatronModule):
         self,
         x_with_bias: Tuple[Tensor, Optional[Tensor]],
         h_post: Tensor,
-        manager: Optional['CheckpointManager'] = None,
+        manager: Optional['MHCCheckpointManager'] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """
         Apply H_post to x and optionally bias, with optional checkpointing.
@@ -472,7 +472,7 @@ class HyperConnectionModule(MegatronModule):
                 - x: [s, b, C] - hidden states
                 - bias: [C] or None - optional bias tensor
             h_post: [s, b, n] - expansion weights
-            manager: Optional CheckpointManager for checkpoint management.
+            manager: Optional MHCCheckpointManager for checkpoint management.
                 When provided, wraps _apply_h_post with CheckpointWithoutOutput.
 
         Returns:
@@ -551,7 +551,7 @@ class HyperConnectionModule(MegatronModule):
     def forward(
         self,
         hidden_states: Tensor,
-        mhc_recompute_manager: Optional['CheckpointManager'] = None,
+        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         output_slot: Optional['MHCRecomputeArenaSlot'] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
@@ -564,7 +564,7 @@ class HyperConnectionModule(MegatronModule):
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
+            mhc_recompute_manager: Optional MHCCheckpointManager for checkpoint management.
                 When provided, uses _forward_with_checkpoint for memory-efficient execution.
             output_slot: Optional arena slot used as the aggregate kernel's
                 caller-owned output for both forward and recompute.
@@ -617,7 +617,7 @@ class HyperConnectionModule(MegatronModule):
     def _forward_with_checkpoint(
         self,
         hidden_states: Tensor,
-        manager: 'CheckpointManager',
+        manager: 'MHCCheckpointManager',
         output_slot: Optional['MHCRecomputeArenaSlot'] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
@@ -630,7 +630,7 @@ class HyperConnectionModule(MegatronModule):
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            manager: CheckpointManager for unified recomputation
+            manager: MHCCheckpointManager for unified recomputation
             output_slot: Optional direct-write attention CUDA Graph input slot.
 
         Returns:
@@ -718,7 +718,7 @@ class HyperConnectionModule(MegatronModule):
         dropout_prob: float,
         training: bool,
         fused: bool,
-        manager: Optional['CheckpointManager'] = None,
+        manager: Optional['MHCCheckpointManager'] = None,
     ) -> Tensor:
         """
         Fused kernel combining apply_h_res, apply_h_post and bias-dropout-add.
@@ -741,7 +741,7 @@ class HyperConnectionModule(MegatronModule):
             dropout_prob: Dropout probability
             training: Whether in training mode
             fused: Whether to use fused BDA implementation
-            manager: Optional CheckpointManager for checkpoint management.
+            manager: Optional MHCCheckpointManager for checkpoint management.
                 When provided, each operation is wrapped with CheckpointWithoutOutput.
 
         Returns:
@@ -830,7 +830,7 @@ class HyperConnectionModule(MegatronModule):
         dropout_prob: float,
         training: bool,
         fused: bool,
-        manager: 'CheckpointManager',
+        manager: 'MHCCheckpointManager',
     ) -> Tensor:
         """
         Checkpointed variant of _fused_h_res_h_post_bda_native.
@@ -848,7 +848,7 @@ class HyperConnectionModule(MegatronModule):
             dropout_prob: Dropout probability
             training: Whether in training mode
             fused: Whether to use fused BDA implementation
-            manager: CheckpointManager for checkpoint management
+            manager: MHCCheckpointManager for checkpoint management
 
         Returns:
             output: [s, b, n*C] - final output

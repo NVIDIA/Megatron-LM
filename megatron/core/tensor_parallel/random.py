@@ -837,14 +837,21 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-class CheckpointManager:
-    """Manage checkpoints that are recomputed together across transformer layers.
+class MHCCheckpointManager:
+    """Manage mHC checkpoints that are recomputed together across transformer layers.
 
     This manager enables unified recomputation for checkpoint operations with sequential
     dependencies, such as when one checkpoint's output is the next checkpoint's input.
 
+    Specific to manifold hyper-connections, and named for it: it owns an
+    ``MHCRecomputeArena``, validates slot addresses before every replay, and its
+    phase argument is ``MHCRecomputePhase``. Every construction site in the tree
+    is an mHC one. Should a second consumer ever want the group-replay machinery
+    without the arena, the general part is worth lifting into a base class at
+    that point rather than being asserted by the name now.
+
     Examples:
-        ckpt_manager = CheckpointManager()
+        ckpt_manager = MHCCheckpointManager()
         ckpt_function = CheckpointWithoutOutput(ckpt_manager=ckpt_manager)
         ckpt_function.checkpoint(run_function, *args)
         # other checkpointed operations
@@ -932,7 +939,7 @@ class CheckpointManager:
         if self._recomputed:
             return
         if not self._outputs_discarded:
-            raise RuntimeError("CheckpointManager.recompute_until() requires discarded outputs.")
+            raise RuntimeError("MHCCheckpointManager.recompute_until() requires discarded outputs.")
         self.mhc_arena.validate_addresses()
         # NOTE: arena slots are deliberately never released in this method.
         # The recompute node is not the last reader of the group -- the
@@ -991,7 +998,7 @@ class CheckpointWithoutOutput(object):
 
         Args:
             fp8: Whether to use FP8 mode. Defaults to False.
-            ckpt_manager: Optional CheckpointManager instance. When provided,
+            ckpt_manager: Optional MHCCheckpointManager instance. When provided,
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
