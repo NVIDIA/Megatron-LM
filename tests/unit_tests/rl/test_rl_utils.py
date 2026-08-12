@@ -1420,7 +1420,8 @@ class TestRLUtils:
         # Per-turn max epoch stamps (when each turn completed)
         completed_epochs = [[5, 3], [5, 1]]
         num_evictions = [[0, 1], [0, 0]]
-        rollout_statuses = [["graded", "ok"], ["ok", "ok"]]
+        # "env/timeout" sits outside KNOWN_ROLLOUT_STATUSES and needs key sanitization.
+        rollout_statuses = [["graded", "ok"], ["env/timeout", "ok"]]
         failure_reasons = [[None, None], [None, None]]
         current_iteration = 6
         if inject_placeholders:
@@ -1471,8 +1472,16 @@ class TestRLUtils:
         assert metrics["rollout/count"] == (8 if inject_placeholders else 4)
         assert metrics["rollout/placeholder_count"] == (4 if inject_placeholders else 0)
         assert metrics["rollout/placeholder_rate"] == (0.5 if inject_placeholders else 0.0)
+        # Statuses in KNOWN_ROLLOUT_STATUSES always emit a series, zeros included...
+        assert metrics["rollout/ok_count"] == 2
+        assert metrics["rollout/ok_rate"] == (0.25 if inject_placeholders else 0.5)
         assert metrics["rollout/masked_count"] == 0
+        assert metrics["rollout/masked_rate"] == 0.0
         assert metrics["rollout/graded_count"] == 1
+        # ...and statuses beyond the vocabulary are still counted, under a
+        # wandb-safe key.
+        assert metrics["rollout/env_timeout_count"] == 1
+        assert metrics["rollout/env_timeout_rate"] == (0.125 if inject_placeholders else 0.25)
         if inject_placeholders:
             assert metrics["rollout/failure_reason/http_500"] == 4
         else:
@@ -1680,6 +1689,7 @@ class TestRLUtils:
         assert group_rows == [[1.0, 0.0], [0.0, 0.0]]
         # The stamped taxonomy decomposes the structural zero-turn count.
         assert metrics["rollout/count"] == 6
+        assert metrics["rollout/ok_count"] == 2
         assert metrics["rollout/placeholder_count"] == 3
         assert metrics["rollout/masked_count"] == 1
         assert metrics["rollout/graded_count"] == 0

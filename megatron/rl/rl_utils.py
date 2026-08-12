@@ -73,6 +73,7 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.rl.agent.api import (
+    KNOWN_ROLLOUT_STATUSES,
     EvaluationRequest,
     EvaluationResponse,
     GroupedRolloutRequest,
@@ -1074,24 +1075,20 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     rewards = np.asarray(rewards, dtype=np.float64)
     num_turns = np.asarray(num_turns, dtype=np.int64)
     assert rewards.shape == num_turns.shape, (
-        f"rewards and num_turns must have matching shapes, got "
-        f"{rewards.shape} and {num_turns.shape}"
+        f"rewards and num_turns must have matching shape, got {rewards.shape} and {num_turns.shape}"
     )
 
     # Each outer dimension of num_turns is a group. Sum of those gives total num_turns per group.
     # Let's use this to calculate advantage.
     # mean/std should be repeated based on group lens
     group_turns = num_turns.sum(axis=-1)
-    # Zero-turn rollouts are empty-trajectory placeholders for failed episodes:
-    # Their 0.0 rewards must not shift the normalization of the real rewards in the same group.
-    valid_rewards = num_turns > 0
-    group_means = np.zeros(rewards.shape[0], dtype=np.float64)
-    group_stds = np.zeros(rewards.shape[0], dtype=np.float64)
-    for group_idx, valid_mask in enumerate(valid_rewards):
-        if valid_mask.any():
-            valid_group_rewards = rewards[group_idx, valid_mask]
-            group_means[group_idx] = valid_group_rewards.mean()
-            group_stds[group_idx] = valid_group_rewards.std()
+    # Zero-turn rollouts are empty-trajectory placeholders for failed episodes and are masked out.
+    real_mask = num_turns > 0
+    # Clamping to 1 avoids 0/0 for all-placeholder groups.
+    real_counts = np.maximum(real_mask.sum(axis=-1), 1)
+    group_means = np.where(real_mask, rewards, 0.0).sum(axis=-1) / real_counts
+    group_deviations = np.where(real_mask, rewards - group_means[:, np.newaxis], 0.0)
+    group_stds = np.sqrt((group_deviations**2).sum(axis=-1) / real_counts)
     reward_means = group_means.repeat(group_turns)
     reward_stds = group_stds.repeat(group_turns)
 
@@ -1289,9 +1286,8 @@ def prep_wandb_metrics(
 
     """Make a wandb-parseable dictionary of metrics for logging.
 
-    Zero-turn rollouts are a mark of placeholders (empty-trajectory pads for failed episodes).
-    But their rewards are excluded from group normalization, so we need to track them separately.
-    All other per-rollout fields of theirs are masked out of stats.
+    Zero-turn rollouts are empty-trajectory placeholders for failed episodes.
+    Their rewards are excluded from GRPO group normalization; the stats reflect this.
 
     Args:
         wandb_writer: Wandb run to log to.
@@ -1314,30 +1310,37 @@ def prep_wandb_metrics(
     real_mask = [[nt > 0 for nt in g] for g in num_turns]
     total_rollouts = sum(len(g) for g in num_turns)
     failed_rollouts = sum(not keep for g in real_mask for keep in g)
-    failure_metrics = {
+    if rollout_statuses is None:
+        rollout_statuses = [['ok'] * len(g) for g in rewards]
+    if failure_reasons is None:
+        failure_reasons = [[None] * len(g) for g in rewards]
+    status_counts = Counter(s for g in rollout_statuses for s in g)
+    rollout_metrics = {
+        'rollout/count': total_rollouts,
         'failed_rollouts/count': failed_rollouts,
         'failed_rollouts/ratio': (
             failed_rollouts / total_rollouts if total_rollouts else 0.0
         ),
     }
 
-    statuses_grouped = rollout_statuses or [['ok'] * len(g) for g in rewards]
-    reasons_grouped = failure_reasons or [[None] * len(g) for g in rewards]
-    statuses_all = [s for g in statuses_grouped for s in g]
-    failure_metrics['rollout/count'] = total_rollouts
-    for status in ('placeholder', 'masked', 'graded'):
-        count = sum(s == status for s in statuses_all)
-        failure_metrics[f'rollout/{status}_count'] = count
-        failure_metrics[f'rollout/{status}_rate'] = (
+    def _safe_key(label):
+        """Sanitize a free-form label for use inside a wandb metric key."""
+        return ''.join(c if c.isalnum() or c in ('_', '-') else '_' for c in label)
+
+    # Union so that adapter-stamped statuses beyond the known vocabulary are still
+    # counted, while known statuses keep emitting a stable series (zeros included)
+    # even in iterations where they never occur.
+    for status in sorted(set(status_counts) | set(KNOWN_ROLLOUT_STATUSES)):
+        safe_status = _safe_key(status)
+        count = status_counts[status]
+        rollout_metrics[f'rollout/{safe_status}_count'] = count
+        rollout_metrics[f'rollout/{safe_status}_rate'] = (
             count / total_rollouts if total_rollouts else 0.0
         )
     for failure_reason, count in Counter(
-        r for g in reasons_grouped for r in g if r
+        r for g in failure_reasons for r in g if r
     ).items():
-        safe_reason = ''.join(
-            c if c.isalnum() or c in ('_', '-') else '_' for c in failure_reason
-        )
-        failure_metrics[f'rollout/failure_reason/{safe_reason}'] = count
+        rollout_metrics[f'rollout/failure_reason/{_safe_key(failure_reason)}'] = count
 
     # All-empty wave: every episode failed and was dropped (nothing to aggregate),
     # or every surviving rollout is a zero-turn placeholder (rewards exist but the
@@ -1352,7 +1355,7 @@ def prep_wandb_metrics(
             "prep_wandb_metrics: empty wave (0 usable rollouts); "
             "skipping rollout metrics this iteration."
         )
-        return failure_metrics
+        return rollout_metrics
 
     def _real(grouped):
         """Grouped per-rollout entries with placeholder (zero-turn) rollouts removed."""
@@ -1377,14 +1380,15 @@ def prep_wandb_metrics(
     flat_rewards = [r for g in rewards for r in g]
     flat_traj_lens = [l for g in traj_lens for l in g]
     flat_num_evictions = [e for g in num_evictions for e in g]
-    flat_reasons = [r for g in reasons_grouped for r in g]
+    flat_statuses = [s for g in rollout_statuses for s in g]
+    flat_reasons = [r for g in failure_reasons for r in g]
     flat_policy_epochs = [r for g in policy_epoch for r in g]
     flat_kv_epochs = [r for g in kv_cache_epoch for r in g]
     joined = [i for i, row in enumerate(flat_policy_epochs) if row]
     joined_rewards = [flat_rewards[i] for i in joined]
     joined_traj_lens = [flat_traj_lens[i] for i in joined]
     joined_num_evictions = [flat_num_evictions[i] for i in joined]
-    joined_statuses = [statuses_all[i] for i in joined]
+    joined_statuses = [flat_statuses[i] for i in joined]
     joined_reasons = [flat_reasons[i] for i in joined]
     per_rollout_policy_epochs = [flat_policy_epochs[i] for i in joined]
     per_rollout_kv_epochs = [flat_kv_epochs[i] for i in joined]
@@ -1434,7 +1438,7 @@ def prep_wandb_metrics(
             'mean_advantage': np.mean(advantages),
             'nonzero_groups_ratio': np.count_nonzero(advantages)
             / len(advantages),
-            **failure_metrics,
+            **rollout_metrics,
     }
 
     # Staleness/eviction telemetry: joined rollouts only; skip when nothing joined.
@@ -1488,6 +1492,7 @@ def prep_wandb_metrics(
                 'staleness', 'Per-Token KV Cache Staleness'
             ),
         }
+
 
 
     if example_group:
