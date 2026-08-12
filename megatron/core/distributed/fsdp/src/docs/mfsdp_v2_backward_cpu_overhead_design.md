@@ -7,7 +7,7 @@ shows ~10 ms of CPU time per backward under the `MFSDP <root> backward`
 NVTX tag, spent in:
 
 - **`copy_`** — packing per-parameter gradients into the reduce-scatter input
-  buffer (`copy_gradients_to_partial_buffer`, `parameter_group.py:391`)
+  buffer (`copy_gradients_to_partial_buffer`, `parameter_group.py`)
 - **`_FromTorchTensor`** — DTensor construction per parameter per backward
   (`get_dtensor` / `DBuffer.from_local` in the grad-reduction path and the
   `.grad` rebind in `reduce_partial_gradients`)
@@ -19,7 +19,7 @@ microbatch.
 
 ## 2. Root-cause analysis
 
-### 2.1 `copy_` — gradient packing (parameter_group.py:386-392)
+### 2.1 `copy_` — gradient packing (parameter_group.py)
 
 ```python
 def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
@@ -34,15 +34,10 @@ grouped by `(dtype, requires_grad, is_fp8)`, an MoE layer has ~10-20
 parameters per group → 10-20 `copy_` dispatches per backward per group,
 each with its own kernel launch, stream sync, and tensor-arg validation.
 
-**The wgrad already lands in `parameter.grad` (an autograd-managed buffer).
-A fused path can make the MLP/attention wgrad accumulate directly into the
-partial buffer views, skipping the copy entirely** (PR #5032's
-"gradient-accumulation-fusion" concept).
+### 2.2 `_FromTorchTensor` — DTensor creation (dbuffer.py)
 
-### 2.2 `_FromTorchTensor` — DTensor creation (dbuffer.py:466-496)
-
-`reduce_partial_gradients` (parameter_group.py:471-472) rebinds every
-sharded parameter's `.grad`:
+`reduce_partial_gradients` (parameter_group.py) rebinds every sharded
+parameter's `.grad`:
 
 ```python
 for index, fsdp_parameter in enumerate(self.fsdp_parameters):
@@ -50,84 +45,68 @@ for index, fsdp_parameter in enumerate(self.fsdp_parameters):
 ```
 
 `get_dtensor` calls `DTensor.from_local(...)` → `_FromTorchTensor` per
-parameter per backward. PR #5032 caches these DTensors (`_dist_grad_cache`)
-and rebinds only the `_local_tensor.data` (via
-`rebind_uneven_dtensor_local_tensor`) — the DTensor shell is created once
-and its storage pointer is updated in place, eliminating the
-`_FromTorchTensor` CPU cost on subsequent microbatches.
+parameter per backward. The DTensor shell is rebuilt every microbatch even
+though the backing storage is reused, so the host-side `_FromTorchTensor`
+cost is paid `O(params)` times per backward.
 
-## 3. Design (step by step)
+### 2.3 `get_local_tensor` — per-call `narrow`/`view` (dbuffer.py)
 
-### Step 1: Cache the sharded-grad DTensors (`get_dtensor` reuse)
+`copy_gradients_to_partial_buffer` and `get_dtensor` both resolve each
+parameter's local shard via `local_buffer.narrow(...).view(...)` every call.
+The view is stable within a buffer lifetime (storage is preserved on
+resize), so rebuilding it is pure host overhead.
 
-**Where**: `FsdpParameterGroup`, new `_grad_dtensor_cache: list[DTensor | None]`.
+## 3. Design
+
+### Step 1 (PR #121): Cache the sharded-grad DTensors
+
+**Where**: `FsdpParameterGroup`, new `_grad_dtensor_cache` keyed on the
+`main_grad` DBuffer identity.
 
 - On the first `reduce_partial_gradients` of a group, build the DTensors via
-  `get_dtensor` and cache them keyed by parameter index.
-- On later calls, instead of `DTensor.from_local`, **rebind the cached
-  DTensor's `_local_tensor.data`** to the new `main_grad` local view
-  (`object.__setattr__(dt._local_tensor, "data", new_view)`).
-- Invalidate the cache when `main_grad` is re-allocated (dtype/size change)
-  or when the group is rebuilt.
+  `get_dtensor` and cache them by parameter index.
+- On later calls, rebind the cached DTensor's local tensor in place instead
+  of rebuilding; when storage and shape are unchanged, reuse the cached
+  view entirely (no rebind, no device sync).
+- Invalidate the cache when `main_grad` is replaced (redistribute) or
+  changes dtype.
 
 This removes `_FromTorchTensor` from the per-microbatch hot path.
 
-### Step 2: Gradient-accumulation fusion for the copy_
+### Step 2 (PR #122): Fused foreach grad copy
 
-**Where**: `_reduce_gradient_groups` (module.py:520-538) +
-`copy_gradients_to_partial_buffer` (parameter_group.py:386).
+**Where**: `copy_gradients_to_partial_buffer` (parameter_group.py).
 
-**2a. (rejected) Reuse the partial buffer across microbatches.** A first
-attempt cached `allocate_partial_grad_buffer` on the group. nsys showed
-`cudaEventSynchronize` ~24x and `cudaMemcpyAsync` ~37x worse: with the NCCL
-symmetric-memory pool the reused buffer stays registered across microbatches,
-so the next backward's `copy_` write forces a device sync. **Reverted** — a
-fresh buffer per backward preserves the allocate-on-reduce-scatter-stream +
-release invariant that avoids allocator/symm-mem serialization.
+Replace the per-parameter `.copy_()` loop with `torch._foreach_copy_()` over
+batched destination/source lists — one kernel launch instead of
+`O(params)` launches, with `parameter.grad = None` still applied per
+parameter after the fused copy.
 
-**2b. (tested — regression) Fuse the wgrad write into the partial buffer.**
-Implemented the TE gradient-accumulation-fusion path for M-FSDP v2: attached
-`get_main_grad()` + `__fsdp_param__` + `main_grad` to each unsharded
-parameter so TE's `layers.py` writes the wgrad GEMM output directly into the
-reduce-scatter input buffer, and skipped the `copy_` in
-`copy_gradients_to_partial_buffer` via `grad_added_to_main_grad`.
+### Step 3 (PR #122): Cache DBuffer local-tensor views
 
-**A/B result on Lyris GB200 (24xGB200, MBS=2, mock data, nsys):**
+**Where**: `DBuffer.get_local_tensor` (dbuffer.py).
 
-| Metric | Baseline (no fusion) | Wgrad fusion | Delta |
-|---|---|---|---|
-| Throughput | 456 TFLOP/s/GPU | ~79 TFLOP/s/GPU | **5.8x worse** |
-| cudaEventSynchronize | 1288 ms | 17319 ms | **13.4x worse** |
-| KernelLaunch CPU | 353 ms | 5828 ms | 16.5x worse |
-| MemsetAsync | 28 ms | 317 ms | 11x worse |
+Cache the `narrow(...).view(...)` result keyed by tensor index; the cache is
+cleared on `_resize_storage` (release/reallocate), since cached views alias
+the resized storage. Empty shards are not cached, so indices never share
+the same (empty) tensor object.
 
-**Why it regressed**: the fused wgrad writes into a *Partial* reduce-scatter
-input buffer allocated **lazily during the layer backward on the current
-stream**. The cross-stream handoff (buffer allocated on current stream, RS on
-the reduce-scatter stream) plus TE's `te_general_gemm(out=...)` into the
-fp32 partial view forces a `cudaEventSynchronize` per parameter per backward
-(13x worse). The buffer is also zeroed per backward (MemsetAsync 11x).
+### Step 4 (PR #122): NVTX ranges for MFSDP v2 comm
 
-**The fix that did NOT work here (unlike PR #5032's v2 path)**:
-PR #5032 writes into a *Replicate* main-grad buffer that is **pre-allocated
-per backward with stable storage**, not a lazily-allocated Partial buffer.
-Retrying 2b requires:
-  1. Pre-allocate the fused-wgrad target **before** the layer's backward
-     (not lazily inside `get_main_grad`), with storage bound to one stream.
-  2. Use a Replicate (or same-stream) placement so TE's `out=` write does
-     not cross streams.
-  3. Keep the buffer dtype equal to the wgrad dtype (bf16), not fp32.
+**Where**: `FsdpModule` (module.py).
 
-**Status**: reverted. PR #121 keeps only the gradient-DTensor cache (the
-`_FromTorchTensor` elimination), which is a clean win with no regression.
+Add `MFSDP <name> allgather` and `MFSDP <name> reduce_grad` nvtx ranges so
+M-FSDP v2 communication is visible in nsys traces, and the CPU overhead of
+each phase can be measured directly.
 
-### Step 3: Validate
+### Step 5: Validate
 
 - Unit test: `test_fully_shard.py` — assert DTensor identity is stable
   across microbatches (`grad is grad` for the same sharded parameter),
   and that losses still match the baseline.
 - nsys re-profile: measure CPU time under `MFSDP <root> backward`;
-  target: `_FromTorchTensor` → 0 in the hot path, `copy_` count halved.
+  target: `_FromTorchTensor` → 0 in the hot path, `copy_` count → 1
+  (fused foreach).
 
 ## 4. Risks / constraints
 
@@ -135,10 +114,12 @@ Retrying 2b requires:
   `redistribute` (HSDP outer reduction) or dtype change. The cache must
   key on `(dtype, numel, placements)` and be invalidated on
   `_main_grad` replacement.
-- **partial buffer reuse**: `allocate_partial_grad_buffer` is currently
-  called inside `with torch.cuda.stream(reduce_scatter_stream)` — reusing
-  the buffer across microbatches must preserve the stream-ordering
-  guarantees (the wait_stream edges in `_reduce_gradient_groups`).
+- **DBuffer view cache validity**: cached views alias `local_buffer`
+  storage, so `_resize_storage` must clear the cache; `from_local_buffer`
+  (rebuild) must reset it too.
+- **foreach copy shape matching**: `torch._foreach_copy_` requires
+  destination/source shapes to match; empty-shard parameters are handled by
+  skipping cached empty views.
 - **MXFP8 groups**: `Fp8ParameterGroup` shares the base class grad path;
   DTensor caching applies to both.
 - **delayed wgrad (`delay_wgrad_compute`)**: the post-accumulate hook
@@ -149,5 +130,6 @@ Retrying 2b requires:
 | Metric | Before | After |
 |---|---|---|
 | `_FromTorchTensor` per backward | O(params) | O(1) (cached) |
-| `copy_` per backward | O(params) | unchanged (fusion reverted — see 2b) |
-| CPU time under `MFSDP <root> backward` | ~10 ms | target < 3 ms (DTensor cache) |
+| `copy_` per backward | O(params) | 1 (fused foreach) |
+| `get_local_tensor` per backward | O(params) narrow/view | O(1) (cached views) |
+| CPU time under `MFSDP <root> backward` | ~10 ms | target < 3 ms |
