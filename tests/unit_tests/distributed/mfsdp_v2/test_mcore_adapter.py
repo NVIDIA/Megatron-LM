@@ -415,8 +415,8 @@ class TestMcoreAdapterExpertParallel:
         torch.distributed.destroy_process_group(self.reference_group)
         Utils.destroy_model_parallel()
 
-    def test_build_train_and_step(self):
-        """Shard experts over expert-DP and dense parameters over full DP."""
+    def test_build_train_step_and_clip(self):
+        """Shard experts over expert-DP and clip their combined gradients."""
         # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
         # initialization instead uses the globally configured EP=2 rank in its RNG seed.
         config = TransformerConfig(
@@ -491,7 +491,7 @@ class TestMcoreAdapterExpertParallel:
         assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
 
         optimizer_config = OptimizerConfig(
-            lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=0.0
+            lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
         )
         reference_optimizer = get_megatron_optimizer(
             optimizer_config, [reference_model], use_gloo_process_groups=False
@@ -521,8 +521,11 @@ class TestMcoreAdapterExpertParallel:
                 targets,
             )
             reference_loss.backward()
-            reference_success, _, _ = reference_optimizer.step()
+            reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
             assert reference_success
+            assert reference_pre_clip_norm > optimizer_config.clip_grad, (
+                "Reference gradients must exceed the clipping threshold to exercise clipping."
+            )
             reference_losses.append(reference_loss.detach())
 
         losses = []
