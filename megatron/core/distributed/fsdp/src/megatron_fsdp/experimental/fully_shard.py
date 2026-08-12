@@ -32,27 +32,57 @@ _FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
 
 @contextmanager
 def fully_shard_context(
-    device: torch.device | None = None, *, use_symmetric_memory: bool = False
+    device: torch.device | None = None,
+    *,
+    reuse_existing: bool = False,
+    use_trace_replay: bool = False,
+    use_symmetric_memory: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
     Independent roots are ordered by their root-level ``fully_shard`` calls.
     Construction must finish before any of the registered modules run forward.
 
+    When ``reuse_existing`` is set and a context is already active on the same
+    device, that context is yielded instead of creating a new one. This lets
+    callers that open a context internally (e.g. per-model-chunk adapters)
+    join an outer construction scope, so every module in a multi-chunk model
+    (VPP) shares one set of streams and one cross-root prefetch order. The
+    context is finalized only by the outermost scope.
+
     Args:
         device: CUDA device on which to create communication streams. Defaults to
             the current CUDA device.
+        reuse_existing: Join an already-active context on ``device`` instead of
+            creating a new one. Defaults to False, which rejects nesting.
+        use_trace_replay: Enable trace-and-replay prefetch, which records the
+            actual fine-grained consume order during the first global batch
+            and replays it from the second batch. Required for complex
+            schedules (VPP + combined 1F1B) whose execution does not follow
+            the static forward/backward orders. Defaults to False (normal
+            forward/backward execution with static-order prefetch and
+            activation-recompute support).
         use_symmetric_memory: Allocate communication staging buffers from PyTorch's
             NCCL symmetric-memory pool.
     """
-    if _FSDP_CONTEXT.get() is not None:
+    existing = _FSDP_CONTEXT.get()
+    if existing is not None:
+        if reuse_existing and existing.device == (
+            device or torch.device("cuda", torch.cuda.current_device())
+        ):
+            yield existing
+            return
         raise RuntimeError("fully_shard_context does not support nesting.")
 
     device = device or torch.device("cuda", torch.cuda.current_device())
     if device.type != "cuda":
         raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
 
-    context = FsdpContext(device=device, use_symmetric_memory=use_symmetric_memory)
+    context = FsdpContext(
+        device=device,
+        use_trace_replay=use_trace_replay,
+        use_symmetric_memory=use_symmetric_memory,
+    )
     token = _FSDP_CONTEXT.set(context)
     try:
         yield context
@@ -69,6 +99,8 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
+    fine_grained: bool = False,
+    skip_backward_callback: bool = False,
     grad_divisor: int = 1,
 ) -> None:
     """Apply FSDP to a module in place.
@@ -82,6 +114,11 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
+        fine_grained: Register pre-forward and pre-backward hooks on every sub-module
+            so the 1F1B EP overlap schedule can call sub-modules directly.
+        skip_backward_callback: Skip per-param post_accumulate_grad_hook. Required
+            when ``delay_wgrad_compute=True`` so gradient reduction waits for
+            ``backward_dw()`` to complete.
         grad_divisor: Additional divisor applied to the reduced gradient, on top of the
             averaging the mesh already performs. Defaults to 1, which is correct whenever
             each mesh rank contributes exactly one term to the gradient.
@@ -118,6 +155,8 @@ def fully_shard(
             mesh=mesh,
             placements=placements,
             mixed_precision_policy=mixed_precision_policy,
+            fine_grained=fine_grained,
+            skip_backward_callback=skip_backward_callback,
             grad_divisor=grad_divisor,
             use_symmetric_memory=context.use_symmetric_memory,
         )
