@@ -468,6 +468,11 @@ class TestGatedDeltaNet:
             gdn(hidden_states, None)
 
     def test_deterministic_mode(self):
+        if self.cp_size > 1:
+            pytest.skip(
+                "deterministic_mode uses torch_chunk_gated_delta_rule, which does not support CP."
+            )
+
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
         pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
