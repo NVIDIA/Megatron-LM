@@ -66,9 +66,7 @@ try:
     from transformer_engine.pytorch.distributed import (
         _NVFP4AllGatherAsyncHandle,
         gather_along_first_dim,
-        # Not FP8-only despite the name: TE sets the underlying flag unconditionally, so this is
-        # True under BF16 recompute too. (The FP8-gated one is is_fp8_activation_recompute_enabled.)
-        in_fp8_activation_recompute_phase as in_activation_recompute_phase,
+        in_fp8_activation_recompute_phase,
         reduce_scatter_along_first_dim,
     )
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
@@ -93,13 +91,17 @@ except (ImportError, ModuleNotFoundError):
     MXFP8_BLOCK_SCALING_SIZE = NVFP4_BLOCK_SCALING_SIZE = None
     _NVFP4AllGatherAsyncHandle = MagicMock()
     gather_along_first_dim = reduce_scatter_along_first_dim = MagicMock()
-    in_activation_recompute_phase = MagicMock()
+    in_fp8_activation_recompute_phase = MagicMock()
     get_dummy_wgrad = MagicMock()
     QuantizedTensor = MagicMock()
     MXFP8TensorStorage = NVFP4TensorStorage = MagicMock()
     MXFP8Quantizer = MagicMock()
     nvtx_range_pop = nvtx_range_push = round_up_to_nearest_multiple = MagicMock()
     HAVE_TE = False
+
+# TE's name says fp8, but the flag it returns is set for BF16 activation recompute too (the
+# FP8-gated helper is `is_fp8_activation_recompute_enabled`). Alias it so call sites read right.
+in_activation_recompute_phase = in_fp8_activation_recompute_phase
 
 
 class GTPChain(str, Enum):
