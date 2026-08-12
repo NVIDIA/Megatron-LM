@@ -4,6 +4,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).parents[3] / ".github" / "scripts" / "trigger_workflow_and_wait.py"
 SPEC = importlib.util.spec_from_file_location("trigger_workflow_and_wait", SCRIPT)
 assert SPEC is not None
@@ -67,3 +69,8 @@ def test_poll_workflow_returns_incomplete_at_token_rotation_boundary():
         clock=lambda: next(times),
         sleep=lambda _: None,
     ) == (False, None)
+
+
+def test_validate_workflow_result_rejects_incomplete_run():
+    with pytest.raises(TimeoutError, match="run 123"):
+        MODULE.validate_workflow_result(False, None, 123)

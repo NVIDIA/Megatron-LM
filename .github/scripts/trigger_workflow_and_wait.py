@@ -146,6 +146,14 @@ def poll_workflow(
         sleep(min(wait_interval, remaining))
 
 
+def validate_workflow_result(completed: bool, conclusion: str | None, run_id: int) -> None:
+    """Fail unless the downstream workflow completed successfully."""
+    if not completed:
+        raise TimeoutError(f"Timed out waiting for downstream workflow run {run_id} to complete")
+    if conclusion != "success":
+        raise RuntimeError(f"Downstream workflow concluded with {conclusion}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--owner", required=True)
@@ -195,8 +203,7 @@ def main() -> None:
     append_output("completed", str(completed).lower())
     if conclusion is not None:
         append_output("conclusion", conclusion)
-    if completed and conclusion != "success":
-        raise RuntimeError(f"Downstream workflow concluded with {conclusion}")
+    validate_workflow_result(completed, conclusion, args.run_id)
 
 
 if __name__ == "__main__":
