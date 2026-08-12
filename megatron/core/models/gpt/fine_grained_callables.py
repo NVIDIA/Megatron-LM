@@ -10,7 +10,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.utils import ScheduleNode
+from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
@@ -166,6 +166,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
+
+        if enable_ncclep and layer.config.moe_ncclep_zero_copy:
+            # Insert an identity node as the sole consumer of the dispatch output, so the
+            # dispatch-backward gets the symm buffer instead of a non-symm AccumulateGrad clone.
+            # Must stay inside this node's graph segment (before the next node detaches it).
+            dispatched_tokens = StageDispatchBwdGrad.apply(dispatched_tokens, token_dispatcher)
 
         # `dispatched_probs` is needed by backward pass of swiglu, therefore it's
         # passed to moe_forward within `layer_state` to avoid the free_input process

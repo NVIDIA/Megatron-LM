@@ -83,9 +83,18 @@ def get_moe_module_spec_for_backend(
     # shared experts spec
     shared_experts = partial(_build_shared_experts, submodules=mlp)
 
+    # The inference-optimized backend needs InferenceTopKRouter (compact [tokens, topk]
+    # index routing); other backends keep the MoESubmodules default (training TopKRouter,
+    # dense [tokens, num_experts] map). Mirrors get_inference_optimized_moe_spec().
+    router = InferenceTopKRouter if isinstance(backend, InferenceSpecProvider) else None
+    submodule_kwargs = {"router": router} if router is not None else {}
+
     # MoE module spec
     return partial(
-        MoELayer, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
+        MoELayer,
+        submodules=MoESubmodules(
+            experts=experts, shared_experts=shared_experts, **submodule_kwargs
+        ),
     )
 
 

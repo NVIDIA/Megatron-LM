@@ -90,6 +90,9 @@ class DistributedDataParallelConfig:
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
 
+    megatron_fsdp_version: int = 1
+    """Megatron-FSDP implementation version. Valid values are 1 and 2."""
+
     use_custom_fsdp: bool = False
     """
     NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -250,6 +253,9 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.megatron_fsdp_version not in (1, 2):
+            raise ValueError("megatron_fsdp_version must be either 1 or 2")
+
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 

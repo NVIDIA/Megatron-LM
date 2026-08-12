@@ -43,7 +43,7 @@ def _mock_llm_reporting(monkeypatch):
 
 @pytest.fixture
 def notify_module(monkeypatch):
-    pytest.importorskip("nemo_ci_triage.slack_notification")
+    pytest.importorskip("cerno.slack_notification")
     monkeypatch.setenv("GITLAB_ENDPOINT", "ci.example.com")
     from tests.test_utils.python_scripts import notify
 
@@ -119,6 +119,31 @@ def test_error_extraction_is_opt_in_for_generated_jobs(
         assert job["artifacts"]["paths"] == ["results/"]
 
 
+def test_cerno_hard_cutover_contract():
+    pipeline = yaml.safe_load(Path(".gitlab-ci.yml").read_text())
+    triage = Path(".gitlab/stages/06.triage.yml").read_text()
+    dockerfile = Path("docker/Dockerfile.linting").read_text()
+    build_script = Path(".gitlab/scripts/build.sh").read_text()
+
+    assert pipeline["variables"]["CERNO_CONFIG"] == ".gitlab/cerno.yml"
+    assert triage.count("cerno-linear") == 3
+    assert triage.count("cerno-notify") == 2
+    assert triage.count('--config "${CERNO_CONFIG}"') == 3
+    assert '"cerno @ git+${CI_SERVER_URL}/dl/nemo/cerno.git@${CERNO_COMMIT}"' in dockerfile
+    assert "id=CERNO_TOKEN" in dockerfile
+    assert "/run/secrets/CERNO_TOKEN" in dockerfile
+    assert "--secret id=CERNO_TOKEN,env=PAT" in build_script
+
+
+def test_linear_write_assigns_new_issues_to_scheduled_oncall():
+    triage = yaml.safe_load(Path(".gitlab/stages/06.triage.yml").read_text())
+    script = "\n".join(triage["triage:linear_write"]["script"])
+
+    assert "resolve_oncall_assignee.py" in script
+    assert "--schedule-file .github/oncall_schedule.json" in script
+    assert '--assignee "${ONCALL_ASSIGNEE}"' in script
+
+
 def test_notification_rules_use_expected_pipeline_sources():
     unit = yaml.safe_load(Path(".gitlab/stages/02.test.yml").read_text())
     functional = yaml.safe_load(Path(".gitlab/stages/04.functional-tests.yml").read_text())
@@ -157,60 +182,16 @@ def test_all_generated_test_types_enable_error_extraction():
     assert functional.count('"--enable-error-extraction"') >= 2
 
 
-@pytest.mark.parametrize(("test_type", "expected_alerts"), [("regular", 0), ("release", 1)])
-def test_retry_exhaustion_per_test_alert_is_release_only(
-    monkeypatch, tmp_path, test_type, expected_alerts
-):
-    pytest.importorskip("jetclient")
-    from tests.test_utils.python_scripts import launch_jet_workload
+def test_functional_notifications_are_parent_aggregate_only():
+    launcher = Path("tests/test_utils/python_scripts/launch_jet_workload.py").read_text()
+    functional = yaml.safe_load(Path(".gitlab/stages/04.functional-tests.yml").read_text())
+    notify_script = "\n".join(functional["functional:x_notify"]["script"])
 
-    base_path = tmp_path / "tests" / "test_utils" / "python_scripts"
-    model_config = (
-        tmp_path
-        / "tests"
-        / "functional_tests"
-        / "test_cases"
-        / "model"
-        / "case"
-        / "model_config.yaml"
-    )
-    base_path.mkdir(parents=True)
-    model_config.parent.mkdir(parents=True)
-    model_config.write_text(f"TEST_TYPE: {test_type}\n")
-
-    job = Mock()
-    job.name = "basic-job"
-    pipeline = Mock()
-    pipeline.get_jobs.return_value = [job]
-    launch = Mock(return_value=pipeline)
-    alert = Mock()
-    telemetry = Mock()
-    monkeypatch.setattr(launch_jet_workload, "BASE_PATH", base_path)
-    monkeypatch.setattr(launch_jet_workload, "launch_and_wait_for_completion", launch)
-    monkeypatch.setattr(launch_jet_workload, "download_job_assets", Mock(return_value=None))
-    monkeypatch.setattr(launch_jet_workload, "send_slack_alert", alert)
-    monkeypatch.setattr(launch_jet_workload, "telemetrics_and_exit", telemetry)
-
-    launch_jet_workload.main.callback(
-        model="model",
-        test_case="case",
-        environment="dev",
-        n_repeat=1,
-        time_limit=1,
-        scope="mr",
-        account="mcore",
-        partition=None,
-        cluster="cluster",
-        platform="platform",
-        container_tag="tag",
-        record_checkpoints="false",
-        run_name="run",
-        wandb_experiment="experiment",
-    )
-
-    assert launch.call_count == 9
-    assert alert.call_count == expected_alerts
-    telemetry.assert_called_once()
+    assert "send_slack_alert" not in launcher
+    assert "notify.py" not in launcher
+    assert notify_script.count("python tests/test_utils/python_scripts/notify.py") == 1
+    assert "--check-for functional-tests" in notify_script
+    assert "--pipeline-context $CONTEXT" in notify_script
 
 
 def test_get_pipeline_jobs_uses_triage_collector(monkeypatch, notify_module):
@@ -410,9 +391,9 @@ def test_failed_job_without_report_still_creates_a_safe_bucket(monkeypatch):
 
 
 def test_triage_config_selects_megatron_and_enables_write_actions():
-    linear_status = pytest.importorskip("nemo_ci_triage.linear.linear_status")
-    linear_write = pytest.importorskip("nemo_ci_triage.linear.linear_write")
-    config = Path(".gitlab/nemo-ci-triage.yml")
+    linear_status = pytest.importorskip("cerno.linear.linear_status")
+    linear_write = pytest.importorskip("cerno.linear.linear_write")
+    config = Path(".gitlab/cerno.yml")
 
     assert linear_status.modules_for_regex("^megatron-lm$", config) == [
         (
@@ -452,7 +433,8 @@ def test_slack_followup_uses_upstream_detailed_and_execution_summaries():
     assert 'if [[ -z "${THREAD_TIMESTAMP}" ]]' in script
 
 
-def test_notification_delegates_to_triage_package(monkeypatch, notify_module):
+@pytest.mark.parametrize("pipeline_context", ["mr", "nightly", "weekly", "release"])
+def test_notification_delegates_to_cerno(monkeypatch, notify_module, pipeline_context):
     notify = notify_module
     project = Mock()
     pipeline_jobs = [("functional:run_dev_dgx_h100", 101, [{"status": "failed"}])]
@@ -475,7 +457,7 @@ def test_notification_delegates_to_triage_package(monkeypatch, notify_module):
             "--check-for",
             "functional-tests",
             "--pipeline-context",
-            "mr",
+            pipeline_context,
             "--pipeline-created-at",
             "2026-07-12T00:00:00Z",
         ],
@@ -484,13 +466,13 @@ def test_notification_delegates_to_triage_package(monkeypatch, notify_module):
     assert result.exit_code == 0, result.output
     sender.assert_called_once_with(
         "megatron-lm",
-        "mr",
+        pipeline_context,
         pipeline_jobs,
         None,
         webhook_url="https://slack.invalid/webhook",
         slack_bot_token=None,
         slack_channel_id=None,
-        config=notify.TRIAGE_CONFIG,
+        config=notify.CERNO_CONFIG,
     )
     collector.assert_called_once_with(123, notify.JOB_PREFIXES["functional-tests"], project=project)
 
@@ -574,7 +556,7 @@ def test_notification_records_bot_thread_context(monkeypatch, tmp_path, notify_m
         webhook_url=None,
         slack_bot_token="xoxb-test",
         slack_channel_id="C0123456789",
-        config=notify.TRIAGE_CONFIG,
+        config=notify.CERNO_CONFIG,
     )
     assert json.loads(slack_output.read_text()) == {
         "channel_id": "C0123456789",

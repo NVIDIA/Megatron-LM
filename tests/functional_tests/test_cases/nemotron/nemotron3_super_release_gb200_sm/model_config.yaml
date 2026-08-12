@@ -1,11 +1,18 @@
 ENV_VARS:
-  NVTE_FWD_LAYERNORM_SM_MARGIN: 16
-  NVTE_BWD_LAYERNORM_SM_MARGIN: 16
+  CUDA_DEVICE_MAX_CONNECTIONS: 32
+  NCCL_GRAPH_REGISTER: 0
+  NCCL_NVLS_ENABLE: 0
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCH_NCCL_AVOID_RECORD_STREAMS: 1
+  TORCH_NCCL_HIGH_PRIORITY: 1
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 64
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: 128
+  NVLINK_DOMAIN_SIZE: 72
+  USE_MNNVL: 1
+  NVTE_BWD_LAYERNORM_SM_MARGIN: 20
+  NVTE_FWD_LAYERNORM_SM_MARGIN: 20
   TORCHINDUCTOR_WORKER_START: fork
   QUANTIZATION_TYPE_DEBUG: 1
-  # PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 64
-  USE_MNNVL: 1
   NON_DETERMINSTIC_RESULTS: 1
 TEST_TYPE: "release"
 MODEL_ARGS:
@@ -30,12 +37,14 @@ MODEL_ARGS:
   --train-samples: 12207031
   --cross-entropy-loss-fusion: true
   --cross-entropy-fusion-impl: native
-  --attention-backend: flash
-  --enable-cuda-graph: true
-  --cuda-graph-modules: "[mamba attn]"
+  --attention-backend: fused
+  --transformer-impl: transformer_engine
+  --cuda-graph-impl: transformer_engine
+  --cuda-graph-modules: "[attn mamba moe_router moe_preprocess]"
+  --cuda-graph-warmup-steps: 3
   --te-rng-tracker: true
   --manual-gc: true
-  --manual-gc-interval: 10
+  --manual-gc-interval: 100
   --no-create-attention-mask-in-dataloader: true
   --num-workers: 1
   --exit-interval: 4768
@@ -53,7 +62,7 @@ MODEL_ARGS:
   --group-query-attention: true
   --num-query-groups: 2
   --kv-channels: 128
-  --hybrid-override-pattern: MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME
+  --hybrid-layer-pattern: "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME/*E/*E"
   --position-embedding-type: none
   --normalization: RMSNorm
   --untie-embeddings-and-output-weights: true
@@ -81,6 +90,7 @@ MODEL_ARGS:
   --moe-router-dtype: fp32
   --moe-router-load-balancing-type: seq_aux_loss
   --moe-aux-loss-coeff: 1e-4
+  --moe-router-padding-for-quantization: true
   --moe-token-dispatcher-type: flex
   --moe-flex-dispatcher-backend: hybridep
   --moe-hybridep-num-sms: 32
@@ -91,18 +101,19 @@ MODEL_ARGS:
 
   # MTP args
   --mtp-num-layers: 2
-  --mtp-hybrid-override-pattern: \"*E\"
   --calculate-per-token-loss: true
   --mtp-loss-scaling-factor: 0.3
 
   # Mixed precision / quantization args
   --bf16: true
-  --te-precision-config-file: /mnt/artifacts/model/nemotron3_super_release_gb200/te_quant.cfg
+  --grad-reduce-in-bf16: true
   --first-last-layers-bf16: true
   --num-layers-at-start-in-bf16: 0
   --num-layers-at-end-in-bf16: 14
-  --fp4-format: e2m1
-  --fp4-recipe: nvfp4
+  --fp8-format: e4m3
+  --fp8-recipe: mxfp8
+  --fp8-param-gather: true
+  --reuse-grad-buf-for-mxfp8-param-ag: true
 
   # Regularization args
   --attention-dropout: 0.0
@@ -128,9 +139,8 @@ MODEL_ARGS:
   --ckpt-fully-parallel-save: true
   --ckpt-fully-parallel-load: true
   --ckpt-assume-constant-structure: true
-  --async-save: true
-  --use-persistent-ckpt-worker: true
-  --save-interval: 100
+  --dist-ckpt-strictness: log_all
+  --save-interval: 200
   --save-retain-interval: 2000
 
   # Validation args
@@ -160,3 +170,4 @@ METRICS:
   - "lm loss"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
+LAUNCHER: ft_launcher

@@ -73,6 +73,7 @@ _fa_version = None
 _flashinfer_version = None
 _mamba_ssm_version = None
 _causal_conv1d_version = None
+_emerging_optimizers_version = None
 
 
 _Wrapped = TypeVar('_Wrapped', bound=Callable)
@@ -487,6 +488,39 @@ def is_flashinfer_min_version(version, check_equality=True):
     return flashinfer_version > PkgVersion(version)
 
 
+def get_emerging_optimizers_version():
+    """Get emerging_optimizers version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_emerging_optimizers_version_str():
+        import emerging_optimizers
+
+        if hasattr(emerging_optimizers, "__version__"):
+            return str(emerging_optimizers.__version__)
+        else:
+            # The distribution name is hyphenated even though the module is not.
+            return version("emerging-optimizers")
+
+    global _emerging_optimizers_version
+    if _emerging_optimizers_version is None:
+        _emerging_optimizers_version = PkgVersion(get_emerging_optimizers_version_str())
+    return _emerging_optimizers_version
+
+
+def is_emerging_optimizers_min_version(version, check_equality=True):
+    """Check if minimum version of `emerging_optimizers` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_emerging_optimizers_version() >= PkgVersion(version)
+    return get_emerging_optimizers_version() > PkgVersion(version)
+
+
 _VALID_DSA_KERNEL_BACKENDS = ("none", "tilelang", "cudnn")
 
 
@@ -859,6 +893,8 @@ def mup_scaled_init_method_normal(sigma, num_layers, width_mult, multiplier=2.0)
 
 def log_on_each_pipeline_stage(
     logger: logging.Logger,
+    level: int,
+    msg: object,
     *args: Any,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -869,23 +905,32 @@ def log_on_each_pipeline_stage(
     Args:
         logger (logging.Logger): The logger to write the logs
 
-        args (Tuple[Any]): All logging.Logger.log positional arguments
+        level (int): Logging level for the message.
+
+        msg (object): Message format string.
+
+        args (Tuple[Any]): Message format arguments.
 
         kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
     """
     assert torch.distributed.is_initialized()
 
+    if (tp_group is None) != (dp_cp_group is None):
+        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
+
+    if not logger.isEnabledFor(level):
+        return
+
     if tp_group is None and dp_cp_group is None:
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    elif tp_group is not None and dp_cp_group is not None:
+    else:
+        assert tp_group is not None and dp_cp_group is not None
         tp_rank = tp_group.rank()
         dp_cp_rank = dp_cp_group.rank()
-    else:
-        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
 
     if tp_rank == 0 and dp_cp_rank == 0:
-        logger.log(*args, **kwargs)
+        logger.log(level, msg, *args, **kwargs)
 
 
 def check_param_hashes_across_dp_replicas(
@@ -2820,11 +2865,18 @@ def unwrap_model(model, module_instances=None):
         from megatron.core.distributed import DistributedDataParallel as DDP
         from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
         from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-            FullyShardedDataParallel as megatron_FSDP,
+            FullyShardedDataParallelV1,
+            FullyShardedDataParallelV2,
         )
         from megatron.core.transformer.module import Float16Module
 
-        module_instances = (DDP, torch_FSDP, megatron_FSDP, Float16Module)
+        module_instances = (
+            DDP,
+            torch_FSDP,
+            FullyShardedDataParallelV1,
+            FullyShardedDataParallelV2,
+            Float16Module,
+        )
 
     return_list = True
     if not isinstance(model, list):

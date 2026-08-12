@@ -168,27 +168,55 @@ def test_dynamic_inference_request_tracked_metadata_defaults_termination_id():
 def test_dynamic_inference_request_record_checkpoint_and_merge():
     """RequestRecord.checkpoint() rolls the current request forward — prompt
     becomes prompt+generated, num_tokens_to_generate is debited, and the
-    add_engine event is inherited (or created) so downstream tooling can find
-    it. RequestRecord.merge() collapses the chain back into a single request
-    with concatenated tokens, text, routing_indices, and the record's latency.
-    Both are non-trivial state machines."""
-    sp = SamplingParams(num_tokens_to_generate=5, termination_id=0)
+    prefix-cache configuration is inherited while hashes are recomputed for the
+    expanded prompt. The add_engine event is inherited (or created) so
+    downstream tooling can find it. RequestRecord.merge() collapses the chain
+    back into a single request with concatenated tokens, text, routing_indices,
+    and the record's latency. Both are non-trivial state machines."""
+    sp = SamplingParams(num_tokens_to_generate=8, termination_id=0)
 
-    # checkpoint() inherits event_add_engine when present.
+    # checkpoint() inherits prefix-cache configuration and event_add_engine.
     req = DynamicInferenceRequest(
         request_id=1,
-        prompt_tokens=torch.tensor([1, 2, 3]),
+        prompt_tokens=torch.tensor([1, 2, 3, 4, 5, 6]),
         sampling_params=sp,
-        generated_tokens=[10, 11],
+        generated_tokens=[7, 8],
+        block_size_tokens=4,
+        enable_prefix_caching=True,
     )
+    original_hashes = req.precomputed_block_hashes
     original_event = req.add_event_add_engine()
     record = DynamicInferenceRequestRecord.from_request(req)
     record.checkpoint()
     assert len(record.requests) == 2
     new_req = record.requests[-1]
-    assert new_req.prompt_tokens.tolist() == [1, 2, 3, 10, 11]
-    assert new_req.sampling_params.num_tokens_to_generate == 3
+    assert new_req.prompt_tokens.tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert new_req.sampling_params.num_tokens_to_generate == 6
+    assert new_req.block_size_tokens == 4
+    assert new_req.enable_prefix_caching
+    assert new_req.precomputed_block_hashes == compute_block_hashes_batched(
+        new_req.prompt_tokens, new_req.block_size_tokens
+    )
+    assert new_req.precomputed_block_hashes is not original_hashes
+    assert len(new_req.precomputed_block_hashes) == 2
     assert new_req.event_add_engine is original_event
+
+    # A second checkpoint must keep the sticky configuration and extend the hash chain again.
+    new_req.generated_tokens = [9, 10, 11, 12]
+    previous_hashes = new_req.precomputed_block_hashes
+    record.checkpoint()
+    assert len(record.requests) == 3
+    second_new_req = record.requests[-1]
+    assert second_new_req.prompt_tokens.tolist() == list(range(1, 13))
+    assert second_new_req.sampling_params.num_tokens_to_generate == 2
+    assert second_new_req.block_size_tokens == 4
+    assert second_new_req.enable_prefix_caching
+    assert second_new_req.precomputed_block_hashes == compute_block_hashes_batched(
+        second_new_req.prompt_tokens, second_new_req.block_size_tokens
+    )
+    assert second_new_req.precomputed_block_hashes is not previous_hashes
+    assert len(second_new_req.precomputed_block_hashes) == 3
+    assert second_new_req.event_add_engine is original_event
 
     # checkpoint() creates a new event_add_engine when the previous request had none.
     req2 = DynamicInferenceRequest(

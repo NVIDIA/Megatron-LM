@@ -1,4 +1,4 @@
-# Megatron-LM configuration for nemo-ci-triage.
+# Megatron-LM configuration for Cerno.
 
 gitlab:
   project_id: 19378

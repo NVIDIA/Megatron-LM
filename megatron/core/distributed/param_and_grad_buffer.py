@@ -28,7 +28,7 @@ from ..fp4_utils import (
     modify_nvfp4_rowwise_storage,
 )
 from ..fp8_utils import (
-    copy_tensor_to_quantized_param,
+    copy_tensors_to_quantized_params,
     is_float8tensor,
     is_grouped_mxfp8tensor,
     is_grouped_tensor,
@@ -308,6 +308,9 @@ class _ParamAndGradBucketGroup:
                     # buffer to copy back from.
                     continue
                 has_non_quantized_weight = False
+                quantized_params = []
+                param_slices = []
+                flat_param_data = bucket.param_data.view(-1)
                 for param in bucket.params:
                     # Non-quantized weights are already mapped to param.data. Skip
                     # mixed buckets because zeroing bucket.param_data would also
@@ -316,8 +319,11 @@ class _ParamAndGradBucketGroup:
                         has_non_quantized_weight = True
                         break
                     param_start, param_end = bucket.param_to_index[param]
-                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                    copy_tensor_to_quantized_param(param, param_slice)
+                    quantized_params.append(param)
+                    param_slices.append(flat_param_data[param_start:param_end])
+                # Cast the bucket in one call: these casts are small, so the per-param cost of
+                # issuing them is worth avoiding.
+                copy_tensors_to_quantized_params(quantized_params, param_slices)
                 if has_non_quantized_weight:
                     continue
                 # All-gathered params are not needed after being copied to param.data.
@@ -888,8 +894,9 @@ def group_params_for_buffers(
     - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
     - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
     - is_expert_parallel: whether the parameter uses the expert topology (param.allreduce == False),
-      which requires a separate buffer for the expert data-parallel group.  This is true for experts
-      when expert-parallelism > 1 or expert-tensor-parallelism != tensor-parallelism.
+      which requires a separate buffer for the expert data-parallel group. This is true for experts
+      when expert-parallelism > 1, expert-tensor-parallelism != tensor-parallelism, or expert-GTP
+      != GTP.
 
     The param_indices track each parameter's position among same-dtype params (using
     the "fake" high-precision dtype for FP8/NVFP4 params), needed for loading non-native-fp8
@@ -1071,6 +1078,7 @@ class _ParamAndGradBuffer:
             param_layout = _compute_default_per_buffer_param_layout(self.params, bucket_size)
         self.param_index_map = param_layout.param_index_map
         self.bucket_indices = param_layout.bucket_indices
+        self.num_optimizer_shards = param_layout.num_optimizer_shards
         per_bucket_numel_unpadded = param_layout.per_bucket_numel_unpadded
 
         # Check if this buffer contains NVFP4 params.
@@ -1404,28 +1412,27 @@ class _ParamAndGradBuffer:
                 _create_bucket(cur_bucket_id, bucket_params, bucket_params_with_extra_main_grads)
             )
         # Log buckets for all PP stages.
-        log_strs = []
-        log_strs.append(
-            f"Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}"
-        )
-        for index, bucket in enumerate(self.buckets):
-            numel = 0
-            for param in bucket.params_list:
-                numel += param.data.nelement()
+        if (
+            logger.isEnabledFor(logging.INFO)
+            and self.tp_group.rank() == 0
+            and self.dp_cp_group.rank() == 0
+        ):
+            log_strs = []
             log_strs.append(
-                f"Params for bucket {index + 1} ({numel} elements, "
-                f"{bucket.grad_data.nelement()} padded size, "
-                f"{len(bucket.params_with_extra_main_grads)} param(s) with extra main_grads):"
+                f"Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}"
             )
-            for param in bucket.params_list:
-                log_strs.append(f"\t{param_to_name[param]} ({param.main_grad.dtype=})")
-        log_on_each_pipeline_stage(
-            logger,
-            logging.INFO,
-            "\n".join(log_strs),
-            tp_group=self.tp_group,
-            dp_cp_group=self.dp_cp_group,
-        )
+            for index, bucket in enumerate(self.buckets):
+                numel = 0
+                for param in bucket.params_list:
+                    numel += param.data.nelement()
+                log_strs.append(
+                    f"Params for bucket {index + 1} ({numel} elements, "
+                    f"{bucket.grad_data.nelement()} padded size, "
+                    f"{len(bucket.params_with_extra_main_grads)} param(s) with extra main_grads):"
+                )
+                for param in bucket.params_list:
+                    log_strs.append(f"\t{param_to_name[param]} ({param.main_grad.dtype=})")
+            logger.info("\n".join(log_strs))
 
     def _compute_nvfp4_packed_layout(self, params_with_names):
         """Derive packed NVFP4 index map and bucket indices from the primary layout.
