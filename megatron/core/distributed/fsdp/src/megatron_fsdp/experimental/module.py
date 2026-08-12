@@ -440,12 +440,17 @@ class FsdpModule:
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state.
 
-        Any submodule FsdpModule still in the BACKWARD phase (e.g. the 1F1B
-        schedule skipped its per-module release) is finalized first.
+        No-op unless this module is in the BACKWARD phase (idempotent). Any
+        submodule FsdpModule still in the BACKWARD phase (e.g. the 1F1B schedule
+        skipped its per-module release) is finalized first.
         """
+        if self.phase is not FsdpModule.Phase.BACKWARD:
+            return
         # The 1F1B schedule may skip a per-module release; finalize any submodule
-        # still in the BACKWARD phase.
+        # still in the BACKWARD phase (excluding this module itself).
         for module in reversed(list(cast(nn.Module, self).modules())):
+            if module is self:
+                continue
             if isinstance(module, FsdpModule) and module.phase is FsdpModule.Phase.BACKWARD:
                 module.post_backward()
         self._reduce_gradient_groups()
@@ -617,12 +622,15 @@ def _register_fine_grained_backward_hooks(fsdp_module: FsdpModule) -> None:
 def _fine_grained_pre_backward_hook(submodule: nn.Module, grad_output) -> None:
     """Pre-backward hook for fine-grained sub-modules.
 
-    Unshards the parent ``FsdpModule`` before the sub-module's backward runs
-    so its weight-gradient computation sees full parameters.
+    Marks the parent ``FsdpModule`` BACKWARD and unshards it before the
+    sub-module's backward runs, so its weight-gradient computation sees full
+    parameters.
     """
     target = _find_fsdp_target(submodule)
     if target is None:
         return
+    if target.phase is FsdpModule.Phase.RESTING:
+        target.phase = FsdpModule.Phase.BACKWARD
     target._unshard_parameter_groups()
     if target._unshard_event is not None:
         target.context.current_stream().wait_event(target._unshard_event)

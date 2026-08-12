@@ -127,11 +127,13 @@ The `FullyShardedDataParallelV2` adapter binds both through a single
 
 **File:** `combined_1f1b.py` → `FsdpModule.post_backward()`
 
-Called once after each overlapped run completes. MFSDP v2:
+Called once after each overlapped run completes. `post_backward()` is a
+**no-op unless this module is in the BACKWARD phase** (idempotent — the
+schedule may call it on a module already released). MFSDP v2:
 
-- walks the module subtree and finalizes (reduce + reshard) any submodule
-  `FsdpModule` that is **still in the BACKWARD phase** — i.e. the 1F1B
-  schedule skipped its per-module release,
+- walks the module subtree (excluding itself) and finalizes (reduce +
+  reshard) any submodule `FsdpModule` that is **still in the BACKWARD
+  phase** — i.e. the 1F1B schedule skipped its per-module release,
 - then reduces and reshards this module itself and returns it to `RESTING`.
 
 The v2 adapter binds `self.post_backward = self.module.post_backward` (no
@@ -192,15 +194,17 @@ def _fine_grained_pre_forward(hook_module, args, kwargs):
 
 ### 2.2 Pre-backward hooks on sub-modules
 
-A `register_full_backward_pre_hook` on each sub-module unshards the parent
-`FsdpModule` before that sub-module's own backward runs, so its
-weight-gradient computation sees full parameters:
+A `register_full_backward_pre_hook` on each sub-module marks the parent
+`FsdpModule` BACKWARD and unshards it before that sub-module's own backward
+runs, so its weight-gradient computation sees full parameters:
 
 ```python
 def _fine_grained_pre_backward_hook(submodule: nn.Module, grad_output) -> None:
     target = _find_fsdp_target(submodule)
     if target is None:
         return
+    if target.phase is FsdpModule.Phase.RESTING:
+        target.phase = FsdpModule.Phase.BACKWARD
     target._unshard_parameter_groups()
     if target._unshard_event is not None:
         target.context.current_stream().wait_event(target._unshard_event)
@@ -264,7 +268,7 @@ path, where the schedule drives reduction explicitly).
 | Method | Signature | Description |
 |---|---|---|
 | `pre_backward()` | `() -> None` | Root backward-phase setup (unshard for backward). |
-| `post_backward()` | `() -> None` | Finalize backward: reduce+reshard this module, and any submodule `FsdpModule` still in the BACKWARD phase. |
+| `post_backward()` | `() -> None` | Finalize backward: no-op unless BACKWARD phase; reduce+reshard this module, and any submodule `FsdpModule` still in the BACKWARD phase. |
 
 ### New parameters on `fully_shard()`
 
