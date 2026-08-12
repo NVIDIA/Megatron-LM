@@ -62,7 +62,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          token: ${{ steps.branch-token.outputs.token }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Get PR info
         id: get-pr-info
@@ -93,7 +93,7 @@ jobs:
       - name: Set maintainer status
         id: check-membership
         env:
-          GITHUB_TOKEN: ${{ steps.branch-token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           NVIDIA_NEMO_MEMBERS_TOKEN: ${{ steps.nvidia-nemo-members-token.outputs.token }}
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
@@ -209,7 +209,7 @@ jobs:
         id: configure
         shell: bash -x -e -u -o pipefail {0}
         env:
-          GH_TOKEN: ${{ steps.branch-token.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           EVENT_NAME: ${{ github.event_name }}
@@ -1297,7 +1297,7 @@ jobs:
       - name: Generate fake coverage report
         uses: actions/github-script@v8
         with:
-          github-token: ${{ steps.branch-token.outputs.token }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
@@ -1391,7 +1391,7 @@ jobs:
       - name: Comment on PR with action run URL
         uses: actions/github-script@v8
         with:
-          github-token: ${{ steps.branch-token.outputs.token }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const prNumber = ${{ steps.get-pr-number.outputs.pr_number }};
             const runUrl = `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
