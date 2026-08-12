@@ -114,6 +114,7 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
 
+    # Warmup
     with torch.cuda.stream(capture_stream):
         # See: https://docs.nvidia.com/dl-cuda-graph/troubleshooting/memory-issues.html#gradient-accumulator-cross-stream-memory-growth
         # Warm up on the same stream used for capture so autograd's accumulation
