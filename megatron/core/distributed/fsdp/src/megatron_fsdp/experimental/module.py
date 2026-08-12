@@ -15,7 +15,6 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 import enum
-from functools import partial
 from typing import Literal, cast
 from weakref import ref
 
@@ -218,31 +217,10 @@ class FsdpModule:
         self._num_trainable_parameters = sum(
             len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
-        self._post_backward_issued = False
         self._register_hooks(
             fine_grained=fine_grained, skip_backward_callback=skip_backward_callback
         )
-        # Public callables for 1F1B EP overlap schedule integration.
-        self.post_forward_release_module = partial(self._post_forward_release)
-        self.post_backward_release_module = self._post_backward_release
         context.register_module(self)
-
-    def _post_forward_release(self, hook_module=None) -> None:
-        """Release forward-pass parameters (reshard only, no gradient reduction).
-
-        Matching the v1 contract: takes an optional hook_module argument
-        (ignored — this FsdpModule manages its own parameters)."""
-        self.reshard_parameters()
-
-    def _post_backward_release(self, hook_module=None) -> None:
-        """Release backward-pass parameters (reshard + reduce gradients).
-
-        Matching the v1 contract: takes an optional hook_module argument
-        (ignored — this FsdpModule manages its own parameters)."""
-        modules = cast(nn.Module, self).modules()
-        for module in reversed(list(modules)):
-            if isinstance(module, FsdpModule):
-                module._issue_post_backward()
 
     @property
     def context(self) -> FsdpContext:
@@ -460,8 +438,6 @@ class FsdpModule:
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
-            for module in context.forward_order:
-                module._post_backward_issued = False
             context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
@@ -480,29 +456,21 @@ class FsdpModule:
         if next_module is not None:
             next_module._unshard_parameter_groups()
 
-    def post_backward(self, finalize_context: bool = False) -> None:
+    def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state.
 
-        Args:
-            finalize_context: Whether to finalize the root context synchronously.
+        Any submodule FsdpModule still in the BACKWARD phase (e.g. the 1F1B
+        schedule skipped its per-module release) is finalized first.
         """
-        if finalize_context:
-            assert self.is_root()
-            for module in reversed(list(self.context.forward_order)):
-                module._issue_post_backward()
-        else:
-            self._issue_post_backward()
-        torch.cuda.nvtx.range_pop()
-
-    def _issue_post_backward(self) -> None:
-        """Reshard and reduce this module's gradients at most once per backward."""
-        if self._post_backward_issued:
-            return
+        # The 1F1B schedule may skip a per-module release; finalize any submodule
+        # still in the BACKWARD phase.
+        for module in reversed(list(cast(nn.Module, self).modules())):
+            if isinstance(module, FsdpModule) and module.phase is FsdpModule.Phase.BACKWARD:
+                module.post_backward()
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
         self._phase = FsdpModule.Phase.RESTING
-        self._num_ready_grad_parameters = 0
-        self._post_backward_issued = True
+        torch.cuda.nvtx.range_pop()
 
     def reduce_grad(self) -> None:
         """Public API: pack gradients and launch their reduce-scatters.

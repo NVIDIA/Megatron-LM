@@ -253,7 +253,7 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
 
     assert model.inner.context is first_context
 def test_post_backward_release_processes_nested_fsdp_modules_once(distributed_setup, monkeypatch):
-    """Manual 1F1B release should include nested units without reducing twice."""
+    """Manual 1F1B release should include nested units still in the backward phase."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -276,11 +276,14 @@ def test_post_backward_release_processes_nested_fsdp_modules_once(distributed_se
             module, "_reduce_gradient_groups", lambda name=name: calls.append((name, "reduce"))
         )
 
-    model.post_backward_release_module()
-    model.post_backward_release_module()
+    # The schedule skipped the inner unit's per-module release; its post_backward
+    # should still finalize it because it remains in the BACKWARD phase.
+    model.phase = FsdpModule.Phase.BACKWARD
+    model.inner.phase = FsdpModule.Phase.BACKWARD
+    model.post_backward()
 
-    # Each nested unit is resharded and reduced exactly once per backward;
-    # the relative order of the two operations is not a contract.
+    # The root post_backward finalizes itself and any nested unit still in the
+    # BACKWARD phase; the relative order of the two operations is not a contract.
     assert sorted(calls) == [
         ("inner", "reduce"),
         ("inner", "reshard"),

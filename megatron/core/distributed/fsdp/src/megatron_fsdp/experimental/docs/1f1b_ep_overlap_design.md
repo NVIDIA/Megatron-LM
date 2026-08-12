@@ -102,10 +102,10 @@ The v2 adapter exposes the same entry point by forwarding to the module:
 Called once per overlapped run before backward. MFSDP v2:
 
 - transitions this module to `Phase.BACKWARD`,
-- if root: resets `_post_backward_issued` on all modules in the context,
-  registers the post-backward final callback (waits the reduce-scatter stream
-  after autograd), and forks the reduce-scatter stream off the current stream
-  once so later allocations stay legal under CUDA-graph capture,
+- if root: registers the post-backward final callback (waits the
+  reduce-scatter stream after autograd) and forks the reduce-scatter stream
+  off the current stream once so later allocations stay legal under
+  CUDA-graph capture,
 - unshards parameters (all-gather) and waits for them,
 - prefetches the next module in `backward_order` (static-order prefetch).
 
@@ -118,28 +118,28 @@ The schedule attaches two callables per `TransformerLayerSchedulePlan`:
 - **`post_forward_release_module(module)`** — called after the last forward
   node of a layer; reshard only (no gradient reduction).
 - **`post_backward_release_module(module)`** — called after the last backward
-  node; reshards **and** issues gradient reduction for the module subtree.
+  node; runs the module's `post_backward()` (reshard + gradient reduction).
 
-MFSDP v2 exposes both on `FsdpModule` (`_post_forward_release` /
-`_post_backward_release`, where `_post_backward_release` walks the module
-subtree calling `_issue_post_backward()` on each child `FsdpModule`). The
-`FullyShardedDataParallelV2` adapter wraps them with a `release_module(module,
-*, reduce_grad)` helper that validates the argument is an `FsdpModule` and
-binds them to `post_forward_release_module` / `post_backward_release_module`.
+The `FullyShardedDataParallelV2` adapter binds both through a single
+`release_module(module, *, reduce_grad)` helper (in
+`_setup_1f1b_overlap_interface`) that validates the argument is an
+`FsdpModule`, then calls `module.reshard_parameters()` (forward) or
+`module.post_backward()` (backward). No release helpers live on
+`FsdpModule` itself.
 
 ### 1.5 Root backward finalization — `post_backward()`
 
-**File:** `combined_1f1b.py` → `FsdpModule.post_backward(finalize_context)`
+**File:** `combined_1f1b.py` → `FsdpModule.post_backward()`
 
 Called once after each overlapped run completes. MFSDP v2:
 
-- issues per-module post-backward (reduce + reshard) for any module whose
-  per-module release was skipped,
-- with `finalize_context=True` (the schedule path), finalizes the root context
-  synchronously after issuing all module post-backwards.
+- walks the module subtree and finalizes (reduce + reshard) any submodule
+  `FsdpModule` that is **still in the BACKWARD phase** — i.e. the 1F1B
+  schedule skipped its per-module release,
+- then reduces and reshards this module itself and returns it to `RESTING`.
 
-The v2 adapter binds `self.post_backward = partial(self.module.post_backward,
-finalize_context=True)`.
+The v2 adapter binds `self.post_backward = self.module.post_backward` (no
+arguments).
 
 ### 1.6 Gradient sync suppression — `no_sync_func()`
 
@@ -277,10 +277,8 @@ path, where the schedule drives reduction explicitly).
 | `reshard_parameters()` | `() -> None` | Release all-gathered storage, install DTensor params. |
 | `reduce_grad()` | `() -> None` | Pack gradients → reduce-scatter → install DTensor `.grad`. |
 | `pre_backward()` | `() -> None` | Root backward-phase setup (unshard for backward). |
-| `post_backward()` | `(finalize_context: bool = False) -> None` | Finalize backward (reduce pending grads, reset state). |
+| `post_backward()` | `() -> None` | Finalize backward: reduce+reshard this module, and any submodule `FsdpModule` still in the BACKWARD phase. |
 | `_replace_param_with_raw_if_needed()` | `() -> None` | Finalize the root context; no parameter swap is needed. |
-| `_post_forward_release(hook_module=None)` | `() -> None` | Release forward-pass params (reshard only). |
-| `_post_backward_release(hook_module=None)` | `() -> None` | Release backward-pass params (reshard + reduce) for the subtree. |
 
 ### New parameters on `fully_shard()`
 
