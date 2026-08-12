@@ -43,6 +43,7 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
@@ -579,9 +580,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 # Their gradients need the EP divisor because the same expert receives
                 # contributions after dispatch from every EP rank.
                 for submodule in module.modules():
-                    if isinstance(submodule, MoETransformerLayer):
+                    if isinstance(submodule, MoELayer):
                         fully_shard(
-                            submodule.mlp.experts,
+                            submodule.experts,
                             mesh=expert_dp_mesh,
                             placements=placements,
                             mixed_precision_policy=self.mp_policy,
@@ -669,7 +670,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             if pg_collection.expt_dp is None:
                 raise ValueError("MFSDP v2 with EP requires an explicit expert-DP process group.")
             if not any(
-                isinstance(submodule, MoETransformerLayer) for submodule in module.modules()
+                isinstance(submodule, MoELayer) for submodule in module.modules()
             ):
                 raise ValueError("MFSDP v2 with EP requires MoE transformer layers.")
         if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
