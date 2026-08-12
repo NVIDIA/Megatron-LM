@@ -630,15 +630,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     f"got {type(module).__name__}."
                 )
             if reduce_grad:
-                module.post_backward_release_module()
+                module.post_backward()
             else:
                 module.reshard_parameters()
 
         self._replace_param_with_raw_if_needed = self.module._replace_param_with_raw_if_needed
         self.post_forward_release_module = partial(release_module, reduce_grad=False)
         self.post_backward_release_module = partial(release_module, reduce_grad=True)
-        self.pre_backward = partial(self.module.pre_backward, register_final_callback=False)
-        self.post_backward = partial(self.module.post_backward, finalize_context=True)
+        self.pre_backward = self.module.pre_backward
+        self.post_backward = self.module.post_backward
 
     @staticmethod
     def _validate_config(

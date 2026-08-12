@@ -147,14 +147,12 @@ class TestMcoreAdapterDense:
         monkeypatch.setattr(
             wrapped.module,
             "pre_backward",
-            lambda *, register_final_callback: root_calls.append(
-                ("pre_backward", register_final_callback)
-            ),
+            lambda: root_calls.append("pre_backward"),
         )
         monkeypatch.setattr(
             wrapped.module,
             "post_backward",
-            lambda *, finalize_context: root_calls.append(("post_backward", finalize_context)),
+            lambda: root_calls.append("post_backward"),
         )
         wrapped._setup_1f1b_overlap_interface()
         assert find_megatron_fsdp(wrapped) is wrapped
@@ -176,14 +174,14 @@ class TestMcoreAdapterDense:
             wrapped.module[0], "reshard_parameters", lambda: release_calls.append("reshard")
         )
         monkeypatch.setattr(
-            wrapped.module[0], "reduce_grad", lambda: release_calls.append("reduce_grad")
+            wrapped.module[0], "post_backward", lambda: release_calls.append("post_backward")
         )
         wrapped.post_forward_release_module(wrapped.module[0])
         wrapped.post_backward_release_module(wrapped.module[0])
-        assert release_calls == ["reshard", "reshard", "reduce_grad"]
+        assert release_calls == ["reshard", "post_backward"]
         wrapped.pre_backward()
         wrapped.post_backward()
-        assert root_calls == [("pre_backward", False), ("post_backward", True)]
+        assert root_calls == ["pre_backward", "post_backward"]
 
     @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
     def test_build_train_and_step(self, optimizer_cuda_graph, monkeypatch):
