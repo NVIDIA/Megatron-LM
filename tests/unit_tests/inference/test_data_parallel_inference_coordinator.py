@@ -28,6 +28,7 @@ from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
     EngineState,
     RequestEntry,
+    _engine_reply_frames,
 )
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
@@ -56,6 +57,115 @@ DEFAULT_PORT = 46581
 def test_coordinator_registers_client_kv_handoff_handlers():
     assert Headers.SUBMIT_REQUEST_WITH_KV in HANDLERS
     assert Headers.RELEASE_KV in HANDLERS
+
+
+class _StubCoordinator:
+    """Minimal stand-in exposing only what the submit handlers touch."""
+
+    def __init__(self, identity=b"engine-0"):
+        self.known_clients = {b"client-0"}
+        self.next_request_id = 100
+        self.request_id_to_client_id = {}
+        self.request_id_to_client_request_id = {}
+        self.client_request_to_request_id = {}
+        self.request_id_to_rank = {}
+        self.identities_of_data_parallel_ranks = [identity]
+        self.identity_to_rank_index = {identity: 0}
+        self._pending_counts = np.zeros(1, dtype=np.int64)
+        self._identity = identity
+        self.sent = []
+
+    def get_least_loaded_data_parallel_rank(self):
+        return self._identity
+
+    def _send_to_engine(self, identity, frames):
+        # Mirrors the real signature: a list of frames, metadata first. Passing
+        # raw bytes here would splay one frame per byte, so assert the shape.
+        assert isinstance(frames, list), f"expected a frame list, got {type(frames).__name__}"
+        self.sent.append((identity, frames))
+        return True
+
+
+def test_kv_handoff_round_trip_keeps_prompt_in_its_own_frame():
+    """Client -> coordinator -> engine for a KV handoff, asserting the framing.
+
+    The prompt must never be decoded by the coordinator: it is forwarded as the
+    opaque body frame the client packed, byte for byte.
+    """
+    prompt_tokens = [11, 22, 33, 44]
+    kv_meta = {"agent": "nixl-0"}
+    src_block_ids = [7, 8]
+
+    # --- client side: build the frames without needing a live socket ---
+    client = InferenceClient.__new__(InferenceClient)
+    client.next_request_id = 5
+    request_id, frames = InferenceClient._make_kv_handoff_request(
+        client, prompt_tokens, SamplingParams(num_tokens_to_generate=4), kv_meta, src_block_ids
+    )
+    assert request_id == 5
+    assert len(frames) == 3, "KV handoff must be framed as [metadata, prompt, src_block_ids]"
+
+    metadata = msgpack.unpackb(frames[0], raw=False)
+    assert metadata[0] == Headers.SUBMIT_REQUEST_WITH_KV.value
+    assert len(metadata) == 4, "only constant-size fields belong in the metadata frame"
+    assert metadata[1] == request_id
+    assert metadata[3] == kv_meta
+    assert msgpack.unpackb(frames[1], raw=False) == prompt_tokens
+    assert msgpack.unpackb(frames[2], raw=False) == src_block_ids
+
+    # --- coordinator side: route it ---
+    coordinator = _StubCoordinator()
+    handler = HANDLERS[Headers.SUBMIT_REQUEST_WITH_KV]
+    handler(coordinator, b"client-0", metadata, frames[1:])
+
+    assert len(coordinator.sent) == 1
+    identity, out_frames = coordinator.sent[0]
+    assert identity == b"engine-0"
+    assert len(out_frames) == 3
+    # Both body frames are forwarded untouched -- not re-packed.
+    assert out_frames[1] is frames[1]
+    assert out_frames[2] is frames[2]
+
+    engine_metadata = msgpack.unpackb(out_frames[0], raw=False)
+    assert engine_metadata[0] == Headers.SUBMIT_REQUEST_WITH_KV.value
+    server_request_id = engine_metadata[1]
+    assert coordinator.request_id_to_client_request_id[server_request_id] == request_id
+    assert coordinator.request_id_to_rank[server_request_id] == b"engine-0"
+    assert coordinator._pending_counts[0] == 1
+
+    # --- engine side: the bodies are decoded here, for the first time ---
+    assert msgpack.unpackb(out_frames[1], raw=False) == prompt_tokens
+    assert msgpack.unpackb(out_frames[2], raw=False) == src_block_ids
+
+
+def test_kv_handoff_metadata_frame_does_not_grow_with_sequence_length():
+    """The metadata frame is the only one the coordinator decodes, so its size
+    must not follow the prompt. Build the same request at two prompt lengths and
+    require the metadata frame to be byte-identical in length."""
+    client = InferenceClient.__new__(InferenceClient)
+    sizes = []
+    for n_blocks in (1, 64):
+        client.next_request_id = 5
+        _, frames = InferenceClient._make_kv_handoff_request(
+            client,
+            list(range(n_blocks * 64)),
+            SamplingParams(num_tokens_to_generate=4),
+            {"agent": "nixl-0"},
+            list(range(n_blocks)),
+        )
+        sizes.append(len(frames[0]))
+    assert sizes[0] == sizes[1], (
+        f"metadata frame grew with prompt length ({sizes[0]} -> {sizes[1]} bytes); "
+        "something sequence-dependent leaked into it"
+    )
+
+
+def test_kv_handoff_rejects_legacy_single_frame_payload():
+    """A pre-split single-frame payload must be rejected, not silently mis-read."""
+    coordinator = _StubCoordinator()
+    legacy = [Headers.SUBMIT_REQUEST_WITH_KV.value, 1, [1, 2], {}, {}, []]
+    HANDLERS[Headers.SUBMIT_REQUEST_WITH_KV](coordinator, b"client-0", legacy, [])
+    assert coordinator.sent == []
 
 
 class DummyTokenizer:
@@ -198,13 +308,11 @@ class DummyEngine(DynamicInferenceEngine):
                 finished_request_records.append(entry.record)
                 entry.future.set_result(entry.record)
                 to_remove.append(request_id)
-                # Send signal to coordinator.
+                # Send signal to coordinator, framed the way a real engine does.
                 if self.is_mp_coordinator:
-                    payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.merge().serialize()]],
-                        use_bin_type=True,
+                    self.socket_for_receiving_requests.send_multipart(
+                        _engine_reply_frames([entry.record.merge().serialize()])
                     )
-                    self.socket_for_receiving_requests.send(payload)
 
         for request_id in to_remove:
             del self.requests[request_id]
@@ -877,10 +985,19 @@ class TestRoutingPolicies:
         """A removed engine's queued replies still deliver; never-connected senders assert."""
 
         def reply(fid):
-            return [
-                Headers.ENGINE_REPLY.value,
-                [{"request_id": fid, "generated_tokens": [1], "sampling_params": {}}],
+            """An ENGINE_REPLY as (metadata, body frames), matching the wire format.
+
+            The metadata frame carries only the routing key and the detokenize
+            flag; the finished request travels as an opaque body frame.
+            """
+            metadata = [Headers.ENGINE_REPLY.value, [[fid, False]]]
+            bodies = [
+                msgpack.packb(
+                    {"request_id": fid, "generated_tokens": [1], "sampling_params": {}},
+                    use_bin_type=True,
+                )
             ]
+            return metadata, bodies
 
         coord = _make_routing_coordinator(num_ranks=2)
         coord.tokenizer = DummyTokenizer()
@@ -892,7 +1009,7 @@ class TestRoutingPolicies:
 
         # A sender that never registered is a protocol violation.
         with pytest.raises(AssertionError, match="never-connected"):
-            handle_engine_reply(coord, b"impostor", reply(11))
+            handle_engine_reply(coord, b"impostor", *reply(11))
         assert coord.router_socket.send_multipart.call_count == 0
         assert 11 in coord.request_id_to_client_id
 
@@ -900,7 +1017,7 @@ class TestRoutingPolicies:
         # reply can still arrive - and must reach its client.
         coord._remove_engine(b"rank-0")
         with caplog.at_level(logging.WARNING):
-            handle_engine_reply(coord, b"rank-0", reply(11))
+            handle_engine_reply(coord, b"rank-0", *reply(11))
         assert "removed engine" in caplog.text
         assert coord.router_socket.send_multipart.call_args[0][0][0] == b"client-A"
         assert 11 not in coord.request_id_to_client_id
