@@ -36,11 +36,52 @@ def dtype_tols(dtype):
 
 
 class FakeCPGroup:
+    def __init__(self, size=1, rank=0):
+        self._size = size
+        self._rank = rank
+
     def size(self):
-        return 1
+        return self._size
 
     def rank(self):
-        return 0
+        return self._rank
+
+
+class TestApplyRotaryPosEmbTHD:
+    def test_packed_freqs_returns_offset_mapped_output_for_context_parallel(self):
+        cp_group = FakeCPGroup(size=2, rank=0)
+        cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(8, 1, 1, 8)
+
+        out = rope_utils_module._apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, cp_group=cp_group)
+
+        expected_freqs = torch.cat([freqs[0:1], freqs[3:4], freqs[4:5], freqs[7:8]], dim=0)
+        expected = rope_utils_module._apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1), expected_freqs
+        ).squeeze(1)
+
+        torch.testing.assert_close(out, expected)
+
+    def test_max_seqlen_freqs_returns_sequence_mapped_output_for_context_parallel(self):
+        cp_group = FakeCPGroup(size=2, rank=1)
+        cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(4, 1, 1, 8)
+
+        out = rope_utils_module._apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, cp_group=cp_group)
+
+        expected_freqs = torch.cat([freqs[1:2], freqs[2:3]], dim=0)
+        expected_slices = []
+        for x in torch.split(t, [2, 2]):
+            expected_slices.append(
+                rope_utils_module._apply_rotary_pos_emb_bshd(
+                    x.unsqueeze(1), expected_freqs
+                ).squeeze(1)
+            )
+        expected = torch.cat(expected_slices, dim=0)
+
+        torch.testing.assert_close(out, expected)
 
 
 def _test_fused_apply_mla_rope_for_q(input_format):

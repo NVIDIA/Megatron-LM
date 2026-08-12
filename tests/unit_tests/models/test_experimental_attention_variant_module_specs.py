@@ -106,7 +106,14 @@ class TestIsLinearAttentionVariant:
 
     @pytest.mark.parametrize(
         "variant, expected",
-        [("gated_delta_net", True), ("dsa", False), (None, False), ("some_unknown_variant", False)],
+        [
+            ("gdn", True),
+            ("gdn2", True),
+            ("gated_delta_net", True),
+            ("dsa", False),
+            (None, False),
+            ("some_unknown_variant", False),
+        ],
     )
     def test_variants(self, variant, expected):
         """Validate linear-attention variant classification across supported and unsupported names."""
@@ -319,12 +326,14 @@ class TestGetDsaModuleSpec:
         with pytest.raises(AssertionError, match="qk_l2_norm is not supported"):
             get_dsa_module_spec_for_backend(cfg, backend=_make_backend())
 
-    def test_returns_mla_self_attention_spec(self):
-        """Verify the returned attention module is MLA self-attention with causal mask."""
-        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+    def test_returns_absorbed_mla_self_attention_spec(self):
+        """Verify the returned attention module is absorbed MLA with causal mask."""
+        from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+            AbsorbedMLASelfAttention,
+        )
 
         spec = self._call()
-        assert spec.module is MLASelfAttention
+        assert spec.module is AbsorbedMLASelfAttention
         assert spec.params == {"attn_mask_type": AttnMaskType.causal}
         assert spec.metainfo == {"fuse_input_layernorm": False}
 
@@ -410,6 +419,8 @@ class TestGetExperimentalAttentionVariantModuleSpec:
     @pytest.mark.parametrize(
         "variant, target_fn",
         [
+            ("gdn", "get_gated_delta_net_module_spec"),
+            ("gdn2", "get_gated_delta_net_module_spec"),
             ("gated_delta_net", "get_gated_delta_net_module_spec"),
             ("dsa", "get_dsa_module_spec_for_backend"),
         ],

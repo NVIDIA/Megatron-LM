@@ -52,6 +52,24 @@ def test_divide_improperly():
         util.divide(4, 5)
 
 
+@pytest.mark.skipif(not util.HAVE_PACKAGING, reason="packaging is not installed")
+@pytest.mark.parametrize("check_equality", [True, False])
+def test_is_flashinfer_min_version(check_equality):
+    from packaging.version import Version as PkgVersion
+
+    with patch.object(util, "get_flashinfer_version", return_value=PkgVersion("0.6.5")):
+        # check_equality=False exercised the path that used to reference an
+        # undefined name and raise NameError instead of returning a bool.
+        assert util.is_flashinfer_min_version("0.6.4", check_equality=check_equality) is True
+        assert util.is_flashinfer_min_version("0.7.0", check_equality=check_equality) is False
+        assert (
+            util.is_flashinfer_min_version("0.6.5", check_equality=check_equality) is check_equality
+        )
+
+    with patch.object(util, "get_flashinfer_version", return_value=None):
+        assert util.is_flashinfer_min_version("0.6.4", check_equality=check_equality) is False
+
+
 def test_experimental_cls_init():
     with patch.object(config, 'ENABLE_EXPERIMENTAL', True):
         # Check that initialization works
@@ -94,6 +112,43 @@ def test_global_memory_buffer():
     obtained_tensor = global_memory_buffer.get_tensor((3, 2), torch.float32, "test_tensor")
     expected_tensor = torch.empty((3, 2), dtype=torch.float32, device=torch.cuda.current_device())
     assert obtained_tensor.shape == expected_tensor.shape
+
+
+def test_global_memory_buffer_stable_after_presizing():
+    """Regression test for CUDA-graph corruption via GlobalMemoryBuffer growth.
+
+    ``get_tensor`` is grow-only: it only reallocates the backing buffer when the
+    cached one is missing or too small. Megatron's dynamic inference engine relies
+    on this to keep a CUDA-graph-captured all-gather buffer's address stable -- it
+    pre-sizes the buffer to the worst case before capturing graphs. If a *larger*
+    request later reallocated the buffer, the freed address (still written by a
+    captured graph on replay) would be recycled and silently corrupted.
+
+    This asserts the invariant the fix depends on: once sized to the max, any
+    smaller request reuses the SAME storage (stable device address); a larger
+    request is the only thing that reallocates.
+    """
+    gmb = util.GlobalMemoryBuffer()
+    device = torch.cuda.current_device()
+
+    # Pre-size to the worst case (mirrors create_cuda_graphs priming).
+    max_tensor = gmb.get_tensor((128,), torch.float32, "mpu")
+    presized_ptr = max_tensor.untyped_storage().data_ptr()
+
+    # Every smaller-or-equal request must reuse the same backing storage, i.e. the
+    # captured address never moves and is never freed.
+    for shape in [(128,), (64,), (1,), (100,)]:
+        t = gmb.get_tensor(shape, torch.float32, "mpu")
+        assert t.untyped_storage().data_ptr() == presized_ptr, (
+            f"get_tensor({shape}) reallocated the 'mpu' buffer after pre-sizing; "
+            "a captured CUDA graph would write to the freed address."
+        )
+
+    # Sanity: a request larger than the pre-sized buffer is the only case that
+    # reallocates. (This is exactly the condition the engine avoids by pre-sizing
+    # to context.max_tokens * hidden_size before graph capture.)
+    grown = gmb.get_tensor((256,), torch.float32, "mpu")
+    assert grown.untyped_storage().data_ptr() != presized_ptr
 
 
 def test_make_viewless_tensor():

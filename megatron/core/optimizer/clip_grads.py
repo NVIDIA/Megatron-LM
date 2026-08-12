@@ -47,7 +47,7 @@ except ImportError:
         multi_tensor_scale_tensor_impl = None
 
 
-from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
+from ..tensor_parallel import param_is_not_gtp_duplicate, param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
@@ -92,7 +92,7 @@ def get_grad_norm_fp32(
 
     # Calculate norm.
     if norm_type == inf:
-        total_norm = max(grad.abs().max() for grad in grads_for_norm)
+        total_norm = max((grad.abs().max() for grad in grads_for_norm), default=torch.tensor(0.0))
         total_norm_cuda = torch.tensor([float(total_norm)], dtype=torch.float, device='cuda')
         # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         if data_parallel_group:
@@ -105,24 +105,20 @@ def get_grad_norm_fp32(
         total_norm = total_norm_cuda[0].item()
 
     else:
-        if norm_type == 2.0:
+        total_norm = torch.zeros(1, dtype=torch.float, device='cuda')
+        if not grads_for_norm:
+            pass
+        elif norm_type == 2.0:
             dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
-            if grads_for_norm:
-                grad_norm, _ = multi_tensor_applier(
-                    l2_norm_impl,
-                    dummy_overflow_buf,
-                    [grads_for_norm],
-                    False,  # no per-parameter norm
-                )
-            else:
-                grad_norm = torch.zeros(1, dtype=torch.float, device='cuda')
+            grad_norm, _ = multi_tensor_applier(
+                l2_norm_impl, dummy_overflow_buf, [grads_for_norm], False  # no per-parameter norm
+            )
             # Since we will be summing across data parallel groups,
             # we need the pow(norm-type).
             total_norm = grad_norm**norm_type
-
         else:
             for grad in grads_for_norm:
                 grad_norm = torch.norm(grad, norm_type)
@@ -201,14 +197,15 @@ def count_zeros_fp32(
     grad_stats_parallel_group: torch.distributed.ProcessGroup,
     use_decoupled_grad: bool = False,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expert_tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> float:
     """Counts the number of zero values in the gradients of the given parameters.
 
     The count is performed in FP32. This method filters parameters to ensure
     gradients are not double-counted by checking if the gradient is not None,
-    the parameter is not shared, and the parameter is not a replica due
-    to tensor model parallelism. It also handles parameters managed by
-    Megatron FSDP specifically.
+    the parameter is not shared, and the parameter is not a replica due to
+    tensor model parallelism or (expert) generalized tensor parallelism. It also
+    handles parameters managed by Megatron FSDP specifically.
 
     Args:
         parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of
@@ -230,6 +227,7 @@ def count_zeros_fp32(
     #   - grad should not be none
     #   - parameter should not be shared
     #   - should not be a replica due to tensor model parallelism
+    #   - should not be a replica due to (expert) generalized tensor parallelism
     total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
     data_parallel_group = None
     use_megatron_fsdp = False
@@ -245,8 +243,11 @@ def count_zeros_fp32(
             total_num_zeros += num_zeros
             continue
         is_not_shared = param_is_not_shared(param)
-        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
-        if grad_not_none and is_not_shared and is_not_tp_duplicate:
+        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(
+            param, tp_group=tp_group, expert_tp_group=expert_tp_group
+        )
+        is_not_gtp_duplicate = param_is_not_gtp_duplicate(param)
+        if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
             grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
             grad = to_local_if_dtensor(grad_obj).detach()

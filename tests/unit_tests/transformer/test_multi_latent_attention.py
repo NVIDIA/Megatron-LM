@@ -7,6 +7,7 @@ from unittest import mock
 import pytest
 import torch
 
+import megatron.core.transformer.multi_latent_attention as mla_module
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -164,6 +165,56 @@ class TestParallelMLAAttention:
         # Identify parameters that are in Attention but missing in MultiLatentAttention
         missing_params = attn_params - mla_params
         assert not missing_params, f"Missing parameters in MultiLatentAttention: {missing_params}"
+
+    @pytest.mark.parametrize("is_decode_only", [False, True])
+    def test_dynamic_inference_forwards_decode_only_to_flash_attention(self, is_decode_only):
+        """Test that MLA forwards the dynamic context's decode-only state."""
+        attention = self.parallel_attention
+        attention.eval()
+        attention.config.cache_mla_latents = True
+        attention.cache_mla_latents = True
+
+        hidden_states = torch.empty((1, 1, attention.config.hidden_size))
+        query = torch.empty((1, 1, 1, 1))
+        key = torch.empty_like(query)
+        value = torch.empty_like(query)
+        block_table = torch.zeros((1, 1), dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+        sequence_lengths = torch.ones(1, dtype=torch.int32)
+
+        inference_context = mock.Mock()
+        inference_context.is_static_batching.return_value = False
+        inference_context.is_decode_only.return_value = is_decode_only
+        inference_context.cu_query_lengths.return_value = (cu_seqlens, 1)
+        inference_context.cu_kv_lengths.return_value = (cu_seqlens, sequence_lengths, 1)
+
+        with (
+            mock.patch.object(attention, "prepare_for_absorption"),
+            mock.patch.object(
+                attention,
+                "get_query_key_value_tensors",
+                return_value=(query, key, value, None, None),
+            ),
+            mock.patch.object(
+                attention,
+                "_adjust_key_value_for_inference",
+                return_value=(query, key, value, None, AttnMaskType.causal, block_table),
+            ),
+            mock.patch.object(
+                attention,
+                "flash_decode_and_prefill",
+                side_effect=RuntimeError("flash attention call reached"),
+            ) as flash_decode_and_prefill,
+            pytest.raises(RuntimeError, match="flash attention call reached"),
+        ):
+            attention(hidden_states, attention_mask=None, inference_context=inference_context)
+
+        flash_call = signature(Attention.flash_decode_and_prefill).bind(
+            attention,
+            *flash_decode_and_prefill.call_args.args,
+            **flash_decode_and_prefill.call_args.kwargs,
+        )
+        assert flash_call.arguments["is_decode_only"] is is_decode_only
 
     def test_constructor(self):
         assert isinstance(self.parallel_attention, MLASelfAttention)
@@ -1674,6 +1725,45 @@ class TestFusedMLASelfAttention:
             config.kv_lora_rank + config.qk_pos_emb_head_dim,
         )
 
+    def test_qkv_down_projection_split_tensor_parallel_shard(self, monkeypatch):
+        config = self.transformer_config
+        tp_size = 2
+        seq_len, batch = 2, 1
+        q_split = config.q_lora_rank // tp_size
+        kv_split = (config.kv_lora_rank + config.qk_pos_emb_head_dim) // tp_size
+
+        q_shard = torch.arange(seq_len * batch * q_split, dtype=torch.float32).view(
+            seq_len, batch, q_split
+        )
+        kv_shard = torch.full((seq_len, batch, kv_split), 7.0)
+        qkv_shard = torch.cat([q_shard, kv_shard], dim=-1)
+
+        class FakeQKVDownProjection(torch.nn.Module):
+            def forward(self, hidden_states):
+                return qkv_shard, None
+
+        gathered_q = torch.cat([q_shard, torch.zeros_like(q_shard)], dim=-1)
+        captured = {}
+
+        def fake_gather_from_tensor_model_parallel_region(tensor):
+            captured["q_shard"] = tensor
+            return gathered_q
+
+        monkeypatch.setattr(mla_module, "get_pg_size", lambda group: tp_size)
+        monkeypatch.setattr(
+            mla_module,
+            "gather_from_tensor_model_parallel_region",
+            fake_gather_from_tensor_model_parallel_region,
+        )
+        self.fused_attention.linear_qkv_down_proj = FakeQKVDownProjection()
+
+        hidden = torch.zeros(seq_len, batch, config.hidden_size)
+        q_compressed, kv_combined = self.fused_attention._qkv_down_projection(hidden)
+
+        torch.testing.assert_close(captured["q_shard"], q_shard)
+        torch.testing.assert_close(q_compressed, gathered_q)
+        torch.testing.assert_close(kv_combined, kv_shard)
+
     def test_gpu_forward(self):
         if not is_te_min_version("1.10.0"):
             pytest.skip("Requires TE >= 1.10.0")
@@ -1768,36 +1858,6 @@ class TestFusedMLAGradientFlow:
         assert hidden_states.grad is not None
 
 
-def test_fused_mla_training_hooks_use_fused_down_projection(monkeypatch):
-    """Training hooks should use fused q/kv down projection attributes."""
-
-    class LinearWithDelayedWgrad:
-        def __init__(self, name):
-            self.name = name
-
-        def backward_dw(self):
-            calls.append(self.name)
-
-    calls = []
-    fused = FusedMLASelfAttention.__new__(FusedMLASelfAttention)
-    fused.linear_kv_up_proj = LinearWithDelayedWgrad("kv_up")
-    fused.linear_qkv_down_proj = LinearWithDelayedWgrad("qkv_down")
-    fused.linear_q_up_proj = LinearWithDelayedWgrad("q_up")
-    fused.linear_proj = LinearWithDelayedWgrad("out")
-
-    fused.backward_dw()
-
-    assert calls == ["kv_up", "qkv_down", "q_up", "out"]
-
-    saved_inputs = []
-    mla_module = __import__(FusedMLASelfAttention.__module__, fromlist=["set_save_original_input"])
-    monkeypatch.setattr(mla_module, "set_save_original_input", saved_inputs.append)
-
-    fused.set_for_recompute_input_layernorm()
-
-    assert saved_inputs == [fused.linear_qkv_down_proj]
-
-
 class TestFusedMLALoadFromStateDict:
 
     @pytest.fixture(scope='function', autouse=True)
@@ -1878,6 +1938,78 @@ class TestFusedMLALoadFromStateDict:
         assert not any(
             'linear_qkv_down_proj.weight' in k for k in sharded_sd
         ), f"Unexpected linear_qkv_down_proj.weight in sharded state dict"
+
+    def test_set_for_recompute_input_layernorm_uses_fused_down_proj(self, monkeypatch):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        fused = FusedMLASelfAttention(
+            self.transformer_config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        seen = []
+
+        def mock_set_save_original_input(module):
+            seen.append(module)
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.multi_latent_attention.set_save_original_input",
+            mock_set_save_original_input,
+        )
+
+        fused.set_for_recompute_input_layernorm()
+
+        assert seen == [fused.linear_qkv_down_proj]
+
+    def test_sharded_state_dict_preserves_fused_layernorm_keys(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        fused = FusedMLASelfAttention(
+            self.transformer_config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        sharded_sd = fused.sharded_state_dict(prefix="")
+        layernorm_keys = [k for k in sharded_sd if k.startswith("linear_qkv_down_proj.layer_norm_")]
+        if not layernorm_keys:
+            pytest.skip("Fused test backend did not expose linear_qkv_down_proj layernorm keys")
+
+        fused_keys = [k for k in sharded_sd if k.startswith("linear_qkv_down_proj.")]
+        assert all(k.startswith("linear_qkv_down_proj.layer_norm_") for k in fused_keys)
+
+    def test_synthetic_state_dict_hooks_fuse_legacy_down_proj_weights(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("Requires TE >= 1.10.0")
+
+        fused = FusedMLASelfAttention(
+            self.transformer_config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        config = self.transformer_config
+        q_weight = torch.randn(config.q_lora_rank, config.hidden_size)
+        kv_weight = torch.randn(
+            config.kv_lora_rank + config.qk_pos_emb_head_dim, config.hidden_size
+        )
+        state_dict = {
+            "linear_q_down_proj.weight": q_weight,
+            "linear_kv_down_proj.weight": kv_weight,
+        }
+
+        assert fused._synthetic_state_dict_key_suffixes() == ("linear_q_down_proj.weight",)
+        fused._synthesize_fused_qkv_down_weight(state_dict, "")
+
+        assert "linear_q_down_proj.weight" not in state_dict
+        assert "linear_kv_down_proj.weight" not in state_dict
+        torch.testing.assert_close(
+            state_dict["linear_qkv_down_proj.weight"], torch.cat([q_weight, kv_weight], dim=0)
+        )
 
 
 class TestFusedMLARequiresQLora:

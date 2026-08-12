@@ -5,6 +5,7 @@
 from typing import List, Optional, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
+from megatron.core.inference.apis.serve_config import ServeConfig
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
@@ -24,12 +25,9 @@ class MegatronLLM(_MegatronLLMBase):
     - Sync lifecycle controls: :meth:`pause` / :meth:`unpause` /
       :meth:`suspend` / :meth:`resume` / :meth:`shutdown` /
       :meth:`wait_for_shutdown`.
+    - :meth:`serve` for OpenAI-compatible HTTP serving on the primary rank.
     - Context-manager protocol: ``with MegatronLLM(...) as llm:``; exit
       calls :meth:`shutdown`.
-
-    Note:
-        ``serve()`` (online HTTP serving) is async-only by design; use
-        :class:`MegatronAsyncLLM` for serving.
     """
 
     def __init__(
@@ -38,7 +36,7 @@ class MegatronLLM(_MegatronLLMBase):
         model,
         tokenizer,
         inference_config: Optional[InferenceConfig] = None,
-        use_coordinator: bool = False,
+        use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
     ) -> None:
@@ -132,12 +130,62 @@ class MegatronLLM(_MegatronLLMBase):
         if self._shutdown_called:
             return
         self._shutdown_called = True
+        self._stop_frontend_if_started()
         if not self._use_coordinator:
             return  # direct mode: nothing to tear down
         assert self._loop_manager is not None
         self._loop_manager.run_sync(self._shutdown_impl())
         # Sync caller already on its own thread; no need for to_thread.
         self._loop_manager.stop()
+
+    def serve(self, serve_config: ServeConfig, *, blocking: bool = True) -> None:
+        """Start the OpenAI-compatible HTTP frontend.
+
+        Coordinator mode only. The HTTP frontend runs only on the primary
+        rank (global rank 0); other ranks no-op the HTTP setup but still
+        respect ``blocking`` (so all ranks return together).
+
+        With ``blocking=True`` (default), this blocks the calling thread until
+        the engine loop terminates via :meth:`shutdown` -- suitable for
+        standalone serving scripts. With ``blocking=False``, this returns once
+        the HTTP frontend is up (primary) or immediately (workers); the engine
+        loop continues in the background runtime, and the user can call
+        :meth:`generate` / :meth:`shutdown` afterward.
+
+        Raises:
+            ValueError: if ``use_coordinator=False`` (HTTP serving requires
+                the coordinator path).
+        """
+        if not self._use_coordinator:
+            raise ValueError("MegatronLLM.serve() requires use_coordinator=True")
+
+        if self._is_primary_rank:
+            # Lazy import: keep the module importable in environments where
+            # the HTTP server backend (Quart/Hypercorn) isn't installed.
+            import torch.distributed as dist
+
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (  # pylint: disable=line-too-long
+                start_text_gen_server,
+            )
+
+            assert self._coord_runtime is not None
+            start_text_gen_server(
+                coordinator_addr=self._coord_runtime.coord_addr,
+                tokenizer=self._controller.tokenizer,
+                rank=dist.get_rank(),
+                server_port=serve_config.port,
+                parsers=serve_config.parsers,
+                verbose=serve_config.verbose,
+                num_replicas=serve_config.frontend_replicas,
+                hostname=serve_config.host,
+            )
+            self._serve_started = True
+
+        if blocking:
+            # Block until the engine loop terminates (shutdown was invoked
+            # somewhere in this process; for serve(blocking=True) typically by
+            # SIGINT or out-of-band orchestration).
+            self.wait_for_shutdown()
 
     def wait_for_shutdown(self) -> None:
         """Block until the engine loop terminates. Direct mode no-op."""

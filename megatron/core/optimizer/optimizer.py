@@ -46,6 +46,7 @@ from ..dist_checkpointing.optimizer import (
     optim_state_to_sharding_state,
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
+from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
@@ -94,7 +95,58 @@ def _multi_tensor_copy_this_to_that(
             that_.copy_(this_)
 
 
-param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
+# Per-group keys used to uniquely identify a param_group during save/load matching.
+# Used by ``DistributedOptimizer.load_state_dict`` and
+# ``MegatronOptimizer._filter_and_reorder_param_groups`` to map saved param_groups
+# onto current param_groups by behavioral equivalence.
+#
+# This MUST cover every per-group field that influences scheduler or optimizer behavior;
+# otherwise two groups that differ only in a missing key (e.g. ``max_lr``) will collide
+# in the matching dict and one will silently overwrite the other on load. That's a
+# correctness bug: the load returns silently but the LR/WD applied at the next
+# optimizer step is wrong, leading to loss explosion on a converged-enough model.
+#
+# Source of truth for the user-overridable fields is
+# :class:`megatron.core.optimizer_param_scheduler.ParamGroupOverride` (the keys the
+# scheduler reads from each param_group via ``param_group.get(...)``):
+# ``max_lr``, ``min_lr``, ``start_wd``, ``end_wd``, ``wd_mult``, ``optimizer``.
+# We pull those keys directly from that TypedDict's annotations so future
+# additions to ``ParamGroupOverride`` automatically extend the identifier.
+#
+# The remaining keys (``lr_mult``, ``is_expert_parallel``, ``is_decoupled_lr``) are
+# structural flags set by ``_get_param_groups`` (in this module's ``__init__.py``)
+# on every param_group at construction time. They aren't part of ``ParamGroupOverride``
+# (users don't override them directly; they're implied by ``decoupled_lr`` config and
+# expert-parallel sharding), so we list them explicitly.
+def _param_group_override_keys() -> tuple[str, ...]:
+    """Return every field declared on ``ParamGroupOverride``.
+
+    For any TypedDict, ``__annotations__.keys() == __required_keys__ | __optional_keys__``
+    - the (required, optional) pair is just a *partition* of the declared set
+    based on the TypedDict's totality choice and any ``Required[]`` /
+    ``NotRequired[]`` wrappers. We want the whole declared set, regardless of
+    how it's partitioned, so we read ``__annotations__`` directly. Reading just
+    one side of the partition would silently miss fields if a future maintainer
+    flipped totality or introduced wrappers:
+
+        total=False (current):  optional={max_lr, min_lr, ...}, required={}
+        total=True:             required={max_lr, min_lr, ...}, optional={}
+        mixed Required/NotRequired:  fields split between the two sides
+    """
+    return tuple(sorted(_ParamGroupOverride.__annotations__.keys()))
+
+
+param_group_identifier_keys = (
+    # Per-group user-overridable keys (single source of truth: ParamGroupOverride).
+    # The scheduler reads ``max_lr``/``min_lr`` in ``get_lr`` and ``start_wd``/``end_wd``
+    # in ``get_wd``; ``wd_mult`` is multiplied into ``weight_decay`` in ``step``;
+    # ``optimizer`` selects per-group optimizer class.
+    *_param_group_override_keys(),
+    # Optimizer-side structural flags (not user-overridable via ParamGroupOverride):
+    'lr_mult',
+    'is_expert_parallel',
+    'is_decoupled_lr',
+)
 MTP_GRAD_NORM_GROUP = 'mtp'
 GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
 SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
@@ -124,6 +176,8 @@ def _is_separate_grad_norm_group(grad_norm_group: Optional[str]) -> bool:
 
 def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
     """Copy optimizer-relevant metadata when creating param views/copies."""
+    if hasattr(source, 'allreduce'):
+        destination.allreduce = source.allreduce
     if hasattr(source, 'shared'):
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
@@ -170,6 +224,10 @@ class MegatronOptimizer(ABC):
                     params.append(param)
         return params
 
+    def prepare_model_params_for_param_sync(self) -> None:
+        """Stage optimizer-owned model params before an explicit DDP param sync."""
+        return
+
     def _filter_grads_for_norm(
         self,
         params: List[torch.nn.Parameter],
@@ -183,6 +241,7 @@ class MegatronOptimizer(ABC):
           - parameter should not be shared (i.e., grads shouldn't be double counted while
             computing norms).
           - should not be a replica due to tensor model parallelism.
+          - should not be a replica due to (expert) generalized tensor parallelism.
         """
         grads_for_norm = []
         for param in params:
@@ -209,9 +268,12 @@ class MegatronOptimizer(ABC):
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
-                param, getattr(self, 'tp_group', None)
+                param,
+                tp_group=getattr(self, 'tp_group', None),
+                expert_tp_group=getattr(self, 'expert_tp_group', None),
             )
-            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+            is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(param)
+            if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 grads_for_norm.append(grad)
         return grads_for_norm
 
@@ -376,6 +438,7 @@ class MegatronOptimizer(ABC):
                 and getattr(params[0], "__fsdp_param__", False)
             ),
             tp_group=getattr(self, 'tp_group', None),
+            expert_tp_group=getattr(self, 'expert_tp_group', None),
         )
 
     @abstractmethod
@@ -531,9 +594,10 @@ class MegatronOptimizer(ABC):
     def _filter_and_reorder_param_groups(
         current_groups: List[Dict], state_dict_groups: List[Dict]
     ) -> List[Dict]:
-        """Filter and reorder state_dict parameter groups to match current optimizer groups.
-        Keys used for matching align with those from _get_param_groups:
-        (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr)
+        """Pair each current param_group with its saved counterpart by identifier tuple.
+
+        Construction order isn't part of the checkpoint, so we match by a tuple of
+        per-group config (``param_group_identifier_keys``) rather than by position.
 
         Args:
             current_groups (List[Dict]): Parameter groups from the current optimizer instance.
@@ -545,24 +609,29 @@ class MegatronOptimizer(ABC):
         Raises:
             ValueError: If parameter groups in state dict don't match current optimizer.
         """
-        # Define groups order that is needed in the current optimizer (coming from runtime)
-        needed_groups = [
-            # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-            tuple(g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys)
-            for g in current_groups
-        ]
 
-        # Keep state_dict param group order since groups are LocalNonpersistentObject
-        # and their order is determined at runtime, not from the checkpoint.
+        def _identifier_for(group: dict) -> tuple:
+            out = []
+            for key in param_group_identifier_keys:
+                # NeMo aliases ``wd_mult``/``lr_mult`` as ``pre_wd_mult``/``pre_lr_mult``.
+                if key in group:
+                    out.append(group[key])
+                elif f"pre_{key}" in group:
+                    out.append(group[f"pre_{key}"])
+                else:
+                    # Treat missing and explicit None identifier values as equivalent.
+                    out.append(None)
+            return tuple(out)
+
+        needed_groups = [_identifier_for(g) for g in current_groups]
         params_in_state_dict_order = [g['params'] for g in state_dict_groups]
-        loaded_groups_map = {
-            tuple(
-                # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-                group[key] if key in group else group[f"pre_{key}"]
-                for key in param_group_identifier_keys
-            ): group
-            for group in state_dict_groups
-        }
+        # Duplicate identifiers here silently clobber: two saved groups with the same tuple
+        # collapse to whichever was inserted last, and one current group inherits the wrong
+        # override state (``max_lr`` etc.). Params are unaffected — they come from the
+        # current optimizer below — but the next step runs at the wrong LR / WD. Adding the
+        # distinguishing field to ``param_group_identifier_keys`` is the fix. See
+        # ``test_filter_reorder_distinguishes_groups_by_max_lr``.
+        loaded_groups_map = {_identifier_for(group): group for group in state_dict_groups}
 
         final_groups = []
         for key, params in zip(needed_groups, params_in_state_dict_order):
@@ -724,7 +793,13 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+            # The reuse_grad_buf (fp8-param-gather) path stages master params into the DDP
+            # param buffer, which only DistributedOptimizer owns. Optimizers without it
+            # (e.g. LayerWiseDistributedOptimizer's Float16 base opts) must instead copy
+            # master -> model params so the forward sees the update.
+            if self.config.reuse_grad_buf_for_mxfp8_param_ag and hasattr(
+                self, "_copy_main_params_to_param_buffer"
+            ):
                 # In the case of overlap_param_gather,
                 # copy is manually called in the training loop
                 if not self.config.overlap_param_gather:
@@ -770,6 +845,120 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         # Successful update.
         return success, grad_norm, num_zeros_in_grad
+
+
+def _strip_module_prefix(name: str) -> str:
+    """Strip wrapper ``module.`` prefixes (DDP/Float16Module) off a dotted param name."""
+    while name.startswith('module.'):
+        name = name[len('module.') :]
+    return name
+
+
+def _backfill_gtp_sharded_param_map(
+    id_to_sharded_param_map: dict, float16_groups, model_sharded_state_dict=None
+) -> None:
+    """Backfill the optimizer id->ShardedTensor map with GTP_remat shards it is missing (in place).
+
+    WHAT: ``get_param_id_to_sharded_param_map`` matches an optimizer param to its model
+    ShardedTensor by object identity (``id(model_entry.data) == id(optim_param)``). Two GTP_remat
+    cases break that match:
+      1. Native-FP8 GTP weights: the model entry's data is a *dequantized BF16 copy* of the param
+         (make_tp_sharded_tensor_for_checkpoint). The copy carries a ``_gtp_dequant_src`` backlink
+         to the live FP8 param, so the model's OWN entry is reused here (identity first, tagged
+         ``_debug_name`` second) -- preserving its full offsets (expert axes included) and
+         replica_id.
+      2. Gathered+split factory params (Mamba ``in_proj``): the model entry exposes the *gathered*
+         tensor, so nothing matches the per-shard GTP param. Rebuild the same per-shard
+         ShardedTensor every other GTP_remat weight gets. The rebuild is NOT expert-parallel
+         aware (no expert offsets/replica), so expert params must resolve via case 1; refuse
+         loudly instead of writing colliding shards across EP groups.
+
+    WHEN: only the distributed-Muon path reaches here. ``LayerWiseDistributedOptimizer`` keeps such
+    matrix params whole and routes them through this ``Float16OptimizerWithFloat16Params``.
+    Distributed Adam uses its own ``DistributedOptimizer.sharded_state_dict`` (flat-buffer path)
+    and is unaffected.
+
+    No-op when GTP is unavailable or when every param already matched.
+    """
+    try:
+        from megatron.core.tensor_parallel.gtp_api import (
+            is_gtp_param,
+            make_sharded_tensors_for_checkpoint_with_gtp_remat,
+        )
+    except ImportError:
+        return  # GTP not built in -- nothing to backfill.
+
+    # is_gtp_param matches both the legacy BF16 slice params and native-FP8 GTP params.
+    unmatched = [
+        (param_id, p)
+        for param_id, p in enumerate(chain.from_iterable(float16_groups))
+        if param_id not in id_to_sharded_param_map and is_gtp_param(p)
+    ]
+    if not unmatched:
+        return
+
+    from ..dist_checkpointing.dict_utils import nested_values
+    from ..dist_checkpointing.mapping import ShardedTensor
+
+    # Index the model's own entries by (a) the dequantized-copy backlink and (b) checkpoint key.
+    src_id_to_entry = {}
+    key_to_entry = {}
+    if model_sharded_state_dict is not None:
+        for entry in nested_values(model_sharded_state_dict):
+            src = getattr(getattr(entry, 'data', None), '_gtp_dequant_src', None)
+            if src is not None:
+                src_id_to_entry[id(src)] = entry
+            key = getattr(entry, 'key', None)
+            if key is not None:
+                # Grouped-expert entries share one key (offsets differ) -> ambiguous, drop.
+                key_to_entry[key] = None if key in key_to_entry else entry
+
+    # Groups sourced lazily (below) only when a rebuild is needed, so GTP models on
+    # explicit grids (e.g. MiMo) don't require the global MPU groups unless they hit it.
+    tp_group = None
+    dp_cp_gtp_remat_group = None
+    for param_id, p in unmatched:
+        # Case 1: reuse the model's own entry (native-FP8 dequantized copy broke the id match).
+        entry = src_id_to_entry.get(id(p))
+        if entry is None:
+            name = _strip_module_prefix(getattr(p, '_debug_name', '') or '')
+            candidate = key_to_entry.get(name)
+            # Reuse only a plain ShardedTensor with this shard's local shape; a factory
+            # (gathered data, e.g. Mamba in_proj) must take the per-shard rebuild below.
+            if (
+                candidate is not None
+                and isinstance(candidate, ShardedTensor)
+                and tuple(candidate.data.shape) == tuple(p.shape)
+            ):
+                entry = candidate
+        if entry is not None:
+            id_to_sharded_param_map[param_id] = entry
+            continue
+        # Case 2: rebuild. Not EP-aware -- an expert param rebuilt here would collide across
+        # expert-parallel groups (duplicate writers), so it must have matched above.
+        if not getattr(p, 'allreduce', True):
+            raise ValueError(
+                f"GTP expert-parallel param '{getattr(p, '_debug_name', '')}' (id {param_id}) "
+                "has no matching model ShardedTensor; refusing the EP-unaware rebuild (it would "
+                "write duplicate shards across expert-parallel groups)."
+            )
+        if tp_group is None:
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            # Required kwarg, unused for GTP-sharded params (offset/replica from the gtp axis).
+            dp_cp_gtp_remat_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True
+            )
+        # Key by the param's dotted name (set in prod by tag_gtp_params_with_names); the fallback
+        # keeps the function usable in tests where the name was not tagged.
+        key = p._debug_name or f'_gtp_optim_param_{param_id}'
+        rebuilt = make_sharded_tensors_for_checkpoint_with_gtp_remat(
+            {key: p},
+            prefix='',
+            tensor_parallel_layers_axis_map={key: 0},
+            tp_group=tp_group,
+            dp_cp_group=dp_cp_gtp_remat_group,
+        )
+        id_to_sharded_param_map[param_id] = rebuilt[key]
 
 
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
@@ -823,6 +1012,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
+                            tensor_parallel.copy_gtp_attributes(main_param, param)
                             copy_optimizer_param_metadata(main_param, param)
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
@@ -957,14 +1147,50 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         state_dict = self.state_dict()
 
+        # Optimizer state ids enumerate the inner optimizer params: the fp32 main
+        # copies of float16 params, native fp32 params, and any frozen params,
+        # interleaved in the original param-group order. Map each fp32 main copy
+        # back to its model-side param; all other params already are model params.
+        main_param_id_to_model_param = {
+            id(main_param): model_param
+            for model_group, main_group in zip(
+                self.float16_groups, self.fp32_from_float16_groups, strict=True
+            )
+            for model_param, main_param in zip(model_group, main_group, strict=True)
+        }
+
+        def model_params_in_optimizer_order():
+            for param in chain.from_iterable(
+                inner_group['params'] for inner_group in self.optimizer.param_groups
+            ):
+                yield main_param_id_to_model_param.get(id(param), param)
+
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
-            model_sharded_state_dict, chain.from_iterable(g for g in self.float16_groups)
+            model_sharded_state_dict, model_params_in_optimizer_order()
+        )
+
+        _backfill_gtp_sharded_param_map(
+            id_to_sharded_param_map, self.float16_groups, model_sharded_state_dict
         )
 
         # Convert fp32_from_fp16_params
         assert len(state_dict['fp32_from_fp16_params']) == len(
             state_dict['optimizer']['param_groups']
         )
+        # State ids of the fp32 main copies only, skipping native fp32 and frozen params.
+        float16_param_ids_per_group = []
+        for state_group, inner_group in zip(
+            state_dict['optimizer']['param_groups'], self.optimizer.param_groups, strict=True
+        ):
+            float16_param_ids_per_group.append(
+                [
+                    param_id
+                    for param_id, param in zip(
+                        state_group['params'], inner_group['params'], strict=True
+                    )
+                    if id(param) in main_param_id_to_model_param
+                ]
+            )
         state_dict['fp32_from_fp16_params'] = [
             [
                 make_sharded_optimizer_tensor(
@@ -972,10 +1198,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     fp32_param,
                     prefix=f'optimizer.state.fp32_param',
                 )
-                for param_id, fp32_param in zip(state_group['params'], fp32_group)
+                for param_id, fp32_param in zip(param_ids, fp32_group, strict=True)
             ]
-            for fp32_group, state_group in zip(
-                state_dict['fp32_from_fp16_params'], state_dict['optimizer']['param_groups']
+            for fp32_group, param_ids in zip(
+                state_dict['fp32_from_fp16_params'], float16_param_ids_per_group, strict=True
             )
         ]
 
@@ -1392,6 +1618,43 @@ class ChainedOptimizer(MegatronOptimizer):
             optimizer.load_state_dict(state)
         self._synchronize_steps()
 
+    @override
+    @torch.no_grad()
+    def prepare_model_params_for_param_sync(self) -> None:
+        """Stage params once per DDP model chunk before explicit param sync."""
+        use_reused_grad_buffer = (
+            self.config.reuse_grad_buf_for_mxfp8_param_ag and self.config.overlap_param_gather
+        )
+        if not use_reused_grad_buffer:
+            for optimizer in self.chained_optimizers:
+                optimizer.prepare_model_params_for_param_sync()
+            return
+
+        from .distrib_optimizer import DistributedOptimizer
+
+        model_chunks = []
+        model_chunk_ids = set()
+        dist_optimizers = []
+
+        for optimizer in self.chained_optimizers:
+            if isinstance(optimizer, DistributedOptimizer):
+                dist_optimizers.append(optimizer)
+                if getattr(optimizer, 'is_stub_optimizer', False):
+                    continue
+                for model_chunk in optimizer.model_chunks:
+                    model_chunk_id = id(model_chunk)
+                    if model_chunk_id not in model_chunk_ids:
+                        model_chunk_ids.add(model_chunk_id)
+                        model_chunks.append(model_chunk)
+            else:
+                optimizer.prepare_model_params_for_param_sync()
+
+        for model_chunk in model_chunks:
+            model_chunk.zero_grad_buffer()
+        for optimizer in dist_optimizers:
+            if not getattr(optimizer, 'is_stub_optimizer', False):
+                optimizer._copy_main_params_to_param_buffer()
+
     @torch.no_grad()
     def prepare_grads(self) -> bool:
         """Pre-processing gradients before the optimizer step, returns whether inf/nan is found."""
@@ -1559,6 +1822,8 @@ class ChainedOptimizer(MegatronOptimizer):
                     self.config.use_precision_aware_optimizer
                     and getattr(params[0], "__fsdp_param__", False)
                 ),
+                tp_group=getattr(self.chained_optimizers[0], 'tp_group', None),
+                expert_tp_group=getattr(self.chained_optimizers[0], 'expert_tp_group', None),
             )
         else:
             num_zeros_in_grad = 0
@@ -1687,7 +1952,12 @@ class ChainedOptimizer(MegatronOptimizer):
                         use_decoupled_grad=use_decoupled_grad,
                     )
 
-            if grad_norm > optimizer.config.grad_norm_skip_threshold and main_params:
+            grad_norm_skip_threshold = optimizer.config.grad_norm_skip_threshold
+            if (
+                main_params
+                and math.isfinite(grad_norm_skip_threshold)
+                and grad_norm > grad_norm_skip_threshold
+            ):
                 log_single_rank(
                     logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
                 )

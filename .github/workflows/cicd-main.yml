@@ -34,7 +34,7 @@ permissions:
 
 env:
   container-registry: 766267172432.dkr.ecr.us-east-1.amazonaws.com
-  container-registry-gb200: us-east4-docker.pkg.dev/nv-projdgxchipp-20260113193621/megatron-lm
+  container-registry-gb200: 766267172432.dkr.ecr.us-east-2.amazonaws.com
 
 jobs:
   is-not-external-contributor:
@@ -44,7 +44,7 @@ jobs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
       is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
       selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || 'nvidia-ci-aws-gpu-x8-ephemeral' }}
-      selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-gcp-gpu-x4' || 'ubuntu-latest' }}
+      selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-use2-gpu-x4' || 'ubuntu-latest' }}
     permissions:
       issues: write
       pull-requests: write
@@ -54,14 +54,14 @@ jobs:
       DISABLE_EXTERNAL_CONTRIBUTOR: ${{ vars.DISABLE_EXTERNAL_CONTRIBUTOR }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           token: ${{ env.GITHUB_TOKEN }}
 
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Check NVIDIA SSO membership
         id: check-sso
@@ -133,7 +133,7 @@ jobs:
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v1.0.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
 
   configure:
     runs-on: ubuntu-latest
@@ -154,7 +154,7 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       # Resolve a single SHA used by the build, every test job, and every
       # downstream checkout so that the container image, golden values, and
@@ -341,12 +341,12 @@ jobs:
       )
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           version: 0.7.2
 
@@ -354,10 +354,36 @@ jobs:
         run: |
           uv sync --locked --only-group linting
 
+      - name: Test CI cache keys
+        run: .github/scripts/test_cache_keys.sh
+
+      - name: Test queue approval topology
+        run: .github/scripts/test_approve_test_queue.sh
+
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+
+      - name: Validate updated golden values
+        if: github.event_name == 'merge_group' || (startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push')
+        env:
+          BASE_REF: ${{ github.event.merge_group.base_ref || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
+        run: |
+          BASE_REF="${BASE_REF#refs/heads/}"
+          git fetch origin "$BASE_REF"
+          mapfile -t GOLDEN_VALUES_FILES < <(
+            git diff --name-only --diff-filter=ACMR \
+              --merge-base "origin/$BASE_REF" -- \
+              ':(glob)tests/functional_tests/test_cases/**/golden_values*.json'
+          )
+
+          if (( ${#GOLDEN_VALUES_FILES[@]} == 0 )); then
+            echo "No golden value files were updated; skipping validation."
+            exit 0
+          fi
+
+          python3 tools/check_golden_values.py "${GOLDEN_VALUES_FILES[@]}"
 
       - name: Run linting
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
@@ -406,7 +432,7 @@ jobs:
       mbridge-test-suite: ${{ needs.configure.outputs.mbridge_suite }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: How-To
         run: bash .github/scripts/readme.sh
@@ -418,9 +444,9 @@ jobs:
       - configure
       - cicd-wait-in-queue
       - cicd-parse-downstream-testing
-    # skip downstream mbridge testing on PR pushes by
-    # default. They still run for merge_group and nightly (schedule /
-    # workflow_dispatch) triggers, and PR authors can opt in by adding the
+    # Skip downstream MBridge testing for docs-only changes and PR pushes by
+    # default. Non-docs merge_group and nightly (schedule / workflow_dispatch)
+    # triggers still run it, and PR authors can opt in by adding the
     # "Run MBridge tests" label — all three cases set
     # configure.outputs.run_mbridge == 'true'.
     if: |
@@ -430,6 +456,7 @@ jobs:
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
       && vars.ENABLE_CICD_MBRIDGE_TESTING == 'true'
       && needs.configure.outputs.run_mbridge == 'true'
+      && needs.pre-flight.outputs.docs_only == 'false'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -441,10 +468,10 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Checkout MBridge and create testing branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: main
           repository: NVIDIA-NeMo/Megatron-Bridge
@@ -461,7 +488,7 @@ jobs:
           git push origin ${{ env.MBRIDGE_BRANCH_NAME }} --force
 
       - name: Trigger MBridge tests
-        uses: convictional/trigger-workflow-and-wait@v1.6.5
+        uses: convictional/trigger-workflow-and-wait@f69fa9eedd3c62a599220f4d5745230e237904be # v1.6.5
         env:
           MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
         with:
@@ -497,7 +524,7 @@ jobs:
       && (needs.cicd-mbridge-testing.result == 'success' || needs.cicd-mbridge-testing.result == 'failure')
     steps:
       - name: Send Slack alert
-        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@main
+        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@209ac7913b0419a5ccbac47b02d00fbea4939243 # main
         with:
           webhook: ${{ secrets.SLACK_WH_MLM_MB_ALERTS }}
           message: |
@@ -516,21 +543,21 @@ jobs:
         id: compute
         env:
           IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
-          ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
+          ENABLE_GB_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
           SELECTED_RUNNER: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
-          SELECTED_RUNNER_GB200: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+          SELECTED_RUNNER_GB_GPU: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
           REGISTRY_AWS: ${{ env.container-registry }}
-          REGISTRY_GCP: ${{ env.container-registry-gb200 }}
+          REGISTRY_GB_GPU: ${{ env.container-registry-gb200 }}
         run: |
-          AWS_ENTRY=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
-            '{"cloud": "aws", "registry": $registry, "runner": $runner}')
-          if [ "$IS_MAINTAINER" == "true" ] && [ "$ENABLE_GB200_TESTING" == "true" ]; then
-            GCP_ENTRY=$(jq -nc --arg registry "$REGISTRY_GCP" --arg runner "$SELECTED_RUNNER_GB200" \
-              '{"cloud": "gcp", "registry": $registry, "runner": $runner}')
-            MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" --argjson gcp "$GCP_ENTRY" \
-              '{"include": [$aws, $gcp]}')
+          AWS_H100=$(jq -nc --arg registry "$REGISTRY_AWS" --arg runner "$SELECTED_RUNNER" \
+            '{"cloud": "aws-h100", "registry": $registry, "runner": $runner}')
+          if [ "$IS_MAINTAINER" == "true" ] && [ "$ENABLE_GB_TESTING" == "true" ]; then
+            GB_GPU=$(jq -nc --arg registry "$REGISTRY_GB_GPU" --arg runner "$SELECTED_RUNNER_GB_GPU" \
+              '{"cloud": "gb-gpu", "registry": $registry, "runner": $runner}')
+            MATRIX=$(jq -nc --argjson aws "$AWS_H100" --argjson gb_gpu "$GB_GPU" \
+              '{"include": [$aws, $gb_gpu]}')
           else
-            MATRIX=$(jq -nc --argjson aws "$AWS_ENTRY" '{"include": [$aws]}')
+            MATRIX=$(jq -nc --argjson aws "$AWS_H100" '{"include": [$aws]}')
           fi
           echo "matrix=$MATRIX" | tee -a "$GITHUB_OUTPUT"
 
@@ -556,56 +583,80 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
       - name: Setup python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: 3.12
 
-      - name: Install GH CLI
-        shell: bash -x -e -u -o pipefail {0}
-        run: |
-          for i in 1 2 3; do
-            apt-get update && apt-get install -y gh && break
-            echo "apt attempt $i failed, retrying..."
-            sleep 10
-          done
-
       - name: Download test data
         shell: bash
+        env:
+          NEMO_TEST_DATA_ROOT: /mnt/datadrive/TestData/nemo-fw/TestData
         run: |
           echo "::group::Download test data"
-          pip install --no-cache-dir click requests
-          python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
+          for attempt in 1 2 3; do
+            if pip install --no-cache-dir click requests \
+              && python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets; then
+              break
+            fi
+            echo "Download test data attempt ${attempt} failed, retrying..." >&2
+            if [ "${attempt}" -eq 3 ]; then
+              echo "Download test data failed after 3 attempts" >&2
+              exit 1
+            fi
+            sleep 10
+          done
           echo "::endgroup::"
 
-      - name: Get last merged PR
-        id: cache_from
+      - name: Compute cache config
+        id: cache_keys
+        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.event.merge_group.base_ref || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref || github.ref_name }}
+          CACHE_VARIANT: ${{ needs.configure.outputs.lts == 'true' && 'lts' || 'dev' }}
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
+          REF: ${{ github.ref }}
         run: |
-          LAST_PRS=$(gh api graphql -f query='
-            query {
-              repository(owner: "NVIDIA", name: "Megatron-LM") {
-                pullRequests(states: MERGED, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
-                  nodes {
-                    number
-                  }
-                }
-              }
-            }' | jq -r '.data.repository.pullRequests.nodes[].number' | while read -r number; do
-              echo "type=registry,ref=${{ matrix.registry }}/megatron-lm:$number-buildcache,mode=max"
-            done)
+          BASE_REF="${BASE_REF#refs/heads/}"
+          CACHE_NAMESPACE=$(printf '%s' "$BASE_REF" | tr '/:@' '-' | tr -cd '[:alnum:]_.-')
+          if [ -z "$CACHE_NAMESPACE" ]; then
+            echo "Unable to derive a cache namespace from base ref: $BASE_REF" >&2
+            exit 1
+          fi
 
-          echo "LAST_PRS<<EOF" | tee -a $GITHUB_OUTPUT
-          echo "$LAST_PRS" | tee -a $GITHUB_OUTPUT
-          echo "EOF" | tee -a $GITHUB_OUTPUT
+          if [ "$PR_NUMBER" = "0" ] && [ -n "$MERGE_GROUP_HEAD_REF" ]; then
+            PR_NUMBER=$(printf '%s' "$MERGE_GROUP_HEAD_REF" | sed -nE 's#.*pr-([0-9]+)-.*#\1#p')
+          fi
+
+          BASELINE_KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-baseline"
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "0" ]; then
+            KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-${PR_NUMBER}"
+          elif [ "$REF" = "refs/heads/$BASE_REF" ] || [ "$EVENT_NAME" = "schedule" ]; then
+            KEY="$BASELINE_KEY"
+          else
+            BRANCH_NAMESPACE=$(printf '%s' "$GITHUB_REF_NAME" | tr '/:@' '-' | tr -cd '[:alnum:]_.-')
+            KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-${BRANCH_NAMESPACE}"
+          fi
+
+          if [ "${#KEY}" -gt 100 ]; then
+            KEY="${KEY:0:83}-$(printf '%s' "$KEY" | sha256sum | cut -c1-16)"
+          fi
+          if [ "${#BASELINE_KEY}" -gt 100 ]; then
+            BASELINE_KEY="${BASELINE_KEY:0:83}-$(printf '%s' "$BASELINE_KEY" | sha256sum | cut -c1-16)"
+          fi
+
+          echo "key=$KEY" | tee -a "$GITHUB_OUTPUT"
+          echo "baseline=$BASELINE_KEY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Parse baseimage
         shell: bash
@@ -626,10 +677,27 @@ jobs:
           fi
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.0.0
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Select cache donor
+        id: cache_from
+        shell: bash
+        env:
+          BASELINE_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.baseline }}-buildcache-${{ matrix.cloud }}
+          LEGACY_CACHE: ${{ matrix.registry }}/megatron-lm:0-buildcache-${{ matrix.cloud }}
+          RUN_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }}
+        run: |
+          DONOR_CACHE="$RUN_CACHE"
+          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
+            DONOR_CACHE="$BASELINE_CACHE"
+          fi
+          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
+            DONOR_CACHE="$LEGACY_CACHE"
+          fi
+          echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
 
       - name: Build and push
-        uses: docker/build-push-action@v7.1.0
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           file: ${{ steps.base-image.outputs.dockerfile }}
           push: true
@@ -638,16 +706,12 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
             IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
-          cache-from: |
-            type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
-            type=registry,ref=${{ matrix.registry }}/megatron-lm:main-buildcache,mode=max
-            ${{ steps.cache_from.outputs.LAST_PRS }}
-          cache-to: |
-            type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}-buildcache,mode=max
+          cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
+          cache-to: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }},mode=max
           no-cache: false
           tags: |
-            ${{ matrix.registry }}/megatron-lm:${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
-            ${{ matrix.registry }}/megatron-lm:${{ needs.configure.outputs.sha }}
+            ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-${{ matrix.cloud }}
+            ${{ matrix.registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-${{ matrix.cloud }}
           secrets: |
             GH_TOKEN=${{ secrets.PAT }}
 
@@ -674,7 +738,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
@@ -720,7 +784,7 @@ jobs:
       PIP_RETRIES: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -731,7 +795,96 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
+          sha: ${{ needs.configure.outputs.sha }}
+
+  cicd-parse-unit-tests-gb200:
+    runs-on: ubuntu-latest
+    outputs:
+      unit-tests-gb200: ${{ steps.parse-unit-tests.outputs.unit-tests-gb200 }}
+    needs:
+      - is-not-external-contributor
+      - pre-flight
+      - configure
+      - cicd-wait-in-queue
+      - cicd-container-build
+    if: |
+      needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
+      && vars.ENABLE_GB200_TESTING == 'true'
+      && (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
+      )
+      && !cancelled()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+      - name: Parse unit tests
+        id: parse-unit-tests
+        run: |
+          cat tests/test_utils/recipes/gb200/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests-gb200.json
+          echo "unit-tests-gb200=$(cat unit-tests-gb200.json)" | tee -a $GITHUB_OUTPUT
+
+  cicd-unit-tests-latest-gb200:
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.cicd-parse-unit-tests-gb200.outputs.unit-tests-gb200) }}
+    needs:
+      - is-not-external-contributor
+      - pre-flight
+      - configure
+      - cicd-wait-in-queue
+      - cicd-container-build
+      - cicd-parse-unit-tests-gb200
+    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
+    timeout-minutes: 60
+    name: "${{ matrix.bucket }} - gb200 latest"
+    if: |
+      needs.is-not-external-contributor.result != 'cancelled'
+      && needs.pre-flight.result != 'cancelled'
+      && needs.configure.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && needs.cicd-parse-unit-tests-gb200.result == 'success'
+      && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
+      && vars.ENABLE_GB200_TESTING == 'true'
+      && (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
+      )
+      && !cancelled()
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: 1
+      PIP_NO_PYTHON_VERSION_WARNING: 1
+      PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.configure.outputs.sha }}
+      - name: main
+        uses: ./.github/actions
+        with:
+          test_case: ${{ matrix.bucket }}
+          tag: latest
+          timeout: ${{ matrix.timeout || 30 }}
+          is_unit_test: "true"
+          PAT: ${{ secrets.PAT }}
+          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
+          platform: dgx_gb200
           sha: ${{ needs.configure.outputs.sha }}
 
   # Single source of truth for "should integration tests run?".
@@ -810,7 +963,7 @@ jobs:
       integration-tests-h100: ${{ steps.main.outputs.integration-tests-h100 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
@@ -875,7 +1028,7 @@ jobs:
       && needs.cicd-parse-integration-tests-h100.result == 'success'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -887,7 +1040,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}
+          container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
@@ -909,7 +1062,7 @@ jobs:
       integration-tests-gb200: ${{ steps.main.outputs.integration-tests-gb200 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
@@ -976,7 +1129,7 @@ jobs:
       && vars.ENABLE_GB200_TESTING == 'true'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -988,7 +1141,7 @@ jobs:
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
-          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}
+          container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
           lightweight: ${{ needs.configure.outputs.lightweight }}
@@ -1001,6 +1154,7 @@ jobs:
       - pre-flight
       - is-not-external-contributor
       - cicd-unit-tests-latest
+      - cicd-unit-tests-latest-gb200
       - cicd-integration-tests-latest-h100
       - cicd-integration-tests-latest-gb200
     if: |
@@ -1017,7 +1171,7 @@ jobs:
     permissions: write-all
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Get workflow result
         id: result
@@ -1032,6 +1186,7 @@ jobs:
           FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
           ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
+          UNIT_GB200_RESULT: ${{ needs.cicd-unit-tests-latest-gb200.result }}
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
           GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
         run: |
@@ -1067,12 +1222,16 @@ jobs:
             FAILED=true
           fi
 
-          # GB200 integration tests are required only when explicitly enabled.
+          # GB200 tests are required only when explicitly enabled.
           if [ "$ENABLE_GB200_TESTING" == "true" ]; then
-            # GB200 integration tests may be skipped only for non-maintainer PRs
+            # GB200 tests may be skipped only for non-maintainer PRs
             # (no GB200 runners available); maintainer runs must always succeed.
             if [ "$GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
               echo "❌ cicd-integration-tests-latest-gb200: skipped unexpectedly for a maintainer run"
+              FAILED=true
+            fi
+            if [ "$UNIT_GB200_RESULT" == "skipped" ] && [ "$IS_MAINTAINER" == "true" ]; then
+              echo "❌ cicd-unit-tests-latest-gb200: skipped unexpectedly for a maintainer run"
               FAILED=true
             fi
           else
@@ -1122,7 +1281,7 @@ jobs:
       && github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Generate fake coverage report
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           github-token: ${{ secrets.PAT }}
           script: |
@@ -1153,13 +1312,13 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download coverage reports of current branch
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: coverage-${{ matrix.flag }}-*
 
@@ -1180,7 +1339,7 @@ jobs:
           ls -al
 
       - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
@@ -1188,7 +1347,7 @@ jobs:
           base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: coverage-${{ matrix.flag }}-aggregated
           path: |
@@ -1209,7 +1368,7 @@ jobs:
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
 
       - name: Comment on PR with action run URL
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           github-token: ${{ secrets.PAT }}
           script: |

@@ -330,7 +330,7 @@ class TestPartitionAdapterApplyContextParallel:
 def _expected_cp_zigzag_shard(tensor: torch.Tensor, cp_size: int, cp_rank: int) -> torch.Tensor:
     """Reconstruct the CP zigzag shard of ``tensor`` along the sequence dim (dim 1).
 
-    Mirrors ``get_pretrain_batch_on_this_cp_rank``: the sequence is split into
+    Mirrors ``_get_batch_on_this_cp_rank_per_sequence_balancing``: the sequence is split into
     ``2 * cp_size`` equal chunks and rank ``r`` keeps chunks ``r`` and
     ``2*cp_size - r - 1`` (concatenated in that order). Implemented independently
     here so the real-distributed assertions do not lean on the production helper.

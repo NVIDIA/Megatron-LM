@@ -120,6 +120,7 @@ def _make_dsa_config(num_layers: int, tp: int = 1, pp: int = 1) -> MLATransforme
         hidden_dropout=0.0,
         attention_dropout=0.0,
         tensor_model_parallel_size=tp,
+        sequence_parallel=tp > 1,
         pipeline_model_parallel_size=pp,
     )
 

@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 
-
 @dataclass(kw_only=True)
 class TrainingConfig:
     """Configuration settings related to the training loop."""
@@ -367,6 +366,27 @@ class LoggerConfig:
     save_config_filepath: str | None = None
     """If set, save the task configuration (ConfigContainer) to this file."""
 
+    moe_routing_trace_path: str | None = None
+    """Directory for MoE router decision traces (JSONL).  When set, a RouterTracer is initialized
+    at training start and hooks are registered on all TopKRouter modules.
+    Traces are written in the same format as inference traces so the analysis scripts under
+    tools/moe_routing work on both."""
+
+    moe_routing_trace_max_training_iters: int | None = None
+    """Maximum number of training iterations to trace.  Tracing stops
+    automatically after this many calls to advance_step().  Defaults
+    to tracing all iterations when moe_routing_trace_path is set.
+    (Inference uses --moe-routing-trace-max-inference-steps instead.)"""
+
+    moe_routing_trace_capture_logits: bool = False
+    """Capture pre-topk routing logits for each router call."""
+
+    moe_routing_trace_capture_hidden_states: bool = False
+    """Capture input hidden-state tensors for each router call."""
+
+    moe_routing_trace_dump_weights: bool = False
+    """Save router weight tensors to a .pt sidecar file."""
+
 
 @dataclass(kw_only=True)
 class CheckpointConfig:
@@ -528,6 +548,14 @@ class CheckpointConfig:
     "gather_object": Gather the checkpoint from all ranks in a single operation.
     """
 
+    ckpt_fully_parallel_load_per_rank_objects: bool = False
+    """Load ShardedObjects per-rank during fully parallel load of distributed checkpoints.
+    When True, every rank reads all of its own ShardedObjects (RNG states,
+    TE `_extra_state`, ...) directly from storage, which removes the WORLD-wide
+    `all_gather_object` that otherwise exchanges them. Objects are
+    content-addressable by `unique_key`, so the loaded values are identical.
+    When False (default), the legacy gather-based object exchange is used."""
+
     ckpt_fully_parallel_save_process_group: Literal["dp", "ep_dp"] = "dp"
     """Process group for fully parallel save of distributed checkpoints.
     "dp"(default): Data parallel process group.
@@ -544,9 +572,11 @@ class CheckpointConfig:
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
     ckpt_load_validate_sharding_integrity: bool = True
-    """Whether to validate sharding access integrity when loading a distributed checkpoint.
-    When True (default), each tensor shard is checked to be accessed exactly once as main
-    replica by some rank. Disabling skips this validation"""
+    """Whether to validate sharding access integrity when loading *and saving* a distributed
+    checkpoint. When True (default), each tensor shard is checked to be accessed exactly once as
+    main replica by some rank. Disabling skips this validation; on save this also skips the
+    world-wide determine_global_metadata all_gather_object (otherwise run on the first save of a
+    job)."""
 
     strict_fsdp_dtensor_load: bool = True
     """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""

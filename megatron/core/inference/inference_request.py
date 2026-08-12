@@ -142,6 +142,10 @@ class InferenceRequest:
     sampling_params: Optional[SamplingParams] = None
     inference_parameters: Optional[SamplingParams] = None
     prompt_tokens: Optional[List[int]] = None
+    # Prompt token count. Always populated when serializing a finished request so the
+    # API can report usage.prompt_tokens even when the prompt_tokens tensor itself is
+    # dropped from the payload (see SamplingParams.return_prompt_tokens).
+    prompt_length: Optional[int] = None
     arrival_time: Optional[float] = None
     status: Optional[Status] = None
     encoder_prompt: Optional[str] = None
@@ -380,6 +384,7 @@ class DynamicInferenceRequest(InferenceRequest):
     # Prefix caching fields
     block_size_tokens: Optional[int] = None  # Block size for hash computation
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
+    num_cached_tokens: int = 0  # Tokens served from prefix cache (set by context on first match)
 
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
@@ -440,19 +445,40 @@ class DynamicInferenceRequest(InferenceRequest):
                 serialization.
         """
         nvtx_range_push("DynamicInferenceRequest.serialize")
+
+        # The prompt length is always reported (needed for usage.prompt_tokens),
+        # but the prompt_tokens tensor is dropped from the wire payload unless the
+        # client asked for it back (return_prompt_tokens). This keeps the large
+        # prompt tensor off the engine->coordinator->API path. Null it around
+        # super() so the tensor is never serialized, then restore local state.
+        prompt_len = len(self.prompt_tokens) if self.prompt_tokens is not None else None
+        drop_prompt = (
+            self.prompt_tokens is not None
+            and self.sampling_params is not None
+            and not getattr(self.sampling_params, "return_prompt_tokens", False)
+        )
+        saved_prompt_tokens = None
+        if drop_prompt:
+            saved_prompt_tokens = self.prompt_tokens
+            self.prompt_tokens = None
+
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
+        obj["prompt_length"] = prompt_len
 
         # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:
-            total_tokens = len(self.prompt_tokens) + len(self.generated_tokens)
+            total_tokens = prompt_len + len(self.generated_tokens)
             # the last generated token does not undergo a forward pass
             # hence we expect routing indices for total_tokens - 1
             assert self.routing_indices.shape[0] == total_tokens - 1, (
                 f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
                 f"total tokens {total_tokens-1}."
             )
+
+        if drop_prompt:
+            self.prompt_tokens = saved_prompt_tokens
 
         nvtx_range_pop("DynamicInferenceRequest.serialize")
         return obj
@@ -669,13 +695,16 @@ class DynamicInferenceRequestRecord:
             }
         )
 
-        # New request.
+        # Preserve prefix-cache configuration and let __post_init__ recompute hashes for the
+        # expanded prompt. The previous hash list may not include newly completed blocks.
         new_request = DynamicInferenceRequest(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
+            block_size_tokens=old_request.block_size_tokens,
+            enable_prefix_caching=old_request.enable_prefix_caching,
         )
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
@@ -740,6 +769,7 @@ class DynamicInferenceRequestRecord:
             block_size_tokens=self.requests[0].block_size_tokens,
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
+            num_cached_tokens=self.requests[0].num_cached_tokens,
         )
 
         return request

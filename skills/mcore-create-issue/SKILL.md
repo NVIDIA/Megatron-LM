@@ -6,7 +6,7 @@ when_to_use: User shares a GitHub Actions URL and wants to file a bug report; 'c
 user_invocable: true
 argument: "GitHub Actions run or job URL"
 metadata:
-  author: Philip Petrakian <ppetrakian@nvidia.com>
+  author: Oliver Koenig <okoenig@nvidia.com>
 ---
 
 # Triage CI Failure into a GitHub Issue
