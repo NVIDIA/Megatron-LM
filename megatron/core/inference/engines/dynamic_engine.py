@@ -2342,9 +2342,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 if self.local_metadata_ledger_enabled:
                     # Index every finished request's extra metadata before it is dropped.
                     for merged in merged_requests:
-                        assert merged.uid not in self.local_metadata_ledger, (
-                            f"finished-request ledger: duplicate uid {merged.uid!r}"
-                        )
+                        assert (
+                            merged.uid not in self.local_metadata_ledger
+                        ), f"finished-request ledger: duplicate uid {merged.uid!r}"
                         self.local_metadata_ledger[merged.uid] = FinishedRequestRecord.from_request(
                             merged
                         )
