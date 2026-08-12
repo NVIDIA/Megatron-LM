@@ -3,6 +3,7 @@
 """Caller-owned orchestration of grouped rollout generation over an agent."""
 
 import asyncio
+import logging
 import time
 from collections import deque
 from typing import TYPE_CHECKING, AsyncIterator, NamedTuple
@@ -19,6 +20,8 @@ from .api import EpisodeResult, GroupedRolloutRequest, GroupRolloutParams, Rollo
 if TYPE_CHECKING:
     from ..rollout_bank import RolloutBank
     from .api import GroupedRolloutGenerator
+
+logger = logging.getLogger(__name__)
 
 
 class _GranularityConfig(NamedTuple):
@@ -260,6 +263,7 @@ class RolloutPipeline:
         self.inferred_count = 0
         self.assembled_count = 0
         self.filtered_count = 0
+        self.refilled_placeholder_groups = 0
         self.restored_count = 0
         self.yielded_count = 0
         self.prepared_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
@@ -466,8 +470,26 @@ class RolloutPipeline:
                     batch_id=first.item.batch_id,
                     index_in_batch=first.item.index_in_batch,
                 )
-                if self._should_drop(group):
-                    self.filtered_count += 1
+                # All-placeholder groups carry zero salvageable work and must be refilled.
+                _placeholder = all(not rollout.trajectory for rollout in group.rollouts)
+                if _placeholder or self._should_drop(group):
+                    if _placeholder:
+                        self.refilled_placeholder_groups += 1
+                        if (
+                            self.refilled_placeholder_groups == 1
+                            or self.refilled_placeholder_groups % 32 == 0
+                        ):
+                            logger.warning(
+                                "Refilling all-placeholder group (batch %s slot %s): %d "
+                                "refilled so far. Groups whose episodes all failed are "
+                                "regenerated instead of reaching the trainer; a climbing "
+                                "count means episodes are failing upstream of the pipeline.",
+                                group.batch_id,
+                                group.index_in_batch,
+                                self.refilled_placeholder_groups,
+                            )
+                    else:
+                        self.filtered_count += 1
                     task = asyncio.create_task(self._regenerate_group(group))
                     self._regen_tasks.add(task)
                     task.add_done_callback(self._regen_tasks.discard)
