@@ -491,7 +491,7 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_mbridge_orchestrator.yml@8fafba382b006bb22f80a70758cba27cf2fd8b0d
+    uses: svcnemo-autobot/FW-CI-templates/.github/workflows/_mbridge_orchestrator.yml@8fafba382b006bb22f80a70758cba27cf2fd8b0d
     with:
       mcore_ref: ${{ needs.configure.outputs.sha }}
       test_suite: ${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}
