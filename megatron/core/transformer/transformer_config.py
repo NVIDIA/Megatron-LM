@@ -989,6 +989,44 @@ class TransformerConfig(ModelParallelConfig):
     count)."""
 
     ##################
+    # MoE Experts Offloading
+    ##################
+    moe_use_offloading_experts: bool = False
+    """Use OffloadingExpertsMLP for the routed experts. Expert weights are kept in pinned CPU
+    memory and prefetched chunk-by-chunk into a small GPU staging buffer during forward and
+    backward, trading host-to-device bandwidth for GPU memory. Requires expert tensor parallel
+    size 1 and gradient_accumulation_fusion."""
+
+    moe_offloading_num_chunks: int = 1
+    """Number of chunks the local experts are split into for offloading. Each chunk is prefetched
+    from CPU as a unit, so more chunks means a smaller GPU staging buffer but more (and smaller)
+    H2D copies. num_local_experts must be divisible by this value."""
+
+    moe_offloading_num_stages: int = 2
+    """Number of GPU staging buffers used to prefetch expert chunks. 2 gives double buffering, so
+    the H2D copy of chunk i+1 overlaps the compute of chunk i. GPU buffer memory is
+    moe_offloading_num_stages * moe_offloading_chunk_size expert weights per FC layer."""
+
+    moe_offloading_chunk_size: int = -1
+    """Number of experts per chunk. Derived by OffloadingExpertsMLP at build time as
+    num_local_experts // moe_offloading_num_chunks; not intended to be set by the user."""
+
+    moe_offloading_experts_te_style_init: bool = True
+    """Initialize offloaded expert weights the way TEGroupedMLP does (per-expert init on GPU under
+    the expert-parallel RNG tracker) instead of _initialize_affine_weight_cpu, so that runs with
+    and without offloading start from the same weights."""
+
+    moe_offloading_experts_skip_post_backward_hook: bool = True
+    """Mark offloaded expert weights with skip_backward_post_hook so DDP registers the grad
+    accumulation/reduce hook on the module rather than the parameter, letting the wgrad reduce run
+    from backward_dw(). Only takes effect with delay_wgrad_compute; ignored in debug mode."""
+
+    moe_offloading_experts_debug_mode: bool = False
+    """Debug mode: keep the 'offloaded' expert weights resident on GPU (unpinned, no H2D staging,
+    no backward post-hook rerouting) so the offloading path can be compared against a plain GPU
+    run."""
+
+    ##################
     # Context Parallel
     ##################
     cp_comm_type: Optional[Union[str, List[str]]] = None
@@ -1888,6 +1926,29 @@ class TransformerConfig(ModelParallelConfig):
                             "transformer-engine>=2.6.0dev0, "
                             f"but your version is {get_te_version()}."
                         )
+
+        if self.moe_use_offloading_experts:
+            if self.moe_offloading_num_chunks < 1:
+                raise ValueError("moe_offloading_num_chunks must be at least 1.")
+            if self.moe_offloading_num_stages < 1:
+                raise ValueError("moe_offloading_num_stages must be at least 1.")
+            if self.moe_offloading_num_chunks > 1 and self.moe_offloading_num_stages < 2:
+                raise ValueError(
+                    "moe_offloading_num_stages must be at least 2 when "
+                    "moe_offloading_num_chunks > 1, otherwise the prefetch of chunk i+1 "
+                    "overwrites the staging buffer chunk i is computing on."
+                )
+            if (
+                self.expert_tensor_parallel_size is not None
+                and self.expert_tensor_parallel_size > 1
+            ):
+                raise ValueError(
+                    "Expert tensor parallelism is not supported with moe_use_offloading_experts."
+                )
+            if not self.gradient_accumulation_fusion:
+                raise ValueError(
+                    "moe_use_offloading_experts requires gradient_accumulation_fusion."
+                )
 
         if self.moe_layer_recompute:
             warnings.warn(
