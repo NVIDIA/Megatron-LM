@@ -4,8 +4,6 @@ import asyncio
 import logging
 from typing import Any, Optional, Type
 
-import numpy as np
-
 from .registry import get_agent_class
 from .api import (
     AgentBaseModel,
@@ -70,9 +68,7 @@ class WeightedMultiTask(
                 self.weights.append(config.weight / total_weight)
 
     @classmethod
-    def from_config(
-        cls, config: list[dict[str, Any]], *, parallel_generation_tasks: int | None = None
-    ) -> 'WeightedMultiTask':
+    def from_config(cls, config: list[dict[str, Any]]) -> 'WeightedMultiTask':
         """Create a WeightedMultiTask from a config list.
 
         Args:
@@ -89,8 +85,6 @@ class WeightedMultiTask(
             if not all(k in entry for k in ['agent_type', 'agent_args', 'weight']):
                 raise ValueError(f"Missing required keys in config entry: {entry}")
             agent_args = entry.get('agent_args', {})
-            agent_args['parallel_generation_tasks'] = parallel_generation_tasks
-
             agent_type = get_agent_class(entry['agent_type'])
             agent_configs.append(
                 AgentConfig(
@@ -101,10 +95,7 @@ class WeightedMultiTask(
                 )
             )
 
-        instance = cls(agent_configs)
-        if parallel_generation_tasks is not None:
-            instance.parallel_generation_tasks = parallel_generation_tasks
-        return instance
+        return cls(agent_configs)
 
     def _distribute_counts(self, total_count: int, distribute_remainder: bool = True) -> list[int]:
         """Helper method to distribute counts according to weights.
@@ -156,13 +147,54 @@ class WeightedMultiTask(
 
         return final_counts
 
+    def rollout_group_layout(self, num_groups: int) -> list[int]:
+        """Per-batch groups for each weighted env, in env_index order."""
+        counts = self._distribute_counts(num_groups)
+        env_ids = [
+            getattr(agent, "env_id", None) or f"agent_{idx}"
+            for idx, agent in enumerate(self.agents)
+        ]
+        starved = [
+            env_ids[idx]
+            for idx, count in enumerate(counts)
+            if count == 0 and self.weights[idx] > 0
+        ]
+        if starved:
+            raise ValueError(
+                f"num_groups={num_groups} is too small to give every weighted env a group "
+                f"per batch (starved envs: {starved}); increase the trainer batch size."
+            )
+        for agent, count in zip(self.agents, counts):
+            if count > 0 and not isinstance(agent, GroupedRolloutGenerator):
+                raise TypeError(
+                    f"Agent of type {type(agent)} does not support grouped rollouts"
+                )
+        # Snapshot for metric logging; read back by rl_utils.
+        self.latest_distribution = {
+            "env_ids": env_ids,
+            "agent_groups": list(counts),
+            "num_groups": num_groups,
+        }
+        logger.info(
+            "WeightedMultiTask layout: num_groups=%d per_agent=%s",
+            num_groups,
+            ", ".join(f"{eid}(groups={c})" for eid, c in zip(env_ids, counts)),
+        )
+        return [count for count in counts if count > 0]
+
+    def _active_rollout_agents(self, num_groups: int) -> list:
+        """Sub-agents receiving groups, aligned with rollout_group_layout's env order."""
+        counts = self._distribute_counts(num_groups)
+        return [agent for agent, count in zip(self.agents, counts) if count > 0]
+
     async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
+        env_index: int = 0,
     ) -> GroupRolloutParams:
-        raise NotImplementedError(
-            "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_grouped_rollouts instead to generate grouped rollouts."
-        )
+        """Route the group to the sub-agent owning env slot `env_index`."""
+        agent = self._active_rollout_agents(request.num_groups)[env_index]
+        return await agent.prepare_group_rollout(request)
 
     async def get_rollout_response(self, request, inference_request):
         raise NotImplementedError(
@@ -188,104 +220,6 @@ class WeightedMultiTask(
         # Run all tasks concurrently and gather results
         all_rollouts_lists = await asyncio.gather(*tasks)
         return [rollout for rollouts in all_rollouts_lists for rollout in rollouts]
-
-    async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
-        """Distribute grouped rollouts across sub-agents according to weights."""
-        agent_groups = self._distribute_counts(request.num_groups)
-        if request.submission_granularity == "B":
-            # In BATCH mode, pgt counts local batches in flight. agent_groups already
-            # splits each batch by weight, so copy pgt to every active agent.
-            agent_pgts = [
-                self.parallel_generation_tasks if num_groups > 0 else 0
-                for num_groups in agent_groups
-            ]
-        else:
-            # In GROUP/ROLLOUT mode, pgt counts fine-grained work units, so split it by weight.
-            agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
-        agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
-        agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
-
-        # Snapshot the distribution for observability. Read back by rl_utils
-        # during per-iteration metric logging.
-        env_ids = [getattr(a, "env_id", f"agent_{i}") or f"agent_{i}"
-                   for i, a in enumerate(self.agents)]
-        self.latest_distribution = {
-            "env_ids": env_ids,
-            "agent_groups": list(agent_groups),
-            "agent_pgts": list(agent_pgts),
-            "agent_slots": agent_slots.tolist(),
-            "total_pgt": int(sum(agent_pgts)),
-            "num_groups": request.num_groups,
-        }
-        logger.info(
-            "WeightedMultiTask distribution: sub=%s cons=%s num_groups=%d "
-            "rollouts_per_group=%d total_pgt=%d per_agent="
-            + ", ".join(
-                f"{eid}(groups={g}, pgt={p}, slots={s:g})"
-                for eid, g, p, s in zip(env_ids, agent_groups, agent_pgts, agent_slots)
-            ),
-            request.submission_granularity,
-            request.consumption_granularity,
-            request.num_groups,
-            request.rollouts_per_group,
-            int(sum(agent_pgts)),
-        )
-
-        # Create tasks for each agent with non-zero groups
-        generators = []
-        for agent, num_groups, pgt in zip(
-            self.agents, agent_groups, agent_pgts, strict=True
-        ):
-            if num_groups > 0:
-                if not isinstance(agent, GroupedRolloutGenerator):
-                    raise TypeError(
-                        f"Agent of type {type(agent)} does not support grouped rollouts"
-                    )
-                agent.parallel_generation_tasks = pgt
-                agent_request = GroupedRolloutRequest(
-                    num_groups=num_groups,
-                    streaming=request.streaming,
-                    rollouts_per_group=request.rollouts_per_group,
-                    inference_interface=request.inference_interface,
-                    validation=request.validation,
-                    generation_args=request.generation_args,
-                    filter_groups_with_same_reward=request.filter_groups_with_same_reward,
-                    submission_granularity=request.submission_granularity,
-                    consumption_granularity=request.consumption_granularity,
-                )
-                generators.append(agent.get_grouped_rollouts(agent_request))
-            else:
-                generators.append(None)
-
-        while any(generators):
-            balanced_rollouts = asyncio.Queue()
-
-            async def get_balanced_rollouts_if_remaining(agent_id):
-                generated_rollouts = 0
-                while generated_rollouts < agent_slots[agent_id]:
-                    if generators[agent_id] is None:
-                        return
-                    try:
-                        await balanced_rollouts.put(await anext(generators[agent_id]))
-                        generated_rollouts += 1
-                    except StopAsyncIteration:
-                        await balanced_rollouts.put(None)
-                        generators[agent_id] = None
-                        return
-
-            tasks = [
-                asyncio.create_task(get_balanced_rollouts_if_remaining(agent_id))
-                for agent_id in range(len(generators))
-            ]
-
-            try:
-                while balanced_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
-                    rollout = await balanced_rollouts.get()
-                    if rollout is not None:
-                        yield rollout
-            finally:
-                for task in tasks:
-                    task.cancel()
 
     async def get_contrastive_rollouts(self, request: RolloutRequest) -> list[ContrastiveRollout]:
         """Distribute contrastive rollouts across sub-agents according to weights."""
