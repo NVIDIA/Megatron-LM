@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+from torch.distributed.tensor import DTensor
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -309,6 +310,74 @@ class TestMcoreAdapterDense:
 
         success, _, _ = optimizer.step()
         assert success
+
+    def test_gradient_clipping_reaches_global_norm(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=_build_block(config),
+            pg_collection=self.pg_collection,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="adam",
+                lr=1.0e-3,
+                weight_decay=0.0,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                use_distributed_optimizer=False,
+                clip_grad=1.0,
+            ),
+            [model],
+        )
+
+        def global_grad_norm() -> float:
+            squared_norm = torch.zeros(1, dtype=torch.float32, device="cuda")
+            for parameter in optimizer.get_parameters():
+                if parameter.grad is not None:
+                    assert isinstance(parameter.grad, DTensor)
+                    squared_norm += parameter.grad.to_local().float().square().sum()
+            torch.distributed.all_reduce(squared_norm)
+            return squared_norm.sqrt().item()
+
+        optimizer.zero_grad(set_to_none=True)
+        output = model(
+            hidden_states=torch.full(
+                (8, 2, config.hidden_size),
+                fill_value=torch.distributed.get_rank() + 1,
+                device="cuda",
+                dtype=torch.bfloat16,
+            ),
+            attention_mask=None,
+        )
+        output.float().square().sum().backward()
+
+        clip_grad = optimizer.config.clip_grad
+        expected_pre_clip_norm = global_grad_norm()
+        success, pre_clip_norm, _ = optimizer.step()
+        post_clip_norm = global_grad_norm()
+
+        assert success
+        torch.testing.assert_close(pre_clip_norm, expected_pre_clip_norm)
+        assert (
+            expected_pre_clip_norm > clip_grad
+        ), "Test gradients must exceed the clipping threshold to exercise clipping."
+        torch.testing.assert_close(post_clip_norm, clip_grad)
 
 
 class TestMcoreAdapterExpertParallel:
