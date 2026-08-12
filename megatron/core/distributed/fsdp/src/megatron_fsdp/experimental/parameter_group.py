@@ -262,14 +262,18 @@ class FsdpParameterGroup:
 
     def cast_main_weight_to_model_weight(self) -> None:
         """Cast optimizer weights to the model-weight dtype."""
-        if self.main_weight is self.model_weight:
-            return
+        context = self.get_context()
+        allgather_stream = context.allgather_stream
+        allgather_stream.wait_stream(context.current_stream())
+        with torch.cuda.stream(allgather_stream):
+            if self.main_weight is self.model_weight:
+                return
 
-        if self.main_weight.placements == self.model_weight.placements:
-            self.main_weight.cast(self.model_weight.dtype, out=self.model_weight)
-            return
+            if self.main_weight.placements == self.model_weight.placements:
+                self.main_weight.cast(self.model_weight.dtype, out=self.model_weight)
+                return
 
-        self.model_weight = self.main_weight.cast(self.model_weight.dtype)
+            self.model_weight = self.main_weight.cast(self.model_weight.dtype)
 
     def restore_model_weight(self) -> None:
         """Restore a deferred ZeRO-1 model weight to its compute placements."""
