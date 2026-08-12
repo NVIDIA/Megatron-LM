@@ -343,17 +343,8 @@ class GatedDeltaNet(_GDNBase):
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        gated_delta_rule_inputs = kernel_inputs
-        if self.gated_delta_rule is torch_chunk_gated_delta_rule:
-            gated_delta_rule_inputs = {
-                "query": kernel_inputs["q"],
-                "key": kernel_inputs["k"],
-                "value": kernel_inputs["v"],
-                "g": kernel_inputs["g"],
-                "beta": kernel_inputs["beta"],
-            }
         core_attn_out, _ = self.gated_delta_rule(
-            **gated_delta_rule_inputs,
+            **kernel_inputs,
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
@@ -616,9 +607,9 @@ class GatedDeltaNet(_GDNBase):
 # Torch native gated delta rule
 ####################
 def torch_chunk_gated_delta_rule(
-    query,
-    key,
-    value,
+    q,
+    k,
+    v,
     g,
     beta,
     chunk_size=64,
@@ -646,63 +637,63 @@ def torch_chunk_gated_delta_rule(
         cp_context is None
     ), "cp_context is not supported for torch_chunk_gated_delta_rule for now."
 
-    initial_dtype = query.dtype
+    initial_dtype = q.dtype
     if use_qk_l2norm_in_kernel:
-        query = l2norm(query, dim=-1, eps=1e-6)
-        key = l2norm(key, dim=-1, eps=1e-6)
-    query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+        q = l2norm(q, dim=-1, eps=1e-6)
+        k = l2norm(k, dim=-1, eps=1e-6)
+    q, k, v, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (q, k, v, beta, g)
     ]
 
-    batch_size, num_heads, sequence_length, k_head_dim = key.shape
-    v_head_dim = value.shape[-1]
+    batch_size, num_heads, sequence_length, k_head_dim = k.shape
+    v_head_dim = v.shape[-1]
     pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
-    query = F.pad(query, (0, 0, 0, pad_size))
-    key = F.pad(key, (0, 0, 0, pad_size))
-    value = F.pad(value, (0, 0, 0, pad_size))
+    q = F.pad(q, (0, 0, 0, pad_size))
+    k = F.pad(k, (0, 0, 0, pad_size))
+    v = F.pad(v, (0, 0, 0, pad_size))
     beta = F.pad(beta, (0, pad_size))
     g = F.pad(g, (0, pad_size))
     total_sequence_length = sequence_length + pad_size
     if scale is None:
-        scale = 1 / (query.shape[-1] ** 0.5)
-    query = query * scale
+        scale = 1 / (q.shape[-1] ** 0.5)
+    q = q * scale
 
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
+    v_beta = v * beta.unsqueeze(-1)
+    k_beta = k * beta.unsqueeze(-1)
     # reshape to chunks
-    query, key, value, k_beta, v_beta = [
+    q, k, v, k_beta, v_beta = [
         x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
-        for x in (query, key, value, k_beta, v_beta)
+        for x in (q, k, v, k_beta, v_beta)
     ]
     g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
     mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=0
     )
 
     # chunk decay
     g = g.cumsum(dim=-1)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    attn = -((k_beta @ k.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
         sub = attn[..., :i, :i].clone()
         attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
+    v = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     last_recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(v)
         if initial_state is None
-        else initial_state.to(value)
+        else initial_state.to(v)
     )
-    core_attn_out = torch.zeros_like(value)
+    core_attn_out = torch.zeros_like(v)
     mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=1
     )
 
     # for each chunk
     for i in range(0, total_sequence_length // chunk_size):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
         attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
         v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
         v_new = v_i - v_prime

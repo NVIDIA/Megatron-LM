@@ -154,9 +154,9 @@ def test_gdn_chunkwise_cp_head_divisibility_ignores_cp_size():
 def test_torch_chunk_gated_delta_rule_preserves_public_signature():
     signature = inspect.signature(torch_chunk_gated_delta_rule)
     assert tuple(signature.parameters) == (
-        "query",
-        "key",
-        "value",
+        "q",
+        "k",
+        "v",
         "g",
         "beta",
         "chunk_size",
