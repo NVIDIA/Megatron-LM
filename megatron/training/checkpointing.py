@@ -1759,7 +1759,12 @@ def _load_global_dist_base_checkpoint(
             )
 
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, process_group, exchange_algo=args.ckpt_fully_parallel_load_exchange_algo
+            load_strategy,
+            process_group,
+            exchange_algo=args.ckpt_fully_parallel_load_exchange_algo,
+            per_rank_object_load=getattr(
+                args, 'ckpt_fully_parallel_load_per_rank_objects', False
+            ),
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
