@@ -80,7 +80,7 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     dim = _HIDDEN
     model = NestedModel(dim=dim, num_children=2).to(device)
 
-    static_input = torch.randn(256, dim, device=device)
+    static_input = torch.eye(dim, device=device)
     static_target = torch.zeros_like(static_input)
 
     placements = _flat_placements()
