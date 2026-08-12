@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+
 from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
@@ -141,9 +142,7 @@ def _make_aux_loss_hook():
 def _build_dist_opt_optimizer(
     chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState
 ):
-    from megatron.lite.primitive.optimizers.megatron_wrap import (
-        build_dist_opt_training_optimizer,
-    )
+    from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_training_optimizer
 
     return build_dist_opt_training_optimizer(
         chunks,
@@ -163,6 +162,11 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
+    if impl_cfg.attention_backend_override == "magi":
+        raise ValueError(
+            "Qwen3.5 MagiAttention is not supported because its linear-attention layers "
+            "require an order-preserving CP layout. Use qwen3_moe for the initial backend."
+        )
 
     if impl_cfg.router_aux_loss_coef is not None:
         model_cfg.router_aux_loss_coef = impl_cfg.router_aux_loss_coef
