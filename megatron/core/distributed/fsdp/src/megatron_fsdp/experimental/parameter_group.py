@@ -424,8 +424,16 @@ class FsdpParameterGroup:
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
         # A future fused-wgrad path can write directly into these buffer views.
-        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_local_tensor(index).copy_(fsdp_parameter.unsharded.grad)
+        destinations = [
+            partial_grad.get_local_tensor(index) for index in range(len(self.fsdp_parameters))
+        ]
+        sources = [
+            self.fsdp_parameters[index].unsharded.grad
+            for index in range(len(self.fsdp_parameters))
+        ]
+        if destinations:
+            torch._foreach_copy_(destinations, sources)
+        for fsdp_parameter in self.fsdp_parameters:
             fsdp_parameter.unsharded.grad = None
 
     def _has_sharded_grads(self) -> bool:
