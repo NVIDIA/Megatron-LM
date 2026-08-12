@@ -77,8 +77,8 @@ class FsdpParameterGroup:
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
         reduce_scatter_stream: torch.cuda.Stream,
-        use_symm_mem: bool = False,
         grad_divisor: int = 1,
+        use_symmetric_memory: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -89,14 +89,14 @@ class FsdpParameterGroup:
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
             reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
-            use_symm_mem: Allocate communication staging buffers from PyTorch's
+            use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
-        if use_symm_mem and not hasattr(symm_mem, "is_symm_mem_tensor"):
+        if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
@@ -135,7 +135,7 @@ class FsdpParameterGroup:
             placements=main_weight_placements,
         )
 
-        if use_symm_mem:
+        if use_symmetric_memory:
             # PyTorch caches this in C++ and returns early when the backend is already NCCL.
             symm_mem.set_backend("NCCL")
             self._symm_mem_pool = symm_mem.get_mem_pool(self.main_weight.device)

@@ -594,8 +594,8 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     )
 
 
-@pytest.mark.parametrize("use_symm_mem", [False, True], ids=["default", "symmetric_memory"])
-def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
+@pytest.mark.parametrize("use_symmetric_memory", [False, True], ids=["default", "symmetric_memory"])
+def test_overlaps_communication_and_compute(distributed_setup, use_symmetric_memory):
     """Forward and backward communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -620,7 +620,7 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
-    if use_symm_mem:
+    if use_symmetric_memory:
         # Dedicated communicator with NCCL's zero-CTA policy. cta_policy is a
         # per-communicator property, so scoping it to this group leaves the rest of the
         # bucket on default-CTA symmetric-memory kernels (test_symmetric_memory.py asserts
@@ -642,15 +642,9 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     model = MultiChildModel(dim=dim, num_children=num_children).to(device=device, dtype=dtype)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, use_symmetric_memory=use_symmetric_memory):
         for layer in model.layers:
-            fully_shard(
-                layer,
-                mesh=mesh,
-                placements=placements,
-                mixed_precision_policy=policy,
-                use_symm_mem=use_symm_mem,
-            )
+            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     x = torch.randn(4096, dim, device=device, dtype=dtype, requires_grad=True)
 
@@ -683,7 +677,7 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     # Each child layer does a forward and a backward all-gather and one
     # reduce-scatter. Zero-CTA moves the all-gather to copy-engine memcpys, so it
     # should not emit all-gather kernels.
-    expected_allgather_kernel_count = 0 if use_symm_mem else 2 * num_children
+    expected_allgather_kernel_count = 0 if use_symmetric_memory else 2 * num_children
     assert len(allgather_kernels) == expected_allgather_kernel_count, (
         f"Expected {expected_allgather_kernel_count} all-gather kernels, got "
         f"{len(allgather_kernels)}: {[kernel.name for kernel in allgather_kernels]}"
@@ -712,7 +706,7 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     )
     expected_allgather_overlap = 2 * (num_children - 1)
     expected_reduce_scatter_overlap = num_children - 1
-    if not use_symm_mem:
+    if not use_symmetric_memory:
         assert allgather_overlap_count >= expected_allgather_overlap, (
             f"Expected at least {expected_allgather_overlap} all-gathers to "
             f"overlap compute, got {allgather_overlap_count}/{len(allgather_kernels)}."

@@ -43,19 +43,23 @@ class FsdpContext:
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
+    use_symmetric_memory: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, use_symmetric_memory: bool = False) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
             device: Device on which this context schedules communication.
+            use_symmetric_memory: Whether modules constructed in this context allocate
+                communication staging buffers from PyTorch's NCCL symmetric-memory pool.
         """
         self.is_last_microbatch = True
+        self.use_symmetric_memory = use_symmetric_memory
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         # Construction-only; empty after finalization.
@@ -154,8 +158,8 @@ class FsdpModule:
         mesh: DeviceMesh,
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
-        use_symm_mem: bool = False,
         grad_divisor: int = 1,
+        use_symmetric_memory: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -177,8 +181,8 @@ class FsdpModule:
                 placements=placements,
                 mixed_precision_policy=mixed_precision_policy,
                 reduce_scatter_stream=context.reduce_scatter_stream,
-                use_symm_mem=use_symm_mem,
                 grad_divisor=grad_divisor,
+                use_symmetric_memory=use_symmetric_memory,
             )
             for group_parameters in _group_parameters(owned_parameters)
         ]

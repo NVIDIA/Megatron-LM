@@ -75,6 +75,7 @@ class FullyParallelSaveStrategyWrapper:
         do_cache_distribution: bool = False,
         backend: str = "torch_dist",
         version: int = 1,
+        validate_access_integrity: bool = True,
     ):
         """ """
         self.base_strategy = strategy
@@ -84,6 +85,12 @@ class FullyParallelSaveStrategyWrapper:
         self.do_cache_distribution = do_cache_distribution
         self.backend = backend
         self.version = version
+        # When False, skip the first-save sharding-integrity validation (its
+        # determine_global_metadata all_gather_object). Mirrors the
+        # validate_access_integrity used by dist_checkpointing.save, so
+        # --no-ckpt-load-validate-sharding-integrity skips *both* save-side
+        # validation collectives, not just the one in save_preprocess.
+        self.validate_access_integrity = validate_access_integrity
 
         self.cached_distribution: Optional[ShardDistribution] = None
 
@@ -130,7 +137,7 @@ class FullyParallelSaveStrategyWrapper:
         distribute_main_replicas_with_precomputed_distribution(
             sharded_state_dict, self.parallelization_group, precomputed_distribution
         )
-        if self.cached_distribution is None:
+        if self.cached_distribution is None and self.validate_access_integrity:
             # First time applying the parallelization
             validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
         if self.do_cache_distribution:

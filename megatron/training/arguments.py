@@ -2537,6 +2537,9 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
                        choices=['blockwise', 'duplicated', 'distributed'],
                        help='How to perform NS calculation for tensor model parallel weights')
+    group.add_argument('--muon-use-syrk', action='store_true',
+                       help='Use the Triton SYRK kernel for the Gram matrix '
+                       'in Newton-Schulz iteration.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
@@ -2893,6 +2896,17 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
+    group.add_argument('--ckpt-drop-redundant-extra-state', action='store_true',
+                       default=False,
+                       help='Drop TE `_extra_state` artifacts that carry no '
+                       'irreplaceable state (no FP8, or block/current FP8 '
+                       'scaling) from the distributed checkpoint, keeping them '
+                       'local instead of writing them. Only delayed-scaling '
+                       '`_extra_state` (amax history + scale) is ever needed and '
+                       'it is always persisted regardless of this flag. By '
+                       'default (flag off) all `_extra_state` are persisted, '
+                       'preserving the previous behavior. Older checkpoints load '
+                       'unchanged either way.')
     return parser
 
 
