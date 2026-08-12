@@ -108,15 +108,36 @@ def make_token_rollout(trajectory, logprobs, generation_mask=None, reward=1.0, p
     )
 
 
-class DummyLangModule:
+class DummyConfigModule(torch.nn.Module):
     def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+
+class DummyLogprobsModel(torch.nn.Module):
+    def __init__(self, config, layer_config):
+        super().__init__()
+        self.config = config
+        self.layer = DummyConfigModule(layer_config)
+        self.pg_collection = SimpleNamespace(pp=object())
+        self.config_values_during_forward = None
+
+    def forward(self, tokens, position_ids, attention_mask, **kwargs):
+        del position_ids, attention_mask, kwargs
+        self.config_values_during_forward = (
+            self.config.flash_decode,
+            self.layer.config.flash_decode,
+        )
+        return torch.ones((tokens.shape[0], tokens.shape[1], VOCAB))
+
+
+class DummyLangModule(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
         self.config = config
         self.rotary_pos_emb = None
         self.eval = MagicMock()
         self.train = MagicMock()
-
-    def modules(self):
-        return iter(())
 
 
 class DummyMoELayer:
@@ -346,17 +367,33 @@ class TestRLUtils:
 
         return MagicMock(side_effect=_toggle)
 
-    def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "share_config",
+        [pytest.param(True, id="shared-config"), pytest.param(False, id="distinct-config")],
+    )
+    @pytest.mark.parametrize("num_experts", [None, 8], ids=["dense", "moe"])
+    def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(
+        self, monkeypatch, share_config, num_experts
+    ):
         config = SimpleNamespace(
             cuda_graph_impl="none",
             cuda_graph_modules=[CudaGraphModule.attn],
             inference_cuda_graph_scope=InferenceCudaGraphScope.none,
         )
-        lang_module = DummyLangModule(config)
+        layer_config = (
+            config
+            if share_config
+            else SimpleNamespace(
+                cuda_graph_impl="none",
+                cuda_graph_modules=[CudaGraphModule.attn],
+                inference_cuda_graph_scope=InferenceCudaGraphScope.none,
+            )
+        )
+        lang_module = DummyLangModule(layer_config)
         model = [SimpleNamespace(config=config, module=lang_module)]
         args = SimpleNamespace(
             rl_training_cuda_graphs=False,
-            num_experts=None,
+            num_experts=num_experts,
             curr_iteration=11,
             cuda_graph_impl="local",
             cuda_graph_modules=[CudaGraphModule.attn],
@@ -368,19 +405,60 @@ class TestRLUtils:
 
         with rl_utils.megatron_rl_inference_mode(model, MagicMock(), "local", False) as result:
             assert result is interface
-            assert config.cuda_graph_impl == "local"
-            assert config.cuda_graph_modules == []
-            assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+            for current_config in (config, layer_config):
+                assert current_config.cuda_graph_impl == "local"
+                assert current_config.cuda_graph_modules == []
+                assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
 
         assert toggle_cuda_graphs.call_args_list == [
             call(lang_module, "local"),
             call(lang_module, "none"),
         ]
-        assert config.cuda_graph_impl == "local"
-        assert config.cuda_graph_modules == [CudaGraphModule.attn]
-        assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        expected_modules = (
+            [
+                CudaGraphModule.mamba,
+                CudaGraphModule.attn,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.moe_preprocess,
+            ]
+            if num_experts is not None
+            else [CudaGraphModule.attn]
+        )
+        for current_config in (config, layer_config):
+            assert current_config.cuda_graph_impl == "local"
+            assert current_config.cuda_graph_modules == expected_modules
+            assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         lang_module.eval.assert_called_once()
         lang_module.train.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "share_config",
+        [pytest.param(True, id="shared-config"), pytest.param(False, id="distinct-config")],
+    )
+    def test_get_logprobs_updates_all_model_configs(self, monkeypatch, share_config):
+        config = SimpleNamespace(flash_decode=True)
+        layer_config = config if share_config else SimpleNamespace(flash_decode=True)
+        model = DummyLogprobsModel(config, layer_config)
+        monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(fp16=False, bf16=False))
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
+        )
+        monkeypatch.setattr(
+            rl_utils, "get_attr_wrapped_model", lambda model, name: getattr(model, name)
+        )
+        monkeypatch.setattr(rl_utils, "is_pp_last_stage", lambda _group: False)
+
+        output = rl_utils.get_logprobs(
+            model,
+            torch.ones((1, 2), dtype=torch.long),
+            position_ids=None,
+            packed_seq_params=object(),
+        )
+
+        assert output.shape == (1, 2, VOCAB)
+        assert model.config_values_during_forward == (False, False)
+        assert config.flash_decode is True
+        assert layer_config.flash_decode is True
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",

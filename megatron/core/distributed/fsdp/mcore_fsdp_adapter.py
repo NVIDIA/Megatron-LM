@@ -669,9 +669,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             if pg_collection.expt_dp is None:
                 raise ValueError("MFSDP v2 with EP requires an explicit expert-DP process group.")
-            if not any(
-                isinstance(submodule, MoELayer) for submodule in module.modules()
-            ):
+            if not any(isinstance(submodule, MoELayer) for submodule in module.modules()):
                 raise ValueError("MFSDP v2 with EP requires MoE transformer layers.")
         if ddp_config.data_parallel_sharding_strategy != "optim_grads_params":
             raise ValueError(
