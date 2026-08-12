@@ -1265,7 +1265,9 @@ class TestDynamicMicrobatchSlots:
         from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 
         order = [1, 2, 1, 2, -1, -2, -1, -2]
-        combined = TECudaGraphHelper._build_slot_aliased_variant_order(order, 2, 2)
+        combined = TECudaGraphHelper._build_slot_aliased_variant_order(
+            order, 2, 2, canonical_variant=0
+        )
 
         assert combined == [1, 3, 2, 4, 1, 3, 2, 4, -1, -3, -2, -4, -1, -3, -2, -4]
 
