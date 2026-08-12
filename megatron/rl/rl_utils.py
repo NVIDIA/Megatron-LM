@@ -2,6 +2,7 @@
 
 import copy
 import gc
+import hashlib
 
 # Keep this to make the env registered.
 import itertools
@@ -984,6 +985,13 @@ def compute_group_stats(
     return stats
 
 
+def _bounded_artifact_key(key, limit=100):
+    """Bound a fully-qualified metric key to wandb's artifact-name limit."""
+    if len(key) <= limit:
+        return key
+    digest = hashlib.md5(key.encode()).hexdigest()[:8]
+    return f'{key[: limit - 9]}_{digest}'
+
 
 def prep_wandb_metrics(
         wandb_writer: wandb_run.Run,
@@ -1349,7 +1357,12 @@ def maybe_log_training_metrics(
             tokenizer=tokenizer,
         )
         for k, v in env_metrics.items():
-            metrics[f"{env_id}_{k}"] = v
+            # Only table/plot values have a character length limit.
+            # Scalar keys are fine.
+            full_key = f"{env_id}_{k}"
+            if not isinstance(v, (int, float, bool)):
+                full_key = _bounded_artifact_key(full_key)
+            metrics[full_key] = v
 
     # Per-pipeline instrumentation (queue sizes, gate state, per-stage
     # timings) and the multi-task work distribution, collected on rank 0
