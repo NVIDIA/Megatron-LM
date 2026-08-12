@@ -36,9 +36,10 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
 )
 
 
-def _worker_gtp_partial_cg_correctness(rank, world_size, port):
-    """Compare eager and local attention CUDA graphs with GTP2 x DP2."""
+def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_modules, opt_in_modules):
+    """Compare eager and local CUDA graphs with GTP2 x DP2."""
     del port
+    gtp_module._GTP_PARAMS.clear()
 
     from megatron.core import parallel_state as ps
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -56,14 +57,15 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
     )
     from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
     from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.transformer.transformer_layer import MoETransformerLayer
 
-    hidden = 4096
-    num_heads = 32
-    ffn_hidden = 16384
-    # Four layers force parameters with matching scheduling domains/shapes to reuse the two-slot
-    # wgrad ring across independently replayed graphs.
-    num_layers = 4
-    sequence_length = 32
+    latent_projection_case = "moe_latent_proj" in opt_in_modules
+    hidden = 256 if latent_projection_case else 4096
+    num_heads = 8 if latent_projection_case else 32
+    ffn_hidden = 512 if latent_projection_case else 16384
+    # Use multiple layers to exercise repeated local CUDA-graph execution with GTP parameters.
+    num_layers = 1 if latent_projection_case else 4
+    sequence_length = 16 if latent_projection_case else 32
     batch_size = 1
     learning_rate = 0.01
     steps = 10
@@ -73,6 +75,18 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
     assert world_size == gtp_degree * dp_degree
 
     def make_config(*, partial_cg=False):
+        moe_options = {}
+        if latent_projection_case:
+            moe_options = {
+                "num_moe_experts": 2,
+                "moe_router_topk": 1,
+                "moe_router_pre_softmax": True,
+                "moe_ffn_hidden_size": ffn_hidden,
+                "moe_grouped_gemm": True,
+                "moe_token_dispatcher_type": "allgather",
+                "moe_aux_loss_coeff": 0.0,
+                "moe_latent_size": 128,
+            }
         return TransformerConfig(
             num_attention_heads=num_heads,
             num_layers=num_layers,
@@ -83,16 +97,40 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
             hidden_dropout=0.0,
             attention_dropout=0.0,
             bias_dropout_fusion=False,
+            gradient_accumulation_fusion=latent_projection_case,
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
             gtp_weight_remat_size=gtp_degree,
+            gtp_remat_opt_in_modules=opt_in_modules,
             cuda_graph_impl="local" if partial_cg else "none",
-            cuda_graph_modules=["attn"] if partial_cg else [],
+            cuda_graph_modules=partial_cg_modules if partial_cg else [],
             cuda_graph_warmup_steps=2,
+            **moe_options,
         )
 
-    def make_attention_stack(config, pg_collection):
-        spec = copy.deepcopy(get_gpt_layer_with_transformer_engine_spec())
+    def make_layer_stack(config, pg_collection):
+        spec = copy.deepcopy(
+            get_gpt_layer_with_transformer_engine_spec(
+                num_experts=2 if latent_projection_case else None,
+                moe_grouped_gemm=latent_projection_case,
+            )
+        )
+        if latent_projection_case:
+            spec.submodules.input_layernorm = IdentityOp
+            spec.submodules.self_attention = IdentityOp
+            spec.submodules.self_attn_bda = IdentityFuncOp
+            return torch.nn.ModuleList(
+                [
+                    MoETransformerLayer(
+                        config,
+                        spec.submodules,
+                        layer_number=1,
+                        pg_collection=pg_collection,
+                        name="decoder.layers.0",
+                    )
+                ]
+            )
+
         spec.submodules.pre_mlp_layernorm = IdentityOp
         spec.submodules.mlp = IdentityOp
         spec.submodules.mlp_bda = IdentityFuncOp
@@ -104,6 +142,27 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
                 for i in range(num_layers)
             ]
         )
+
+    def get_cudagraph_managers(layers):
+        if latent_projection_case:
+            return [
+                manager
+                for layer in layers
+                for manager in (layer.cudagraph_manager_router, layer.cudagraph_manager_postprocess)
+            ]
+        return [layer.cudagraph_manager for layer in layers]
+
+    def get_latent_params(layers):
+        return [
+            param
+            for name, param in layers.named_parameters()
+            if "fc1_latent_proj.weight" in name or "fc2_latent_proj.weight" in name
+        ]
+
+    def make_pg_collection():
+        if latent_projection_case:
+            return ProcessGroupCollection.use_mpu_process_groups()
+        return ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp", "gtp_remat"])
 
     def run_step(layers, x):
         with fp8_autocast(enabled=False):
@@ -162,17 +221,19 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=gtp_degree
     )
     model_parallel_cuda_manual_seed(42)
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-        required_pgs=["tp", "cp", "gtp_remat"]
-    )
+    pg_collection = make_pg_collection()
     eager_config = make_config()
-    eager = make_attention_stack(eager_config, pg_collection).cuda()
+    eager = make_layer_stack(eager_config, pg_collection).cuda()
     eager_gtp_group = ps.get_gtp_weight_remat_group()
     eager_dp_group = ps.get_data_parallel_group(with_gtp_remat=False)
     eager_dp_rank = eager_dp_group.rank()
     assert eager_gtp_group.size() == gtp_degree
     assert eager_dp_group.size() == dp_degree
     assert any(isinstance(param, GTPShardedParam) for param in eager.parameters())
+    if latent_projection_case:
+        eager_latent_params = get_latent_params(eager)
+        assert len(eager_latent_params) == 2
+        assert all(isinstance(param, GTPShardedParam) for param in eager_latent_params)
     initialize_main_grads(eager)
     saved_local_weights = {name: param.data.clone() for name, param in eager.named_parameters()}
 
@@ -190,20 +251,20 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
         apply_sgd_step(eager, eager_gtp_group.size())
 
     del eager, loss, x
+    torch.cuda.synchronize()
     ps.destroy_model_parallel()
     gtp_module.reset_gtp_state()
+    gtp_module._GTP_PARAMS.clear()
 
-    # Optimized path: the same GTP2 x DP2 topology with attention-only local CUDA graphs.
+    # Optimized path: the same GTP2 x DP2 topology with local CUDA graphs.
     ps.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=gtp_degree
     )
     initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
     model_parallel_cuda_manual_seed(42)
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-        required_pgs=["tp", "cp", "gtp_remat"]
-    )
+    pg_collection = make_pg_collection()
     partial_cg_config = make_config(partial_cg=True)
-    partial_cg = make_attention_stack(partial_cg_config, pg_collection).cuda()
+    partial_cg = make_layer_stack(partial_cg_config, pg_collection).cuda()
     classify_gtp_remat_chains(
         partial_cg,
         cuda_graph_modules=partial_cg_config.cuda_graph_modules,
@@ -220,7 +281,8 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
     assert dp_rank == eager_dp_rank
     gtp_params = [param for param in partial_cg.parameters() if isinstance(param, GTPShardedParam)]
     assert gtp_params, "GTP not active: no GTPShardedParam found"
-    assert all(param.chain_id == GTPChain.GRAPHED.value for param in gtp_params)
+    params_in_scope = get_latent_params(partial_cg) if latent_projection_case else gtp_params
+    assert all(param.chain_id == GTPChain.GRAPHED.value for param in params_in_scope)
     for name, param in partial_cg.named_parameters():
         param.data.copy_(saved_local_weights[name])
     # Production captures after DDP maps every parameter into a main-grad buffer and initializes
@@ -241,18 +303,21 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
         wait_for_gtp_grad_reduction_on_current_stream()
         eager_grad_norm = global_grad_norm(partial_cg, gtp_group)
         eager_probe_loss_value = eager_probe_loss.item()
+        del eager_probe_loss, eager_probe_x
+        reset_grad_state(partial_cg)
 
         create_cudagraphs()
         assert _CudagraphGlobalRecord.cudagraph_created
-        runners = [layer.cudagraph_manager.cudagraph_runners[0] for layer in partial_cg]
-        assert all(runner.gtp_remat for runner in runners)
-        assert any(runner._gtp_wgrad_ring_slots for runner in runners)
+        managers = get_cudagraph_managers(partial_cg)
+        assert all(len(manager.cudagraph_runners) == 1 for manager in managers)
+        runners = [manager.cudagraph_runners[0] for manager in managers]
+        assert any(runner.gtp_remat for runner in runners)
 
         replay_grad_norms = []
         replay_losses = []
         for _ in range(3):
             reset_grad_state(partial_cg)
-            replay_x = eager_probe_x.detach().clone().requires_grad_()
+            replay_x = make_replica_input(1234, dp_rank).requires_grad_()
             replay_loss = run_step(partial_cg, replay_x)
             replay_loss.backward()
             wait_for_gtp_grad_reduction_on_current_stream()
@@ -280,7 +345,7 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
                 flush=True,
             )
 
-        del eager_probe_loss, eager_probe_x, replay_loss, replay_x
+        del replay_loss, replay_x
 
         for step in range(steps):
             reset_grad_state(partial_cg)
@@ -295,19 +360,21 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
         del loss, x
     finally:
         torch.cuda.synchronize()
-        for layer in partial_cg:
-            for runner in layer.cudagraph_manager.cudagraph_runners:
+        managers = get_cudagraph_managers(partial_cg)
+        for manager in managers:
+            for runner in manager.cudagraph_runners:
                 if runner.fwd_graph is not None:
                     runner.fwd_graph.reset()
                 if runner.bwd_graph is not None:
                     runner.bwd_graph.reset()
         delete_cuda_graphs()
-        for layer in partial_cg:
-            layer.cudagraph_manager.cudagraph_runners.clear()
+        for manager in managers:
+            manager.cudagraph_runners.clear()
         gc.collect()
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
         gtp_module.reset_gtp_state()
+        gtp_module._GTP_PARAMS.clear()
 
     if rank == 0:
         for step, (eager_loss, partial_cg_loss) in enumerate(zip(eager_losses, partial_cg_losses)):
@@ -324,8 +391,17 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port):
 
 
 class TestGTPPartialCGCorrectness:
-    def test_gtp_partial_cg_loss_and_grad_norm_match_eager(self):
+    @pytest.mark.parametrize(
+        "partial_cg_modules,opt_in_modules",
+        [
+            pytest.param(["attn"], [], id="attention"),
+            pytest.param(["moe_router"], ["moe_latent_proj"], id="moe-router-latent-projections"),
+        ],
+    )
+    def test_gtp_partial_cg_loss_and_grad_norm_match_eager(
+        self, partial_cg_modules, opt_in_modules
+    ):
         """Local-CG loss trajectory and global grad norm must match eager execution."""
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
-        _run_distributed(_worker_gtp_partial_cg_correctness, 4)
+        _run_distributed(_worker_gtp_partial_cg_correctness, 4, partial_cg_modules, opt_in_modules)

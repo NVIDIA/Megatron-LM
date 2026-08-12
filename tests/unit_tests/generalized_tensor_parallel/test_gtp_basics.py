@@ -502,6 +502,42 @@ class TestGroupedExpertChainClassification:
         assert gtp_module._chain_is_graphed("GTP_graphed")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GTPShardedParam requires CUDA")
+class TestLatentProjectionChainClassification:
+    """Classify opted-in latent projections through the public GTP chain API."""
+
+    FC1 = "decoder.layers.3.mlp.fc1_latent_proj.weight"
+    FC2 = "decoder.layers.3.mlp.fc2_latent_proj.weight"
+
+    def teardown_method(self, method):
+        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
+        gtp_module.reset_gtp_state()
+
+    def _chains(self, *, cuda_graph_modules=None, cuda_graph_impl="none"):
+        params = tuple(GTPShardedParam(torch.zeros(1, device="cuda")) for _ in range(2))
+        assert all(isinstance(param, GTPShardedParam) for param in params)
+
+        class _Model:
+            def named_parameters(_self):
+                return iter(zip((self.FC1, self.FC2), params))
+
+        gtp_module.classify_gtp_remat_chains(
+            _Model(), cuda_graph_modules=cuda_graph_modules, cuda_graph_impl=cuda_graph_impl
+        )
+        return tuple(param.chain_id for param in params)
+
+    def test_eager_latent_projections_are_ungraphed(self):
+        assert self._chains() == (GTPChain.UNGRAPHED.value, GTPChain.UNGRAPHED.value)
+
+    def test_local_router_captures_both_latent_projections(self):
+        chains = self._chains(cuda_graph_modules={"moe_router"}, cuda_graph_impl="local")
+        assert chains == (GTPChain.GRAPHED.value, GTPChain.GRAPHED.value)
+
+    def test_unrelated_local_scope_leaves_latent_projections_ungraphed(self):
+        chains = self._chains(cuda_graph_modules={"mamba", "attn"}, cuda_graph_impl="local")
+        assert chains == (GTPChain.UNGRAPHED.value, GTPChain.UNGRAPHED.value)
+
+
 class TestGroupedDoubleBuffer:
     """One-block-ahead grouped chains must double-buffer: consecutive MoE layers get distinct
     gather buffers (else prefetching layer N+1 clobbers layer N's in-use weight). Pure cache-key
