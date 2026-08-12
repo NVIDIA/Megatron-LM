@@ -3122,7 +3122,7 @@ def deprecate_inference_params(inference_context, inference_params):
 
 #: Attribute a parameter-sharding backend sets on each parameter it publishes asynchronously.
 #: See :func:`ensure_params_ready`.
-PARAM_READY_ATTR = "_ensure_param_ready"
+PARAM_READY_CALLBACK_ATTR = "_ensure_param_ready"
 
 
 def ensure_params_ready(params: Iterable[Any]) -> None:
@@ -3131,27 +3131,15 @@ def ensure_params_ready(params: Iterable[Any]) -> None:
     A parameter-sharding backend (DDP with ``overlap_param_gather``, FSDP, ...) publishes values
     asynchronously, so only the owning module's forward pre-hook makes ``param.data`` valid. Any
     consumer reading it earlier -- ahead of that module, or from another stream -- calls this
-    first. Backends mark their params with :data:`PARAM_READY_ATTR`; unmarked params no-op, so
-    neither side needs to know about the other.
+    first. Backends mark their params with :data:`PARAM_READY_CALLBACK_ATTR`; unmarked params
+    no-op, so neither side needs to know about the other.
 
-    Hot path: called once per weight per forward, so weights x microbatches times per iteration.
-    Only the first microbatch actually publishes a bucket, so nearly every call is a no-op --
-    hence it allocates nothing unless one call spans two or more buckets.
+    Callbacks are shared per communication bucket, so each fires once, not once per parameter.
     """
-    called = None  # last callback fired
-    called_ids = None  # ids of every callback fired; allocated only if one call spans buckets
+    fired = set()
     for param in params:
-        callback = getattr(param, PARAM_READY_ATTR, None)
-        if callback is None:
-            continue  # no backend owns this parameter
-        if callback is called:
-            continue  # same bucket as the previous parameter -- the common case
-        if called_ids is not None and id(callback) in called_ids:
-            continue  # a bucket already published earlier in this call
-        if called is not None:
-            # A second distinct bucket appeared, so adjacency alone no longer dedups.
-            if called_ids is None:
-                called_ids = {id(called)}
-            called_ids.add(id(callback))
-        called = callback
+        callback = getattr(param, PARAM_READY_CALLBACK_ATTR, None)
+        if callback is None or id(callback) in fired:
+            continue
+        fired.add(id(callback))
         callback()

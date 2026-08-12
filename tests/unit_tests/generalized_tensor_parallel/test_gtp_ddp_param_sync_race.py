@@ -36,7 +36,7 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.distributed.param_and_grad_buffer import shard_buffer
 from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import PARAM_READY_ATTR
+from megatron.core.utils import PARAM_READY_CALLBACK_ATTR
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
     _make_gtp_linear,
     _make_gtp_remat_grouped_linear,
@@ -92,9 +92,9 @@ def _build_ddp_two_gtp_layers():
     # build the callback by hand, so without this nothing would catch the registration silently
     # not running -- which would make every readiness call a no-op and the fix ineffective.
     for w in weights:
-        assert hasattr(w, PARAM_READY_ATTR), (
-            f"DDP did not attach {PARAM_READY_ATTR} to a bucketed parameter; the readiness "
-            "protocol is not wired up"
+        assert hasattr(w, PARAM_READY_CALLBACK_ATTR), (
+            f"DDP did not attach {PARAM_READY_CALLBACK_ATTR} to a bucketed parameter; the "
+            "readiness protocol is not wired up"
         )
     return ddp_model, weights
 

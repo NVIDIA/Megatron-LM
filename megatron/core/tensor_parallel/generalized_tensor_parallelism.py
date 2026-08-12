@@ -1223,15 +1223,13 @@ class GTPShardedParam(torch.nn.Parameter):
 
         weights = self._weights
 
-        # 0. Publish the shards before reading them. EVERY chain prefetches ahead of the module
-        #    that owns the target weight -- default chains by one weight, grouped-expert chains by
-        #    one MoE block -- so that module's DDP pre-hook may not have run and the shard can
-        #    still hold last iteration's values. Reading further ahead widens the window, not
-        #    creates it. No-op when no backend owns the parameter, or it is already published.
+        # 0. Wait for DDP's asynchronous parameter all-gather (and its post-gather quantize), if
+        #    any, to finish on the shards we are about to read. GTP prefetches ahead of the module
+        #    that owns the target weight, so that module's DDP pre-hook may not have run yet and
+        #    the shard can still hold last iteration's values.
         #
-        #    FORWARD ONLY. Backward re-reads what forward published; recompute is a forward
-        #    replayed inside backward, where publishing could dispatch an all-gather into the
-        #    buffer that aliases grads under --reuse-grad-buf-for-mxfp8-param-ag.
+        #    Forward only: backward re-reads what forward published, and recompute runs inside
+        #    backward where a dispatch could gather into the grad-aliased buffer.
         if fwd and not in_fp8_activation_recompute_phase():
             ensure_params_ready(weights)
 

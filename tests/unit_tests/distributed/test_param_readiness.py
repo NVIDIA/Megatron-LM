@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Parameter readiness: ``ensure_params_ready`` and DDP's ``_BucketParamReadiness`` callback.
+"""Parameter readiness: ``ensure_params_ready`` and DDP's ``_BucketParamReadyCallback``.
 
 The GPU test in ``generalized_tensor_parallel/`` runs one configuration: healthy DDP, pre-hooks
 enabled, ``align_param_gather=False``. These cover the branches it never exercises --
@@ -14,9 +14,9 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel import (
     DistributedDataParallel,
-    _BucketParamReadiness,
+    _BucketParamReadyCallback,
 )
-from megatron.core.utils import PARAM_READY_ATTR, ensure_params_ready
+from megatron.core.utils import PARAM_READY_CALLBACK_ATTR, ensure_params_ready
 
 
 class _FakeBucketGroup:
@@ -43,7 +43,7 @@ class TestParamReadinessProtocol:
     def test_no_marker_is_a_noop(self):
         """A parameter no backend owns must be readable without any callback."""
         param = torch.nn.Parameter(torch.zeros(2))
-        assert not hasattr(param, PARAM_READY_ATTR)
+        assert not hasattr(param, PARAM_READY_CALLBACK_ATTR)
         ensure_params_ready([param])  # must not raise
 
     def test_callbacks_are_deduplicated_per_bucket(self):
@@ -53,33 +53,14 @@ class TestParamReadinessProtocol:
         other = lambda: calls.append("other")  # noqa: E731
 
         first, second, third = (torch.nn.Parameter(torch.zeros(1)) for _ in range(3))
-        setattr(first, PARAM_READY_ATTR, shared)
-        setattr(second, PARAM_READY_ATTR, shared)
-        setattr(third, PARAM_READY_ATTR, other)
+        setattr(first, PARAM_READY_CALLBACK_ATTR, shared)
+        setattr(second, PARAM_READY_CALLBACK_ATTR, shared)
+        setattr(third, PARAM_READY_CALLBACK_ATTR, other)
         plain = torch.nn.Parameter(torch.zeros(1))
 
         ensure_params_ready([first, second, plain, first, third])
 
         assert calls == ["shared", "other"]
-
-    def test_non_adjacent_repeat_is_deduplicated(self):
-        """A repeat separated by another bucket must still fire once.
-
-        Adjacent repeats are caught by an identity check against the previous callback; only a
-        non-adjacent repeat (A, B, A) exercises the dedup set, which is allocated lazily.
-        """
-        calls = []
-        a = lambda: calls.append("a")  # noqa: E731
-        b = lambda: calls.append("b")  # noqa: E731
-
-        pa, pb, pa2 = (torch.nn.Parameter(torch.zeros(1)) for _ in range(3))
-        setattr(pa, PARAM_READY_ATTR, a)
-        setattr(pb, PARAM_READY_ATTR, b)
-        setattr(pa2, PARAM_READY_ATTR, a)
-
-        ensure_params_ready([pa, pb, pa2])
-
-        assert calls == ["a", "b"]
 
 
 class TestBucketParamReadiness:
@@ -92,13 +73,13 @@ class TestBucketParamReadiness:
     def test_publishes_once_then_is_idempotent(self):
         ddp = _fake_ddp()
         bucket_group = _FakeBucketGroup()
-        readiness = _BucketParamReadiness(ddp, bucket_group)
+        ready_callback = _BucketParamReadyCallback(ddp, bucket_group)
 
-        readiness()
+        ready_callback()
         assert bucket_group.finished == [False]
 
         # Already published this iteration: no second collective.
-        readiness()
+        ready_callback()
         assert bucket_group.finished == [False]
 
     def test_in_flight_gather_is_drained(self):
@@ -107,13 +88,13 @@ class TestBucketParamReadiness:
         bucket_group.param_gather_dispatched = True
         bucket_group.param_gather_handle = object()
 
-        _BucketParamReadiness(ddp, bucket_group)()
+        _BucketParamReadyCallback(ddp, bucket_group)()
         assert bucket_group.finished == [False]
 
     def test_align_param_gather_skips_next_bucket_dispatch(self):
         ddp = _fake_ddp(align_param_gather=True)
         bucket_group = _FakeBucketGroup()
-        _BucketParamReadiness(ddp, bucket_group)()
+        _BucketParamReadyCallback(ddp, bucket_group)()
         assert bucket_group.finished == [True]
 
     def test_disabled_forward_hooks_do_not_start_a_gather(self):
@@ -121,7 +102,7 @@ class TestBucketParamReadiness:
         gather into a buffer it is actively using."""
         ddp = _fake_ddp(hooks_enabled=False)
         bucket_group = _FakeBucketGroup()
-        _BucketParamReadiness(ddp, bucket_group)()
+        _BucketParamReadyCallback(ddp, bucket_group)()
         assert bucket_group.finished == []
 
     def test_in_flight_gather_is_drained_even_with_hooks_disabled(self):
@@ -133,22 +114,22 @@ class TestBucketParamReadiness:
         bucket_group.param_gather_dispatched = True
         bucket_group.param_gather_handle = object()
 
-        _BucketParamReadiness(ddp, bucket_group)()
+        _BucketParamReadyCallback(ddp, bucket_group)()
         assert bucket_group.finished == [True]  # drained, next dispatch skipped
 
     def test_dead_bucket_group_is_a_noop(self):
         """The bucket group is held weakly so the callback, which lives on parameters that
         outlive DDP, cannot retain the bucket-group graph."""
         ddp = _fake_ddp()
-        readiness = _BucketParamReadiness(ddp, _FakeBucketGroup())
-        assert readiness._bucket_group() is None
-        readiness()  # must not raise
+        ready_callback = _BucketParamReadyCallback(ddp, _FakeBucketGroup())
+        assert ready_callback._bucket_group() is None
+        ready_callback()  # must not raise
 
     def test_dead_ddp_is_a_noop(self):
         """The callback holds DDP weakly, so a collected DDP must not resurrect work."""
         bucket_group = _FakeBucketGroup()
-        readiness = _BucketParamReadiness(_fake_ddp(), bucket_group)
+        ready_callback = _BucketParamReadyCallback(_fake_ddp(), bucket_group)
         # No strong reference above, so the referent is already gone.
-        assert readiness._ddp() is None
-        readiness()
+        assert ready_callback._ddp() is None
+        ready_callback()
         assert bucket_group.finished == []
