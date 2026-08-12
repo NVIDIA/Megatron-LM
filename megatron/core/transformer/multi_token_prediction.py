@@ -724,6 +724,126 @@ def _compute_mtp_acceptance_counts(
     return correct, total
 
 
+class _VocabParallelTVDistance(torch.autograd.Function):
+    """Full-vocabulary TV distance with a TP-aware analytical backward.
+
+    The implementation follows Algorithms 1 and 2 in the Bebop paper
+    (https://arxiv.org/abs/2606.12370). It intentionally keeps the target
+    distribution detached and returns gradients for draft logits only.
+
+    This PyTorch implementation establishes the mathematical contract. It does
+    not yet fuse the vocabulary passes into a dedicated GPU kernel.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        draft_logits: Tensor,
+        target_logits: Tensor,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        logits_are_vocab_sharded: bool,
+    ) -> Tensor:
+        """Compute the TV distance and save the draft-side backward state."""
+        if draft_logits.shape != target_logits.shape:
+            raise ValueError(
+                "Draft and target logits must have identical shapes, got "
+                f"{tuple(draft_logits.shape)} and {tuple(target_logits.shape)}."
+            )
+        if draft_logits.device != target_logits.device:
+            raise ValueError("Draft and target logits must be on the same device.")
+
+        tp_size = torch.distributed.get_world_size(group=tp_group) if tp_group is not None else 1
+        if logits_are_vocab_sharded and tp_group is None and parallel_state.is_initialized():
+            initialized_tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            if initialized_tp_size > 1:
+                raise ValueError(
+                    "tp_group must be provided for TV distance over vocab-sharded logits "
+                    f"when tensor parallel size is {initialized_tp_size}."
+                )
+
+        draft_logits_fp32 = draft_logits.float()
+        target_logits_fp32 = target_logits.float()
+        maxima = torch.stack(
+            (draft_logits_fp32.max(dim=-1).values, target_logits_fp32.max(dim=-1).values)
+        )
+        if logits_are_vocab_sharded and tp_size > 1:
+            torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+        draft_max, target_max = maxima.unbind(dim=0)
+
+        draft_exp = torch.exp(draft_logits_fp32 - draft_max.unsqueeze(-1))
+        target_exp = torch.exp(target_logits_fp32 - target_max.unsqueeze(-1))
+        denominators = torch.stack((draft_exp.sum(dim=-1), target_exp.sum(dim=-1)))
+        if logits_are_vocab_sharded and tp_size > 1:
+            torch.distributed.all_reduce(
+                denominators, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+        draft_denominator, target_denominator = denominators.unbind(dim=0)
+
+        draft_prob = draft_exp / draft_denominator.unsqueeze(-1)
+        target_prob = target_exp / target_denominator.unsqueeze(-1)
+        draft_below_target = draft_prob <= target_prob
+        overlap_and_s = torch.stack(
+            (
+                torch.minimum(draft_prob, target_prob).sum(dim=-1),
+                (draft_prob * draft_below_target).sum(dim=-1),
+            )
+        )
+        if logits_are_vocab_sharded and tp_size > 1:
+            torch.distributed.all_reduce(
+                overlap_and_s, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+        overlap, s = overlap_and_s.unbind(dim=0)
+
+        raw_tv_distance = 1.0 - overlap
+        tv_distance = raw_tv_distance.clamp(min=0.0, max=1.0)
+        clamp_gradient_mask = (raw_tv_distance >= 0.0) & (raw_tv_distance <= 1.0)
+        ctx.save_for_backward(
+            draft_logits,
+            draft_max,
+            draft_denominator,
+            s,
+            draft_prob > target_prob,
+            clamp_gradient_mask,
+        )
+        return tv_distance
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        """Apply the analytical Bebop gradient to the draft logits only."""
+        (draft_logits, draft_max, draft_denominator, s, draft_above_target, clamp_gradient_mask) = (
+            ctx.saved_tensors
+        )
+
+        draft_prob = torch.exp(draft_logits.float() - draft_max.unsqueeze(-1))
+        draft_prob = draft_prob / draft_denominator.unsqueeze(-1)
+        grad_draft = draft_prob * (s.unsqueeze(-1) - 1.0 + draft_above_target.to(draft_prob.dtype))
+        grad_draft *= (grad_output * clamp_gradient_mask).unsqueeze(-1)
+        return grad_draft.to(draft_logits.dtype), None, None, None
+
+
+def vocab_parallel_tv_distance(
+    draft_logits: Tensor,
+    target_logits: Tensor,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    logits_are_vocab_sharded: bool = True,
+) -> Tensor:
+    """Compute per-position full-vocabulary TV distance between draft and target logits.
+
+    Args:
+        draft_logits: Trainable draft logits with vocabulary in the last dimension.
+        target_logits: Detached target logits with the same local or global vocabulary layout.
+        tp_group: Tensor-parallel group owning vocabulary shards.
+        logits_are_vocab_sharded: Whether the last dimension is sharded across ``tp_group``.
+
+    Returns:
+        A FP32 tensor with the vocabulary dimension removed. Gradients flow only to
+        ``draft_logits``.
+    """
+    return _VocabParallelTVDistance.apply(
+        draft_logits, target_logits.detach(), tp_group, logits_are_vocab_sharded
+    )
+
+
 @dataclass
 class MultiTokenPredictionLayerSubmodules:
     """
@@ -929,9 +1049,127 @@ class MTPLossAutoScaler(torch.autograd.Function):
         MTPLossAutoScaler.main_loss_backward_scale = scale
 
 
+def _process_mtp_e2e_tv_loss(
+    hidden_states_list: tuple[Tensor, ...],
+    loss_mask: Tensor,
+    output_layer: Callable,
+    output_weight: Tensor,
+    runtime_gather_output: Optional[bool],
+    is_training: bool,
+    config: TransformerConfig,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    packed_seq_params: Optional[PackedSeqParams],
+    scale_logits_fn: Optional[Callable[[Tensor], Tensor]],
+    original_num_tokens: Tensor,
+) -> Tensor:
+    """Apply the end-to-end TV objective to MTP draft hidden states.
+
+    The frozen backbone is projected once. For depth ``i``, its target logits are
+    shifted by ``i + 1`` positions to align with the MTP draft distribution for
+    the same future token. Only start positions with a complete chain across all
+    configured MTP depths contribute to the objective.
+    """
+    hidden_states = hidden_states_list[0]
+    logits_are_vocab_sharded = _mtp_logits_are_vocab_sharded(output_layer, runtime_gather_output)
+
+    # Project the frozen backbone once, then align each target distribution by
+    # rolling logits. Re-projecting one shifted hidden tensor per MTP depth would
+    # add a full vocabulary GEMM for every draft step.
+    with torch.no_grad():
+        target_logits, _ = output_layer(
+            hidden_states.detach(),
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        if scale_logits_fn is not None:
+            target_logits = scale_logits_fn(target_logits)
+    # roll_tensor handles packed boundaries and CP communication along its last
+    # dimension. Keep vocabulary before sequence while preparing target alignment.
+    target_logits = target_logits.permute(1, 2, 0)
+    current_loss_mask = loss_mask
+    chain_valid = torch.ones_like(loss_mask, dtype=torch.bool)
+    tv_distances = []
+
+    for mtp_layer_number in range(config.mtp_num_layers):
+        target_logits, _ = roll_tensor(
+            target_logits,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            return_sum=False,
+        )
+        current_loss_mask, _ = roll_tensor(
+            current_loss_mask,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            return_sum=False,
+        )
+        chain_valid &= current_loss_mask.bool()
+
+        draft_logits, _ = output_layer(
+            hidden_states_list[mtp_layer_number + 1],
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        if scale_logits_fn is not None:
+            draft_logits = scale_logits_fn(draft_logits)
+        tv_distances.append(
+            vocab_parallel_tv_distance(
+                draft_logits,
+                target_logits.permute(2, 0, 1),
+                tp_group=tp_group,
+                logits_are_vocab_sharded=logits_are_vocab_sharded,
+            )
+        )
+
+    tv_distances_tensor = torch.stack(tv_distances, dim=0)
+    per_step_acceptance = 1.0 - tv_distances_tensor
+    prefix_acceptance = torch.cumprod(per_step_acceptance, dim=0)
+    prefix_losses = 1.0 - prefix_acceptance
+    e2e_tv_loss = prefix_losses.mean(dim=0)
+
+    chain_mask = chain_valid.transpose(0, 1).to(e2e_tv_loss.dtype)
+    num_tokens = chain_mask.sum()
+    masked_e2e_tv_loss = e2e_tv_loss * chain_mask
+
+    if is_training:
+        avg_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        for mtp_layer_number in range(config.mtp_num_layers):
+            loss_for_log = (
+                torch.sum(prefix_losses[mtp_layer_number] * chain_mask)
+                / num_tokens.clamp(min=1)
+            )
+            correct = torch.sum(per_step_acceptance[mtp_layer_number] * chain_mask)
+            MTPLossLoggingHelper.save_metrics_to_tracker(
+                loss_for_log,
+                correct,
+                num_tokens,
+                mtp_layer_number,
+                config.mtp_num_layers,
+                avg_group=avg_group,
+            )
+
+    assert config.mtp_loss_scaling_factor is not None
+    if config.calculate_per_token_loss:
+        normalized_loss = (
+            config.mtp_loss_scaling_factor
+            * masked_e2e_tv_loss
+            * (original_num_tokens / num_tokens.clamp(min=1))
+        )
+    else:
+        normalized_loss = (
+            config.mtp_loss_scaling_factor * masked_e2e_tv_loss / num_tokens.clamp(min=1)
+        )
+    return MTPLossAutoScaler.apply(hidden_states, normalized_loss)
+
+
 def process_mtp_loss(
     hidden_states: Tensor,
-    labels: Tensor,
+    labels: Optional[Tensor],
     loss_mask: Optional[Tensor],
     output_layer: Callable,
     output_weight: Optional[Tensor],
@@ -1008,6 +1246,23 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
+
+    if config.mtp_loss_type == "e2e_tv":
+        assert output_weight is not None
+        return _process_mtp_e2e_tv_loss(
+            hidden_states_list=hidden_states_list,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            is_training=is_training,
+            config=config,
+            cp_group=cp_group,
+            tp_group=tp_group,
+            packed_seq_params=packed_seq_params,
+            scale_logits_fn=scale_logits_fn,
+            original_num_tokens=original_num_tokens,
+        )
 
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_logits, _ = output_layer(
