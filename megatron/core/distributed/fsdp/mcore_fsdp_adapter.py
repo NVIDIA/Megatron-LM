@@ -573,7 +573,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         fine_grained = config.overlap_moe_expert_parallel_comm
         skip_backward_cb = fine_grained and ddp_config.delay_wgrad_compute
-        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
+        # The combined-1F1B EP overlap schedule does not follow the static
+        # forward/backward orders, so enable trace-and-replay prefetch.
+        with fully_shard_context(
+            device=device,
+            reuse_existing=True,
+            use_trace_replay=fine_grained,
+            use_symmetric_memory=ddp_config.nccl_ub,
+        ):
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
                     # The root is always sharded after selected child units so it is not
@@ -739,6 +746,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 gradient reduction is complete when backward returns."""
+
+    def complete_fsdp_trace(self) -> None:
+        """Mark the global-batch boundary for the execution-order runner.
+
+        Called by the training loop after each optimizer step so the runner
+        compiles the traced fine-grained consume cycle and, from the second
+        global batch, replays it to prefetch the true next consumer under the
+        combined-1F1B + VPP schedule.
+        """
+        self.module.context.runner.complete_trace()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
