@@ -111,13 +111,27 @@ class InferenceClient:
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
-        payload_serialized = msgpack.packb(payload, use_bin_type=True)
-        self.socket.send(payload_serialized)
+        self.socket.send_multipart(self._submit_frames(request_id, prompt, sampling_params))
         assert request_id not in self.completion_futures
         self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
+
+    def _submit_frames(self, request_id, prompt, sampling_params):
+        """Frame a submission as [metadata, prompt].
+
+        The prompt travels in its own frame so the coordinator can route the
+        request without decoding it -- at long prompts that decode dominates the
+        coordinator's per-request cost, and it is a single serial loop shared by
+        every data parallel rank.
+        """
+        return [
+            msgpack.packb(
+                [Headers.SUBMIT_REQUEST.value, request_id, sampling_params.serialize()],
+                use_bin_type=True,
+            ),
+            msgpack.packb(prompt, use_bin_type=True),
+        ]
 
     def abort_request(self, request_id: int) -> None:
         """Cancel an in-flight request and close its local response stream."""
@@ -161,8 +175,7 @@ class InferenceClient:
         sampling_params.streaming = True
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self.socket.send_multipart(self._submit_frames(request_id, prompt, sampling_params))
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop
         )
@@ -185,13 +198,16 @@ class InferenceClient:
         """
         while True:
             try:
-                data = msgpack.unpackb(self.socket.recv(flags=zmq.NOBLOCK), raw=False)
+                # frames[0] is metadata; a reply body, when present, follows it.
+                frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
+                data = msgpack.unpackb(frames[0], raw=False)
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
-                    request_id, reply = data[1:]
+                    request_id = data[1]
                     if request_id in self.aborted_request_ids:
                         self.aborted_request_ids.discard(request_id)
                         continue
+                    reply = msgpack.unpackb(frames[1], raw=False)
                     submitted = self.request_submission_times.pop(request_id, None)
                     if submitted is not None:
                         reply['latency'] = time.perf_counter() - submitted
@@ -215,10 +231,10 @@ class InferenceClient:
                     )
                     completion_future.set_result(completed_request)
                 elif header == Headers.ENGINE_REPLY_PARTIAL:
-                    request_id, partial = data[1:]
+                    request_id = data[1]
                     stream = self.streams.get(request_id)
                     if stream is not None:
-                        stream.put({"partial": partial})
+                        stream.put({"partial": msgpack.unpackb(frames[1], raw=False)})
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -238,7 +254,7 @@ class InferenceClient:
             timeout=max(0, int(timeout_seconds * 1000))
         ):
             raise TimeoutError("Timed out connecting to the Megatron inference coordinator")
-        reply = msgpack.unpackb(self.socket.recv(), raw=False)
+        reply = msgpack.unpackb(self.socket.recv_multipart()[0], raw=False)
         assert Headers(reply[0]) == Headers.CONNECT_ACK
 
     def start(

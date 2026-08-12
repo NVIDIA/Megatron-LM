@@ -47,12 +47,17 @@ async def test_inference_client_lifecycle():
     assert client.completion_futures == {}
 
     # start(): handshake sends CONNECT, expects CONNECT_ACK, spawns listener task.
-    # We stage two recv() replies: the CONNECT_ACK during handshake, and an
-    # ENGINE_REPLY for the request we'll add below. Subsequent recvs raise
-    # zmq.Again so the listener loop yields back to the event loop.
+    # We stage two recv_multipart() replies: the CONNECT_ACK during handshake,
+    # and an ENGINE_REPLY for the request we'll add below. Messages arrive as
+    # [metadata, body] frames; the body is only present on replies that carry
+    # one. Subsequent recvs raise zmq.Again so the listener yields back to the
+    # event loop.
     recv_queue = [
-        msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True),
-        msgpack.packb([Headers.ENGINE_REPLY.value, 0, {"foo": "bar"}], use_bin_type=True),
+        [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)],
+        [
+            msgpack.packb([Headers.ENGINE_REPLY.value, 0], use_bin_type=True),
+            msgpack.packb({"foo": "bar"}, use_bin_type=True),
+        ],
     ]
 
     def fake_recv(*args, **kwargs):
@@ -60,23 +65,25 @@ async def test_inference_client_lifecycle():
             return recv_queue.pop(0)
         raise zmq.Again()
 
-    fake_socket.recv.side_effect = fake_recv
+    fake_socket.recv_multipart.side_effect = fake_recv
 
     client.start()
     assert isinstance(client.listener_task, asyncio.Task)
     sent_connect = fake_socket.send.call_args.args[0]
     assert msgpack.unpackb(sent_connect, raw=False)[0] == Headers.CONNECT.value
 
-    # add_request: SUBMIT_REQUEST payload (header, id, prompt, sampling-dict), counter increments.
+    # add_request frames the submission as [metadata, prompt] so the coordinator
+    # can route it without decoding the prompt.
     fut = client.add_request("hello", SamplingParams(temperature=0.5))
     assert isinstance(fut, asyncio.Future)
     assert client.next_request_id == 1
     assert 0 in client.request_submission_times
-    submit_payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    submit_meta, submit_prompt = fake_socket.send_multipart.call_args.args[0]
+    submit_payload = msgpack.unpackb(submit_meta, raw=False)
     assert submit_payload[0] == Headers.SUBMIT_REQUEST.value
     assert submit_payload[1] == 0
-    assert submit_payload[2] == "hello"
-    assert submit_payload[3]["temperature"] == 0.5
+    assert submit_payload[2]["temperature"] == 0.5
+    assert msgpack.unpackb(submit_prompt, raw=False) == "hello"
 
     # Listener delivers the reply: future resolves with payload + injected latency.
     # Submission-time entry is popped on completion.
@@ -115,6 +122,8 @@ async def test_inference_client_connect_handshake_rejects_unexpected_reply():
     fatal protocol mismatch, not a recoverable error. Separated from the
     lifecycle test because it short-circuits before any state is established."""
     client, _, fake_socket = _make_client()
-    fake_socket.recv.return_value = msgpack.packb([Headers.STOP.value], use_bin_type=True)
+    fake_socket.recv_multipart.return_value = [
+        msgpack.packb([Headers.STOP.value], use_bin_type=True)
+    ]
     with pytest.raises(AssertionError):
         client._connect_with_inference_coordinator()

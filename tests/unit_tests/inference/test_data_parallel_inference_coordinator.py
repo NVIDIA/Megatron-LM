@@ -25,6 +25,7 @@ from megatron.core.inference.engines.dynamic_engine import (
     DynamicInferenceEngine,
     EngineState,
     RequestEntry,
+    _engine_reply_frames,
 )
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
@@ -190,13 +191,11 @@ class DummyEngine(DynamicInferenceEngine):
                 finished_request_records.append(entry.record)
                 entry.future.set_result(entry.record)
                 to_remove.append(request_id)
-                # Send signal to coordinator.
+                # Send signal to coordinator, framed the way a real engine does.
                 if self.is_mp_coordinator:
-                    payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.merge().serialize()]],
-                        use_bin_type=True,
+                    self.socket_for_receiving_requests.send_multipart(
+                        _engine_reply_frames([entry.record.merge().serialize()])
                     )
-                    self.socket_for_receiving_requests.send(payload)
 
         for request_id in to_remove:
             del self.requests[request_id]
@@ -869,10 +868,19 @@ class TestRoutingPolicies:
         """A removed engine's queued replies still deliver; never-connected senders assert."""
 
         def reply(fid):
-            return [
-                Headers.ENGINE_REPLY.value,
-                [{"request_id": fid, "generated_tokens": [1], "sampling_params": {}}],
+            """An ENGINE_REPLY as (metadata, body frames), matching the wire format.
+
+            The metadata frame carries only the routing key and the detokenize
+            flag; the finished request travels as an opaque body frame.
+            """
+            metadata = [Headers.ENGINE_REPLY.value, [[fid, False]]]
+            bodies = [
+                msgpack.packb(
+                    {"request_id": fid, "generated_tokens": [1], "sampling_params": {}},
+                    use_bin_type=True,
+                )
             ]
+            return metadata, bodies
 
         coord = _make_routing_coordinator(num_ranks=2)
         coord.tokenizer = DummyTokenizer()
@@ -884,7 +892,7 @@ class TestRoutingPolicies:
 
         # A sender that never registered is a protocol violation.
         with pytest.raises(AssertionError, match="never-connected"):
-            handle_engine_reply(coord, b"impostor", reply(11))
+            handle_engine_reply(coord, b"impostor", *reply(11))
         assert coord.router_socket.send_multipart.call_count == 0
         assert 11 in coord.request_id_to_client_id
 
@@ -892,7 +900,7 @@ class TestRoutingPolicies:
         # reply can still arrive - and must reach its client.
         coord._remove_engine(b"rank-0")
         with caplog.at_level(logging.WARNING):
-            handle_engine_reply(coord, b"rank-0", reply(11))
+            handle_engine_reply(coord, b"rank-0", *reply(11))
         assert "removed engine" in caplog.text
         assert coord.router_socket.send_multipart.call_args[0][0][0] == b"client-A"
         assert 11 not in coord.request_id_to_client_id

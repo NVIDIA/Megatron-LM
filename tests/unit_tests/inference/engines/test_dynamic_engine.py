@@ -13,6 +13,7 @@ from functools import partial
 from typing import Dict, List, Optional, Tuple
 from unittest import mock
 
+import msgpack
 import pytest
 import torch
 from tqdm import tqdm
@@ -34,6 +35,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -765,7 +767,12 @@ def test_streaming_partials_are_sent():
 
     engine._try_send_streaming_partials()
 
-    engine.socket_for_receiving_requests.send.assert_called_once()
+    # Partials go out as [metadata, body] frames: the metadata names the request
+    # ids so the coordinator can route without decoding the bodies.
+    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
+    frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
+    assert msgpack.unpackb(frames[0], raw=False) == [Headers.ENGINE_REPLY_PARTIAL.value, [7]]
+    assert msgpack.unpackb(frames[1], raw=False)["new_tokens"] == [11, 12, 13]
     assert engine._partial_emit_lengths == {7: 3}
 
 
@@ -784,13 +791,13 @@ def test_streaming_partials_buffer_until_token_interval():
 
     engine._try_send_streaming_partials()
 
-    engine.socket_for_receiving_requests.send.assert_not_called()
+    engine.socket_for_receiving_requests.send_multipart.assert_not_called()
     assert engine._partial_emit_lengths == {}
 
     request.generated_tokens.append(13)
     engine._try_send_streaming_partials()
 
-    engine.socket_for_receiving_requests.send.assert_called_once()
+    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
     assert engine._partial_emit_lengths == {7: 3}
 
 
