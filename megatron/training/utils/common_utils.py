@@ -379,7 +379,25 @@ def get_ltor_masks_and_position_ids(data,
                                     eod_mask_loss,
                                     pad_mask_loss,
                                     create_attention_mask=True):
-    """Build masks and position id for left to right model."""
+    """Build masks and position id for left to right model.
+
+    Args:
+        data: Token ids, shape [micro_batch_size, seq_length].
+        eod_token: End-of-document token id.
+        pad_token: Padding token id.
+        reset_position_ids: Restart position ids from 0 after each EOD token.
+        reset_attention_mask: Additionally mask attention across document boundaries,
+            turning the shared causal mask into a per-sample block-causal mask.
+            Requires create_attention_mask, since it modifies the materialized mask.
+        eod_mask_loss: Zero the loss mask at EOD tokens.
+        pad_mask_loss: Zero the loss mask at pad tokens.
+        create_attention_mask: Materialize the dense causal attention mask.
+            Can be disabled if the attention kernel generates the mask by itself
+            (e.g. from PackedSeqParams), in which case attention_mask is returned as None.
+
+    Returns:
+        Tuple of (attention_mask or None, loss_mask, position_ids).
+    """
     assert create_attention_mask or not reset_attention_mask, \
         "reset_attention_mask requires the attention mask to be created."
 
