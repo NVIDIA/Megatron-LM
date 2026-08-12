@@ -16,6 +16,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
     fully_shard,
+    fully_shard_context,
     fully_shard_optimizer,
 )
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -173,7 +174,8 @@ def test_qwen35_mfsdp_v2_pipeline_parallel_trains_end_to_end(distributed_setup):
             assert isinstance(layer.self_attention, expected_attention_type)
             assert layer.mlp.__class__.__name__ == "MoELayer"
 
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        with fully_shard_context(device=device):
+            fully_shard(model, mesh=mesh, placements=_flat_placements())
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         fully_shard_optimizer(optimizer)
 
