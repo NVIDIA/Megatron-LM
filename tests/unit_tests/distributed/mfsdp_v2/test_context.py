@@ -117,24 +117,6 @@ def test_two_child_subtrees_then_parent_share_one_context(distributed_setup):
 
 def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     """Independent roots should share streams and follow construction order."""
-def test_fine_grained_hooks_preserve_registered_module_hierarchy(distributed_setup):
-    """Fine-grained parent references must not become registered child modules."""
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = MultiChildModel(dim=4, num_children=2).to(device)
-    module_names = tuple(name for name, _ in model.named_modules())
-    layer_keys = tuple(model.layers._modules)
-
-    with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
-
-    assert tuple(name for name, _ in model.named_modules()) == module_names
-    assert tuple(model.layers._modules) == layer_keys
-
-
-def test_sibling_roots_without_parent_keep_separate_contexts(distributed_setup):
-    """Independent FSDP roots should not share runtime scheduling state."""
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -153,6 +135,22 @@ def test_sibling_roots_without_parent_keep_separate_contexts(distributed_setup):
     assert model.layers[1].is_root()
     assert list(context.forward_order) == [model.layers[0], model.layers[1]]
     assert list(context.backward_order) == [model.layers[1], model.layers[0]]
+
+
+def test_fine_grained_hooks_preserve_registered_module_hierarchy(distributed_setup):
+    """Fine-grained parent references must not become registered child modules."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+    module_names = tuple(name for name, _ in model.named_modules())
+    layer_keys = tuple(model.layers._modules)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    assert tuple(name for name, _ in model.named_modules()) == module_names
+    assert tuple(model.layers._modules) == layer_keys
 
 
 def test_nested_prefetch_orders_use_dfs(distributed_setup):
@@ -252,6 +250,8 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
             fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     assert model.inner.context is first_context
+
+
 def test_post_backward_release_processes_nested_fsdp_modules_once(distributed_setup, monkeypatch):
     """Manual 1F1B release should include nested units still in the backward phase."""
     device = distributed_setup.device
