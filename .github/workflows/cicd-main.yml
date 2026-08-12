@@ -493,7 +493,6 @@ jobs:
       )
       && !cancelled()
     timeout-minutes: 300
-    timeout-minutes: 300
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -557,21 +556,9 @@ jobs:
             --ref "${{ env.MBRIDGE_BRANCH_NAME }}" \
             --client-payload "${CLIENT_PAYLOAD}"
 
-      - name: Generate MBridge polling token 1
-        id: poll-token-1
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-          owner: NVIDIA-NeMo
-          repositories: Megatron-Bridge
-          permission-actions: read
-
-      - name: Wait for MBridge tests (1/6)
-        id: wait-1
-        if: steps.poll-token-1.outcome == 'success'
+      - name: Wait for MBridge tests
         env:
-          GH_TOKEN: ${{ steps.poll-token-1.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 .github/scripts/trigger_workflow_and_wait.py \
             --owner NVIDIA-NeMo \
@@ -579,138 +566,7 @@ jobs:
             --wait-interval 60 \
             poll \
             --run-id "${{ steps.trigger-mbridge.outputs.workflow_id }}" \
-            --poll-timeout 2100
-
-      - name: Generate MBridge polling token 2
-        id: poll-token-2
-        if: steps.wait-1.outputs.completed != 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-          owner: NVIDIA-NeMo
-          repositories: Megatron-Bridge
-          permission-actions: read
-
-      - name: Wait for MBridge tests (2/6)
-        id: wait-2
-        if: steps.wait-1.outputs.completed != 'true' && steps.poll-token-2.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ steps.poll-token-2.outputs.token }}
-        run: |
-          python3 .github/scripts/trigger_workflow_and_wait.py \
-            --owner NVIDIA-NeMo \
-            --repo Megatron-Bridge \
-            --wait-interval 60 \
-            poll \
-            --run-id "${{ steps.trigger-mbridge.outputs.workflow_id }}" \
-            --poll-timeout 2100
-
-      - name: Generate MBridge polling token 3
-        id: poll-token-3
-        if: steps.wait-1.outputs.completed != 'true' && steps.wait-2.outputs.completed != 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-          owner: NVIDIA-NeMo
-          repositories: Megatron-Bridge
-          permission-actions: read
-
-      - name: Wait for MBridge tests (3/6)
-        id: wait-3
-        if: steps.wait-1.outputs.completed != 'true' && steps.wait-2.outputs.completed != 'true' && steps.poll-token-3.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ steps.poll-token-3.outputs.token }}
-        run: |
-          python3 .github/scripts/trigger_workflow_and_wait.py \
-            --owner NVIDIA-NeMo \
-            --repo Megatron-Bridge \
-            --wait-interval 60 \
-            poll \
-            --run-id "${{ steps.trigger-mbridge.outputs.workflow_id }}" \
-            --poll-timeout 2100
-
-      - name: Generate MBridge polling token 4
-        id: poll-token-4
-        if: steps.wait-1.outputs.completed != 'true' && steps.wait-2.outputs.completed != 'true' && steps.wait-3.outputs.completed != 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-          owner: NVIDIA-NeMo
-          repositories: Megatron-Bridge
-          permission-actions: read
-
-      - name: Wait for MBridge tests (4/6)
-        id: wait-4
-        if: steps.wait-1.outputs.completed != 'true' && steps.wait-2.outputs.completed != 'true' && steps.wait-3.outputs.completed != 'true' && steps.poll-token-4.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ steps.poll-token-4.outputs.token }}
-        run: |
-          python3 .github/scripts/trigger_workflow_and_wait.py \
-            --owner NVIDIA-NeMo \
-            --repo Megatron-Bridge \
-            --wait-interval 60 \
-            poll \
-            --run-id "${{ steps.trigger-mbridge.outputs.workflow_id }}" \
-            --poll-timeout 2100
-
-      - name: Generate MBridge polling token 5
-        id: poll-token-5
-        if: steps.wait-1.outputs.completed != 'true' && steps.wait-2.outputs.completed != 'true' && steps.wait-3.outputs.completed != 'true' && steps.wait-4.outputs.completed != 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-          owner: NVIDIA-NeMo
-          repositories: Megatron-Bridge
-          permission-actions: read
-
-      - name: Wait for MBridge tests (5/6)
-        id: wait-5
-        if: steps.wait-1.outputs.completed != 'true' && steps.wait-2.outputs.completed != 'true' && steps.wait-3.outputs.completed != 'true' && steps.wait-4.outputs.completed != 'true' && steps.poll-token-5.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ steps.poll-token-5.outputs.token }}
-        run: |
-          python3 .github/scripts/trigger_workflow_and_wait.py \
-            --owner NVIDIA-NeMo \
-            --repo Megatron-Bridge \
-            --wait-interval 60 \
-            poll \
-            --run-id "${{ steps.trigger-mbridge.outputs.workflow_id }}" \
-            --poll-timeout 2100
-
-      - name: Generate MBridge polling token 6
-        id: poll-token-6
-        if: steps.wait-1.outputs.completed != 'true' && steps.wait-2.outputs.completed != 'true' && steps.wait-3.outputs.completed != 'true' && steps.wait-4.outputs.completed != 'true' && steps.wait-5.outputs.completed != 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-          owner: NVIDIA-NeMo
-          repositories: Megatron-Bridge
-          permission-actions: read
-
-      - name: Wait for MBridge tests (6/6)
-        id: wait-6
-        if: steps.wait-1.outputs.completed != 'true' && steps.wait-2.outputs.completed != 'true' && steps.wait-3.outputs.completed != 'true' && steps.wait-4.outputs.completed != 'true' && steps.wait-5.outputs.completed != 'true' && steps.poll-token-6.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ steps.poll-token-6.outputs.token }}
-        run: |
-          python3 .github/scripts/trigger_workflow_and_wait.py \
-            --owner NVIDIA-NeMo \
-            --repo Megatron-Bridge \
-            --wait-interval 60 \
-            poll \
-            --run-id "${{ steps.trigger-mbridge.outputs.workflow_id }}" \
-            --poll-timeout 2100
-
-      - name: Require completed MBridge tests
-        if: steps.wait-1.outputs.completed != 'true' && steps.wait-2.outputs.completed != 'true' && steps.wait-3.outputs.completed != 'true' && steps.wait-4.outputs.completed != 'true' && steps.wait-5.outputs.completed != 'true' && steps.wait-6.outputs.completed != 'true'
-        run: |
-          echo "MBridge tests did not finish within the bounded polling windows" >&2
-          exit 1
+            --poll-timeout 12600
 
       - name: Generate cleanup token
         if: always()
