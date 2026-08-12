@@ -152,6 +152,36 @@ def format_mem_bytes(mem_bytes):
     return "%d bytes" % mem_bytes
 
 
+def _engine_reply_frames(finished_requests: List[dict]) -> List[bytes]:
+    """Frame finished requests as [metadata, body, body, ...] for the coordinator.
+
+    The metadata frame carries only what the coordinator needs to route each
+    reply: the request id, and whether it must detokenize into the body. Every
+    body stays a separate opaque frame so the coordinator can forward it without
+    decoding -- a finished request echoes the prompt back, so decoding it costs
+    more than the inbound submission did.
+
+    Args:
+        finished_requests: Serialized requests, in the order their frames follow.
+
+    Returns:
+        The frames to send, metadata first.
+    """
+    metadata = [
+        Headers.ENGINE_REPLY.value,
+        [
+            [
+                request["request_id"],
+                bool((request.get("sampling_params") or {}).get("detokenize_generations")),
+            ]
+            for request in finished_requests
+        ],
+    ]
+    return [msgpack.packb(metadata, use_bin_type=True)] + [
+        msgpack.packb(request, use_bin_type=True) for request in finished_requests
+    ]
+
+
 def _get_decode_only_log_state(
     mode: AsyncScheduleMode, decode_only: DecodeOnly
 ) -> Tuple[str, Optional[bool]]:
@@ -1087,11 +1117,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     merged.uid not in self.local_metadata_ledger
                 ), f"finished-request ledger: duplicate uid {merged.uid!r}"
                 self.local_metadata_ledger[merged.uid] = FinishedRequestRecord.from_request(merged)
-        payload = msgpack.packb(
-            [Headers.ENGINE_REPLY.value, [request.serialize() for request in merged_requests]],
-            use_bin_type=True,
+        self.socket_for_receiving_requests.send_multipart(
+            _engine_reply_frames([request.serialize() for request in merged_requests])
         )
-        self.socket_for_receiving_requests.send(payload)
 
     def _handle_failed_request(self, request_id: int):
         """Handle a failed request by sending the reply immediately.
@@ -2397,9 +2425,16 @@ class DynamicInferenceEngine(AbstractEngine):
         if not partials:
             return
 
-        payload = msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True)
         nvtx_range_push("coordinator_streaming")
-        self.socket_for_receiving_requests.send(payload)
+        self.socket_for_receiving_requests.send_multipart(
+            [
+                msgpack.packb(
+                    [Headers.ENGINE_REPLY_PARTIAL.value, [p["request_id"] for p in partials]],
+                    use_bin_type=True,
+                )
+            ]
+            + [msgpack.packb(p, use_bin_type=True) for p in partials]
+        )
         nvtx_range_pop("coordinator_streaming")
 
         self._partial_emit_lengths.update(emit_lengths)
@@ -2786,6 +2821,52 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return finished_request_records_list
 
+    @staticmethod
+    def _pack_tp_broadcast(messages: List[List[bytes]]) -> List[bytes]:
+        """Flatten per-message frame lists into one TP-broadcast multipart message.
+
+        A message is a list of frames -- metadata first, then any payload bodies.
+        ZMQ multipart is flat, so the frame boundaries would be lost on the wire.
+        They are carried instead in a manifest frame holding one frame count per
+        message, which lets peer ranks rebuild the grouping without any payload
+        being copied, decoded, or re-packed.
+
+        Args:
+            messages: One frame list per message, in delivery order.
+
+        Returns:
+            ``[tp_broadcast_header, manifest, *flattened frames]``.
+        """
+        manifest = msgpack.packb([len(message) for message in messages], use_bin_type=True)
+        return [bytes([Headers.TP_BROADCAST.value]), manifest] + [
+            frame for message in messages for frame in message
+        ]
+
+    @staticmethod
+    def _unpack_tp_broadcast(frames: List[bytes]) -> List[List[bytes]]:
+        """Rebuild per-message frame lists from a TP broadcast.
+
+        Inverse of :meth:`_pack_tp_broadcast`.
+
+        Args:
+            frames: The received multipart message, header frame first.
+
+        Returns:
+            One frame list per message, in the order they were packed.
+        """
+        frame_counts = msgpack.unpackb(frames[1], raw=False)
+        flat = frames[2:]
+        messages = []
+        offset = 0
+        for count in frame_counts:
+            messages.append(flat[offset : offset + count])
+            offset += count
+        assert offset == len(flat), (
+            f"TP broadcast manifest accounts for {offset} frames but {len(flat)} were received; "
+            "sender and receiver disagree on message framing"
+        )
+        return messages
+
     def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
 
@@ -2820,25 +2901,32 @@ class DynamicInferenceEngine(AbstractEngine):
         nvtx_range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
+            # Locally-generated notifications are single-frame messages, so they
+            # are wrapped to match the frame-list shape of socket traffic.
             all_messages.extend(
-                msgpack.packb(
-                    [Headers.KV_HANDOFF_COMPLETE.value, request_id, failed], use_bin_type=True
-                )
+                [
+                    msgpack.packb(
+                        [Headers.KV_HANDOFF_COMPLETE.value, request_id, failed], use_bin_type=True
+                    )
+                ]
                 for request_id, failed in self._drain_handoff_completion_notifications()
             )
             while True:
                 try:
                     # Receive messages in a non-blocking way.
-                    all_messages.append(self.socket_for_receiving_requests.recv(flags=zmq.NOBLOCK))
+                    all_messages.append(
+                        self.socket_for_receiving_requests.recv_multipart(flags=zmq.NOBLOCK)
+                    )
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
             self.model_parallel_publisher_socket.send_multipart(
-                [bytes([Headers.TP_BROADCAST.value])] + all_messages
+                self._pack_tp_broadcast(all_messages)
             )
         else:
-            frames = self.model_parallel_subscriber_socket.recv_multipart()
-            all_messages = frames[1:]
+            all_messages = self._unpack_tp_broadcast(
+                self.model_parallel_subscriber_socket.recv_multipart()
+            )
 
         nvtx_range_pop("drain_zmq_socket")
 
@@ -2846,17 +2934,23 @@ class DynamicInferenceEngine(AbstractEngine):
         # Control signals are queued for the second pass.
         new_generation_epoch = None
         for message in all_messages:
-            data = msgpack.unpackb(message, raw=False)
+            data = msgpack.unpackb(message[0], raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                request_id, prompt, sampling_params = data[1:]
+                request_id, sampling_params = data[1:]
+                # The prompt rides in its own frame; the engine is its first
+                # consumer, so this is where it finally gets decoded.
+                prompt = msgpack.unpackb(message[1], raw=False)
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
             elif header == Headers.SUBMIT_REQUEST_WITH_KV:
-                # Decode-side KV import.
-                request_id, prompt, sampling_params, kv_meta, src_block_ids = data[1:]
+                # Decode-side KV import. As on the plain path, the prompt rides
+                # in its own frame and the engine is its first consumer.
+                request_id, sampling_params, kv_meta = data[1:]
+                prompt = msgpack.unpackb(message[1], raw=False)
+                src_block_ids = msgpack.unpackb(message[2], raw=False)
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request_with_kv_handoff")
                 self.add_request_with_kv_handoff(
@@ -2925,7 +3019,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # processes one state transition per iteration).
         if self._pending_signals:
             message = self._pending_signals.popleft()
-            data = msgpack.unpackb(message, raw=False)
+            data = msgpack.unpackb(message[0], raw=False)
             header = Headers(data[0])
 
             if header == Headers.PAUSE:

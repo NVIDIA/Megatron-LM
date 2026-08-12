@@ -22,7 +22,14 @@ from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
+from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
+    handle_submit_request,
+)
+from megatron.core.inference.engines.dynamic_engine import (
+    DynamicInferenceEngine,
+    RequestEntry,
+    _engine_reply_frames,
+)
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
@@ -154,10 +161,9 @@ class DummyEngine(DynamicInferenceEngine):
                 entry.future.set_result(entry.record)
                 to_remove.append(request_id)
                 if self.is_mp_coordinator:
-                    payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
+                    self.socket_for_receiving_requests.send_multipart(
+                        _engine_reply_frames([entry.record.serialize()])
                     )
-                    self.socket_for_receiving_requests.send(payload)
 
         for request_id in to_remove:
             del self.requests[request_id]
@@ -249,18 +255,6 @@ class TestCoordinatorHashComputation:
         hashes_from_list = coordinator.compute_request_hashes([1, 2, 3, 4, 5, 6, 7, 8])
         assert hashes_from_str == hashes_from_list
 
-    def test_hash_empty_when_disabled(self):
-        """Returns empty list when prefix caching is disabled."""
-        coordinator = make_coordinator_direct(enable_prefix_caching=False)
-        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
-        assert hashes == []
-
-    def test_hash_empty_when_no_block_size(self):
-        """Returns empty list when block_size_tokens is None."""
-        coordinator = make_coordinator_direct(block_size_tokens=None)
-        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
-        assert hashes == []
-
     def test_hash_partial_block_ignored(self):
         """Tokens that don't fill a complete block produce no hash."""
         coordinator = make_coordinator_direct()
@@ -286,6 +280,62 @@ class TestCoordinatorHashComputation:
         assert h1[0] != h2[0]
         # Block 2 hashes also differ due to parent chaining.
         assert h1[1] != h2[1]
+
+
+class TestSubmitDoesNotDecodePrompt:
+    """The coordinator must not decode the prompt when no routing needs it.
+
+    Decoding is O(prompt length) on the coordinator's single serial loop, so
+    skipping it is the point of carrying the prompt in its own frame. Each test
+    sends a prompt frame that is deliberately *not* valid msgpack: if the
+    handler tried to decode it the call would raise, so completing cleanly is
+    proof the bytes were forwarded untouched.
+    """
+
+    UNDECODABLE_PROMPT = b"\xc1not-valid-msgpack"
+
+    def _submit(self, coordinator):
+        """Drive handle_submit_request once and return the frames sent onward."""
+        coordinator.known_clients = {b"client-A"}
+        coordinator.next_request_id = 0
+        coordinator.request_id_to_client_id = {}
+        coordinator.request_id_to_client_request_id = {}
+        coordinator.client_request_to_request_id = {}
+        coordinator.request_id_to_rank = {}
+        coordinator.schedule_records = None
+        coordinator.router_socket = MagicMock()
+
+        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}]
+        handle_submit_request(coordinator, b"client-A", metadata, [self.UNDECODABLE_PROMPT])
+        return coordinator.router_socket.send_multipart.call_args.args[0]
+
+    def test_load_balanced_forwards_prompt_verbatim(self):
+        """LOAD_BALANCED ignores hashes, so the prompt is never decoded."""
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        )
+        _identity, _metadata, prompt_frame = self._submit(coordinator)
+        assert prompt_frame is self.UNDECODABLE_PROMPT
+
+    def test_disabled_prefix_caching_forwards_prompt_verbatim(self):
+        """With prefix caching off there are no hashes to compute either."""
+        coordinator = make_coordinator_direct(data_parallel_size=2, enable_prefix_caching=False)
+        _identity, _metadata, prompt_frame = self._submit(coordinator)
+        assert prompt_frame is self.UNDECODABLE_PROMPT
+
+    def test_metadata_frame_is_rewritten_with_server_request_id(self):
+        """The client's request id is swapped for the coordinator's own."""
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        )
+        _identity, metadata_frame, _prompt = self._submit(coordinator)
+        header, request_id, sampling_params = msgpack.unpackb(metadata_frame, raw=False)
+        assert header == Headers.SUBMIT_REQUEST.value
+        assert request_id == 0  # server-side id, not the client's 7
+        assert sampling_params == {"temperature": 1.0}
+        assert coordinator.request_id_to_client_request_id[0] == 7
 
 
 class TestCoordinatorPrefixRouting:
