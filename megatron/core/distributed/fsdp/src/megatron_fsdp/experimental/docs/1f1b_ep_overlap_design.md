@@ -192,28 +192,18 @@ def _fine_grained_pre_forward(hook_module, args, kwargs):
 
 ### 2.2 Pre-backward hooks on sub-modules
 
-A forward hook on each sub-module registers a `register_multi_grad_hook` on
-its output tensors; when autograd reaches the sub-module during backward, the
-grad hook unshards the parent `FsdpModule`:
+A `register_full_backward_pre_hook` on each sub-module unshards the parent
+`FsdpModule` before that sub-module's own backward runs, so its
+weight-gradient computation sees full parameters:
 
 ```python
-def _create_fine_grained_backward_hook(submodule: nn.Module) -> None:
-    def _forward_hook(_module, inputs, output):
-        output_list = [t for t in (output if isinstance(output, (tuple, list)) else [output])
-                       if isinstance(t, torch.Tensor)]
-
-        def _multi_grad_hook(grads):
-            target = _find_fsdp_target(submodule)
-            if target is None:
-                return
-            target._unshard_parameter_groups()
-            if target._unshard_event is not None:
-                target.context.current_stream().wait_event(target._unshard_event)
-
-        torch.autograd.graph.register_multi_grad_hook(output_list, _multi_grad_hook, mode="any")
-        return output
-
-    submodule.register_forward_hook(_forward_hook)
+def _fine_grained_pre_backward_hook(submodule: nn.Module, grad_output) -> None:
+    target = _find_fsdp_target(submodule)
+    if target is None:
+        return
+    target._unshard_parameter_groups()
+    if target._unshard_event is not None:
+        target.context.current_stream().wait_event(target._unshard_event)
 ```
 
 ### 2.3 Wiring from `fully_shard()`
