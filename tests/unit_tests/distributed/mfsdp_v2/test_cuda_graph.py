@@ -114,11 +114,8 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
 
-    # See: https://docs.nvidia.com/dl-cuda-graph/troubleshooting/memory-issues.html#gradient-accumulator-cross-stream-memory-growth
-    # Warm up on the same stream used for capture so autograd's accumulation path does
-    # not create cross-stream gradient-memory growth. The first warmup installs the
-    # reusable sharded gradient views (and, with symmetric memory, allocates and
-    # rendezvouses the staging buffers) so the captured region reuses them for replay.
+    # Warm up on the capture stream. With symmetric memory, this allocates and
+    # rendezvouses the reusable collective buffers before CUDA-graph capture.
     with torch.cuda.stream(capture_stream):
         for _ in range(3):
             train_iteration()
