@@ -18,6 +18,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
+from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -137,7 +138,8 @@ class TestMcoreAdapterDense:
 
         assert fully_shard_context_calls == [True]
 
-    def test_build_train_and_step(self):
+    @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
+    def test_build_train_and_step(self, optimizer_cuda_graph):
         config = TransformerConfig(
             num_layers=2,
             hidden_size=16,
@@ -156,16 +158,19 @@ class TestMcoreAdapterDense:
         # DistributedOptimizer path that expects DDP/FSDP buffer metadata.
         reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
 
+        ddp_config = DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+        )
+        if optimizer_cuda_graph:
+            # Capturable TE FusedAdam requires the main-gradient and main-weight dtypes
+            # to match (https://github.com/NVIDIA/TransformerEngine/issues/3358).
+            ddp_config.megatron_fsdp_main_grads_dtype = ddp_config.megatron_fsdp_main_params_dtype
+
         model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-            ),
-            module=model,
-            pg_collection=self.pg_collection,
+            config=config, ddp_config=ddp_config, module=model, pg_collection=self.pg_collection
         )
 
         reference_optimizer_config = OptimizerConfig(
@@ -180,7 +185,9 @@ class TestMcoreAdapterDense:
         reference_optimizer = get_megatron_optimizer(
             reference_optimizer_config, [reference_model], use_gloo_process_groups=False
         )
-        optimizer_config = replace(reference_optimizer_config)
+        optimizer_config = replace(
+            reference_optimizer_config, optimizer_cuda_graph=optimizer_cuda_graph
+        )
         with pytest.raises(
             ValueError, match="MFSDP v2 currently requires use_distributed_optimizer=False"
         ):
@@ -192,6 +199,8 @@ class TestMcoreAdapterDense:
         optimizer = get_megatron_optimizer(optimizer_config, [model], use_gloo_process_groups=False)
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()
+        if optimizer_cuda_graph:
+            optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=1)
 
         steps = [
             [
