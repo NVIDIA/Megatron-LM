@@ -715,6 +715,7 @@ def num_floating_point_operations(
         gdn_conv_kernel_dim=4,
         vocab_size=256000,
         mtp_num_layers=0,
+        mtp_loss_type="cross_entropy",
         multi_latent_attention=False,
         q_lora_rank=None,
         kv_lora_rank=0,
@@ -821,7 +822,14 @@ def num_floating_point_operations(
                 2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
             )  # logits computation
         )
-        return flops_fwd * 3
+        # E2E TV projects the frozen backbone once to produce target logits.
+        # This projection has no backward pass because the target distribution
+        # is detached. Softmax/overlap elementwise work is omitted consistently
+        # with the existing cross-entropy FLOPs convention.
+        e2e_tv_target_projection_flops = (
+            2 * total_tokens * hidden_size * vocab_size if mtp_loss_type == "e2e_tv" else 0
+        )
+        return flops_fwd * 3 + e2e_tv_target_projection_flops
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1158,6 +1166,11 @@ def num_floating_point_operations(
                 * args.hidden_size
                 * args.padded_vocab_size
                 * (mtp_num_layers + 1)  # MTP + final logit
+                # E2E TV target distribution: one frozen forward-only output projection.
+                + fma_expansion_factor
+                * args.hidden_size
+                * args.padded_vocab_size
+                * int(getattr(args, "mtp_loss_type", "cross_entropy") == "e2e_tv")
             )
             # Self Attention (core L^2 part). For BSHD the default
             # ``seqlen_squared_sum_in_batch = batch_size * seq_length^2`` recovers the
@@ -1245,6 +1258,7 @@ def num_floating_point_operations(
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
+            mtp_loss_type=getattr(args, "mtp_loss_type", "cross_entropy"),
             multi_latent_attention=args.multi_latent_attention,
             q_lora_rank=args.q_lora_rank,
             kv_lora_rank=args.kv_lora_rank,
