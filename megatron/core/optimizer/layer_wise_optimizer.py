@@ -229,15 +229,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
            followed by an isolated bucket for that embedding alone.
         2. When the chunk's total numel reaches ``bucket_size`` (or all
            params have been consumed), bin-pack the chunk into ``dp_size``
-           shards via greedy LPT — sort by numel descending and assign each
-           param to the shard with the smallest current load.
+           shards: sort by estimated Newton-Schulz compute cost descending and
+           assign each param to the shard with the smallest accumulated compute
+           load, subject to a per-bucket numel cap that bounds shard-imbalance
+           padding. Compute loads persist across buckets so expensive
+           (GTP-sharded) matrices spread over the whole buffer instead of
+           clustering inside each bucket.
         3. Pad each shard to ``max(shard_cursors)`` aligned to
            :meth:`_shard_divisor`, then emit the bucket.
 
         Each bucket therefore spans a contiguous backprop range so that
         ``overlap_grad_reduce`` can dispatch the bucket's reduce-scatter as
         soon as the bucket's backward segment finishes — preserving the
-        original DDP overlap semantics.  LPT bin-packing keeps shards close
+        original DDP overlap semantics.  Greedy bin-packing keeps shards close
         to balanced; for uniform transformer blocks where ``params_per_layer
         * num_layers`` is a multiple of ``dp_size`` the packing is perfect.
 
@@ -262,6 +266,27 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         buffer_cursor = 0
         bucket_id = 0
         shard_imbalance_padding_numel = 0
+
+        # Persistent compute loads across buckets so LPT spreads expensive
+        # (GTP-sharded) params evenly instead of clustering them per bucket.
+        shard_compute_loads = [0] * dp_size
+
+        def _ns_compute_cost(param):
+            """Estimate Newton-Schulz compute cost for a parameter.
+
+            Newton-Schulz only runs on matrices, so anything that is not 2D falls
+            back to its element count. For a 2D param the cost is
+            ~ max(M,N) * min(M,N)^2, the dominant term in the orthogonalization;
+            GTP-sharded params reconstruct the full post-AllGather shape first
+            (GTP always shards along dim 0).
+            """
+            if param.dim() != 2:
+                return param.data.nelement()
+            m, n = param.data.shape
+            if getattr(param, 'is_gtp_weight_remat', False):
+                m = m * getattr(param, 'gtp_remat_size', 1)
+            big, small = max(m, n), min(m, n)
+            return big * small * small
 
         def _emit_bucket(
             chunk_params: List[torch.nn.Parameter], shared_embedding: bool = False
@@ -292,17 +317,33 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     shard_assignments[shard_id].append((None, numel))
                     shard_cursors[shard_id] = numel
             else:
-                # Greedy LPT: largest first, assign to the least-loaded shard.
-                # The within-shard order is sorted-by-numel, not backprop —
+                # Compute-balanced LPT: sort by Newton-Schulz compute cost
+                # (accounts for full post-AllGather shape under GTP), assign to
+                # the shard with least accumulated compute load. Compute loads
+                # persist across buckets; numel cursors reset per bucket.
+                # A per-bucket numel cap prevents excessive padding.
+                # The within-shard order is sorted-by-compute-cost, not backprop;
                 # that is fine because all params in the chunk share the same
                 # bucket_id, so DDP's backprop-order iteration still sees
                 # monotonic bucket_ids across the chunk boundary.
-                for param in sorted(chunk_params, key=lambda p: -p.data.nelement()):
+                _NUMEL_EPSILON = 0.3
+                total_chunk_numel = sum(p.data.nelement() for p in chunk_params)
+                max_shard_numel = total_chunk_numel / dp_size * (1 + _NUMEL_EPSILON)
+                for param in sorted(chunk_params, key=lambda p: -_ns_compute_cost(p)):
                     numel = param.data.nelement()
-                    min_shard = min(range(dp_size), key=lambda s: shard_cursors[s])
+                    candidates = [
+                        s
+                        for s in range(dp_size)
+                        if pad_param_start(shard_cursors[s]) + numel <= max_shard_numel
+                    ]
+                    if candidates:
+                        min_shard = min(candidates, key=lambda s: shard_compute_loads[s])
+                    else:
+                        min_shard = min(range(dp_size), key=lambda s: shard_cursors[s])
                     placement = pad_param_start(shard_cursors[min_shard])
                     shard_assignments[min_shard].append((param, numel))
                     shard_cursors[min_shard] = placement + numel
+                    shard_compute_loads[min_shard] += _ns_compute_cost(param)
 
             padded_shard_size = pad_to_divisor(max(shard_cursors), shard_divisor)
             bucket_start_index = buffer_cursor
@@ -339,6 +380,31 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         chunk_params: List[torch.nn.Parameter] = []
         chunk_numel = 0
         chunk_max_param = 0
+        # Approximate _emit_bucket's placement so we can decide, per param,
+        # whether it still fits in the current bucket. This estimates rather
+        # than mirrors, for two reasons: _emit_bucket sorts the chunk before
+        # packing it, while this places params in backprop order, and
+        # _emit_bucket assigns by Newton-Schulz compute cost, while this tracks
+        # numel. Equal-sized params make both differences vanish, because
+        # sorting is then a no-op and cost is proportional to numel. Mixed
+        # sizes send params to different shards under the two orders, so the
+        # real maximum shard load can exceed the estimated one. _absorbs then
+        # admits a param that does grow the bucket, leaving a buffer larger
+        # than closing the bucket early would have produced. The layout stays
+        # valid either way; see test_mixed_sizes_can_absorb_into_larger_bucket.
+        shard_loads = [0] * dp_size
+
+        def _absorbs(numel: int) -> bool:
+            """True if ``numel`` fits in the least-loaded shard without growing
+            the bucket's padded size (``dp_size * padded_shard_size``), i.e.,
+            it fills existing shard padding instead of adding a new row."""
+            target = pad_to_divisor(max(shard_loads), shard_divisor)
+            return pad_param_start(min(shard_loads)) + numel <= target
+
+        def _place(numel: int) -> None:
+            shard_id = min(range(dp_size), key=lambda s: shard_loads[s])
+            shard_loads[shard_id] = pad_param_start(shard_loads[shard_id]) + numel
+
         for param in reversed(params):
             param_numel = param.data.nelement()
             if getattr(param, 'shared_embedding', False):
