@@ -42,6 +42,26 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
+
+def compute_depth_scale(
+    residual_depth_scaling: bool,
+    num_layers: int,
+    residual_depth_scaling_L_ref: int = 1,
+    residual_depth_scaling_exponent: float = 1.0,
+) -> float | None:
+    """Compute the scalar applied to each branch before its residual add.
+
+    The scale is ``min(1, (L_ref / L) ** exponent)``. With ``L_ref=1``,
+    exponent 1 gives 1/L scaling and exponent 0.5 gives 1/sqrt(L) scaling.
+    """
+    if not residual_depth_scaling:
+        return None
+    if num_layers <= 0:
+        raise ValueError(f"num_layers must be positive, got {num_layers}.")
+    ratio = residual_depth_scaling_L_ref / num_layers
+    return min(1.0, ratio**residual_depth_scaling_exponent)
+
+
 try:
     from packaging.version import Version as PkgVersion
 
@@ -467,6 +487,30 @@ class TransformerConfig(ModelParallelConfig):
     0.5 = standard attention (1/sqrt(d_head)), 1.0 = MuP attention (1/d_head).
     Default: 1.0 (MuP scaling when use_mup is True). Set to 0.5 for standard scaling.
     """
+
+    ####################
+    # residual scaling
+    ####################
+    residual_depth_scaling: bool = False
+    """Scale residual branch writes by ``min(1, (L_ref / L) ** exponent)``."""
+
+    residual_depth_scaling_L_ref: int = 1
+    """Reference depth used to compute the residual branch scale."""
+
+    residual_depth_scaling_exponent: float = 1.0
+    """Exponent on ``L_ref / L``; use 1.0 for 1/L or 0.5 for 1/sqrt(L)."""
+
+    use_residual_forget_gate: bool = False
+    """Apply a bounded learnable scalar retention gate to each active residual branch."""
+
+    residual_forget_gate_init: float = 0.999
+    """Initial residual retention scalar gamma."""
+
+    residual_forget_gate_max_forget: float = 0.02
+    """Maximum forget rate; gamma remains in ``(1 - max_forget, 1)``."""
+
+    residual_eps: float = 1.0e-6
+    """Clamp epsilon used to initialize the residual forget-gate logit."""
 
     ####################
     # mixed-precision
@@ -1343,6 +1387,33 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"gdp_num_householder must be positive, got {self.gdp_num_householder}."
             )
+
+        if self.residual_depth_scaling:
+            compute_depth_scale(
+                self.residual_depth_scaling,
+                self.num_layers,
+                self.residual_depth_scaling_L_ref,
+                self.residual_depth_scaling_exponent,
+            )
+
+        if self.use_residual_forget_gate:
+            if not self.residual_depth_scaling:
+                raise ValueError("use_residual_forget_gate requires residual_depth_scaling.")
+            if self.fine_grained_activation_offloading or (
+                self.cpu_offloading and self.cpu_offloading_activations
+            ):
+                raise ValueError(
+                    "use_residual_forget_gate is not supported with CPU activation offloading."
+                )
+            if not (0.0 < self.residual_forget_gate_max_forget < 1.0):
+                raise ValueError("residual_forget_gate_max_forget must be in (0, 1).")
+            if not (0.0 < self.residual_eps < 0.5):
+                raise ValueError("residual_eps must be in (0, 0.5).")
+            min_gamma = 1.0 - self.residual_forget_gate_max_forget
+            if not (min_gamma < self.residual_forget_gate_init < 1.0):
+                raise ValueError(
+                    "residual_forget_gate_init must satisfy 1 - max_forget < init < 1."
+                )
 
         # Apply BF16 matmul precision setting if needed
         if self.bf16 and self.disable_bf16_reduced_precision_matmul:
@@ -2909,6 +2980,12 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.inference_fuse_tp_communication:
+            if self.residual_depth_scaling or self.use_residual_forget_gate:
+                raise ValueError(
+                    "Residual depth scaling and forget gates are incompatible with "
+                    "inference_fuse_tp_communication because its fused projection performs "
+                    "the residual add internally."
+                )
             assert self.transformer_impl == "inference_optimized", (
                 "inference_fuse_tp_communication is only supported "
                 "for inference_optimized transformer implementation."

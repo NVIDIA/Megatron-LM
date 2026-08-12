@@ -13,6 +13,7 @@ from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.fusions.fused_bias_dropout import ResidualForgetGate
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -22,7 +23,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig, compute_depth_scale
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params
 
@@ -97,6 +98,21 @@ class MambaLayer(GraphableMegatronModule):
         )
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
+        self.depth_scale = compute_depth_scale(
+            self.config.residual_depth_scaling,
+            self.config.num_layers,
+            self.config.residual_depth_scaling_L_ref,
+            self.config.residual_depth_scaling_exponent,
+        )
+        self.residual_forget_gate = (
+            ResidualForgetGate(
+                gamma_init=self.config.residual_forget_gate_init,
+                max_forget=self.config.residual_forget_gate_max_forget,
+                residual_eps=self.config.residual_eps,
+            )
+            if self.config.use_residual_forget_gate
+            else None
+        )
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the mamba layer for cudagraphs."""
@@ -154,11 +170,25 @@ class MambaLayer(GraphableMegatronModule):
         mixer_out_with_bias = self.mixer(
             hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
         )
+        if self.depth_scale is None:
+            mamba_bda = self.mamba_bda(
+                training=self.training, fused=self.config.bias_dropout_fusion
+            )
+        else:
+            residual_scale = (
+                self.residual_forget_gate(residual.dtype)
+                if self.residual_forget_gate is not None
+                else None
+            )
+            mamba_bda = self.mamba_bda(
+                self.training,
+                self.config.bias_dropout_fusion,
+                self.depth_scale,
+                residual_scale,
+            )
 
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mamba_bda(
-                training=self.training, fused=self.config.bias_dropout_fusion
-            )(mixer_out_with_bias, residual, self.hidden_dropout)
+            hidden_states = mamba_bda(mixer_out_with_bias, residual, self.hidden_dropout)
 
         return hidden_states
 

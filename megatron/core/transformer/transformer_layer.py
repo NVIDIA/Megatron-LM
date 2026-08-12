@@ -15,6 +15,7 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.fusions.fused_bias_dropout import ResidualForgetGate
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -25,7 +26,7 @@ from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig, compute_depth_scale
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -442,6 +443,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
 
+        self.depth_scale = compute_depth_scale(
+            self.config.residual_depth_scaling,
+            self.config.num_layers,
+            self.config.residual_depth_scaling_L_ref,
+            self.config.residual_depth_scaling_exponent,
+        )
+        self.self_attn_residual_forget_gate = self._build_residual_forget_gate(
+            self.self_attention
+        )
+        self.cross_attn_residual_forget_gate = self._build_residual_forget_gate(
+            self.cross_attention
+        )
+        self.mlp_residual_forget_gate = self._build_residual_forget_gate(self.mlp)
+
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
@@ -523,6 +538,32 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
+
+    def _build_residual_forget_gate(
+        self, sublayer: torch.nn.Module
+    ) -> ResidualForgetGate | None:
+        if not self.config.use_residual_forget_gate or isinstance(sublayer, IdentityOp):
+            return None
+        return ResidualForgetGate(
+            gamma_init=self.config.residual_forget_gate_init,
+            max_forget=self.config.residual_forget_gate_max_forget,
+            residual_eps=self.config.residual_eps,
+        )
+
+    def _get_bda_with_residual_scaling(self, bda_factory, residual, residual_forget_gate):
+        if self.depth_scale is None:
+            return bda_factory(self.training, self.config.bias_dropout_fusion)
+        residual_scale = (
+            residual_forget_gate(residual.dtype)
+            if residual_forget_gate is not None
+            else None
+        )
+        return bda_factory(
+            self.training,
+            self.config.bias_dropout_fusion,
+            self.depth_scale,
+            residual_scale,
+        )
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the transformer layer for cudagraphs."""
@@ -680,8 +721,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # self attention module.
             hidden_states = attention_output_with_bias[0]
         else:
+            self_attn_bda = self._get_bda_with_residual_scaling(
+                self.self_attn_bda,
+                residual,
+                self.self_attn_residual_forget_gate,
+            )
             with self.bias_dropout_add_exec_handler():
-                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                hidden_states = self_attn_bda(
                     attention_output_with_bias, residual, self.hidden_dropout
                 )
         nvtx_range_pop(suffix="self_attn_bda")
@@ -722,8 +768,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
+        if not isinstance(self.cross_attention, IdentityOp):
+            cross_attn_bda = self._get_bda_with_residual_scaling(
+                self.cross_attn_bda,
+                residual,
+                self.cross_attn_residual_forget_gate,
+            )
+        else:
+            cross_attn_bda = self.cross_attn_bda(
+                self.training, self.config.bias_dropout_fusion
+            )
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
+            hidden_states = cross_attn_bda(
                 attention_output_with_bias, residual, self.hidden_dropout
             )
 
@@ -976,10 +1032,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
         else:
+            mlp_bda = self._get_bda_with_residual_scaling(
+                self.mlp_bda,
+                residual,
+                self.mlp_residual_forget_gate,
+            )
             with self.bias_dropout_add_exec_handler():
-                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                    mlp_output_with_bias, residual, self.hidden_dropout
-                )
+                hidden_states = mlp_bda(mlp_output_with_bias, residual, self.hidden_dropout)
         nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
