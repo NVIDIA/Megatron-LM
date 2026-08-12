@@ -308,6 +308,8 @@ class RolloutStats:
     kv_cache_epoch: list[list[int]]
     completed_epochs: list[list[int]]
     num_evictions: list[list[int]]
+    rollout_statuses: list[list[str]]
+    failure_reasons: list[list[str | None]]
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -1069,15 +1071,29 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     # get [a,b] with 1.0 and [c,d,e] with 1.0 when doing updates.
     """
 
-    rewards = np.array(rewards)
+    rewards = np.asarray(rewards, dtype=np.float64)
+    num_turns = np.asarray(num_turns, dtype=np.int64)
+    assert rewards.shape == num_turns.shape, (
+        f"rewards and num_turns must have matching shapes, got "
+        f"{rewards.shape} and {num_turns.shape}"
+    )
 
-    num_turns = np.array(num_turns)
     # Each outer dimension of num_turns is a group. Sum of those gives total num_turns per group.
     # Let's use this to calculate advantage.
     # mean/std should be repeated based on group lens
     group_turns = num_turns.sum(axis=-1)
-    reward_means = rewards.mean(axis=1, keepdims=True).repeat(group_turns)
-    reward_stds = rewards.std(axis=1, keepdims=True).repeat(group_turns)
+    # Zero-turn rollouts are empty-trajectory placeholders for failed episodes:
+    # Their 0.0 rewards must not shift the normalization of the real rewards in the same group.
+    valid_rewards = num_turns > 0
+    group_means = np.zeros(rewards.shape[0], dtype=np.float64)
+    group_stds = np.zeros(rewards.shape[0], dtype=np.float64)
+    for group_idx, valid_mask in enumerate(valid_rewards):
+        if valid_mask.any():
+            valid_group_rewards = rewards[group_idx, valid_mask]
+            group_means[group_idx] = valid_group_rewards.mean()
+            group_stds[group_idx] = valid_group_rewards.std()
+    reward_means = group_means.repeat(group_turns)
+    reward_stds = group_stds.repeat(group_turns)
 
     # rewards are originally [g, group_size]
     # Making an assumption that all groups are of the same size!
@@ -1117,6 +1133,8 @@ def compute_group_stats(
     all_kv_cache_epoch = []
     all_completed_epochs = []
     all_num_evictions = []
+    all_rollout_statuses = []
+    all_failure_reasons = []
     for group in rollouts:
         group_rewards = []
         group_traj_lengths = []
@@ -1126,6 +1144,8 @@ def compute_group_stats(
         group_kv_epoch = []
         group_completed_epochs = []
         group_num_evictions = []
+        group_rollout_statuses = []
+        group_failure_reasons = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
                 for turn_traj in rollout.trajectory:
@@ -1177,10 +1197,18 @@ def compute_group_stats(
             )
             group_completed_epochs.extend(record.policy_epoch[-1][1] for record in turn_records)
             group_num_evictions.append(sum(record.num_evictions for record in turn_records))
+            rollout_status = rollout.rollout_status
+            # All empty-trajectory rollouts are placeholders.
+            if not rollout.trajectory and rollout_status == 'ok':
+                rollout_status = 'placeholder'
+            group_rollout_statuses.append(rollout_status)
+            group_failure_reasons.append(rollout.failure_reason)
         all_policy_epoch.append(group_policy_epoch)
         all_kv_cache_epoch.append(group_kv_epoch)
         all_completed_epochs.append(group_completed_epochs)
         all_num_evictions.append(group_num_evictions)
+        all_rollout_statuses.append(group_rollout_statuses)
+        all_failure_reasons.append(group_failure_reasons)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
@@ -1212,6 +1240,8 @@ def compute_group_stats(
         kv_cache_epoch=all_kv_cache_epoch,
         completed_epochs=all_completed_epochs,
         num_evictions=all_num_evictions,
+        rollout_statuses=all_rollout_statuses,
+        failure_reasons=all_failure_reasons,
     )
     return stats
 
@@ -1251,6 +1281,8 @@ def prep_wandb_metrics(
         completed_epochs: List[List[int]],
         num_evictions: List[List[int]],
         current_iteration: int,
+        rollout_statuses: List[List[str]] | None = None,
+        failure_reasons: List[List[str | None]] | None = None,
         example_group: list[TokenRollout | Rollout] | None = None,
         tokenizer: MegatronTokenizer | None = None,
     ):
@@ -1258,9 +1290,8 @@ def prep_wandb_metrics(
     """Make a wandb-parseable dictionary of metrics for logging.
 
     Zero-turn rollouts are a mark of placeholders (empty-trajectory pads for failed episodes).
-    Their 0.0 reward deliberately stays in the reward and group-mean/std aggregates:
-    it does affect training dynamics.
-    All other per-rollout field of theirs is masked out of stats.
+    But their rewards are excluded from group normalization, so we need to track them separately.
+    All other per-rollout fields of theirs are masked out of stats.
 
     Args:
         wandb_writer: Wandb run to log to.
@@ -1274,6 +1305,8 @@ def prep_wandb_metrics(
         completed_epochs: Grouped list of per-turn max policy epoch stamps.
         num_evictions: Grouped list of per-rollout number of evictions.
         current_iteration: Current training iteration.
+        rollout_statuses: Grouped adapter-stamped statuses; None means all 'ok'.
+        failure_reasons: Grouped failure-cause labels; None means all None.
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
     """
@@ -1287,6 +1320,24 @@ def prep_wandb_metrics(
             failed_rollouts / total_rollouts if total_rollouts else 0.0
         ),
     }
+
+    statuses_grouped = rollout_statuses or [['ok'] * len(g) for g in rewards]
+    reasons_grouped = failure_reasons or [[None] * len(g) for g in rewards]
+    statuses_all = [s for g in statuses_grouped for s in g]
+    failure_metrics['rollout/count'] = total_rollouts
+    for status in ('placeholder', 'masked', 'graded'):
+        count = sum(s == status for s in statuses_all)
+        failure_metrics[f'rollout/{status}_count'] = count
+        failure_metrics[f'rollout/{status}_rate'] = (
+            count / total_rollouts if total_rollouts else 0.0
+        )
+    for failure_reason, count in Counter(
+        r for g in reasons_grouped for r in g if r
+    ).items():
+        safe_reason = ''.join(
+            c if c.isalnum() or c in ('_', '-') else '_' for c in failure_reason
+        )
+        failure_metrics[f'rollout/failure_reason/{safe_reason}'] = count
 
     # All-empty wave: every episode failed and was dropped (nothing to aggregate),
     # or every surviving rollout is a zero-turn placeholder (rewards exist but the
@@ -1309,26 +1360,32 @@ def prep_wandb_metrics(
             [x for x, keep in zip(g, m) if keep] for g, m in zip(grouped, real_mask)
         ]
 
-    # Reward metrics include failures. All other metrics do not. Staleness and
-    # eviction telemetry filters through `joined` instead: placeholders pop no
-    # ledger records, so they have no epoch rows and never join.
+    # Raw delivery aggregates (mean_reward, rewards_hist) keep failures. All other metrics do
+    # not. Staleness and eviction telemetry filters through `joined` instead: placeholders pop
+    # no ledger records, so they have no epoch rows and never join.
+    rewards_real = _real(rewards)
+    table_rewards = [r for g in rewards_real for r in g]
     traj_lens_real = _real(traj_lens)
     num_turns_real = _real(num_turns)
 
+    # Mirror calculate_grpo_advantages: group means/stds over real rollouts only.
     group_table = wandb_writer.Table(
         columns=['group_means', 'group_stds'],
-        data=[[np.mean(g), np.std(g)] for g in rewards],
+        data=[[np.mean(g) if g else 0.0, np.std(g) if g else 0.0] for g in rewards_real],
     )
 
     flat_rewards = [r for g in rewards for r in g]
     flat_traj_lens = [l for g in traj_lens for l in g]
     flat_num_evictions = [e for g in num_evictions for e in g]
+    flat_reasons = [r for g in reasons_grouped for r in g]
     flat_policy_epochs = [r for g in policy_epoch for r in g]
     flat_kv_epochs = [r for g in kv_cache_epoch for r in g]
     joined = [i for i, row in enumerate(flat_policy_epochs) if row]
     joined_rewards = [flat_rewards[i] for i in joined]
     joined_traj_lens = [flat_traj_lens[i] for i in joined]
     joined_num_evictions = [flat_num_evictions[i] for i in joined]
+    joined_statuses = [statuses_all[i] for i in joined]
+    joined_reasons = [flat_reasons[i] for i in joined]
     per_rollout_policy_epochs = [flat_policy_epochs[i] for i in joined]
     per_rollout_kv_epochs = [flat_kv_epochs[i] for i in joined]
     # Per-rollout staleness (oldest token)
@@ -1373,6 +1430,7 @@ def prep_wandb_metrics(
             'max_num_turns': max(max(g) for g in num_turns_real if g),
             'min_num_turns': min(min(g) for g in num_turns_real if g),
             'mean_reward': np.mean([np.mean(g) for g in rewards]),
+            'valid_mean_reward': np.mean(table_rewards) if table_rewards else 0.0,
             'mean_advantage': np.mean(advantages),
             'nonzero_groups_ratio': np.count_nonzero(advantages)
             / len(advantages),
@@ -1387,6 +1445,7 @@ def prep_wandb_metrics(
                     'reward', 'traj_length', 'num_evictions',
                     'policy_staleness', 'kv_staleness',
                     'policy_last_token_staleness', 'kv_last_token_staleness',
+                    'rollout_status', 'failure_reason',
                 ],
                 data=list(zip(
                     joined_rewards,
@@ -1396,6 +1455,8 @@ def prep_wandb_metrics(
                     rollout_kv_staleness,
                     rollout_policy_last_token_staleness,
                     rollout_kv_last_token_staleness,
+                    joined_statuses,
+                    joined_reasons,
                 )),
             ),
             # NOTE: This table can get very large (one row per token across all rollouts).
@@ -1599,11 +1660,15 @@ def maybe_log_training_metrics(
     kv_cache_epoch = group_stats.kv_cache_epoch
     completed_epochs = group_stats.completed_epochs
     num_evictions = group_stats.num_evictions
+    rollout_statuses = group_stats.rollout_statuses
+    failure_reasons = group_stats.failure_reasons
 
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
         policy_epoch=policy_epoch, kv_cache_epoch=kv_cache_epoch, completed_epochs=completed_epochs,
-        num_evictions=num_evictions, current_iteration=current_iteration)
+        num_evictions=num_evictions, current_iteration=current_iteration,
+        rollout_statuses=rollout_statuses, failure_reasons=failure_reasons)
+
 
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
@@ -1628,6 +1693,8 @@ def maybe_log_training_metrics(
             completed_epochs=env_stats(completed_epochs, env_idx),
             num_evictions=env_stats(num_evictions, env_idx),
             current_iteration=current_iteration,
+            rollout_statuses=env_stats(rollout_statuses, env_idx),
+            failure_reasons=env_stats(failure_reasons, env_idx),
             example_group=example_groups[env_id],
             tokenizer=tokenizer,
         )
