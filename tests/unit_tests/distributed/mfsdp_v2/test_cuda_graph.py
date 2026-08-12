@@ -114,8 +114,7 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
 
-    # Warm up on the capture stream. With symmetric memory, this allocates and
-    # rendezvouses the reusable collective buffers before CUDA-graph capture.
+    # Warmup
     with torch.cuda.stream(capture_stream):
         for _ in range(3):
             train_iteration()
