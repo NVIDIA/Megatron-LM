@@ -126,10 +126,10 @@ def test_cerno_hard_cutover_contract():
     build_script = Path(".gitlab/scripts/build.sh").read_text()
 
     assert pipeline["variables"]["CERNO_CONFIG"] == ".gitlab/cerno.yml"
-    assert triage.count("cerno-linear") == 3
+    assert triage.count("cerno-linear") == 4
     assert triage.count("cerno-notify") == 2
-    assert triage.count('--config "${CERNO_CONFIG}"') == 3
-    assert "ARG CERNO_COMMIT=5a5fb5360e67f8f09d189871bbc0d768c09c43fa" in dockerfile
+    assert triage.count('--config "${CERNO_CONFIG}"') == 4
+    assert "ARG CERNO_COMMIT=681545020f385d895652431542813c9700e09a8d" in dockerfile
     assert '"cerno @ git+${CI_SERVER_URL}/dl/nemo/cerno.git@${CERNO_COMMIT}"' in dockerfile
     assert "id=CERNO_TOKEN" in dockerfile
     assert "/run/secrets/CERNO_TOKEN" in dockerfile
@@ -156,12 +156,46 @@ def test_notification_rules_use_expected_pipeline_sources():
         '$FUNCTIONAL_TEST == "yes"'
     )
 
-    triage_jobs = (".linear_reconcile_rules", "triage:linear_write", "triage:slack_linear_followup")
+    triage_jobs = (
+        ".linear_reconcile_rules",
+        "triage:linear_write",
+        "triage:linear_overview",
+        "triage:slack_linear_followup",
+    )
     for job_name in triage_jobs:
         condition = triage[job_name]["rules"][0]["if"]
         assert '$FUNCTIONAL_TEST == "yes"' in condition
         assert '$CI_PIPELINE_SOURCE == "schedule"' in condition
         assert '$CI_COMMIT_BRANCH == "main"' in condition
+
+
+def test_linear_overview_uses_explicit_upstream_artifacts():
+    functional = yaml.safe_load(Path(".gitlab/stages/04.functional-tests.yml").read_text())
+    triage = yaml.safe_load(Path(".gitlab/stages/06.triage.yml").read_text())
+    overview = triage["triage:linear_overview"]
+
+    assert overview["needs"] == [
+        {"job": "functional:x_notify", "artifacts": True},
+        {"job": "triage:linear_write", "artifacts": True},
+    ]
+    assert {"pipeline_summaries.json", "failure_buckets.json"} <= set(
+        functional["functional:x_notify"]["artifacts"]["paths"]
+    )
+    assert {"linear_status_report.json", "linear_action_plan_post.json"} <= set(
+        triage["triage:linear_write"]["artifacts"]["paths"]
+    )
+    assert overview["rules"] == triage["triage:linear_write"]["rules"]
+    assert overview["script"] == [
+        'cerno-linear overview --config "${CERNO_CONFIG}" '
+        "--pipeline-summaries pipeline_summaries.json "
+        "--failure-buckets failure_buckets.json "
+        "--linear-report linear_status_report.json "
+        "--plan linear_action_plan_post.json"
+    ]
+    assert "cerno-linear write" not in overview["script"][0]
+    assert {"job": "triage:linear_overview", "artifacts": False} in triage[
+        "triage:slack_linear_followup"
+    ]["needs"]
 
 
 def test_all_generated_test_types_enable_error_extraction():
@@ -392,6 +426,10 @@ def test_triage_config_selects_megatron_and_enables_write_actions():
             linear_ci.LINEAR_MODULE,
             {
                 "build_module": "megatron-lm",
+                "display_name": "Megatron-LM",
+                "grafana_dashboard_url": (
+                    "https://grafana.nvidia.com/d/ccel3m7ntzqkke/megatron-lm-ci"
+                ),
                 "channel_id_env": "MCORE_SLACK_CHANNEL_ID",
                 "reconcile_proposal": True,
                 "team_key": "MCORE",
