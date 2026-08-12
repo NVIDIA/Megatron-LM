@@ -78,16 +78,10 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
     mesh = init_device_mesh(device.type, (world_size,))
     torch.manual_seed(1234)
     dim = _HIDDEN
-    # bf16 compute weights: FSDP's default mixed-precision policy keeps fp32 optimizer
-    # master weights, so SGD updates accumulate in fp32 and the loss keeps decreasing
-    # across replays instead of stalling within bf16 precision.
-    model = NestedModel(dim=dim, num_children=2).to(device=device, dtype=torch.bfloat16)
+    model = NestedModel(dim=dim, num_children=2).to(device)
 
-    # A zero regression target drives ``mean(output**2)`` toward zero so the loss
-    # decreases by a robust margin (unlike a random target, whose loss floors near its
-    # own variance and barely moves within bf16 precision).
-    static_input = torch.randn(256, dim, device=device, dtype=torch.bfloat16)
-    static_target = torch.zeros(256, dim, device=device, dtype=torch.bfloat16)
+    static_input = torch.randn(256, dim, device=device)
+    static_target = torch.zeros_like(static_input)
 
     placements = _flat_placements()
     with fully_shard_context(device=device, use_symmetric_memory=use_symmetric_memory):
