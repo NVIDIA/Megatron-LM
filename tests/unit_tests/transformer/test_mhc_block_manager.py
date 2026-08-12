@@ -4,8 +4,8 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import (
-    MHCCheckpointManager,
     CheckpointWithoutOutput,
+    MHCCheckpointManager,
     initialize_rng_tracker,
 )
 from tests.unit_tests.test_utilities import Utils
