@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,14 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
 from .placement import changed_mesh_axis
+from .quantization import (
+    E4M3_BLOCK_SIZE,
+    allocate_quantize_temp,
+    clear_payloads,
+    set_columnwise_payload,
+    set_rowwise_payload,
+    te_cast_master_weights_to_fp8,
+)
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -81,16 +89,17 @@ class FsdpParameterGroup:
     dtype: torch.dtype
     requires_grad: bool
     main_weight: DBuffer
-    model_weight: DBuffer
+    model_weight: DBuffer | None
     # Optimizer-layout view into model_weight storage, avoiding a second allocation.
     post_optimizer_model_weight: DBuffer
     # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
     # view; the remaining model_weight slices must be all-gathered before compute.
     _model_weight_is_stale: bool
     main_grad: DBuffer | None
-    _unsharded_model_weight: DBuffer
+    _unsharded_model_weight: DBuffer | None
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
+    _model_weight_placements: tuple[Placement, ...]
 
     def __init__(
         self,
@@ -130,6 +139,7 @@ class FsdpParameterGroup:
         for fqn, parameter in parameters.items():
             parameter_to_fqns.setdefault(parameter, []).append(fqn)
 
+        self._model_weight_placements = model_weight_placements
         # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
         # is finalized to main_weight's placements after the last microbatch.
         self._main_grad_placements = main_grad_placements
@@ -169,36 +179,13 @@ class FsdpParameterGroup:
         else:
             self._symm_mem_pool = None
 
-        if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
-            self.model_weight = self.main_weight
-        else:
-            # Keep the configured compute-weight layout alive for the lifetime of this
-            # parameter group. The optimizer-layout sync buffer below is only a view
-            # into its local storage, so the first ZeRO-1 unshard can all-gather
-            # directly into this allocation.
-            with self._symmetric_memory_context():
-                self.model_weight = DBuffer(
-                    mesh=self.mesh,
-                    placements=model_weight_placements,
-                    tensor_shapes=tensor_shapes,
-                    dtype=self.dtype,
-                    device=self.main_weight.device,
-                )
-        self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
-        # Cast into the preallocated optimizer-layout view on the current stream.
-        self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
-        self._model_weight_is_stale = (
-            self.post_optimizer_model_weight.placements != self.model_weight.placements
+        self._init_compute_weight_storage(
+            tensor_shapes,
+            main_weight_dtype,
+            model_weight_placements,
+            main_weight_placements,
+            use_symmetric_memory,
         )
-
-        with self._symmetric_memory_context():
-            self._unsharded_model_weight = DBuffer(
-                mesh=self.mesh,
-                placements=[Replicate()] * self.mesh.ndim,
-                tensor_shapes=tensor_shapes,
-                dtype=self.dtype,
-                device=self.main_weight.device,
-            )
 
         self.main_grad = None
         if self.requires_grad:
@@ -220,28 +207,23 @@ class FsdpParameterGroup:
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
             )
+            # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
+            # is finalized to main_weight's placements after the last microbatch.
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
-            if parameter.is_meta:
-                # A meta Parameter cannot set .data to a real tensor because their
-                # TensorImpl types are incompatible, so swap in a materialized Parameter.
-                # This may be problematic if attributes from the original Parameter need
-                # to be copied to the unsharded Parameter.
-                materialized_parameter = nn.Parameter(
-                    unsharded_tensor, requires_grad=parameter.requires_grad
-                )
-                torch.utils.swap_tensors(parameter, materialized_parameter)
-            else:
-                parameter.data = unsharded_tensor
-                parameter.grad = None
-            # Parameter-owned markers must not retain their FSDP module tree.
+            unsharded_tensor = (
+                self._unsharded_model_weight.get_local_tensor(index)
+                if self._unsharded_model_weight is not None
+                else None
+            )
+            self._materialize_unsharded_parameter(parameter, unsharded_tensor)
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
+            sharded_parameter.__fsdp_param__ = True
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
@@ -250,8 +232,69 @@ class FsdpParameterGroup:
             )
         self.fsdp_parameters = tuple(fsdp_parameters)
 
-        self._unsharded_model_weight.release_storage()
         self._switch_to_sharded_parameters()
+        if self._unsharded_model_weight is not None:
+            self._unsharded_model_weight.release_storage()
+
+    def _init_compute_weight_storage(
+        self,
+        tensor_shapes: tuple[torch.Size, ...],
+        main_weight_dtype: torch.dtype,
+        model_weight_placements: tuple[Placement, ...],
+        main_weight_placements: tuple[Placement, ...],
+        use_symmetric_memory: bool,
+    ) -> None:
+        """Create the sharded and replicated compute-weight storage."""
+        del use_symmetric_memory
+        if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
+            self.model_weight = self.main_weight
+        else:
+            # Keep the configured compute-weight layout alive for the lifetime of this
+            # parameter group. The optimizer-layout sync buffer below is only a view
+            # into its local storage, so the first ZeRO-1 unshard can all-gather
+            # directly into this allocation.
+            with self._symmetric_memory_context():
+                self.model_weight = DBuffer(
+                    mesh=self.mesh,
+                    placements=model_weight_placements,
+                    tensor_shapes=tensor_shapes,
+                    dtype=self.dtype,
+                    device=self.main_weight.device,
+                )
+        assert self.model_weight is not None
+        self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
+        # Cast into the preallocated optimizer-layout view on the current stream.
+        self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+        self._model_weight_is_stale = (
+            self.post_optimizer_model_weight.placements != self.model_weight.placements
+        )
+
+        with self._symmetric_memory_context():
+            self._unsharded_model_weight = DBuffer(
+                mesh=self.mesh,
+                placements=[Replicate()] * self.mesh.ndim,
+                tensor_shapes=tensor_shapes,
+                dtype=self.dtype,
+                device=self.main_weight.device,
+            )
+
+    def _materialize_unsharded_parameter(
+        self, parameter: nn.Parameter, unsharded_tensor: torch.Tensor | None
+    ) -> None:
+        """Install the full compute parameter on the module's parameter object."""
+        assert unsharded_tensor is not None
+        if parameter.is_meta:
+            # A meta Parameter cannot set .data to a real tensor because their
+            # TensorImpl types are incompatible, so swap in a materialized Parameter.
+            # This may be problematic if attributes from the original Parameter need
+            # to be copied to the unsharded Parameter.
+            materialized_parameter = nn.Parameter(
+                unsharded_tensor, requires_grad=parameter.requires_grad
+            )
+            torch.utils.swap_tensors(parameter, materialized_parameter)
+        else:
+            parameter.data = unsharded_tensor
+            parameter.grad = None
 
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:
@@ -271,18 +314,32 @@ class FsdpParameterGroup:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.sharded)
 
     def _switch_to_unsharded_parameters(self) -> None:
-        for fsdp_parameter in self.fsdp_parameters:
-            self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            self._set_module_parameter(fsdp_parameter.fqns, self._get_unsharded_parameter(index))
+
+    def _get_unsharded_parameter(self, index: int) -> torch.Tensor:
+        """Return the parameter object installed on the module for tensor ``index``."""
+        return self.fsdp_parameters[index].unsharded
 
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
+        assert self.model_weight is not None
         self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
         self._model_weight_is_stale = (
             self.post_optimizer_model_weight.placements != self.model_weight.placements
         )
 
-    def unshard_parameters(self) -> None:
-        """Install full parameters for local compute."""
+    def unshard_parameters(self, orientation: str = "rowwise") -> None:
+        """Install full parameters for local compute.
+
+        Args:
+            orientation: Which payload orientation to gather for MXFP8 groups
+                (``"rowwise"`` on forward, ``"colwise"`` on backward). Ignored
+                by regular groups.
+        """
+        del orientation
+        assert self.model_weight is not None
+        assert self._unsharded_model_weight is not None
         if self._model_weight_is_stale:
             self.post_optimizer_model_weight.redistribute(
                 self.model_weight.placements, out=self.model_weight
@@ -305,8 +362,10 @@ class FsdpParameterGroup:
                     self._unsharded_model_weight.placements, out=self._unsharded_model_weight
                 )
             unsharded_model_weight = self._unsharded_model_weight
-        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.unsharded.data = unsharded_model_weight.get_local_tensor(index)
+        for index in range(len(self.fsdp_parameters)):
+            self._get_unsharded_parameter(index).data = unsharded_model_weight.get_local_tensor(
+                index
+            )
         self._switch_to_unsharded_parameters()
 
     def reshard_parameters(self) -> None:
@@ -323,17 +382,19 @@ class FsdpParameterGroup:
         # That alternative is not much cleaner, and splitting post-forward and
         # post-backward reshard behavior would make the caller code less clean,
         # so keep the shared storage-release path.
-        self._unsharded_model_weight.release_storage()
+        if self._unsharded_model_weight is not None:
+            self._unsharded_model_weight.release_storage()
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
 
         grads: list[torch.Tensor] = []
-        for fsdp_parameter in self.fsdp_parameters:
-            if fsdp_parameter.unsharded.grad is None:
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            grad = self._get_unsharded_parameter(index).grad
+            if grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            grads.append(fsdp_parameter.unsharded.grad)
+            grads.append(grad)
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
@@ -347,8 +408,9 @@ class FsdpParameterGroup:
         """Pack full local gradients into an existing reduce-scatter input buffer."""
         # A future fused-wgrad path can write directly into these buffer views.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_local_tensor(index).copy_(fsdp_parameter.unsharded.grad)
-            fsdp_parameter.unsharded.grad = None
+            parameter = self._get_unsharded_parameter(index)
+            partial_grad.get_local_tensor(index).copy_(parameter.grad)
+            parameter.grad = None
 
     def _has_sharded_grads(self) -> bool:
         has_any_grad = False
@@ -444,6 +506,244 @@ class FsdpParameterGroup:
         # Make each sharded parameter's .grad consistent with the final main_grad.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             fsdp_parameter.sharded.grad = self.main_grad.get_dtensor(index)
+
+
+class Fp8ParameterGroup(FsdpParameterGroup):
+    """FSDP parameter group whose parameters are TE MXFP8Tensor primary weights.
+
+    The sharded compute weights rest as row-wise (forward GEMM) and column-wise
+    (backward GEMM) MXFP8 E4M3 payloads in two uint8 DBuffers with the same
+    layout as ``main_weight``. Quantization is done by TE's verified
+    ``cast_master_weights_to_fp8`` into full-size temporary tensors whose shard
+    slices are copied back into the DBuffers; the tensors' scale-inverse grids
+    are filled in place by TE and never gathered. Unshard gathers only the
+    orientation needed by the pass (row-wise on forward, column-wise on
+    backward) and rebinds the module's own MXFP8Tensor payloads from the
+    gathered buffers; reshard detaches them.
+    """
+
+    _rowwise_buffer: DBuffer
+    _colwise_buffer: DBuffer
+    _unsharded_rowwise: DBuffer
+    _unsharded_colwise: DBuffer
+
+    def __init__(
+        self,
+        owning_module: nn.Module,
+        parameters: dict[str, nn.Parameter],
+        mesh: DeviceMesh,
+        model_weight_placements: tuple[Placement, ...],
+        main_grad_placements: tuple[Placement, ...],
+        main_weight_placements: tuple[Placement, ...],
+        mixed_precision_policy: MixedPrecisionPolicy,
+        reduce_scatter_stream: torch.cuda.Stream,
+        grad_divisor: int = 1,
+        use_symmetric_memory: bool = False,
+    ) -> None:
+        if use_symmetric_memory:
+            raise ValueError("MFSDP v2 fp8 model weights do not support symmetric memory yet.")
+        if te_cast_master_weights_to_fp8() is None:
+            raise RuntimeError(
+                "MFSDP v2 fp8 model weights require Transformer Engine with "
+                "cast_master_weights_to_fp8 support."
+            )
+        super().__init__(
+            owning_module=owning_module,
+            parameters=parameters,
+            mesh=mesh,
+            model_weight_placements=model_weight_placements,
+            main_grad_placements=main_grad_placements,
+            main_weight_placements=main_weight_placements,
+            mixed_precision_policy=mixed_precision_policy,
+            reduce_scatter_stream=reduce_scatter_stream,
+            use_symmetric_memory=False,
+            grad_divisor=grad_divisor,
+        )
+        # Compute weights must be initialized before the first forward;
+        # subsequent refreshes happen from the optimizer's post-step hook.
+        self.sync_model_weight_from_main_weight()
+
+    def _init_compute_weight_storage(
+        self,
+        tensor_shapes: tuple[torch.Size, ...],
+        main_weight_dtype: torch.dtype,
+        model_weight_placements: tuple[Placement, ...],
+        main_weight_placements: tuple[Placement, ...],
+        use_symmetric_memory: bool,
+    ) -> None:
+        del main_weight_dtype, main_weight_placements, use_symmetric_memory
+        # The bf16 model-weight storage is replaced by the two uint8 payload
+        # DBuffers; the unsharded parameters are the module's own MXFP8Tensor
+        # objects whose raw payloads are rebound from the gathered buffers.
+        self.model_weight = None
+        self._unsharded_model_weight = None
+        device = self.main_weight.device
+        self._rowwise_buffer = DBuffer(
+            mesh=self.mesh,
+            placements=model_weight_placements,
+            tensor_shapes=tensor_shapes,
+            dtype=torch.uint8,
+            device=device,
+        )
+        self._colwise_buffer = DBuffer(
+            mesh=self.mesh,
+            placements=model_weight_placements,
+            tensor_shapes=tensor_shapes,
+            dtype=torch.uint8,
+            device=device,
+        )
+        self._unsharded_rowwise = DBuffer(
+            mesh=self.mesh,
+            placements=[Replicate()] * self.mesh.ndim,
+            tensor_shapes=tensor_shapes,
+            dtype=torch.uint8,
+            device=device,
+        )
+        self._unsharded_colwise = DBuffer(
+            mesh=self.mesh,
+            placements=[Replicate()] * self.mesh.ndim,
+            tensor_shapes=tensor_shapes,
+            dtype=torch.uint8,
+            device=device,
+        )
+        for index, shape in enumerate(tensor_shapes):
+            if (
+                len(shape) != 2
+                or shape[0] % E4M3_BLOCK_SIZE != 0
+                or shape[1] % E4M3_BLOCK_SIZE != 0
+            ):
+                raise ValueError(
+                    f"MXFP8 parameter tensor {index} with shape {shape} must be 2D with "
+                    f"dims divisible by {E4M3_BLOCK_SIZE}."
+                )
+
+    def _materialize_unsharded_parameter(
+        self, parameter: nn.Parameter, unsharded_tensor: torch.Tensor | None
+    ) -> None:
+        del unsharded_tensor
+        # The module already owns an MXFP8Tensor parameter (fp8 primary
+        # weights); keep the object and only reset its gradient. Its raw
+        # payloads are bound to the gathered storage at unshard and detached
+        # at reshard.
+        parameter.grad = None
+
+    def sync_model_weight_from_main_weight(self) -> None:
+        """Quantize the sharded main weights into the fp8 payload DBuffers."""
+        self._quantize_model_weight_from_main_weight()
+
+    def _quantize_model_weight_from_main_weight(self) -> None:
+        """Quantize via TE's ``cast_master_weights_to_fp8``.
+
+        A full-size temporary MXFP8Tensor per fp8 tensor receives the
+        quantized shard in its row-wise and column-wise raw data (filled at
+        the shard's flat offset); the shard slices are then copied into the
+        group's payload DBuffers and the temporaries are released.
+        """
+        main = self.main_weight.local_buffer
+        cast_master_weights_to_fp8 = te_cast_master_weights_to_fp8()
+        assert cast_master_weights_to_fp8 is not None
+
+        model_weights = []
+        master_weights = []
+        start_offsets = []
+        fsdp_shard_model_weights = []
+        temps = []
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            tensor = fsdp_parameter.unsharded
+            owned_range = self.main_weight._get_owned_range(index)
+            height, width = self.main_weight.layout.tensor_shapes[index]
+            temp = allocate_quantize_temp(tensor, height, width, self.main_weight.device)
+            temps.append((temp, index, owned_range))
+            model_weights.append(temp)
+            if owned_range is None:
+                # This rank does not own any rows of this tensor (its master
+                # weight lives in other ranks). TE skips the cast for
+                # master_weight=None; the empty fragments are never touched.
+                master_weights.append(None)
+                start_offsets.append(0)
+                fsdp_shard_model_weights.append(
+                    (temp._rowwise_data.reshape(-1)[:0], temp._columnwise_data.reshape(-1)[:0])
+                )
+                continue
+            numel = owned_range.numel
+            rows_local = numel // tensor.shape[-1]
+            start_offset = owned_range.tensor_relative_offset
+            # TE's mxfp8 partial-amax kernel requires the master shard as a
+            # flat 1D tensor (it derives the geometry from h, w, start_offset).
+            master_weights.append(main.narrow(0, owned_range.buffer_relative_offset, numel))
+            start_offsets.append(start_offset)
+            end_offset = start_offset + numel
+            fsdp_shard_model_weights.append(
+                (
+                    temp._rowwise_data.reshape(-1)[start_offset:end_offset],
+                    temp._columnwise_data.reshape(-1)[start_offset:end_offset],
+                )
+            )
+
+        gather_axis = changed_mesh_axis(
+            self._model_weight_placements, tuple(Replicate() for _ in range(self.mesh.ndim))
+        )
+        if gather_axis is None:
+            raise RuntimeError("FSDP fp8 parameter quantize requires a changed placement axis.")
+        cast_master_weights_to_fp8(
+            model_weights=model_weights,
+            master_weights=master_weights,
+            start_offsets=start_offsets,
+            group=self.mesh.get_group(gather_axis),
+            fsdp_shard_model_weights=fsdp_shard_model_weights,
+        )
+
+        # Copy the shard slices out of the temporaries into the payload
+        # DBuffers; the temporaries are released when this scope ends.
+        for temp, index, owned_range in temps:
+            if owned_range is None:
+                continue
+            numel = owned_range.numel
+            rows_local = numel // temp.shape[-1]
+            start_offset = owned_range.tensor_relative_offset
+            end_offset = start_offset + numel
+            ro_chunk = self._rowwise_buffer.get_local_tensor(index)
+            co_chunk = self._colwise_buffer.get_local_tensor(index)
+            ro_chunk.copy_(
+                temp._rowwise_data.reshape(-1)[start_offset:end_offset].view(rows_local, -1)
+            )
+            co_chunk.copy_(
+                temp._columnwise_data.reshape(-1)[start_offset:end_offset].view(rows_local, -1)
+            )
+
+    def unshard_parameters(self, orientation: str = "rowwise") -> None:
+        """Gather both payload orientations and bind them on the fp8 tensors.
+
+        ``orientation`` is accepted for schedule compatibility but both
+        orientations are always gathered and bound: Megatron's TE layers call
+        ``update_usage(rowwise=True, columnwise=True)`` on fp8 primary weights
+        at forward, so the tensor must carry both row-wise and column-wise
+        data and scale inverses for compute. The scale-inverse grids live on
+        the tensors (global after quantize) and are never gathered.
+        """
+        del orientation
+        for source, target in (
+            (self._rowwise_buffer, self._unsharded_rowwise),
+            (self._colwise_buffer, self._unsharded_colwise),
+        ):
+            with self._symmetric_memory_context():
+                target.reallocate_storage()
+            gather_axis = changed_mesh_axis(source.placements, target.placements)
+            if gather_axis is None:
+                raise RuntimeError("FSDP fp8 parameter unshard requires a changed placement axis.")
+            source.redistribute(target.placements, out=target)
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            tensor = fsdp_parameter.unsharded
+            set_rowwise_payload(tensor, self._unsharded_rowwise.get_local_tensor(index))
+            set_columnwise_payload(tensor, self._unsharded_colwise.get_local_tensor(index))
+        self._switch_to_unsharded_parameters()
+
+    def release_unsharded_storage(self) -> None:
+        """Detach the fp8 tensor payloads and release the gathered buffers."""
+        for fsdp_parameter in self.fsdp_parameters:
+            clear_payloads(fsdp_parameter.unsharded)
+        self._unsharded_rowwise.release_storage()
+        self._unsharded_colwise.release_storage()
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
