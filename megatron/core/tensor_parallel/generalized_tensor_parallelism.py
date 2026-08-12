@@ -217,6 +217,10 @@ def _classify_param_chain(param_name: str) -> str:
     if not scope:  # CG disabled
         return U
 
+    # MoE latent projections.
+    if ".mlp.fc1_latent_proj." in n or ".mlp.fc2_latent_proj." in n:
+        return G if "moe_router" in scope else U
+
     if ".mlp.shared_experts." in n:
         if _MOE_SHARED_EXPERT_OVERLAP:
             return U
