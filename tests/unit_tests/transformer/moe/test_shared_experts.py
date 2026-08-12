@@ -489,8 +489,18 @@ class TestSharedExperts:
         )
         hidden_states_no_overlap = hidden_states.detach().clone().requires_grad_(True)
 
-        output_overlap, _ = moe_layer_overlap(hidden_states)
-        output_no_overlap, _ = moe_layer_no_overlap(hidden_states_no_overlap)
+        shared_expert_overlap = moe_layer_overlap.shared_experts
+        shared_expert_no_overlap = moe_layer_no_overlap.shared_experts
+        assert shared_expert_overlap is not None
+        assert shared_expert_no_overlap is not None
+
+        # Isolate shared-expert parity from nondeterministic routed-token unpermutation.
+        shared_expert_overlap.pre_forward_comm(hidden_states)
+        shared_expert_overlap.linear_fc1_forward_and_act()
+        shared_expert_overlap.linear_fc2_forward()
+        shared_expert_overlap.post_forward_comm()
+        output_overlap = shared_expert_overlap.get_output()
+        output_no_overlap = shared_expert_no_overlap(hidden_states_no_overlap)
         torch.testing.assert_close(output_overlap, output_no_overlap)
 
         output_overlap.mean().backward()
@@ -498,7 +508,7 @@ class TestSharedExperts:
 
         torch.testing.assert_close(hidden_states.grad, hidden_states_no_overlap.grad)
         for p_overlap, p_no_overlap in zip(
-            moe_layer_overlap.parameters(), moe_layer_no_overlap.parameters()
+            shared_expert_overlap.parameters(), shared_expert_no_overlap.parameters()
         ):
             torch.testing.assert_close(p_overlap.grad, p_no_overlap.grad)
 
