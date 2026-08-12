@@ -2,7 +2,6 @@
 
 import copy
 import gc
-import hashlib
 
 # Keep this to make the env registered.
 import itertools
@@ -603,20 +602,6 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
     return _ROLLOUT_GENERATOR
 
 
-def _merge_request_ledger(
-    persistent: dict[tuple[bytes, bytes], list[FinishedRequestRecord]],
-    fresh: dict[tuple[bytes, bytes], list[FinishedRequestRecord]],
-    partial_rollouts: bool,
-) -> dict[tuple[bytes, bytes], list[FinishedRequestRecord]]:
-    """Update the persistent ledger with this newly-drained ledger window."""
-    if not partial_rollouts:
-        return fresh
-    merged = {key: records for key, records in persistent.items() if records}
-    for key, records in fresh.items():
-        merged.setdefault(key, []).extend(records)
-    return merged
-
-
 def get_environment_rollouts(
     model: LanguageModule, inference_model: LanguageModule, optimizer: MegatronOptimizer, n_prompts: int, samples_per_group: int
 ):
@@ -881,47 +866,11 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     return ((rewards - reward_means) / (1e-4 + reward_stds)).tolist()
 
 
-def _pop_request_records(
-    rollout: TokenRollout | Rollout,
-    request_ledger: dict[tuple[bytes, bytes], list[FinishedRequestRecord]],
-) -> list[FinishedRequestRecord]:
-    """Pop one turn from the per-request metadata ledger."""
-    if not isinstance(rollout, TokenRollout):
-        return []
-    assert len(rollout.trajectory) == len(rollout.generation_mask), (
-        f"request-ledger join: {len(rollout.trajectory)} trajectory turns but "
-        f"{len(rollout.generation_mask)} generation_mask rows; every turn needs its "
-        "mask row to recover the (prompt, generated) key."
-    )
-    records = []
-    for tokens, mask in zip(rollout.trajectory, rollout.generation_mask):
-        if torch.is_tensor(tokens):
-            tokens = tokens.cpu()
-        prompt_length = next((i for i, generated in enumerate(mask) if generated), len(mask))
-        assert all(mask[prompt_length:]), (
-            "request-ledger join: generation_mask must be a False-prefix (prompt) then a "
-            "True-suffix (generation); an interleaved mask cannot recover the streams the "
-            "engine keyed this record by."
-        )
-        key = (
-            hashlib.sha256(np.asarray(tokens[:prompt_length], dtype=np.int64).tobytes()).digest(),
-            hashlib.sha256(np.asarray(tokens[prompt_length:], dtype=np.int64).tobytes()).digest(),
-        )
-        bucket = request_ledger.get(key)
-        assert bucket, (
-            "request-ledger join: a rollout turn matched no finished-request record. Its "
-            "tokens match no request the engine finished and retained, so the trajectory was "
-            "mutated between the engine and training."
-        )
-        records.append(bucket.pop(0))
-    return records
-
-
 def compute_group_stats(
     rollouts: GroupedRollouts,
     tokenizer: MegatronTokenizer,
     seq_len: int,
-    request_ledger: dict[tuple[bytes, bytes], list[FinishedRequestRecord]],
+    request_ledger: dict[str, FinishedRequestRecord],
 ) -> RolloutStats:
     """Add group-based rollout stats for logging.
 
@@ -994,11 +943,11 @@ def compute_group_stats(
                 roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
-            # Zero-turn placeholder rollouts pop no records: their per-rollout
-            # entries stay empty (keeping positional alignment for the masking
-            # in prep_wandb_metrics) and, completed_epochs being per-turn, they
-            # contribute no sentinel epochs there either.
-            turn_records = _pop_request_records(rollout, request_ledger)
+            turn_records = (
+                [request_ledger.pop(completion_id) for completion_id in rollout.completion_ids]
+                if isinstance(rollout, TokenRollout)
+                else []
+            )
             group_policy_epoch.append(
                 [epoch for record in turn_records for _, epoch in record.policy_epoch]
             )
@@ -1655,7 +1604,7 @@ def prepare_data_for_update(
     tokenizer: MegatronTokenizer,
     sequence_packing: bool,
     is_correction: bool,
-    request_ledger: dict[tuple[bytes, bytes], list[FinishedRequestRecord]],
+    request_ledger: dict[str, FinishedRequestRecord],
 ) -> tuple[RerunDataIterator, RolloutStats, dict]:
     """Extract data for the update from raw rollouts.
 
@@ -1666,8 +1615,7 @@ def prepare_data_for_update(
         tokenizer: Tokenizer to pad/tokenize data.
         sequence_packing: Use sequence packing if True.
         is_correction: Prepare data for IS correction if True.
-        request_ledger: Finished-request records keyed by token content (see
-            FinishedRequestRecord); joined to the rollouts for staleness stats.
+        request_ledger: Finished-request records keyed by the completion id.
 
     Returns:
         Tuple of (cycled iterator over dataset batches, group stats, example groups per env).
@@ -2011,9 +1959,9 @@ def get_grpo_data_iterator(
         rollouts, fresh_ledger = get_environment_rollouts(
             model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
         )
-        runtime_state.request_ledger = _merge_request_ledger(
-            runtime_state.request_ledger, fresh_ledger, get_args().rl_partial_rollouts
-        )
+        # Records persist until their rollout's join pops them (partial rollouts
+        # deliver across window boundaries); never-joined residents are accepted.
+        runtime_state.request_ledger.update(fresh_ledger)
         buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
             model=model,
             ref_state_dict=ref_state_dict,

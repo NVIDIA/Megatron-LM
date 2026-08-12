@@ -37,7 +37,6 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
-    FinishedRequestRecord,
     Status,
     compute_block_hashes_batched,
 )
@@ -3310,7 +3309,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         engine.socket_for_receiving_requests = mock.MagicMock()
 
         def run_request(request_id):
-            # Distinct constant prompts so the two requests' ledger keys differ.
             prompt_tokens = torch.full(
                 (PROMPT_LEN,), request_id + 1, dtype=torch.int64, device=torch.cuda.current_device()
             )
@@ -3332,7 +3330,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Default (plain serving): nothing is indexed, nothing accumulates.
         finished_records = run_request(0)
         assert len(finished_records) == 1
-        assert engine.consume_local_metadata_ledger() == {}
+        assert engine.local_metadata_ledger == {}
 
         # RL launch (MegatronLocal.launch) enables the ledger: every finished
         # request is indexed, no per-request tagging involved.
@@ -3340,13 +3338,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         finished_records = run_request(1)
         assert len(finished_records) == 1
 
-        # merge() is pure, so recompute the expected content key from the record.
-        expected_key, _ = FinishedRequestRecord.from_request(finished_records[0].merge())
-        ledger = engine.consume_local_metadata_ledger()
-        assert list(ledger.keys()) == [expected_key]
-        assert len(ledger[expected_key]) == 1
-        assert ledger[expected_key][0].policy_epoch == [(0, 3)]
-        assert engine.consume_local_metadata_ledger() == {}  # drained
+        # The ledger keys by the request's engine-minted uid — the same string the
+        # endpoints return as the OpenAI response id.
+        merged = finished_records[0].merge()
+        ledger = engine.local_metadata_ledger
+        assert list(ledger.keys()) == [merged.uid]
+        assert ledger[merged.uid].policy_epoch == [(0, 3)]
 
     @pytest.mark.internal
     @pytest.mark.skipif(

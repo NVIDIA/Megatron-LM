@@ -448,7 +448,9 @@ class TestGroupedRollouts:
             assert np.gcd.reduce(agent_slots) == 0
 
 
-def make_response(prompt_length, total_len, content="resp", finish_reason="stop"):
+def make_response(
+    prompt_length, total_len, content="resp", finish_reason="stop", completion_id=None
+):
     return InferenceResponse(
         response=LLMChatMessage(role="assistant", content=content),
         raw_text=content,
@@ -456,14 +458,15 @@ def make_response(prompt_length, total_len, content="resp", finish_reason="stop"
         prompt_length=prompt_length,
         logprobs=[0.0] * (total_len - prompt_length),
         finish_reason=finish_reason,
+        completion_id=completion_id,
     )
 
 
 # Conversation length -> response spec: length 1 is the first turn (the bare prompt), length 3
 # the second (assistant reply + observation appended).
 TWO_TURN_SCRIPT = {
-    1: dict(prompt_length=3, total_len=7, content="a0"),
-    3: dict(prompt_length=6, total_len=11, content="a1"),
+    1: dict(prompt_length=3, total_len=7, content="a0", completion_id="cc-1"),
+    3: dict(prompt_length=6, total_len=11, content="a1", completion_id="cc-3"),
 }
 
 # Both two-turn termination modes (env-signaled done, max_turns exhausted) must produce this
@@ -473,6 +476,7 @@ TWO_TURN_EXPECTED = dict(
     reward_conv=[("user", "hello"), ("assistant", "a0"), ("user", "obs0"), ("assistant", "a1")],
     rewarded=[("a1", "stop")],
     genmask_sums=[4, 5],
+    completion_ids=["cc-1", "cc-3"],
 )
 
 
@@ -531,12 +535,13 @@ class TestMultiTurnEpisode:
             pytest.param(
                 1,
                 None,
-                {1: dict(prompt_length=2, total_len=6, content="only")},
+                {1: dict(prompt_length=2, total_len=6, content="only", completion_id="cc-1")},
                 dict(
                     seen_roles=[["user"]],
                     reward_conv=[("user", "hello"), ("assistant", "only")],
                     rewarded=[("only", "stop")],
                     genmask_sums=[4],
+                    completion_ids=["cc-1"],
                     observation_turns=[],
                 ),
                 id="single_turn",
@@ -592,6 +597,8 @@ class TestMultiTurnEpisode:
         assert isinstance(rollout, TokenRollout)
         assert rollout.reward == 1.5
         assert rollout.problem_id == "p0"
+        # Per-turn backend response ids ride onto the rollout for the ledger join.
+        assert rollout.completion_ids == expected["completion_ids"]
         # One trajectory entry per generated turn.
         assert len(rollout.trajectory) == len(expected["genmask_sums"])
         # Each turn's inference request = prior conversation (reply + observation appended).

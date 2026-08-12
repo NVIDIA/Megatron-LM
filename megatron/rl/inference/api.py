@@ -24,3 +24,4 @@ class InferenceResponse(BaseModel):
     prompt_length: int | None = None
     logprobs: list[float] | None = None
     finish_reason: str
+    completion_id: str | None = None

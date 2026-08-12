@@ -702,8 +702,11 @@ try:
         # at submit time (above) and drive both the response shape here and whether the
         # engine kept the prompt_tokens tensor on the payload.
         request_idx = 0
+        response_uid = None
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
+            if response_uid is None:
+                response_uid = result["uid"]
 
             text_output = result["generated_text"]
             # The engine always reports prompt_length (for usage), but drops the
@@ -839,7 +842,7 @@ try:
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         cached_token_count = max(cached_tokens_counts) if cached_tokens_counts else 0
         response = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "id": response_uid,
             "created": int(time.time()),
             "model": "EMPTY",
             "object": "chat.completion",

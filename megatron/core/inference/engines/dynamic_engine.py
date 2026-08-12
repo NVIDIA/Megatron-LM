@@ -358,7 +358,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
         self.local_metadata_ledger_enabled: bool = False
-        self.local_metadata_ledger: dict[tuple[bytes, bytes], list[FinishedRequestRecord]] = {}
+        self.local_metadata_ledger: dict[str, FinishedRequestRecord] = {}
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
@@ -1034,13 +1034,6 @@ class DynamicInferenceEngine(AbstractEngine):
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
         return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
-
-    def consume_local_metadata_ledger(
-        self,
-    ) -> dict[tuple[bytes, bytes], list[FinishedRequestRecord]]:
-        """Return this engine's local-metadata ledger and clear it."""
-        ledger, self.local_metadata_ledger = self.local_metadata_ledger, {}
-        return ledger
 
     def get_request(self, request_id: int) -> DynamicInferenceRequest:
         """Get most recent request from a request record.
@@ -2349,8 +2342,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 if self.local_metadata_ledger_enabled:
                     # Index every finished request's extra metadata before it is dropped.
                     for merged in merged_requests:
-                        key, finished_record = FinishedRequestRecord.from_request(merged)
-                        self.local_metadata_ledger.setdefault(key, []).append(finished_record)
+                        assert merged.uid not in self.local_metadata_ledger, (
+                            f"finished-request ledger: duplicate uid {merged.uid!r}"
+                        )
+                        self.local_metadata_ledger[merged.uid] = FinishedRequestRecord.from_request(
+                            merged
+                        )
                 payload = msgpack.packb(
                     [Headers.ENGINE_REPLY.value, [m.serialize() for m in merged_requests]],
                     use_bin_type=True,

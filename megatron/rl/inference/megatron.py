@@ -85,6 +85,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             logprobs=choice.message.generation_log_probs,
             finish_reason=choice.finish_reason,
             prompt_length=len(choice.message.prompt_token_ids),
+            completion_id=response.id,
         )
 
     @classmethod
@@ -193,15 +194,18 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.suspend_engines()
         await self._inference_engine.wait_until(EngineState.SUSPENDED)
 
-    def merge_global_request_ledgers(self) -> dict[tuple[bytes, bytes], list[FinishedRequestRecord]]:
+    def merge_global_request_ledgers(self) -> dict[str, FinishedRequestRecord]:
         """Union every engine's local-metadata ledger and clear them."""
-        local = self._inference_engine.consume_local_metadata_ledger()
+        engine = self._inference_engine
+        local, engine.local_metadata_ledger = engine.local_metadata_ledger, {}
         shards = [None] * dist.get_world_size()
         dist.all_gather_object(shards, local)
-        merged: dict[tuple[bytes, bytes], list[FinishedRequestRecord]] = {}
+        merged: dict[str, FinishedRequestRecord] = {}
         for shard in shards:
-            for key, records in shard.items():
-                merged.setdefault(key, []).extend(records)
+            merged.update(shard)
+        assert len(merged) == sum(len(shard) for shard in shards), (
+            "finished-request ledger: duplicate uids across engine ledgers"
+        )
         return merged
 
     async def resume(self):

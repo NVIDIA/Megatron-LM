@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import time
+import uuid
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
@@ -366,6 +367,9 @@ class DynamicInferenceRequest(InferenceRequest):
     """
 
     request_id: int
+    # `request_id` is per-engine, do not cross DP, and do not persist.
+    # A uuid is globally unique and can be used to track down individual requests.
+    uid: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
@@ -748,6 +752,7 @@ class DynamicInferenceRequestRecord:
         # Merged request.
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
+            uid=self.requests[0].uid,
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             prompt_log_probs=self.requests[0].prompt_log_probs,
@@ -811,18 +816,8 @@ class FinishedRequestRecord:
     num_evictions: int
 
     @classmethod
-    def from_request(
-        cls, request: "DynamicInferenceRequest"
-    ) -> tuple[tuple[bytes, bytes], "FinishedRequestRecord"]:
+    def from_request(cls, request: "DynamicInferenceRequest") -> "FinishedRequestRecord":
         """Build the request's non-RESTful metadata from a finished request."""
-        prompt = request.prompt_tokens
-        if torch.is_tensor(prompt):
-            prompt = prompt.cpu()
-            request.prompt_tokens = prompt
-        key = (
-            hashlib.sha256(np.asarray(prompt, dtype=np.int64).tobytes()).digest(),
-            hashlib.sha256(np.asarray(request.generated_tokens, dtype=np.int64).tobytes()).digest(),
-        )
         # Epoch stamps exist only while the engine has a generation epoch set.
         record = cls(
             policy_epoch=(
@@ -837,7 +832,7 @@ class FinishedRequestRecord:
                 1 for event in request.events if event.type is DynamicInferenceEventType.EVICT
             ),
         )
-        return key, record
+        return record
 
 
 @dataclass(kw_only=True)

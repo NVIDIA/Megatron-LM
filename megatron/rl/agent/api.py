@@ -66,6 +66,7 @@ class TokenRollout(AgentBaseModel):
     logprobs: list[list[float]] | None = None
     env_id: str = ''
     problem_id: str | None = None
+    completion_ids: list[str] = []
 
 
 Rollouts = list[TokenRollout | Rollout]

@@ -202,6 +202,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 ],
                 env_id=self.env_id,
                 problem_id=problem_id,
+                completion_ids=[r.completion_id for r in responses],
             )
         else:
             return Rollout(
