@@ -17,7 +17,6 @@
 import enum
 import weakref
 from collections.abc import Callable
-from functools import partial
 from typing import Literal, cast
 from weakref import ref
 
@@ -193,25 +192,13 @@ class FsdpModule:
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
 
-        if any(parameter.is_meta for parameter in owned_parameters.values()):
-            # Collect nested FsdpModules to skip — they were already materialized
-            # when their own fully_shard() processed them bottom-up.
-            ignored_modules: set = set()
-            for _, child in self.named_modules():
-                if child is not self and isinstance(child, FsdpModule):
-                    for sub in child.modules():
-                        ignored_modules.add(sub)
-            _materialize_meta_params(self, mesh, ignored_modules)
-            # Parameters were replaced by m._apply() — re-read.
-            owned_parameters = _collect_owned_parameters(self)
-
         meta_parameter_names = [
             name for name, parameter in owned_parameters.items() if parameter.is_meta
         ]
         if meta_parameter_names:
             raise RuntimeError(
-                "FSDP parameter materialization left parameters on the meta device: "
-                + ", ".join(repr(name) for name in meta_parameter_names)
+                "MFSDP v2 requires materialized parameters; "
+                "found meta parameters: " + ", ".join(repr(name) for name in meta_parameter_names)
             )
 
         parameter_groups = [
@@ -233,31 +220,10 @@ class FsdpModule:
         self._num_trainable_parameters = sum(
             len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
-        self._post_backward_issued = False
         self._register_hooks(
             fine_grained=fine_grained, skip_backward_callback=skip_backward_callback
         )
-        # Public callables for 1F1B EP overlap schedule integration.
-        self.post_forward_release_module = partial(self._post_forward_release)
-        self.post_backward_release_module = self._post_backward_release
         context.register_module(self)
-
-    def _post_forward_release(self, hook_module=None) -> None:
-        """Release forward-pass parameters (reshard only, no gradient reduction).
-
-        Matching the v1 contract: takes an optional hook_module argument
-        (ignored — this FsdpModule manages its own parameters)."""
-        self.reshard_parameters()
-
-    def _post_backward_release(self, hook_module=None) -> None:
-        """Release backward-pass parameters (reshard + reduce gradients).
-
-        Matching the v1 contract: takes an optional hook_module argument
-        (ignored — this FsdpModule manages its own parameters)."""
-        modules = cast(nn.Module, self).modules()
-        for module in reversed(list(modules)):
-            if isinstance(module, FsdpModule):
-                module._issue_post_backward()
 
     @property
     def context(self) -> FsdpContext:
@@ -457,8 +423,6 @@ class FsdpModule:
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
-            for module in context.forward_order:
-                module._post_backward_issued = False
             context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
@@ -477,29 +441,21 @@ class FsdpModule:
         if next_module is not None:
             next_module._unshard_parameter_groups()
 
-    def post_backward(self, finalize_context: bool = False) -> None:
+    def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state.
 
-        Args:
-            finalize_context: Whether to finalize the root context synchronously.
+        Any submodule FsdpModule still in the BACKWARD phase (e.g. the 1F1B
+        schedule skipped its per-module release) is finalized first.
         """
-        if finalize_context:
-            assert self.is_root()
-            for module in reversed(list(self.context.forward_order)):
-                module._issue_post_backward()
-        else:
-            self._issue_post_backward()
-        torch.cuda.nvtx.range_pop()
-
-    def _issue_post_backward(self) -> None:
-        """Reshard and reduce this module's gradients at most once per backward."""
-        if self._post_backward_issued:
-            return
+        # The 1F1B schedule may skip a per-module release; finalize any submodule
+        # still in the BACKWARD phase.
+        for module in reversed(list(cast(nn.Module, self).modules())):
+            if isinstance(module, FsdpModule) and module.phase is FsdpModule.Phase.BACKWARD:
+                module.post_backward()
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
         self._phase = FsdpModule.Phase.RESTING
-        self._num_ready_grad_parameters = 0
-        self._post_backward_issued = True
+        torch.cuda.nvtx.range_pop()
 
     def reduce_grad(self) -> None:
         """Public API: pack gradients and launch their reduce-scatters.
@@ -602,65 +558,6 @@ def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.
         key = (parameter.dtype, parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
-
-def _materialize_meta_params(
-    module: nn.Module,
-    mesh: DeviceMesh,
-    ignored_modules: set | None = None,
-) -> None:
-    """Materialize meta parameters to real tensors and initialize weights.
-
-    Replaces every meta ``nn.Parameter`` with a real tensor on the current
-    CUDA device, calls ``m.reset_parameters()`` to re-initialize, and
-    broadcasts weights from DP rank 0.
-
-    Args:
-        module: Root module whose meta parameters should be materialized.
-        mesh: Data-parallel device mesh used for the weight broadcast.
-        ignored_modules: Set of module instances to skip (nested FsdpModules
-            already materialized by their own ``fully_shard()`` call).
-    """
-    ignored_modules = ignored_modules or set()
-    device = torch.cuda.current_device()
-    device = device if isinstance(device, torch.device) else torch.device("cuda", device)
-
-    from torch.distributed.tensor import DTensor
-
-    for name, m in reversed(list(module.named_modules())):
-        if m in ignored_modules:
-            continue
-        if m is not module and isinstance(m, FsdpModule):
-            continue
-        if not any(p.is_meta for p in m.parameters(recurse=False)):
-            m._apply(lambda t: t if t.is_meta else t.to(device), recurse=False)
-            continue
-
-        m._apply(lambda t: (torch.empty_like(t, device=device) if t.is_meta else t), recurse=False)
-        if hasattr(m, "reset_parameters"):
-            m.reset_parameters()
-        elif hasattr(m, "_reset_parameters"):
-            m._reset_parameters()
-        else:
-            raise ValueError(f"Module {name!r} contains meta parameters but cannot reset them")
-
-        m._apply(lambda t: t if t.is_meta else t.to(device), recurse=False)
-        for p in m.parameters(recurse=False):
-            if p.is_meta:
-                raise RuntimeError(
-                    f"Module {name!r} contains meta parameters after materialization"
-                )
-
-    if mesh.size() > 1:
-        for param in module.parameters():
-            if param.is_meta or isinstance(param, DTensor):
-                continue
-            for mesh_dim in range(mesh.ndim):
-                group = mesh.get_group(mesh_dim=mesh_dim)
-                if torch.distributed.get_world_size(group) == 1:
-                    continue
-                src_rank = torch.distributed.get_global_rank(group, 0)
-                torch.distributed.broadcast(param.data, src=src_rank, group=group)
-
 
 # ---------------------------------------------------------------------------
 # Fine-grained hook registration for 1F1B EP overlap support
