@@ -27,7 +27,7 @@ from torch.distributed import DeviceMesh
 from ..mixed_precision import MixedPrecisionPolicy
 from .indexed_order import IndexedOrder
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
-from .placement import MeshAxis, Placements
+from .placement import Placements
 
 
 def _is_in_backward() -> bool:
@@ -411,12 +411,17 @@ class FsdpModule:
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state.
 
-        Any submodule FsdpModule still in the BACKWARD phase (e.g. the 1F1B
-        schedule skipped its per-module release) is finalized first.
+        No-op unless this module is in the BACKWARD phase (idempotent). Any
+        submodule FsdpModule still in the BACKWARD phase (e.g. the 1F1B schedule
+        skipped its per-module release) is finalized first.
         """
+        if self.phase is not FsdpModule.Phase.BACKWARD:
+            return
         # The 1F1B schedule may skip a per-module release; finalize any submodule
-        # still in the BACKWARD phase.
+        # still in the BACKWARD phase (excluding this module itself).
         for module in reversed(list(cast(nn.Module, self).modules())):
+            if module is self:
+                continue
             if isinstance(module, FsdpModule) and module.phase is FsdpModule.Phase.BACKWARD:
                 module.post_backward()
         self._reduce_gradient_groups()
@@ -569,27 +574,15 @@ def _register_fine_grained_backward_hooks(fsdp_module: FsdpModule) -> None:
 def _fine_grained_pre_backward_hook(submodule: nn.Module, grad_output) -> None:
     """Pre-backward hook for fine-grained sub-modules.
 
-    Unshards the parent ``FsdpModule`` before the sub-module's backward runs
-    so its weight-gradient computation sees full parameters.
+    Marks the parent ``FsdpModule`` BACKWARD and unshards it before the
+    sub-module's backward runs, so its weight-gradient computation sees full
+    parameters.
     """
     target = _find_fsdp_target(submodule)
     if target is None:
         return
+    if target.phase is FsdpModule.Phase.RESTING:
+        target.phase = FsdpModule.Phase.BACKWARD
     target._unshard_parameter_groups()
     if target._unshard_event is not None:
         target.context.current_stream().wait_event(target._unshard_event)
-
-
-def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
-    if isinstance(axis, int):
-        axis_index = axis
-        if axis_index < 0:
-            axis_index += mesh.ndim
-        if axis_index < 0 or axis_index >= mesh.ndim:
-            raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
-        return axis_index
-
-    dim_names = mesh.mesh_dim_names
-    if dim_names is None or axis not in dim_names:
-        raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
-    return dim_names.index(axis)
