@@ -273,7 +273,30 @@ class FsdpParameterGroup:
 
     def restore_model_weight(self) -> None:
         """Restore a deferred ZeRO-1 model weight to its compute placements."""
-        self.model_weight = self.model_weight.redistribute(self._model_weight_placements)
+        placements = self._model_weight_placements
+        if self.model_weight.placements == placements:
+            return
+
+        # The regular allocator needs no setup, so let redistribute allocate its output.
+        if self._symm_mem_pool is None:
+            self.model_weight = self.model_weight.redistribute(placements)
+            return
+
+        # The symmetric-memory output must be allocated from its pool and rendezvoused
+        # before the collective. Consequently, redistribute cannot allocate it internally.
+        with self._symmetric_memory_context():
+            restored_model_weight = DBuffer(
+                mesh=self.mesh,
+                placements=placements,
+                tensor_shapes=self.model_weight.layout.tensor_shapes,
+                dtype=self.model_weight.dtype,
+                device=self.model_weight.device,
+            )
+        gather_axis = changed_mesh_axis(self.model_weight.placements, placements)
+        assert gather_axis is not None
+        restored_model_weight.rendezvous(gather_axis)
+        self.model_weight.redistribute(placements, out=restored_model_weight)
+        self.model_weight = restored_model_weight
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""

@@ -541,18 +541,17 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, foreach=False)
     fully_shard_optimizer(optimizer)
 
-    # Warm up and record baseline.
+    # Warm up.
     with torch.no_grad():
         for _ in range(2):
             model(x)
-    torch.cuda.synchronize(device)
-    torch.cuda.empty_cache()
-    allocated_before = torch.cuda.memory_allocated(device)
-
     # Initialize sharded Adam states.
     model(x).sum().backward()
     optimizer.step()
     assert parameter_group.model_weight.placements == (Flat(),)
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    allocated_before_forward = torch.cuda.memory_allocated(device)
 
     # Restore replicated model weight.
     with torch.no_grad():
@@ -570,12 +569,14 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     fp32_size = torch.empty((), dtype=torch.float32).element_size()
     bf16_size = torch.empty((), dtype=dtype).element_size()
     theoretical_optimizer_size = 2 * shard_numel * fp32_size
-    # Theoretical post-forward growth.
-    theoretical_forward_size = theoretical_optimizer_size + num_tokens * dim * bf16_size
+    # Replicated weight replaces its Flat shard, plus the retained output.
+    theoretical_forward_growth = (
+        dim * dim - shard_numel
+    ) * bf16_size + num_tokens * dim * bf16_size
 
     assert actual_optimizer_size == theoretical_optimizer_size
-    actual_forward_size = torch.cuda.memory_allocated(device) - allocated_before
-    assert abs(actual_forward_size - theoretical_forward_size) < 1024**2
+    actual_forward_growth = torch.cuda.memory_allocated(device) - allocated_before_forward
+    assert abs(actual_forward_growth - theoretical_forward_growth) < 1024**2
 
 
 def test_deleted_model_releases_fsdp_storage(distributed_setup):
