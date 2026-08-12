@@ -77,23 +77,19 @@ adapter wrapping an `FsdpModule` (`hasattr(m, "ddp_config")`), or a bare
 
 ### 1.2 Pre-schedule setup — `_replace_param_with_raw_if_needed()`
 
-**File:** `combined_1f1b.py` → `FsdpModule._replace_param_with_raw_if_needed()`
+**File:** `combined_1f1b.py` → `FullyShardedDataParallelV2._replace_param_with_raw_if_needed()`
 
 The schedule calls this once before running. In v1 it swaps optimizer-facing
 DTensor parameters back to raw `nn.Parameter`s. MFSDP v2 always stores raw
 tensors backed by `DBuffer` on the module, so **no parameter swap is needed**;
-the method finalizes the root `FsdpContext` instead, ensuring a child FSDP
+the adapter finalizes the root `FsdpContext` instead, ensuring a child FSDP
 unit cannot mistake itself for the root when it executes first:
 
 ```python
-# On FsdpModule (module.py)
-def _replace_param_with_raw_if_needed(self) -> None:
-    """Initialize the root context before a fine-grained schedule runs."""
-    self.context.ensure_finalized()
+# In FullyShardedDataParallelV2._setup_1f1b_overlap_interface (mcore_fsdp_adapter.py)
+def _replace_param_with_raw_if_needed() -> None:
+    self.module.context.ensure_finalized()
 ```
-
-The v2 adapter exposes the same entry point by forwarding to the module:
-`self._replace_param_with_raw_if_needed = self.module._replace_param_with_raw_if_needed`.
 
 ### 1.3 Root backward-phase setup — `pre_backward()`
 
@@ -123,7 +119,7 @@ The schedule attaches two callables per `TransformerLayerSchedulePlan`:
 The `FullyShardedDataParallelV2` adapter binds both through a single
 `release_module(module, *, reduce_grad)` helper (in
 `_setup_1f1b_overlap_interface`) that validates the argument is an
-`FsdpModule`, then calls `module.reshard_parameters()` (forward) or
+`FsdpModule`, then calls `module._reshard_parameter_groups()` (forward) or
 `module.post_backward()` (backward). No release helpers live on
 `FsdpModule` itself.
 
@@ -189,7 +185,9 @@ def _fine_grained_pre_forward(hook_module, args, kwargs):
     target = _find_fsdp_target(hook_module)
     if target is None:
         return
-    target.unshard_parameters()
+    target._unshard_parameter_groups()
+    if target._unshard_event is not None:
+        target.context.current_stream().wait_event(target._unshard_event)
 ```
 
 ### 2.2 Pre-backward hooks on sub-modules
@@ -208,7 +206,9 @@ def _create_fine_grained_backward_hook(submodule: nn.Module) -> None:
             target = _find_fsdp_target(submodule)
             if target is None:
                 return
-            target.unshard_parameters()
+            target._unshard_parameter_groups()
+            if target._unshard_event is not None:
+                target.context.current_stream().wait_event(target._unshard_event)
 
         torch.autograd.graph.register_multi_grad_hook(output_list, _multi_grad_hook, mode="any")
         return output
@@ -273,12 +273,8 @@ path, where the schedule drives reduction explicitly).
 
 | Method | Signature | Description |
 |---|---|---|
-| `unshard_parameters()` | `() -> None` | All-gather full parameters for compute. Idempotent. |
-| `reshard_parameters()` | `() -> None` | Release all-gathered storage, install DTensor params. |
-| `reduce_grad()` | `() -> None` | Pack gradients → reduce-scatter → install DTensor `.grad`. |
 | `pre_backward()` | `() -> None` | Root backward-phase setup (unshard for backward). |
 | `post_backward()` | `() -> None` | Finalize backward: reduce+reshard this module, and any submodule `FsdpModule` still in the BACKWARD phase. |
-| `_replace_param_with_raw_if_needed()` | `() -> None` | Finalize the root context; no parameter swap is needed. |
 
 ### New parameters on `fully_shard()`
 
@@ -289,10 +285,19 @@ path, where the schedule drives reduction explicitly).
 
 ### New methods on `FullyShardedDataParallelV2` (adapter)
 
-| Method | Signature | Description |
+The schedule-facing surface is assembled in `_setup_1f1b_overlap_interface`,
+which binds closures that operate on a passed `FsdpModule`:
+
+| Attribute | Signature | Description |
 |---|---|---|
+| `unshard_parameters` | `(module) -> None` | All-gather full parameter storage for compute. Idempotent. |
+| `reshard_parameters` | `(module) -> None` | Release all-gathered storage, install DTensor params. |
+| `reduce_grad` | `(module) -> None` | Pack gradients → reduce-scatter → install DTensor `.grad`. |
+| `_replace_param_with_raw_if_needed` | `() -> None` | Finalize the root context; no parameter swap is needed. |
+| `post_forward_release_module` | `(module) -> None` | Release forward-pass params (reshard only). |
+| `post_backward_release_module` | `(module) -> None` | Release backward-pass params (reshard + reduce). |
 | `no_sync()` | `() -> contextmanager` | Suppress gradient finalization for non-final microbatches. |
-| `_setup_1f1b_overlap_interface()` | `() -> None` | Bind `post_forward_release_module` / `post_backward_release_module` / `pre_backward` / `post_backward` for the schedule. |
+| `_setup_1f1b_overlap_interface()` | `() -> None` | Bind the schedule-facing callbacks above. |
 
 ### Changes to `find_megatron_fsdp()` (`megatron_fsdp/utils.py`)
 

@@ -353,17 +353,6 @@ class FsdpModule:
                 group.unshard_parameters()
             self._unshard_event = allgather_stream.record_event()
 
-    def unshard_parameters(self) -> None:
-        """Public API: all-gather full parameter storage for compute.
-
-        Idempotent — if parameters are already unsharded, this is a no-op.
-        Called by the 1F1B EP overlap schedule via fine-grained sub-module
-        hooks before each individual sub-module compute.
-        """
-        self._unshard_parameter_groups()
-        if self._unshard_event is not None:
-            self.context.current_stream().wait_event(self._unshard_event)
-
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
         # Recomputed parameters are consumed immediately by this module's
@@ -393,14 +382,6 @@ class FsdpModule:
             for group in self._parameter_groups:
                 group.release_unsharded_storage()
             self._unshard_event = None
-
-    def reshard_parameters(self) -> None:
-        """Public API: release all-gathered storage and install DTensor parameters.
-
-        Called by the 1F1B EP overlap schedule's per-layer release hooks
-        after compute completes on a sub-module.
-        """
-        self._reshard_parameter_groups()
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
@@ -442,27 +423,6 @@ class FsdpModule:
         self._reshard_parameter_groups()
         self._phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
-
-    def reduce_grad(self) -> None:
-        """Public API: pack gradients and launch their reduce-scatters.
-
-        Called by the 1F1B EP overlap schedule's per-layer release hooks
-        after backward compute completes.  Only operates on parameter groups
-        that require gradients.
-        """
-        self._reduce_gradient_groups()
-
-    def _replace_param_with_raw_if_needed(self) -> None:
-        """Initialize the root context before a fine-grained schedule runs.
-
-        Provided for compatibility with the 1F1B EP overlap schedule, which
-        calls this method to swap optimizer-facing DTensor parameters back to
-        raw nn.Parameters before accessing sub-modules directly.  The
-        experimental API stores raw tensors backed by DBuffer at all times,
-        so no swap is needed, but finalizing the context here ensures a child
-        FSDP unit cannot mistake itself for the root when it executes first.
-        """
-        self.context.ensure_finalized()
 
     def _reduce_gradient_groups(self) -> None:
         """Pack gradients and immediately launch their reduce-scatters."""
@@ -565,7 +525,7 @@ def _register_fine_grained_forward_hooks(fsdp_module: FsdpModule) -> None:
 
     When the 1F1B EP overlap schedule calls individual sub-modules directly
     (e.g., ``layer.attn.forward()``), the hook resolves the parent FsdpModule
-    and calls ``unshard_parameters()``.
+    and unshards its parameters.
     """
     for submodule in fsdp_module.modules():
         if submodule is fsdp_module:
@@ -584,15 +544,17 @@ def _fine_grained_pre_forward_hook(submodule: nn.Module, args, kwargs) -> None:
     target = _find_fsdp_target(submodule)
     if target is None:
         return
-    target.unshard_parameters()
+    target._unshard_parameter_groups()
+    if target._unshard_event is not None:
+        target.context.current_stream().wait_event(target._unshard_event)
 
 
 def _register_fine_grained_backward_hooks(fsdp_module: FsdpModule) -> None:
     """Register pre-backward hooks on every sub-module of *fsdp_module*.
 
     Uses ``register_multi_grad_hook`` on sub-module output tensors.  When
-    autograd reaches a sub-module during backward, the hook calls
-    ``unshard_parameters()`` on the parent FsdpModule.
+    autograd reaches a sub-module during backward, the hook unshards the
+    parent FsdpModule's parameters.
     """
     for submodule in fsdp_module.modules():
         if submodule is fsdp_module:
@@ -617,7 +579,9 @@ def _create_fine_grained_backward_hook(submodule: nn.Module) -> None:
             target = _find_fsdp_target(submodule)
             if target is None:
                 return
-            target.unshard_parameters()
+            target._unshard_parameter_groups()
+            if target._unshard_event is not None:
+                target.context.current_stream().wait_event(target._unshard_event)
 
         torch.autograd.graph.register_multi_grad_hook(output_list, _multi_grad_hook, mode="any")
         return output

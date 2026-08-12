@@ -621,20 +621,56 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             self._setup_1f1b_overlap_interface()
 
     def _setup_1f1b_overlap_interface(self) -> None:
-        """Expose the parameter lifecycle callbacks used by combined 1F1B."""
+        """Expose the parameter lifecycle callbacks used by combined 1F1B.
 
-        def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:
+        All callbacks live on the adapter rather than on ``FsdpModule`` so the
+        experimental module API stays schedule-agnostic; the schedule-facing
+        surface is assembled here.
+        """
+
+        def _require_fsdp_module(module: torch.nn.Module) -> FsdpModule:
             if not isinstance(module, FsdpModule):
                 raise TypeError(
                     "MFSDP v2 combined 1F1B callbacks require an experimental FsdpModule, "
                     f"got {type(module).__name__}."
                 )
-            if reduce_grad:
-                module.post_backward()
-            else:
-                module.reshard_parameters()
+            return module
 
-        self._replace_param_with_raw_if_needed = self.module._replace_param_with_raw_if_needed
+        def unshard_parameters(module: torch.nn.Module) -> None:
+            """All-gather full parameter storage for compute (idempotent)."""
+            module = _require_fsdp_module(module)
+            module._unshard_parameter_groups()
+            if module._unshard_event is not None:
+                module.context.current_stream().wait_event(module._unshard_event)
+
+        def reshard_parameters(module: torch.nn.Module) -> None:
+            """Release all-gathered storage and install DTensor parameters."""
+            _require_fsdp_module(module)._reshard_parameter_groups()
+
+        def reduce_grad(module: torch.nn.Module) -> None:
+            """Pack gradients and launch their reduce-scatters."""
+            _require_fsdp_module(module)._reduce_gradient_groups()
+
+        def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:
+            if reduce_grad:
+                _require_fsdp_module(module).post_backward()
+            else:
+                reshard_parameters(module)
+
+        def _replace_param_with_raw_if_needed() -> None:
+            """Initialize the root context before a fine-grained schedule runs.
+
+            The experimental API stores raw tensors backed by DBuffer at all
+            times, so no parameter swap is needed, but finalizing the context
+            here ensures a child FSDP unit cannot mistake itself for the root
+            when it executes first.
+            """
+            self.module.context.ensure_finalized()
+
+        self.unshard_parameters = unshard_parameters
+        self.reshard_parameters = reshard_parameters
+        self.reduce_grad = reduce_grad
+        self._replace_param_with_raw_if_needed = _replace_param_with_raw_if_needed
         self.post_forward_release_module = partial(release_module, reduce_grad=False)
         self.post_backward_release_module = partial(release_module, reduce_grad=True)
         self.pre_backward = self.module.pre_backward
