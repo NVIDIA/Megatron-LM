@@ -18,6 +18,7 @@ Tests use the real DDP + distributed-optimizer path and none depend on timing:
 - ``..._prefetch_reads_stale_weight_values``    -- did the read actually see stale values?
 - ``..._grouped_expert_one_block_ahead_prefetch`` -- same, on the widest (grouped) window.
 - ``..._recompute_forward_does_not_request_publication`` -- recompute must not ask DDP to publish.
+  (The TE flag that gate depends on is pinned in ``test_gtp_basics.py``.)
 """
 
 import contextlib
@@ -307,7 +308,7 @@ def _worker_recompute_skips_readiness(rank, world_size, _port):
     gradient reduction by then, and publishing could dispatch a parameter all-gather mid-backward
     into a buffer that aliases the gradient buffer under --reuse-grad-buf-for-mxfp8-param-ag.
     """
-    patched = _patched(gtp_module, "ensure_params_ready", "in_fp8_activation_recompute_phase")
+    patched = _patched(gtp_module, "ensure_params_ready", "in_activation_recompute_phase")
     with _gtp_env(), patched:
         ddp_model, weights = _build_ddp_two_gtp_layers()
         ddp_model.start_param_sync(force_sync=True)
@@ -317,7 +318,7 @@ def _worker_recompute_skips_readiness(rank, world_size, _port):
 
         # Baseline: a genuine forward gather must consult readiness, otherwise this test could
         # pass simply because the call site was deleted.
-        gtp_module.in_fp8_activation_recompute_phase = lambda: False
+        gtp_module.in_activation_recompute_phase = lambda: False
         weights[0]._all_gather_weight(async_op=False, fwd=True)
         assert calls, (
             f"[rank {rank}] a real forward gather did not consult param readiness -- the call "
@@ -326,7 +327,7 @@ def _worker_recompute_skips_readiness(rank, world_size, _port):
 
         # The actual guarantee: inside recompute, readiness must not be consulted at all.
         calls.clear()
-        gtp_module.in_fp8_activation_recompute_phase = lambda: True
+        gtp_module.in_activation_recompute_phase = lambda: True
         weights[0]._all_gather_weight(async_op=False, fwd=True)
         assert not calls, (
             f"[rank {rank}] activation-recompute asked DDP to publish parameters "

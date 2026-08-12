@@ -66,7 +66,9 @@ try:
     from transformer_engine.pytorch.distributed import (
         _NVFP4AllGatherAsyncHandle,
         gather_along_first_dim,
-        in_fp8_activation_recompute_phase,
+        # Not FP8-only despite the name: TE sets the underlying flag unconditionally, so this is
+        # True under BF16 recompute too. (The FP8-gated one is is_fp8_activation_recompute_enabled.)
+        in_fp8_activation_recompute_phase as in_activation_recompute_phase,
         reduce_scatter_along_first_dim,
     )
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
@@ -91,7 +93,7 @@ except (ImportError, ModuleNotFoundError):
     MXFP8_BLOCK_SCALING_SIZE = NVFP4_BLOCK_SCALING_SIZE = None
     _NVFP4AllGatherAsyncHandle = MagicMock()
     gather_along_first_dim = reduce_scatter_along_first_dim = MagicMock()
-    in_fp8_activation_recompute_phase = MagicMock()
+    in_activation_recompute_phase = MagicMock()
     get_dummy_wgrad = MagicMock()
     QuantizedTensor = MagicMock()
     MXFP8TensorStorage = NVFP4TensorStorage = MagicMock()
@@ -1230,13 +1232,13 @@ class GTPShardedParam(torch.nn.Parameter):
         #
         #    Forward only: backward re-reads what forward published, and recompute runs inside
         #    backward where a dispatch could gather into the grad-aliased buffer.
-        if fwd and not in_fp8_activation_recompute_phase():
+        if fwd and not in_activation_recompute_phase():
             ensure_params_ready(weights)
 
         # 1. Transition state for async gathers. Skip during recompute-forward: it gathers
         #    rowwise (_ag_ticket_fwd) while a bwd-chain prefetch may hold an in-flight columnwise
         #    AG state (_ag_ticket_bwd) on the same weight — clobbering breaks the dgrad consume.
-        if GTP_CONFIG.check_param_states and not in_fp8_activation_recompute_phase():
+        if GTP_CONFIG.check_param_states and not in_activation_recompute_phase():
             new_state = GTPWeightState.ASYNC_WAIT if async_op else GTPWeightState.DATA_READY_SYNC
             for w in weights:
                 w._set_state(new_state)
@@ -1515,7 +1517,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # During an activation-recompute forward (runs in backward), route consume +
         # prefetch through the recompute-forward chain on its own _recompute_* slot
         # (see __init__) instead of the fwd/bwd chains; lazy-built below.
-        in_recompute = in_fp8_activation_recompute_phase()
+        in_recompute = in_activation_recompute_phase()
         use_recompute_chain = in_recompute and GTP_CONFIG.weight_prefetch
 
         # Consume current weight.

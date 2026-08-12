@@ -3122,7 +3122,7 @@ def deprecate_inference_params(inference_context, inference_params):
 
 #: Attribute a parameter-sharding backend sets on each parameter it publishes asynchronously.
 #: See :func:`ensure_params_ready`.
-PARAM_READY_CALLBACK_ATTR = "_ensure_param_ready"
+PARAM_READY_CALLBACK_ATTR = "_ensure_param_ready_callback"
 
 
 def ensure_params_ready(params: Iterable[Any]) -> None:
