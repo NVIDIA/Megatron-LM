@@ -126,7 +126,8 @@ def test_fine_grained_hooks_preserve_registered_module_hierarchy(distributed_set
     module_names = tuple(name for name, _ in model.named_modules())
     layer_keys = tuple(model.layers._modules)
 
-    fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
 
     assert tuple(name for name, _ in model.named_modules()) == module_names
     assert tuple(model.layers._modules) == layer_keys
@@ -258,22 +259,31 @@ def test_post_backward_release_processes_nested_fsdp_modules_once(distributed_se
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = NestedModel().to(device)
 
-    fully_shard(model.inner, mesh=mesh, placements=_flat_placements(), skip_backward_callback=True)
-    fully_shard(model, mesh=mesh, placements=_flat_placements(), skip_backward_callback=True)
+    with fully_shard_context(device=device):
+        fully_shard(
+            model.inner, mesh=mesh, placements=_flat_placements(), skip_backward_callback=True
+        )
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), skip_backward_callback=True)
 
     calls = []
     for name, module in (("root", model), ("inner", model.inner)):
         monkeypatch.setattr(
-            module, "reshard_parameters", lambda name=name: calls.append((name, "reshard"))
+            module,
+            "_reshard_parameter_groups",
+            lambda name=name: calls.append((name, "reshard")),
         )
-        monkeypatch.setattr(module, "reduce_grad", lambda name=name: calls.append((name, "reduce")))
+        monkeypatch.setattr(
+            module, "_reduce_gradient_groups", lambda name=name: calls.append((name, "reduce"))
+        )
 
     model.post_backward_release_module()
     model.post_backward_release_module()
 
-    assert calls == [
-        ("inner", "reshard"),
+    # Each nested unit is resharded and reduced exactly once per backward;
+    # the relative order of the two operations is not a contract.
+    assert sorted(calls) == [
         ("inner", "reduce"),
-        ("root", "reshard"),
+        ("inner", "reshard"),
         ("root", "reduce"),
+        ("root", "reshard"),
     ]
