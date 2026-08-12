@@ -20,8 +20,8 @@ from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import get_mtbench_chat_data
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.models.model_provider import model_provider
 from megatron.training.utils import print_rank_0
-from model_provider import model_provider
 
 warnings.filterwarnings('ignore')
 

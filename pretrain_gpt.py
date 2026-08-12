@@ -23,13 +23,12 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -62,9 +61,10 @@ from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.models.gpt_builders import gpt_builder
+from megatron.training.models.model_provider import model_provider
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
-from model_provider import model_provider
 
 try:
     from megatron.post_training.arguments import add_modelopt_args

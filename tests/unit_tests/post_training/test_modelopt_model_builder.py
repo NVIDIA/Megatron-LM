@@ -4,7 +4,7 @@
 
 from argparse import Namespace
 
-import model_provider as mp
+import megatron.training.models.model_provider as mp
 
 
 def _sentinel_builder(return_value, calls):
