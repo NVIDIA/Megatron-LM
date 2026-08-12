@@ -282,6 +282,42 @@ class TestSizeMatchingLayout:
 
         assert len(layout.bucket_indices) == 4  # 8 params / (dp_size per round) = 4 rounds
 
+    # -- bucket size as a soft minimum --
+
+    def test_bucket_absorbs_param_that_fits_existing_shard_padding(self):
+        """``bucket_size`` is a soft minimum, so a param filling shard padding is absorbed.
+
+        Six equal params over 4 shards with a threshold that lands mid-row. Closing the
+        bucket the moment the threshold is met would emit a 5-param bucket (one shard
+        holding two params, three holding one) followed by a 1-param bucket, and both
+        pad out to the tallest shard. Absorbing the sixth completes the second row
+        instead, so one bucket covers all six.
+        """
+        dp_size = 4
+        numel = 256
+        params = [_make_param((numel,)) for _ in range(6)]
+        cfg = _make_ddp_config()
+
+        layout = _LWO._compute_per_buffer_param_layout(params, 5 * numel, dp_size, cfg)
+
+        assert len(layout.bucket_indices) == 1
+        # Two rows of 256 per shard: 4 * 512 buffer, of which 6 * 256 is real.
+        total_buffer_numel = layout.bucket_indices[-1][1]
+        assert total_buffer_numel == 2048
+        assert total_buffer_numel - 6 * numel == 512
+
+    def test_bucket_has_no_padding_when_params_pack_evenly(self):
+        """Params that fill every shard exactly leave no padding behind."""
+        dp_size = 4
+        numel = 256
+        params = [_make_param((numel,)) for _ in range(8)]
+        cfg = _make_ddp_config()
+
+        layout = _LWO._compute_per_buffer_param_layout(params, 5 * numel, dp_size, cfg)
+
+        total_buffer_numel = layout.bucket_indices[-1][1]
+        assert total_buffer_numel == 8 * numel
+
     # -- bucket alignment --
 
     def test_bucket_dp_divisible(self):

@@ -26,8 +26,16 @@ jobs:
     if: github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
-        branch: [main, dev, others]
-        contributor_type: [internal, external]
+        include:
+          - branch: main
+            contributor_type: internal
+          - branch: dev
+            contributor_type: internal
+          - branch: others
+            contributor_type: internal
+          # External contributors share one global queue across all target branches.
+          - branch: all
+            contributor_type: external
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -231,8 +239,12 @@ jobs:
               exit(1)
           pending_workflows = waiting_resp.get("workflow_runs", [])
           print("Pending workflows:", len(pending_workflows))
-          pending_workflows = [run for run in pending_workflows
-                              if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+          if CONTRIBUTOR_TYPE == "external":
+              pending_workflows = [run for run in pending_workflows
+                                  if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+          else:
+              pending_workflows = [run for run in pending_workflows
+                                  if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
           # Sort deployments by creation date (oldest first)
           print("Sorting workflows...")
