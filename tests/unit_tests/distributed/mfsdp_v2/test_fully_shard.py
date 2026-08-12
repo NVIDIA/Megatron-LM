@@ -283,16 +283,16 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     # Backward completes each module before recomputing the previous one, so
     # every module-local phase must be cleared after its matching backward.
-    assert model._phase is FsdpModule.Phase.RESTING
-    assert model.fc1._phase is FsdpModule.Phase.RESTING
-    assert model.fc2._phase is FsdpModule.Phase.RESTING
+    assert model.phase is FsdpModule.Phase.RESTING
+    assert model.fc1.phase is FsdpModule.Phase.RESTING
+    assert model.fc2.phase is FsdpModule.Phase.RESTING
 
     # A second forward after backward runs in the forward phase again, so
     # forward-order prefetch resumes and the module phases return to resting.
     model(x).sum().backward()
-    assert model._phase is FsdpModule.Phase.RESTING
-    assert model.fc1._phase is FsdpModule.Phase.RESTING
-    assert model.fc2._phase is FsdpModule.Phase.RESTING
+    assert model.phase is FsdpModule.Phase.RESTING
+    assert model.fc1.phase is FsdpModule.Phase.RESTING
+    assert model.fc2.phase is FsdpModule.Phase.RESTING
 
 
 @pytest.mark.parametrize("set_to_none", [True, False])
@@ -681,8 +681,8 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
 
 
 @pytest.mark.parametrize("strategy", ["zero1", "zero2", "zero3"])
-@pytest.mark.parametrize("use_symm_mem", [False, True], ids=["default", "symmetric_memory"])
-def test_overlaps_communication_and_compute(distributed_setup, strategy, use_symm_mem):
+@pytest.mark.parametrize("use_symmetric_memory", [False, True], ids=["default", "symmetric_memory"])
+def test_overlaps_communication_and_compute(distributed_setup, strategy, use_symmetric_memory):
     """ZeRO-1/2/3 communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -714,7 +714,7 @@ def test_overlaps_communication_and_compute(distributed_setup, strategy, use_sym
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
-    if use_symm_mem:
+    if use_symmetric_memory:
         # Dedicated communicator with NCCL's zero-CTA policy. cta_policy is a
         # per-communicator property, so scoping it to this group leaves the rest of the
         # bucket on default-CTA symmetric-memory kernels (test_symmetric_memory.py asserts
@@ -735,15 +735,9 @@ def test_overlaps_communication_and_compute(distributed_setup, strategy, use_sym
     mesh = DeviceMesh.from_group(dp_group, device.type)
     model = MultiChildModel(dim=dim, num_children=num_children).to(device=device, dtype=dtype)
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(device=device, use_symmetric_memory=use_symmetric_memory) as context:
         for layer in model.layers:
-            fully_shard(
-                layer,
-                mesh=mesh,
-                placements=placements,
-                mixed_precision_policy=policy,
-                use_symm_mem=use_symm_mem,
-            )
+            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
     fully_shard_optimizer(optimizer)
@@ -802,7 +796,7 @@ def test_overlaps_communication_and_compute(distributed_setup, strategy, use_sym
     }
     expected_ag, expected_rs, expected_ag_overlap, expected_rs_overlap = expected[strategy]
 
-    expected_allgather_kernel_count = 0 if use_symm_mem else expected_ag
+    expected_allgather_kernel_count = 0 if use_symmetric_memory else expected_ag
     # Zero-CTA moves the all-gather to copy-engine memcpys, so it should not emit
     # all-gather kernels.
     assert len(allgather_kernels) == expected_allgather_kernel_count, (
@@ -831,7 +825,7 @@ def test_overlaps_communication_and_compute(distributed_setup, strategy, use_sym
         any(events_overlap(kernel, gemm) for gemm in gemm_kernels)
         for kernel in reduce_scatter_kernels
     )
-    if not use_symm_mem:
+    if not use_symmetric_memory:
         assert allgather_overlap_count >= expected_ag_overlap, (
             f"Expected at least {expected_ag_overlap} all-gathers to "
             f"overlap compute, got {allgather_overlap_count}/{len(allgather_kernels)}."

@@ -41,25 +41,9 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from ..uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
-from .module import FsdpModule
+from .parameter_group import cast_model_weights_from_main_weights
 
 __all__ = ["save_checkpoint", "load_checkpoint"]
-
-
-def _cast_model_weight_from_main_weight(model: torch.nn.Module) -> None:
-    """Cast every FSDP group's compute weights from its loaded main weights.
-
-    A load writes into the ``main_weight``-backed sharded DTensors. When mixed precision keeps a
-    separate lower-precision compute buffer, cast it here. The next forward's first microbatch
-    restores its compute placements as part of parameter unsharding.
-
-    Args:
-        model: Root module (or any module tree) containing ``FsdpModule`` instances.
-    """
-    for module in model.modules():
-        if isinstance(module, FsdpModule):
-            for parameter_group in module.parameter_groups:
-                parameter_group.cast_main_weight_to_model_weight()
 
 
 def _init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
@@ -138,4 +122,4 @@ def load_checkpoint(
     set_model_state_dict(model, model_state_dict)
     set_optimizer_state_dict(model, optimizer, optimizer_state_dict)
     if sync_model_weights:
-        _cast_model_weight_from_main_weight(model)
+        cast_model_weights_from_main_weights(model.parameters())

@@ -14,12 +14,13 @@
 
 """Optimizer adapter for the minimal Megatron-FSDP path."""
 
+from itertools import chain
 from typing import Any, NamedTuple
 
 import torch
 from torch import nn
 
-from .parameter_group import get_containing_parameter_group
+from .parameter_group import cast_model_weights_from_main_weights, get_containing_parameter_group
 
 
 def fully_shard_optimizer(
@@ -109,17 +110,9 @@ def fully_shard_optimizer(
             set_grad(parameter, original_grad)
         casted_grads.clear()
 
-        seen_parameter_groups = set()
-        for optimizer_group in hooked_optimizer.param_groups:
-            for parameter in optimizer_group["params"]:
-                parameter_group = get_containing_parameter_group(parameter)
-                if parameter_group is None:
-                    continue
-                if parameter_group in seen_parameter_groups:
-                    continue
-                seen_parameter_groups.add(parameter_group)
-
-                parameter_group.cast_main_weight_to_model_weight()
+        cast_model_weights_from_main_weights(
+            chain.from_iterable(group["params"] for group in hooked_optimizer.param_groups)
+        )
 
     optimizer.register_step_pre_hook(step_pre_hook)
     optimizer.register_step_post_hook(step_post_hook)
