@@ -2178,6 +2178,9 @@ class TextGenerationController:
             chunked_prefill_rows = torch.nonzero(
                 active_request_ids == context.chunked_prefill_request_id, as_tuple=True
             )[0]
+            # Under memory pressure, the next chunk may not be admitted, so the
+            # chunked-prefill request can remain hidden for a step while active decode
+            # requests use overlap. Zero matches is valid; multiple matches are not.
             assert (
                 chunked_prefill_rows.numel() <= 1
             ), "The chunked-prefill request must have at most one active row."
