@@ -100,10 +100,10 @@ def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
         optimizer.step()
         return loss.detach()
 
-    # Warm the data-parallel communicator before capture. This is a no-op for the
-    # default path, but NCCL symmetric-memory window registration can fail when a
-    # rendezvous is the first collective on a communicator, so establish it here.
-    dist.barrier(group=mesh.get_group(0), device_ids=[device.index])
+    if use_symmetric_memory:
+        # NCCL symmetric-memory window registration can fail when a rendezvous is the
+        # first collective on a communicator, so establish it before capture.
+        dist.barrier(group=mesh.get_group(0), device_ids=[device.index])
 
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
