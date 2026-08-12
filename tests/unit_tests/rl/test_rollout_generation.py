@@ -14,12 +14,11 @@ from megatron.rl.agent.api import (
     GroupRolloutParams,
     Rollout,
     RolloutGenerator,
-    RolloutPipeline,
     RolloutRequest,
     TokenRollout,
-    _SubmissionGate,
 )
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
+from megatron.rl.agent.rollout_pipeline import RolloutPipeline, _SubmissionGate
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
 from megatron.rl.inference import InferenceResponse, LLMChatMessage, ReturnsRaw, ReturnsTokens
 
