@@ -49,8 +49,7 @@ triage:linear_write:
       artifacts: true
   allow_failure: true
   script:
-    # Requires a masked, protected NVIDIA_MANAGEMENT_ORG_PAT with read access to
-    # NVIDIA-GitHub-Management/github-audits.
+    # The shared GitHub email lookup reads the existing GH_TOKEN CI variable.
     - |
       ONCALL_ASSIGNEE="$(
         python tests/test_utils/python_scripts/resolve_oncall_assignee.py \

@@ -142,7 +142,6 @@ def test_linear_write_assigns_new_issues_to_scheduled_oncall():
     assert "resolve_oncall_assignee.py" in script
     assert "--schedule-file .github/oncall_schedule.json" in script
     assert '--assignee "${ONCALL_ASSIGNEE}"' in script
-    assert "users_sso.json" not in triage["triage:linear_write"]["artifacts"]["paths"]
 
 
 def test_notification_rules_use_expected_pipeline_sources():

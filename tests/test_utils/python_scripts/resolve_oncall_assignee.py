@@ -4,23 +4,15 @@
 
 import argparse
 import json
-import os
 import sys
-import time
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
-from typing import Callable
-from urllib.parse import urlparse
 
-import requests
+_GITHUB_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / ".github" / "scripts"
+sys.path.insert(0, str(_GITHUB_SCRIPTS_DIR))
 
-GITHUB_API_URL = "https://api.github.com"
-GITHUB_AUDITS_REPOSITORY = "NVIDIA-GitHub-Management/github-audits"
-GITHUB_AUDITS_RELEASE = "v0.1.0"
-SSO_USERS_ASSET = "users_sso.json"
-GITHUB_TOKEN_ENV = "NVIDIA_MANAGEMENT_ORG_PAT"
-REQUEST_TIMEOUT_SECONDS = 30
-REQUEST_ATTEMPTS = 3
-RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+from github_slack_utils import get_user_email  # noqa: E402
 
 
 class AssigneeResolutionError(RuntimeError):
@@ -57,109 +49,23 @@ def current_oncall(schedule: list[dict[str, object]]) -> str:
     return username.strip()
 
 
-def _get_json(
-    http_get: Callable[..., requests.Response], url: str, description: str, **kwargs: object
-) -> object:
-    """Fetch JSON with bounded retries and convert failures to a safe diagnostic."""
+def resolve_nvidia_email(github_login: str) -> str:
+    """Resolve a GitHub login with the repository's shared email lookup helper."""
 
-    for attempt in range(REQUEST_ATTEMPTS):
-        try:
-            response = http_get(url, **kwargs)
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            status = exc.response.status_code if exc.response is not None else None
-            retryable = status is None or status in RETRYABLE_HTTP_STATUSES
-            if retryable and attempt + 1 < REQUEST_ATTEMPTS:
-                time.sleep(2**attempt)
-                continue
-            raise AssigneeResolutionError(f"failed to download {description}: {exc}") from exc
-
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise AssigneeResolutionError(f"{description} is not valid JSON") from exc
-
-    raise AssertionError("request retry loop exited unexpectedly")
-
-
-def download_sso_users(
-    token: str, http_get: Callable[..., requests.Response] = requests.get
-) -> dict[str, object]:
-    """Download the NVIDIA SSO map from the private github-audits release."""
-
-    token = token.strip()
-    if not token or any(character.isspace() for character in token):
-        raise AssigneeResolutionError(f"{GITHUB_TOKEN_ENV} is missing or invalid")
-
-    release_url = (
-        f"{GITHUB_API_URL}/repos/{GITHUB_AUDITS_REPOSITORY}/releases/tags/"
-        f"{GITHUB_AUDITS_RELEASE}"
-    )
-    api_headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    release = _get_json(
-        http_get,
-        release_url,
-        f"{GITHUB_AUDITS_REPOSITORY} release {GITHUB_AUDITS_RELEASE}",
-        headers=api_headers,
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
-    if not isinstance(release, dict) or not isinstance(release.get("assets"), list):
-        raise AssigneeResolutionError("github-audits release metadata has no assets list")
-
-    matching_assets = [
-        asset
-        for asset in release["assets"]
-        if isinstance(asset, dict) and asset.get("name") == SSO_USERS_ASSET
-    ]
-    if len(matching_assets) != 1:
+    # The shared helper reports lookup details on stdout. Suppress those messages
+    # so command substitution receives only the email printed by ``main`` and CI
+    # logs do not repeat email addresses from fallback diagnostics.
+    try:
+        with redirect_stdout(StringIO()):
+            email = get_user_email(github_login)
+    except SystemExit as exc:
         raise AssigneeResolutionError(
-            f"expected one {SSO_USERS_ASSET} asset, found {len(matching_assets)}"
-        )
+            f"could not look up an email for GitHub user {github_login!r}"
+        ) from exc
 
-    asset_url = matching_assets[0].get("url")
-    if not isinstance(asset_url, str):
-        raise AssigneeResolutionError("github-audits returned an invalid release asset URL")
-    parsed_asset_url = urlparse(asset_url)
-    if parsed_asset_url.scheme != "https" or parsed_asset_url.netloc != "api.github.com":
-        raise AssigneeResolutionError("github-audits returned an invalid release asset URL")
-
-    asset_headers = {**api_headers, "Accept": "application/octet-stream"}
-    # requests removes Authorization when GitHub redirects the asset download to
-    # a different host, so the private-repo token is not forwarded to object storage.
-    users = _get_json(
-        http_get,
-        asset_url,
-        SSO_USERS_ASSET,
-        headers=asset_headers,
-        timeout=REQUEST_TIMEOUT_SECONDS,
-        allow_redirects=True,
-    )
-    if not isinstance(users, dict):
-        raise AssigneeResolutionError(f"{SSO_USERS_ASSET} must contain a JSON object")
-    return users
-
-
-def resolve_nvidia_email(users: dict[str, object], github_login: str) -> str:
-    """Resolve a GitHub login to its verified ``nvidia_email`` SSO field."""
-
-    matching_logins = [login for login in users if login.casefold() == github_login.casefold()]
-    if len(matching_logins) != 1:
-        raise AssigneeResolutionError(
-            f"expected one SSO record for GitHub user {github_login!r}, found {len(matching_logins)}"
-        )
-
-    record = users[matching_logins[0]]
-    if not isinstance(record, dict):
-        raise AssigneeResolutionError(f"SSO record for GitHub user {github_login!r} is invalid")
-
-    email = record.get("nvidia_email")
     if not isinstance(email, str):
         raise AssigneeResolutionError(
-            f"SSO record for GitHub user {github_login!r} has no nvidia_email"
+            f"GitHub user {github_login!r} did not resolve to an NVIDIA email"
         )
     email = email.strip()
     local_part, separator, domain = email.rpartition("@")
@@ -171,7 +77,7 @@ def resolve_nvidia_email(users: dict[str, object], github_login: str) -> str:
         or any(character.isspace() for character in email)
     ):
         raise AssigneeResolutionError(
-            f"SSO record for GitHub user {github_login!r} has an invalid NVIDIA email"
+            f"GitHub user {github_login!r} did not resolve to a valid NVIDIA email"
         )
     return email
 
@@ -188,11 +94,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path(".github/oncall_schedule.json"),
         help="path to the dated GitHub on-call schedule",
     )
-    parser.add_argument(
-        "--token-env",
-        default=GITHUB_TOKEN_ENV,
-        help=f"environment variable containing the github-audits token (default: {GITHUB_TOKEN_ENV})",
-    )
     return parser.parse_args(argv)
 
 
@@ -202,8 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         username = current_oncall(load_schedule(args.schedule_file))
-        token = os.environ.get(args.token_env, "")
-        email = resolve_nvidia_email(download_sso_users(token), username)
+        email = resolve_nvidia_email(username)
     except AssigneeResolutionError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
