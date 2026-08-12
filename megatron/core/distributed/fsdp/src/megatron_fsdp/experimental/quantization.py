@@ -12,35 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MXFP8 block quantization kernels for the minimal Megatron-FSDP path.
+"""MXFP8 payload helpers for the minimal Megatron-FSDP path.
 
-Implements MXFP8 E4M3 block-scaled quantization with 32-element blocks and
-one bf16 scale per block (scale = block amax / E4M3 max normal). The encode is
-bit-exact E4M3: 1 sign bit, 4 exponent bits (bias 7), 3 mantissa bits, with
-round-half-to-even and saturation at +/-448. Values below 2**-6 encode as
-subnormals in 2**-9 steps.
+MFSDP v2 rests model weights as TE ``MXFP8Tensor`` primary weights with two
+payload orientations — row-wise (forward GEMM) and column-wise (backward
+GEMM). Quantization itself is delegated to Transformer Engine's verified
+``cast_master_weights_to_fp8`` (``te_cast_master_weights_to_fp8`` +
+``allocate_quantize_temp`` allocate the full-size temporaries TE fills); this
+module only rebinds and detaches the raw uint8 payloads:
 
-Two quantization geometries are provided for model weights, matching
-Transformer Engine's MXFP8 primary weights:
+- ``set_rowwise_payload`` / ``set_columnwise_payload`` bind gathered payload
+  storage onto a TE quantized tensor via TE's ``fp8_set_raw_data``.
+- ``clear_payloads`` detaches a tensor's payloads between unshards (they rest
+  sharded in the group's rowwise/colwise DBuffers otherwise).
 
-- Row-wise: 1x32 blocks along the last dimension (forward GEMM weight).
-- Column-wise: 32x1 blocks along the first dimension (backward GEMM weight).
-  Column-wise scales are global: each rank computes a partial per-block amax
-  over its own rows, the ranks reduce-max, and every rank quantizes its rows
-  with the merged scale grid.
-
-Both payloads are ``(rows, cols)`` row-major uint8 data (TE's
-``_columnwise_data`` has the same shape as ``_rowwise_data``); only the block
-direction and the scale grid differ.
-
-The scale dtype is bf16 rather than E8M0 for simplicity; the E4M3 payload
-format is identical to MXFP8, so the numerics match block-scaled FP8 training
-to within scale precision.
-
-The production path delegates quantization to TE's verified
-``cast_master_weights_to_fp8`` (see ``te_cast_master_weights_to_fp8`` and
-``allocate_quantize_temp``); ``set_*_payload`` / ``clear_payloads`` rebind raw
-payloads through TE's verified ``fp8_set_raw_data``.
+Payloads are ``(rows, cols)`` row-major uint8 data (TE's ``_columnwise_data``
+shares the ``_rowwise_data`` shape); only the block direction and scale grid
+differ between the two orientations.
 """
 
 import torch
