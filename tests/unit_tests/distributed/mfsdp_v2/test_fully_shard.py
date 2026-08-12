@@ -262,16 +262,16 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     # Backward completes each module before recomputing the previous one, so
     # every module-local phase must be cleared after its matching backward.
-    assert model._phase is FsdpModule.Phase.RESTING
-    assert model.fc1._phase is FsdpModule.Phase.RESTING
-    assert model.fc2._phase is FsdpModule.Phase.RESTING
+    assert model.phase is FsdpModule.Phase.RESTING
+    assert model.fc1.phase is FsdpModule.Phase.RESTING
+    assert model.fc2.phase is FsdpModule.Phase.RESTING
 
     # A second forward after backward runs in the forward phase again, so
     # forward-order prefetch resumes and the module phases return to resting.
     model(x).sum().backward()
-    assert model._phase is FsdpModule.Phase.RESTING
-    assert model.fc1._phase is FsdpModule.Phase.RESTING
-    assert model.fc2._phase is FsdpModule.Phase.RESTING
+    assert model.phase is FsdpModule.Phase.RESTING
+    assert model.fc1.phase is FsdpModule.Phase.RESTING
+    assert model.fc2.phase is FsdpModule.Phase.RESTING
 
 
 @pytest.mark.parametrize("set_to_none", [True, False])
