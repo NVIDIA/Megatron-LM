@@ -15,6 +15,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
     fully_shard,
+    fully_shard_context,
     fully_shard_optimizer,
 )
 from megatron.core.enums import ModelType
@@ -100,8 +101,11 @@ def test_pipeline_parallel_schedule_trains_for_two_iterations(
             PipelineStage(hidden_size, config, vp_stage=vp_stage, recompute=recompute).to(device)
             for vp_stage in range(virtual_pipeline_parallel_size or 1)
         ]
-        for model in models:
-            fully_shard(model, mesh=mesh, placements=_flat_placements())
+        # All chunks share one FSDP context, mirroring the training-loop wrap
+        # of a multi-chunk (VPP) model.
+        with fully_shard_context(device=device):
+            for model in models:
+                fully_shard(model, mesh=mesh, placements=_flat_placements())
         optimizer = torch.optim.SGD(
             (parameter for model in models for parameter in model.parameters()), lr=0.05
         )
