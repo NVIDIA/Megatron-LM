@@ -566,9 +566,10 @@ def _fine_grained_pre_forward_hook(submodule: nn.Module, args, kwargs) -> None:
 def _register_fine_grained_backward_hooks(fsdp_module: FsdpModule) -> None:
     """Register pre-backward hooks on every sub-module of *fsdp_module*.
 
-    Uses ``register_multi_grad_hook`` on sub-module output tensors.  When
+    Uses ``register_full_backward_pre_hook`` on each sub-module.  When
     autograd reaches a sub-module during backward, the hook unshards the
-    parent FsdpModule's parameters.
+    parent FsdpModule's parameters before that sub-module's own backward
+    computes its gradients.
     """
     for submodule in fsdp_module.modules():
         if submodule is fsdp_module:
@@ -576,31 +577,21 @@ def _register_fine_grained_backward_hooks(fsdp_module: FsdpModule) -> None:
         target = _find_fsdp_target(submodule)
         if target is not None and target is not fsdp_module:
             continue
-        _create_fine_grained_backward_hook(submodule)
+        submodule.register_full_backward_pre_hook(_fine_grained_pre_backward_hook)
 
 
-def _create_fine_grained_backward_hook(submodule: nn.Module) -> None:
-    """Wrap *submodule* so a pre-backward hook fires via register_multi_grad_hook."""
+def _fine_grained_pre_backward_hook(submodule: nn.Module, grad_output) -> None:
+    """Pre-backward hook for fine-grained sub-modules.
 
-    def _forward_hook(_module, inputs, output):
-        output_list = []
-        if isinstance(output, torch.Tensor):
-            output_list = [output]
-        elif isinstance(output, (tuple, list)):
-            output_list = [t for t in output if isinstance(t, torch.Tensor)]
-
-        def _multi_grad_hook(grads):
-            target = _find_fsdp_target(submodule)
-            if target is None:
-                return
-            target._unshard_parameter_groups()
-            if target._unshard_event is not None:
-                target.context.current_stream().wait_event(target._unshard_event)
-
-        torch.autograd.graph.register_multi_grad_hook(output_list, _multi_grad_hook, mode="any")
-        return output
-
-    submodule.register_forward_hook(_forward_hook)
+    Unshards the parent ``FsdpModule`` before the sub-module's backward runs
+    so its weight-gradient computation sees full parameters.
+    """
+    target = _find_fsdp_target(submodule)
+    if target is None:
+        return
+    target._unshard_parameter_groups()
+    if target._unshard_event is not None:
+        target.context.current_stream().wait_event(target._unshard_event)
 
 
 def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
