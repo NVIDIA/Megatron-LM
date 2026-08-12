@@ -119,6 +119,16 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             model_chunk.zero_grad(set_to_none=set_to_none)
 
+    @torch.no_grad()
+    def step(self):
+        """Step the optimizer, then mark the FSDP execution-trace boundary."""
+        result = super().step()
+        for model_chunk in self.model_chunks:
+            complete_fsdp_trace = getattr(model_chunk, "complete_fsdp_trace", None)
+            if complete_fsdp_trace is not None:
+                complete_fsdp_trace()
+        return result
+
     def _copy_model_grads_to_main_grads(self) -> None:
         """No-op: MFSDP v2 reduces directly into optimizer-visible sharded grads."""
 
