@@ -219,9 +219,12 @@ class FsdpParameterGroup:
             )
         self.fsdp_parameters = tuple(fsdp_parameters)
 
-        # Compute weights must be initialized before the first forward; subsequent
-        # refreshes happen from the FSDP optimizer's post-step hook.
-        self.sync_model_weight_from_main_weight()
+        # Initialize compute weights on the construction stream. Subsequent casts happen
+        # on the all-gather stream so their temporary buffers can be consumed there safely.
+        if self.main_weight is not self.model_weight:
+            self.main_weight.cast(self.model_weight.dtype).redistribute(
+                self.model_weight.placements, out=self.model_weight
+            )
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
 
@@ -255,28 +258,16 @@ class FsdpParameterGroup:
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
-    def sync_model_weight_from_main_weight(self) -> None:
-        """Cast optimizer weights and restore the configured model-weight placements."""
-        self.cast_main_weight_to_model_weight()
-        self.restore_model_weight()
-
     def cast_main_weight_to_model_weight(self) -> None:
         """Cast optimizer weights to the model-weight dtype."""
         context = self.get_context()
         allgather_stream = context.allgather_stream
         allgather_stream.wait_stream(context.current_stream())
         with torch.cuda.stream(allgather_stream):
-            if self.main_weight is self.model_weight:
-                return
-
-            if self.main_weight.placements == self.model_weight.placements:
-                self.main_weight.cast(self.model_weight.dtype, out=self.model_weight)
-                return
-
             self.model_weight = self.main_weight.cast(self.model_weight.dtype)
 
-    def restore_model_weight(self) -> None:
-        """Restore a deferred ZeRO-1 model weight to its compute placements."""
+    def redistribute_model_weight_for_compute(self) -> None:
+        """Redistribute a deferred ZeRO-1 model weight to its compute placements."""
         placements = self._model_weight_placements
         if self.model_weight.placements == placements:
             return
@@ -308,7 +299,7 @@ class FsdpParameterGroup:
         # microbatch sees placements different from the configured model placements
         # and restores the replicated model weight.
         if self.model_weight.placements != self._model_weight_placements:
-            self.restore_model_weight()
+            self.redistribute_model_weight_for_compute()
         with self._symmetric_memory_context():
             self._unsharded_model_weight.reallocate_storage()
         # This buffer backs unsharded Parameters whose views may be saved by autograd.

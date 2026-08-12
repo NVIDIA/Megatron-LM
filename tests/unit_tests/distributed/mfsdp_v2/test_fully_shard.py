@@ -1100,7 +1100,7 @@ def test_meta_parameters_shard_to_mesh_device(distributed_setup):
     # model weights. This simulates load_checkpoint() until
     # https://github.com/NVIDIA/Megatron-LM/pull/6024 lands and syncs after loading.
     for parameter_group in model.parameter_groups:
-        parameter_group.sync_model_weight_from_main_weight()
+        parameter_group.cast_main_weight_to_model_weight()
 
     output = model(torch.ones(1, 4, device=device, dtype=torch.bfloat16))
     torch.testing.assert_close(output, torch.full_like(output, 96.0))

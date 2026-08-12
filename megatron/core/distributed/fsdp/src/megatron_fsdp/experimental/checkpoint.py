@@ -46,13 +46,12 @@ from .module import FsdpModule
 __all__ = ["save_checkpoint", "load_checkpoint"]
 
 
-def _sync_model_weight_from_main_weight(model: torch.nn.Module) -> None:
-    """Refresh every FSDP group's compute weights from its (loaded) main weights.
+def _cast_model_weight_from_main_weight(model: torch.nn.Module) -> None:
+    """Cast every FSDP group's compute weights from its loaded main weights.
 
     A load writes into the ``main_weight``-backed sharded DTensors. When mixed precision keeps a
-    separate lower-precision compute buffer, that buffer is stale until the next forward pre-hook
-    would resync it; doing it here makes the post-load state deterministic. It is a no-op when the
-    compute buffer aliases the main buffer.
+    separate lower-precision compute buffer, cast it here. The next forward's first microbatch
+    restores its compute placements as part of parameter unsharding.
 
     Args:
         model: Root module (or any module tree) containing ``FsdpModule`` instances.
@@ -60,7 +59,7 @@ def _sync_model_weight_from_main_weight(model: torch.nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, FsdpModule):
             for parameter_group in module.parameter_groups:
-                parameter_group.sync_model_weight_from_main_weight()
+                parameter_group.cast_main_weight_to_model_weight()
 
 
 def _init_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
@@ -139,4 +138,4 @@ def load_checkpoint(
     set_model_state_dict(model, model_state_dict)
     set_optimizer_state_dict(model, optimizer, optimizer_state_dict)
     if sync_model_weights:
-        _sync_model_weight_from_main_weight(model)
+        _cast_model_weight_from_main_weight(model)
