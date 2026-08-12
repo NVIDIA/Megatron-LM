@@ -2688,6 +2688,10 @@ class MultiTokenPredictionLayer(MegatronModule):
             roll_depth=roll_depth,
         )
 
+        mtp_dsa_kwargs = {}
+        if mtp_dsa_context is not None:
+            mtp_dsa_kwargs["mtp_dsa_context"] = mtp_dsa_context
+
         if self.config.recompute_granularity == 'full' and self.training:
             checkpoint_outputs = self._checkpointed_forward(
                 hidden_states=hidden_states,
@@ -2704,7 +2708,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
-                mtp_dsa_context=mtp_dsa_context,
+                **mtp_dsa_kwargs,
             )
             if mtp_dsa_context is not None:
                 hidden_states, shared_tensors = checkpoint_outputs
@@ -2727,7 +2731,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
-                mtp_dsa_context=mtp_dsa_context,
+                **mtp_dsa_kwargs,
             )
             if mtp_dsa_context is not None and mtp_dsa_context.is_source:
                 shared_tensors = mtp_dsa_context.require_source_tensors()
