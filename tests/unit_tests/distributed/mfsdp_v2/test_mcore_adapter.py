@@ -224,18 +224,24 @@ class TestMcoreAdapterDense:
             reference_losses.append(torch.stack(microbatch_losses).mean())
 
         losses = []
-        for microbatches in steps:
-            model.zero_grad_buffer()
-            optimizer.zero_grad(set_to_none=True)
-            microbatch_losses = []
-            for batch in microbatches:
-                output = model(hidden_states=batch, attention_mask=None)
-                loss = output.float().square().mean()
-                (loss / len(microbatches)).backward()
-                microbatch_losses.append(loss.detach())
-            success, _, _ = optimizer.step()
-            assert success
-            losses.append(torch.stack(microbatch_losses).mean())
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+            for microbatches in steps:
+                model.zero_grad_buffer()
+                optimizer.zero_grad(set_to_none=True)
+                microbatch_losses = []
+                for batch in microbatches:
+                    output = model(hidden_states=batch, attention_mask=None)
+                    loss = output.float().square().mean()
+                    (loss / len(microbatches)).backward()
+                    microbatch_losses.append(loss.detach())
+                success, _, _ = optimizer.step()
+                assert success
+                losses.append(torch.stack(microbatch_losses).mean())
+
+        if optimizer_cuda_graph:
+            # The first step is eager; capture replays once and every subsequent step replays.
+            graph_launches = sum(event.name == "cudaGraphLaunch" for event in prof.events())
+            assert graph_launches == len(steps) - 1
 
         losses = torch.stack(losses)
         reference_losses = torch.stack(reference_losses)
