@@ -18,8 +18,10 @@ import torch
 
 from examples.mimo.model_providers.radio_encoder import (
     RADIOEncoderWrapper,
+    _pixel_shuffle_dynamic_res,
     radio_vision_encoder_spec,
 )
+from megatron.core.models.multimodal.llava_model import pixel_shuffle
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -71,6 +73,18 @@ def _has_finite_grad(module):
         for p in module.parameters()
         if p.requires_grad
     )
+
+
+def test_dynamic_resolution_pixel_shuffle_uses_shared_spatial_grouping():
+    features = torch.arange(48).reshape(1, 24, 2)
+    imgs_sizes = torch.tensor([[2, 4], [4, 4]], dtype=torch.int32)
+
+    actual = _pixel_shuffle_dynamic_res(features, imgs_sizes, patch_dim=1)
+    expected = torch.cat(
+        [pixel_shuffle(features[:, :8], h=2, w=4), pixel_shuffle(features[:, 8:], h=4, w=4)], dim=-2
+    )
+
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="RADIO encoder forward needs a GPU")

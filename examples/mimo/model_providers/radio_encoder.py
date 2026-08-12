@@ -122,30 +122,16 @@ def _pixel_shuffle_dynamic_res(x, imgs_sizes, patch_dim, scale_factor=0.5, versi
     """Pixel shuffle for dynamic resolution (variable tile sizes).
 
     Splits the packed sequence by per-tile lengths, applies pixel shuffle to each
-    tile, then re-concatenates. Element ordering intentionally differs from core
-    ``pixel_shuffle`` (e2e-validated); do not swap to match it.
+    tile through the shared multimodal implementation, then re-concatenates.
     """
     seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
     splits = torch.split(x, seq_lens.tolist(), dim=-2)
 
     out = []
     for i, sv in enumerate(splits):
-        h = imgs_sizes[i][0] // patch_dim
-        w = imgs_sizes[i][1] // patch_dim
-        sv = sv.reshape(sv.shape[0], h, w, -1)
-
-        n, h, w, c = sv.size()
-        sv = sv.view(n, h, int(w * scale_factor), int(c / scale_factor))
-        sv = sv.permute(0, 2, 1, 3).contiguous()
-        sv = sv.view(
-            n, int(w * scale_factor), int(h * scale_factor), int(c / (scale_factor * scale_factor))
-        )
-
-        if version == 2:
-            sv = sv.permute(0, 2, 1, 3).contiguous()
-
-        sv = sv.reshape(sv.shape[0], -1, sv.shape[-1])
-        out.append(sv)
+        h = int(imgs_sizes[i][0]) // patch_dim
+        w = int(imgs_sizes[i][1]) // patch_dim
+        out.append(pixel_shuffle(sv, scale_factor=scale_factor, version=version, h=h, w=w))
 
     return torch.cat(out, dim=-2)
 
