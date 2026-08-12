@@ -54,6 +54,7 @@ from .utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_parallel_duplicated,
     log_single_rank,
+    safe_get_rank,
     using_tensor_parallel,
 )
 
@@ -837,7 +838,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             # If the bucket is not eligible for fixed pool buffering, or no buffer is available,
             # fall back to dynamic allocation via the backup allocator. This means that we
             # will do dynamic memory allocation.
-            logging.debug(f"[FSDP] Using backup allocator for {bucket_id} {fsdp_unit_id}")
+            logging.debug("[FSDP] Using backup allocator for %s %s", bucket_id, fsdp_unit_id)
             return self.backup_allocator.allocate(
                 bucket_id=bucket_id, size=size, dtype=dtype, device=device
             )
@@ -876,7 +877,9 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             return
         if self.fallback_to_persistent_buffer is False:
             # If not managed by fixed pool allocator, delegate to the backup allocator.
-            logging.debug(f"[FSDP] Free from the backup allocator for {bucket_id} {fsdp_unit_id}")
+            logging.debug(
+                "[FSDP] Free from the backup allocator for %s %s", bucket_id, fsdp_unit_id
+            )
             self.backup_allocator.free(bucket_id)
 
 
@@ -1129,8 +1132,9 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
             # fall back to dynamic allocation via the backup allocator. This means that we
             # will do dynamic memory allocation.
             logging.debug(
-                "[MaxPoolAllocator] Using backup allocator for "
-                f"Bucket ID {bucket_id} in FSDP Unit {fsdp_unit_id}."
+                "[MaxPoolAllocator] Using backup allocator for Bucket ID %s in FSDP Unit %s.",
+                bucket_id,
+                fsdp_unit_id,
             )
             return self.backup_allocator.allocate(
                 bucket_id=bucket_id, size=size, dtype=dtype, device=device
@@ -1172,8 +1176,9 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         if self.fallback_to_persistent_buffer is False:
             # If not persistent, free the storage allocated by the backup allocator.
             logging.debug(
-                "[MaxPoolAllocator] Free backup allocation for "
-                f"Bucket ID {bucket_id} in FSDP Unit {fsdp_unit_id}."
+                "[MaxPoolAllocator] Free backup allocation for Bucket ID %s in FSDP Unit %s.",
+                bucket_id,
+                fsdp_unit_id,
             )
             self.backup_allocator.free(bucket_id)
 
@@ -2256,6 +2261,8 @@ class ParamAndGradBuffer:
 
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters."""
+        if not logger.isEnabledFor(logging.INFO) or safe_get_rank() != 0:
+            return
 
         def _bytes_to_mb(bytes_val: int) -> str:
             return f"{bytes_val / 1_000_000:.2f} MB"
@@ -2301,7 +2308,7 @@ class ParamAndGradBuffer:
             f"Total pad: {_bytes_to_mb(total_padded_bytes)}"
         )
 
-        log_single_rank(logger, logging.INFO, "\n".join(log_lines))
+        logger.info("\n".join(log_lines))
 
     def _resolve_group_grad_dtype(
         self, group: "ParameterGroup", meta_device_init_fp8_params: Dict[str, Tuple[bool, bool]]
@@ -2802,24 +2809,25 @@ class ParamAndGradBuffer:
                 for p in m.parameters(recurse=False):
                     self.param_to_direct_module[p] = (name, m)
 
-            meta_params_numel = 0
-            cuda_params_numel = 0
-            cpu_params_numel = 0
-            for group in self.parameter_groups:
-                for p in group.params:
-                    p_numel = to_local_if_dtensor(p).shape.numel()
-                    if p.is_meta:
-                        meta_params_numel += p_numel
-                    elif p.device.type == "cuda":
-                        cuda_params_numel += p_numel
-                    else:
-                        cpu_params_numel += p_numel
-            log_str = (
-                f"Meta params numel: {meta_params_numel / 1_000_000:.2f} M, "
-                f"CUDA params numel: {cuda_params_numel / 1_000_000:.2f} M, "
-                f"CPU params numel: {cpu_params_numel / 1_000_000:.2f} M"
-            )
-            log_single_rank(logger, logging.INFO, log_str)
+            if logger.isEnabledFor(logging.INFO) and safe_get_rank() == 0:
+                meta_params_numel = 0
+                cuda_params_numel = 0
+                cpu_params_numel = 0
+                for group in self.parameter_groups:
+                    for p in group.params:
+                        p_numel = to_local_if_dtensor(p).shape.numel()
+                        if p.is_meta:
+                            meta_params_numel += p_numel
+                        elif p.device.type == "cuda":
+                            cuda_params_numel += p_numel
+                        else:
+                            cpu_params_numel += p_numel
+                log_str = (
+                    f"Meta params numel: {meta_params_numel / 1_000_000:.2f} M, "
+                    f"CUDA params numel: {cuda_params_numel / 1_000_000:.2f} M, "
+                    f"CPU params numel: {cpu_params_numel / 1_000_000:.2f} M"
+                )
+                logger.info(log_str)
 
         # Initialize the model weight buffer data of each parameter group.
         # Specifically, replace the Torch module's parameter data with tensors
