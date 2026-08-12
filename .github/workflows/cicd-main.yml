@@ -58,6 +58,9 @@ jobs:
         with:
           app-id: ${{ vars.BOT_ID }}
           private-key: ${{ secrets.BOT_KEY }}
+          permission-contents: read
+          permission-members: read
+          permission-metadata: read
 
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -204,6 +207,7 @@ jobs:
         with:
           app-id: ${{ vars.BOT_ID }}
           private-key: ${{ secrets.BOT_KEY }}
+          permission-pull-requests: read
 
       - name: Configure
         id: configure
@@ -1354,6 +1358,7 @@ jobs:
         with:
           app-id: ${{ vars.BOT_ID }}
           private-key: ${{ secrets.BOT_KEY }}
+          permission-statuses: write
 
       - name: Generate fake coverage report
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
@@ -1448,6 +1453,7 @@ jobs:
         with:
           app-id: ${{ vars.BOT_ID }}
           private-key: ${{ secrets.BOT_KEY }}
+          permission-issues: write
 
       - name: Comment on PR with action run URL
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
