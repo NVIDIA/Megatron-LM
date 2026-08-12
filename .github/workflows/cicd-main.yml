@@ -60,7 +60,6 @@ jobs:
           private-key: ${{ secrets.BOT_KEY }}
           permission-contents: read
           permission-members: read
-          permission-metadata: read
 
       - name: Checkout repository
         uses: actions/checkout@v6
