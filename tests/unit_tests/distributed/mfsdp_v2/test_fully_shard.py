@@ -448,6 +448,83 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
     )
 
 
+def test_sharded_grad_dtensor_reuse_across_microbatches(distributed_setup):
+    """Sharded-parameter .grad DTensor shells should be stable across microbatches.
+
+    After the first backward of a step, subsequent microbatches rebind the cached
+    DTensor's local storage instead of building fresh DTensors. Assert the
+    DTensor *object identity* of each sharded parameter's .grad stays the same
+    across microbatches (the CPU-side ``_FromTorchTensor`` cost is eliminated),
+    and that numerical parity with a baseline optimizer is preserved.
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    dim = 8
+    model = MultiChildModel(dim=dim, num_children=2).to(device)
+    baseline = MultiChildModel(dim=dim, num_children=2).to(device)
+    model.load_state_dict(baseline.state_dict())
+    with fully_shard_context(device=device) as context:
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+
+    micro_batch_size = 2
+    num_microbatches = 3
+    # Identical inputs on every rank (same seed as the model), so all ranks see
+    # the same data and the averaged FSDP gradient matches single-rank SGD.
+    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    microbatches = tuple(zip(x.unbind(), target.unbind()))
+
+    sharded_params = [p for p in model.parameters() if getattr(p, "__fsdp_param__", False)]
+    assert sharded_params, "expected sharded parameters in the model"
+
+    def train(model, optimizer):
+        losses = []
+        grad_identities: list[list[int]] = []
+        for _ in range(3):
+            optimizer.zero_grad(set_to_none=True)
+            step_identities = []
+            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+                is_last = microbatch_index == num_microbatches - 1
+                with microbatch(context, is_last=is_last):
+                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                    (loss / num_microbatches).backward()
+                losses.append(loss.detach())
+                step_identities.append(
+                    [id(parameter.grad) for parameter in sharded_params if parameter.grad is not None]
+                )
+            grad_identities.append(step_identities)
+            optimizer.step()
+        return losses, grad_identities
+
+    baseline_losses, _ = train(baseline, baseline_optimizer)
+    sharded_losses, grad_identities = train(model, optimizer)
+
+    torch.testing.assert_close(
+        torch.stack(sharded_losses),
+        torch.stack(baseline_losses),
+        msg="Sharded losses did not match baseline losses with DTensor grad reuse.",
+    )
+
+    # Within each step, the grad DTensor object identity must be stable across
+    # microbatches after the first (the cache rebinds storage in place).
+    for step, step_identities in enumerate(grad_identities):
+        first = step_identities[0]
+        for microbatch_identities in step_identities[1:]:
+            assert microbatch_identities == first, (
+                f"step {step}: sharded grad DTensor identity changed across microbatches "
+                f"(first={first}, later={microbatch_identities})."
+            )
+
+
 def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     """HSDP reduce-scatters DP-inner every microbatch but all-reduces DP-outer once.
 
