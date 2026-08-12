@@ -350,6 +350,12 @@ jobs:
         with:
           version: 0.7.2
 
+      - name: Test yq checksum expansion
+        run: .github/scripts/test_yq_checksums.sh
+
+      - name: Test queue approval topology
+        run: .github/scripts/test_approve_test_queue.sh
+
       - name: Install linting tools
         run: |
           uv sync --locked --only-group linting
