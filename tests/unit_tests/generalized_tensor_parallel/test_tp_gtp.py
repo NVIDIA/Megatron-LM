@@ -17,6 +17,7 @@ Test groups
 4.  TestTPGTPLayerNormLinear      - LayerNormLinear column-parallel smoke test
 5.  TestTPGTPPaddingAlignment     - pre-init pads the per-TP slice for alignment
 6.  TestTPGTPReplicatedBias       - replicated bias and bias-disabled TE placeholder coverage
+7.  TestTPGTPMultimodalPrefetchOrder - vision→embedding→language ordering under per-consume gathers
 
 Tests use (tp_size, gtp_remat_size) = (2, 2) → world_size = 4 (runs on 4-GPU machines).
 
@@ -556,3 +557,77 @@ class TestTPGTPReplicatedBias:
         world_size = tp_size * gtp_remat_size
         _requires_multi_gpu(world_size)
         _run_distributed(_worker_presharded_bias, world_size, tp_size, gtp_remat_size)
+
+
+# ---------------------------------------------------------------------------
+# 7. TestTPGTPMultimodalPrefetchOrder
+# ---------------------------------------------------------------------------
+
+
+def _worker_multimodal_prefetch_order(rank, world_size, port, tp_size, gtp_remat_size):
+    """Vision → embedding → language ordering under per-consume gathers.
+
+    Mirrors the multimodal layout: an embedding-like weight links into the chain in
+    forward (on-demand consume) but never enters the backward prefetch path
+    (GTPEmbeddingWeight.backward reduce-scatters wgrad only). Its neighbours must keep
+    gathering bitwise-correct weights: the vision tail's backward has no producer, so
+    it must fall back to an on-demand gather instead of reading whatever the shared
+    buffer last held.
+    """
+    torch.manual_seed(0)
+    _, gtp_remat_group, _, _ = _build_groups(rank, world_size, tp_size, gtp_remat_size)
+    original_weight_prefetch = GTP_CONFIG.weight_prefetch
+    update_gtp_config(weight_prefetch=True)
+    try:
+        vision = _make_gtp_linear(64, 64, gtp_remat_group)
+        embedding = _make_gtp_linear(64, 64, gtp_remat_group)
+        language = _make_gtp_linear(64, 64, gtp_remat_group)
+        weights = (vision.weight, embedding.weight, language.weight)
+        vision_weight, embedding_weight, language_weight = weights
+
+        # Mirrors VocabParallelEmbedding under GTP: forward gathers on demand (and links
+        # into the chain), backward reduce-scatters wgrad without ever entering
+        # all_gather_and_prefetch_bwd — classify_gtp_chains clears these flags for it.
+        embedding_weight._need_weight_prefetch = False
+        embedding_weight._need_weight_prefetch_bwd = False
+
+        def expected_full(weight):
+            shard = weight.data.clone()
+            gathered = [torch.zeros_like(shard) for _ in range(world_size)]
+            dist.all_gather(gathered, shard, group=gtp_remat_group)
+            return torch.cat(gathered, dim=0)[: weight._unsharded_shape[0]]
+
+        truths = [expected_full(w) for w in weights]
+
+        # First forward links the chain in execution order. There is no segment split:
+        # the embedding sits in the chain like everyone else, and correctness comes from
+        # every consume checking whether a gather was actually issued for it.
+        for w in weights:
+            w.all_gather_and_prefetch()
+        assert vision_weight.next_w is embedding_weight
+        assert embedding_weight.next_w is language_weight
+
+        # Steady-state forward: every consume must see bitwise-correct weights — the
+        # embedding falls back on demand (its producer skips it), language stays on the
+        # prefetched path (the embedding still produces for it).
+        for w, truth in zip(weights, truths):
+            gathered = w.all_gather_and_prefetch()
+            assert torch.equal(gathered, truth)
+
+        # Backward starts at the language tail; the embedding's custom backward never
+        # produces the vision tail's gather, so vision must fall back on demand — with
+        # correct data, not the shared buffer's previous contents.
+        bwd_language = language_weight.all_gather_and_prefetch_bwd()
+        assert torch.equal(bwd_language, truths[2])
+        bwd_vision = vision_weight.all_gather_and_prefetch_bwd()
+        assert torch.equal(bwd_vision, truths[0])
+    finally:
+        update_gtp_config(weight_prefetch=original_weight_prefetch)
+
+
+class TestTPGTPMultimodalPrefetchOrder:
+    @pytest.mark.parametrize("tp_size,gtp_remat_size", [(2, 2)])
+    def test_vision_embedding_language_ordering(self, tp_size, gtp_remat_size):
+        world_size = tp_size * gtp_remat_size
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_multimodal_prefetch_order, world_size, tp_size, gtp_remat_size)
