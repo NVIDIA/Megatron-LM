@@ -90,6 +90,9 @@ class TransformerConfig(ModelParallelConfig):
     mtp_hsm: bool = False
     """Enable uniform per-token Hidden State Mixing for MTP layers."""
 
+    mtp_cp_token_layout: Literal['zigzag', 'contiguous'] = 'zigzag'
+    """Context-parallel token ownership layout used by MTP rolling."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
@@ -1310,6 +1313,12 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        if self.mtp_cp_token_layout not in ('zigzag', 'contiguous'):
+            raise ValueError(
+                "mtp_cp_token_layout must be either 'zigzag' or 'contiguous', "
+                f"got {self.mtp_cp_token_layout!r}."
+            )
 
         # Resolve deprecated attention variant spellings up front so that every consumer
         # downstream only has to handle the canonical names. Imported lazily because the
