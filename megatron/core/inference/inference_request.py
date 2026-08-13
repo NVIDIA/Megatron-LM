@@ -164,6 +164,22 @@ def resolve_multimodal_data_for_engine(
             kwargs[key] = value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
     if "num_img_embeddings_per_tile" in image_data:
         kwargs["num_img_embeddings_per_tile"] = int(image_data["num_img_embeddings_per_tile"])
+
+    # Reject incomplete static-tiling payloads. Static tiling (imgs +
+    # num_tiles, no imgs_sizes) needs num_img_embeddings_per_tile to size the
+    # image-token expansion; without it the engine defaults the count to
+    # zero, has_images silently becomes False, and neither the image-token
+    # expansion nor the vision encoder runs. Fail fast at the wire boundary
+    # instead of returning a text-only completion for what the client thinks
+    # is a multimodal request.
+    has_num_tiles = "num_tiles" in kwargs
+    has_imgs_sizes = "imgs_sizes" in kwargs
+    has_per_tile = kwargs.get("num_img_embeddings_per_tile", 0) > 0
+    if has_num_tiles and not has_imgs_sizes and not has_per_tile:
+        raise ValueError(
+            "Static-tiling image payload requires num_img_embeddings_per_tile > 0 "
+            "when num_tiles is provided without imgs_sizes."
+        )
     return kwargs
 
 
