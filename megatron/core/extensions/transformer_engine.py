@@ -2339,6 +2339,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             if not fp8_checkpoint:
                 return [state] * self.num_gemms
 
+            # Stateless FP8 recipes have no extra state to split.
+            if isinstance(state, torch.Tensor) and state.numel() == 0:
+                return [state] * self.num_gemms
+
             state = self._decode_extra_state(state)
             extra_states = []
             extra_fp8_variables = state["extra_fp8_variables"]
