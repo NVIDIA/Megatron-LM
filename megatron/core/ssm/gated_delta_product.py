@@ -23,7 +23,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
 
 # Decode uses the in-repo Triton conv update, which accepts int64 slot indices.
-from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.packed_seq_helpers import (
     build_packed_seq_idx,
     check_fla_sequence_packing_support,
