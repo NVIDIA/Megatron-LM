@@ -1813,6 +1813,7 @@ def pretrain(
         }
     else:
         checkpointing_context = {}
+    checkpointing_context['config_container'] = cfg_container
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
@@ -2831,7 +2832,12 @@ def setup_model_and_optimizer(
         )
         args.iteration = 1
         save_checkpoint(
-            args.iteration, model, None, None, args.num_floating_point_operations_so_far
+            args.iteration,
+            model,
+            None,
+            None,
+            args.num_floating_point_operations_so_far,
+            checkpointing_context=checkpointing_context,
         )
         torch.distributed.barrier()
         del dense_model_for_upcycling
@@ -2927,6 +2933,12 @@ def setup_model_and_optimizer(
         args.ckpt_format = args.ckpt_convert_format
         args.save = os.path.join(args.ckpt_convert_save, args.ckpt_convert_format)
         update_use_dist_ckpt(args)
+        conversion_checkpointing_context = {}
+        if cfg_container is not None:
+            conversion_config_container = copy.deepcopy(cfg_container)
+            conversion_config_container.checkpoint.ckpt_format = args.ckpt_format
+            conversion_config_container.checkpoint.save = args.save
+            conversion_checkpointing_context['config_container'] = conversion_config_container
 
         save_checkpoint(
             args.iteration,
@@ -2934,6 +2946,7 @@ def setup_model_and_optimizer(
             optimizer,
             opt_param_scheduler,
             args.num_floating_point_operations_so_far,
+            checkpointing_context=conversion_checkpointing_context,
             preprocess_common_state_dict_fn=preprocess_common_state_dict,
         )
 
