@@ -319,7 +319,9 @@ class RolloutPipeline:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _submit_group(self, *, group_id: int, batch_id: int, index_in_batch: int) -> None:
+    async def _submit_group_to_infer_queue(
+        self, *, group_id: int, batch_id: int, index_in_batch: int
+    ) -> None:
         """Enqueue one group's inference items, acquiring per-rollout gate slots.
 
         The group's "G" submission slot is the caller's concern: stage_prepare
@@ -365,7 +367,7 @@ class RolloutPipeline:
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
                     await self.gate.acquire_for("G")
                     self._groups_in_flight += 1
-                    await self._submit_group(
+                    await self._submit_group_to_infer_queue(
                         group_id=group_id, batch_id=batch_id, index_in_batch=index_in_batch
                     )
                     group_id += 1
@@ -470,7 +472,7 @@ class RolloutPipeline:
                     # G/B gate slots free on consumption, which a dropped group
                     # never reaches: like its in-flight count, its slot carries
                     # over to the replacement (no release here, no fresh "G"
-                    # acquire in _submit_group) and frees when the replacement
+                    # acquire in _submit_group_to_infer_queue) and frees when the replacement
                     # is ultimately consumed. Releasing here and re-acquiring
                     # instead could deadlock: with the gate fully held, the
                     # freed slot can be won by stage_prepare's FIFO-earlier
@@ -504,15 +506,14 @@ class RolloutPipeline:
     async def _regenerate_group(self, dropped: RolloutGroup) -> None:
         """Resubmit a replacement group for a dropped group's batch slot.
 
-        The replacement inherits the dropped group's submission-gate slot and
-        in-flight count, so no "G" slot is acquired here. _submit_group still
-        acquires "R" slots: the replacement's rollouts are new engine work, and
-        R slots free on inference completion, never on consumption, so waiting
-        for one cannot deadlock against the consumer.
+        The replacement inherits the dropped group's submission-gate slot and in-flight count,
+        so no "G" slot is acquired here. _submit_group_to_infer_queue still acquires "R" slots:
+        the replacement's rollouts are new engine work, and R slots free on inference completion,
+        never on consumption, so waiting for one cannot deadlock against the consumer.
         """
         group_id = self._next_regen_group_id
         self._next_regen_group_id -= 1
-        await self._submit_group(
+        await self._submit_group_to_infer_queue(
             group_id=group_id, batch_id=dropped.batch_id, index_in_batch=dropped.index_in_batch
         )
 
