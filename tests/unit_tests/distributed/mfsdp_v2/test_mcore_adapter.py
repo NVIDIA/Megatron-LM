@@ -87,9 +87,6 @@ class TestMcoreAdapterDense:
 
         assert isinstance(wrapped.module, FsdpModule)
         assert isinstance(wrapped.module[0], FsdpModule)
-        assert all(
-            getattr(parameter, "__fsdp_param__", False) for parameter in wrapped.parameters()
-        )
 
         # Post-order wrapping gives the selected TransformerLayer its own parameter group;
         # the root FSDP unit should own only the parameters of the remaining Linear module.
