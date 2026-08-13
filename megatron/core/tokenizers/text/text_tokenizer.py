@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import awkward as ak
+
 from collections import OrderedDict
 from typing import Dict, List, Optional, Union
 
@@ -145,6 +147,26 @@ class MegatronTokenizerText(MegatronTokenizerBase):
             )
         else:
             raise NotImplementedError("This method is supported only for SFTTokenizer.")
+
+    def tokenize_files(paths: str | list[str], field: str = "text") -> ak.Array:
+        """
+        Tokenizes whole jsonl files using gigatoken. Only supported for `huggingface` and `megatron` libraries.
+
+        Args:
+            paths (str | list[str]): path to the jsonl file(s).
+            field (str): field name to extract text from jsonl file(s).
+        Returns:
+            ak.Array: an array of tokenized documents.
+        """
+
+        if self.library in ["huggingface", "megatron"]:
+            if isinstance(paths, str):
+                paths = [paths]
+            return self._tokenzier.encode_files(paths, field=field)
+        else:
+            raise NotImplementedError(
+                "This method is supported only for `huggingface` and `megatron` libraries."
+            )
 
     def save_pretrained(self, path: str) -> None:
         """

@@ -101,26 +101,15 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                 f'for {tokenizer_path}. Exception: {e}'
             )
         
-        # this logic deals with different huggingface tokenizers having different args
-        if use_gigatoken:
-            # restore tokenizer with gigatoken
-            if HAVE_GIGATOKEN:
-                self.tokenizer = gt.Tokenizer(self.tokenizer).as_hf()
-            else:
-                raise ModuleNotFoundError(
-                    "gigatoken library is not installed. "
-                    "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
-                )
-
         # Store the tokenizer's existing chat template if the user does not provide
         # a custom chat template. Otherwise, override the default chat template with
         # the user-provided template.
-        if not fast_tokenizer:
-            if chat_template is None:
-                chat_template = self.tokenizer.chat_template
-            else:
-                self.tokenizer.chat_template = chat_template
+        if chat_template is None:
+            chat_template = self.tokenizer.chat_template
+        else:
+            self.tokenizer.chat_template = chat_template
 
+        self.use_gigatoken = use_gigatoken
         self.include_special_tokens = include_special_tokens
         self.original_vocab_size = len(self.tokenizer)
         self.eos_token = eos_token
@@ -199,12 +188,23 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                 f'{new_tokens_in_vocab} \n will be added to the vocabulary.\n'
                 f'Please resize your model accordingly.',
             )
-        if not fast_tokenizer:
-            self.add_special_tokens(special_tokens_dict)
+        self.add_special_tokens(special_tokens_dict)
         self.space_sensitive = self.text_to_tokens('x y') != self.text_to_tokens(
             'x'
         ) + self.text_to_tokens('y')
         self._inv_vocab_dict = {}
+
+        if self.use_gigatoken:
+            # restore tokenizer with gigatoken
+            if HAVE_GIGATOKEN:
+                logger.info(f"Restoring {tokenizer_path} tokenizer with gigatoken.")
+                self.tokenizer = gt.Tokenizer(self.tokenizer).as_hf()
+            else:
+                raise ModuleNotFoundError(
+                    "gigatoken library is not installed. "
+                    "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
+                )
+
 
     def add_special_tokens(self, special_tokens_dict: dict) -> int:
         """
@@ -310,6 +310,18 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         return self.tokenizer.apply_chat_template(
             conversation=conversation, chat_template=chat_template, **kwargs
         )
+
+    def encode_files(paths: list[str], field: str = "text") -> ak.Array:
+        if self.use_gigatoken:
+            return self.tokenizer.tokenizer.encode_files(
+                gt.JsonlFileSource(paths, field="text"),
+                parallel=True,
+            )
+        else:
+            raise NotImplementedError(
+                "This method is supported only for gigatoken tokenizers. "
+                "Please, set `use_gigatoken=True`."
+            )
 
     @property
     def vocab(self) -> list:
