@@ -57,6 +57,31 @@ class TestCudaGraphBucket64Floor:
                 f"(num_cuda_graphs={num_cuda_graphs})"
             )
 
+    def test_non_multiple_max_requests_keeps_largest_decode_bucket(self):
+        # Regression: the floor must PAD buckets, not invalidate them. With
+        # max_requests=100 (not a 64-multiple), the largest decode bucket must
+        # survive with its request budget intact and an aligned token count.
+        with set_batch_invariant_mode(True, backend="triton"):
+            dims, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+                tp_size=1,
+                num_cuda_graphs=16,
+                cuda_graph_max_tokens=2048,
+                cuda_graph_mixed_prefill_request_count=None,
+                max_requests=100,
+                max_tokens=2048,
+                max_sequence_length=4096,
+                use_cuda_graphs_for_non_decode_steps=False,
+            )
+        decode_dims = [d for d in dims if d.prefill_req_count == 0 and d.decode_req_count > 0]
+        assert decode_dims, "no decode buckets survived"
+        largest = max(decode_dims, key=lambda d: d.decode_req_count)
+        assert (
+            largest.decode_req_count == 100
+        ), f"largest decode bucket lost its request budget: {largest}"
+        assert (
+            largest.token_count % 64 == 0 and largest.token_count >= 128
+        ), f"largest decode bucket not aligned/padded: {largest}"
+
     def test_auto_sizing_injects_small_buckets_without_bi(self):
         # Guard for the non-BI behavior this floor exists to counteract: the
         # auto (-1) ladder includes 1/2-token buckets when BI mode is off.
@@ -270,9 +295,20 @@ class TestTeNativeBackend:
         )
 
         try:
+            import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm_mod
+
+            ws_fn_before = te_gemm_mod.get_cublas_workspace_size_bytes
+            have_te = True
+        except ImportError:
+            have_te = False
+        env_before = os.environ.get("CUBLASLT_WORKSPACE_SIZE")
+        try:
             enable_batch_invariant_mode("te_native")
             assert is_batch_invariant_mode_enabled()
             assert get_batch_invariant_backend() == "te_native"
+            assert os.environ.get("CUBLASLT_WORKSPACE_SIZE") == "0"
+            if have_te:
+                assert te_gemm_mod.get_cublas_workspace_size_bytes() == 1024
             # te_native must NOT reroute aten::mm — native kernels stay
             a = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
             b = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
@@ -280,3 +316,8 @@ class TestTeNativeBackend:
         finally:
             disable_batch_invariant_mode()
         assert not is_batch_invariant_mode_enabled()
+        # the workspace patch and env pin must be fully restored (no leak
+        # into subsequent non-BI work in the same process)
+        if have_te:
+            assert te_gemm_mod.get_cublas_workspace_size_bytes is ws_fn_before
+        assert os.environ.get("CUBLASLT_WORKSPACE_SIZE") == env_before

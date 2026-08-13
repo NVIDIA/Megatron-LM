@@ -205,8 +205,8 @@ class InferenceBatchDimensions:
         return adjusted_batch_dim
 
 
-def _batch_invariant_token_floor(token_count: int) -> int:
-    """Floor a CUDA-graph bucket token count to a 64-multiple (min 64).
+def _batch_invariant_token_align(token_count: int) -> int:
+    """Round a CUDA-graph bucket token count UP to a 64-multiple (min 64).
 
     Under batch-invariant mode every graphed step must execute norms/GEMMs in
     the same M-alignment class as eager steps: TE rmsnorm (and other
@@ -304,9 +304,9 @@ class CUDAGraphBatchDimensionBuilder:
         rounder = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
         if _batch_invariant_mode_enabled():
             # Batch-invariant mode: 64-multiple token ladder (see
-            # _batch_invariant_token_floor).
+            # _batch_invariant_token_align).
             rounder = 64
-            cuda_graph_max_tokens = _batch_invariant_token_floor(cuda_graph_max_tokens)
+            cuda_graph_max_tokens = _batch_invariant_token_align(cuda_graph_max_tokens)
 
         # Cuda graph step size.
         cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
@@ -373,8 +373,8 @@ class CUDAGraphBatchDimensionBuilder:
             )
             if _batch_invariant_mode_enabled():
                 # Batch-invariant mode: floor every bucket to a 64-multiple
-                # (see _batch_invariant_token_floor) and dedupe collisions.
-                sizes = [_batch_invariant_token_floor(s) for s in sizes]
+                # (see _batch_invariant_token_align) and dedupe collisions.
+                sizes = [_batch_invariant_token_align(s) for s in sizes]
             # TP-align and dedupe in order; preserve original ordering for parity.
             sizes = list(dict.fromkeys(round_up_to_nearest_multiple(s, tp_size) for s in sizes))
             sizes = [s for s in sizes if s <= cuda_graph_max_tokens]
@@ -463,13 +463,21 @@ class CUDAGraphBatchDimensionBuilder:
 
         def add_if_valid(token_count: int, prefill_req_count: int, decode_req_count: int) -> None:
             """Helper to create and append batch dimension to list only if it's valid."""
-            if _batch_invariant_mode_enabled():
-                # Batch-invariant mode: floor EVERY bucket's token count to a
-                # 64-multiple (see _batch_invariant_token_floor); the flooring
-                # can collide previously-distinct buckets, so skip duplicates.
-                token_count = _batch_invariant_token_floor(token_count)
             batch_dim = InferenceBatchDimensions(token_count, prefill_req_count, decode_req_count)
             if batch_dim.is_valid(max_requests, max_sequence_length, num_speculative_tokens):
+                if _batch_invariant_mode_enabled():
+                    # Batch-invariant mode: floor the bucket's token count to a
+                    # 64-multiple (see _batch_invariant_token_align). The floor
+                    # is alignment PADDING, mirroring the eager path's
+                    # TOKEN_ROUNDER (which already yields token counts above
+                    # what the requests produce), so validity is judged on the
+                    # unpadded dims; request counts are untouched. Flooring can
+                    # collide previously-distinct buckets, so skip duplicates.
+                    batch_dim = InferenceBatchDimensions(
+                        _batch_invariant_token_align(token_count),
+                        prefill_req_count,
+                        decode_req_count,
+                    )
                 if batch_dim not in cuda_graph_batch_dimensions_list:
                     cuda_graph_batch_dimensions_list.append(batch_dim)
 
