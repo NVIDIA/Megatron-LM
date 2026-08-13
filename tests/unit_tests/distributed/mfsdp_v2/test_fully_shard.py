@@ -594,7 +594,20 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     )
 
 
-@pytest.mark.parametrize("use_symmetric_memory", [False, True], ids=["default", "symmetric_memory"])
+@pytest.mark.parametrize(
+    "use_symmetric_memory",
+    [
+        # Both variants' all-gathers are launch-timing sensitive, but default-CTA
+        # kernels occupy more compute CTAs, making the profiler overlap count less
+        # stable across ranks (see
+        # https://github.com/NVIDIA/Megatron-LM/actions/runs/31615942188).
+        # The symmetric-memory variant uses zero-CTA all-gather kernels, so its overlap
+        # measurement is more stable and remains enabled.
+        pytest.param(False, marks=(pytest.mark.flaky, pytest.mark.flaky_in_dev)),
+        pytest.param(True),
+    ],
+    ids=["default", "symmetric_memory"],
+)
 def test_overlaps_communication_and_compute(distributed_setup, use_symmetric_memory):
     """Forward and backward communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
