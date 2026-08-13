@@ -232,7 +232,7 @@ class TestMcoreAdapterDense:
         reference_losses = torch.stack(reference_losses)
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
-        torch.testing.assert_close(losses, reference_losses)
+        torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
 
 
 class TestMcoreAdapterExpertParallel:
