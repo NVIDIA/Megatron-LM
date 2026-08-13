@@ -245,7 +245,7 @@ class FsdpParameterGroup:
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
 
-    def get_context(self) -> "FsdpContext":
+    def _get_context(self) -> "FsdpContext":
         """Return the finalized runtime context that owns this parameter group."""
         owning_module = self._owning_module()
         if owning_module is None:
