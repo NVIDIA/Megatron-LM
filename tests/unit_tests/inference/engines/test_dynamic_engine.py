@@ -1171,6 +1171,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             max_prompt_length=8,
             num_cuda_graphs=1,
             context_max_requests=4,
+            max_sequence_length=512,
         )
         env = self._build_test_env(test_config)
         context = env.engine.context
@@ -1180,8 +1181,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         self._run_step(env)  # decode: graphed, one real row
 
         assert context.using_cuda_graph_this_step()
-        # An 8-token prompt holds a handful of pages of the 512-token budget,
-        # so the real row genuinely has an unallocated tail to pin.
+        # The 512-token budget spans two 256-token pages. 8-token prompt allocates only the first.
+        # So the real row genuinely has an unallocated tail to pin.
         block_count = int(context.request_kv_block_counts[0].item())
         staged_row = context._cpu_mha_block_table[0]
         assert 0 < block_count < staged_row.numel()
