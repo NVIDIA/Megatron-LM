@@ -464,7 +464,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         if not self.pre_process:
             # See set_input_tensor().
-            hidden_states = self.input_tensor
+            if not (
+                self.training
+                and getattr(self, 'cuda_graph_training_iteration', True)
+                and self.config.cuda_graph_impl == "local"
+                and getattr(self.config, 'cuda_graph_granularity', 'layer') == "chunk"
+                and hidden_states is not None
+            ):
+                hidden_states = self.input_tensor
 
         # Make the input viewless. This is usually redundant — embedding outputs and
         # p2p_communication.py both produce viewless tensors — but make_viewless_tensor()
@@ -750,14 +757,42 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
+    def _prepare_pipeline_input_for_chunk_cuda_graph(self, args, kwargs):
+        """Use the real PP input tensor before local chunk graph manager sees inputs."""
+        kwargs = kwargs.copy()
+        if self.pre_process:
+            return args, kwargs
+
+        hidden_states = self.input_tensor
+        assert hidden_states is not None, (
+            "Chunk-wise CUDA graph on a non-pre-process PP stage requires "
+            "TransformerBlock.input_tensor to be set before replay/capture."
+        )
+        if args:
+            args = list(args)
+            args[0] = hidden_states
+            args = tuple(args)
+        else:
+            kwargs['hidden_states'] = hidden_states
+        return args, kwargs
+
     def _should_call_local_cudagraph(self, *args, **kwargs):
         """
         Check if we should call the local cudagraph path.
         """
         if (
+            self.training
+            and getattr(self, 'cuda_graph_training_iteration', True)
+            and self.config.cuda_graph_impl == "local"
+            and getattr(self.config, 'cuda_graph_granularity', 'layer') == "chunk"
+            and hasattr(self, 'cudagraph_manager')
+        ):
+            return True
+
+        if (
             InferenceMode.is_active()
             and hasattr(self, 'cudagraph_manager')
-            and kwargs['attention_mask'] is None
+            and kwargs.get('attention_mask') is None
             and (
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
@@ -773,8 +808,72 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 return True
         return False
 
+    def _get_local_chunk_cuda_graph_cache_key(self):
+        """Return a stable runner key for local chunk CUDA graphs under PP."""
+        if not (
+            self.training
+            and self.config.cuda_graph_impl == "local"
+            and getattr(self.config, 'cuda_graph_granularity', 'layer') == "chunk"
+            and hasattr(self, 'cudagraph_manager')
+            and not getattr(self.cudagraph_manager, 'reuse_cudagraphs', False)
+        ):
+            return None
+
+        slot = getattr(self, 'cuda_graph_forward_slot', None)
+        if slot is None and getattr(self.config, 'cuda_graph_dynamic_microbatches', False):
+            raise AssertionError(
+                "Dynamic local chunk CUDA graph requires an active runtime slot before forward."
+            )
+        if slot is None:
+            slot = getattr(self, 'current_microbatch', None)
+        if slot is None:
+            return None
+        cache_key = ("chunk", int(slot))
+        if self.config.moe_paged_stash and not (
+            self.config.cuda_graph_dynamic_microbatches
+            and self.config.cuda_graph_impl == "local"
+            and self.config.cuda_graph_granularity == "chunk"
+        ):
+            microbatch = getattr(self, 'current_microbatch', None)
+            assert (
+                microbatch is not None
+            ), "Paged-stash chunk CUDA graph requires the current microbatch id."
+            runner_signature = getattr(self, 'cuda_graph_runner_signature', None)
+            assert (
+                runner_signature is not None
+            ), "Paged-stash chunk CUDA graph requires a schedule-derived runner signature."
+            # PagedTensor queues are keyed by the absolute PP schedule. Keep one logical runner
+            # per microbatch so ordered capture reproduces every stash/reload transition, while
+            # CudaGraphManager shares physical storage across runners assigned to the same slot.
+            cache_key += (int(microbatch), runner_signature)
+        return cache_key
+
+    @staticmethod
+    def _make_local_chunk_output_pipeline_safe(output):
+        """Return graph outputs through fresh viewless tensor objects for PP schedules."""
+
+        def make_output_viewless(out):
+            if torch.is_tensor(out):
+                out = torch.as_strided(out, out.size(), out.stride(), out.storage_offset())
+                return make_viewless_tensor(
+                    inp=out, requires_grad=out.requires_grad, keep_graph=True
+                )
+            return out
+
+        if isinstance(output, tuple):
+            return tuple(make_output_viewless(out) for out in output)
+        return make_output_viewless(output)
+
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
+            if self.training:
+                args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
+                output = self.cudagraph_manager(
+                    self, args, kwargs, cache_key=self._get_local_chunk_cuda_graph_cache_key()
+                )
+                if isinstance(output, tuple) and len(output) == 1:
+                    output = output[0]
+                return self._make_local_chunk_output_pipeline_safe(output)
             kwargs['hidden_states'] = (
                 kwargs['hidden_states'].unwrap()
                 if isinstance(kwargs['hidden_states'], WrappedTensor)
@@ -826,7 +925,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
-        attention_mask: Optional[Tensor],
+        attention_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,

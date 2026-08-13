@@ -160,6 +160,8 @@ def paged_stash_pop_kernel(
     PAGE_SIZE: tl.constexpr,
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    MAX_NUM_TOKENS: tl.constexpr,
+    ZERO_PADDED_TOKENS: tl.constexpr,
 ):
     """Restore variable-length MoE activations from a paged buffer (CUDA, or pinned host).
 
@@ -172,7 +174,8 @@ def paged_stash_pop_kernel(
         2. Read spilled_to_host from the matching stash: CUDA buffer by default, host
            buffer when the forward stash spilled to pinned memory.
         3. Copy tokens in parallel: look up page_id from page_record, read hidden
-           vectors from the stash pages into dst, return each page_id to the freelist.
+           vectors from the stash pages into dst, optionally zero the static-shape tail,
+           and return each page_id to the freelist.
         4. Program 0 writes updated freelist tails for the caller to copy_ back.
     """
     pid = tl.program_id(axis=0)
@@ -222,35 +225,42 @@ def paged_stash_pop_kernel(
         new_tail_host = tail_host + required_pages
 
     token_idx = pid
-    while token_idx < num_tokens:
-        page_slot = token_idx // PAGE_SIZE
-        token_in_page = token_idx % PAGE_SIZE
-        page_id = tl.load(page_record_ptr + page_slot)
-        src_token_idx = page_id * PAGE_SIZE + token_in_page
-
+    loop_num_tokens = MAX_NUM_TOKENS if ZERO_PADDED_TOKENS else num_tokens
+    while token_idx < loop_num_tokens:
         elements_per_thread = HIDDEN_SIZE // BLOCK_SIZE
         need_mask = (HIDDEN_SIZE % BLOCK_SIZE) != 0
         num_iters = elements_per_thread + (1 if need_mask else 0)
-        src_token_idx_i64 = src_token_idx.to(tl.int64)
         token_idx_i64 = token_idx.to(tl.int64)
-        src_base = src_ptr + src_token_idx_i64 * HIDDEN_SIZE
         dst_base = dst_ptr + token_idx_i64 * HIDDEN_SIZE
 
-        if need_mask:
+        if token_idx < num_tokens:
+            page_slot = token_idx // PAGE_SIZE
+            token_in_page = token_idx % PAGE_SIZE
+            page_id = tl.load(page_record_ptr + page_slot)
+            src_token_idx = page_id * PAGE_SIZE + token_in_page
+            src_token_idx_i64 = src_token_idx.to(tl.int64)
+            src_base = src_ptr + src_token_idx_i64 * HIDDEN_SIZE
+
+            if need_mask:
+                for iter in range(num_iters):
+                    hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
+                    hidden_mask = hidden_offsets < HIDDEN_SIZE
+                    data = tl.load(src_base + hidden_offsets, mask=hidden_mask, other=0)
+                    tl.store(dst_base + hidden_offsets, data, mask=hidden_mask)
+            else:
+                for iter in range(elements_per_thread):
+                    hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
+                    data = tl.load(src_base + hidden_offsets)
+                    tl.store(dst_base + hidden_offsets, data)
+
+            if token_in_page == 0:
+                write_idx = (tail + page_slot) % cap
+                tl.store(free_list_ptr + write_idx, page_id)
+        else:
             for iter in range(num_iters):
                 hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
                 hidden_mask = hidden_offsets < HIDDEN_SIZE
-                data = tl.load(src_base + hidden_offsets, mask=hidden_mask, other=0)
-                tl.store(dst_base + hidden_offsets, data, mask=hidden_mask)
-        else:
-            for iter in range(elements_per_thread):
-                hidden_offsets = tl.arange(0, BLOCK_SIZE) + iter * BLOCK_SIZE
-                data = tl.load(src_base + hidden_offsets)
-                tl.store(dst_base + hidden_offsets, data)
-
-        if token_in_page == 0:
-            write_idx = (tail + page_slot) % cap
-            tl.store(free_list_ptr + write_idx, page_id)
+                tl.store(dst_base + hidden_offsets, 0.0, mask=hidden_mask)
         token_idx += num_blocks
 
     if pid == 0:

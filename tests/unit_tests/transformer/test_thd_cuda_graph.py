@@ -8,17 +8,17 @@ Padding helpers and dataclass round-trip (any GPU count, fast):
         tests/unit_tests/transformer/test_thd_cuda_graph.py \
         -k "Pad or Decompose"
 
-End-to-end no-graph vs graph bitwise loss/grad_norm match for
+End-to-end no-graph vs graph bitwise loss/aux-loss/grad_norm match for
 Moonlight-16B and Qwen3-8B with TP2_CP2_PP2 + sequence packing
-(requires 8 GPUs, slow ~5 min per run, 4 runs total). Moonlight covers
-MoE router/preprocess graph capture with router fusion; Qwen3 is dense and
-covers attention graph capture:
+(requires 8 GPUs). Moonlight covers MoE router/preprocess graph capture
+with router fusion; Qwen3 covers partial attention graphs; Moonlight also
+covers local full-chunk graphs:
     pytest -xvs tests/unit_tests/transformer/test_thd_cuda_graph.py::TestE2EBitwise
+    pytest -xvs tests/unit_tests/transformer/test_thd_cuda_graph.py::TestLocalChunkE2EBitwise
 
-The E2E test directly subprocesses `torchrun pretrain_gpt.py` -- the same
-command exercised by test_moonlight_qwen3_bitwise.sh -- with both
-cuda_graph_impl=none and cuda_graph_impl=transformer_engine, then compares
-the per-iteration loss / grad_norm lines. They must be exactly equal.
+The E2E tests directly subprocess `torchrun pretrain_gpt.py` with
+cuda_graph_impl=none and either transformer_engine or local, then compare the
+per-iteration loss / aux-loss / grad_norm fields. They must be exactly equal.
 """
 
 import os
@@ -40,6 +40,7 @@ from megatron.core.packed_seq_params import (
     resolve_thd_tail_padding_policy,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
@@ -1071,9 +1072,8 @@ class TestDynamicMicrobatchSlots:
 
 # =============================================================================
 # 3. E2E no-graph vs graph bitwise loss/grad_norm match
-#    Subprocess-launches `torchrun pretrain_gpt.py` -- same recipe as
-#    test_moonlight_qwen3_bitwise.sh -- and asserts the per-iteration
-#    metric strings are byte-identical between the two runs.
+#    Subprocess-launches `torchrun pretrain_gpt.py` and asserts the
+#    per-iteration metric strings are byte-identical between the two runs.
 # =============================================================================
 
 # Common args shared across both models.
@@ -1103,6 +1103,8 @@ _COMMON_ARGS = [
     "--global-batch-size",
     "64",
     "--train-iters",
+    str(_TRAIN_ITERS),
+    "--exit-interval",
     str(_TRAIN_ITERS),
     "--lr",
     "1e-5",
@@ -1227,6 +1229,8 @@ _MOONLIGHT_ARGS = _COMMON_ARGS + [
     "flex",
     "--moe-flex-dispatcher-backend",
     "hybridep",
+    "--moe-router-dtype",
+    "fp32",
     "--moe-router-fusion",
     "--moe-router-score-function",
     "sigmoid",
@@ -1284,6 +1288,21 @@ _ATTN_CUDA_GRAPH_ARGS = [
 ]
 
 _MOE_CUDA_GRAPH_ARGS = _ATTN_CUDA_GRAPH_ARGS + ["moe_preprocess", "moe_router"]
+
+_LOCAL_CHUNK_CUDA_GRAPH_ARGS = [
+    "--cuda-graph-impl",
+    "local",
+    "--cuda-graph-granularity",
+    "chunk",
+    "--cuda-graph-dynamic-microbatches",
+]
+
+_LOCAL_CHUNK_MOONLIGHT_ARGS = _MOONLIGHT_ARGS + [
+    "--use-distributed-optimizer",
+    "--moe-expert-capacity-factor",
+    "1.0",
+    "--moe-pad-expert-input-to-capacity",
+]
 
 
 def _get_available_port(preferred):
@@ -1368,12 +1387,71 @@ def _extract_metrics(stdout):
         lr = re.search(r"learning rate:\s*(\S+)", window)
         lm_loss = re.search(r"lm loss:\s*(\S+)", window)
         grad_norm = re.search(r"grad norm:\s*(\S+)", window)
+        lb_loss = re.search(r"load_balancing_loss:\s*(\S+)", window)
         if not (lr and lm_loss and grad_norm):
             continue
         parts = [f"iter={m.group(1)}", f"lr={lr.group(1)}", f"lm_loss={lm_loss.group(1)}"]
+        if lb_loss:
+            parts.append(f"lb_loss={lb_loss.group(1)}")
         parts.append(f"grad_norm={grad_norm.group(1)}")
         results.append(" | ".join(parts))
     return results
+
+
+def _assert_no_graph_vs_graph(model_name, model_args, cuda_graph_args, base_port):
+    """Run an eager/graph pair and require bitwise-identical training metrics."""
+    eager = _run_pretrain(model_args, cuda_graph_args=[], master_port=base_port)
+    assert eager.returncode == 0, (
+        f"[{model_name}] noGraph pretrain failed (rc={eager.returncode})\n"
+        f"--- stdout (tail) ---\n{eager.stdout[-4000:]}\n"
+        f"--- stderr (tail) ---\n{eager.stderr[-2000:]}"
+    )
+    metrics_eager = _extract_metrics(eager.stdout)
+    assert len(metrics_eager) == _TRAIN_ITERS, (
+        f"[{model_name}] noGraph: expected {_TRAIN_ITERS} metric lines, "
+        f"got {len(metrics_eager)}\n"
+        f"--- stdout (tail) ---\n{eager.stdout[-2000:]}"
+    )
+    if model_name.startswith("moonlight"):
+        assert all("lb_loss=" in metric for metric in metrics_eager), (
+            f"[{model_name}] eager metrics did not include load_balancing_loss: "
+            f"{metrics_eager}"
+        )
+
+    graph = _run_pretrain(model_args, cuda_graph_args=cuda_graph_args, master_port=base_port + 1)
+    assert graph.returncode == 0, (
+        f"[{model_name}] cudaGraph pretrain failed (rc={graph.returncode})\n"
+        f"--- stdout (tail) ---\n{graph.stdout[-4000:]}\n"
+        f"--- stderr (tail) ---\n{graph.stderr[-2000:]}"
+    )
+    if "local" in cuda_graph_args:
+        combined_graph_log = graph.stdout + "\n" + graph.stderr
+        assert re.search(r"> built [1-9]\d* cuda graph\(s\)", combined_graph_log), (
+            f"[{model_name}] local CUDA graph run completed without proving that any graph "
+            "was captured.\n"
+            f"--- stdout (tail) ---\n{graph.stdout[-4000:]}\n"
+            f"--- stderr (tail) ---\n{graph.stderr[-2000:]}"
+        )
+    metrics_graph = _extract_metrics(graph.stdout)
+    assert len(metrics_graph) == _TRAIN_ITERS, (
+        f"[{model_name}] cudaGraph: expected {_TRAIN_ITERS} metric lines, "
+        f"got {len(metrics_graph)}\n"
+        f"--- stdout (tail) ---\n{graph.stdout[-2000:]}"
+    )
+    if model_name.startswith("moonlight"):
+        assert all("lb_loss=" in metric for metric in metrics_graph), (
+            f"[{model_name}] graph metrics did not include load_balancing_loss: "
+            f"{metrics_graph}"
+        )
+
+    for iteration, (eager_metric, graph_metric) in enumerate(
+        zip(metrics_eager, metrics_graph), start=1
+    ):
+        assert eager_metric == graph_metric, (
+            f"[{model_name}] iter {iteration} differs:\n"
+            f"  eager: {eager_metric}\n"
+            f"  graph: {graph_metric}"
+        )
 
 
 @pytest.mark.internal
@@ -1392,43 +1470,29 @@ class TestE2EBitwise:
 
     Each test launches `torchrun pretrain_gpt.py` twice -- once without CUDA
     graphs and once with `cuda_graph_impl=transformer_engine` -- using the same
-    model/test settings as test_moonlight_qwen3_bitwise.sh. Moonlight covers
-    attn/moe_preprocess/moe_router graphs with router fusion; Qwen3 covers attn
-    graphs because this test's Qwen3 recipe is dense.
+    model/test settings. Moonlight covers attn/moe_preprocess/moe_router graphs
+    with router fusion; Qwen3 covers attn graphs because this test's Qwen3
+    recipe is dense.
     Asserts the per-iteration `lm loss / grad norm` lines are byte-identical.
 
     Slow (~5 min per model). Marked `internal` so CI can opt-in.
     """
 
     def test_no_graph_vs_graph(self, model_name, model_args, cuda_graph_args, base_port):
-        # No graph baseline.
-        r1 = _run_pretrain(model_args, cuda_graph_args=[], master_port=base_port)
-        assert r1.returncode == 0, (
-            f"[{model_name}] noGraph pretrain failed (rc={r1.returncode})\n"
-            f"--- stdout (tail) ---\n{r1.stdout[-4000:]}\n"
-            f"--- stderr (tail) ---\n{r1.stderr[-2000:]}"
-        )
-        metrics_eager = _extract_metrics(r1.stdout)
-        assert len(metrics_eager) == _TRAIN_ITERS, (
-            f"[{model_name}] noGraph: expected {_TRAIN_ITERS} metric lines, "
-            f"got {len(metrics_eager)}\n"
-            f"--- stdout (tail) ---\n{r1.stdout[-2000:]}"
-        )
+        _assert_no_graph_vs_graph(model_name, model_args, cuda_graph_args, base_port)
 
-        # CUDA graph capture.
-        r2 = _run_pretrain(model_args, cuda_graph_args=cuda_graph_args, master_port=base_port + 1)
-        assert r2.returncode == 0, (
-            f"[{model_name}] cudaGraph pretrain failed (rc={r2.returncode})\n"
-            f"--- stdout (tail) ---\n{r2.stdout[-4000:]}\n"
-            f"--- stderr (tail) ---\n{r2.stderr[-2000:]}"
-        )
-        metrics_graph = _extract_metrics(r2.stdout)
-        assert len(metrics_graph) == _TRAIN_ITERS, (
-            f"[{model_name}] cudaGraph: expected {_TRAIN_ITERS} metric lines, "
-            f"got {len(metrics_graph)}\n"
-            f"--- stdout (tail) ---\n{r2.stdout[-2000:]}"
-        )
 
-        # Bitwise compare per iteration.
-        for i, (a, b) in enumerate(zip(metrics_eager, metrics_graph)):
-            assert a == b, f"[{model_name}] iter {i+1} differs:\n" f"  eager: {a}\n" f"  graph: {b}"
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")
+@pytest.mark.skipif(not HAVE_HYBRIDEP, reason="HybridEP is not available")
+class TestLocalChunkE2EBitwise:
+    """Moonlight THD varlen comparison for a static-capacity full-chunk graph."""
+
+    def test_moonlight_no_graph_vs_graph(self):
+        _assert_no_graph_vs_graph(
+            "moonlight-local-chunk",
+            _LOCAL_CHUNK_MOONLIGHT_ARGS,
+            _LOCAL_CHUNK_CUDA_GRAPH_ARGS,
+            29664,
+        )
