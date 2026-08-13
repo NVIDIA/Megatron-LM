@@ -216,8 +216,8 @@ def _conv_silu_project_kernel(
     out_typed = out.to(out_ptr.dtype.element_ty)
 
     # Write the same data to ``REPEAT`` adjacent value heads. ``REPEAT == 1``
-    # is the no-repeat case (V branch is handled by a separate kernel that
-    # always has REPEAT == 1, but using the same code here is convenient).
+    # is the no-repeat case (the V branch reuses this kernel with
+    # ``REPEAT == 1`` and ``NUM_GROUPS == 1``).
     for r in tl.static_range(REPEAT):
         v_head = head_id * REPEAT + r
         write_ptr = (
