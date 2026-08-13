@@ -1335,9 +1335,17 @@ class LLaVAModel(MegatronModule):
                 )
             )
 
+        # combined_position_ids is a plain arange over the combined sequence and
+        # does not reflect the per-image token expansion computed inside
+        # _preprocess_data. Feeding that to the LM as position_ids is only inert
+        # for plain-RoPE-with-decoder_input; learned_absolute / mrope would read
+        # wrong positions. Pass None so the LM either computes positions itself
+        # (from decoder_input) or errors clearly on the unsupported combination
+        # rather than silently degrading. Image-aware combined positions are a
+        # follow-up.
         language_model_kwargs = {
             "input_ids": combined_input_ids,
-            "position_ids": combined_position_ids,
+            "position_ids": None,
             "attention_mask": attention_mask,
             "decoder_input": combined_embeddings,
             "labels": expanded_labels,
