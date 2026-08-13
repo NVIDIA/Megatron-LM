@@ -4,7 +4,11 @@
 
 Trains the same small GPT/Hybrid model under M-FSDP v2 and under a plain
 distributed optimizer and compares per-step losses and parameter snapshots,
-across activation recompute, EP 1F1B overlap, and PP2/VPP2/EP2 1F1B overlap.
+across activation recompute and EP 1F1B overlap.
+
+Note: interleaved pipeline (PP/VPP) + FSDP + 1F1B overlap is not yet supported
+and is deferred to a follow-up PR; see
+combined_1f1b_schedule_for_interleaved_pipelining.
 """
 
 import pytest
@@ -221,31 +225,6 @@ class TestMegatronFSDPE2E:
                     "parameter_tolerance": {"atol": 5e-3, "rtol": 1e-3},
                 },
                 id="ep2-optim_grads_params-1f1b-overlap",
-            ),
-            pytest.param(
-                {
-                    "name": "PP2 VPP2 EP2 optim_grads_params 1F1B overlap",
-                    "model_family": "gpt",
-                    "model_parallel_config": {
-                        "pipeline_model_parallel_size": 2,
-                        "virtual_pipeline_model_parallel_size": 2,
-                        "expert_model_parallel_size": 2,
-                    },
-                    "model_config": {
-                        "bf16": True,
-                        "data_parallel_sharding_strategy": "optim_grads_params",
-                        "clip_grad": 0.0,
-                        "megatron_fsdp_main_grads_dtype": torch.float32,
-                        "moe_grouped_gemm": True,
-                        "moe_token_dispatcher_type": "alltoall",
-                        "num_layers_per_virtual_pipeline_stage": 1,
-                        "overlap_moe_expert_parallel_comm": True,
-                        "delay_wgrad_compute": True,
-                    },
-                    "loss_tolerance": {"atol": 0, "rtol": 0.05},
-                    "parameter_tolerance": {"atol": 5e-3, "rtol": 1e-3},
-                },
-                id="pp2-vpp2-ep2-optim_grads_params-1f1b-overlap",
             ),
         ],
     )
