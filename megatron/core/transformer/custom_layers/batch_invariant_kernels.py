@@ -1694,7 +1694,10 @@ def enable_batch_invariant_mode(backend: str = "deepgemm"):
             "deepgemm" (default) routes bf16 CUDA inputs through DeepGEMM
             `bf16_gemm_nn`. "triton" routes through the batch-invariant
             Triton `matmul_persistent` kernel (works for bf16/fp16/fp32 and
-            on any CUDA device). Grouped GEMM always uses DeepGEMM regardless.
+            on any CUDA device). "te_native" keeps the native cuBLASLt
+            kernels (aten and TE) and obtains invariance via workspace
+            starvation instead of kernel substitution. Grouped GEMM uses
+            DeepGEMM for "deepgemm"/"triton"; "te_native" leaves it native.
     """
     global _batch_invariant_MODE, _batch_invariant_LIB, _BATCH_INVARIANT_BACKEND
     if _batch_invariant_MODE:
