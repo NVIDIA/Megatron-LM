@@ -92,7 +92,7 @@ def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, e
 
 
 def test_legacy_layer_config_mutations_are_synchronized(monkeypatch):
-    """Legacy-derived config lists retain shared constructor-mutation behavior."""
+    """The positional layer-type API converts configs and retains shared mutation behavior."""
 
     class BuiltLayer(torch.nn.Module):
 
@@ -112,17 +112,26 @@ def test_legacy_layer_config_mutations_are_synchronized(monkeypatch):
 
     config = MLATransformerConfig(num_layers=3, hidden_size=64, num_attention_heads=4)
     config.tp_comm_overlap = True
-    layer_config_list = validate_segment_layers("M+-", config)
     block = HybridStack(
-        config=config,
-        submodules=submodules,
-        layer_config_list=layer_config_list,
-        pre_process=False,
+        config,
+        submodules,
+        False,
+        list("M+-"),
         post_layer_norm=False,
         post_process=False,
         pg_collection=SimpleNamespace(pp=None, tp=None),
     )
+    layer_config_list = block.layer_config_list
 
+    assert not hasattr(block, "layer_type_list")
+    assert [type(layer_config) for layer_config in layer_config_list] == [
+        LAYER_CONFIG_BY_PATTERN_CHAR[pattern_char] for pattern_char in "M+-"
+    ]
+    assert len({id(layer_config) for layer_config in layer_config_list}) == len(layer_config_list)
+    assert all(layer_config is not config for layer_config in layer_config_list)
+    assert all(
+        layer.config is layer_config for layer, layer_config in zip(block.layers, layer_config_list)
+    )
     assert config.tp_comm_overlap is False
     assert all(layer_config.tp_comm_overlap is False for layer_config in layer_config_list)
 
@@ -155,6 +164,50 @@ def test_legacy_layer_config_mutations_are_synchronized(monkeypatch):
     assert independent_layer_configs[0].tp_comm_overlap is False
     assert independent_layer_configs[1].tp_comm_overlap is True
     assert independent_root_config.tp_comm_overlap is True
+
+
+@pytest.mark.parametrize(
+    ("provide_layer_type_list", "provide_layer_config_list"),
+    [(False, False), (True, True)],
+    ids=["neither", "both"],
+)
+def test_hybrid_stack_requires_exactly_one_layer_list(
+    provide_layer_type_list, provide_layer_config_list
+):
+    """HybridStack requires exactly one legacy symbol list or per-layer config list."""
+    config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
+    layer_type_list = ["M"] if provide_layer_type_list else None
+    layer_config_list = validate_segment_layers("M", config) if provide_layer_config_list else None
+
+    with pytest.raises(
+        ValueError, match="Exactly one of layer_type_list or layer_config_list must be provided"
+    ):
+        HybridStack(
+            config=config,
+            submodules=hybrid_stack_spec.submodules,
+            layer_type_list=layer_type_list,
+            layer_config_list=layer_config_list,
+            pre_process=False,
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=SimpleNamespace(pp=None, tp=None),
+        )
+
+
+def test_hybrid_stack_rejects_multi_character_layer_type():
+    """The legacy list treats each entry as one layer symbol."""
+    config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
+
+    with pytest.raises(ValueError, match="Each entry in layer_type_list must be a single"):
+        HybridStack(
+            config=config,
+            submodules=hybrid_stack_spec.submodules,
+            layer_type_list=["M*"],
+            pre_process=False,
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=SimpleNamespace(pp=None, tp=None),
+        )
 
 
 def test_mamba_state_shapes_are_selected_by_layer_config_type():

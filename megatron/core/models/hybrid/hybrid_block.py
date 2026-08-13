@@ -21,7 +21,10 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.hybrid.hybrid_layer_allocation import HybridLayerConfig
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    HybridLayerConfig,
+    validate_segment_layers,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -66,11 +69,15 @@ class HybridStack(MegatronModule):
     Args:
         config (TransformerConfig): the model configuration
         submodules (HybridStackSubmodules): the submodules for the stack
-        layer_config_list (list): per-layer configs for this pipeline segment. When
-            provided by HybridModel, pipeline stage selection has already been done
-            via '|' separators in the pattern.
         pre_process (bool, optional): whether to include an embedding layer.
             Defaults to True.
+        layer_type_list (list[str], optional): backward-compatible list of layer
+            type symbols for this pipeline segment. It is immediately converted to
+            independent per-layer configs.
+        layer_config_list (list, optional): per-layer configs for this pipeline segment. When
+            provided by HybridModel, pipeline stage selection has already been done
+            via '|' separators in the pattern. Exactly one of ``layer_type_list`` or
+            ``layer_config_list`` must be provided.
         pp_layer_offset (int, optional): the global layer offset for this pipeline
             segment. Defaults to 0.
         post_layer_norm (bool, optional): whether to include a final layer norm.
@@ -88,8 +95,8 @@ class HybridStack(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: HybridStackSubmodules,
-        layer_config_list: list[HybridLayerConfig],
         pre_process: bool = True,
+        layer_type_list: list[str] | None = None,
         pp_layer_offset: int = 0,
         post_layer_norm: bool = True,
         post_process: bool = True,
@@ -98,11 +105,23 @@ class HybridStack(MegatronModule):
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
         name: str | None = None,
+        *,
+        layer_config_list: list[HybridLayerConfig] | None = None,
     ) -> None:
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
         """
+        if (layer_type_list is None) == (layer_config_list is None):
+            raise ValueError("Exactly one of layer_type_list or layer_config_list must be provided")
+        if layer_type_list is not None:
+            if any(
+                not isinstance(layer_type, str) or len(layer_type) != 1
+                for layer_type in layer_type_list
+            ):
+                raise ValueError("Each entry in layer_type_list must be a single layer symbol")
+            layer_config_list = validate_segment_layers(''.join(layer_type_list), config)
+
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
@@ -118,6 +137,7 @@ class HybridStack(MegatronModule):
         self.input_tensor = None
         self.pg_collection = pg_collection
 
+        assert layer_config_list is not None
         self.layer_config_list = layer_config_list
 
         if getattr(self.config, "mla_down_proj_fusion", False):
