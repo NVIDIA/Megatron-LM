@@ -991,7 +991,6 @@ class PagedStashRunner:
         # every MoE layer config (expert forward). Some models may use a distinct config for
         # each layer.
         seen_cfg_ids = set()
-        seen_moe_layer_ids = set()
         self._configs_to_sync_moe_paged_stash = []
 
         def _track_cfg(c):
@@ -1004,23 +1003,50 @@ class PagedStashRunner:
 
         _track_cfg(config)
 
+        # Local import avoids circular import: schedules -> paged_stash -> multi_token_prediction
+        # -> megatron.core (still loading).
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
         for model_chunk in self.model:
             model_with_decoder = get_attr_wrapped_model(
                 model_chunk, "decoder", allow_none=False, return_model_obj=True
             )
             _track_cfg(model_with_decoder.config)
+
+            # Track MoE configs independently from the existing structural discovery below.
+            # This keeps overflow and retry behavior unchanged for models whose modules share
+            # the root config while allowing distinct module configs to stay synchronized.
             for module in model_with_decoder.modules():
                 token_dispatcher = getattr(module, 'token_dispatcher', None)
                 if token_dispatcher is None or not hasattr(token_dispatcher, 'check_over_budget'):
                     continue
-
-                module_id = id(module)
-                if module_id in seen_moe_layer_ids:
-                    continue
-
-                seen_moe_layer_ids.add(module_id)
-                self.moe_layers.append(module)
                 _track_cfg(getattr(module, 'config', None))
+
+            for layer in model_with_decoder.decoder.layers:
+                transformer_layer = (
+                    layer.mtp_model_layer if isinstance(layer, MultiTokenPredictionLayer) else layer
+                )
+                mlp = getattr(transformer_layer, "mlp", None)
+                if (
+                    mlp is not None
+                    and hasattr(mlp, 'token_dispatcher')
+                    and hasattr(mlp.token_dispatcher, 'check_over_budget')
+                ):
+                    self.moe_layers.append(mlp)
+            if model_with_decoder.mtp_process:
+                for layer in model_with_decoder.mtp.layers:
+                    transformer_layer = (
+                        layer.mtp_model_layer
+                        if isinstance(layer, MultiTokenPredictionLayer)
+                        else layer
+                    )
+                    mlp = getattr(transformer_layer, "mlp", None)
+                    if (
+                        mlp is not None
+                        and hasattr(mlp, 'token_dispatcher')
+                        and hasattr(mlp.token_dispatcher, 'check_over_budget')
+                    ):
+                        self.moe_layers.append(mlp)
 
     def _set_moe_paged_stash_all(self, value: bool) -> None:
         """Set moe_paged_stash on every tracked training, model, and MoE config."""

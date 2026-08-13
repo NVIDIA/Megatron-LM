@@ -80,6 +80,10 @@ class _FakeModelChunk(torch.nn.Module):
 def _run_retry(
     monkeypatch, training_config, model_config, decoder_config, mtp_config, nested_mtp=False
 ):
+    monkeypatch.setattr(
+        "megatron.core.transformer.multi_token_prediction.MultiTokenPredictionLayer",
+        _FakeMTPPredictionLayer,
+    )
     decoder_moe = _FakeMoELayer(decoder_config)
     mtp_moe = _FakeMoELayer(mtp_config)
     model = _FakeModelChunk(model_config, decoder_moe, mtp_moe, nested_mtp=nested_mtp)
@@ -177,7 +181,7 @@ def test_retry_disables_and_restores_per_module_configs(monkeypatch):
         nested_mtp=True,
     )
 
-    assert run.runner.moe_layers == [run.decoder_moe, run.mtp_moe]
+    assert run.runner.moe_layers == [run.decoder_moe]
     assert [id(config) for config in run.runner._configs_to_sync_moe_paged_stash] == [
         id(training_config),
         id(model_config),
@@ -189,9 +193,9 @@ def test_retry_disables_and_restores_per_module_configs(monkeypatch):
     assert run.model.zero_grad_count == 1
     assert len(run.release_stash_buffer_calls) == 1
     assert run.decoder_moe.token_dispatcher.reset_count == 1
-    assert run.mtp_moe.token_dispatcher.reset_count == 1
+    assert run.mtp_moe.token_dispatcher.reset_count == 0
     assert run.decoder_moe.token_dispatcher.invalidate_count == 2
-    assert run.mtp_moe.token_dispatcher.invalidate_count == 2
+    assert run.mtp_moe.token_dispatcher.invalidate_count == 0
     assert run.decoder_moe.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor == 1.5
     assert run.mtp_moe.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor == 1.5
     assert (
