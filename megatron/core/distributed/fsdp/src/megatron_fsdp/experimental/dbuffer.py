@@ -358,6 +358,13 @@ class DBuffer:
         placements[mesh_axis] = Replicate()
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
+        # Symmetric-memory registration is scoped to the collective's process
+        # group, so rendezvous the output on the same mesh axis as the all-gather.
+        is_symm_mem = hasattr(symm_mem, "is_symm_mem_tensor") and symm_mem.is_symm_mem_tensor(
+            out.local_buffer
+        )
+        if is_symm_mem:
+            out.rendezvous(mesh_axis)
         dist.all_gather_into_tensor(
             output_tensor=out.local_buffer,
             input_tensor=self.local_buffer,

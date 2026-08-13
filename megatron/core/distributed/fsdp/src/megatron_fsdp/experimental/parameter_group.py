@@ -28,7 +28,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Partial, Placements, Replicate, changed_mesh_axis
+from .placement import Partial, Placements, Replicate
 
 if TYPE_CHECKING:
     from .module import FsdpContext, FsdpModule
@@ -277,38 +277,11 @@ class FsdpParameterGroup:
 
     def cast_main_weight_to_model_weight(self) -> None:
         """Cast optimizer weights to the model-weight dtype."""
-        context = self.get_context()
+        context = self._get_context()
         allgather_stream = context.allgather_stream
         allgather_stream.wait_stream(context.current_stream())
         with torch.cuda.stream(allgather_stream):
             self.model_weight = self.main_weight.cast(self.model_weight.dtype)
-
-    def redistribute_model_weight_for_compute(self) -> None:
-        """Redistribute a deferred ZeRO-1 model weight to its compute placements."""
-        placements = self._model_weight_placements
-        if self.model_weight.placements == placements:
-            return
-
-        # The regular allocator needs no setup, so let redistribute allocate its output.
-        if self._symm_mem_pool is None:
-            self.model_weight = self.model_weight.redistribute(placements)
-            return
-
-        # The symmetric-memory output must be allocated from its pool and rendezvoused
-        # before the collective. Consequently, redistribute cannot allocate it internally.
-        with self._symmetric_memory_context():
-            restored_model_weight = DBuffer(
-                mesh=self.mesh,
-                placements=placements,
-                tensor_shapes=self.model_weight.layout.tensor_shapes,
-                dtype=self.model_weight.dtype,
-                device=self.model_weight.device,
-            )
-        gather_axis = changed_mesh_axis(self.model_weight.placements, placements)
-        assert gather_axis is not None
-        restored_model_weight.rendezvous(gather_axis)
-        self.model_weight.redistribute(placements, out=restored_model_weight)
-        self.model_weight = restored_model_weight
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
@@ -316,7 +289,8 @@ class FsdpParameterGroup:
         # microbatch sees placements different from the configured model placements
         # and restores the replicated model weight.
         if self.model_weight.placements != self._model_weight_placements:
-            self.redistribute_model_weight_for_compute()
+            with self._symmetric_memory_context():
+                self.model_weight = self.model_weight.redistribute(self._model_weight_placements)
         with self._symmetric_memory_context():
             self._unsharded_model_weight.reallocate_storage()
         # This buffer backs unsharded Parameters whose views may be saved by autograd.
@@ -324,14 +298,9 @@ class FsdpParameterGroup:
         # in-place writes like the out= redistribution below increment that counter even
         # under no_grad. Without preserving it, backward can fail with "modified by an
         # inplace operation" even though FSDP only materialized internal storage.
-        gather_axis = changed_mesh_axis(
-            self.model_weight.placements, self._unsharded_model_weight.placements
-        )
         with torch.autograd._unsafe_preserve_version_counter(
             self._unsharded_model_weight.local_buffer
         ):
-            if self._symm_mem_pool is not None and gather_axis is not None:
-                self._unsharded_model_weight.rendezvous(gather_axis)
             self.model_weight.redistribute(
                 self._unsharded_model_weight.placements, out=self._unsharded_model_weight
             )
