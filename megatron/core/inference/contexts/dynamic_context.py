@@ -4796,10 +4796,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # prefill+decode chunk).
                 if seg.numel() < query_len:
                     pad = torch.full(
-                        (query_len - seg.numel(),),
-                        -1,
-                        dtype=seg.dtype,
-                        device=seg.device,
+                        (query_len - seg.numel(),), -1, dtype=seg.dtype, device=seg.device
                     )
                     seg = torch.cat([seg, pad])
                 positive = seg >= 0

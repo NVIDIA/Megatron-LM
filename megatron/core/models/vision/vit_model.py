@@ -374,9 +374,7 @@ class QwenVL2DRotaryEmbedding(nn.Module):
         # `.item()` host-device sync (previously used to size the table
         # dynamically to the current input) and the accompanying rebuild.
         positions = torch.arange(max_patches_per_side, dtype=inv_freq.dtype)
-        self.register_buffer(
-            "freq_table", torch.outer(positions, inv_freq), persistent=False
-        )
+        self.register_buffer("freq_table", torch.outer(positions, inv_freq), persistent=False)
 
     def forward(self, row_ids: torch.Tensor, col_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -761,9 +759,7 @@ class Kimi2DRotaryEmbedding(nn.Module):
         # Precompute full frequency table to avoid a per-forward .item() sync
         # and rebuild (previously used to size the table to current input).
         positions = torch.arange(max_patches_per_side, dtype=inv_freq.dtype)
-        self.register_buffer(
-            "freq_table", torch.outer(positions, inv_freq), persistent=False
-        )
+        self.register_buffer("freq_table", torch.outer(positions, inv_freq), persistent=False)
 
     def forward(self, row_ids: torch.Tensor, col_ids: torch.Tensor) -> torch.Tensor:
         """

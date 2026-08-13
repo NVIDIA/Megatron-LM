@@ -1151,10 +1151,7 @@ class DynamicInferenceEngine(AbstractEngine):
         request_entry.future.set_result(request_entry.record)
 
     def _fail_submission(
-        self,
-        request_id: int,
-        sampling_params: Optional[SamplingParams],
-        exc: BaseException,
+        self, request_id: int, sampling_params: Optional[SamplingParams], exc: BaseException
     ) -> None:
         """Register a minimal failed request so a rejected admission still
         produces a client-visible failure reply.
@@ -1166,8 +1163,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         if self.rank == 0:
             warnings.warn(
-                f"Request {request_id} rejected before admission: "
-                f"{type(exc).__name__}: {exc}"
+                f"Request {request_id} rejected before admission: " f"{type(exc).__name__}: {exc}"
             )
         # Empty prompt tokens are safe — the reply short-circuits at
         # Status.FAILED and the client sees the failure, not a completion.

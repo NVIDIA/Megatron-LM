@@ -149,7 +149,9 @@ def resolve_multimodal_data_for_engine(
 
         if image_preprocessing_config is None:
             raise RuntimeError("Raw image data require InferenceConfig.image_preprocessing_config.")
-        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
+        device = (
+            torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
+        )
         return preprocess_image_bytes_list(image_data, image_preprocessing_config, device=device)
     if not isinstance(image_data, dict):
         raise TypeError(

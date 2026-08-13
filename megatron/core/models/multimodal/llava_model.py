@@ -802,9 +802,7 @@ class LLaVAModel(MegatronModule):
                 final_position_ids = None
             else:
                 final_position_ids = (
-                    torch.arange(
-                        max_seq_len, dtype=position_ids.dtype, device=position_ids.device
-                    )
+                    torch.arange(max_seq_len, dtype=position_ids.dtype, device=position_ids.device)
                     .unsqueeze(0)
                     .expand(batch_size, -1)
                     .contiguous()
@@ -946,9 +944,9 @@ class LLaVAModel(MegatronModule):
                 shard_factor = self.tensor_model_parallel_size_lm
                 seq_dim = 0
 
-            assert shard_factor is not None and seq_dim is not None, (
-                "_process_embedding_token_parallel called without SP or CP enabled"
-            )
+            assert (
+                shard_factor is not None and seq_dim is not None
+            ), "_process_embedding_token_parallel called without SP or CP enabled"
 
             # VLM combined embeddings (text + vision tokens) may not align
             # naturally to shard_factor under dynamic resolution — the number of

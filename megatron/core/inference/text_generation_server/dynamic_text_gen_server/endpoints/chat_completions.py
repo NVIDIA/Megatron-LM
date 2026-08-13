@@ -270,9 +270,7 @@ def _extract_image_url_bytes(url: str) -> bytes:
             or ip.is_reserved
             or ip.is_unspecified
         ):
-            raise ValueError(
-                f"Refusing to fetch image from non-public address: {parsed.hostname}"
-            )
+            raise ValueError(f"Refusing to fetch image from non-public address: {parsed.hostname}")
         req = urllib.request.Request(url, headers={"User-Agent": _IMAGE_FETCH_USER_AGENT})
         with urllib.request.urlopen(req, timeout=_IMAGE_FETCH_TIMEOUT_S) as response:
             data = response.read(_MAX_IMAGE_BYTES + 1)

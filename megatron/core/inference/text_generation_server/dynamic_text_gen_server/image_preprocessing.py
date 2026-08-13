@@ -164,9 +164,7 @@ def preprocess_image_bytes(
 
 
 def preprocess_image_bytes_list(
-    image_bytes_list,
-    config: ImageProcessingConfig,
-    device: Optional[torch.device] = None,
+    image_bytes_list, config: ImageProcessingConfig, device: Optional[torch.device] = None
 ) -> dict:
     """Preprocess a list of raw image bytes into engine.add_request image kwargs.
 
@@ -216,9 +214,7 @@ def preprocess_image_bytes_list(
 
 
 def preprocess_image_bytes_tiled(
-    image_bytes: bytes,
-    config: ImageProcessingConfig,
-    device: Optional[torch.device] = None,
+    image_bytes: bytes, config: ImageProcessingConfig, device: Optional[torch.device] = None
 ) -> tuple:
     """Preprocess raw image bytes into tiled tensors for static-resolution inference.
 
