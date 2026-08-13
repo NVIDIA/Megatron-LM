@@ -1481,11 +1481,12 @@ class TransformerConfig(ModelParallelConfig):
 
         if (
             self.gdn_pre_gated_delta_rule_fusion
-            and self.experimental_attention_variant != "gated_delta_net"
+            and self.experimental_attention_variant != "gdn"
         ):
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
-                "experimental_attention_variant='gated_delta_net'."
+                "experimental_attention_variant='gdn' "
+                "or deprecated alias experimental_attention_variant='gated_delta_net'."
             )
 
         if self.fp8:
