@@ -192,6 +192,7 @@ class TestMegatronFSDPE2E:
                     "model_parallel_config": {"expert_model_parallel_size": 2},
                     "model_config": {
                         "data_parallel_sharding_strategy": "optim_grads_params",
+                        "clip_grad": 0.0,
                         "recompute_granularity": "full",
                         "recompute_method": "uniform",
                         "recompute_num_layers": 1,
@@ -209,6 +210,7 @@ class TestMegatronFSDPE2E:
                     "model_config": {
                         "bf16": True,
                         "data_parallel_sharding_strategy": "optim_grads_params",
+                        "clip_grad": 0.0,
                         "megatron_fsdp_main_grads_dtype": torch.float32,
                         "moe_grouped_gemm": True,
                         "moe_token_dispatcher_type": "alltoall",
@@ -232,6 +234,7 @@ class TestMegatronFSDPE2E:
                     "model_config": {
                         "bf16": True,
                         "data_parallel_sharding_strategy": "optim_grads_params",
+                        "clip_grad": 0.0,
                         "megatron_fsdp_main_grads_dtype": torch.float32,
                         "moe_grouped_gemm": True,
                         "moe_token_dispatcher_type": "alltoall",
