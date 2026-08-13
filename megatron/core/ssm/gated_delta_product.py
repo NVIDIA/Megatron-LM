@@ -474,10 +474,20 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             assert batch_size == 1, "Packed sequences require batch=1 (THD/varlen format)."
 
         if conv_state is not None:
-            # Static-batching prefill: also seeds conv_state and ssm_state.
-            y = self._gdp_prefill(
-                hidden_states, conv_state, ssm_state, packed_seq_params=packed_seq_params
+            # Static-batching prefill: same computation as training, but it also caches
+            # the trailing conv window and the final recurrent state for the decode
+            # steps. Selective recompute and offloading are training-only, so this runs
+            # the shared helpers directly. Packing is asserted off above.
+            z, VKQ, ba = self._in_proj_preprocess(hidden_states)
+            # _prepare_qkv also seeds conv_state
+            query, key, value = self._prepare_qkv(VKQ, conv_state=conv_state)
+            beta, g = self._compute_gating(ba)
+            core_attn_out, last_recurrent_state = self._run_gdp_kernel(
+                query, key, value, g, beta, VKQ, output_final_state=(ssm_state is not None)
             )
+            if ssm_state is not None:
+                ssm_state.copy_(last_recurrent_state)
+            y = self._postprocess(core_attn_out, z)
         else:
             y = self._gdp_training(hidden_states, packed_seq_params=packed_seq_params)
 
@@ -570,35 +580,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         return y
 
-    def _gdp_prefill(self, hidden_states, conv_state, ssm_state, packed_seq_params=None):
-        """Static-batching prefill: same computation as training, but also caches the
-        trailing conv window in conv_state and the final recurrent state in ssm_state for
-        the subsequent decode steps."""
-        z, VKQ, ba = self._in_proj_preprocess(hidden_states, packed_seq_params=packed_seq_params)
-
-        seq_idx_packed, cu_seqlens_packed = self._packed_metadata(packed_seq_params, VKQ.shape[1])
-
-        # _prepare_qkv also updates conv_state
-        query, key, value = self._prepare_qkv(VKQ, conv_state=conv_state, seq_idx=seq_idx_packed)
-
-        beta, g = self._compute_gating(ba)
-
-        core_attn_out, last_recurrent_state = self._run_gdp_kernel(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            VKQ,
-            output_final_state=(ssm_state is not None),
-            cu_seqlens=cu_seqlens_packed,
-        )
-
-        if ssm_state is not None:
-            ssm_state.copy_(last_recurrent_state)
-
-        return self._postprocess(core_attn_out, z, packed_seq_params=packed_seq_params)
-
     def _run_gdp_kernel(self, query, key, value, g, beta, VKQ, output_final_state, cu_seqlens=None):
         """Run the selected chunked gated delta product kernel and return
         (core_attn_out, final_state).
@@ -648,7 +629,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         zVKQba = rearrange(zVKQba, "l b d -> b l d").contiguous()
 
-        z, VKQ, ba = torch.split(
+        return self._split_projection(zVKQba)
+
+    def _split_projection(self, zVKQba):
+        """Split the (b, l, proj_dim) input projection into the z, VKQ, and ba groups."""
+        return torch.split(
             zVKQba,
             [
                 self.cp.d_inner_local_tpcp,
@@ -658,8 +643,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             ],
             dim=-1,
         )
-
-        return z, VKQ, ba
 
     def _prepare_qkv(self, x, conv_state=None, seq_idx=None):
         """Run the causal conv on the VKQ slice and split/reshape it into query, key,
@@ -680,14 +663,18 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
             # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
             conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
-        # causal_conv1d uses seq_idx to reset the convolution boundaries
-        x = causal_conv1d_fn(
-            x=x,
-            weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-            bias=self.cp.get_conv1d_bias(),
-            activation=self.activation,
-            seq_idx=seq_idx,
-        )
+        if causal_conv1d_fn is None:
+            seqlen = x.size(2)
+            x = self.act(self.cp.conv1d(x)[..., :seqlen])
+        else:
+            # causal_conv1d uses seq_idx to reset the convolution boundaries
+            x = causal_conv1d_fn(
+                x=x,
+                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                bias=self.cp.get_conv1d_bias(),
+                activation=self.activation,
+                seq_idx=seq_idx,
+            )
 
         x = rearrange(x, "b d l ->  b l d")
 
@@ -957,89 +944,35 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         seq_idx = metadata.seq_idx
         cu_seqlens = metadata.cu_seqlens
         batch_indices = metadata.batch_indices_prefill
-        M = self.num_householder
 
         # l b d -> b l d
         zVKQba = rearrange(zVKQba, "l b d -> b l d").contiguous()
 
-        z, VKQ, ba = torch.split(
-            zVKQba,
-            [
-                self.cp.d_inner_local_tpcp,
-                self.cp.d_inner_local_tpcp * M
-                + (M + 1) * self.cp.ngroups_local_tpcp * self.d_state,
-                self.cp.nheads_local_tpcp * (M + 1),
-            ],
-            dim=-1,
-        )
+        z, VKQ, ba = self._split_projection(zVKQba)
 
         # Capture per-request final conv states (before the conv consumes the
-        # inputs) and write them into the prefill requests' cache rows.
+        # inputs) and write them into the prefill requests' cache rows. Done here
+        # rather than via _prepare_qkv's conv_state argument, which seeds a single
+        # static-batching window with F.pad instead of one row per request.
         conv_varlen_states = causal_conv1d_varlen_states(
             VKQ.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
         )
         tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
-        # Maintain channels-last memory layout so causal_conv1d_fn can use seq_idx.
-        VKQ = VKQ.transpose(1, 2)
 
-        seqlen = VKQ.size(2)
-        if causal_conv1d_fn is None:
-            VKQ = self.act(self.cp.conv1d(VKQ)[..., :seqlen])
-        else:
-            VKQ = causal_conv1d_fn(
-                x=VKQ,
-                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                bias=self.cp.get_conv1d_bias(),
-                activation=self.activation,
-                seq_idx=seq_idx,
-            )
-        VKQ = rearrange(VKQ, "b d l -> b l d")
+        query, key, value = self._prepare_qkv(VKQ, seq_idx=seq_idx)
 
-        value, key, query = torch.split(
-            VKQ,
-            [
-                self.cp.d_inner_local_tpcp * M,
-                self.cp.ngroups_local_tpcp * self.d_state * M,
-                self.cp.ngroups_local_tpcp * self.d_state,
-            ],
-            dim=-1,
-        )
-        b, a = torch.split(ba, [self.cp.nheads_local_tpcp * M, self.cp.nheads_local_tpcp], dim=-1)
+        beta, g = self._compute_gating(ba)
 
-        # batch = 1 packed sequence of length T; householder folded into seq.
-        value = rearrange(value, "b l (m h p) -> b (l m) h p", m=M, p=self.headdim).contiguous()
-        key = rearrange(key, "b l (m g s) -> b (l m) g s", m=M, s=self.d_state).contiguous()
-        query = rearrange(query, "b l (g s) -> b l g s", s=self.d_state).contiguous()
-        beta = rearrange(b.sigmoid(), "b l (m h) -> b (l m) h", m=M).contiguous()
-        g = -self.cp.get_A_log().float().exp() * F.softplus(a.float() + self.cp.get_dt_bias())
-        g = g.contiguous()
-
-        if self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp > 1:
-            rep = self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp
-            query = query.repeat_interleave(rep, dim=2)
-            key = key.repeat_interleave(rep, dim=2)
-
-        core_attn_out, last_recurrent_state = chunk_gated_delta_product(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=True,
-            num_householder=M,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens,
+        core_attn_out, last_recurrent_state = self._run_gdp_kernel(
+            query, key, value, g, beta, VKQ, output_final_state=True, cu_seqlens=cu_seqlens
         )
 
         # Write per-request final SSM states into the cache for subsequent decode.
         tensor_masked_update(ssm_state, batch_indices, last_recurrent_state)
 
-        y = rearrange(core_attn_out, "b l h p -> l b (h p)").contiguous()
-        if self.rmsnorm:
-            z = rearrange(z, "b l d -> l b d").contiguous()
-            y = self.norm(y, z)
-        return y
+        # post_conv_ssm inside _postprocess is a no-op here: dynamic inference asserts
+        # cp_size == 1.
+        return self._postprocess(core_attn_out, z)
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         """
