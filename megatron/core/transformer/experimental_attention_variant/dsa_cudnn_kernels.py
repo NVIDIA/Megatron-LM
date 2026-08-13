@@ -16,6 +16,11 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_scoring_plan import (
+    IndexerScoringDecision,
+    IndexerScoringPlan,
+    resolve_indexer_scoring_plan,
+)
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
 if TYPE_CHECKING:
@@ -1132,6 +1137,36 @@ def _topk_in_bounds(
     return in_range & valid_bounds
 
 
+def _resolve_scoring_plan_for_call(
+    *,
+    starts: Optional[Tensor],
+    ends: Optional[Tensor],
+    varlen_is_plain_causal: bool,
+    packed_thd: bool,
+    cp_size: int,
+    use_local_indexer_varlen: bool,
+    single_packed_thd_sequence: bool,
+    packed_metadata_available: bool,
+) -> IndexerScoringDecision:
+    """Map this call's layout facts onto a scoring plan.
+
+    ``use_local_indexer_varlen`` already encodes "packed, CP>1, causal, no custom key
+    positions" -- it is how the caller reports a layout the packed kernels can accept.
+    It is unpacked here rather than re-tested downstream, so each resolver argument
+    keeps exactly one meaning.
+    """
+    return resolve_indexer_scoring_plan(
+        bounds_available=starts is not None and ends is not None,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+        packed_thd=packed_thd,
+        cp_size=cp_size,
+        mask_is_causal=use_local_indexer_varlen or not packed_thd,
+        explicit_key_positions=False,
+        single_sequence_pack=single_packed_thd_sequence,
+        packed_metadata_available=packed_metadata_available,
+    )
+
+
 def _indexer_topk_bshd(
     q_bshd: Tensor,
     k_bsd: Tensor,
@@ -1152,6 +1187,8 @@ def _indexer_topk_bshd(
     packed_max_seqlen_q: Optional[int] = None,
     packed_max_seqlen_k: Optional[int] = None,
     packed_cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
+    scoring_plan: Optional[IndexerScoringDecision] = None,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     """BSHD-layout indexer scoring and top-K selection.
 
@@ -1199,7 +1236,27 @@ def _indexer_topk_bshd(
 
     k_bshd = k_bsd.unsqueeze(2)  # (b, sk, 1, idx_hd)
 
-    if starts is None:
+    if scoring_plan is None:
+        scoring_plan = _resolve_scoring_plan_for_call(
+            starts=starts,
+            ends=ends,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            packed_thd=use_local_indexer_varlen or packed_cu_seqlens_q is not None,
+            cp_size=packed_cp_size,
+            use_local_indexer_varlen=use_local_indexer_varlen,
+            single_packed_thd_sequence=single_packed_thd_sequence,
+            packed_metadata_available=(
+                packed_cu_seqlens_q is not None
+                and packed_cu_seqlens_k is not None
+                and packed_max_seqlen_q is not None
+                and packed_max_seqlen_k is not None
+            ),
+        )
+    plan = scoring_plan.plan
+
+    # PLAIN_CAUSAL means the bounds, if any, are the trivial whole-sequence causal ones
+    # that ``_causal_seq_lens`` rebuilds exactly, so the single-kernel scorer applies.
+    if starts is None or plan is IndexerScoringPlan.PLAIN_CAUSAL:
         q_idx = torch.arange(sq, device=device)
         seq_lens = _causal_seq_lens(q_idx, _INDEXER_RATIO, sk).to(torch.int32).repeat(b)
         if not return_scores:
@@ -1214,7 +1271,7 @@ def _indexer_topk_bshd(
             ]  # (b, sq, sk) fp32, -inf on masked positions
     else:
         seq_lens = ends.clamp(max=sk).to(torch.int32).repeat(b)
-        if not return_scores and use_local_indexer_varlen and single_packed_thd_sequence:
+        if not return_scores and plan is IndexerScoringPlan.PACKED_CP_SINGLE:
             topk_indices, topk_scores = _indexer_topk_single_packed_cp_segments(
                 q_bshd,
                 k_bshd,
@@ -1225,14 +1282,7 @@ def _indexer_topk_bshd(
                 local_packed_cp_query_start,
                 local_packed_cp_query_len,
             )
-        elif (
-            not return_scores
-            and use_local_indexer_varlen
-            and packed_cu_seqlens_q is not None
-            and packed_cu_seqlens_k is not None
-            and packed_max_seqlen_q is not None
-            and packed_max_seqlen_k is not None
-        ):
+        elif not return_scores and plan is IndexerScoringPlan.PACKED_CP_MULTI:
             topk_indices, topk_scores = _indexer_topk_multi_packed_cp_thd(
                 q_bshd,
                 k_bshd,
@@ -1400,17 +1450,11 @@ def run_fused_qk_topk(
         return None
     if q.size(2) != weights.size(2) or q.size(3) != k.size(2):
         return None
-    # Guard first: bounds the caller could not build at all are a genuine decline. Only
-    # bounds that exist and are plain causal are normalized away below.
+    # Bounds the caller could not build at all are a genuine decline, which is a
+    # different thing from bounds that exist but describe a layout a fused kernel can
+    # rebuild for itself. The scoring plan distinguishes the two.
     if starts is None or ends is None:
         return None
-    starts, ends = _normalize_plain_causal_bounds(
-        starts,
-        ends,
-        cp_size=cp_size,
-        packed_seq_params=packed_seq_params,
-        varlen_is_plain_causal=varlen_is_plain_causal,
-    )
 
     packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q, packed_max_seqlen_k = (
         _get_multi_packed_cp_thd_metadata(
@@ -1438,6 +1482,7 @@ def run_fused_qk_topk(
         packed_max_seqlen_q=packed_max_seqlen_q,
         packed_max_seqlen_k=packed_max_seqlen_k,
         packed_cp_size=cp_size,
+        varlen_is_plain_causal=varlen_is_plain_causal,
     )
     return topk_indices, topk_length
 
@@ -1486,17 +1531,11 @@ def run_fused_qk_topk_with_loss(
         return None
     if query.size(3) != key.size(3):
         return None
-    # Guard first: bounds the caller could not build at all are a genuine decline. Only
-    # bounds that exist and are plain causal are normalized away below.
+    # Bounds the caller could not build at all are a genuine decline, which is a
+    # different thing from bounds that exist but describe a layout a fused kernel can
+    # rebuild for itself. The scoring plan distinguishes the two.
     if starts is None or ends is None:
         return None
-    starts, ends = _normalize_plain_causal_bounds(
-        starts,
-        ends,
-        cp_size=cp_size,
-        packed_seq_params=packed_seq_params,
-        varlen_is_plain_causal=varlen_is_plain_causal,
-    )
 
     latent_v_channels = int(getattr(config, "kv_lora_rank", 0) or 0)
     if latent_v_channels <= 0:
@@ -1536,6 +1575,7 @@ def run_fused_qk_topk_with_loss(
         packed_max_seqlen_k,
         cp_size,
         tp_group,
+        varlen_is_plain_causal,
     )
 
 
@@ -2224,6 +2264,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         packed_max_seqlen_k: Optional[int],
         packed_cp_size: int,
         tp_group,
+        varlen_is_plain_causal: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -2261,6 +2302,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             packed_max_seqlen_q=packed_max_seqlen_q,
             packed_max_seqlen_k=packed_max_seqlen_k,
             packed_cp_size=packed_cp_size,
+            varlen_is_plain_causal=varlen_is_plain_causal,
         )
 
         prepared_topk_length = (
@@ -2484,6 +2526,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         packed_max_seqlen_k: Optional[int],
         packed_cp_size: int,
         tp_group,
+        varlen_is_plain_causal: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Compute shared attention top-k metadata and sparse indexer loss."""
         _ensure_dsa_namespace()
@@ -2514,6 +2557,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             packed_max_seqlen_q=packed_max_seqlen_q,
             packed_max_seqlen_k=packed_max_seqlen_k,
             packed_cp_size=packed_cp_size,
+            varlen_is_plain_causal=varlen_is_plain_causal,
         )
 
         if indexer_score_payload is None:
