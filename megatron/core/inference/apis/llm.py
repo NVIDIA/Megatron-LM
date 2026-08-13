@@ -11,6 +11,9 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 
 
@@ -42,7 +45,7 @@ class MegatronLLM(_MegatronLLMBase):
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
-        inference_wrapper_cls: Optional[Type[AbstractModelInferenceWrapper]] = None,
+        inference_wrapper_cls: Type[AbstractModelInferenceWrapper] = GPTInferenceWrapper,
     ) -> None:
         super().__init__(
             model=model,
