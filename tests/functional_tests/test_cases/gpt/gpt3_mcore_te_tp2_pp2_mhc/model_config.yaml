@@ -51,8 +51,8 @@ MODEL_ARGS:
   --attention-backend: unfused
   --sequence-parallel: true
   --log-memory-to-tensorboard: true
-  --enable-hyper-connections: true
-  --num-residual-streams: 4
+  --enable-mhc-connections: true
+  --mhc-num-residual-streams: 4
   --mhc-sinkhorn-iterations: 20
   --mhc-init-gating-factor: 0.01
   --recompute-granularity: selective
