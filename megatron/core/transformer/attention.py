@@ -11,6 +11,8 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
+from megatron.core.context_parallel_layout.conversion import CpPartitionModeConverter
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -1357,7 +1359,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_sequence_cp_metadata=None,
-    ) -> Tensor:
+    ) -> Tensor | tuple[Tensor, CpPartitionModeConverter]:
         """
         Run the QKV input projection and core attention, stopping before linear_proj.
 
@@ -1379,13 +1381,27 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 inference CUDA graphs.
 
         Return:
-            Tensor consumed by the attention output projection.
+            Tensor consumed by the output projection, optionally paired with the converter
+            that restores this call's input CP layout after projection.
 
         """
         assert (
             packed_sequence_cp_metadata is None
         ), "Attention does not support packed-sequence chunkwise CP metadata."
         runtime_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        cp_group = runtime_cp_group
+        hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+            hidden_states=hidden_states,
+            key_value_states=key_value_states,
+            packed_seq_params=packed_seq_params,
+            cp_group=cp_group,
+            tp_group=self.pg_collection.tp,
+            target_partition_mode="zigzag",
+            sequence_parallel=self.config.sequence_parallel,
+            config=self.config,
+            attention_mask=attention_mask,
+            attention_bias=attention_bias,
+        )
 
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
@@ -1512,6 +1528,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
+            if back_to_input_converter is not None:
+                return context_layer, back_to_input_converter
             return context_layer
 
         if (
@@ -1690,16 +1708,28 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
             nvtx_range_pop(suffix="output_gate")
 
+        if back_to_input_converter is not None:
+            return core_attn_out, back_to_input_converter
         return core_attn_out
 
-    def forward_post_core_attn(self, core_attn_out: Tensor) -> tuple[Tensor, Tensor | None]:
-        """Apply the attention output projection to a core-attention result."""
+    def forward_post_core_attn(
+        self, core_attn_out: Tensor | tuple[Tensor, CpPartitionModeConverter]
+    ) -> tuple[Tensor, Tensor | None]:
+        """Project the core result, then restore this call's input CP layout."""
+        back_to_input_converter = None
+        if isinstance(core_attn_out, tuple):
+            core_attn_out, back_to_input_converter = core_attn_out
         nvtx_range_push(suffix="linear_proj")
         attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
         with attn_proj_manager as core_attn_out:
             output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
+
+        if back_to_input_converter is not None:
+            output = back_to_input_converter.convert(
+                output, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
 
         return output, bias
 

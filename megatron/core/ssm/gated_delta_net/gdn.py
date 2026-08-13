@@ -12,6 +12,8 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
+from megatron.core.context_parallel_layout.conversion import CpPartitionModeConverter
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
@@ -162,12 +164,13 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_sequence_cp_metadata=None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, CpPartitionModeConverter]:
         """
         Run GDN through its normalized recurrence output, before output projection.
 
         Return:
-            torch.Tensor: Normalized recurrence output.
+            Normalized recurrence output, optionally paired with the converter that
+            restores this call's input CP layout after projection.
         """
         assert (
             packed_sequence_cp_metadata is None
@@ -182,6 +185,21 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         assert (
             inference_context is None and not InferenceMode.is_active()
         ), "Two-stage GDN execution is training-only; inference is dispatched by forward()."
+
+        cp_group = (
+            packed_seq_params.cp_group
+            if packed_seq_params is not None and packed_seq_params.cp_group is not None
+            else self.pg_collection.cp
+        )
+        hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+            hidden_states=hidden_states,
+            packed_seq_params=packed_seq_params,
+            cp_group=cp_group,
+            tp_group=self.pg_collection.tp,
+            target_partition_mode="zigzag",
+            sequence_parallel=self.config.sequence_parallel,
+            config=self.config,
+        )
 
         seq_len, batch, _ = hidden_states.shape
         seq_len = seq_len * self.sp_size * self.cp_size
@@ -284,6 +302,8 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
             )
 
+        if back_to_input_converter is not None:
+            return norm_out, back_to_input_converter
         return norm_out
 
     def forward(

@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core.context_parallel_layout.conversion import CpPartitionModeConverter
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -296,9 +297,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         return not self.recompute_norm_out
 
     def forward_post_core_attn(
-        self, norm_out: torch.Tensor
+        self, norm_out: torch.Tensor | tuple[torch.Tensor, CpPartitionModeConverter]
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Apply a GDN variant's output projection to its normalized recurrence output."""
+        """Project the recurrence output, then restore this call's input CP layout."""
+        back_to_input_converter = None
+        if isinstance(norm_out, tuple):
+            norm_out, back_to_input_converter = norm_out
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
@@ -306,6 +310,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         if self.recompute_norm_out:
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
+        if back_to_input_converter is not None:
+            out = back_to_input_converter.convert(
+                out, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
         return out, out_bias
 
     def _setup_variant_attrs(self):
