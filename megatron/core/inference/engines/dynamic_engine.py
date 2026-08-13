@@ -1029,7 +1029,20 @@ class DynamicInferenceEngine(AbstractEngine):
             add_time = time.time()
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
-                self._add_request(self.get_request(request_id))
+                request = self.get_request(request_id)
+                self._add_request(request)
+                # Buffer reinit above wipes the context's per-request image
+                # maps. Re-register them from the preserved VLM request fields
+                # so the resumed request sees its own image_embeddings /
+                # image_token_mask when the controller calls
+                # current_image_token_mask on the next step, rather than
+                # falling through to the text-only path.
+                if isinstance(request, DynamicVLMInferenceRequest):
+                    self.context.add_vlm_request_data(
+                        request_id,
+                        image_embeddings=request.image_embeddings,
+                        image_token_mask=request.image_token_mask,
+                    )
 
             # Ensure chunked prefill request remains at the head of the waiting queue
             if self.context.chunked_prefill_request_id != -1:

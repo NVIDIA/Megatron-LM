@@ -841,7 +841,7 @@ class DynamicInferenceRequestRecord:
 
         # Preserve prefix-cache configuration and let __post_init__ recompute hashes for the
         # expanded prompt. The previous hash list may not include newly completed blocks.
-        new_request = DynamicInferenceRequest(
+        common_kwargs = dict(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
@@ -850,6 +850,21 @@ class DynamicInferenceRequestRecord:
             block_size_tokens=old_request.block_size_tokens,
             enable_prefix_caching=old_request.enable_prefix_caching,
         )
+        # Preserve the VLM subtype and multimodal fields so a suspend/resume
+        # cycle doesn't downcast the request to text-only and lose its imgs /
+        # embeddings / token mask.
+        if isinstance(old_request, DynamicVLMInferenceRequest):
+            new_request = DynamicVLMInferenceRequest(
+                **common_kwargs,
+                num_img_embeddings_per_tile=old_request.num_img_embeddings_per_tile,
+                imgs=old_request.imgs,
+                num_tiles=old_request.num_tiles,
+                decoder_seq_length=old_request.decoder_seq_length,
+                image_embeddings=old_request.image_embeddings,
+                image_token_mask=old_request.image_token_mask,
+            )
+        else:
+            new_request = DynamicInferenceRequest(**common_kwargs)
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
         if old_request.event_add_engine is not None:
