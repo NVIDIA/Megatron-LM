@@ -59,6 +59,7 @@ except (ImportError, AttributeError):
 
 pytestmark = [
     pytest.mark.internal,
+    pytest.mark.launch_on_gb200,
     pytest.mark.skipif(
         not is_te_min_version("2.14.0"),
         reason="moe_single_grouped_weight requires Transformer Engine >= 2.14.0",
@@ -696,7 +697,22 @@ class TestMoESingleGroupedWeightNumerics:
             use_transformer_engine_op_fuser=True,
         )
 
-    @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
+    @pytest.mark.parametrize(
+        "precision",
+        [
+            "bf16",
+            "mxfp8",
+            pytest.param(
+                "nvfp4",
+                marks=pytest.mark.skip(
+                    reason=(
+                        "NVFP4 single grouped weights without FP4 parameter gather use a "
+                        "TransformerEngine split-quantize fallback that is being deprecated; "
+                    )
+                ),
+            ),
+        ],
+    )
     @pytest.mark.parametrize("gradient_accumulation_fusion", [False, True])
     def test_single_grouped_weight_parity_without_primary_param_gather(
         self, precision, gradient_accumulation_fusion

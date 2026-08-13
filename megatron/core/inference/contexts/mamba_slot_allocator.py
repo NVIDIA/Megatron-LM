@@ -60,7 +60,7 @@ class MambaSlotAllocator:
         self.num_mamba_layers = num_mamba_layers
 
         gpu_device = torch.cuda.current_device()
-        num_blocks = context.kv_block_allocator.total_count
+        num_blocks = context.kv_block_allocator.pool_size
 
         # Block <-> slot mappings (CPU for bookkeeping).
         self.block_to_slot = torch.full((num_blocks,), -1, dtype=torch.int32, device='cpu')
@@ -216,8 +216,8 @@ class MambaSlotAllocator:
         """Return blocks whose durable Mamba slots have no live KV owner."""
 
         kv_alloc = self.context.kv_block_allocator
-        has_slot_mask = self.block_to_slot[: kv_alloc.total_count] >= 0
-        ref_zero_mask = kv_alloc.block_ref_counts[: kv_alloc.total_count] == 0
+        has_slot_mask = self.block_to_slot[: kv_alloc.pool_size] >= 0
+        ref_zero_mask = kv_alloc.block_ref_counts[: kv_alloc.pool_size] == 0
         return torch.nonzero(has_slot_mask & ref_zero_mask, as_tuple=True)[0]
 
     def _evict_lru_slots_batch(self, num_needed: int, candidate_ids: Tensor) -> list:

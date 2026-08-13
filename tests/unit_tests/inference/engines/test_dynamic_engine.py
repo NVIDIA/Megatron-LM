@@ -6,6 +6,8 @@ import math
 import os
 import random
 import types
+from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Dict, List, Optional, Tuple
@@ -32,7 +34,12 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
-from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    DynamicInferenceRequestRecord,
+    Status,
+    compute_block_hashes_batched,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -40,6 +47,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_inference_spec,
@@ -628,6 +636,164 @@ class DynamicInferenceEngineTestBase:
         return env
 
 
+def _make_prefix_cached_request_for_checkpoint(request_id: int) -> DynamicInferenceRequest:
+    """Build a request whose generated tokens complete one additional cache block."""
+    return DynamicInferenceRequest(
+        request_id=request_id,
+        prompt_tokens=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=6, termination_id=-1),
+        generated_tokens=[5, 6],
+        block_size_tokens=2,
+        enable_prefix_caching=True,
+    )
+
+
+def _assert_prefix_cache_checkpoint(
+    original: DynamicInferenceRequest, checkpointed: DynamicInferenceRequest
+) -> None:
+    """Verify a checkpoint retained config and rehashed its expanded prompt."""
+    expected_prompt = torch.cat(
+        (
+            original.prompt_tokens,
+            torch.tensor(
+                original.generated_tokens,
+                dtype=original.prompt_tokens.dtype,
+                device=original.prompt_tokens.device,
+            ),
+        )
+    )
+    expected_hashes = compute_block_hashes_batched(
+        expected_prompt, block_size=original.block_size_tokens
+    )
+
+    assert checkpointed.enable_prefix_caching is True
+    assert checkpointed.block_size_tokens == original.block_size_tokens
+    assert torch.equal(checkpointed.prompt_tokens, expected_prompt)
+    assert torch.equal(checkpointed.remaining_prompt_tokens, expected_prompt)
+    assert checkpointed.precomputed_block_hashes == expected_hashes
+    assert len(checkpointed.precomputed_block_hashes) == len(original.precomputed_block_hashes) + 1
+
+
+def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes():
+    """Eviction must checkpoint and requeue a prefix-enabled request without losing its config."""
+    request = _make_prefix_cached_request_for_checkpoint(request_id=17)
+    record = DynamicInferenceRequestRecord.from_request(request)
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        chunked_prefill_request_id=-1, kv_block_allocator=types.SimpleNamespace()
+    )
+    engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
+    engine.waiting_request_ids = deque()
+    engine.finished_request_count = 0
+    engine.evicted_request_count = 0
+    engine.track_generated_token_events = False
+    engine.num_speculative_tokens = 0
+    engine.stop_word_being_finished_ids = set()
+
+    active_request_ids, finished_records = engine.post_process_requests(
+        request_ids=torch.empty(0, dtype=torch.int64),
+        finished_request_ids=torch.empty(0, dtype=torch.int64),
+        evict_request_ids=torch.tensor([request.request_id], dtype=torch.int64),
+        step_time=0.0,
+        sample=torch.empty(0, dtype=torch.int64),
+        accepted_tokens=None,
+        log_probs=[],
+        consumed_chunked_prefill_request_id=-1,
+    )
+
+    assert active_request_ids == []
+    assert finished_records == []
+    assert list(engine.waiting_request_ids) == [request.request_id]
+    assert len(record.requests) == 2
+    _assert_prefix_cache_checkpoint(request, engine.get_request(request.request_id))
+
+
+def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes():
+    """RECOMPUTE suspend/resume must re-add the prefix-enabled checkpoint tail."""
+    request = _make_prefix_cached_request_for_checkpoint(request_id=23)
+    record = DynamicInferenceRequestRecord.from_request(request)
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        chunked_prefill_request_id=-1,
+        kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
+        static_kv_memory_pointers=True,
+        deallocate_inference_state_buffers=mock.Mock(),
+        reinitialize_inference_state_buffers=mock.Mock(),
+    )
+    engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
+    engine.waiting_request_ids = deque()
+    engine.state = EngineState.RUNNING
+    engine.unified_memory_level = 0
+    engine.use_coordinator = False
+    engine._add_request = mock.Mock()
+    engine._notify_cond_for_new_request = mock.Mock(return_value=None)
+    engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
+
+    with (
+        mock.patch.object(
+            DynamicInferenceEngine,
+            "suspend_resume_ctx",
+            side_effect=lambda *args, **kwargs: nullcontext(),
+        ),
+        mock.patch.object(InferenceMode, "unset_active"),
+        mock.patch.object(InferenceMode, "set_active"),
+        mock.patch.object(torch.cuda, "synchronize"),
+    ):
+        engine.suspend()
+        checkpointed = engine.get_request(request.request_id)
+        _assert_prefix_cache_checkpoint(request, checkpointed)
+
+        engine.resume()
+
+    assert engine.context.deallocate_inference_state_buffers.call_count == 1
+    assert engine.context.reinitialize_inference_state_buffers.call_count == 1
+    assert engine.state == EngineState.RUNNING
+    assert engine._add_request.call_count == 1
+    assert engine._add_request.call_args.args[0] is checkpointed
+
+
+def test_streaming_partials_are_sent():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._partial_emit_lengths = {}
+    request = types.SimpleNamespace(
+        generated_tokens=[11, 12, 13],
+        generated_log_probs=None,
+        sampling_params=types.SimpleNamespace(streaming=True, return_log_probs=False),
+    )
+    engine.requests = {7: types.SimpleNamespace(record=[request])}
+    engine.socket_for_receiving_requests = mock.Mock()
+
+    engine._try_send_streaming_partials()
+
+    engine.socket_for_receiving_requests.send.assert_called_once()
+    assert engine._partial_emit_lengths == {7: 3}
+
+
+def test_streaming_partials_buffer_until_token_interval():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._partial_emit_lengths = {}
+    request = types.SimpleNamespace(
+        generated_tokens=[11, 12],
+        generated_log_probs=None,
+        sampling_params=SamplingParams(
+            streaming=True, streaming_interval=3, return_log_probs=False
+        ),
+    )
+    engine.requests = {7: types.SimpleNamespace(record=[request])}
+    engine.socket_for_receiving_requests = mock.Mock()
+
+    engine._try_send_streaming_partials()
+
+    engine.socket_for_receiving_requests.send.assert_not_called()
+    assert engine._partial_emit_lengths == {}
+
+    request.generated_tokens.append(13)
+    engine._try_send_streaming_partials()
+
+    engine.socket_for_receiving_requests.send.assert_called_once()
+    assert engine._partial_emit_lengths == {7: 3}
+
+
 class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
     @classmethod
@@ -913,15 +1079,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     def test_generation_within_tight_kv_pool(
         self, num_speculative_tokens: int, exact_fit_tokens: int
     ) -> None:
-        """Admission is bounded by what the active pool can ever grant a running request:
-        paused-pool blocks are not grantable (a request admitted against them pauses forever)
-        and only stored tokens need slots;
+        """Admission is bounded by what the shared pool can grant a running request.
+        Only stored tokens need slots:
         the final sampled token is never stored, the last decode step stores its speculative drafts.
         Exact fit: 8 prompt + (exact_fit_tokens - 1) outputs + drafts = 256."""
         env = self._build_test_env(DynamicEngineTestConfig())
         block_size_bytes = env.engine.context.block_size_bytes
 
-        # 3-block pool: 1 active + 1 paused + 1 dummy.
+        # 2-block pool: 1 usable + 1 dummy.
         test_config = DynamicEngineTestConfig(
             num_requests=3,
             min_prompt_length=8,
@@ -929,19 +1094,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             num_tokens_to_generate=None,
             max_sequence_length=512,
             num_speculative_tokens=num_speculative_tokens,
-            context_buffer_size_gb=3 * block_size_bytes / 1024**3,
-            context_paused_buffer_size_gb=block_size_bytes / 1024**3,
+            context_buffer_size_gb=2 * block_size_bytes / 1024**3,
+            context_paused_buffer_size_gb=0.0,
             context_max_requests=4,
         )
         env = self._build_test_env(test_config)
 
-        # The msl-derived default budget (8 + 504) fits the old total-blocks
-        # bound but needs more than the 1 grantable block; fails at admission.
+        # The msl-derived default budget (8 + 504) exceeds the usable block.
         doomed_request = env.requests[0]
         env.engine._add_request(doomed_request)
         assert doomed_request.status == Status.FAILED
 
-        # One more stored token than the active block holds; fails at admission.
+        # One more stored token than the usable block holds; fails at admission.
         overflow_request = env.requests[2]
         overflow_request.sampling_params.num_tokens_to_generate = exact_fit_tokens + 1
         env.engine._add_request(overflow_request)
@@ -2877,14 +3041,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"num_requests ({len(env.requests)})."
             )
             assert context.max_requests == 4
-        # Exact step counts and KV occupancy depend on sampled token sequences.
+        # Exact step counts depend on sampled token sequences.
         # With DP-offset sampling seeds, only DP rank 0 matches the golden seed.
         if parallel_state.get_data_parallel_rank() == 0:
             if max_requests is None:
                 assert step_count == 23
             else:
                 assert step_count == 35
-            assert context.kv_block_allocator.active_count == 655
+        assert context.kv_block_allocator.pool_size == 819
 
     @pytest.mark.internal
     @pytest.mark.skipif(

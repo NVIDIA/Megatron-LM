@@ -24,6 +24,7 @@ from megatron.training.checkpointing import (
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
+    load_args_from_checkpoint,
     load_checkpoint,
     maybe_save_dataloader_state,
     read_metadata,
@@ -149,6 +150,31 @@ def test_maybe_save_dataloader_state_skips_empty_state_after_barriers(tmp_path):
     save.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("checkpoint_args", "configured_num_householder", "expected_num_householder"),
+    [(SimpleNamespace(gdp_num_householder=5), 3, 5), (SimpleNamespace(), 5, 3)],
+)
+def test_load_args_restores_gdp_num_householder_from_checkpoint(
+    checkpoint_args, configured_num_householder, expected_num_householder
+):
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        gdp_num_householder=configured_num_householder,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.gdp_num_householder == expected_num_householder
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123
@@ -214,7 +240,6 @@ def create_ckpt_load_args(create_args):
     args.tensor_model_parallel_size = 1
     args.pipeline_model_parallel_size = 1
     args.ckpt_assume_constant_structure = False
-    args.stream_ckpt_dequant = True
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
     args.ckpt_load_validate_sharding_integrity = True
