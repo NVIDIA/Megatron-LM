@@ -611,16 +611,17 @@ def vllm_fused_moe(
     # stages) host-side from the token-count hint, not from the worst-case
     # buffer size. Same config is used for both FC1 and FC2 (matches vLLM).
     batch_invariant_mode = batch_invariant.enabled()
+    config = _get_default_config(M=effective_tokens, E=num_local_experts, top_k=topk)
     if batch_invariant_mode:
-        # Batch-invariant mode: the config must not depend on the token count.
-        # _get_default_config is a step function of M, so different co-batch
-        # sizes would otherwise select different tile shapes and change the
-        # fp32 accumulation grouping (batch-variant bits). Pin the large-M
-        # config for every launch; grid SIZING below may still use the hint
-        # (the kernel strides, so grid size never changes per-tile math).
-        config = _get_default_config(M=1 << 30, E=num_local_experts, top_k=topk)
-    else:
-        config = _get_default_config(M=effective_tokens, E=num_local_experts, top_k=topk)
+        # Batch-invariant mode: pin only the K-reduction recipe. The kernel
+        # accumulates in fp32 with no split-K, so bits depend solely on the
+        # K-loop grouping (BLOCK_SIZE_K); M/N tile shapes, tile grouping and
+        # pipeline depth reorder nothing in the accumulation (bf16 products
+        # are exact in fp32 — only the addition order matters). Keeping the
+        # M/N tiling adaptive preserves the decode-tuned configs; pinning
+        # BLOCK_SIZE_K removes the one field _get_default_config varies that
+        # could change the summation order across co-batch sizes.
+        config['BLOCK_SIZE_K'] = 64
 
     sorted_token_ids, expert_ids, num_post_padded = _moe_align_block_size_cuda_graphable(
         routing_map, config['BLOCK_SIZE_M'], num_local_experts, local_expert_start, valid_tokens
