@@ -1798,7 +1798,30 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             with self.attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
 
+        input_layernorm_output = self._reject_residual_returning_norm(
+            input_layernorm_output, "input_layernorm"
+        )
         return input_layernorm_output, residual, (h_res, h_post)
+
+    @staticmethod
+    def _reject_residual_returning_norm(layernorm_output, norm_name):
+        """Reject layernorms that also return a residual.
+
+        Base ``TransformerLayer`` accepts a ``(output, residual)`` tuple from a
+        layernorm and uses the returned residual. mHC cannot: its residual must
+        be the n-stream tensor captured *before* the hyper-connection aggregates
+        n-stream -> single-stream, because ``fused_h_res_h_post_bda`` mixes it
+        with ``H_res``. A norm-supplied single-stream residual would silently
+        produce wrong shapes, so fail fast instead.
+        """
+        if isinstance(layernorm_output, tuple):
+            raise ValueError(
+                f"HyperConnectionTransformerLayer does not support a {norm_name} that "
+                f"returns a (output, residual) tuple. mHC requires the n-stream residual "
+                f"captured before hyper-connection aggregation. Use a layernorm submodule "
+                f"that returns only the normalized output."
+            )
+        return layernorm_output
 
     def _apply_self_attn_bda_step(self, attention_output_with_bias, residual, attn_state):
         """HC fused bias-dropout-add: combines apply_h_res + apply_h_post + bda.
@@ -1867,6 +1890,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
+        pre_mlp_layernorm_output = self._reject_residual_returning_norm(
+            pre_mlp_layernorm_output, "pre_mlp_layernorm"
+        )
         return pre_mlp_layernorm_output, residual, (mlp_h_res, mlp_hc_h_post)
 
     def _apply_mlp_bda_step(self, mlp_output_with_bias, residual, mlp_state):
@@ -2114,16 +2140,7 @@ class MoETransformerLayer(TransformerLayer):
 
         self.mlp.fwd_execution_map = "postprocess"
         output = apply_module(self.mlp)(None, intermediate_tensors=(output, shared_expert_output))
-        out = self._apply_mlp_bda_step((output, mlp_bias), residual)
-
-        if is_graph_capturing() and not is_graph_warmup():
-            for attr_name, attr in self.token_dispatcher_attrs.items():
-                weak_ref = make_weakref(attr, inplace=False)
-                self.token_dispatcher_attrs[attr_name] = weak_ref
-                obj, name = self._resolve_token_dispatcher_attr(attr_name)
-                setattr(obj, name, weak_ref)
-
-        return out
+        return self._apply_mlp_bda_step((output, mlp_bias), residual)
 
     def _forward_mlp(
         self, hidden_states, inference_context=None, padding_mask=None, packed_seq_params=None

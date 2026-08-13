@@ -859,13 +859,21 @@ class CheckpointWithoutOutput(object):
         Initialize CheckpointWithoutOutput.
 
         Args:
-            fp8: Whether to use FP8 mode. Defaults to False.
+            fp8: Quantization recipe, or a bool. Note that the default `fp8=False`
+                 still evaluates to `self.fp8 = True`; every caller that constructs
+                 `CheckpointWithoutOutput()` with no arguments therefore takes the
+                 TE `activation_recompute_forward` path. That is long-standing
+                 behavior which several selective-recompute modules ("layernorm",
+                 "moe_act", "gdn_norm_out") depend on for correct FP8 amax
+                 bookkeeping, so do NOT "fix" this to `bool(fp8)` here — tightening
+                 it changes FP8 numerics and needs its own PR with FP8
+                 functional-test evidence.
             ckpt_manager: Optional CheckpointWithoutOutputManager instance. When provided,
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
         """
-        self.fp8 = bool(fp8)
+        self.fp8 = fp8 is not None
         self.ckpt_manager = ckpt_manager
         self.run_function = None
         self.fwd_cpu_rng_state = None
