@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -573,6 +574,7 @@ def _eager_train_comm_warmup():
         'expert_mp': mpu.get_expert_model_parallel_group,
     }
     warmed = []
+    start = time.perf_counter()
     for name, getter in group_getters.items():
         try:
             group = getter()
@@ -580,13 +582,15 @@ def _eager_train_comm_warmup():
             continue
         if group is None:
             continue
+        group_start = time.perf_counter()
         dist.all_reduce(torch.zeros(1, device='cuda'), group=group)
-        warmed.append(name)
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        warmed.append(f'{name}={time.perf_counter() - group_start:.2f}s')
     log_single_rank(
         logger,
         logging.INFO,
-        f'[EagerCommWarmup] initialized NCCL communicators for: {warmed}',
+        f'[EagerCommWarmup] initialized NCCL communicators in '
+        f'{time.perf_counter() - start:.2f}s: {warmed}',
     )
 
 

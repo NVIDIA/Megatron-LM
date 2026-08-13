@@ -415,6 +415,78 @@ class TestRLUtils:
         lang_module.eval.assert_called_once()
         lang_module.train.assert_called_once()
 
+    @pytest.mark.parametrize(
+        "do_train, skip_train, expect_train_branch",
+        [
+            pytest.param(True, False, True, id="training"),
+            pytest.param(True, True, True, id="inference_only"),
+            pytest.param(False, False, False, id="eval_only"),
+        ],
+    )
+    def test_evaluate_and_print_results_rl_wandb_step_handling(
+        self, monkeypatch, do_train, skip_train, expect_train_branch
+    ):
+        """Only eval-only mode (--skip-train --train-iters 0, do_train=False) takes the decoupled
+        eval_only/* wandb path. --skip-train alone still runs the RL loop with monotonically
+        advancing iteration, so its evals log against the global step (see PR #6043)."""
+        args = SimpleNamespace(
+            do_train=do_train,
+            skip_train=skip_train,
+            world_size=1,
+            cuda_graph_impl="none",
+            rl_offload_optimizer_during_inference=False,
+            rl_prompts_per_eval=1,
+            rl_default_temperature=1.0,
+            rl_default_top_p=1.0,
+            rl_default_top_k=0,
+            seq_length=SEQ,
+        )
+        response = SimpleNamespace(
+            env_id="env", metrics=lambda: {"reward": [1.0, 0.5]}, results=[]
+        )
+        agent = SimpleNamespace(run_evaluation=lambda request: [response])
+        wandb_writer = MagicMock()
+
+        monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(
+            rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
+        )
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
+        )
+        monkeypatch.setattr(rl_utils, "get_agent", lambda *_args: agent)
+        monkeypatch.setattr(
+            rl_utils, "get_asyncio_loop", lambda: SimpleNamespace(run_until_complete=lambda r: r)
+        )
+        monkeypatch.setattr(
+            rl_utils, "EvaluationRequest", lambda **kwargs: SimpleNamespace(**kwargs)
+        )
+        monkeypatch.setattr(rl_utils, "get_wandb_writer", lambda: wandb_writer)
+        monkeypatch.setattr(rl_utils, "lang_rl_log_dir", None)
+        monkeypatch.setattr(rl_utils.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(
+            rl_utils.dist, "gather_object", lambda obj, lst, dst=0: lst.__setitem__(0, obj)
+        )
+
+        rl_utils.evaluate_and_print_results_rl(
+            data_iterator=None,
+            model=[MagicMock()],
+            optimizer=MagicMock(),
+            iteration=7,
+            write_to_tensorboard=False,
+        )
+
+        if expect_train_branch:
+            wandb_writer.log.assert_called_once_with({"env_eval_mean_reward": 0.75}, step=7)
+            wandb_writer.define_metric.assert_not_called()
+        else:
+            wandb_writer.define_metric.assert_called_once_with(
+                "eval_only/*", step_metric="eval_checkpoint_iter"
+            )
+            wandb_writer.log.assert_called_once_with(
+                {"eval_checkpoint_iter": 7, "eval_only/env_eval_mean_reward": 0.75}
+            )
+
     @pytest.mark.parametrize("template_dtype", [torch.float32, torch.bfloat16])
     def test_align_unpacked_inference_logprobs_rides_in_float32(self, template_dtype):
         """Under bf16 training old_logprobs arrives bf16 while wire inference
