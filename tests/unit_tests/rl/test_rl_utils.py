@@ -231,7 +231,7 @@ class TestRLUtils:
         Previously ``get_rollout_generator`` forced ``num_groups`` to 1 whenever it
         streamed with a non-batch submission granularity, collapsing the per-env
         group layout so some environments received zero groups (now a loud
-        ``ValueError`` from ``rollout_group_counts_by_env``). ``num_groups`` must stay at
+        ``ValueError`` from ``rollout_allocations``). ``num_groups`` must stay at
         the trainer batch size (``n_prompts``) regardless of streaming or
         submission granularity.
         """

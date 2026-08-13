@@ -240,7 +240,6 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
     async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
-        env_index: int = 0,
     ) -> GroupRolloutParams:
 
         prompt, golden = await self.get_prompt(validation=request.validation)

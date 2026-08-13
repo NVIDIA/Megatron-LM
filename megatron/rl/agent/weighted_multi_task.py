@@ -9,6 +9,7 @@ from .api import (
     AgentBaseModel,
     ContrastiveRollout,
     ContrastiveRolloutGenerator,
+    EnvAllocation,
     EvaluationAgent,
     EvaluationRequest,
     EvaluationResponse,
@@ -147,8 +148,8 @@ class WeightedMultiTask(
 
         return final_counts
 
-    def rollout_group_counts_by_env(self, num_groups: int) -> list[int]:
-        """Per-batch groups for each weighted env, in env_index order."""
+    def rollout_allocations(self, num_groups: int) -> list[EnvAllocation]:
+        """Constant per-batch allocation for each weighted env, in env order."""
         counts = self._distribute_counts(num_groups)
         env_ids = [
             getattr(agent, "env_id", None) or f"agent_{idx}"
@@ -180,21 +181,20 @@ class WeightedMultiTask(
             num_groups,
             ", ".join(f"{eid}(groups={c})" for eid, c in zip(env_ids, counts)),
         )
-        return [count for count in counts if count > 0]
-
-    def _active_rollout_agents(self, num_groups: int) -> list:
-        """Sub-agents receiving groups, aligned with rollout_group_counts_by_env's env order."""
-        counts = self._distribute_counts(num_groups)
-        return [agent for agent, count in zip(self.agents, counts) if count > 0]
+        return [
+            EnvAllocation(agent=agent, env_id=env_id, num_groups=count)
+            for agent, env_id, count in zip(self.agents, env_ids, counts)
+            if count > 0
+        ]
 
     async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
-        env_index: int = 0,
     ) -> GroupRolloutParams:
-        """Route the group to the sub-agent owning env slot `env_index`."""
-        agent = self._active_rollout_agents(request.num_groups)[env_index]
-        return await agent.prepare_group_rollout(request)
+        raise NotImplementedError(
+            "WeightedMultiTask only routes; the pipeline prepares each group via the "
+            "agent in the matching rollout_allocations entry."
+        )
 
     async def get_rollout_response(self, request, inference_request):
         raise NotImplementedError(

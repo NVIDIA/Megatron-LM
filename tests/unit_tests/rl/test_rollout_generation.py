@@ -69,7 +69,7 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
         self.get_rollout_response_calls += 1
         return await request.inference_interface.agenerate(inference_request)
 
-    async def prepare_group_rollout(self, request, env_index: int = 0):
+    async def prepare_group_rollout(self, request):
         idx = self._call_count
         self._call_count += 1
         self.prepare_group_rollout_calls += 1
@@ -228,7 +228,7 @@ class TestStageFailurePropagation:
     @pytest.mark.asyncio
     async def test_prepare_failure_raises_out_of_run(self):
         class BrokenPrepareGenerator(MockGenerator):
-            async def prepare_group_rollout(self, request, env_index: int = 0):
+            async def prepare_group_rollout(self, request):
                 raise TypeError("agent/pipeline interface mismatch")
 
         request = GroupedRolloutRequest(
@@ -251,9 +251,9 @@ class TestStageFailurePropagation:
         class BrokenBuildGenerator(MockGenerator):
             """First group builds normally; every later group's build_rollout raises."""
 
-            async def prepare_group_rollout(self, request, env_index: int = 0):
+            async def prepare_group_rollout(self, request):
                 idx = self._call_count
-                params = await super().prepare_group_rollout(request, env_index=env_index)
+                params = await super().prepare_group_rollout(request)
                 if idx < 1:
                     return params
 
@@ -447,10 +447,7 @@ class TestGroupedRollouts:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "submission_granularity, consumption_granularity",
-        [
-            pytest.param("B", "B", id="batch_batch"),
-            pytest.param("G", "G", id="group_group"),
-        ],
+        [pytest.param("B", "B", id="batch_batch"), pytest.param("G", "G", id="group_group")],
     )
     async def test_weighted_multi_task(self, submission_granularity, consumption_granularity):
         configs = [
@@ -513,9 +510,7 @@ class TestGroupedRollouts:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "submission_granularity, consumption_granularity",
-        [
-            pytest.param("B", "G", id="batch_group"),
-        ],
+        [pytest.param("B", "G", id="batch_group")],
     )
     async def test_consumption_finer_than_submission_rejected(
         self, submission_granularity, consumption_granularity
@@ -539,8 +534,8 @@ class TestGroupedRollouts:
         ]
         mt = WeightedMultiTask(configs)
         with pytest.raises(ValueError, match="starved"):
-            mt.rollout_group_counts_by_env(1)
-        assert mt.rollout_group_counts_by_env(8) == [6, 2]
+            mt.rollout_allocations(1)
+        assert [a.num_groups for a in mt.rollout_allocations(8)] == [6, 2]
 
         # Evaluation-only envs take no groups and never count as starved.
         mt = WeightedMultiTask(
@@ -554,7 +549,7 @@ class TestGroupedRollouts:
                 )
             ]
         )
-        assert mt.rollout_group_counts_by_env(8) == [6, 2]
+        assert [a.num_groups for a in mt.rollout_allocations(8)] == [6, 2]
 
 
 def make_response(epochs, prompt_length, total_len, content="resp", finish_reason="stop"):

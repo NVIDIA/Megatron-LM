@@ -200,7 +200,7 @@ class RolloutPipeline:
     """Orchestrates grouped rollout generation over an agent, one instance per request.
 
     Constructed and driven by the caller (e.g. the trainer via run());
-    the agent only supplies the env layout, per-group preparation, and inference calls.
+    the agent only supplies the env allocations, per-group preparation, and inference calls.
     """
 
     def __init__(
@@ -221,8 +221,9 @@ class RolloutPipeline:
         ), "InferenceInterface must support raw_text return to provide rollouts."
         self.agent = agent
         self.request = request
+        self.allocations = agent.rollout_allocations(request.num_groups)
         self.gran_policy = _GranularityConfig.from_request(
-            request, agent.rollout_group_counts_by_env(request.num_groups)
+            request, [allocation.num_groups for allocation in self.allocations]
         )
         self.gate = _SubmissionGate(
             capacity=parallel_generation_tasks
@@ -317,9 +318,8 @@ class RolloutPipeline:
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
                     env_index = self.gran_policy.env_of_index(index_in_batch)
                     await self.gate.acquire_for("G")
-                    params: GroupRolloutParams = await self.agent.prepare_group_rollout(
-                        self.request, env_index=env_index
-                    )
+                    agent = self.allocations[env_index].agent
+                    params: GroupRolloutParams = await agent.prepare_group_rollout(self.request)
                     self.prepared_groups_per_env[env_index] += 1
 
                     for rollout_idx in range(self.request.rollouts_per_group):

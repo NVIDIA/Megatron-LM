@@ -193,21 +193,31 @@ class TokenizedRolloutGenerator(Agent, ABC):
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]: ...
 
 
+class EnvAllocation(NamedTuple):
+    """One env's constant share of every trainer batch."""
+
+    agent: "GroupedRolloutGenerator"
+    env_id: str
+    num_groups: int
+
+
 class GroupedRolloutGenerator(Agent, ABC):
     """Agent contract consumed by RolloutPipeline to generate grouped rollouts (e.g. GRPO)."""
 
     @abstractmethod
-    async def prepare_group_rollout(
-        self,
-        request: GroupedRolloutRequest,
-        env_index: int = 0,
-    ) -> GroupRolloutParams:
+    async def prepare_group_rollout(self, request: GroupedRolloutRequest) -> GroupRolloutParams:
         """Return the params for one group's rollouts."""
         ...
 
-    def rollout_group_counts_by_env(self, num_groups: int) -> list[int]:
-        """Returns the groups within a batch that each env contributes, in env order."""
-        return [num_groups]
+    def rollout_allocations(self, num_groups: int) -> list[EnvAllocation]:
+        """Returns each env's per-trainer-batch allocation, in env order."""
+        return [
+            EnvAllocation(
+                agent=self,
+                env_id=getattr(self, "env_id", None) or "rollout",
+                num_groups=num_groups,
+            )
+        ]
 
 
 class EvaluationAgent(Agent, ABC):
