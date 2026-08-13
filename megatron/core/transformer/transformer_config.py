@@ -412,6 +412,11 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    gdn_backend: Literal["torch", "fla", "internal"] = "internal"
+    """Backend used for the gated delta rule recurrence. "torch" selects the native PyTorch
+    implementation, "fla" selects Flash Linear Attention, and "internal" selects the internal
+    chunked implementation."""
+
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
 
@@ -1824,6 +1829,12 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
                 "experimental_attention_variant='gated_delta_net'."
+            )
+
+        if self.gdn_backend not in ("torch", "fla", "internal"):
+            raise ValueError(
+                "gdn_backend must be one of 'torch', 'fla', or 'internal', "
+                f"got {self.gdn_backend!r}."
             )
 
         if self.fp8:

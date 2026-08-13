@@ -6,6 +6,9 @@ This package replaces the former ``megatron/core/ssm/gated_delta_net.py`` module
 at the same import path; the names below preserve that module's public surface.
 """
 
+from megatron.core.ssm.gated_delta_net.backends.internal import (
+    chunk_gated_delta_rule as internal_chunk_gated_delta_rule,
+)
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
     GatedDeltaNetSubmodules,
@@ -29,6 +32,7 @@ __all__ = [
     "causal_conv1d",
     "chunk_gated_delta_rule",
     "get_parameter_local_cp",
+    "internal_chunk_gated_delta_rule",
     "l2norm",
     "tensor_a2a_cp2hp",
     "tensor_a2a_hp2cp",
