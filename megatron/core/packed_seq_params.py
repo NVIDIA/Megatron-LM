@@ -1,9 +1,13 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
+
+if TYPE_CHECKING:
+    from megatron.core.context_parallel_layout import ThdCpRoute
 
 
 @dataclass
@@ -11,6 +15,10 @@ class PackedSeqParams:
     '''
     parameters to TEDotProductAttention and fused rope kernels for the
     `thd` (packed) sequence format
+
+    ``cp_partition_route`` is a per-microbatch THD CP layout conversion route.
+    Metadata annotation helpers update the current partition mode in-place while
+    preserving the route identity.
     '''
 
     qkv_format: str = None
@@ -26,6 +34,8 @@ class PackedSeqParams:
     seq_idx: Tensor = None
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    cp_partition_route: Optional["ThdCpRoute"] = None
     cp_scatter_cache: object = None
 
     def __post_init__(self):
