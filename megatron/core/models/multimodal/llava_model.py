@@ -899,7 +899,11 @@ class LLaVAModel(MegatronModule):
             final_loss_mask = final_loss_mask[:, : self._language_max_sequence_length]
         if final_input_ids.shape[1] > self._language_max_sequence_length:
             final_input_ids = final_input_ids[:, : self._language_max_sequence_length]
-            final_position_ids = final_position_ids[:, : self._language_max_sequence_length]
+            # final_position_ids may be None (dynamic-inference path that
+            # supplies decoder_input directly and doesn't need combined-
+            # sequence position ids).
+            if final_position_ids is not None:
+                final_position_ids = final_position_ids[:, : self._language_max_sequence_length]
 
         return final_embedding, final_labels, final_loss_mask, final_input_ids, final_position_ids
 
