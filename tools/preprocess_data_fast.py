@@ -3,6 +3,7 @@
 """Processing large data for pretraining using gigatoken."""
 
 import argparse
+import awkward as ak
 import gigatoken as gt
 import time
 
@@ -33,10 +34,13 @@ def get_args():
                        help='Path to binary output file without suffix')
     group.add_argument('--log-interval', type=int, required=False, default=10000,
                        help='Interval to log the progress')
+    group.add_argument('--append-eod', action='store_true',
+                       help='Append an <eod> token to the end of a document.')
     args = parser.parse_args()
     args.keep_empty = False
 
     # some default/dummy values for the tokenizer
+    args.use_gigatoken = True
     args.rank = 1
     args.make_vocab_size_divisible_by = 128
     args.tensor_model_parallel_size = 1
@@ -48,9 +52,7 @@ def get_args():
 def process_key(args, key, level):
     tokenizer = build_tokenizer(args)  # each process needs its own tokenizer
 
-    encoded_docs = tokenizer._tokenizer.tokenizer.tokenizer.encode_files(
-        gt.JsonlFileSource([args.input], field=key), parallel=True
-    )
+    encoded_docs = tokenizer.tokenize_files(args.input, key)
 
     bin_file = "{}_{}_{}.bin".format(args.output_prefix, key, level)
     idx_file = "{}_{}_{}.idx".format(args.output_prefix, key, level)
@@ -60,6 +62,8 @@ def process_key(args, key, level):
         dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
     )
     for doc in encoded_docs:
+        if args.append_eod:
+            doc = ak.concatenate([doc, [tokenizer.eod]])
         builder.add_document(doc, [len(doc)])
 
     builder.finalize(idx_file)

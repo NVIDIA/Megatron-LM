@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import awkward as ak
 import logging
 from typing import List, Optional
 
@@ -311,7 +312,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             conversation=conversation, chat_template=chat_template, **kwargs
         )
 
-    def encode_files(paths: list[str], field: str = "text") -> ak.Array:
+    def encode_files(self, paths: list[str], field: str = "text") -> ak.Array:
         if self.use_gigatoken:
             return self.tokenizer.tokenizer.encode_files(
                 gt.JsonlFileSource(paths, field="text"),
