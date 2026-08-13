@@ -959,7 +959,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         model = env.engine.controller.inference_wrapped_model.model
         assert model.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         assert model.config.cuda_graph_modules == []
-        assert model.decoder.cudagraph_manager.cudagraph_runners
+        assert model.cudagraph_manager.cudagraph_runners
+        assert not hasattr(model.decoder, 'cudagraph_manager')
         for layer in model.decoder.layers:
             assert not hasattr(layer, 'cudagraph_manager')
 
