@@ -2009,12 +2009,10 @@ class TransformerConfig(ModelParallelConfig):
                 "The fused inference TP path assumes single-stream residual tensors."
             )
 
-        if self.enable_mhc_connections and (self.num_moe_experts or 0) > 0:
-            raise NotImplementedError(
-                "enable_mhc_connections is not yet supported with MoE layers. "
-                "HyperConnectionTransformerLayer rejects MoE MLP submodules; disable MoE "
-                "(num_moe_experts=None) or disable mHC."
-            )
+        # Note: mHC + MoE is deliberately NOT rejected here. HyperConnectionTransformerLayer
+        # raises for a MoE MLP submodule at build time, which is the precise check; a
+        # config-level `num_moe_experts` guard would also block the documented composition
+        # (wrapping MoE as a HybridStack layer via HyperConnectionHybridLayer).
 
         if self.enable_mhc_connections:
             # TransformerBlock expands to n-stream at `pre_process` and contracts back at

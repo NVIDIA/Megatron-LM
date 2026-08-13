@@ -443,17 +443,6 @@ class TestTransformerConfigRecomputeMhc:
                 "full activation recompute",
             ),
             ({"inference_fuse_tp_communication": True}, NotImplementedError, "single-stream"),
-            (
-                {
-                    "num_moe_experts": 4,
-                    "moe_ffn_hidden_size": 64,
-                    "moe_router_topk": 2,
-                    "moe_router_load_balancing_type": "none",
-                    "moe_token_dispatcher_type": "allgather",
-                },
-                NotImplementedError,
-                "MoE",
-            ),
             ({"mhc_sinkhorn_iterations": 0}, ValueError, "mhc_sinkhorn_iterations"),
             ({"mhc_init_gating_factor": -0.1}, ValueError, "mhc_init_gating_factor"),
         ],
