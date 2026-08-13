@@ -705,7 +705,14 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
         with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
-        ctx.save_for_backward(*detach_variable(args))
+        # Save the raw inputs (as torch.utils.checkpoint does) rather than
+        # detach_variable()-ed copies: detaching here creates leaf tensors that
+        # require grad, and autograd's SavedVariable keeps such leaves alive until
+        # backward even when saved-tensor hooks (e.g. fine-grained activation
+        # offload) pack them away, pinning the input storage on GPU for the whole
+        # forward-backward interval. _recompute() detaches the unpacked tensors
+        # before rerunning the function.
+        ctx.save_for_backward(*args)
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
         checkpoint_without_output_obj.ctx = ctx

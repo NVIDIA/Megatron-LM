@@ -14,6 +14,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import Chun
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import OffloadTensorPool
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
@@ -73,6 +74,95 @@ def test_chunk_offload_handler_respects_tensor_opt_out_flags():
 
     tensor._TE_do_not_offload = True
     assert not handler.tensor_need_offloading_checker(tensor)
+
+
+def _make_chunk_handler_for_offload_reload():
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler.cpu_tensor_pool = OffloadTensorPool(device="cpu", pin_memory=True)
+    handler._cpu_backup_refcount = {}
+    return handler
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_chunk_offload_handler_offloads_base_storage_for_covering_views():
+    handler = _make_chunk_handler_for_offload_reload()
+
+    base = torch.randn(64, 96, device="cuda")
+    view = base[:, :80]  # non-contiguous last-dim slice covering >50% of the storage
+    assert not view.is_contiguous()
+
+    state = handler.offload(view, base_backup_cache={})
+    _, cpu_backup, _, view_meta = state
+    # The full flat storage is offloaded, not a gathered copy of the view.
+    assert cpu_backup.shape == (base.numel(),)
+    assert view_meta == (view.size(), view.stride(), view.storage_offset())
+
+    reloaded = handler.reload(state)
+    torch.cuda.synchronize()
+    assert reloaded.shape == view.shape
+    assert reloaded.stride() == view.stride()
+    assert torch.equal(reloaded, view)
+    # The pool backup was returned after the reload.
+    assert handler.cpu_tensor_pool._stats["current_in_use"] == 0
+
+    # Autograd hands the saved-tensor hooks a detach()-ed alias (e.g. the
+    # checkpoint's saved input), which has no ._base; the storage-based
+    # resolution must still take the base path.
+    detached = base[:, :80].detach()
+    state_d = handler.offload(detached, base_backup_cache={})
+    assert state_d[3] is not None
+    reloaded_d = handler.reload(state_d)
+    torch.cuda.synchronize()
+    assert torch.equal(reloaded_d, detached)
+    assert handler.cpu_tensor_pool._stats["current_in_use"] == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_chunk_offload_handler_gathers_low_coverage_views():
+    handler = _make_chunk_handler_for_offload_reload()
+
+    base = torch.randn(64, 96, device="cuda")
+    view = base[:, :8]  # covers well under BASE_OFFLOAD_MIN_COVERAGE of base
+
+    state = handler.offload(view, base_backup_cache={})
+    _, cpu_backup, _, view_meta = state
+    # Low-coverage views fall back to the contiguous gather.
+    assert view_meta is None
+    assert cpu_backup.shape == view.shape
+
+    reloaded = handler.reload(state)
+    torch.cuda.synchronize()
+    assert reloaded.is_contiguous()
+    assert torch.equal(reloaded, view)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_chunk_offload_handler_dedups_views_sharing_a_base():
+    handler = _make_chunk_handler_for_offload_reload()
+
+    base = torch.randn(64, 96, device="cuda")
+    view_a = base[:, :64]
+    view_b = base[:, 32:]
+
+    base_backup_cache = {}
+    state_a = handler.offload(view_a, base_backup_cache=base_backup_cache)
+    state_b = handler.offload(view_b, base_backup_cache=base_backup_cache)
+    # The shared base storage is copied to CPU exactly once.
+    assert state_a[1] is state_b[1]
+    assert handler._cpu_backup_refcount[id(state_a[1])] == 2
+    assert handler.cpu_tensor_pool._stats["current_in_use"] == 1
+
+    base_reload_cache = {}
+    reloaded_a = handler.reload(state_a, base_reload_cache=base_reload_cache)
+    reloaded_b = handler.reload(state_b, base_reload_cache=base_reload_cache)
+    torch.cuda.synchronize()
+    assert torch.equal(reloaded_a, view_a)
+    assert torch.equal(reloaded_b, view_b)
+    # One shared H2D copy backs both reconstructed views.
+    assert reloaded_a.untyped_storage().data_ptr() == reloaded_b.untyped_storage().data_ptr()
+    # The backup is returned to the pool only by the last reload.
+    assert not handler._cpu_backup_refcount
+    assert handler.cpu_tensor_pool._stats["current_in_use"] == 0
 
 
 def _build_gpt_model(

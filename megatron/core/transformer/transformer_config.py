@@ -553,7 +553,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out".
+    "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -563,8 +563,12 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
-    "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
+    preprocessing.
+    "gdp_qkv": recompute the GatedDeltaProduct causal conv and QKV preparation.
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", and "gdp_qkv" use
+    output-discarding checkpointing, "core_attn", "mlp", "moe", and "shared_experts" use
+    normal checkpointing.
     """
 
     ####################
@@ -1208,6 +1212,17 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Controls usage of the memory efficient path for Mamba layers."""
 
+    gdp_cutedsl_kernel: bool = False
+    """Whether to use the CuTeDSL kernel for the GatedDeltaProduct mixer."""
+
+    gdp_num_chunk_states_to_recompute: int = 2
+    """Checkpoint-coarsening ratio N in [0, 64] for the CuTeDSL GatedDeltaProduct kernel.
+    N=0 checkpoints every chunk state for the backward pass (dense, no recompute). N>=1
+    stores one checkpoint per group of N+1 chunks (1/(N+1) the checkpoint memory) and the
+    backward recomputes each group's N missing chunk states, trading recompute time for
+    activation memory monotonically in N (sweet spot N=2..3). Only honored by kernel
+    builds that expose the num_chunk_states_to_recompute argument."""
+
     mlp_chunks_for_prefill: int = 1
     """The number of chunks along the sequence dimension to use for MLP computation
     during prefill."""
@@ -1244,7 +1259,7 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp".
+             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "gdp_qkv".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1253,6 +1268,8 @@ class TransformerConfig(ModelParallelConfig):
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
     "fused_group_mlp": offload the input of the whole fused grouped MLP.
+    "gdp_qkv": offload the input of the causal conv and QKV preparation in the
+               GatedDeltaProduct mixer.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -1832,6 +1849,8 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "gdn_norm_out",
+                    "gdp_in_proj",
+                    "gdp_qkv",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1916,6 +1935,7 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
+                "gdp_qkv",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
@@ -1927,6 +1947,17 @@ class TransformerConfig(ModelParallelConfig):
                     "attn_proj cannot be set to offload_modules alone without core_attn "
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
+                )
+            if (
+                "gdp_qkv" in self.offload_modules
+                and self.recompute_granularity == "selective"
+                and "gdp_in_proj" in self.recompute_modules
+            ):
+                raise ValueError(
+                    "gdp_qkv cannot be set in offload_modules together with gdp_in_proj in "
+                    "recompute_modules, because gdp_in_proj discards the input of the causal "
+                    "conv and rematerializes it at the start of the mixer backward, leaving "
+                    "nothing for the gdp_qkv offload group to keep on the host."
                 )
             if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
                 offload_inside_moe = {"moe_act", "expert_fc1", "fused_group_mlp"} & set(

@@ -392,7 +392,7 @@ class OffloadTensorGroup:
         stream.wait_event(self._reload_event)
 
     def update_offload_info(self, tensor):
-        """Update the offload information."""
+        """Update the offload information with the tensor actually copied to CPU."""
         self.total_offload_bytes += tensor.numel() * tensor.element_size()
         self.total_tensor_count += 1
 
@@ -828,12 +828,54 @@ class ChunkOffloadHandler:
     Manages tensor groups, coordinates asynchronous GPU-CPU transfers, and handles synchronization.
     """
 
-    def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True):
-        """Offload."""
+    # Minimum fraction of the underlying storage bytes a non-contiguous view must
+    # cover before offloading the storage instead of gathering the view: the
+    # storage path trades D2H/H2D bytes on the copy engines for skipping the
+    # gather kernel and its temporary GPU buffer, which only pays off when the
+    # view spans most of the storage.
+    BASE_OFFLOAD_MIN_COVERAGE = 0.5
+
+    def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True, base_backup_cache=None):
+        """Offload.
+
+        A non-contiguous view that covers most of its underlying storage is
+        offloaded as the flat storage (a plain memcpy plus the view's
+        (size, stride, storage_offset) metadata) instead of being gathered into a
+        temporary contiguous copy. The base is resolved through
+        ``untyped_storage()`` rather than ``._base`` because autograd hands the
+        saved-tensor hooks a detach()-ed alias (e.g. CheckpointWithoutOutput's
+        saved input), which drops the view metadata but not the storage.
+        ``base_backup_cache`` (storage data_ptr -> cpu_backup) deduplicates
+        storages shared by several views within one offload pass; shared backups
+        are refcounted so reload frees them exactly once.
+        """
         debug_rank("--------offload")
 
+        view_meta = None
         if not src_tensor.is_contiguous():
-            src_tensor = src_tensor.contiguous()
+            storage = src_tensor.untyped_storage()
+            element_size = src_tensor.element_size()
+            covered_bytes = src_tensor.numel() * element_size
+            if (
+                storage.nbytes() % element_size == 0
+                and covered_bytes >= self.BASE_OFFLOAD_MIN_COVERAGE * storage.nbytes()
+            ):
+                view_meta = (src_tensor.size(), src_tensor.stride(), src_tensor.storage_offset())
+                # Flat alias of the full storage; contiguous by construction.
+                src_tensor = torch.empty(0, dtype=src_tensor.dtype, device=src_tensor.device).set_(
+                    storage
+                )
+            else:
+                src_tensor = src_tensor.contiguous()
+
+        if view_meta is not None and base_backup_cache is not None:
+            cache_key = src_tensor.untyped_storage().data_ptr()
+            cpu_backup = base_backup_cache.get(cache_key)
+            if cpu_backup is not None:
+                # Another view of the same base was already offloaded in this
+                # pass; reuse its CPU backup instead of copying the storage twice.
+                self._cpu_backup_refcount[id(cpu_backup)] += 1
+                return (src_tensor.device, cpu_backup, use_cpu_pool, view_meta)
 
         if use_cpu_pool:
             cpu_backup = self.cpu_tensor_pool.allocate(src_tensor.shape, dtype=src_tensor.dtype)
@@ -843,21 +885,41 @@ class ChunkOffloadHandler:
             )
 
         cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
-        state = (src_tensor.device, cpu_backup, use_cpu_pool)
+        if view_meta is not None and base_backup_cache is not None:
+            base_backup_cache[cache_key] = cpu_backup
+            self._cpu_backup_refcount[id(cpu_backup)] = 1
+        state = (src_tensor.device, cpu_backup, use_cpu_pool, view_meta)
         return state
 
-    def reload(self, state, non_blocking=None):
-        """Reload."""
+    def reload(self, state, non_blocking=None, base_reload_cache=None):
+        """Reload.
+
+        ``base_reload_cache`` (id(cpu_backup) -> gpu tensor) lets views that share
+        an offloaded base storage share one H2D copy within a reload pass. A
+        refcounted backup is returned to the CPU pool only by its last reload.
+        """
         debug_rank("------reload")
-        dev, cpu_backup, use_cpu_pool = state
+        dev, cpu_backup, use_cpu_pool, view_meta = state
         if non_blocking is None:
             non_blocking = cpu_backup.is_pinned()
-        gpu_tensor = torch.empty(
-            cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
-        )
-        gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
-        if use_cpu_pool:
+        gpu_tensor = None
+        if base_reload_cache is not None:
+            gpu_tensor = base_reload_cache.get(id(cpu_backup))
+        if gpu_tensor is None:
+            gpu_tensor = torch.empty(
+                cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
+            )
+            gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
+            if base_reload_cache is not None:
+                base_reload_cache[id(cpu_backup)] = gpu_tensor
+        remaining = self._cpu_backup_refcount.pop(id(cpu_backup), None)
+        if remaining is not None and remaining > 1:
+            self._cpu_backup_refcount[id(cpu_backup)] = remaining - 1
+        elif use_cpu_pool:
             self.cpu_tensor_pool.free(cpu_backup)
+        if view_meta is not None:
+            size, stride, storage_offset = view_meta
+            gpu_tensor = gpu_tensor.as_strided(size, stride, storage_offset)
         return gpu_tensor
 
     def __init__(
@@ -892,6 +954,9 @@ class ChunkOffloadHandler:
         self._max_inflight_offloads = max_inflight_offloads
         # group_name -> FIFO of offload events for that name (same cap for every name).
         self._offload_pending_by_name: Dict[str, deque] = defaultdict(deque)
+        # id(cpu_backup) -> number of states sharing that base-storage backup;
+        # only populated for deduplicated base offloads (see offload()/reload()).
+        self._cpu_backup_refcount: Dict[int, int] = {}
 
     def reset(self):
         """Reset the chunk offload handler."""
@@ -903,6 +968,7 @@ class ChunkOffloadHandler:
         # Clear the pending-event FIFO at iter boundary so we never wait on
         # an event recorded in a previous (non-captured) iteration.
         self._offload_pending_by_name.clear()
+        self._cpu_backup_refcount.clear()
 
     def find_group_with_name(
         self, groups: list[OffloadTensorGroup], name: str, start_index: int = 0
@@ -1005,13 +1071,23 @@ class ChunkOffloadHandler:
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
         with torch.cuda.stream(self.d2h_stream):
+            # Deduplicates base storages shared by several saved views in this pass.
+            base_backup_cache = {}
+            counted_backups = set()
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
                 if self.tensor_need_offloading_checker(tensor_on_device):
                     state = self.offload(
-                        tensor_on_device, use_cpu_pool=group_to_offload.use_cpu_pool
+                        tensor_on_device,
+                        use_cpu_pool=group_to_offload.use_cpu_pool,
+                        base_backup_cache=base_backup_cache,
                     )
-                    if self.is_warmup:
-                        group_to_offload.update_offload_info(tensor_on_device)
+                    # Account the bytes actually copied to CPU (the base storage
+                    # for view offloads), once per shared backup.
+                    if self.is_warmup and id(state[1]) not in counted_backups:
+                        counted_backups.add(id(state[1]))
+                        group_to_offload.update_offload_info(state[1])
+                    # record_stream on the view marks the shared storage
+                    # allocation, so this also covers base-storage offloads.
                     tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
@@ -1043,10 +1119,12 @@ class ChunkOffloadHandler:
             # Wait for offload to complete before reloading
             if not is_graph_capturing():
                 group_to_reload.wait_offload_event(self.h2d_stream)
+            # Views sharing an offloaded base storage share one H2D copy.
+            base_reload_cache = {}
             for tensor_tag, state in group_to_reload._tensors.items():
                 # Only reload if tensor was offloaded (stored as tuple)
                 if isinstance(state, tuple):
-                    recovered_tensor = self.reload(state)
+                    recovered_tensor = self.reload(state, base_reload_cache=base_reload_cache)
                     debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
                     group_to_reload.push_tensor(tensor_tag, recovered_tensor)
             group_to_reload.record_reload_event(self.h2d_stream)

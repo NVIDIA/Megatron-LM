@@ -3850,8 +3850,9 @@ def train(
                 prof.step()
             elif iteration == args.profile_step_start:
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
-                nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=args.record_shapes)
-                nsys_nvtx_context.__enter__()
+                if args.record_shapes:
+                    nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=args.record_shapes)
+                    nsys_nvtx_context.__enter__()
 
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
