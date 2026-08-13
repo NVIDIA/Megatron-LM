@@ -2493,6 +2493,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # varlen_is_plain_causal
         )
 
 
@@ -2644,6 +2645,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # varlen_is_plain_causal
         )
 
 
