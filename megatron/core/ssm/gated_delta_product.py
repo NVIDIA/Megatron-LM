@@ -982,10 +982,10 @@ class GatedDeltaProductMixer(MegatronModule):
             + (1 + self.num_householder) * self.ngroups_local_tp * self.d_state
             + self.nheads_local_tp * (1 + self.num_householder)
         )
-        # Under GTP, in_proj.weight is GTP-sliced along axis 0. The [z|V|K|Q|b|a] split boundaries
-        # don't line up with GTP slice boundaries, so gather the shards back to TP-local size
-        # (strip the trailing pad rows from the gathered tail) and fall through to the same
-        # split path the non-GTP run uses — saved ckpt format matches a non-GTP run.
+        # Under GTP, in_proj.weight is GTP-sliced along axis 0. The [z|V*|K*|Q|b*|a] split
+        # boundaries don't line up with GTP slice boundaries, so gather the shards back to
+        # TP-local size (strip the trailing pad rows from the gathered tail) and fall through
+        # to the same split path the non-GTP run uses — saved ckpt matches a non-GTP run.
         in_proj_gtp_remat_size = getattr(self.in_proj.weight, "gtp_remat_size", 1)
         in_proj_is_gtp = (
             in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight)
@@ -995,7 +995,7 @@ class GatedDeltaProductMixer(MegatronModule):
             # in_proj.weight was already built at the sharded size by the submodule
             # sharded_state_dict above — and, for native-FP8 GTP, dequantized to BF16 there
             # (make_tp_sharded_tensor_for_checkpoint). Gather those (BF16) shards back to the
-            # full TP-local size so the [z|V|K|Q|b|a] split below matches a non-GTP run.
+            # full TP-local size so the [z|V*|K*|Q|b*|a] split below matches a non-GTP run.
             local = sharded_state_dict[f"{prefix}in_proj.weight"].data.contiguous()
             gathered = torch.empty(
                 (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
@@ -1050,8 +1050,8 @@ class GatedDeltaProductMixer(MegatronModule):
 
         # GTP load-side inverse of the save-time all-gather (see
         # docs/api-guide/core/generalized_tensor_parallel.md §3.3, in_proj note): the checkpoint
-        # stores the FULL TP-local in_proj.weight (pad stripped) under the 6 split keys
-        # [z|V|K|Q|b|a], so the default merge_fn cats them back to ``in_proj_dim`` rows with no
+        # stores the FULL TP-local in_proj.weight (pad stripped) under the per-householder split
+        # keys, so the default merge_fn cats them back to ``in_proj_dim`` rows with no
         # padding. To reload into the live GTP param we must mirror init
         # (``_gtp_slice_one_param``): F.pad the merged tensor with zeros up to
         # ``gtp_remat_local_size * gtp_remat_size``, then slice by ``gtp_remat_local_rank``.

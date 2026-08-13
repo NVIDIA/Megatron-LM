@@ -946,7 +946,7 @@ def _worker_mamba_inproj_optim_param_map(rank, world_size, port):
 # Gated-delta-product (GDP) in_proj: gather+split under GTP_remat
 #
 # GDP's ``in_proj.weight`` is GTP-sliced along axis 0 and zero-padded to an alignment multiple,
-# while the checkpoint splits it into 6 chunks [z|V|K|Q|b|a] whose boundaries do NOT line up with
+# while the checkpoint splits it into householder-major chunks whose boundaries do NOT line up with
 # the GTP slice boundaries. ``GatedDeltaProductMixer.sharded_state_dict`` therefore all-gathers the
 # shards back to the TP-local width and strips the pad before splitting (§3.3), and wraps the
 # factory's merge_fn to re-pad + re-slice on load. The three workers below cover that contract.
@@ -1011,7 +1011,7 @@ def _worker_gdp_inproj_gather_split(rank, world_size, port):
     """GatedDeltaProductMixer.sharded_state_dict under GTP_remat.
 
     Regression for the GDP save crash: the raw GTP shard neither matches ``in_proj_dim`` nor lines
-    up with the [z|V|K|Q|b|a] split boundaries -- the pre-fix code asserted here. Verify the mixer
+    up with the in_proj split boundaries -- the pre-fix code asserted here. Verify the mixer
     gathers back to TP-local size, splits into the 6 chunks a non-GTP_remat run would write, and
     that the load-side merge_fn re-pads + re-slices back to the live GTP shard.
     """
@@ -1034,11 +1034,22 @@ def _worker_gdp_inproj_gather_split(rank, world_size, port):
         # Save side: the gathered tensor is the full TP-local width, pad stripped.
         assert factory.data.size(0) == in_proj_dim, (factory.data.size(0), in_proj_dim)
 
+        from megatron.core.ssm.gated_delta_product import _get_in_proj_checkpoint_split_layout
+
+        # The chunk names/sizes come from _get_in_proj_checkpoint_split_layout (householder-major:
+        # z, V0..V(M-1), K0..K(M-1), Q, b0..b(M-1), a). Derive the expectation from that helper so
+        # this pins "GTP splits exactly like a non-GTP_remat run" rather than a frozen key list.
+        _, expected_names = _get_in_proj_checkpoint_split_layout(
+            mixer.d_inner_local_tp,
+            mixer.ngroups_local_tp * mixer.d_state,
+            mixer.nheads_local_tp,
+            mixer.num_householder,
+        )
         chunks = factory.build_fn(factory.key, factory.data, factory.replica_id, None)
-        assert [t.key.rsplit('.', 1)[-1] for t in chunks] == ["z", "V", "K", "Q", "b", "a"]
+        assert [t.key.rsplit('.', 1)[-1] for t in chunks] == expected_names
         assert sum(t.data.size(0) for t in chunks) == in_proj_dim
 
-        # Load side: cat the 6 chunks, re-pad, re-slice -> exactly this rank's live GTP shard.
+        # Load side: cat the chunks, re-pad, re-slice -> exactly this rank's live GTP shard.
         merged = factory.merge_fn([t.data for t in chunks])
         assert tuple(merged.shape) == tuple(in_proj_w.data.shape), (
             tuple(merged.shape),
