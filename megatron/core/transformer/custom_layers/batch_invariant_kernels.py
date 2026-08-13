@@ -1647,6 +1647,10 @@ def is_batch_invariant_mode_enabled():
 
 _TE_NATIVE_WORKSPACE_BYTES = 1024
 
+# Originals saved by _enable_te_native_workspace_starvation for restoration.
+_TE_WORKSPACE_SIZE_FN_ORIG = None
+_TE_NATIVE_ENV_ORIG: dict = {}
+
 
 def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WORKSPACE_BYTES):
     """Make the NATIVE cuBLASLt GEMM kernels batch-invariant via workspace starvation.
@@ -1666,19 +1670,69 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
       env pin alone never engages for TE-launched GEMMs — patch the size fn and
       clear its lru_cache.
     """
+    import logging
     import os
 
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
-    os.environ.setdefault("CUBLASLT_WORKSPACE_SIZE", "0")
+    global _TE_WORKSPACE_SIZE_FN_ORIG
+    logger = logging.getLogger(__name__)
+
+    # CUBLASLT_WORKSPACE_SIZE must be pinned (not setdefault): a preset value
+    # (e.g. from a determinism launcher) large enough for split-K would make
+    # te_native silently non-invariant on the aten GEMM path.
+    for var, pinned in (("CUBLASLT_WORKSPACE_SIZE", "0"),):
+        prev = os.environ.get(var)
+        if prev is not None and prev != pinned:
+            logger.warning(
+                "te_native batch-invariant backend overriding %s=%s with %s "
+                "(split-K disqualification requires a starved workspace).",
+                var,
+                prev,
+                pinned,
+            )
+        _TE_NATIVE_ENV_ORIG[var] = prev
+        os.environ[var] = pinned
+    if torch.cuda.is_initialized():
+        logger.warning(
+            "te_native backend enabled after CUDA initialization; cuBLASLt "
+            "handles created earlier may retain their original workspace and "
+            "remain batch-variant. Enable batch-invariant mode before the "
+            "first GEMM."
+        )
     try:
         import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
 
-        if hasattr(_te_gemm_mod, "get_cublas_workspace_size_bytes"):
+        if _TE_WORKSPACE_SIZE_FN_ORIG is None and hasattr(
+            _te_gemm_mod, "get_cublas_workspace_size_bytes"
+        ):
+            _TE_WORKSPACE_SIZE_FN_ORIG = _te_gemm_mod.get_cublas_workspace_size_bytes
             _te_gemm_mod.get_cublas_workspace_size_bytes = lambda: workspace_bytes
             if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
                 _te_gemm_mod.get_cublas_workspace.cache_clear()
     except ImportError:
         pass
+
+
+def _disable_te_native_workspace_starvation():
+    """Restore the TE workspace function and env pinned by the te_native backend."""
+    import os
+
+    global _TE_WORKSPACE_SIZE_FN_ORIG
+    if _TE_WORKSPACE_SIZE_FN_ORIG is not None:
+        try:
+            import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
+
+            _te_gemm_mod.get_cublas_workspace_size_bytes = _TE_WORKSPACE_SIZE_FN_ORIG
+            if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
+                _te_gemm_mod.get_cublas_workspace.cache_clear()
+        except ImportError:
+            pass
+        _TE_WORKSPACE_SIZE_FN_ORIG = None
+    for var, prev in _TE_NATIVE_ENV_ORIG.items():
+        if prev is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = prev
+    _TE_NATIVE_ENV_ORIG.clear()
 
 
 def get_batch_invariant_backend() -> str:
@@ -1755,6 +1809,7 @@ def disable_batch_invariant_mode():
     _batch_invariant_LIB = None
     # Restore Transformer Engine kernels if previously patched
     _te_unpatch_for_batch_invariant()
+    _disable_te_native_workspace_starvation()
     _unpin_mamba_autotuners()
 
 
