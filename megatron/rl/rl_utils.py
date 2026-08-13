@@ -604,7 +604,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
 
 def get_environment_rollouts(
     model: LanguageModule, inference_model: LanguageModule, optimizer: MegatronOptimizer, n_prompts: int, samples_per_group: int
-):
+) -> tuple[GroupedRollouts, dict[str, FinishedRequestRecord]]:
     """Sample environment rollouts from an LLM.
 
     Args:
@@ -696,11 +696,13 @@ def get_environment_rollouts(
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
-        with nvtx_range("rl/sync-rollouts", time=True):
+        with nvtx_range("rl/sync-rollout-state", time=True):
             # Wait for Rollouts to be collected
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
-            request_ledger = inference_interface.merge_global_request_ledgers()
+
+            with nvtx_range("rl/sync-request-ledger", time=True):
+                request_ledger = inference_interface.merge_global_request_ledgers()
         logger.debug(f"Got rollouts on rank {rank}")
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
