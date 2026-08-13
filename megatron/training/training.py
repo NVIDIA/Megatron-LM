@@ -2855,7 +2855,7 @@ def training_log(
         if args.record_memory_history and (should_prof_rank or torch.distributed.get_backend() == 'fake'):
             rank = safe_get_rank()
             base, ext = os.path.splitext(args.memory_snapshot_path)
-            snapshot_filename = f"{base}-{rank}{ext}"
+            snapshot_filename = f"{base}_{rank}{ext}"
             torch.cuda.memory._dump_snapshot(snapshot_filename)
 
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
