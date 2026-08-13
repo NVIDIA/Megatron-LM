@@ -38,7 +38,6 @@ from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
 from megatron.rl.inference import ReturnsRaw
-from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -108,15 +107,36 @@ def make_token_rollout(trajectory, logprobs, generation_mask=None, reward=1.0, p
     )
 
 
-class DummyLangModule:
+class DummyConfigModule(torch.nn.Module):
     def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+
+class DummyLogprobsModel(torch.nn.Module):
+    def __init__(self, config, layer_config):
+        super().__init__()
+        self.config = config
+        self.layer = DummyConfigModule(layer_config)
+        self.pg_collection = SimpleNamespace(pp=object())
+        self.config_values_during_forward = None
+
+    def forward(self, tokens, position_ids, attention_mask, **kwargs):
+        del position_ids, attention_mask, kwargs
+        self.config_values_during_forward = (
+            self.config.flash_decode,
+            self.layer.config.flash_decode,
+        )
+        return torch.ones((tokens.shape[0], tokens.shape[1], VOCAB))
+
+
+class DummyLangModule(torch.nn.Module):
+    def __init__(self, config):
+        super().__init__()
         self.config = config
         self.rotary_pos_emb = None
         self.eval = MagicMock()
         self.train = MagicMock()
-
-    def modules(self):
-        return iter(())
 
 
 class DummyMoELayer:
@@ -193,30 +213,6 @@ class TestRLUtils:
         assert args.rl_consumption_granularity == "B"
         assert args.rl_generation_lag == 0
         assert not hasattr(args, "rl_parallel_generation_tasks")
-        assert get_rl_parallel_generation_tasks(args) == 1
-
-    @pytest.mark.parametrize(
-        "submission_granularity, generation_lag, expected_parallel_generation_tasks",
-        [
-            pytest.param("B", 0, 1, id="batch"),
-            pytest.param("B", 2, 3, id="batch_with_lag"),
-            pytest.param("G", 0, 8, id="group"),
-            pytest.param("G", 2, 24, id="group_with_lag"),
-            pytest.param("R", 0, 32, id="rollout"),
-            pytest.param("R", 2, 96, id="rollout_with_lag"),
-        ],
-    )
-    def test_get_rl_parallel_generation_tasks(
-        self, submission_granularity, generation_lag, expected_parallel_generation_tasks
-    ):
-        args = SimpleNamespace(
-            rl_submission_granularity=submission_granularity,
-            rl_generation_lag=generation_lag,
-            grpo_prompts_per_step=8,
-            grpo_group_size=4,
-        )
-
-        assert get_rl_parallel_generation_tasks(args) == expected_parallel_generation_tasks
 
     @pytest.mark.parametrize(
         "rl_partial_rollouts, submission_granularity",
@@ -233,49 +229,52 @@ class TestRLUtils:
         """Regression for the removed ``num_groups=1`` streaming override.
 
         Previously ``get_rollout_generator`` forced ``num_groups`` to 1 whenever it
-        streamed with a non-batch submission granularity. For a multi-environment
-        agent that collapses the per-env group distribution so some environments
-        receive zero groups (and a degenerate all-zero ``agent_slots``), stalling
-        ``get_grouped_rollouts``. ``num_groups`` must stay at the trainer batch size
-        (``n_prompts``) regardless of streaming or submission granularity.
+        streamed with a non-batch submission granularity, collapsing the per-env
+        group layout so some environments received zero groups (now a loud
+        ``ValueError`` from ``rollout_allocations``). ``num_groups`` must stay at
+        the trainer batch size (``n_prompts``) regardless of streaming or
+        submission granularity.
         """
         n_prompts = 8
         captured = {}
         rollout_generator = object()
+        agent = object()
 
-        class Agent:
-            def get_grouped_rollouts(self, request):
+        class FakePipeline:
+            def __init__(self, agent, request, parallel_generation_tasks):
+                captured["agent"] = agent
                 captured["request"] = request
+                captured["parallel_generation_tasks"] = parallel_generation_tasks
+
+            def run(self):
                 return rollout_generator
 
-        def get_agent(_args, parallel_generation_tasks=None):
-            captured["parallel_generation_tasks"] = parallel_generation_tasks
-            return Agent()
-
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
-        monkeypatch.setattr(rl_utils, "get_agent", get_agent)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", None)
+        monkeypatch.setattr(rl_utils, "get_agent", lambda _env_config_path: agent)
+        monkeypatch.setattr(rl_utils, "RolloutPipeline", FakePipeline)
 
-        args = SimpleNamespace(
-            rl_partial_rollouts=rl_partial_rollouts,
-            rl_submission_granularity=submission_granularity,
-            rl_consumption_granularity="B",
-            rl_generation_lag=0,
-            grpo_prompts_per_step=n_prompts,
-            grpo_group_size=4,
-            rl_default_temperature=1.0,
-            inference_max_seq_length=128,
-            rl_default_top_p=1.0,
-            rl_default_top_k=0,
-            grpo_filter_groups_with_same_reward=False,
-        )
-
+        generation_lag = 0
         result = rl_utils.get_rollout_generator(
-            args, inference_interface=ReturnsRaw(), n_prompts=n_prompts, samples_per_group=4
+            ReturnsRaw(),
+            n_prompts,
+            4,
+            streaming=rl_partial_rollouts,
+            generation_args={'temperature': 1.0, 'max_tokens': 128, 'top_p': 1.0, 'top_k': 0},
+            filter_groups_with_same_reward=False,
+            submission_granularity=submission_granularity,
+            consumption_granularity="B",
+            generation_lag=generation_lag,
+            env_config_path="unused.yaml",
         )
 
         assert result is rollout_generator
+        assert captured["agent"] is agent
         assert captured["request"].num_groups == n_prompts
         assert captured["request"].streaming == rl_partial_rollouts
+        # The gate depth handed to the pipeline is lag + 1 trainer batches,
+        # independent of submission granularity.
+        assert captured["parallel_generation_tasks"] == generation_lag + 1
         assert captured["request"].submission_granularity == submission_granularity
 
     @pytest.mark.parametrize(
@@ -295,11 +294,6 @@ class TestRLUtils:
                 {"rl_consumption_granularity": "R"},
                 "--rl-consumption-granularity R is not currently supported",
                 id="rollout_consumption_unsupported",
-            ),
-            pytest.param(
-                {"rl_submission_granularity": "B", "rl_consumption_granularity": "G"},
-                "--rl-submission-granularity B with --rl-consumption-granularity G",
-                id="batch_submit_group_consume_unsupported",
             ),
         ],
     )
@@ -346,17 +340,33 @@ class TestRLUtils:
 
         return MagicMock(side_effect=_toggle)
 
-    def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "share_config",
+        [pytest.param(True, id="shared-config"), pytest.param(False, id="distinct-config")],
+    )
+    @pytest.mark.parametrize("num_experts", [None, 8], ids=["dense", "moe"])
+    def test_megatron_rl_inference_mode_restores_training_cuda_graph_state(
+        self, monkeypatch, share_config, num_experts
+    ):
         config = SimpleNamespace(
             cuda_graph_impl="none",
             cuda_graph_modules=[CudaGraphModule.attn],
             inference_cuda_graph_scope=InferenceCudaGraphScope.none,
         )
-        lang_module = DummyLangModule(config)
+        layer_config = (
+            config
+            if share_config
+            else SimpleNamespace(
+                cuda_graph_impl="none",
+                cuda_graph_modules=[CudaGraphModule.attn],
+                inference_cuda_graph_scope=InferenceCudaGraphScope.none,
+            )
+        )
+        lang_module = DummyLangModule(layer_config)
         model = [SimpleNamespace(config=config, module=lang_module)]
         args = SimpleNamespace(
             rl_training_cuda_graphs=False,
-            num_experts=None,
+            num_experts=num_experts,
             curr_iteration=11,
             cuda_graph_impl="local",
             cuda_graph_modules=[CudaGraphModule.attn],
@@ -368,19 +378,60 @@ class TestRLUtils:
 
         with rl_utils.megatron_rl_inference_mode(model, MagicMock(), "local", False) as result:
             assert result is interface
-            assert config.cuda_graph_impl == "local"
-            assert config.cuda_graph_modules == []
-            assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+            for current_config in (config, layer_config):
+                assert current_config.cuda_graph_impl == "local"
+                assert current_config.cuda_graph_modules == []
+                assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
 
         assert toggle_cuda_graphs.call_args_list == [
             call(lang_module, "local"),
             call(lang_module, "none"),
         ]
-        assert config.cuda_graph_impl == "local"
-        assert config.cuda_graph_modules == [CudaGraphModule.attn]
-        assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        expected_modules = (
+            [
+                CudaGraphModule.mamba,
+                CudaGraphModule.attn,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.moe_preprocess,
+            ]
+            if num_experts is not None
+            else [CudaGraphModule.attn]
+        )
+        for current_config in (config, layer_config):
+            assert current_config.cuda_graph_impl == "local"
+            assert current_config.cuda_graph_modules == expected_modules
+            assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         lang_module.eval.assert_called_once()
         lang_module.train.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "share_config",
+        [pytest.param(True, id="shared-config"), pytest.param(False, id="distinct-config")],
+    )
+    def test_get_logprobs_updates_all_model_configs(self, monkeypatch, share_config):
+        config = SimpleNamespace(flash_decode=True)
+        layer_config = config if share_config else SimpleNamespace(flash_decode=True)
+        model = DummyLogprobsModel(config, layer_config)
+        monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(fp16=False, bf16=False))
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
+        )
+        monkeypatch.setattr(
+            rl_utils, "get_attr_wrapped_model", lambda model, name: getattr(model, name)
+        )
+        monkeypatch.setattr(rl_utils, "is_pp_last_stage", lambda _group: False)
+
+        output = rl_utils.get_logprobs(
+            model,
+            torch.ones((1, 2), dtype=torch.long),
+            position_ids=None,
+            packed_seq_params=object(),
+        )
+
+        assert output.shape == (1, 2, VOCAB)
+        assert model.config_values_during_forward == (False, False)
+        assert config.flash_decode is True
+        assert layer_config.flash_decode is True
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
@@ -719,6 +770,17 @@ class TestRLUtils:
     def test_advantage_calculation(self, num_turns, expected):
         advs = rl_utils.calculate_grpo_advantages([[-1, 1], [4, 4]], num_turns)
         torch.testing.assert_close(torch.tensor(advs), torch.tensor(expected), atol=1e-4, rtol=1e-5)
+
+    def test_bounded_artifact_key(self):
+        short = "env_rollout_table"
+        assert rl_utils._bounded_artifact_key(short) == short
+        long_key = "nemo_gym:" + "x" * 120 + "_staleness_hist"
+        bounded = rl_utils._bounded_artifact_key(long_key)
+        assert len(bounded) == 100
+        assert bounded.startswith(long_key[:91])
+        # Deterministic, and distinct keys stay distinct after bounding.
+        assert bounded == rl_utils._bounded_artifact_key(long_key)
+        assert bounded != rl_utils._bounded_artifact_key(long_key + "y")
 
     @pytest.mark.parametrize(
         "scenario, expected_turn_lens, expected_traj_lens, expected_num_turns",

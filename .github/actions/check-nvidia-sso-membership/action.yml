@@ -1,5 +1,5 @@
 name: 'Check NVIDIA SSO Membership'
-description: 'Check if a GitHub username exists in the NVIDIA SSO users list from github-audits'
+description: 'Check if a GitHub username is in the NVIDIA SSO users list or internal allowlist'
 author: 'NVIDIA'
 
 inputs:
@@ -24,7 +24,7 @@ inputs:
 
 outputs:
   is_member:
-    description: 'Boolean - true if user is in NVIDIA SSO list, false otherwise'
+    description: 'Boolean - true if user is in NVIDIA SSO list or internal allowlist, false otherwise'
     value: ${{ steps.check-membership.outputs.is_member }}
   is_org_member:
     description: 'Boolean - true if user has NVIDIA or NVIDIA-NeMo in org_roles'
@@ -90,6 +90,15 @@ runs:
         SSO_FILE="${{ inputs.sso_users_filename }}"
 
         echo "Checking if $USERNAME is in NVIDIA SSO users list..."
+
+        # Service accounts cannot enroll in SSO but can be explicitly trusted.
+        if [ "$USERNAME" = "svcnemo-autobot" ]; then
+          echo "$USERNAME found in NVIDIA internal user allowlist"
+          echo "is_member=true" >> $GITHUB_OUTPUT
+          echo "is_org_member=false" >> $GITHUB_OUTPUT
+          echo "user_orgs=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
 
         # Check if SSO file is available
         if [ "${{ steps.download-sso.outputs.sso_file_available }}" != "true" ] || [ ! -f "$SSO_FILE" ]; then

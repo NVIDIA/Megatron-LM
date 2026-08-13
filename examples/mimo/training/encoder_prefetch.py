@@ -187,6 +187,10 @@ class EncoderPrefetchLoader:
         """Return this loader as its own iterator."""
         return self
 
+    def save_state(self) -> None:
+        """Keep encoder lookahead derived from the canonical language-loader state."""
+        return None
+
     def start(self) -> None:
         """Initialize CUDA stream state and start the producer thread."""
         with self._condition:
@@ -274,8 +278,8 @@ class EncoderPrefetchLoader:
                 self._condition.notify_all()
                 terminate = source_exhausted or source_error is not None
             if self._debug:
-                assert encode_start is not None
-                _log_producer_debug(batch_id, data_fetch_ms, encode_start, completion_event)
+                if encode_start is not None:
+                    _log_producer_debug(batch_id, data_fetch_ms, encode_start, completion_event)
                 self._drain_encoder_wait_timings()
                 self._drain_projection_timings()
             if terminate:
@@ -288,20 +292,20 @@ class EncoderPrefetchLoader:
         if not isinstance(batch, dict):
             raise TypeError("encoder prefetch source must return a batch dictionary")
         modality_inputs = batch.get("modality_inputs")
-        if not isinstance(modality_inputs, dict) or self._encoder_name not in modality_inputs:
-            raise ValueError(f"batch has no inputs for encoder {self._encoder_name!r}")
 
         with torch.cuda.device(self._device), torch.cuda.stream(self._stream):
             # Encoder ranks intentionally retain only fields consumed by their forward step.
             output_batch = {"input_ids": batch["input_ids"]}
-            encoder_inputs = move_batch_to_cuda(modality_inputs[self._encoder_name])
-            encode_start = torch.cuda.Event(enable_timing=True) if self._debug else None
-            if encode_start is not None:
-                encode_start.record(self._stream)
-            encoded = self._feature_producer(encoder_inputs)
-            if not isinstance(encoded, torch.Tensor):
-                raise TypeError("feature_producer must return one combined tensor")
-            output_batch[PREFETCHED_FEATURES_KEY] = {self._encoder_name: encoded}
+            encode_start = None
+            if modality_inputs:
+                encoder_inputs = move_batch_to_cuda(modality_inputs[self._encoder_name])
+                encode_start = torch.cuda.Event(enable_timing=True) if self._debug else None
+                if encode_start is not None:
+                    encode_start.record(self._stream)
+                encoded = self._feature_producer(encoder_inputs)
+                if not isinstance(encoded, torch.Tensor):
+                    raise TypeError("feature_producer must return one combined tensor")
+                output_batch[PREFETCHED_FEATURES_KEY] = {self._encoder_name: encoded}
             completion_event = torch.cuda.Event(enable_timing=self._debug)
             completion_event.record(self._stream)
         return output_batch, completion_event, encode_start
@@ -349,9 +353,12 @@ class EncoderPrefetchLoader:
             if wait_end_event is not None:
                 wait_end_event.record(current_stream)
                 self._queue_encoder_wait_timing(batch_id, wait_start_event, wait_end_event)
-        _record_feature_streams(item[PREFETCHED_FEATURES_KEY], current_stream)
+        features = item.get(PREFETCHED_FEATURES_KEY)
+        if features is not None:
+            _record_feature_streams(features, current_stream)
+            if self._debug:
+                item[PROJECTION_TIMER_KEY] = _ProjectionTimer(self, batch_id)
         if self._debug:
-            item[PROJECTION_TIMER_KEY] = _ProjectionTimer(self, batch_id)
             _log_consumer_debug(
                 batch_id, ready_at_request, self._depth, completion_event is not None, wait_start
             )

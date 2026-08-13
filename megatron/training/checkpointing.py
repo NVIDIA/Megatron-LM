@@ -15,7 +15,7 @@ import types
 from argparse import Namespace
 from datetime import datetime
 from enum import Enum, auto
-from logging import getLogger
+from logging import DEBUG, getLogger
 from pathlib import Path
 from time import time
 from typing import Any, Dict, List, Optional, Union
@@ -25,7 +25,8 @@ import torch
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
-from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
@@ -39,10 +40,8 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
-from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
-from megatron.post_training.utils import print_distributed_quant_summary
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -65,6 +64,18 @@ try:
     HAVE_MEGATRON_FSDP = True
 except ImportError:
     HAVE_MEGATRON_FSDP = False
+
+
+# [ModelOpt]: Import
+try:
+    from modelopt.torch.opt.plugins import save_modelopt_state, save_sharded_modelopt_state
+
+    from megatron.post_training.utils import print_distributed_quant_summary
+
+    has_nvidia_modelopt = True
+except Exception:
+    has_nvidia_modelopt = False
+
 
 _CHECKPOINT_VERSION = None
 _LOADED_ITERATION = None
@@ -93,9 +104,13 @@ def finalize_deletion_processes(blocking=False):
     finished = []
     for proc in _deletion_processes:
         if not proc.is_alive() or blocking:
-            logger.debug(
-                f'Joining deletion process {proc.pid} (blocking={blocking}, is_alive={proc.is_alive()})'
-            )
+            if logger.isEnabledFor(DEBUG):
+                logger.debug(
+                    "Joining deletion process %s (blocking=%s, is_alive=%s)",
+                    proc.pid,
+                    blocking,
+                    proc.is_alive(),
+                )
             proc.join()
             finished.append(proc)
     for proc in finished:
@@ -158,6 +173,8 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
+    if hasattr(args, 'gdp_num_householder'):
+        _compare('gdp_num_householder', default=3)
     _compare('add_position_embedding', default=True)
     if args.vocab_file:
         _compare('max_position_embeddings')
@@ -827,8 +844,16 @@ def save_checkpoint(
                             else mpu.get_expert_data_parallel_group()
                         )
                     save_strategy = FullyParallelSaveStrategyWrapper(
-                        save_strategy, process_group, args.ckpt_assume_constant_structure
+                        save_strategy,
+                        process_group,
+                        args.ckpt_assume_constant_structure,
+                        validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
                     )
+            # Allow opting out of save-side sharding validation entirely (even on
+            # the first save) via --no-ckpt-load-validate-sharding-integrity. This
+            # skips the world-wide determine_global_metadata all_gather_object.
+            if not args.ckpt_load_validate_sharding_integrity:
+                validate_sharding_integrity = False
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
@@ -848,7 +873,8 @@ def save_checkpoint(
                 verify_integrity=args.verify_integrity,
             )
             # [ModelOpt]: save sharded modelopt_state
-            save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
+            if has_nvidia_modelopt:
+                save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
         elif ckpt_type == CheckpointType.GLOBAL and ckpt_format in ['torch_dcp', 'fsdp_dtensor']:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
@@ -902,10 +928,11 @@ def save_checkpoint(
                 )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
-            if ckpt_type == CheckpointType.LOCAL:
-                print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
-            else:
-                save_modelopt_state(model, state_dict)
+            if has_nvidia_modelopt:
+                if ckpt_type == CheckpointType.LOCAL:
+                    print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
+                else:
+                    save_modelopt_state(model, state_dict)
 
             end_ckpt = time()
             logger.debug(
@@ -1414,7 +1441,97 @@ def generate_state_dict(
     if not args.no_save_rng and rng_state:
         state_dict['rng_state'] = rng_state
 
+    # Optionally avoid persisting TE `_extra_state` artifacts that carry no
+    # irreplaceable state (see `_localize_redundant_extra_states`). Opt-in via
+    # --ckpt-drop-redundant-extra-state (off by default, preserving prior behavior).
+    # Applied here so the SAME decision is used for both the save state dict and
+    # the load *request* (`generate_state_dict` is the shared chokepoint), which
+    # keeps the two symmetric and backward compatible.
+    if args.ckpt_format == "torch_dist" and getattr(
+        args, "ckpt_drop_redundant_extra_state", False
+    ):
+        _localize_redundant_extra_states(state_dict)
+
     return state_dict
+
+
+# Byte markers of the dict keys that TE `get_extra_state` writes ONLY under
+# `if recipe.delayed():` (see TransformerEngine `module/base.py`). Their presence
+# in the serialized payload is a robust, unpickle-free signal that the
+# `_extra_state` carries persistent delayed-scaling state (amax history + scale).
+_FP8_PERSISTENT_EXTRA_STATE_MARKERS = (b"amax_history_fwd", b"scale_fwd", b"scale_bwd")
+
+
+def _fp8_extra_state_is_persistent(data) -> bool:
+    """Whether a TE `_extra_state` payload must be checkpointed.
+
+    A `_extra_state` is worth persisting only when it carries state that cannot
+    be reconstructed from the run config at model-build time, i.e. the
+    delayed-scaling FP8 amax history + scale. Concretely:
+
+    * ``None`` / empty ``uint8`` tensor  -> FP8 disabled        -> NOT persistent
+    * non-empty, no delayed-scaling key  -> block/current scaling (NVFP4, MXFP8,
+      Float8CurrentScaling): recipe + scalars only, all config-derived
+                                                                  -> NOT persistent
+    * non-empty, has ``scale_fwd`` / ``amax_history_fwd`` / ``scale_bwd``
+                                          -> delayed scaling      -> persistent
+
+    The check operates on the raw serialized bytes (the uint8 tensor that
+    ``get_extra_state`` returns) so it needs no unpickling and no TE import.
+    Anything unrecognized defaults to persistent, so real state is never
+    silently dropped.
+    """
+    if data is None:
+        return False
+    if isinstance(data, torch.Tensor):
+        if data.numel() == 0:
+            return False
+        try:
+            raw = data.detach().cpu().contiguous().numpy().tobytes()
+        except Exception:
+            return True
+        return any(marker in raw for marker in _FP8_PERSISTENT_EXTRA_STATE_MARKERS)
+    # Unknown payload type: keep it persistent to be safe.
+    return True
+
+
+def _localize_redundant_extra_states(state_dict):
+    """Rewrite non-persistent TE `_extra_state` ShardedObjects as local objects.
+
+    For checkpoints with no FP8, or with block/current FP8 scaling (NVFP4,
+    MXFP8, Float8CurrentScaling), every `_extra_state` is either empty or a
+    recipe-only blob that the freshly-built model reproduces from config — see
+    `_fp8_extra_state_is_persistent`. Such artifacts are pure overhead: in a
+    large MoE model they account for the overwhelming majority of the
+    checkpoint's ShardedObjects (e.g. ~50k on the 55B hybrid-MoE run).
+
+    Wrapping them in ``LocalNonpersistentObject`` (instead of ``ShardedObject``)
+    means, via the dist-checkpointing pipeline:
+
+    * SAVE: ``save_preprocess`` drops them, so they are never written to disk.
+    * LOAD: ``load_preprocess`` unwraps them back into the loaded state dict with
+      the local (freshly-built) value, so the module's ``_extra_state`` key is
+      still present (strict ``load_state_dict`` stays happy) and
+      ``set_extra_state`` no-ops on the empty/recipe payload.
+
+    Because this runs in ``generate_state_dict`` (shared by save and the load
+    request), the decision is symmetric: dropped keys are never *requested*, so
+    loading an older checkpoint that still stores them simply does not read them
+    (they are neither "missing" nor "unexpected" in the request) — backward
+    compatible. Delayed-scaling `_extra_state` stays a ``ShardedObject`` and is
+    saved/loaded exactly as before.
+    """
+
+    def _maybe_localize(value):
+        if (
+            isinstance(value, ShardedObject)
+            and value.key.endswith("_extra_state")
+            and not _fp8_extra_state_is_persistent(value.data)
+        ):
+            return LocalNonpersistentObject(value.data)
+        return value
+
+    dict_list_map_inplace(_maybe_localize, state_dict)
 
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
@@ -1631,7 +1748,12 @@ def _load_global_dist_base_checkpoint(
             )
 
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, process_group, exchange_algo=args.ckpt_fully_parallel_load_exchange_algo
+            load_strategy,
+            process_group,
+            exchange_algo=args.ckpt_fully_parallel_load_exchange_algo,
+            per_rank_object_load=getattr(
+                args, 'ckpt_fully_parallel_load_per_rank_objects', False
+            ),
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
@@ -1728,10 +1850,16 @@ def _load_base_checkpoint(
             print_rank_0('    will not load any checkpoints and will start from random')
         # Conditionally exit if checkpoint not found.
         if args.exit_on_missing_checkpoint:
-            print_rank_0(">> '--exit-on-missing-checkpoint' set ... exiting. <<")
+            print_rank_0(
+                ">> '--exit-on-missing-checkpoint' is set but no checkpoint was found under "
+                f"load directory '{load_dir}' (missing metadata/tracker file "
+                f"'{tracker_filename}'). Exiting with a non-zero status. <<"
+            )
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
-            sys.exit()
+            # Exit non-zero so that callers (e.g. CI harnesses) detect the missing
+            # checkpoint as a failure instead of silently treating exit code 0 as success.
+            sys.exit(1)
 
         return None, '', False, None
 
@@ -1984,6 +2112,10 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('mamba_head_dim', force=True)
     _set_arg('mamba_num_groups', force=True)
     _set_arg('mamba_num_heads', force=True)
+    # GDP checkpoints created before this argument existed always used three reflections.
+    if not hasattr(checkpoint_args, 'gdp_num_householder'):
+        setattr(checkpoint_args, 'gdp_num_householder', 3)
+    _set_arg('gdp_num_householder', force=True)
     # We need to be able to override hybrid_layer_pattern from the command-line so that different
     # pipelining can be specified when re-loading a model (e.g. for inference or post-training).
     _set_arg('hybrid_layer_pattern')
@@ -2796,7 +2928,8 @@ def load_checkpoint(
                     )
                 log_printed = True
 
-    print_distributed_quant_summary(model, msg='After loading checkpoint')
+    if has_nvidia_modelopt:
+        print_distributed_quant_summary(model, msg='After loading checkpoint')
 
     return iteration, num_floating_point_operations_so_far
 
