@@ -2,9 +2,11 @@
 
 """``fsdp_dtensor`` checkpoint round-trip tests for the MFSDP v2 MCore optimizer."""
 
+import os
 from pathlib import Path
 from typing import Any
 
+import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed.tensor import DTensor
@@ -15,10 +17,13 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -400,3 +405,78 @@ class TestOptimizerCheckpoint:
         _assert_optimizer_matches_snapshot(
             destination_optimizer, state_snapshot, param_group_snapshot
         )
+
+
+class TestOptimizerCheckpointExpertParallel:
+    """Expert parallelism is refused rather than silently mis-checkpointed."""
+
+    def setup_method(self):
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size < 2 or world_size % 2:
+            pytest.skip("MFSDP v2 EP requires an even world size of at least two.")
+        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(1234)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def test_sharded_state_dict_rejects_expert_parallelism(self) -> None:
+        """Building the state dict raises instead of writing a rank-inconsistent checkpoint.
+
+        MFSDP v2 shards expert parameters over the expert-DP mesh and everything else over the
+        DP mesh, and expert parallelism gives each rank a different set of expert FQNs, so the
+        rank-identical DTensor keyspace this format needs cannot be assembled by gathering over
+        one mesh. Until that is implemented, a save has to fail loudly: the alternative is a
+        rank-dependent keyspace, which deadlocks the uneven-DTensor preprocessing.
+        """
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            expert_model_parallel_size=2,
+            moe_layer_freq=[0, 1],
+            moe_token_dispatcher_type="alltoall",
+            moe_router_topk=2,
+            moe_grouped_gemm=True,
+            moe_ffn_hidden_size=128,
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+            params_dtype=torch.float32,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            gradient_accumulation_fusion=False,
+            attention_backend=AttnBackend.unfused,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=8,
+            hybrid_layer_pattern="*E",
+            pg_collection=self.pg_collection,
+        ).cuda()
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                fsdp_all_gather_in_start_param_sync=False,
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=0.0
+            ),
+            [model],
+            use_gloo_process_groups=False,
+        )
+        assert isinstance(optimizer, FullyShardedOptimizer)
+
+        with pytest.raises(NotImplementedError, match="expert parallelism"):
+            optimizer.sharded_state_dict({})
