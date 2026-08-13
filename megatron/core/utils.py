@@ -2705,7 +2705,6 @@ def dsa_mark_end(name: str) -> None:
     _DSA_MARK_STACK.pop().__exit__(None, None, None)
 
 
-
 def _nvtx_range_get_func_path():
     """Get the path of a function. Assumes being called from nvtx_range_push/pop.
 

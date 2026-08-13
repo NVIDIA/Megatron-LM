@@ -28,8 +28,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import dsa_mark_begin, dsa_mark_end, get_pg_size
 
-
-
 try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
@@ -1878,9 +1876,7 @@ class DSAttention(MegatronModule):
             # Whether the pack holds one sequence is a fact about the pack, not about
             # context parallelism; which kernels accept that layout is the scoring
             # plan's decision. Consumers that genuinely need CP already test cp_size.
-            single_packed_thd_sequence = (
-                cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
-            )
+            single_packed_thd_sequence = cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
             packed_query_output_size = (
                 sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
             )
