@@ -247,9 +247,9 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
-    enable_hc = config.enable_hyper_connections
-    hc_module = HyperConnectionModule if enable_hc else IdentityOp
-    layer_module = HyperConnectionTransformerLayer if enable_hc else TransformerLayer
+    enable_mhc = config.enable_mhc_connections
+    hc_module = HyperConnectionModule if enable_mhc else IdentityOp
+    layer_module = HyperConnectionTransformerLayer if enable_mhc else TransformerLayer
 
     layer_specs = []
     for layer_number in range(config.num_layers):
