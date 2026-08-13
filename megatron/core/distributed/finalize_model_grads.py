@@ -6,10 +6,6 @@ from typing import Callable, Dict, List, Optional, Union
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-    uneven_dtensor_to_full_tensor,
-)
-
 try:
     from torch.distributed._tensor import DTensor, distribute_tensor
 
@@ -254,21 +250,13 @@ def _allreduce_embedding_grad(
         grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
         if ddp_config.use_megatron_fsdp:
-            grad = uneven_dtensor_to_full_tensor(orig_grad) if orig_grad is not None else None
-        else:
-            grad = _unshard_if_dtensor(orig_grad)
+            orig_grad = orig_grad._local_tensor if orig_grad is not None else None
+        grad = _unshard_if_dtensor(orig_grad)
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
         torch.distributed.all_reduce(grad, group=embd_group)
-        if ddp_config.use_megatron_fsdp:
-            chunk = orig_grad.__create_chunk_list__()[0]
-            local_slice = tuple(
-                slice(offset, offset + size) for offset, size in zip(chunk.offsets, chunk.sizes)
-            )
-            orig_grad._local_tensor.copy_(grad[local_slice])
-        else:
-            setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+        setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
 def _allreduce_position_embedding_grads(
