@@ -523,9 +523,9 @@ class TestMcoreAdapterExpertParallel:
             reference_loss.backward()
             reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
             assert reference_success
-            assert reference_pre_clip_norm > optimizer_config.clip_grad, (
-                "Reference gradients must exceed the clipping threshold to exercise clipping."
-            )
+            assert (
+                reference_pre_clip_norm > optimizer_config.clip_grad
+            ), "Reference gradients must exceed the clipping threshold to exercise clipping."
             reference_losses.append(reference_loss.detach())
 
         losses = []
