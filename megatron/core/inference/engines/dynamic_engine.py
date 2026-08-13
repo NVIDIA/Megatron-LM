@@ -352,7 +352,15 @@ class DynamicInferenceEngine(AbstractEngine):
         """Number of decode requests awaiting a KV import (none here)."""
         return 0
 
+    @property
+    def has_admittable_kv_import(self) -> bool:
+        """Whether a completed KV import is eligible for admission (false here)."""
+        return False
+
     def _poll_pending_kv_imports(self) -> int:
+        return 0
+
+    def _admit_pending_kv_imports(self) -> int:
         return 0
 
     def _setup_handoff_completion_tracking(self, hostname: str | None = None) -> None:
@@ -1042,6 +1050,17 @@ class DynamicInferenceEngine(AbstractEngine):
         async with self._cond:
             self._cond.notify_all()
 
+    def _send_request_records_to_coordinator(
+        self, records: List[DynamicInferenceRequestRecord]
+    ) -> None:
+        """Send completed or failed request records from the MP coordinator."""
+
+        payload = msgpack.packb(
+            [Headers.ENGINE_REPLY.value, [record.merge().serialize() for record in records]],
+            use_bin_type=True,
+        )
+        self.socket_for_receiving_requests.send(payload)
+
     def _handle_failed_request(self, request_id: int):
         """Handle a failed request by sending the reply immediately.
 
@@ -1077,11 +1096,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Send the reply immediately, because it may never get a chance to be sent again.
         if self.use_coordinator and self.is_mp_coordinator:
-            payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [request_entry.record.merge().serialize()]],
-                use_bin_type=True,
-            )
-            self.socket_for_receiving_requests.send(payload)
+            self._send_request_records_to_coordinator([request_entry.record])
         elif not self.use_coordinator:
             if request.prompt is None:
                 request.prompt = self.controller.tokenizer.detokenize(
@@ -1842,6 +1857,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # lifecycle bookkeeping before preparing the next batch.
         if not self.context.can_prepare_requests():
             return False
+        if self.has_admittable_kv_import:
+            return False
         if not self.waiting_request_ids:
             return True
 
@@ -2431,11 +2448,7 @@ class DynamicInferenceEngine(AbstractEngine):
             ]
             if records_to_send:
                 nvtx_range_push("coordinator_communication")
-                payload = msgpack.packb(
-                    [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
-                    use_bin_type=True,
-                )
-                self.socket_for_receiving_requests.send(payload)
+                self._send_request_records_to_coordinator(records_to_send)
                 nvtx_range_pop("coordinator_communication")
 
             # Stream newly generated tokens for active requests. Finished
@@ -2944,7 +2957,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                 self._poll_pending_kv_imports()
                 self._poll_pending_kv_pushes()
-                if self.context.get_active_request_count() > 0 or self.waiting_request_ids:
+                if (
+                    self.context.get_active_request_count() > 0
+                    or self.waiting_request_ids
+                    or self.has_admittable_kv_import
+                ):
                     await self.async_step()
                 else:
                     # Reached when there is no model work to step but a handoff transfer is
@@ -3041,8 +3058,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.schedule_requests()
 
                 if self.state in (EngineState.RUNNING, EngineState.PAUSING):
-                    local_schedulable = self.context.get_active_request_count() + len(
-                        self.waiting_request_ids
+                    local_schedulable = (
+                        self.context.get_active_request_count()
+                        + len(self.waiting_request_ids)
+                        + int(self.has_admittable_kv_import)
                     )
                     local_pending_imports = self.pending_kv_import_count
                     if self.disable_ep_consensus:

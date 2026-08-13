@@ -107,6 +107,18 @@ class InferenceStateHandoffMixin:
         return len(self._deferred_kv_handoffs) + len(self._pending_kv_imports)
 
     @property
+    def has_admittable_kv_import(self) -> bool:
+        """Whether a completed import can be handled at the next admission point."""
+
+        for pending in self._pending_kv_imports:
+            failed = self._handoff_completion_notifications.get(pending.request_id)
+            if failed is None:
+                continue
+            if failed or can_admit_prefilled_decode(self.context, len(pending.resume_tokens)):
+                return True
+        return False
+
+    @property
     def pending_kv_push_count(self) -> int:
         """Number of prefill sends waiting for transport completion.
 
@@ -173,10 +185,14 @@ class InferenceStateHandoffMixin:
         Side: decode engine; pull and push transport paths.
         """
 
-        if self._kv_transfer_role == "decode" and self.waiting_request_ids:
-            raise RuntimeError(
-                "A disaggregated decode engine cannot schedule prompt prefill requests"
-            )
+        if self._kv_transfer_role == "decode":
+            # Async scheduling reaches this point after consuming the previous
+            # forward's logits. The legacy path does not retain logits across steps.
+            self._admit_pending_kv_imports()
+            if self.waiting_request_ids:
+                raise RuntimeError(
+                    "A disaggregated decode engine cannot schedule prompt prefill requests"
+                )
         super().schedule_waiting_requests()
 
     def setup_kv_transfer(self, role: str, backend: str = "nixl") -> None:
@@ -759,18 +775,22 @@ class InferenceStateHandoffMixin:
                 if first_token == request.sampling_params.termination_id or stop_word_hit:
                     request.sampling_params.num_tokens_to_generate = len(request.generated_tokens)
 
-            admit_prefilled_decode(
-                self.context,
-                request,
-                local_blocks,
-                pending.continuation_blocks,
-                pending.resume_tokens,
-            )
             request.num_cached_tokens = len(pending.prompt)
-            pending.local_blocks = []
-            pending.continuation_blocks = []
-            if self.use_coordinator and self.is_mp_coordinator:
-                self._try_send_streaming_partials()
+            if len(request.generated_tokens) >= request.sampling_params.num_tokens_to_generate:
+                self._release_pending_kv_import(pending)
+                self._complete_handoff_request_without_forward(pending.request_id)
+            else:
+                admit_prefilled_decode(
+                    self.context,
+                    request,
+                    local_blocks,
+                    pending.continuation_blocks,
+                    pending.resume_tokens,
+                )
+                pending.local_blocks = []
+                pending.continuation_blocks = []
+                if self.use_coordinator and self.is_mp_coordinator:
+                    self._try_send_streaming_partials()
 
         def _relay_result(src: asyncio.Future) -> None:
             """Forward decode completion to the handoff future."""
@@ -788,6 +808,32 @@ class InferenceStateHandoffMixin:
 
         request_future.add_done_callback(_relay_result)
 
+    def _complete_handoff_request_without_forward(self, request_id: int) -> None:
+        """Complete an imported request whose transferred token already satisfies it."""
+
+        request_entry = self.requests.pop(request_id)
+        request = request_entry.record[-1]
+        request.generated_length = len(request.generated_tokens)
+        request.status = Status.COMPLETED
+        request.add_event_finish()
+        self.finished_request_count += 1
+
+        if self.use_coordinator and self.is_mp_coordinator:
+            self._send_request_records_to_coordinator([request_entry.record])
+            self._partial_emit_lengths.pop(request_id, None)
+        elif not self.use_coordinator:
+            if request.prompt is None:
+                request.prompt = self.controller.detokenize(
+                    self.controller.tokenizer, request.prompt_tokens.tolist(), remove_EOD=False
+                )
+            request.generated_text = self.controller.detokenize(
+                self.controller.tokenizer,
+                request.generated_tokens,
+                remove_EOD=not request.sampling_params.detokenize_stop_sequence,
+            )
+
+        request_entry.future.set_result(request_entry.record)
+
     def _release_pending_kv_import(self, pending: PendingKvImport) -> None:
         """Release storage owned by an unadmitted decode import.
 
@@ -798,6 +844,8 @@ class InferenceStateHandoffMixin:
         if owned_blocks:
             block_tensor = torch.tensor(owned_blocks, dtype=torch.int32, device="cpu")
             self.context.kv_block_allocator.release_memory_blocks(block_tensor)
+        pending.local_blocks = []
+        pending.continuation_blocks = []
 
     @staticmethod
     def _wait_for_transfer_handles(*handles) -> bool:
@@ -850,7 +898,7 @@ class InferenceStateHandoffMixin:
             pending.terminal_state_reported = True
 
     def _poll_pending_kv_imports(self) -> int:
-        """Finalize decode imports after all model-parallel ranks report completion.
+        """Progress imports without mutating the active decode batch.
 
         Side: decode engine; pull and push transport paths.
         """
@@ -859,11 +907,19 @@ class InferenceStateHandoffMixin:
         if not self._pending_kv_imports:
             return 0
         self._report_completed_kv_imports()
+        return int(self.has_admittable_kv_import)
+
+    def _admit_pending_kv_imports(self) -> int:
+        """Handle completed imports at an engine scheduling admission point.
+
+        Side: decode engine; pull and push transport paths.
+        """
+
         ready = 0
         remaining = deque()
         while self._pending_kv_imports:
             pending = self._pending_kv_imports.popleft()
-            failed = self._handoff_completion_notifications.pop(pending.request_id, None)
+            failed = self._handoff_completion_notifications.get(pending.request_id)
             if failed is None:
                 remaining.append(pending)
                 continue
@@ -876,9 +932,11 @@ class InferenceStateHandoffMixin:
                 if not can_admit_prefilled_decode(self.context, len(pending.resume_tokens)):
                     remaining.append(pending)
                     continue
+                self._handoff_completion_notifications.pop(pending.request_id)
                 self._finalize_kv_handoff_import(pending)
                 ready += 1
             except Exception as exc:
+                self._handoff_completion_notifications.pop(pending.request_id, None)
                 # A peer can fail before posting its half of a two-sided transfer.
                 # Do not wait on this rank's unmatched operation; quarantine its
                 # destination unless its own handle already reached a terminal state.

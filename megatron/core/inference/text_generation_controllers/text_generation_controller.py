@@ -2947,7 +2947,10 @@ class TextGenerationController:
 
         decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)
         if not had_pending_forward:
-            assert active_request_count > 0, "Async no-overlap admission did not add a request."
+            if active_request_count == 0:
+                # An admission callback may resolve queued work without adding
+                # anything that requires a model forward.
+                return DynamicBatchControllerStepResult(decode_only=decode_only)
             return DynamicBatchControllerStepResult(decode_only=decode_only, primer_only=True)
 
         if log_probs_transfer is not None:
