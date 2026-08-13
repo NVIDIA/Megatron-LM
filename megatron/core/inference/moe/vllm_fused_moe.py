@@ -529,6 +529,13 @@ def _moe_sum(
     (downstream RSV reads only the valid range). Only accumulates contributions
     from local experts; non-local topk slots are skipped (their values in
     `input` are undefined).
+
+    Args:
+        apply_weights: multiply each slot by its routing probability (default).
+            Pass False when the probabilities were already applied upstream
+            (e.g. at the activation in batch-invariant mode).
+        acc_fp64: accumulate the topk sum in fp64, making the reduction
+            order-independent by precision.
     """
     if out is None:
         out = torch.empty(max_tokens, K, dtype=torch.float32, device=input.device)
