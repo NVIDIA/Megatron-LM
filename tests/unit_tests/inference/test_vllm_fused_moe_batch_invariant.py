@@ -165,6 +165,30 @@ class TestMoeSumOptions:
         ref = inp.view(max_tokens, topk, K).to(torch.float64).sum(dim=1).to(torch.float32)
         assert torch.equal(out, ref)
 
+    def test_unit_weights_fp32_matches_sequential_reference(self):
+        from megatron.core.inference.moe.vllm_fused_moe import _moe_sum
+
+        inp, probs, routing, max_tokens, topk, K, E = self._setup()
+        out = _moe_sum(
+            inp,
+            probs,
+            max_tokens,
+            topk,
+            K,
+            _vt(max_tokens),
+            routing,
+            0,
+            E,
+            apply_weights=False,
+            acc_fp64=False,
+        )
+        # unit weights => pure sequential fp32 adds (no FMA), so a same-order
+        # torch reference is bitwise-reproducible
+        ref = torch.zeros(max_tokens, K, device="cuda", dtype=torch.float32)
+        for t in range(topk):
+            ref += inp.view(max_tokens, topk, K)[:, t].float()
+        assert torch.equal(out, ref)
+
     def test_default_weighted_fp32_deterministic_and_correct(self):
         from megatron.core.inference.moe.vllm_fused_moe import _moe_sum
 

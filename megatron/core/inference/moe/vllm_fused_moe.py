@@ -492,15 +492,17 @@ def _moe_sum_kernel(
                 lid = eid - local_expert_start
                 if lid >= 0 and lid < num_local_experts:
                     v = tl.load(input_ptr + base + t * K + offs_k, mask=k_mask, other=0.0)
-                    if ACC_FP64:
-                        if APPLY_WEIGHTS:
-                            w = tl.load(topk_weights_ptr + token_id * topk + t)
+                    if APPLY_WEIGHTS:
+                        w = tl.load(topk_weights_ptr + token_id * topk + t)
+                        if ACC_FP64:
                             acc += v.to(tl.float64) * w.to(tl.float64)
                         else:
-                            acc += v.to(tl.float64)
+                            acc += v.to(tl.float32) * w
                     else:
-                        w = tl.load(topk_weights_ptr + token_id * topk + t)
-                        acc += v.to(tl.float32) * w
+                        if ACC_FP64:
+                            acc += v.to(tl.float64)
+                        else:
+                            acc += v.to(tl.float32)
 
             tl.store(output_ptr + token_id_i64 * K + offs_k, acc.to(tl.float32), mask=k_mask)
 
