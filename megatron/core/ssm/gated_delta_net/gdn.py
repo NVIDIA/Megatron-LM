@@ -27,6 +27,9 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.ssm.gated_delta_net.internal_gdn_backend import (
+    chunk_gated_delta_rule as internal_chunk_gated_delta_rule,
+)
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 
@@ -59,10 +62,14 @@ class GatedDeltaNet(_GDNBase):
         self.dt_bias_dim = self.num_v_heads_local_tp
         self.a_log_dim = self.num_v_heads_local_tp
 
-        if self.config.deterministic_mode:
+        if self.config.gdn_gdr_backend == "torch":
             self.gated_delta_rule = torch_chunk_gated_delta_rule
-        else:
+        elif self.config.gdn_gdr_backend == "fla":
             self.gated_delta_rule = chunk_gated_delta_rule
+        elif self.config.gdn_gdr_backend == "internal":
+            self.gated_delta_rule = internal_chunk_gated_delta_rule
+        else:
+            raise ValueError(f"Unsupported GDN GDR backend: {self.config.gdn_gdr_backend!r}.")
 
     def _get_feat_dim_split(self, cp_size_headwise: int) -> tuple[int, int, int, int]:
         """Return GDN1 qkv/z/beta/alpha split sizes for a runtime headwise CP size."""

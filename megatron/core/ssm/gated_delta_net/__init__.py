@@ -6,9 +6,6 @@ This package replaces the former ``megatron/core/ssm/gated_delta_net.py`` module
 at the same import path; the names below preserve that module's public surface.
 """
 
-from megatron.core.ssm.gated_delta_net.backends.internal import (
-    chunk_gated_delta_rule as internal_chunk_gated_delta_rule,
-)
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
     GatedDeltaNetSubmodules,
@@ -23,6 +20,9 @@ from megatron.core.ssm.gated_delta_net.common import (
     tensor_a2a_hp2cp,
 )
 from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet, torch_chunk_gated_delta_rule
+from megatron.core.ssm.gated_delta_net.internal_gdn_backend import (
+    chunk_gated_delta_rule as internal_chunk_gated_delta_rule,
+)
 
 __all__ = [
     "HAVE_FLA",
