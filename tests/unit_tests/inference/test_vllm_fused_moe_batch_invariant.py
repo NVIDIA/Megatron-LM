@@ -105,9 +105,7 @@ class TestWeightedSwigluKernels:
         torch.testing.assert_close(out, _weighted_swiglu_reference(y, probs))
         # bitwise repeat-determinism
         for _ in range(5):
-            assert torch.equal(
-                batch_invariant.swiglu_with_probs(y, perm_map, n_used, probs), out
-            )
+            assert torch.equal(batch_invariant.swiglu_with_probs(y, perm_map, n_used, probs), out)
         # row-locality: a row's bits do not depend on co-batch size
         half_out = batch_invariant.swiglu_with_probs(
             y[:128].contiguous(), perm_map[:128], _vt(128), probs[:128]
@@ -123,9 +121,7 @@ class TestWeightedSwigluKernels:
         probs = torch.rand(rows, device="cuda", dtype=torch.float32)
         bound = torch.tensor(live * ffn, dtype=torch.int64, device="cuda")
         out = batch_invariant.weighted_silu_mul_bounded(y, probs, bound)
-        torch.testing.assert_close(
-            out[:live], _weighted_swiglu_reference(y[:live], probs[:live])
-        )
+        torch.testing.assert_close(out[:live], _weighted_swiglu_reference(y[:live], probs[:live]))
         # rows beyond the device bound are neither read nor written: NaN-poison
         # the tail and require the live rows to stay BITWISE identical
         y2 = y.clone()
@@ -154,12 +150,19 @@ class TestMoeSumOptions:
 
         inp, probs, routing, max_tokens, topk, K, E = self._setup()
         out = _moe_sum(
-            inp, probs, max_tokens, topk, K, _vt(max_tokens), routing, 0, E,
-            apply_weights=False, acc_fp64=True,
+            inp,
+            probs,
+            max_tokens,
+            topk,
+            K,
+            _vt(max_tokens),
+            routing,
+            0,
+            E,
+            apply_weights=False,
+            acc_fp64=True,
         )
-        ref = (
-            inp.view(max_tokens, topk, K).to(torch.float64).sum(dim=1).to(torch.float32)
-        )
+        ref = inp.view(max_tokens, topk, K).to(torch.float64).sum(dim=1).to(torch.float32)
         assert torch.equal(out, ref)
 
     def test_default_weighted_fp32_deterministic_and_correct(self):
@@ -176,8 +179,7 @@ class TestMoeSumOptions:
         # bitwise repeat-determinism of the default path
         for _ in range(5):
             assert torch.equal(
-                _moe_sum(inp, probs, max_tokens, topk, K, _vt(max_tokens), routing, 0, E),
-                out,
+                _moe_sum(inp, probs, max_tokens, topk, K, _vt(max_tokens), routing, 0, E), out
             )
 
 
@@ -206,10 +208,15 @@ class TestVllmFusedMoeBatchInvariance:
         def run(valid, hint):
             with set_batch_invariant_mode(True, backend="triton"):
                 return vllm_fused_moe(
-                    hidden, probs, fc1, fc2,
+                    hidden,
+                    probs,
+                    fc1,
+                    fc2,
                     activation_type=ActivationType.SWIGLU,
-                    num_local_experts=E, local_expert_start=0,
-                    valid_tokens=_vt(valid), routing_map=routing,
+                    num_local_experts=E,
+                    local_expert_start=0,
+                    valid_tokens=_vt(valid),
+                    routing_map=routing,
                     num_tokens_hint=hint,
                 )
 
