@@ -1166,10 +1166,10 @@ def forward_backward_pipelining_with_interleaving(
     # Determine hidden dimension for P2P communication
     # For hyper connections with multiple PP stages, use n-stream dimension
     hidden_dim = config.hidden_size
-    if getattr(config, 'enable_hyper_connections', False) and pipeline_parallel_size > 1:
+    if config.enable_mhc_connections and pipeline_parallel_size > 1:
         # For interleaved PP with hyper connections, all intermediate communications use n-stream
         # Note: This is a simplified approach - proper VPP support may need more complex logic
-        hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
+        hidden_dim = config.hidden_size * config.mhc_num_residual_streams
 
     tensor_shape = [seq_length, micro_batch_size, hidden_dim]
     tensor_shape[0] = tensor_shape[0] // cp_group.size()
@@ -2116,7 +2116,7 @@ def get_tensor_shapes(
     """Determine tensor shapes for pipeline communication.
 
     For hyper connections (mHC), intermediate pipeline stages communicate n-stream tensors
-    with dimension hidden_size * num_residual_streams.
+    with dimension hidden_size * mhc_num_residual_streams.
 
     Args:
         is_recv: If True, compute shape for receiving; if False, for sending.
@@ -2143,7 +2143,7 @@ def get_tensor_shapes(
     # Determine hidden dimension based on hyper connections and pipeline stage
     hidden_size = config.hidden_size
     # TODO: make this more robust, including flexible VPP layout
-    if getattr(config, 'enable_hyper_connections', False) and pp_group is not None:
+    if config.enable_mhc_connections and pp_group is not None:
         pp_rank = pp_group.rank()
         pp_size = pp_group.size()
         # For hyper connections:
@@ -2158,7 +2158,7 @@ def get_tensor_shapes(
             use_nstream = True
 
         if use_nstream:
-            hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
+            hidden_size = hidden_size * config.mhc_num_residual_streams
 
     tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
     return tensor_shapes

@@ -85,8 +85,8 @@ def _make_config(
     num_layers=8,
     pp_size=2,
     vp_size=None,
-    enable_hyper_connections=False,
-    num_residual_streams=4,
+    enable_mhc_connections=False,
+    mhc_num_residual_streams=4,
     account_for_embedding=False,
     account_for_loss=False,
     num_layers_first=None,
@@ -100,8 +100,8 @@ def _make_config(
         num_attention_heads=4,
         pipeline_model_parallel_size=pp_size,
         virtual_pipeline_model_parallel_size=vp_size,
-        enable_hyper_connections=enable_hyper_connections,
-        num_residual_streams=num_residual_streams,
+        enable_mhc_connections=enable_mhc_connections,
+        mhc_num_residual_streams=mhc_num_residual_streams,
         account_for_embedding_in_pipeline_split=account_for_embedding,
         account_for_loss_in_pipeline_split=account_for_loss,
         num_layers_in_first_pipeline_stage=num_layers_first,
@@ -142,7 +142,7 @@ class TestGetTensorShapesWithMHC:
     # --- Without mHC (baseline) ---
 
     def test_no_mhc_pp2_all_stages(self):
-        cfg = _make_config(hidden_size=self.H, pp_size=2, enable_hyper_connections=False)
+        cfg = _make_config(hidden_size=self.H, pp_size=2, enable_mhc_connections=False)
         for rank in range(2):
             for is_recv in (True, False):
                 shapes = self._shapes(cfg, rank, 2, is_recv)
@@ -155,8 +155,8 @@ class TestGetTensorShapesWithMHC:
         cfg = _make_config(
             hidden_size=self.H,
             pp_size=2,
-            enable_hyper_connections=True,
-            num_residual_streams=self.N_STREAMS,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=self.N_STREAMS,
         )
         shapes = self._shapes(cfg, pp_rank=0, pp_size=2, is_recv=False)
         assert shapes == [(self.SEQ, self.MBS, self.H * self.N_STREAMS)]
@@ -166,8 +166,8 @@ class TestGetTensorShapesWithMHC:
         cfg = _make_config(
             hidden_size=self.H,
             pp_size=2,
-            enable_hyper_connections=True,
-            num_residual_streams=self.N_STREAMS,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=self.N_STREAMS,
         )
         shapes = self._shapes(cfg, pp_rank=0, pp_size=2, is_recv=True)
         assert shapes == [(self.SEQ, self.MBS, self.H)]
@@ -177,8 +177,8 @@ class TestGetTensorShapesWithMHC:
         cfg = _make_config(
             hidden_size=self.H,
             pp_size=2,
-            enable_hyper_connections=True,
-            num_residual_streams=self.N_STREAMS,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=self.N_STREAMS,
         )
         shapes = self._shapes(cfg, pp_rank=1, pp_size=2, is_recv=True)
         assert shapes == [(self.SEQ, self.MBS, self.H * self.N_STREAMS)]
@@ -188,8 +188,8 @@ class TestGetTensorShapesWithMHC:
         cfg = _make_config(
             hidden_size=self.H,
             pp_size=2,
-            enable_hyper_connections=True,
-            num_residual_streams=self.N_STREAMS,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=self.N_STREAMS,
         )
         shapes = self._shapes(cfg, pp_rank=1, pp_size=2, is_recv=False)
         assert shapes == [(self.SEQ, self.MBS, self.H)]
@@ -202,8 +202,8 @@ class TestGetTensorShapesWithMHC:
             hidden_size=self.H,
             pp_size=4,
             num_layers=8,
-            enable_hyper_connections=True,
-            num_residual_streams=self.N_STREAMS,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=self.N_STREAMS,
         )
         for rank in (1, 2):
             for is_recv in (True, False):
@@ -219,8 +219,8 @@ class TestGetTensorShapesWithMHC:
         cfg = _make_config(
             hidden_size=self.H,
             pp_size=2,
-            enable_hyper_connections=True,
-            num_residual_streams=self.N_STREAMS,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=self.N_STREAMS,
             sequence_parallel=True,
             tensor_model_parallel_size=2,
         )
@@ -253,7 +253,7 @@ class TestGetNumLayersToBuildWithMHC:
     """
 
     def test_pp2_even_split_mhc(self):
-        cfg = _make_config(num_layers=8, pp_size=2, enable_hyper_connections=True)
+        cfg = _make_config(num_layers=8, pp_size=2, enable_mhc_connections=True)
         assert get_num_layers_to_build(cfg, pp_rank=0) == 4
         assert get_num_layers_to_build(cfg, pp_rank=1) == 4
 
@@ -262,7 +262,7 @@ class TestGetNumLayersToBuildWithMHC:
         cfg = _make_config(
             num_layers=8,
             pp_size=2,
-            enable_hyper_connections=True,
+            enable_mhc_connections=True,
             account_for_embedding=True,
             account_for_loss=True,
         )
@@ -278,7 +278,7 @@ class TestGetNumLayersToBuildWithMHC:
             _make_config(
                 num_layers=12,
                 pp_size=4,
-                enable_hyper_connections=True,
+                enable_mhc_connections=True,
                 account_for_embedding=True,
                 account_for_loss=True,
             )
@@ -288,7 +288,7 @@ class TestGetNumLayersToBuildWithMHC:
         cfg = _make_config(
             num_layers=14,
             pp_size=4,
-            enable_hyper_connections=True,
+            enable_mhc_connections=True,
             account_for_embedding=True,
             account_for_loss=True,
         )
@@ -305,7 +305,7 @@ class TestGetNumLayersToBuildWithMHC:
         cfg = _make_config(
             num_layers=8,
             pp_size=4,
-            enable_hyper_connections=True,
+            enable_mhc_connections=True,
             num_layers_first=2,
             num_layers_last=2,
         )
@@ -316,7 +316,7 @@ class TestGetNumLayersToBuildWithMHC:
 
     def test_vpp_with_mhc(self):
         """VPP=2 with mHC: each VP stage gets half the layers per rank."""
-        cfg = _make_config(num_layers=8, pp_size=2, vp_size=2, enable_hyper_connections=True)
+        cfg = _make_config(num_layers=8, pp_size=2, vp_size=2, enable_mhc_connections=True)
         for pp_rank in range(2):
             for vp_stage in range(2):
                 n = get_num_layers_to_build(cfg, vp_stage=vp_stage, pp_rank=pp_rank)
@@ -329,7 +329,7 @@ class TestGetNumLayersToBuildWithMHC:
                 num_layers=8,
                 pp_size=2,
                 vp_size=2,
-                enable_hyper_connections=True,
+                enable_mhc_connections=True,
                 account_for_embedding=True,
                 account_for_loss=True,
             )
@@ -340,7 +340,7 @@ class TestGetNumLayersToBuildWithMHC:
             num_layers=14,
             pp_size=4,
             vp_size=2,
-            enable_hyper_connections=True,
+            enable_mhc_connections=True,
             account_for_embedding=True,
             account_for_loss=True,
         )
@@ -421,7 +421,7 @@ class TestZeroLayerVPStageWithMHC:
             num_layers=7,
             pp_size=2,
             vp_size=2,
-            enable_hyper_connections=True,
+            enable_mhc_connections=True,
             account_for_embedding=True,
         )
         n = get_num_layers_to_build(cfg, vp_stage=0, pp_rank=0)
@@ -431,7 +431,7 @@ class TestZeroLayerVPStageWithMHC:
     def test_vpp_standalone_loss_last_stage_has_1_layer(self):
         """Last VP stage at last PP rank should have exactly 1 layer (2-1=1)."""
         cfg = _make_config(
-            num_layers=7, pp_size=2, vp_size=2, enable_hyper_connections=True, account_for_loss=True
+            num_layers=7, pp_size=2, vp_size=2, enable_mhc_connections=True, account_for_loss=True
         )
         n = get_num_layers_to_build(cfg, vp_stage=1, pp_rank=1)
         assert n == 1
@@ -443,7 +443,7 @@ class TestZeroLayerVPStageWithMHC:
             num_layers=14,
             pp_size=4,
             vp_size=2,
-            enable_hyper_connections=True,
+            enable_mhc_connections=True,
             account_for_embedding=True,
             account_for_loss=True,
         )
@@ -472,14 +472,14 @@ class TestVPPTensorShapeWithMHC:
 
         config = SimpleNamespace(
             hidden_size=hidden_size,
-            enable_hyper_connections=True,
-            num_residual_streams=n_streams,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=n_streams,
             sequence_parallel=False,
         )
 
         hidden_dim = config.hidden_size
-        if getattr(config, 'enable_hyper_connections', False) and pp_size > 1:
-            hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
+        if getattr(config, 'enable_mhc_connections', False) and pp_size > 1:
+            hidden_dim = config.hidden_size * getattr(config, 'mhc_num_residual_streams', 1)
 
         assert hidden_dim == hidden_size * n_streams
 
@@ -489,12 +489,12 @@ class TestVPPTensorShapeWithMHC:
         pp_size = 2
 
         config = SimpleNamespace(
-            hidden_size=hidden_size, enable_hyper_connections=False, sequence_parallel=False
+            hidden_size=hidden_size, enable_mhc_connections=False, sequence_parallel=False
         )
 
         hidden_dim = config.hidden_size
-        if getattr(config, 'enable_hyper_connections', False) and pp_size > 1:
-            hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
+        if getattr(config, 'enable_mhc_connections', False) and pp_size > 1:
+            hidden_dim = config.hidden_size * getattr(config, 'mhc_num_residual_streams', 1)
 
         assert hidden_dim == hidden_size
 
@@ -506,14 +506,14 @@ class TestVPPTensorShapeWithMHC:
 
         config = SimpleNamespace(
             hidden_size=hidden_size,
-            enable_hyper_connections=True,
-            num_residual_streams=n_streams,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=n_streams,
             sequence_parallel=False,
         )
 
         hidden_dim = config.hidden_size
-        if getattr(config, 'enable_hyper_connections', False) and pp_size > 1:
-            hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
+        if getattr(config, 'enable_mhc_connections', False) and pp_size > 1:
+            hidden_dim = config.hidden_size * getattr(config, 'mhc_num_residual_streams', 1)
 
         assert hidden_dim == hidden_size
 
@@ -531,7 +531,7 @@ class TestPPShapeConsistencyWithMHC:
 
     def test_pp2_mhc_send_recv_match(self):
         """Rank 0's send shape must match rank 1's recv shape."""
-        cfg = _make_config(hidden_size=64, pp_size=2, enable_hyper_connections=True)
+        cfg = _make_config(hidden_size=64, pp_size=2, enable_mhc_connections=True)
         shapes = _get_send_recv_shapes(cfg, 2)
         assert (
             shapes[0][0] == shapes[1][1]
@@ -539,7 +539,7 @@ class TestPPShapeConsistencyWithMHC:
 
     def test_pp4_mhc_all_consecutive_match(self):
         """For all consecutive stages, send[i] == recv[i+1]."""
-        cfg = _make_config(hidden_size=64, num_layers=8, pp_size=4, enable_hyper_connections=True)
+        cfg = _make_config(hidden_size=64, num_layers=8, pp_size=4, enable_mhc_connections=True)
         shapes = _get_send_recv_shapes(cfg, 4)
         for i in range(3):
             assert (
@@ -573,7 +573,7 @@ class TestStandaloneEmbeddingLossWithMHC:
             num_layers=7,
             pp_size=2,
             vp_size=2,
-            enable_hyper_connections=True,
+            enable_mhc_connections=True,
             account_for_embedding=True,
         )
         # rank 0, vp 0: first stage → 2 - 1(embed) = 1
@@ -587,7 +587,7 @@ class TestStandaloneEmbeddingLossWithMHC:
     def test_standalone_loss_last_stage_has_fewer_layers(self):
         """With standalone loss, last PP/VP stage gets 1 fewer layer."""
         cfg = _make_config(
-            num_layers=7, pp_size=2, vp_size=2, enable_hyper_connections=True, account_for_loss=True
+            num_layers=7, pp_size=2, vp_size=2, enable_mhc_connections=True, account_for_loss=True
         )
         # (7+1)/2 = 4, 4/2 = 2 per VP
         # rank 0: 2 each VP
@@ -604,8 +604,8 @@ class TestStandaloneEmbeddingLossWithMHC:
             hidden_size=64,
             num_layers=14,
             pp_size=4,
-            enable_hyper_connections=True,
-            num_residual_streams=4,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=4,
             account_for_embedding=True,
             account_for_loss=True,
         )
@@ -644,8 +644,8 @@ class TestStandaloneEmbeddingLossWithMHC:
             hidden_size=H,
             num_layers=8,
             pp_size=2,
-            enable_hyper_connections=True,
-            num_residual_streams=N,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=N,
         )
         tp, cp = _make_tp_cp_groups()
         send_0 = get_tensor_shapes(
@@ -683,8 +683,8 @@ class TestStandaloneEmbeddingLossWithMHC:
             hidden_size=H,
             num_layers=8,
             pp_size=2,
-            enable_hyper_connections=True,
-            num_residual_streams=N,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=N,
         )
         tp, cp = _make_tp_cp_groups()
         send_last = get_tensor_shapes(
@@ -756,8 +756,8 @@ class TestPPForwardWithMHC:
                 bf16=True,
                 pipeline_model_parallel_size=pp_size,
                 virtual_pipeline_model_parallel_size=vp_size,
-                enable_hyper_connections=enable_mhc,
-                num_residual_streams=4 if enable_mhc else 1,
+                enable_mhc_connections=enable_mhc,
+                mhc_num_residual_streams=4 if enable_mhc else 1,
                 account_for_embedding_in_pipeline_split=account_for_embedding,
                 account_for_loss_in_pipeline_split=account_for_loss,
                 hidden_dropout=0.0,
@@ -873,8 +873,8 @@ def _make_layout_config(
     num_layers=8,
     pp_size=2,
     layout=None,
-    enable_hyper_connections=False,
-    num_residual_streams=4,
+    enable_mhc_connections=False,
+    mhc_num_residual_streams=4,
     **extra,
 ):
     """Build a TransformerConfig with a flexible VPP layout for testing.
@@ -889,8 +889,8 @@ def _make_layout_config(
         pipeline_model_parallel_size=pp_size,
         pipeline_model_parallel_layout=layout,
         pipeline_dtype=torch.bfloat16,
-        enable_hyper_connections=enable_hyper_connections,
-        num_residual_streams=num_residual_streams,
+        enable_mhc_connections=enable_mhc_connections,
+        mhc_num_residual_streams=mhc_num_residual_streams,
         use_cpu_initialization=True,
     )
     kwargs.update(extra)
@@ -928,8 +928,8 @@ class TestFlexibleVPPLayoutLayerCountsWithMHC:
             num_layers=7,
             pp_size=2,
             layout=layout,
-            enable_hyper_connections=True,
-            num_residual_streams=4,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=4,
         )
 
         expected = {(0, 0): 0, (0, 1): 1, (1, 0): 6, (1, 1): 0}
@@ -962,7 +962,7 @@ class TestFlexibleVPPLayoutLayerCountsWithMHC:
             pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
         )
         cfg = _make_layout_config(
-            num_layers=8, pp_size=2, layout=layout, enable_hyper_connections=True
+            num_layers=8, pp_size=2, layout=layout, enable_mhc_connections=True
         )
 
         expected = {(0, 0): 2, (0, 1): 1, (1, 0): 4, (1, 1): 1}
@@ -989,7 +989,7 @@ class TestFlexibleVPPLayoutLayerCountsWithMHC:
             pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
         )
         cfg = _make_layout_config(
-            num_layers=7, pp_size=2, layout=layout, enable_hyper_connections=True
+            num_layers=7, pp_size=2, layout=layout, enable_mhc_connections=True
         )
 
         expected = {(0, 0): 0, (0, 1): 0, (1, 0): 7, (1, 1): 0}
@@ -1012,10 +1012,10 @@ class TestFlexibleVPPLayoutLayerCountsWithMHC:
             pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
         )
         cfg_mhc = _make_layout_config(
-            num_layers=8, pp_size=2, layout=layout, enable_hyper_connections=True
+            num_layers=8, pp_size=2, layout=layout, enable_mhc_connections=True
         )
         cfg_no_mhc = _make_layout_config(
-            num_layers=8, pp_size=2, layout=layout, enable_hyper_connections=False
+            num_layers=8, pp_size=2, layout=layout, enable_mhc_connections=False
         )
 
         for pp_rank in range(2):
@@ -1043,8 +1043,8 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
             num_layers=7,
             pp_size=2,
             layout=[["embedding"], ["decoder"] * 6, ["decoder"], ["loss"]],
-            enable_hyper_connections=True,
-            num_residual_streams=N,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=N,
         )
         shapes = _get_send_recv_shapes(cfg, pp_size=2)
         assert (
@@ -1073,8 +1073,8 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
             num_layers=8,
             pp_size=4,
             layout=layout,
-            enable_hyper_connections=True,
-            num_residual_streams=N,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=N,
         )
         shapes = _get_send_recv_shapes(cfg, pp_size=4)
         for i in range(3):
@@ -1098,7 +1098,7 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
             num_layers=7,
             pp_size=2,
             layout=[["embedding"], ["decoder"] * 6, ["decoder"], ["loss"]],
-            enable_hyper_connections=False,
+            enable_mhc_connections=False,
         )
         shapes = _get_send_recv_shapes(cfg, pp_size=2)
         for i in range(1):
@@ -1114,8 +1114,8 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
             num_layers=8,
             pp_size=2,
             layout=layout,
-            enable_hyper_connections=True,
-            num_residual_streams=N,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=N,
         )
         shapes = _get_send_recv_shapes(cfg, pp_size=2)
         assert (

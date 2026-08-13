@@ -1979,18 +1979,6 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.enable_mhc_connections:
-            # TransformerBlock expands to n-stream at `pre_process` and contracts back at
-            # the stage holding the final layernorm, so every intermediate pipeline stage
-            # exchanges [s, b, n*C] while the p2p buffers are still sized from hidden_size.
-            # Pipeline support lands in the follow-up mHC split, which lifts this guard.
-            if self.pipeline_model_parallel_size > 1:
-                raise NotImplementedError(
-                    "enable_mhc_connections does not support pipeline_model_parallel_size > 1 "
-                    "yet. Inter-stage activations are n-stream ([s, b, n*C]) while pipeline "
-                    "p2p buffers are sized from hidden_size, so the shapes disagree. Use "
-                    "pipeline_model_parallel_size=1 until mHC pipeline support lands."
-                )
-
             # The residual carried across an mHC layer is the n-stream tensor consumed by
             # `fused_h_res_h_post_bda` (a bmm against h_res), not the single-stream residual
             # the base layer casts. Upcasting it alone would mismatch the h_res dtype.

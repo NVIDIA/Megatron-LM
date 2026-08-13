@@ -406,16 +406,22 @@ class TestTransformerConfigRecomputeMhc:
         assert "mhc" in config.recompute_modules
         assert config.enable_mhc_connections is True
 
-    def test_config_rejects_pipeline_parallel(self):
-        """mHC expands to n-stream inside the block, so PP p2p shapes disagree."""
-        with pytest.raises(NotImplementedError, match="pipeline_model_parallel_size"):
-            TransformerConfig(
-                num_layers=2,
-                hidden_size=64,
-                num_attention_heads=4,
-                enable_mhc_connections=True,
-                pipeline_model_parallel_size=2,
-            )
+    def test_config_accepts_pipeline_parallel(self):
+        """PP is supported now that the schedules size p2p buffers from n*C.
+
+        Split 1 rejected pipeline_model_parallel_size > 1 because the p2p
+        buffers were still sized from hidden_size. This split teaches
+        get_tensor_shapes about n-stream activations, so the guard is lifted.
+        """
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            pipeline_model_parallel_size=2,
+        )
+        assert config.enable_mhc_connections is True
+        assert config.pipeline_model_parallel_size == 2
 
     def test_config_rejects_fp32_residual_connection(self):
         """The mHC residual is the n-stream tensor fed to the H_res bmm."""
