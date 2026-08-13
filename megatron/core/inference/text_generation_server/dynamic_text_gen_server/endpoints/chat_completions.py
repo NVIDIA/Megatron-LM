@@ -785,6 +785,15 @@ try:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
+        # TODO(perf): with n > 1, the same ``image_bytes_list`` is forwarded n
+        # times, and every admission independently re-preprocesses the bytes
+        # and runs the vision encoder. The engine has an
+        # ``ImageProcessingConfig`` that could preprocess once here if it were
+        # plumbed to the HTTP layer; embedding-level reuse across the n
+        # requests would need a wider change (compute embeddings once, ship
+        # them as a serialized tensor dict on the wire, skip the encoder for
+        # admissions 2..n). Kept as a known limitation for a follow-up so this
+        # PR stays scoped.
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
             # Streaming currently supports only Hugging Face fast tokenizers.
