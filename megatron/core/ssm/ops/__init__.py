@@ -11,6 +11,9 @@ Organized by which recurrence a kernel belongs to:
 
 The re-exports below are the historical top-level entry points and are kept so
 existing callers do not have to spell out the subpackage.
+
+This package is internal to Megatron Core. The kernels here are implementation
+details of the SSM mixers, not a supported kernel library.
 """
 
 try:
