@@ -21,6 +21,9 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
+
+# Decode uses the in-repo Triton conv update, which accepts int64 slot indices.
+from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.packed_seq_helpers import (
     build_packed_seq_idx,
     check_fla_sequence_packing_support,
@@ -38,11 +41,10 @@ from megatron.core.transformer.utils import (
 from megatron.core.utils import deprecate_inference_params
 
 try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d import causal_conv1d_fn
     from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 except ImportError:
     causal_conv1d_fn = None
-    causal_conv1d_update = None
     causal_conv1d_varlen_states = None
 
 try:
@@ -604,9 +606,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             dim=-1,
         )
 
-        # Indexed conv update: reads/writes the per-request conv state rows
-        # selected by ``batch_indices``, in place. ``self.activation`` must be the
-        # activation *string* so the kernel enables SiLU (a bool would disable it).
+        # Indexed conv update into the per-request state rows (``batch_indices``
+        # is None for static batching, where the cache is already in order).
         VKQ = causal_conv1d_update(
             VKQ,
             conv_state,
