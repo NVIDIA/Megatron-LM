@@ -173,8 +173,8 @@ class MockOptimizer(MockState):
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)
         self.param_groups = [param_group.copy() for param_group in state_dict["param_groups"]]
-        
-        
+
+
 @pytest.mark.parametrize(
     ("checkpoint_args", "configured_num_householder", "expected_num_householder"),
     [(SimpleNamespace(gdp_num_householder=5), 3, 5), (SimpleNamespace(), 5, 3)],
