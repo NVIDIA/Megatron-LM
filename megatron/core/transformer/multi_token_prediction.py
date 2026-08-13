@@ -65,6 +65,36 @@ else:
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 
+def _hsm_mix(hidden_states_list: List[Tensor]) -> Tensor:
+    """Select one accumulated hidden state independently for every token.
+
+    The data-parallel RNG stream is shared by model-parallel ranks, which keeps
+    selections consistent when those ranks hold different shards of the same
+    activation.
+    """
+    num_states = len(hidden_states_list)
+    assert num_states > 0, "Hidden State Mixing requires at least one state."
+
+    sequence_length, batch_size, hidden_size = hidden_states_list[0].shape
+    rng_tracker = tensor_parallel.get_cuda_rng_tracker()
+    rng_context = (
+        rng_tracker.fork(tensor_parallel.get_data_parallel_rng_tracker_name())
+        if rng_tracker.is_initialized()
+        else nullcontext()
+    )
+    with rng_context:
+        indices = torch.randint(
+            num_states,
+            (1, sequence_length, batch_size, 1),
+            device=hidden_states_list[0].device,
+        )
+
+    stacked = torch.stack(hidden_states_list, dim=0)
+    return torch.gather(
+        stacked, dim=0, index=indices.expand(-1, -1, -1, hidden_size)
+    ).squeeze(0)
+
+
 def tie_word_embeddings_state_dict(
     sharded_state_dict: ShardedStateDict,
     word_emb_weight: Tensor,
@@ -1855,12 +1885,46 @@ class MultiTokenPredictionBlock(MegatronModule):
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
 
+        hsm_enabled = (
+            self.config.mtp_hsm and self.training and self.config.mtp_num_layers >= 2
+        )
+        if hsm_enabled:
+            hsm_history = [hidden_states]
+
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
+
+            # Older HSM entries predict earlier targets than the newest entry. Roll
+            # them once per depth so all candidates correspond to the same target.
+            if hsm_enabled and len(hsm_history) > 1:
+                entries_to_roll = hsm_history[:-1]
+                newest_entry = hsm_history[-1]
+                num_entries = len(entries_to_roll)
+                sequence_length, batch_size, hidden_size = entries_to_roll[0].shape
+                stacked = torch.stack(entries_to_roll, dim=0)
+                flattened = stacked.permute(0, 2, 3, 1).reshape(
+                    num_entries * batch_size, hidden_size, sequence_length
+                )
+                rolled, _ = roll_tensor(
+                    flattened,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
+                hsm_history = list(
+                    rolled.reshape(num_entries, batch_size, hidden_size, sequence_length)
+                    .permute(0, 3, 1, 2)
+                    .unbind(0)
+                ) + [newest_entry]
+                hidden_states_input = _hsm_mix(hsm_history)
+            else:
+                hidden_states_input = hidden_states
+
             hidden_states, input_ids, position_ids, padding_mask = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
-                hidden_states=hidden_states,
+                hidden_states=hidden_states_input,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 inference_params=inference_params,
@@ -1872,6 +1936,9 @@ class MultiTokenPredictionBlock(MegatronModule):
                 embedding=embedding,
                 **(extra_block_kwargs or {}),
             )
+
+            if hsm_enabled:
+                hsm_history.append(hidden_states)
 
             # append the output hidden states of the current mtp layer
             # to the hidden_states_list
