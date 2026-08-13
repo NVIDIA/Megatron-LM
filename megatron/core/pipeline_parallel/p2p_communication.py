@@ -245,9 +245,10 @@ class P2PCommunicator:
             for req in reqs if isinstance(reqs, list) else reqs.values():
                 req.wait()
 
-            # To protect against race condition when using batch_isend_irecv().
-            # should take this out once the bug with batch_isend_irecv is resolved.
-            torch.cuda.synchronize()
+            if config.batch_p2p_comm:
+                # To protect against race condition when using batch_isend_irecv().
+                # should take this out once the bug with batch_isend_irecv is resolved.
+                torch.cuda.synchronize()
 
         recv_prev_shape = [0, 0, 0]
         if recv_prev_shape_tensor is not None:
