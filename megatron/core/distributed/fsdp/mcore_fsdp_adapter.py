@@ -665,6 +665,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             """
             self.module.context.ensure_finalized()
 
+        # The 1F1B schedule finds the FSDP wrapper via find_megatron_fsdp(),
+        # which may return the bare FsdpModule (no ddp_config). Expose the
+        # adapter's ddp_config on the module so the schedule can read the
+        # data-parallel sharding strategy without special-casing the v2 path.
+        self.module.ddp_config = self.ddp_config
+
         self.unshard_parameters = unshard_parameters
         self.reshard_parameters = reshard_parameters
         self.reduce_grad = reduce_grad
