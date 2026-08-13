@@ -170,13 +170,17 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
         # Compute per-image embedding counts
         if imgs_sizes is not None and getattr(module, '_dynamic_resolution', False):
-            # Dynamic resolution: compute per-image embedding count from imgs_sizes
+            # Dynamic resolution: compute per-image embedding count from imgs_sizes.
             patch_dim = module.patch_dim
             do_pixel_shuffle = module._pixel_shuffle
 
+            # One D2H sync total instead of two per image. Previous code did
+            # imgs_sizes[i][0].item() + imgs_sizes[i][1].item() inside a Python
+            # loop, incurring 2 * num_images blocking syncs per admission.
+            imgs_sizes_cpu = imgs_sizes.tolist()
             per_image_embeddings = []
-            for i in range(imgs_sizes.shape[0]):
-                h, w = imgs_sizes[i][0].item(), imgs_sizes[i][1].item()
+            for row in imgs_sizes_cpu:
+                h, w = row[0], row[1]
                 num_embeddings = (h // patch_dim) * (w // patch_dim)
                 if do_pixel_shuffle:
                     num_embeddings //= 4
