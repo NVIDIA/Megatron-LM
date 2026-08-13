@@ -1395,8 +1395,8 @@ def _triton_pre_gated_delta_rule_backward(
     saved forward intermediates and returns input/parameter gradients
     ``(d_qkvzba, d_weight, d_A_log, d_dt_bias)``.
 
-    Five Triton kernels + one C++ ``causal_conv1d_bwd_function`` call,
-    fanned out on five side streams so memory-bound work overlaps while
+    Four Triton kernels + one C++ ``causal_conv1d_bwd_function`` call,
+    fanned out on four side streams so memory-bound work overlaps while
     the conv backward runs on the default stream. See module docstring
     for the overall design.
     """
