@@ -861,9 +861,16 @@ def _indexer_topk_single_packed_cp_segments(
     local_query_len = local_packed_cp_query_len if local_packed_cp_query_len is not None else sq
     local_query_start = local_packed_cp_query_start
     local_query_end = local_query_start + sq
-    if b != 1 or local_query_len % 2 != 0 or _INDEXER_RATIO != 1:
+    # Halving is what the zigzag context-parallel layout needs: every rank owns a front
+    # and a back chunk of equal length. A rank holding the whole sequence has no zigzag
+    # to undo, so it needs neither the split nor the even length that the split implies.
+    whole_sequence_local = sk == local_query_len and local_packed_cp_rank == 0
+    if b != 1 or _INDEXER_RATIO != 1:
+        raise RuntimeError("single packed CP cuDNN fast path requires b=1, ratio=1")
+    if not whole_sequence_local and local_query_len % 2 != 0:
         raise RuntimeError(
-            "single packed CP cuDNN fast path requires b=1, even local query length, ratio=1"
+            "single packed CP cuDNN fast path requires an even local query length when the "
+            "sequence is split across context-parallel ranks"
         )
     if local_query_start < 0 or local_query_end > local_query_len:
         raise RuntimeError(
@@ -872,7 +879,12 @@ def _indexer_topk_single_packed_cp_segments(
         )
 
     half = local_query_len // 2
-    if sk == local_query_len:
+    if whole_sequence_local:
+        # One causal segment over the whole local sequence; per-row key lengths are still
+        # built from arange inside the loop, so this is the same masking as the split form
+        # and it does not require an even length.
+        segment_specs = ((0, local_query_len, local_query_len),)
+    elif sk == local_query_len:
         segment_specs = ((0, half, half), (half, local_query_len, local_query_len))
     else:
         segment_specs = (
@@ -1138,7 +1150,7 @@ def _topk_in_bounds(
 
 
 def _segment_kernel_applicable(
-    b: int, sq: int, local_packed_cp_query_len: Optional[int]
+    b: int, sq: int, local_packed_cp_query_len: Optional[int], cp_size: int = 1
 ) -> bool:
     """Whether ``_indexer_topk_single_packed_cp_segments`` can take this shape.
 
@@ -1147,7 +1159,11 @@ def _segment_kernel_applicable(
     cannot drift apart.
     """
     local_query_len = local_packed_cp_query_len if local_packed_cp_query_len is not None else sq
-    return b == 1 and local_query_len % 2 == 0 and _INDEXER_RATIO == 1
+    if b != 1 or _INDEXER_RATIO != 1:
+        return False
+    # An odd local length only rules out the halved zigzag form; a rank holding the whole
+    # sequence takes the single-segment form, which has no parity requirement.
+    return local_query_len % 2 == 0 or cp_size == 1
 
 
 def _resolve_scoring_plan_for_call(
@@ -1254,7 +1270,7 @@ def _indexer_topk_bshd(
     if scoring_plan is None:
         scoring_plan = _resolve_scoring_plan_for_call(
             segment_kernel_applicable=_segment_kernel_applicable(
-                b, sq, local_packed_cp_query_len
+                b, sq, local_packed_cp_query_len, packed_cp_size
             ),
             starts=starts,
             ends=ends,
