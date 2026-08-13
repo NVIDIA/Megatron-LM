@@ -92,16 +92,19 @@ def _ssd_tiling_from(metadata):
     this is the one place that translation happens.
 
     Args:
-        metadata: The step's ``MambaMetadata`` (duck-typed; not imported here
-            so the mixer keeps no import-time dependency on it).
+        metadata: The step's `MambaMetadata` (duck-typed; not imported here
+            so the mixer keeps no import-time dependency on it). Its `ssd`
+            attribute holds the tiling, and is None unless the CuteDSL backend
+            is enabled.
 
     Returns:
-        An ``SSDTiling``, or None when the CuteDSL backend is not importable or
-        the batch has no prefill tiling yet.
+        An `SSDTiling`, or None when the CuteDSL backend is off or not
+        importable, or the batch has no prefill tiling yet.
     """
-    if SSDTiling is None or getattr(metadata, "ssd_active_seq_idx", None) is None:
+    ssd = getattr(metadata, "ssd", None)
+    if SSDTiling is None or ssd is None or ssd.ssd_active_seq_idx is None:
         return None
-    return SSDTiling(metadata)
+    return SSDTiling(ssd)
 
 
 try:

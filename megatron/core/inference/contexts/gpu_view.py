@@ -2,7 +2,9 @@
 
 import torch
 
-from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaSSDChunkState
+from megatron.core.inference.contexts.attention_context.mamba_ssd_metadata import (
+    MambaSSDBufferLayout,
+)
 
 
 class ContextGPUView:
@@ -34,6 +36,7 @@ class ContextGPUView:
         device: torch.device,
         max_mamba_chunks: int = 0,
         mamba_decode_indices_dtype: torch.dtype = torch.int64,
+        use_cutedsl_ssd: bool = False,
     ):
         assert mamba_decode_indices_dtype in (torch.int32, torch.int64)
         # Field layout (must match DynamicInferenceContext's CPU buffer layout):
@@ -76,14 +79,8 @@ class ContextGPUView:
         #   mamba_seq_idx_for_varlen      int32 (max_mamba_chunks,)
         #   mamba_conv_seq_idx            int32 (max_tokens,)
         #   mamba_conv_seq_start          int32 (max_tokens,)
-        #   mamba_ssd_seq_chunk_start       int32 (max_bs,)
-        #   mamba_ssd_seq_chunk_count       int32 (max_bs,)
-        #   mamba_ssd_seq_chunk_base        int32 (max_bs,)
-        #   mamba_ssd_active_seq_idx        int32 (max_bs,)
-        #   mamba_ssd_empty_seq_idx         int32 (max_bs,)
-        #   mamba_ssd_chunk_token_base      int32 (max_ssd_chunks,)
-        #   mamba_ssd_chunk_valid_start     int32 (max_ssd_chunks,)
-        #   mamba_ssd_chunk_valid_end       int32 (max_ssd_chunks,)
+        #   mamba_ssd_*                   int32, only with the CuteDSL SSD backend
+        #                                 (see MambaSSDBufferLayout)
         # Bytes before the Mamba section (needed to compute alignment padding).
         pre_mamba_bytes = (
             3 * tok_int64_bytes
@@ -111,22 +108,9 @@ class ContextGPUView:
             mamba_seq_idx_for_varlen_bytes = max_mamba_chunks * 4
             mamba_conv_seq_idx_bytes = max_tokens * 4
             mamba_conv_seq_start_bytes = max_tokens * 4
-            pre_mamba_ssd_bytes = (
-                pre_mamba_bytes
-                + mamba_align_pad
-                + mamba_batch_indices_decode_bytes
-                + mamba_batch_indices_prefill_bytes
-                + mamba_seq_idx_bytes
-                + mamba_cu_seqlens_bytes
-                + mamba_cu_chunk_seqlens_bytes
-                + mamba_last_chunk_indices_bytes
-                + mamba_seq_idx_for_varlen_bytes
-                + mamba_conv_seq_idx_bytes
-                + mamba_conv_seq_start_bytes
+            mamba_ssd_layout = MambaSSDBufferLayout.create(
+                use_cutedsl_ssd, max_requests, max_mamba_chunks
             )
-            mamba_ssd_align_pad = (-pre_mamba_ssd_bytes) % 16
-            mamba_ssd_states = MambaSSDChunkState.create(max_requests, max_mamba_chunks)
-            mamba_ssd_total_bytes = mamba_ssd_states.total_bytes() if mamba_ssd_states else 0
         else:
             mamba_align_pad = 0
             mamba_batch_indices_decode_bytes = 0
@@ -138,10 +122,9 @@ class ContextGPUView:
             mamba_seq_idx_for_varlen_bytes = 0
             mamba_conv_seq_idx_bytes = 0
             mamba_conv_seq_start_bytes = 0
-            mamba_ssd_align_pad = 0
-            mamba_ssd_total_bytes = 0
+            mamba_ssd_layout = None
 
-        total_bytes = (
+        pre_mamba_ssd_bytes = (
             pre_mamba_bytes
             + mamba_align_pad
             + mamba_batch_indices_decode_bytes
@@ -153,8 +136,11 @@ class ContextGPUView:
             + mamba_seq_idx_for_varlen_bytes
             + mamba_conv_seq_idx_bytes
             + mamba_conv_seq_start_bytes
-            + mamba_ssd_align_pad
-            + mamba_ssd_total_bytes
+        )
+        # The SSD block (when enabled) is 16-byte aligned, so its size depends
+        # on where the rest of the Mamba section ends.
+        total_bytes = pre_mamba_ssd_bytes + (
+            mamba_ssd_layout.bytes_after(pre_mamba_ssd_bytes) if mamba_ssd_layout else 0
         )
 
         # Zero-initialized so pre-transfer reads see zeros (matches prior semantics).
@@ -232,6 +218,9 @@ class ContextGPUView:
         # pinned CPU view in DynamicInferenceContext._cpu_bookkeeping_buf; the
         # per-step coalesced H2D copy covers both MHA and Mamba alongside the
         # token/request bookkeeping.
+        # The SSD views stay None unless the CuteDSL backend bound them below.
+        for name in MambaSSDBufferLayout.view_names():
+            setattr(self, f"mamba_{name}", None)
         if max_mamba_chunks > 0:
             off += mamba_align_pad
             self.mamba_batch_indices_decode = self._buf[
@@ -268,18 +257,10 @@ class ContextGPUView:
                 torch.int32
             )
             off += mamba_conv_seq_start_bytes
-            off += mamba_ssd_align_pad
-            mamba_ssd_bufs = mamba_ssd_states.bind_buf(off, self._buf) if mamba_ssd_states else {}
-            off += mamba_ssd_total_bytes
-            if mamba_ssd_states:
-                self.mamba_ssd_seq_chunk_start = mamba_ssd_bufs["ssd_seq_chunk_start"]
-                self.mamba_ssd_seq_chunk_count = mamba_ssd_bufs["ssd_seq_chunk_count"]
-                self.mamba_ssd_seq_chunk_base = mamba_ssd_bufs["ssd_seq_chunk_base"]
-                self.mamba_ssd_active_seq_idx = mamba_ssd_bufs["ssd_active_seq_idx"]
-                self.mamba_ssd_empty_seq_idx = mamba_ssd_bufs["ssd_empty_seq_idx"]
-                self.mamba_ssd_chunk_token_base = mamba_ssd_bufs["ssd_chunk_token_base"]
-                self.mamba_ssd_chunk_valid_start = mamba_ssd_bufs["ssd_chunk_valid_start"]
-                self.mamba_ssd_chunk_valid_end = mamba_ssd_bufs["ssd_chunk_valid_end"]
+            if mamba_ssd_layout is not None:
+                mamba_ssd_bufs, off = mamba_ssd_layout.bind(off, self._buf)
+                for name, view in mamba_ssd_bufs.items():
+                    setattr(self, f"mamba_{name}", view)
         else:
             self.mamba_batch_indices_decode = None
             self.mamba_batch_indices_prefill = None

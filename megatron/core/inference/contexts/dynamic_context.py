@@ -46,7 +46,8 @@ from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_rank, get_pg_size, internal_api, round_up_to_nearest_multiple
 
-from .attention_context.mamba_metadata import MambaMetadata, MambaSSDChunkState
+from .attention_context.mamba_metadata import MambaMetadata
+from .attention_context.mamba_ssd_metadata import MambaSSDBufferLayout
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
@@ -417,6 +418,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
+        # Whether prefill runs on the CuteDSL varlen SSD kernel. This gates the
+        # extra per-step tiling metadata, the bookkeeping-buffer space it needs,
+        # and the chunk-aligned token padding it requires. InferenceConfig has
+        # already downgraded 'cutedsl' to 'triton' if the kernel is unavailable.
+        self.use_cutedsl_ssd = (
+            self.is_hybrid_model and inference_config.mamba_prefill_backend == "cutedsl"
+        )
         if self.is_hybrid_model:
             self.mamba_conv_states_shape = mamba_inference_state_config.conv_states_shape
             self.mamba_ssm_states_shape = mamba_inference_state_config.ssm_states_shape
@@ -971,6 +979,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
                 decode_indices_dtype=self._mamba_decode_indices_dtype,
+                use_cutedsl_ssd=self.use_cutedsl_ssd,
             )
             # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
             # fields ride along with the single coalesced H2D in
@@ -1196,25 +1205,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_seq_idx_for_varlen_bytes = self._max_mamba_chunks * 4
             _mamba_conv_seq_idx_bytes = self.max_tokens * 4
             _mamba_conv_seq_start_bytes = self.max_tokens * 4
-            _pre_mamba_ssd_bytes = (
-                _pre_mamba_bytes
-                + _mamba_align_pad
-                + _mamba_batch_indices_decode_bytes
-                + _mamba_batch_indices_prefill_bytes
-                + _mamba_seq_idx_bytes
-                + _mamba_cu_seqlens_bytes
-                + _mamba_cu_chunk_seqlens_bytes
-                + _mamba_last_chunk_indices_bytes
-                + _mamba_seq_idx_for_varlen_bytes
-                + _mamba_conv_seq_idx_bytes
-                + _mamba_conv_seq_start_bytes
+            _mamba_ssd_layout = MambaSSDBufferLayout.create(
+                self.use_cutedsl_ssd, self.max_requests, self._max_mamba_chunks
             )
-            # SSD arrays back CuteDSL descriptors, which require 16-byte aligned
-            # data pointers; pad so the block starts aligned (each field size is
-            # already rounded to 16, so every field within it stays aligned).
-            _mamba_ssd_align_pad = (-_pre_mamba_ssd_bytes) % 16
-            _mamba_ssd_states = MambaSSDChunkState.create(self.max_requests, self._max_mamba_chunks)
-            _mamba_ssd_total_bytes = _mamba_ssd_states.total_bytes() if _mamba_ssd_states else 0
         else:
             _mamba_align_pad = 0
             self._max_mamba_chunks = 0
@@ -1227,9 +1220,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_seq_idx_for_varlen_bytes = 0
             _mamba_conv_seq_idx_bytes = 0
             _mamba_conv_seq_start_bytes = 0
-            _mamba_ssd_align_pad = 0
-            _mamba_ssd_total_bytes = 0
-        _total_bytes = (
+            _mamba_ssd_layout = None
+        _pre_mamba_ssd_bytes = (
             _pre_mamba_bytes
             + _mamba_align_pad
             + _mamba_batch_indices_decode_bytes
@@ -1241,8 +1233,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             + _mamba_seq_idx_for_varlen_bytes
             + _mamba_conv_seq_idx_bytes
             + _mamba_conv_seq_start_bytes
-            + _mamba_ssd_align_pad
-            + _mamba_ssd_total_bytes
+        )
+        # The SSD block (when enabled) is 16-byte aligned, so its size depends
+        # on where the rest of the Mamba section ends.
+        _total_bytes = _pre_mamba_ssd_bytes + (
+            _mamba_ssd_layout.bytes_after(_pre_mamba_ssd_bytes) if _mamba_ssd_layout else 0
         )
         self._cpu_bookkeeping_buf = torch.empty(
             _total_bytes, dtype=torch.uint8, device='cpu', pin_memory=True
@@ -1410,13 +1405,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 _off : _off + _mamba_conv_seq_start_bytes
             ].view(torch.int32)
             _off += _mamba_conv_seq_start_bytes
-            _off += _mamba_ssd_align_pad
-            self._cpu_mamba_ssd_bufs = (
-                _mamba_ssd_states.bind_buf(_off, self._cpu_bookkeeping_buf)
-                if _mamba_ssd_states
-                else {}
-            )
-            _off += _mamba_ssd_total_bytes
+            self._cpu_mamba_ssd_bufs = {}
+            if _mamba_ssd_layout is not None:
+                self._cpu_mamba_ssd_bufs, _off = _mamba_ssd_layout.bind(
+                    _off, self._cpu_bookkeeping_buf
+                )
 
         assert _off == _total_bytes, f"layout bug: wrote {_off} of {_total_bytes} bytes"
 
@@ -1431,6 +1424,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_decode_indices_dtype=(
                 self._mamba_decode_indices_dtype if self.is_hybrid_model else torch.int64
             ),
+            use_cutedsl_ssd=self.use_cutedsl_ssd,
         )
         self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
@@ -2400,9 +2394,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 padded_prefill_req_count = 0
             else:
                 padded_token_count = self.round_up_tokens(self.active_token_count)
-                if self.is_hybrid_model:
-                    # The Mamba SSD kernels tile the token buffer into
-                    # mamba_chunk_size chunks and move whole chunks, so the
+                if self.use_cutedsl_ssd:
+                    # The CuteDSL SSD kernel tiles the token buffer into
+                    # mamba_chunk_size chunks and moves whole chunks, so the
                     # padded buffer has to cover the last partial one.
                     # TOKEN_ROUNDER (64) is finer than the chunk size (128), so
                     # without this roughly half of all prefill steps land on a

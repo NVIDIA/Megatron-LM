@@ -7,6 +7,7 @@ import torch
 import triton
 from packaging import version
 
+from .ssd_backend import cutedsl_ssd_available
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
@@ -227,34 +228,6 @@ def _mamba_chunk_scan_combined_varlen_triton(
     return varlen_states
 
 
-_CUTEDSL_SSD_ENABLED = None
-
-
-def _cutedsl_ssd_enabled():
-    """Whether the CuteDSL SSD backend is usable on this system.
-
-    CuteDSL is the default varlen-SSD backend: it is used whenever the GPU is
-    Blackwell (SM 10.0+) and the CuteDSL runtime imports; Triton is the fallback
-    for other platforms and for argument combinations the CuteDSL kernel does
-    not support. The decision is cached in ``_CUTEDSL_SSD_ENABLED`` (tests may
-    override that global directly to force a backend).
-    """
-    global _CUTEDSL_SSD_ENABLED
-    if _CUTEDSL_SSD_ENABLED is not None:
-        return _CUTEDSL_SSD_ENABLED
-
-    enabled = False
-    try:
-        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10:
-            from .cutedsl_mamba2_ssd import is_cutedsl_ssd_available
-
-            enabled = is_cutedsl_ssd_available()
-    except Exception:
-        enabled = False
-    _CUTEDSL_SSD_ENABLED = enabled
-    return enabled
-
-
 def mamba_chunk_scan_combined_varlen(
     x,
     dt,
@@ -278,9 +251,11 @@ def mamba_chunk_scan_combined_varlen(
 ):
     """Dispatch the varlen SSD scan to the CuteDSL (Blackwell) or Triton backend fallback.
 
-    CuteDSL is the default backend on Blackwell (SM 10.0+): a faster drop-in
-    covering the production prefill cases (arbitrary sequence lengths, chunked
-    prefill via ``initial_states``, empty padded sequences, and
+    CuteDSL is opt-in on Blackwell (SM 10.0+) via
+    `--inference-dynamic-batching-mamba-prefill-backend cutedsl`, which is what
+    makes the caller pass an `ssd_tiling`: a faster drop-in covering the
+    production prefill cases (arbitrary sequence
+    lengths, chunked prefill via ``initial_states``, empty padded sequences, and
     ``return_raw_states`` for prefix caching). Eligibility is decided up front
     via :func:`cutedsl_unsupported_reason`; Triton is used on other platforms
     and for the argument combinations the CuteDSL kernel does not support
@@ -288,9 +263,10 @@ def mamba_chunk_scan_combined_varlen(
     sequence chunk grid does not materialise the caller's chunk boundaries).
     """
 
-    # Without a tiling there is nothing to run the kernel on: callers that hold
-    # no per-step metadata (op-level tests, benchmarks) simply get Triton.
-    if _cutedsl_ssd_enabled() and ssd_tiling is not None:
+    # The tiling is built only under the CuteDSL backend, so its presence IS the
+    # backend selection; callers holding no per-step metadata (op-level tests,
+    # benchmarks) simply get Triton. The availability check is a backstop.
+    if ssd_tiling is not None and cutedsl_ssd_available():
         from .cutedsl_mamba2_ssd import (
             cutedsl_unsupported_reason,
             mamba_chunk_scan_combined_varlen_cutedsl_thd,

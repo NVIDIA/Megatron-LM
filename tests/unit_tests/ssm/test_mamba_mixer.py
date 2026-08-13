@@ -6,8 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import megatron.core.ssm.ops.ssd_combined as ssd_combined
-from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaMetadata
+from megatron.core.inference.contexts.attention_context.mamba_ssd_metadata import compute_ssd_tiling
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
@@ -15,7 +14,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
-from megatron.core.ssm.ops.ssd_combined import _cutedsl_ssd_enabled
+from megatron.core.ssm.ops.ssd_backend import cutedsl_ssd_available
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -141,18 +140,18 @@ class TestMambaMixerErrorChecks:
 
 
 @pytest.mark.skipif(
-    not _cutedsl_ssd_enabled(),
+    not cutedsl_ssd_available(),
     reason="CuteDSL SSD backend requires Blackwell (SM 10.0+) and the cutlass DSL runtime",
 )
 class TestMambaMixerCuteDSL:
     """The mamba layer's varlen SSM prefill must give near-identical results with the
     CuteDSL backend vs Triton. CuteDSL accelerates the case where each request length
     is a multiple of the chunk size; the mixer routes the varlen prefill through the
-    ``mamba_chunk_scan_combined_varlen`` dispatcher (CuteDSL by default on Blackwell;
-    forced per-backend here via the dispatcher's cached decision)."""
+    `mamba_chunk_scan_combined_varlen` dispatcher, which picks CuteDSL exactly when
+    the metadata carries an SSD tiling -- which is how each backend is selected here,
+    the same way `mamba_prefill_backend` selects it in production."""
 
     def teardown_method(self, method):
-        ssd_combined._CUTEDSL_SSD_ENABLED = None  # restore backend autodetection
         Utils.destroy_model_parallel()
 
     def _build_mixer(self):
@@ -183,16 +182,21 @@ class TestMambaMixerCuteDSL:
         num_requests: int,
         backend: str,
     ):
-        # Force the dispatcher's cached backend decision (no env knob anymore).
-        ssd_combined._CUTEDSL_SSD_ENABLED = backend == "cutedsl"
-
         conv_dim = mixer.d_inner_local_tp + 2 * mixer.ngroups_local_tp * mixer.d_state
         conv_state = torch.zeros(num_requests, conv_dim, mixer.d_conv, device="cuda")
         ssm_state = torch.zeros(
             num_requests, mixer.nheads_local_tp, mixer.headdim, mixer.d_state, device="cuda"
         )
         with torch.no_grad():
-            _md = _prefill_metadata_for_test(cu_seqlens, seq_idx, mixer.chunk_size, batch_indices)
+            # No tiling -> the dispatcher falls back to Triton, as under
+            # mamba_prefill_backend="triton".
+            _md = _prefill_metadata_for_test(
+                cu_seqlens,
+                seq_idx,
+                mixer.chunk_size,
+                batch_indices,
+                with_ssd_tiling=backend == "cutedsl",
+            )
             _ctx = SimpleNamespace(mamba_metadata=_md, mamba_slot_allocator=None)
             y = mixer.ssm_prefill(
                 zxBCdt=zxBCdt.clone(), conv_state=conv_state, ssm_state=ssm_state, context=_ctx
@@ -233,51 +237,34 @@ class TestMambaMixerCuteDSL:
 SSD_KERNEL_L = 128
 
 
-def _ssd_members_for_test(
+def _ssd_metadata_for_test(
     cu_seqlens_list: list[int], chunk_size: int, device: torch.device
-) -> dict[str, torch.Tensor]:
-    """The per-step SSD tiling MambaMetadata publishes, as device tensors.
+) -> SimpleNamespace:
+    """Stand-in for the `MambaSSDMetadata` a step publishes, as device tensors.
 
-    Delegates the derivation to ``MambaMetadata._compute_mamba_chunk_meta`` so a
-    stand-in can never drift from what production computes.
+    Delegates the derivation to `compute_ssd_tiling` so a stand-in can never
+    drift from what production computes.
 
     Args:
-        cu: Cumulative token counts, one entry per slot plus one.
+        cu_seqlens_list: Cumulative token counts, one entry per slot plus one.
         chunk_size: The kernel's L.
         device: Where the index arrays live.
 
     Returns:
-        A dict of the ``ssd_*`` members, keyed as on MambaMetadata.
+        A namespace carrying the `ssd_*` members and the scalars `SSDTiling` reads.
     """
-    (
-        active,
-        base_l,
-        count_l,
-        start_l,
-        tok_base,
-        valid_lo,
-        valid_hi,
-        empty,
-        starts_aligned,
-        active_is_prefix,
-    ) = MambaMetadata._compute_mamba_chunk_meta(
-        cu_seqlens_list, len(cu_seqlens_list) - 1, chunk_size
-    )
-
-    def i32(values):
-        return torch.tensor(values, dtype=torch.int32, device=device)
-
-    return dict(
-        ssd_seq_chunk_start=i32(start_l),
-        ssd_seq_chunk_count=i32(count_l),
-        ssd_seq_chunk_base=i32(base_l),
-        ssd_active_seq_idx=i32(active),
-        ssd_empty_seq_idx=i32(empty),
-        ssd_chunk_token_base=i32(tok_base),
-        ssd_chunk_valid_start=i32(valid_lo),
-        ssd_chunk_valid_end=i32(valid_hi),
-        ssd_starts_aligned=starts_aligned,
-        ssd_active_is_prefix=active_is_prefix,
+    tiling = compute_ssd_tiling(cu_seqlens_list, len(cu_seqlens_list) - 1, chunk_size)
+    members = {
+        f"ssd_{name}": torch.tensor(values, dtype=torch.int32, device=device)
+        for name, values in tiling.arrays.items()
+    }
+    return SimpleNamespace(
+        **members,
+        ssd_starts_aligned=tiling.starts_aligned,
+        ssd_active_is_prefix=tiling.active_is_prefix,
+        mamba_chunk_size=chunk_size,
+        cu_seqlens=torch.empty(len(cu_seqlens_list), dtype=torch.int32, device=device),
+        real_prefill_token_count=cu_seqlens_list[-1],
     )
 
 
@@ -286,6 +273,7 @@ def _prefill_metadata_for_test(
     seq_idx: torch.Tensor,
     chunk_size: int,
     batch_indices: torch.Tensor | None = None,
+    with_ssd_tiling: bool = True,
 ) -> SimpleNamespace:
     """Stand-in for MambaMetadata carrying the fields ``ssm_prefill`` reads.
 
@@ -294,6 +282,8 @@ def _prefill_metadata_for_test(
         seq_idx: Per-token request id, or None.
         chunk_size: The caller's chunk size.
         batch_indices: Prefill slot map, or None.
+        with_ssd_tiling: Whether to attach the SSD tiling, i.e. select the
+            CuteDSL backend for this step.
 
     Returns:
         A mock ``SimpleNamespace`` shaped like MambaMetadata.
@@ -309,8 +299,12 @@ def _prefill_metadata_for_test(
         chunk_boundaries.append(cu_seqlens_list[i + 1])
         last_chunk_indices.append(len(chunk_boundaries) - 2)
     cu_chunk_seqlens = cu_seqlens.new_tensor(chunk_boundaries)
+    ssd = None
+    if with_ssd_tiling:
+        ssd = _ssd_metadata_for_test(cu_seqlens_list, SSD_KERNEL_L, cu_seqlens.device)
+        ssd.cu_seqlens = cu_seqlens
     return SimpleNamespace(
-        **_ssd_members_for_test(cu_seqlens_list, SSD_KERNEL_L, cu_seqlens.device),
+        ssd=ssd,
         mamba_chunk_size=SSD_KERNEL_L,
         real_prefill_token_count=cu_seqlens_list[-1],
         seq_idx=seq_idx,

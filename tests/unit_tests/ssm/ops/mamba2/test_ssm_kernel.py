@@ -10,11 +10,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaMetadata
+from megatron.core.inference.contexts.attention_context.mamba_ssd_metadata import compute_ssd_tiling
 
 # Assume the provided class is in mamba_mixer.py
 from megatron.core.ssm.mamba_mixer import MambaMixer
-from megatron.core.ssm.ops.ssd_combined import _cutedsl_ssd_enabled
+from megatron.core.ssm.ops.ssd_backend import cutedsl_ssd_available
 
 
 def _build_varlen_ssd_inputs(seq_lens, chunk_size, nheads, headdim, ngroups, dstate, device, dtype):
@@ -220,7 +220,7 @@ def _repack_reference(src, N, N_pad, TC, L):
 
 
 @pytest.mark.skipif(
-    not _cutedsl_ssd_enabled(),
+    not cutedsl_ssd_available(),
     reason="CuteDSL SSD backend requires Blackwell (SM 10.0+) and the cutlass DSL runtime",
 )
 class TestCuteDSLAccuracy:
@@ -430,7 +430,7 @@ class TestCuteDSLAccuracy:
 
 
 @pytest.mark.skipif(
-    not _cutedsl_ssd_enabled(),
+    not cutedsl_ssd_available(),
     reason="CuteDSL SSD backend requires Blackwell (SM 10.0+) and the cutlass DSL runtime",
 )
 class TestCuteDSLRawStates:
@@ -703,11 +703,11 @@ SSD_KERNEL_L = 128
 """The CuteDSL SSD kernel's tile length; the tiling arrays must be built at it."""
 
 
-def _ssd_members_for_test(cu, chunk_size, device):
-    """The per-step SSD tiling MambaMetadata publishes, as device tensors.
+def _ssd_metadata_for_test(cu, chunk_size, device):
+    """Stand-in for the `MambaSSDMetadata` a step publishes, as device tensors.
 
-    Delegates the derivation to ``MambaMetadata._compute_mamba_chunk_meta`` so a
-    stand-in can never drift from what production computes.
+    Delegates the derivation to `compute_ssd_tiling` so a stand-in can never
+    drift from what production computes.
 
     Args:
         cu: Cumulative token counts, one entry per slot plus one.
@@ -715,35 +715,20 @@ def _ssd_members_for_test(cu, chunk_size, device):
         device: Where the index arrays live.
 
     Returns:
-        A dict of the ``ssd_*`` members, keyed as on MambaMetadata.
+        A namespace carrying the `ssd_*` members and the scalars `SSDTiling` reads.
     """
-    (
-        active,
-        base_l,
-        count_l,
-        start_l,
-        tok_base,
-        valid_lo,
-        valid_hi,
-        empty,
-        starts_aligned,
-        active_is_prefix,
-    ) = MambaMetadata._compute_mamba_chunk_meta(cu, len(cu) - 1, chunk_size)
-
-    def i32(values):
-        return torch.tensor(values, dtype=torch.int32, device=device)
-
-    return dict(
-        ssd_seq_chunk_start=i32(start_l),
-        ssd_seq_chunk_count=i32(count_l),
-        ssd_seq_chunk_base=i32(base_l),
-        ssd_active_seq_idx=i32(active),
-        ssd_empty_seq_idx=i32(empty),
-        ssd_chunk_token_base=i32(tok_base),
-        ssd_chunk_valid_start=i32(valid_lo),
-        ssd_chunk_valid_end=i32(valid_hi),
-        ssd_starts_aligned=starts_aligned,
-        ssd_active_is_prefix=active_is_prefix,
+    tiling = compute_ssd_tiling(cu, len(cu) - 1, chunk_size)
+    members = {
+        f"ssd_{name}": torch.tensor(values, dtype=torch.int32, device=device)
+        for name, values in tiling.arrays.items()
+    }
+    return SimpleNamespace(
+        **members,
+        ssd_starts_aligned=tiling.starts_aligned,
+        ssd_active_is_prefix=tiling.active_is_prefix,
+        mamba_chunk_size=chunk_size,
+        cu_seqlens=torch.empty(len(cu), dtype=torch.int32, device=device),
+        real_prefill_token_count=cu[-1],
     )
 
 
@@ -770,8 +755,10 @@ def _prefill_metadata_for_test(cu_seqlens, seq_idx, chunk_size, batch_indices=No
         chunk_boundaries.append(cu[i + 1])
         last_chunk_indices.append(len(chunk_boundaries) - 2)
     cu_chunk_seqlens = cu_seqlens.new_tensor(chunk_boundaries)
+    ssd = _ssd_metadata_for_test(cu, SSD_KERNEL_L, cu_seqlens.device)
+    ssd.cu_seqlens = cu_seqlens
     return SimpleNamespace(
-        **_ssd_members_for_test(cu, SSD_KERNEL_L, cu_seqlens.device),
+        ssd=ssd,
         mamba_chunk_size=SSD_KERNEL_L,
         real_prefill_token_count=cu[-1],
         seq_idx=seq_idx,
@@ -799,15 +786,8 @@ def _ssd_tiling_for_test(cu, chunk_size, device):
         device: Where the index arrays live.
 
     Returns:
-        An ``SSDTiling`` built from a MambaMetadata-shaped stand-in.
+        An `SSDTiling` built from a `MambaSSDMetadata`-shaped stand-in.
     """
     from megatron.core.ssm.ops.cutedsl_mamba2_ssd import SSDTiling
 
-    return SSDTiling(
-        SimpleNamespace(
-            **_ssd_members_for_test(cu, chunk_size, device),
-            mamba_chunk_size=chunk_size,
-            cu_seqlens=torch.empty(len(cu), dtype=torch.int32, device=device),
-            real_prefill_token_count=cu[-1],
-        )
-    )
+    return SSDTiling(_ssd_metadata_for_test(cu, chunk_size, device))
