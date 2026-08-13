@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 Absorbed Multi-Latent Attention implementation.
@@ -828,6 +828,24 @@ class AbsorbedMLASelfAttention(Attention):
         assert (
             inference_context is None and inference_params is None
         ), "Inference is not supported for AbsorbedMLA"
+
+        cp_group = (
+            packed_seq_params.cp_group
+            if packed_seq_params is not None and packed_seq_params.cp_group is not None
+            else self.pg_collection.cp
+        )
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == "thd"
+            and cp_group is not None
+            and get_pg_size(cp_group) > 1
+            and packed_seq_params.cp_partition_mode != "zigzag"
+        ):
+            raise ValueError(
+                "AbsorbedMLASelfAttention requires cp_partition_mode='zigzag', but "
+                f"packed_seq_params has {packed_seq_params.cp_partition_mode!r}. CP partition "
+                "conversion must be handled before entering AbsorbedMLA."
+            )
 
         # =====================
         # Query, Key, and Value

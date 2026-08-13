@@ -1334,6 +1334,18 @@ class Attention(MegatronModule, ABC):
             attention_mask=attention_mask,
             attention_bias=attention_bias,
         )
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == "thd"
+            and cp_group is not None
+            and get_pg_size(cp_group) > 1
+            and packed_seq_params.cp_partition_mode != "zigzag"
+        ):
+            raise ValueError(
+                f"{self.__class__.__name__} requires cp_partition_mode='zigzag', but "
+                f"packed_seq_params has {packed_seq_params.cp_partition_mode!r}. CP partition "
+                "conversion must be handled by TransformerBlock before entering attention."
+            )
 
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
