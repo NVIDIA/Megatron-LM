@@ -62,11 +62,10 @@ if HAVE_TE:
     import transformer_engine_torch as tex
 
     try:
-        from transformer_engine.pytorch.attention import FusedMLAQUpProjRopeQuant
-        from transformer_engine.pytorch.attention.fused_mla_q_uproj import _FusedMLAQUpProjFunction
+        from transformer_engine.pytorch.attention import FusedMLAQUpProjFunction, FusedMLAQUpProjRopeQuant
     except ImportError:
+        FusedMLAQUpProjFunction = None
         FusedMLAQUpProjRopeQuant = None
-        _FusedMLAQUpProjFunction = None
     from transformer_engine.pytorch.attention.dot_product_attention.utils import (
         mxfp8_quantize_only,
         mxfp8_transpose_swizzle,
@@ -93,13 +92,13 @@ else:
         Linear,
         set_save_original_input,
         split_te_layernorm_column_parallel_linear,
+        FusedMLAQUpProjFunction,
         FusedMLAQUpProjRopeQuant,
-        _FusedMLAQUpProjFunction,
         mxfp8_quantize_only,
         mxfp8_transpose_swizzle,
         QuantizedTensor,
         MXFP8Quantizer,
-    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None, None)
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
@@ -220,6 +219,7 @@ class MultiLatentAttention(Attention):
             getattr(self.config, "use_fused_mla_q_uproj", False)
             and FusedMLAQUpProjRopeQuant is not None
             and FusedMLAQUpProjRopeQuant.is_supported()
+            and get_pg_size(self.tp_group) == 1
         )
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
@@ -943,7 +943,7 @@ class MLASelfAttention(MultiLatentAttention):
                     q_normed = gather_from_sequence_parallel_region(q_normed, group=self.tp_group)
                 s = q_normed.shape[0]
 
-                query = _FusedMLAQUpProjFunction.apply(
+                query = FusedMLAQUpProjFunction.apply(
                     q_normed,
                     self.linear_q_up_proj.weight,
                     rotary_pos_cos,
