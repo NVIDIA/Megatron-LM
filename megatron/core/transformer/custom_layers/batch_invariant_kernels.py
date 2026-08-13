@@ -1686,13 +1686,14 @@ def get_batch_invariant_backend() -> str:
     return _BATCH_INVARIANT_BACKEND
 
 
-def enable_batch_invariant_mode(backend: str = "deepgemm"):
+def enable_batch_invariant_mode(backend: str = "te_native"):
     """Enable global batch-invariant mode and patch Aten/TE kernels.
 
     Args:
         backend: which kernel to dispatch `aten::mm`/`aten::addmm` through.
-            "deepgemm" (default) routes bf16 CUDA inputs through DeepGEMM
-            `bf16_gemm_nn`. "triton" routes through the batch-invariant
+            "te_native" (default) keeps the native cuBLASLt kernels and obtains
+            invariance via workspace starvation. "deepgemm" routes bf16 CUDA
+            inputs through DeepGEMM `bf16_gemm_nn`. "triton" routes through the batch-invariant
             Triton `matmul_persistent` kernel (works for bf16/fp16/fp32 and
             on any CUDA device). "te_native" keeps the native cuBLASLt
             kernels (aten and TE) and obtains invariance via workspace

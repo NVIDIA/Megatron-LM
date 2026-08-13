@@ -1167,12 +1167,13 @@ class TransformerConfig(ModelParallelConfig):
        training and inference as the kernels are not full optimized.
        Defaults to False."""
 
-    batch_invariant_backend: str = "deepgemm"
+    batch_invariant_backend: str = "te_native"
     """Which batch-invariant GEMM backend to use when batch_invariant_mode is
-    enabled: "deepgemm" (DeepGEMM bf16 kernels), "triton" (persistent Triton
-    matmul; any dtype), or "te_native" (keep the native cuBLASLt kernels and
-    obtain invariance via workspace starvation — lowest overhead, and the
-    configuration verified bitwise-identical to the TE training forward)."""
+    enabled: "te_native" (default: keep the native cuBLASLt kernels and obtain
+    invariance via workspace starvation — lowest overhead, no extra
+    dependencies, and the configuration verified bitwise-identical to the TE
+    training forward), "deepgemm" (DeepGEMM bf16 kernels), or "triton"
+    (persistent Triton matmul; any dtype)."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
@@ -3191,9 +3192,19 @@ class TransformerConfig(ModelParallelConfig):
                         "Batch-invariant MoE training requires "
                         "moe_token_dispatcher_type='alltoall'."
                     )
-                assert HAVE_DEEPGEMM_BF16, (
+                # DeepGEMM is used by the "deepgemm"/"triton" backends, and by
+                # the torch inference grouped-GEMM path under any backend. The
+                # "te_native" backend with the vLLM inference backend (or the
+                # training path, where TE grouped GEMM stays native) does not
+                # need it.
+                needs_deepgemm = self.batch_invariant_backend in ("deepgemm", "triton") or (
+                    self.transformer_impl == "inference_optimized"
+                    and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
+                )
+                assert not needs_deepgemm or HAVE_DEEPGEMM_BF16, (
                     "batch_invariant_mode=True with MoE requires DeepGEMM with bf16 "
-                    "grouped-GEMM bindings (m_grouped_bf16_gemm_nt_contiguous). "
+                    "grouped-GEMM bindings (m_grouped_bf16_gemm_nt_contiguous) for "
+                    "this backend combination. "
                     "Install via `uv pip install -e .[batch_invariant]`."
                 )
                 assert not (
