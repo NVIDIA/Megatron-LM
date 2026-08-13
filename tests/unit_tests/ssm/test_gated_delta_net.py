@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 import os
@@ -908,9 +908,7 @@ class TestFusedPreGatedDeltaRule:
             requires_grad=True,
         )
         with torch.no_grad():
-            qkvzba[
-                :, :, alpha_channel_offset : alpha_channel_offset + num_value_heads
-            ] = 100.0
+            qkvzba[:, :, alpha_channel_offset : alpha_channel_offset + num_value_heads] = 100.0
             fused_gdn.A_log.zero_()
             fused_gdn.dt_bias.zero_()
         fused_gdn.zero_grad(set_to_none=True)
