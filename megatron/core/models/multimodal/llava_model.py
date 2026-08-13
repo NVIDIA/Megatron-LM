@@ -1131,6 +1131,30 @@ class LLaVAModel(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        # The audio and video (temporal) paths were dropped when this
+        # PR reduced the multimodal example tree to the LLaVA + vision
+        # inference path this engine needs. The kwargs stay on the
+        # signature so callers passing the upstream shape don't hit a
+        # TypeError, but any non-None value is now silently ignored --
+        # fail loudly so a user with an audio- or video-capable
+        # checkpoint sees a clear message rather than a wrong-modality
+        # completion. The audio path can be restored in a follow-up
+        # once the accompanying sound_model / sound_projection wiring
+        # is back.
+        if (
+            sound_clips is not None
+            or sound_length is not None
+            or sound_timestamps is not None
+            or num_sound_clips is not None
+            or (num_frames is not None and num_frames != 1)
+        ):
+            raise NotImplementedError(
+                "LLaVAModel.forward: audio (sound_*) and video (num_frames > 1) "
+                "inputs are not supported on the VLM inference path added in "
+                "this PR. These kwargs are accepted for signature compatibility "
+                "with upstream LLaVAModel and must be left at their defaults."
+            )
+
         use_inference_kv_cache = (
             inference_context is not None
             and hasattr(inference_context, 'key_value_memory_dict')
