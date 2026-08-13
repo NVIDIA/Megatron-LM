@@ -1137,6 +1137,39 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.generated_text = ""
         request_entry.future.set_result(request_entry.record)
 
+    def _fail_submission(
+        self,
+        request_id: int,
+        sampling_params: Optional[SamplingParams],
+        exc: BaseException,
+    ) -> None:
+        """Register a minimal failed request so a rejected admission still
+        produces a client-visible failure reply.
+
+        Called from the SUBMIT_REQUEST handler when image preprocessing or
+        add_request raises. Registering a placeholder record with
+        Status.FAILED lets ``_handle_failed_request`` publish the ENGINE_REPLY
+        without leaving the client hanging or killing the engine loop.
+        """
+        if self.rank == 0:
+            warnings.warn(
+                f"Request {request_id} rejected before admission: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        # Empty prompt tokens are safe — the reply short-circuits at
+        # Status.FAILED and the client sees the failure, not a completion.
+        placeholder_request = DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=torch.empty(0, dtype=torch.int64),
+            sampling_params=(sampling_params or SamplingParams()),
+        )
+        placeholder_request.status = Status.FAILED
+        self.requests[request_id] = RequestEntry(
+            record=DynamicInferenceRequestRecord.from_request(placeholder_request),
+            future=self._loop.create_future(),
+        )
+        self._handle_failed_request(request_id)
+
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
         return self.context.has_unfinished_requests() or len(self.waiting_request_ids) > 0
