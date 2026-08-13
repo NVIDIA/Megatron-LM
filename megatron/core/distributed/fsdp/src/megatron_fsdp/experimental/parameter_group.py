@@ -14,6 +14,7 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
+from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from weakref import ReferenceType, ref
@@ -39,6 +40,22 @@ def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGro
     if parameter_group_ref is None:
         return None
     return parameter_group_ref()
+
+
+def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> None:
+    """Refresh MFSDP compute weights for parameter groups represented by ``parameters``.
+
+    Parameters outside the experimental MFSDP path are ignored. A parameter group
+    may own multiple parameters, but its compute-weight buffer is refreshed once.
+    """
+    seen_parameter_groups = set()
+    for parameter in parameters:
+        if (parameter_group := get_containing_parameter_group(parameter)) is None:
+            continue
+        if parameter_group in seen_parameter_groups:
+            continue
+        seen_parameter_groups.add(parameter_group)
+        parameter_group.sync_model_weight_from_main_weight()
 
 
 @dataclass(frozen=True, eq=False)

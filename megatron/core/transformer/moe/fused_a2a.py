@@ -620,6 +620,7 @@ def ensure_nccl_ep_bootstrapped(
     max_tokens_per_rank,
     recv_capacity_per_rank,
     hidden_dim,
+    num_topk,
     num_sms=0,
     zero_copy=False,
 ):
@@ -635,9 +636,13 @@ def ensure_nccl_ep_bootstrapped(
         num_experts (int): Total experts across ``ep_group`` (global, not per-rank).
         max_tokens_per_rank (int): Upper bound on local input tokens per forward. Must be
             even (NCCL EP requires ``num_tokens_per_rank * inner_dim % 4 == 0``).
-        recv_capacity_per_rank (int): Per-rank receive-buffer capacity in tokens. Must be
-            ``>= max_tokens_per_rank``; runtime overflow hard-traps (no soft drop).
+        recv_capacity_per_rank (int, optional): Per-rank receive-buffer capacity in tokens. Must
+            be ``>= max_tokens_per_rank``. ``None`` selects eager mode, where TE sizes the
+            receive buffer per step from the actual received-token count.
         hidden_dim (int): Token hidden size.
+        num_topk (int): Per-token top-k over ``ep_group``; sizes NCCL EP's internal buffers.
+            This is the same TP-scaled top-k used for the receive-capacity budget, not the
+            raw ``moe_router_topk``.
         num_sms (int): SM cap passed to TE as ``max_num_sms`` (0 lets TE/NCCL choose).
     """
     if not HAVE_TE_EP:
@@ -645,7 +650,7 @@ def ensure_nccl_ep_bootstrapped(
             "transformer_engine.pytorch.ep is unavailable. The 'ncclep' flex dispatcher backend "
             "requires a TransformerEngine build with NCCL EP support (NVTE_BUILD_WITH_NCCL_EP=1)."
         )
-    if te_ep._BOOTSTRAPPED:  # reuse TE's own one-time guard; no parallel state to drift
+    if is_nccl_ep_bootstrapped():  # reuse TE's own one-time guard; no parallel state to drift
         return
     te_ep.ep_bootstrap(
         ep_group,
@@ -653,9 +658,20 @@ def ensure_nccl_ep_bootstrapped(
         max_tokens_per_rank=max_tokens_per_rank,
         recv_capacity_per_rank=recv_capacity_per_rank,
         hidden_dim=hidden_dim,
+        num_topk=num_topk,
         max_num_sms=num_sms,
         zero_copy=zero_copy,
+        drop_on_overflow=recv_capacity_per_rank is not None,
     )
+
+
+def is_nccl_ep_bootstrapped() -> bool:
+    """Whether TE's process-wide NCCL EP context is live. is_ep_bootstrapped is TE 3321."""
+    if not HAVE_TE_EP:
+        return False
+    if hasattr(te_ep, "is_ep_bootstrapped"):
+        return te_ep.is_ep_bootstrapped()
+    return te_ep._BOOTSTRAPPED
 
 
 def nccl_ep_finalize():
@@ -717,12 +733,13 @@ if HAVE_TE_EP:
 
         Returns:
             tuple: ``(recv_tokens, tokens_per_expert, dispatched_probs)``:
-              * ``recv_tokens``: packed received tokens ``[recv_capacity_per_rank, hidden]``,
-                grouped by local expert (no separate compaction step).
-              * ``tokens_per_expert``: ``int32`` ``[num_local_experts]`` device tensor of
+              * ``recv_tokens``: packed received tokens ``[recv_rows, hidden]``, grouped by local
+                expert (no separate compaction step). ``recv_rows`` is
+                ``recv_capacity_per_rank``, or this step's received-token count in eager mode.
+              * ``tokens_per_expert``: ``int64`` ``[num_local_experts]`` device tensor of
                 received counts per local expert (feeds grouped GEMM as group sizes;
                 alignment-padded, == actual when ``alignment=0``).
-              * ``dispatched_probs``: ``float32`` ``[recv_capacity_per_rank]`` per-slot
+              * ``dispatched_probs``: ``float32`` ``[recv_rows]`` per-slot
                 weights; apply them in the expert MLP (combine is called unweighted).
 
             ``tokens_per_expert`` is non-differentiable.
@@ -742,8 +759,8 @@ if HAVE_TE_EP:
 
         Args:
             buffer (te_ep.EpBuffer): The TE EP buffer for this combine.
-            expert_out (torch.Tensor): Expert outputs ``[recv_capacity_per_rank, hidden]``,
-                already weighted.
+            expert_out (torch.Tensor): Expert outputs ``[recv_rows, hidden]`` (the row count
+                ``nccl_ep_dispatch`` returned), already weighted.
             num_local_tokens (int): Rows of the result (local token count for this
                 forward). When None, TE uses ``buffer.max_tokens_per_rank``.
             grad_out (torch.Tensor, optional): caller-owned symm buffer the backward scatters the
