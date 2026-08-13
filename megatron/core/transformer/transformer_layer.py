@@ -777,7 +777,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
         assert (
-            not self.config.enable_hyper_connections
+            not self.config.enable_mhc_connections
         ), "Please use HyperConnectionTransformerLayer instead"
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
@@ -841,7 +841,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return output
         return output.transpose(0, 1).reshape(mbs * packed_seq_params.tokens_per_sample, 1, -1)
 
-    def _run_pre_mlp_layernorm(self, hidden_states):
+    def _pre_mlp_layernorm_and_residual(self, hidden_states):
         """Run pre-MLP layernorm (with optional recompute and offload), unpack a
         tuple-output layernorm, and apply the fp32-residual cast.
 
@@ -893,7 +893,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
-        pre_mlp_layernorm_output, residual, mlp_state = self._run_pre_mlp_layernorm(hidden_states)
+        pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
+            hidden_states
+        )
 
         pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
             pre_mlp_layernorm_output, padding_mask, packed_seq_params
@@ -1030,12 +1032,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         Subclasses override this to swap in a fused kernel that consumes extra
         intermediates threaded via ``mlp_state`` (the third element returned
-        by ``_run_pre_mlp_layernorm``). Base ignores ``mlp_state``.
+        by ``_pre_mlp_layernorm_and_residual``). Base ignores ``mlp_state``.
 
         Args:
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
             residual (Tensor): Residual tensor.
-            mlp_state: Opaque payload from ``_run_pre_mlp_layernorm``. Default ``()``.
+            mlp_state: Opaque payload from ``_pre_mlp_layernorm_and_residual``. Default ``()``.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -1681,7 +1683,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # Set per-call by __call__ from kwargs so forward can read it without re-piping
         # the manager through the CUDA-graph kwarg path (CheckpointWithoutOutputManager
         # is not a CUDA-graph-supported type and gets stripped during capture). Read by
-        # _run_input_layernorm, _apply_self_attn_bda_step, _run_pre_mlp_layernorm, and
+        # _run_input_layernorm, _apply_self_attn_bda_step, _pre_mlp_layernorm_and_residual, and
         # _apply_mlp_bda_step — do not delete; appears unused only at the class level.
         self._mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None
 
@@ -1701,7 +1703,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         """
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
         hs = static_inputs["hidden_states"]
-        n = self.config.num_residual_streams
+        n = self.config.mhc_num_residual_streams
         static_inputs["hidden_states"] = torch.ones(
             (hs.shape[0], hs.shape[1], n * self.config.hidden_size),
             dtype=hs.dtype,
@@ -1735,12 +1737,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         Inherits ``_forward_attention`` and ``_forward_mlp`` from base; the
         mHC-specific behavior is contained in the ``_run_input_layernorm``,
-        ``_apply_self_attn_bda_step``, ``_run_pre_mlp_layernorm``, and
+        ``_apply_self_attn_bda_step``, ``_pre_mlp_layernorm_and_residual``, and
         ``_apply_mlp_bda_step`` overrides, which read the manager off
         ``self`` and thread per-call intermediates through the
         ``attn_state`` / ``mlp_state`` slots.
 
-        Override exists only to skip the ``enable_hyper_connections`` assert
+        Override exists only to skip the ``enable_mhc_connections`` assert
         on base ``TransformerLayer.forward``.
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
@@ -1825,7 +1827,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         self.attn_norm_manager = None
         return hidden_states
 
-    def _run_pre_mlp_layernorm(self, hidden_states):
+    def _pre_mlp_layernorm_and_residual(self, hidden_states):
         """HC pre-mlp layernorm: hyper-connection pre-wrap + mHC-aware checkpoint.
 
         Threads ``mlp_h_res`` and ``mlp_hc_h_post`` (produced by the
@@ -1871,7 +1873,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         """HC fused bias-dropout-add for MLP: combines apply_h_res + apply_h_post + bda.
 
         Unpacks ``mlp_h_res`` and ``mlp_hc_h_post`` from ``mlp_state`` (threaded
-        by ``_run_pre_mlp_layernorm`` via the base skeleton). Computes the
+        by ``_pre_mlp_layernorm_and_residual`` via the base skeleton). Computes the
         per-call ``mhc_mlp_bda_manager`` from ``self._mhc_recompute_manager``:
         the last layer of a recompute block does NOT pass the manager into the
         fused-bda checkpoint — the block-end finalize hook handles its output
@@ -2060,20 +2062,7 @@ class MoETransformerLayer(TransformerLayer):
         """
 
         self.mlp.fwd_execution_map = "route"
-        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
-        if isinstance(pre_mlp_layernorm_output, tuple):
-            if len(pre_mlp_layernorm_output) != 2:
-                raise ValueError(
-                    f"When the output of pre_mlp_layernorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(pre_mlp_layernorm_output)}"
-                )
-            pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
-        else:
-            residual = hidden_states
-
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
+        pre_mlp_layernorm_output, residual, _ = self._pre_mlp_layernorm_and_residual(hidden_states)
 
         hidden_states, probs, shared_expert_output = apply_module(self.mlp)(
             pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask

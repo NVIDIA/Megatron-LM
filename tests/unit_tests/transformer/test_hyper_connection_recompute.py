@@ -33,15 +33,15 @@ class TestHyperConnectionCheckpoint:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _create_hyper_connection_module(self, hidden_size=64, num_residual_streams=4):
+    def _create_hyper_connection_module(self, hidden_size=64, mhc_num_residual_streams=4):
         """Create a HyperConnectionModule for testing."""
         config = TransformerConfig(
             num_layers=2,
             hidden_size=hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_hyper_connections=True,
-            num_residual_streams=num_residual_streams,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=mhc_num_residual_streams,
             mhc_sinkhorn_iterations=5,  # Fewer iterations for faster tests
             mhc_init_gating_factor=0.01,
         )
@@ -235,8 +235,8 @@ class TestMHCBlockRecomputeIntegration:
             hidden_size=hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_hyper_connections=True,
-            num_residual_streams=num_streams,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=num_streams,
             mhc_sinkhorn_iterations=5,
             mhc_init_gating_factor=0.01,
         )
@@ -320,8 +320,8 @@ class TestMHCBlockRecomputeIntegration:
             hidden_size=hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_hyper_connections=True,
-            num_residual_streams=num_streams,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=num_streams,
             mhc_sinkhorn_iterations=5,
             mhc_init_gating_factor=0.01,
         )
@@ -398,13 +398,13 @@ class TestTransformerConfigRecomputeMhc:
             num_layers=2,
             hidden_size=64,
             num_attention_heads=4,
-            enable_hyper_connections=True,
-            num_residual_streams=4,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=4,
             recompute_modules=["core_attn", "mhc"],
             recompute_granularity='selective',
         )
         assert "mhc" in config.recompute_modules
-        assert config.enable_hyper_connections is True
+        assert config.enable_mhc_connections is True
 
 
 if __name__ == "__main__":
