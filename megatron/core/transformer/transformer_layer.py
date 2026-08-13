@@ -312,6 +312,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     output of the same size.
     """
 
+    #: Whether this layer class understands mHC n-stream hidden states
+    #: ([s, b, n*C]). Only HyperConnectionTransformerLayer sets this True;
+    #: __init__ rejects `enable_mhc_connections` on any layer that does not.
+    supports_mhc_connections: bool = False
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -529,6 +534,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
+
+        if config.enable_mhc_connections and not self.supports_mhc_connections:
+            raise ValueError(
+                f"{type(self).__name__} does not implement mHC residual streams. Build the "
+                "decoder with HyperConnectionTransformerLayer when "
+                "enable_mhc_connections=True."
+            )
+
+        # Resolve the legacy `_forward_post_mlp` override once instead of walking the MRO on
+        # every MLP bias-dropout-add. See _apply_mlp_bda_step for the deprecation contract.
+        self._legacy_forward_post_mlp = None
+        for klass in type(self).__mro__:
+            if klass is TransformerLayer:
+                break
+            if "_forward_post_mlp" in vars(klass):
+                self._legacy_forward_post_mlp = klass._forward_post_mlp
+                break
 
     def create_mcore_cudagraph_manager(self, config):
         """Register the transformer layer for cudagraphs."""
@@ -776,9 +798,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        assert (
-            not self.config.enable_mhc_connections
-        ), "Please use HyperConnectionTransformerLayer instead"
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -1046,20 +1065,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # `_forward_post_mlp` and took only (mlp_output_with_bias, residual). If a
         # subclass still overrides the legacy name, route through it and emit a
         # DeprecationWarning. `mlp_state` is dropped — the legacy contract didn't
-        # have it. To be removed in a future release.
-        for klass in type(self).__mro__:
-            if klass is TransformerLayer:
-                break
-            if "_forward_post_mlp" in vars(klass):
-                warnings.warn(
-                    "TransformerLayer._forward_post_mlp has been renamed to "
-                    "_apply_mlp_bda_step and gained an `mlp_state` parameter. "
-                    "Override `_apply_mlp_bda_step` instead; the legacy hook "
-                    "will be removed in a future release.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-                return klass._forward_post_mlp(self, mlp_output_with_bias, residual)
+        # have it. The override is resolved once in __init__ so this hot path stays
+        # a single attribute check. To be removed in a future release.
+        if self._legacy_forward_post_mlp is not None:
+            warnings.warn(
+                "TransformerLayer._forward_post_mlp has been renamed to "
+                "_apply_mlp_bda_step and gained an `mlp_state` parameter. "
+                "Override `_apply_mlp_bda_step` instead; the legacy hook "
+                "will be removed in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return self._legacy_forward_post_mlp(self, mlp_output_with_bias, residual)
 
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
@@ -1621,6 +1638,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     Cross-attention hyper connection is not supported.
     """
 
+    supports_mhc_connections: bool = True
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1823,12 +1842,20 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
         return layernorm_output
 
-    def _apply_self_attn_bda_step(self, attention_output_with_bias, residual, attn_state):
+    def _apply_self_attn_bda_step(self, attention_output_with_bias, residual, attn_state=()):
         """HC fused bias-dropout-add: combines apply_h_res + apply_h_post + bda.
 
         Unpacks ``h_res`` and ``h_post`` from ``attn_state`` (threaded by
-        ``_run_input_layernorm`` via the base skeleton).
+        ``_run_input_layernorm`` via the base skeleton). Keeps the base class's
+        default so base-class call sites that pass only two arguments fail with a
+        readable message rather than a TypeError.
         """
+        if not attn_state:
+            raise ValueError(
+                "HyperConnectionTransformerLayer._apply_self_attn_bda_step requires the "
+                "(h_res, h_post) attn_state produced by _run_input_layernorm. It was called "
+                "through a base-class path that does not thread mHC intermediates."
+            )
         h_res, h_post = attn_state
         nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
         with self.bias_dropout_add_exec_handler():
@@ -1895,7 +1922,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return pre_mlp_layernorm_output, residual, (mlp_h_res, mlp_hc_h_post)
 
-    def _apply_mlp_bda_step(self, mlp_output_with_bias, residual, mlp_state):
+    def _apply_mlp_bda_step(self, mlp_output_with_bias, residual, mlp_state=()):
         """HC fused bias-dropout-add for MLP: combines apply_h_res + apply_h_post + bda.
 
         Unpacks ``mlp_h_res`` and ``mlp_hc_h_post`` from ``mlp_state`` (threaded
@@ -1904,7 +1931,18 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         the last layer of a recompute block does NOT pass the manager into the
         fused-bda checkpoint — the block-end finalize hook handles its output
         discard.
+
+        Keeps the base class's ``mlp_state`` default so base-class call sites that
+        pass only two arguments (``_te_cuda_graph_replay_impl``,
+        ``MoETransformerLayer._forward_mlp_postprocess``) fail with a readable
+        message rather than a TypeError.
         """
+        if not mlp_state:
+            raise ValueError(
+                "HyperConnectionTransformerLayer._apply_mlp_bda_step requires the "
+                "(h_res, h_post) mlp_state produced by _pre_mlp_layernorm_and_residual. It "
+                "was called through a base-class path that does not thread mHC intermediates."
+            )
         mlp_h_res, mlp_hc_h_post = mlp_state
 
         is_last_in_recompute_block = bool(

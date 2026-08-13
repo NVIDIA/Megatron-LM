@@ -197,7 +197,10 @@ class HyperConnectionModule(MegatronModule):
 
     def _init_weights(self) -> None:
         """Initialize weights for stable training."""
-        nn.init.xavier_uniform_(self.mapping_proj.weight)
+        # Honor the mcore convention: skip weight init when the caller will load a
+        # checkpoint over these parameters anyway (e.g. meta-device construction).
+        if self.config.perform_initialization:
+            nn.init.xavier_uniform_(self.mapping_proj.weight)
 
         # Set sequence_parallel attribute on parameters for gradient synchronization
         # across TP ranks when sequence_parallel is enabled.
@@ -707,32 +710,3 @@ class HyperConnectionModule(MegatronModule):
             output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x)
 
         return output
-
-
-# ==================== Checkpoint utilities for mHC ====================
-
-
-class HyperConnectionCheckpoint:
-    """
-    Checkpoint utility for mHC intermediate activations.
-
-    Implements the paper's "recomputing strategy" to reduce memory footprint
-    by discarding intermediate n-stream activations and recomputing on-the-fly.
-    """
-
-    @staticmethod
-    def compute_optimal_block_size(num_layers: int, num_streams: int) -> int:
-        """
-        Compute optimal recomputation block size.
-
-        From paper Eq. (20): L_r^* ≈ sqrt(nL/(n+2))
-
-        Args:
-            num_layers: Total number of transformer layers
-            num_streams: Number of residual streams (n)
-
-        Returns:
-            block_size: Optimal block size for checkpointing
-        """
-        block_size = int(math.sqrt(num_streams * num_layers / (num_streams + 2)))
-        return max(1, block_size)

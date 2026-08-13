@@ -1996,6 +1996,26 @@ class TransformerConfig(ModelParallelConfig):
                 "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
             )
 
+        if self.enable_mhc_connections and self.recompute_granularity == "full":
+            raise NotImplementedError(
+                "enable_mhc_connections is not yet compatible with full activation recompute. "
+                "Use selective recompute with 'mhc' in recompute_modules, or disable "
+                "activation recompute."
+            )
+
+        if self.enable_mhc_connections and self.inference_fuse_tp_communication:
+            raise NotImplementedError(
+                "enable_mhc_connections is not compatible with inference_fuse_tp_communication. "
+                "The fused inference TP path assumes single-stream residual tensors."
+            )
+
+        if self.enable_mhc_connections and (self.num_moe_experts or 0) > 0:
+            raise NotImplementedError(
+                "enable_mhc_connections is not yet supported with MoE layers. "
+                "HyperConnectionTransformerLayer rejects MoE MLP submodules; disable MoE "
+                "(num_moe_experts=None) or disable mHC."
+            )
+
         if self.enable_mhc_connections:
             # TransformerBlock expands to n-stream at `pre_process` and contracts back at
             # the stage holding the final layernorm, so every intermediate pipeline stage
@@ -2017,6 +2037,23 @@ class TransformerConfig(ModelParallelConfig):
                     "enable_mhc_connections is not compatible with fp32_residual_connection. "
                     "The mHC residual is the n-stream tensor consumed by the H_res batched "
                     "matmul, which must share the activation dtype."
+                )
+
+            # SinkhornKnopp.backward's analytic chain rule (grad = grad_M_init * M_init)
+            # is exact only because the per-row max shift is annihilated by the first
+            # row-normalization T_r. With zero iterations that invariance does not hold
+            # and the dropped argmax term makes the gradient silently wrong.
+            if self.mhc_sinkhorn_iterations < 1:
+                raise ValueError(
+                    "mhc_sinkhorn_iterations must be >= 1; the Sinkhorn-Knopp backward "
+                    f"assumes at least one row-normalization pass, got "
+                    f"{self.mhc_sinkhorn_iterations}."
+                )
+
+            if self.mhc_init_gating_factor < 0:
+                raise ValueError(
+                    "mhc_init_gating_factor must be non-negative, got "
+                    f"{self.mhc_init_gating_factor}."
                 )
 
         if self.fine_grained_activation_offloading:

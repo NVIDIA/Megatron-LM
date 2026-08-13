@@ -23,7 +23,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-class TestHyperConnectionCheckpoint:
+class TestHyperConnectionModuleCheckpoint:
     """Test HyperConnectionModule checkpoint functionality."""
 
     def setup_method(self, method):
@@ -426,6 +426,31 @@ class TestTransformerConfigRecomputeMhc:
                 num_attention_heads=4,
                 enable_mhc_connections=True,
                 fp32_residual_connection=True,
+            )
+
+    @pytest.mark.parametrize(
+        "extra_kwargs, error_type, match",
+        [
+            (
+                {"recompute_granularity": "full", "recompute_method": "uniform"},
+                NotImplementedError,
+                "full activation recompute",
+            ),
+            ({"inference_fuse_tp_communication": True}, NotImplementedError, "single-stream"),
+            ({"num_moe_experts": 4}, NotImplementedError, "MoE"),
+            ({"mhc_sinkhorn_iterations": 0}, ValueError, "mhc_sinkhorn_iterations"),
+            ({"mhc_init_gating_factor": -0.1}, ValueError, "mhc_init_gating_factor"),
+        ],
+    )
+    def test_config_rejects_unsupported_combinations(self, extra_kwargs, error_type, match):
+        """Unsupported mHC combinations must fail at config time, not mid-forward."""
+        with pytest.raises(error_type, match=match):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                enable_mhc_connections=True,
+                **extra_kwargs,
             )
 
 

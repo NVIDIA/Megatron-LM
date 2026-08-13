@@ -3,7 +3,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple, Union, cast
+from typing import List, Optional, Set, Union, cast
 
 import torch
 from torch import Tensor
@@ -639,10 +639,22 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             outer_quantization_context = nullcontext()
 
         # Managers retain per-forward checkpoint state, so allocate them for each training pass.
+        use_mhc_recompute = self.training and self.mhc_recompute_enabled
+        if use_mhc_recompute and len(extract_layer_indices) > 0:
+            # mHC recompute discards every checkpoint output in the block and restores them
+            # from a single hook on the block-end tensor. A loss taken on an extracted
+            # mid-block activation can reach those checkpoints before that hook fires and
+            # would read zero-sized storage.
+            raise NotImplementedError(
+                "'mhc' in recompute_modules is not supported together with "
+                "extract_layer_indices. The unified mHC recompute hook is registered on the "
+                "recompute-block boundary, so gradients entering from an extracted "
+                "intermediate layer can reach discarded activations before they are restored."
+            )
         mhc_layer_managers, mhc_is_last_in_recompute_block = build_mhc_recompute_layer_plan(
             num_layers=len(self.layers),
             mhc_recompute_layer_num=self.config.mhc_recompute_layer_num,
-            use_mhc_recompute=self.training and self.mhc_recompute_enabled,
+            use_mhc_recompute=use_mhc_recompute,
         )
 
         with rng_context, outer_quantization_context:
