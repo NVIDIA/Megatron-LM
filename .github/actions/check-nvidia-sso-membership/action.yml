@@ -58,7 +58,7 @@ runs:
             echo "ERROR: Failed to download ${{ inputs.sso_users_filename }} from github-audits release"
             echo "sso_file_available=false" >> $GITHUB_OUTPUT
             echo "user_count=0" >> $GITHUB_OUTPUT
-            exit 0
+            exit 1
           }
 
         # Verify file was downloaded and is valid JSON
@@ -66,7 +66,7 @@ runs:
           echo "ERROR: ${{ inputs.sso_users_filename }} file not found after download"
           echo "sso_file_available=false" >> $GITHUB_OUTPUT
           echo "user_count=0" >> $GITHUB_OUTPUT
-          exit 0
+          exit 1
         fi
 
         # Validate JSON structure
@@ -74,7 +74,7 @@ runs:
           echo "ERROR: ${{ inputs.sso_users_filename }} is not a valid JSON object"
           echo "sso_file_available=false" >> $GITHUB_OUTPUT
           echo "user_count=0" >> $GITHUB_OUTPUT
-          exit 0
+          exit 1
         fi
 
         USER_COUNT=$(jq 'length' ${{ inputs.sso_users_filename }})
