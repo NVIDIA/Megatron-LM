@@ -824,14 +824,22 @@ class TextGenerationController:
         else:
             logits_seq_len = context.padded_active_token_count
 
-        # Check for VLM image data in the context.
-        image_token_mask = context.current_image_token_mask()
-        image_embeddings = context.current_image_embeddings()
-        has_images = (
-            image_token_mask is not None
-            and image_embeddings is not None
-            and (image_token_mask >= 0).any()
-        )
+        # Check for VLM image data in the context. Skip the helpers entirely
+        # on text-only workloads so the decode critical path doesn't call
+        # them once per step (both would return None but still take an
+        # attribute-access hop).
+        if context.has_vlm_data:
+            image_token_mask = context.current_image_token_mask()
+            image_embeddings = context.current_image_embeddings()
+            has_images = (
+                image_token_mask is not None
+                and image_embeddings is not None
+                and (image_token_mask >= 0).any()
+            )
+        else:
+            image_token_mask = None
+            image_embeddings = None
+            has_images = False
 
         inference_input = {
             "tokens": input_ids,

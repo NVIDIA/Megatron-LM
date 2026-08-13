@@ -4726,6 +4726,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._request_to_image_token_mask.pop(request_id, None)
         self._request_to_image_token_count.pop(request_id, None)
 
+    @property
+    def has_vlm_data(self) -> bool:
+        """True iff any active request has attached image data.
+
+        Used by callers on the hot path (``TextGenerationController._
+        dynamic_step_forward_logits``) to skip ``current_image_token_mask``
+        / ``current_image_embeddings`` entirely on text-only workloads.
+        """
+        return bool(self._request_to_image_token_mask)
+
     def current_image_token_mask(self) -> Optional[Tensor]:
         """Flattened image-token mask aligned with current_input_ids.
 
