@@ -626,7 +626,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         value = rearrange(value, "n (m h p) -> n m h p", m=M, p=self.headdim).contiguous()
         key = rearrange(key, "n (m g s) -> n m g s", m=M, s=self.d_state).contiguous()
         query = rearrange(query, "n (g s) -> n 1 g s", s=self.d_state).contiguous()
-        z = rearrange(z, "n (h p) -> n 1 h p", p=self.headdim).contiguous()
         beta = rearrange(b.sigmoid(), "n (m h) -> n m h", m=M).contiguous()
         g = -self.cp.get_A_log().float().exp() * F.softplus(a.float() + self.cp.get_dt_bias())
         g = rearrange(g, "n h -> n 1 h").contiguous()
@@ -678,7 +677,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         y = rearrange(core_attn_out, "n t h p -> n t (h p)").contiguous()  # [n, 1, d_inner]
         if self.rmsnorm:
-            z = rearrange(z, "n t h p -> n t (h p)").contiguous()
+            z = rearrange(z, "n d -> n 1 d").contiguous()
             y = self.norm(y, z)
         return y
 
@@ -737,7 +736,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 activation=self.activation,
                 seq_idx=seq_idx,
             )
-        VKQ = rearrange(VKQ, "b d l -> b l d").contiguous()
+        VKQ = rearrange(VKQ, "b d l -> b l d")
 
         value, key, query = torch.split(
             VKQ,
@@ -754,7 +753,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         value = rearrange(value, "b l (m h p) -> b (l m) h p", m=M, p=self.headdim).contiguous()
         key = rearrange(key, "b l (m g s) -> b (l m) g s", m=M, s=self.d_state).contiguous()
         query = rearrange(query, "b l (g s) -> b l g s", s=self.d_state).contiguous()
-        z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
         beta = rearrange(b.sigmoid(), "b l (m h) -> b (l m) h", m=M).contiguous()
         g = -self.cp.get_A_log().float().exp() * F.softplus(a.float() + self.cp.get_dt_bias())
         g = g.contiguous()
@@ -782,7 +780,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         y = rearrange(core_attn_out, "b l h p -> l b (h p)").contiguous()
         if self.rmsnorm:
-            z = rearrange(z, "b l h p -> l b (h p)").contiguous()
+            z = rearrange(z, "b l d -> l b d").contiguous()
             y = self.norm(y, z)
         return y
 
