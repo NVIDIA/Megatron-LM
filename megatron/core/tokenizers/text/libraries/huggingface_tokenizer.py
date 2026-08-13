@@ -47,7 +47,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         trust_remote_code: Optional[bool] = False,
         include_special_tokens: bool = True,
         chat_template: str = None,
-        fast_tokenizer: bool = False,
+        use_gigatoken: bool = False,
     ):
         """
         Args:
@@ -70,47 +70,47 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             use_fast: whether to use fast HuggingFace tokenizer
             include_special_tokens: when True, converting text to ids will include special
                 tokens / prompt tokens (if any), yielding self.tokenizer(text).input_ids
-            fast_tokenizer: whether to use GigaToken implementation
+            use_gigatoken: whether to use GigaToken implementation
         """
 
         try:
-            # this logic deals with different huggingface tokenizers having different args
-            if fast_tokenizer:
-                # restore tokenizer with gigatoken
-                if HAVE_GIGATOKEN:
-                    self.tokenizer = gt.Tokenizer(tokenizer_path).as_hf()
-                else:
-                    raise ModuleNotFoundError(
-                        "gigatoken library is not installed. "
-                        "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
-                    )
+            if vocab_file is None:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path=tokenizer_path,
+                    use_fast=use_fast,
+                    trust_remote_code=trust_remote_code,
+                )
+            elif merges_file is None:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path=tokenizer_path,
+                    vocab_file=vocab_file,
+                    use_fast=use_fast,
+                    trust_remote_code=trust_remote_code,
+                )
             else:
-                if vocab_file is None:
-                    self.tokenizer = AutoTokenizer.from_pretrained(
-                        pretrained_model_name_or_path=tokenizer_path,
-                        use_fast=use_fast,
-                        trust_remote_code=trust_remote_code,
-                    )
-                elif merges_file is None:
-                    self.tokenizer = AutoTokenizer.from_pretrained(
-                        pretrained_model_name_or_path=tokenizer_path,
-                        vocab_file=vocab_file,
-                        use_fast=use_fast,
-                        trust_remote_code=trust_remote_code,
-                    )
-                else:
-                    self.tokenizer = AutoTokenizer.from_pretrained(
-                        pretrained_model_name_or_path=tokenizer_path,
-                        vocab_file=vocab_file,
-                        merges_file=merges_file,
-                        use_fast=use_fast,
-                        trust_remote_code=trust_remote_code,
-                    )
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_name_or_path=tokenizer_path,
+                    vocab_file=vocab_file,
+                    merges_file=merges_file,
+                    use_fast=use_fast,
+                    trust_remote_code=trust_remote_code,
+                )
         except Exception as e:
             raise ValueError(
                 'Unable to instantiate HuggingFace AutoTokenizer '
                 f'for {tokenizer_path}. Exception: {e}'
             )
+        
+        # this logic deals with different huggingface tokenizers having different args
+        if use_gigatoken:
+            # restore tokenizer with gigatoken
+            if HAVE_GIGATOKEN:
+                self.tokenizer = gt.Tokenizer(self.tokenizer).as_hf()
+            else:
+                raise ModuleNotFoundError(
+                    "gigatoken library is not installed. "
+                    "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
+                )
 
         # Store the tokenizer's existing chat template if the user does not provide
         # a custom chat template. Otherwise, override the default chat template with

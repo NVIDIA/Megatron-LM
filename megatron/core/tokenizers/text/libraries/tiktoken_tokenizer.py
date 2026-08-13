@@ -4,7 +4,6 @@ import base64
 import json
 import logging
 import os
-import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -15,13 +14,6 @@ except ImportError:
 
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
 from .chat_template import MegatronTokenizerChatTemplate
-
-try:
-    import gigatoken as gt
-
-    HAVE_GIGATOKEN = True
-except (ImportError, ModuleNotFoundError):
-    HAVE_GIGATOKEN = False
 
 logger = logging.getLogger(__name__)
 
@@ -81,65 +73,6 @@ def reload_mergeable_ranks(
     return ranks
 
 
-def load_tokenizer(
-    tokenizer_path: str,
-    fast_tokenizer: bool,
-    pattern: str,
-    special_tokens: dict,
-    mergeable_ranks: dict,
-    vocab_size: int,
-):
-    """
-    Load tiktoken tokenizer.
-
-    Args:
-        tokenizer_path (str): path to the tokenizer.
-        fast_tokenizer (bool): whether to use GigaToken implementation.
-        pattern (str): regex pattern to split the text.
-        special_tokens (dict): template for user-defined special tokens.
-        mergeable_ranks (dict): reloaded tokenizer vocab.
-
-    Returns:
-        tiktoken tokenizer.
-    """
-    if fast_tokenizer:
-        if HAVE_GIGATOKEN:
-            if pattern == _PATTERN_TIKTOKEN_V2:
-                pretokenizer = "nemotron"
-            else:
-                raise ValueError("`fast_tokenizer` is only supported with tiktoken pattern `v2`.")
-            # Reformat tiktoken file to gigatoken format
-            with open(tokenizer_path) as f:
-                tokens = json.load(f)
-
-            tokens.sort(key=lambda t: t["rank"])
-
-            tokenizer_path = f"{tokenizer_path}.tiktoken"
-            if not os.path.isfile(tokenizer_path):
-                with open(tokenizer_path, "w") as f:
-                    for idx, t in enumerate(tokens):
-                        f.write(f"{t['token_bytes']} {idx}\n")
-
-            return gt.Tokenizer.from_tiktoken(
-                path=tokenizer_path,
-                pretokenizer=pretokenizer,
-                special_tokens=special_tokens,
-                vocab_size=vocab_size,
-            ).as_tiktoken()
-        else:
-            raise ModuleNotFoundError(
-                "gigatoken library is not installed. "
-                "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
-            )
-    else:
-        return tiktoken.Encoding(
-            name=Path(tokenizer_path).parent.name,
-            pat_str=pattern,
-            mergeable_ranks=mergeable_ranks,
-            special_tokens=special_tokens,  # special tokens are handled manually
-        )
-
-
 class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemplate):
     """TikTokenTokenizer https://github.com/openai/tiktoken."""
 
@@ -151,7 +84,6 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
         chat_template: Optional[str] = None,
         pattern: Optional[str] = "v2",
         vocab_size: Optional[int] = DEFAULT_TIKTOKEN_MAX_VOCAB,
-        fast_tokenizer: Optional[bool] = False,
     ):
         """
         Args:
@@ -161,9 +93,7 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
             chat_template (Optional[str]): tokenizer chat template in jinja format.
             pattern (Optional[str]): regex pattern to split the text.
             vocab_size (Optional[int]): size of vocabulary.
-            fast_tokenizer (Optional[bool]): whether to use GigaToken implementation.
         """
-        self.fast_tokenizer = fast_tokenizer
 
         if not tokenizer_path or not os.path.exists(tokenizer_path):
             raise ValueError(f"tokenizer_path: {tokenizer_path} is invalid")
@@ -230,14 +160,11 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
             self.shifted_id2token[key + self.num_special_tokens] = value
 
         special_tokens_dict = {t: i for i, t in enumerate(self.special_tokens)}
-
-        self.tokenizer = load_tokenizer(
-            tokenizer_path=tokenizer_path,
-            fast_tokenizer=fast_tokenizer,
-            pattern=pattern,
-            special_tokens=special_tokens_dict,
+        self.tokenizer = tiktoken.Encoding(
+            name=Path(tokenizer_path).parent.name,
+            pat_str=pattern,
             mergeable_ranks=self.token2id,
-            vocab_size=vocab_size,
+            special_tokens=special_tokens_dict,  # special tokens are handled manually
         )
 
         self._vocab = special_tokens_dict | self.token2id
@@ -385,8 +312,6 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
     @property
     def vocab(self):
         """Returns tokenizer vocab."""
-        if self.fast_tokenizer:
-            return self.tokenizer._tokenizer.vocab
         return self._vocab
 
     @property
@@ -402,8 +327,6 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
     @property
     def vocab_size(self) -> int:
         """Returns tokenizer vocab size."""
-        if self.fast_tokenizer:
-            return self.tokenizer._tokenizer.vocab_size
         return self._vocab_size
 
     @property

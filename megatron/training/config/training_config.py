@@ -733,5 +733,5 @@ class TokenizerConfig:
     chat_template: Optional[str] = None
     """Custom chat template in jinja format for conversation formatting."""
 
-    fast_tokenizer: Optional[bool] = False
+    use_gigatoken: Optional[bool] = False
     """Whether to use faster implementaion of tokenizers (gigatoken)"""
