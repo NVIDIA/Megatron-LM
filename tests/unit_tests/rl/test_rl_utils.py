@@ -441,9 +441,7 @@ class TestRLUtils:
             rl_default_top_k=0,
             seq_length=SEQ,
         )
-        response = SimpleNamespace(
-            env_id="env", metrics=lambda: {"reward": [1.0, 0.5]}, results=[]
-        )
+        response = SimpleNamespace(env_id="env", metrics=lambda: {"reward": [1.0, 0.5]}, results=[])
         agent = SimpleNamespace(run_evaluation=lambda request: [response])
         wandb_writer = MagicMock()
 
