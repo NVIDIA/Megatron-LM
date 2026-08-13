@@ -1137,6 +1137,19 @@ def _topk_in_bounds(
     return in_range & valid_bounds
 
 
+def _segment_kernel_applicable(
+    b: int, sq: int, local_packed_cp_query_len: Optional[int]
+) -> bool:
+    """Whether ``_indexer_topk_single_packed_cp_segments`` can take this shape.
+
+    That kernel raises rather than returning None when its preconditions fail, so the
+    scoring plan has to ask before promising it. Kept next to the kernel so the two
+    cannot drift apart.
+    """
+    local_query_len = local_packed_cp_query_len if local_packed_cp_query_len is not None else sq
+    return b == 1 and local_query_len % 2 == 0 and _INDEXER_RATIO == 1
+
+
 def _resolve_scoring_plan_for_call(
     *,
     starts: Optional[Tensor],
@@ -1147,6 +1160,7 @@ def _resolve_scoring_plan_for_call(
     use_local_indexer_varlen: bool,
     single_packed_thd_sequence: bool,
     packed_metadata_available: bool,
+    segment_kernel_applicable: bool = True,
 ) -> IndexerScoringDecision:
     """Map this call's layout facts onto a scoring plan.
 
@@ -1164,6 +1178,7 @@ def _resolve_scoring_plan_for_call(
         explicit_key_positions=False,
         single_sequence_pack=single_packed_thd_sequence,
         packed_metadata_available=packed_metadata_available,
+        segment_kernel_applicable=segment_kernel_applicable,
     )
 
 
@@ -1238,6 +1253,9 @@ def _indexer_topk_bshd(
 
     if scoring_plan is None:
         scoring_plan = _resolve_scoring_plan_for_call(
+            segment_kernel_applicable=_segment_kernel_applicable(
+                b, sq, local_packed_cp_query_len
+            ),
             starts=starts,
             ends=ends,
             varlen_is_plain_causal=varlen_is_plain_causal,

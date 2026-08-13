@@ -82,6 +82,7 @@ def resolve_indexer_scoring_plan(
     explicit_key_positions: bool,
     single_sequence_pack: bool,
     packed_metadata_available: bool,
+    segment_kernel_applicable: bool = True,
 ) -> IndexerScoringDecision:
     """Resolve how indexer scoring should run for one attention call.
 
@@ -101,6 +102,10 @@ def resolve_indexer_scoring_plan(
         single_sequence_pack: This microbatch's pack holds exactly one sequence. This is
             the only input here that varies batch to batch.
         packed_metadata_available: ``cu_seqlens`` and max-seqlen metadata are present.
+        segment_kernel_applicable: The zigzag-segment kernel's structural preconditions
+            hold for this call (single batch row, even local query length, indexer ratio
+            of one). It raises rather than declining when they do not, so the plan must
+            not promise it.
 
     Returns:
         The resolved plan and the reason for it.
@@ -123,9 +128,16 @@ def resolve_indexer_scoring_plan(
         # The zigzag-segment kernel degenerates correctly when the rank holds the whole
         # sequence (its ``sk == local_query_len`` branch is plain causal split in two),
         # so a single-sequence pack does not need cp_size > 1.
+        if single_sequence_pack and segment_kernel_applicable:
+            return IndexerScoringDecision(
+                IndexerScoringPlan.PACKED_CP_SINGLE,
+                "one sequence per pack, split into causal segments",
+            )
         if single_sequence_pack:
             return IndexerScoringDecision(
-                IndexerScoringPlan.PACKED_CP_SINGLE, "one sequence per pack, split into causal segments"
+                IndexerScoringPlan.UNFUSED_BOUNDS,
+                "single-sequence pack whose shape the segment kernel cannot take "
+                "(needs one batch row, even local query length, indexer ratio 1)",
             )
         if cp_size > 1 and packed_metadata_available:
             return IndexerScoringDecision(

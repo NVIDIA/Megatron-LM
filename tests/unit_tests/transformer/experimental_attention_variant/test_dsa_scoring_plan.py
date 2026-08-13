@@ -23,6 +23,7 @@ BASE = dict(
     explicit_key_positions=False,
     single_sequence_pack=False,
     packed_metadata_available=False,
+    segment_kernel_applicable=True,
 )
 
 
@@ -63,9 +64,17 @@ class TestIndexerScoringPlan:
         assert decision.plan is IndexerScoringPlan.UNFUSED_BOUNDS
         assert "cu_seqlens" in decision.reason
 
-    def test_packed_without_cp_is_unfused_and_says_why(self):
-        """Packed sequences at cp_size=1 miss every fused kernel. Measured on GB200."""
-        decision = _resolve(packed_thd=True, single_sequence_pack=True, packed_metadata_available=True)
+    def test_single_sequence_pack_reaches_the_fused_scorer_without_cp(self):
+        """The segment kernel degenerates correctly when one rank holds the sequence."""
+        decision = _resolve(
+            packed_thd=True, single_sequence_pack=True, packed_metadata_available=True
+        )
+        assert decision.plan is IndexerScoringPlan.PACKED_CP_SINGLE
+        assert decision.is_fused
+
+    def test_multi_sequence_pack_without_cp_is_unfused_and_says_why(self):
+        """The cu_seqlens kernel genuinely requires cp_size > 1."""
+        decision = _resolve(packed_thd=True, packed_metadata_available=True)
         assert decision.plan is IndexerScoringPlan.UNFUSED_BOUNDS
         assert "cp_size" in decision.reason
 
@@ -74,6 +83,33 @@ class TestIndexerScoringPlan:
         decision = _resolve(cp_size=4)
         assert decision.plan is IndexerScoringPlan.UNFUSED_BOUNDS
         assert "packing" in decision.reason
+
+    def test_segment_kernel_preconditions_are_respected(self):
+        """The segment kernel raises rather than declining, so the plan must not promise it.
+
+        Widening the single-pack gate without this check routed a packed cp_size=1 run
+        into the kernel, which died with "requires b=1, even local query length,
+        ratio=1" instead of falling back.
+        """
+        decision = _resolve(
+            packed_thd=True,
+            single_sequence_pack=True,
+            packed_metadata_available=True,
+            segment_kernel_applicable=False,
+        )
+        assert decision.plan is IndexerScoringPlan.UNFUSED_BOUNDS
+        assert "segment kernel cannot take" in decision.reason
+
+    def test_segment_kernel_preconditions_apply_under_cp_too(self):
+        """The same shape guard is needed on the pre-existing CP>1 path."""
+        decision = _resolve(
+            packed_thd=True,
+            cp_size=16,
+            single_sequence_pack=True,
+            packed_metadata_available=True,
+            segment_kernel_applicable=False,
+        )
+        assert decision.plan is IndexerScoringPlan.UNFUSED_BOUNDS
 
     def test_explicit_key_positions_declines(self):
         """Custom key positions are not expressible as row-wise bounds at all."""
