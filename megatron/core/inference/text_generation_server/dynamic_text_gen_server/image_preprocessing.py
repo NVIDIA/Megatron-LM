@@ -186,64 +186,36 @@ def preprocess_image_bytes_list(
 
     dynamic_res = config.dynamic_resolution and not config.use_tiling
 
-    if dynamic_res:
-        # Preprocess each image independently so its aspect ratio is preserved.
-        # Downstream (llava_model._preprocess_data / vision encoder pack) handles
-        # per-image cu_seqlens, so ragged patch counts are fine.
-        all_imgs, all_sizes = [], []
-        for image_bytes in image_bytes_list:
-            imgs, imgs_sizes = preprocess_image_bytes(image_bytes, config, device=device)
-            all_imgs.append(imgs)
-            all_sizes.append(imgs_sizes)
-        imgs = torch.cat(all_imgs, dim=1) if len(all_imgs) > 1 else all_imgs[0]
-        imgs_sizes = torch.cat(all_sizes, dim=0) if len(all_sizes) > 1 else all_sizes[0]
-        return {"imgs": imgs, "imgs_sizes": imgs_sizes}
+    if not dynamic_res:
+        # Static tiling used to live here as ``preprocess_image_bytes_tiled``,
+        # but it delegated to ``examples.multimodal.image_processing.ImageTransform``,
+        # a bad dependency direction (``megatron/core`` importing from
+        # ``examples/``). No in-tree caller currently hits this branch
+        # (all supported encoders are on the dynamic-resolution path), so we
+        # drop the tiling helper rather than move its 168-line dep into core.
+        # Wire clients that need static tiling should preprocess bytes
+        # themselves and submit a tensor payload
+        # (``multi_modal_data['image'] = {'imgs': Tensor, 'num_tiles': Tensor,
+        # 'num_img_embeddings_per_tile': int}``); the engine already accepts
+        # that shape without touching examples.
+        raise NotImplementedError(
+            "Wire-side static-tiling preprocessing has moved out of "
+            "``megatron/core``. Submit a preprocessed tensor payload as "
+            "``multi_modal_data['image']`` "
+            "({'imgs': Tensor, 'num_tiles': Tensor, "
+            "'num_img_embeddings_per_tile': int}), or set "
+            "``ImageProcessingConfig.dynamic_resolution=True`` to use the "
+            "dynamic-resolution path that stays in-core."
+        )
 
-    all_imgs, all_num_tiles = [], []
+    # Preprocess each image independently so its aspect ratio is preserved.
+    # Downstream (llava_model._preprocess_data / vision encoder pack) handles
+    # per-image cu_seqlens, so ragged patch counts are fine.
+    all_imgs, all_sizes = [], []
     for image_bytes in image_bytes_list:
-        imgs, num_tiles = preprocess_image_bytes_tiled(image_bytes, config, device=device)
+        imgs, imgs_sizes = preprocess_image_bytes(image_bytes, config, device=device)
         all_imgs.append(imgs)
-        all_num_tiles.append(num_tiles)
-    imgs = torch.cat(all_imgs, dim=0) if len(all_imgs) > 1 else all_imgs[0]
-    num_tiles = torch.cat(all_num_tiles, dim=0) if len(all_num_tiles) > 1 else all_num_tiles[0]
-    return {
-        "imgs": imgs,
-        "num_tiles": num_tiles,
-        "num_img_embeddings_per_tile": config.num_img_embeddings_per_tile,
-    }
-
-
-def preprocess_image_bytes_tiled(
-    image_bytes: bytes, config: ImageProcessingConfig, device: Optional[torch.device] = None
-) -> tuple:
-    """Preprocess raw image bytes into tiled tensors for static-resolution inference.
-
-    Returns:
-        (imgs, num_tiles) where imgs is [num_tiles, C, H, W] and num_tiles is a [1] int tensor.
-
-    Note: depends on examples/multimodal/image_processing.py being importable.
-    Callers that use the tiling path must ensure that path is on sys.path.
-    """
-    from PIL import Image
-
-    from examples.multimodal.image_processing import ImageTransform
-
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    if config.img_h is None or config.img_w is None:
-        raise ValueError("Tiled image preprocessing requires img_h and img_w.")
-    transform = ImageTransform(input_size=config.img_h, vision_model_type=config.vision_model_type)
-    imgs_list = transform(
-        img,
-        config.img_h,
-        config.img_w,
-        use_tiling=config.use_tiling,
-        max_num_tiles=config.max_num_tiles,
-        use_thumbnail=config.use_thumbnail,
-    )
-
-    imgs = torch.stack(imgs_list)
-    num_tiles = torch.tensor([len(imgs_list)], dtype=torch.int)
-    if device is not None:
-        return imgs.to(device), num_tiles.to(device)
-    return imgs, num_tiles
+        all_sizes.append(imgs_sizes)
+    imgs = torch.cat(all_imgs, dim=1) if len(all_imgs) > 1 else all_imgs[0]
+    imgs_sizes = torch.cat(all_sizes, dim=0) if len(all_sizes) > 1 else all_sizes[0]
+    return {"imgs": imgs, "imgs_sizes": imgs_sizes}
