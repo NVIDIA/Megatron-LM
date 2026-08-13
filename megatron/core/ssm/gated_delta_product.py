@@ -436,8 +436,10 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor.
         # But the expected memory layout varies depending on whether seq_idx is set.
         if seq_idx_packed is None:
-            # Default path: channels-first contiguous, stride(2) == 1.
-            VKQ = rearrange(VKQ, "b l d -> b d l").contiguous()
+            # Default path: the split view is already channels-last in memory, so the
+            # transpose alone yields channels-contiguous [B, D, L] (stride(1) == 1).
+            # ``causal_conv1d_fn`` handles that layout directly, so skip the copy.
+            VKQ = rearrange(VKQ, "b l d -> b d l")
         else:
             # ``causal_conv1d_fn(seq_idx=...)`` requires channels-last memory but [B, D, L]
             # logical shape. This keeps the channels contiguous in memory.
@@ -458,7 +460,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             seq_idx=seq_idx_packed,
         )
 
-        VKQ = rearrange(VKQ, "b d l ->  b l d").contiguous()
+        VKQ = rearrange(VKQ, "b d l ->  b l d")
 
         value, key, query = torch.split(
             VKQ,
@@ -476,7 +478,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             dim=-1,
         )
 
-        z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
         value = rearrange(
             value, "b l (m h p) -> b (l m) h p", m=self.num_householder, p=self.headdim
         ).contiguous()
@@ -519,7 +520,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         y = rearrange(core_attn_out, "b l h p -> l b (h p)").contiguous()
         y = self.cp.post_conv_ssm(y, packed_seq_params=packed_seq_params)
         if self.rmsnorm:
-            z = rearrange(z, "b l h p -> l b (h p)").contiguous()
+            z = rearrange(z, "b l d -> l b d").contiguous()
             z = self.cp.post_conv_ssm(z, packed_seq_params=packed_seq_params)
             y = self.norm(y, z)
 
