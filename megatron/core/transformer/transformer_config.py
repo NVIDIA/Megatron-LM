@@ -3181,8 +3181,9 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.recompute_granularity == 'full':
                 # Full recompute runs per layer segment; recompute_method /
-                # recompute_num_layers keep their non-overlap meaning and are validated
-                # by the shared checks above. See
+                # recompute_num_layers control the decoder grouping and are validated by
+                # the shared checks above. MTP under 'block' and the FP8/FP4 block window
+                # intentionally differ from the non-overlap checkpoint path. See
                 # megatron/core/models/common/model_chunk_schedule_plan.py.
                 # The replay is hand-rolled rather than a checkpoint primitive, so it
                 # cannot shard the retained segment input across TP ranks.

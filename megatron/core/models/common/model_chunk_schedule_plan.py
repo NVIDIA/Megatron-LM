@@ -720,11 +720,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     def _build_recompute_segments(self, config):
         """Split this chunk's layers into full-recompute segments.
 
-        Decoder segmentation mirrors megatron.core.recompute.checkpointed_forward, so
-        recompute_method / recompute_num_layers mean the same thing with and without
-        --overlap-moe-expert-parallel-comm: 'uniform' groups every decoder layer by
-        recompute_num_layers, 'block' recomputes the first recompute_num_layers decoder
-        layers one per segment. MTP gets one segment per depth under both methods.
+        Decoder segmentation follows the same high-level grouping as
+        megatron.core.recompute.checkpointed_forward: 'uniform' groups every decoder layer
+        by recompute_num_layers, while 'block' recomputes the first recompute_num_layers
+        decoder layers one per segment. The MTP and quantized-block exceptions below
+        intentionally differ from the non-overlap checkpoint path.
 
         Unlike the non-overlap 'block' branch there is no recompute_skip_num_layers
         window under fp8/fp4: no checkpoint primitive is involved, since the replay marks

@@ -436,7 +436,7 @@ EP All-to-All can consume 30-40% of training time without optimization. These fe
 
 > **Requirements for EP A2A Overlap**: `expert_model_parallel_size > 1`, CUDA_DEVICE_MAX_CONNECTIONS > 1.
 
-> **Full activation recompute with EP A2A Overlap**: `--recompute-granularity full` is supported and is applied per layer segment, so `--recompute-method` and `--recompute-num-layers` carry exactly the same meaning as without `--overlap-moe-expert-parallel-comm`. Both flags are required. Earlier releases accepted them being unset (the whole model chunk was recomputed as one unit); such configs now fail validation and must set the two flags explicitly.
+> **Full activation recompute with EP A2A Overlap**: `--recompute-granularity full` is supported and is applied per layer segment. For decoder layers, `uniform` groups layers by `--recompute-num-layers`, while `block` recomputes the first `--recompute-num-layers` layers. Two overlap-specific exceptions apply: MTP layers are recomputed one segment per depth under both methods (non-overlap leaves MTP eager under `block`), and FP8/FP4 `block` does not shift the recompute window past inputs that do not require gradients as non-overlap checkpointing may do. Both flags are required. Earlier releases accepted them being unset (the whole model chunk was recomputed as one unit); such configs now fail validation and must set the two flags explicitly.
 
 ### Compute Optimization
 

@@ -256,12 +256,13 @@ class TestA2AOverlap:
         recompute_method,
         recompute_num_layers,
     ):
-        """Layer-level full recompute matches the non-overlap reference, which checkpoints
-        through checkpointed_forward / MTP _checkpointed_forward with the same config.
+        """Layer-level full recompute matches the non-overlap reference.
+
+        Under block, non-overlap keeps MTP eager while the overlap plan recomputes it;
+        recompute must remain numerically transparent across that intentional difference.
         """
-        if mtp_layers > 0 and not (recompute_method == "uniform" and recompute_num_layers == 1):
-            # Otherwise the non-overlap reference warns and skips MTP recompute, so the
-            # two paths are not comparable.
+        if mtp_layers > 0 and recompute_method == "uniform" and recompute_num_layers != 1:
+            # MultiTokenPredictionLayer._checkpointed_forward rejects this uniform config.
             pytest.skip("MTP recompute requires recompute_method='uniform' with num_layers=1")
 
         extra_kwargs = {
@@ -281,6 +282,19 @@ class TestA2AOverlap:
             # Guard against degrading into the plain overlap test.
             for plan in schedule_plans:
                 assert len(plan._recompute_segments) > 0, "no recompute segments were built"
+                planned_mtp_layers = plan._transformer_layers[plan._num_decoder_layers :]
+                if mtp_layers > 0:
+                    assert (
+                        len(planned_mtp_layers) == mtp_layers
+                    ), "the overlap plan did not build the configured MTP layers"
+                    segmented_layers = {
+                        id(layer)
+                        for segment in plan._recompute_segments
+                        for layer in segment.layers
+                    }
+                    assert all(
+                        id(layer) in segmented_layers for layer in planned_mtp_layers
+                    ), "an MTP layer was not assigned to a recompute segment"
 
         def assert_activations_were_released(plan):
             # The point of the feature: after the chunk forward a recomputed layer holds
