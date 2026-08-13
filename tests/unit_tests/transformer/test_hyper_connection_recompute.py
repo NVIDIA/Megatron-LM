@@ -432,12 +432,28 @@ class TestTransformerConfigRecomputeMhc:
         "extra_kwargs, error_type, match",
         [
             (
-                {"recompute_granularity": "full", "recompute_method": "uniform"},
+                # recompute_num_layers is required for non-selective granularity, and that
+                # check runs first — supply it so the mHC guard is what actually fires.
+                {
+                    "recompute_granularity": "full",
+                    "recompute_method": "uniform",
+                    "recompute_num_layers": 1,
+                },
                 NotImplementedError,
                 "full activation recompute",
             ),
             ({"inference_fuse_tp_communication": True}, NotImplementedError, "single-stream"),
-            ({"num_moe_experts": 4}, NotImplementedError, "MoE"),
+            (
+                {
+                    "num_moe_experts": 4,
+                    "moe_ffn_hidden_size": 64,
+                    "moe_router_topk": 2,
+                    "moe_router_load_balancing_type": "none",
+                    "moe_token_dispatcher_type": "allgather",
+                },
+                NotImplementedError,
+                "MoE",
+            ),
             ({"mhc_sinkhorn_iterations": 0}, ValueError, "mhc_sinkhorn_iterations"),
             ({"mhc_init_gating_factor": -0.1}, ValueError, "mhc_init_gating_factor"),
         ],
