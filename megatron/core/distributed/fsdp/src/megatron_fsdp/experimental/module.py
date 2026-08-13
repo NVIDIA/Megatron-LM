@@ -455,7 +455,7 @@ class FsdpModule:
                 module.post_backward()
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
-        self._phase = FsdpModule.Phase.RESTING
+        self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
