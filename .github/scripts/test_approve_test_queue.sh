@@ -8,6 +8,8 @@ readonly CICD_COMPLETION_TRIGGER='    workflows: ["CICD Megatron-LM"]'
 readonly COMPLETED_ACTIVITY='    types: [completed]'
 readonly CONCURRENCY_GROUP='  group: approve-test-queue'
 readonly SERIALIZED_RUNS='  cancel-in-progress: false'
+readonly INTERNAL_SERVICE_ACCOUNT='          INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}'
+readonly INTERNAL_SERVICE_ACCOUNT_CHECK='              return login in INTERNAL_SERVICE_ACCOUNTS or any('
 
 if [[ $(/usr/bin/grep -c -F "$EXTERNAL_QUEUE" "$WORKFLOW") -ne 1 ]]; then
   echo "Approve Test Queue must define exactly one global external worker" >&2
@@ -36,4 +38,14 @@ for expected in \
   fi
 done
 
-echo "Approve Test Queue uses one global external worker and wakes on completed CICD runs"
+if [[ $(/usr/bin/grep -c -F "$INTERNAL_SERVICE_ACCOUNT" "$WORKFLOW") -ne 1 ]]; then
+  echo "Approve Test Queue must classify svcnemo-autobot as internal without relying on the SSO export" >&2
+  exit 1
+fi
+
+if [[ $(/usr/bin/grep -c -F "$INTERNAL_SERVICE_ACCOUNT_CHECK" "$WORKFLOW") -ne 1 ]]; then
+  echo "Approve Test Queue must apply its internal service-account allowlist" >&2
+  exit 1
+fi
+
+echo "Approve Test Queue uses one global external worker, recognizes its service account, and wakes on completion"
