@@ -580,3 +580,13 @@ def setup_logging() -> None:
         if is_rank0():
             logger.info(f'Setting logging level to {logging_level}')
         logging.getLogger().setLevel(logging_level)
+
+    if not is_rank0():
+        for noisy_logger_name in [
+            'GroupedGemmQuantSm100',
+            'GroupedGemmDsreluSm100',
+            'GroupedGemmSreluSm100',
+            'GroupedGemmWgradSm100',
+            'absl',
+        ]:
+            logging.getLogger(noisy_logger_name).setLevel(logging.ERROR)

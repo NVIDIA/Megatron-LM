@@ -988,7 +988,7 @@ class PagedStashRunner:
         self._required_capacity_factor = None
         # Config objects that must stay in sync for moe_paged_stash: the training loop config
         # (schedules / paged_stash_reset), each model chunk's root config (model forward), and
-        # every MoE layer config (expert forward). Hybrid models may use a distinct config for
+        # every MoE layer config (expert forward). Some models may use a distinct config for
         # each layer.
         seen_cfg_ids = set()
         seen_moe_layer_ids = set()
