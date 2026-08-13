@@ -1167,6 +1167,13 @@ class TransformerConfig(ModelParallelConfig):
        training and inference as the kernels are not full optimized.
        Defaults to False."""
 
+    batch_invariant_backend: str = "deepgemm"
+    """Which batch-invariant GEMM backend to use when batch_invariant_mode is
+    enabled: "deepgemm" (DeepGEMM bf16 kernels), "triton" (persistent Triton
+    matmul; any dtype), or "te_native" (keep the native cuBLASLt kernels and
+    obtain invariance via workspace starvation — lowest overhead, and the
+    configuration verified bitwise-identical to the TE training forward)."""
+
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
 
