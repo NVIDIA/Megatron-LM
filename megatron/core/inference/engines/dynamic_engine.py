@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
 import concurrent.futures
@@ -851,12 +851,23 @@ class DynamicInferenceEngine(AbstractEngine):
             return
 
         InferenceMode.unset_active()
+        dynamo_helper = getattr(self.context, "dynamo_helper", None)
+        if dynamo_helper is not None:
+            dynamo_helper.discard_pending_kv_stored_events()
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
         ):
             self.context.deallocate_inference_state_buffers()
+
+        if (
+            dynamo_helper is not None
+            and self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
+        ):
+            # PERSIST and OFFLOAD restore the same cache contents on resume; only
+            # RECOMPUTE invalidates the blocks previously advertised to Dynamo.
+            dynamo_helper.notify_kv_cache_cleared()
 
         if (
             self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
@@ -1945,7 +1956,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # add_request() only computes `effective = span - skip` tokens.
                 prefix_skip = 0
                 if prefix_caching_enabled and not is_continuing_chunked_prefill:
-                    (_, _, _, _, prefix_skip, _) = self.context._compute_prefix_match(
+                    _, _, _, _, prefix_skip, _ = self.context._compute_prefix_match(
                         req, remaining_len
                     )
                     prefix_skip = min(prefix_skip, remaining_len - 1)  # keep >=1 token to run
@@ -2025,7 +2036,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # admits the request). For >= 2 computed tokens add_request computes
                 # exactly this chunk, which already fits the budget.
                 if prefix_skip > 0 and (prefill_chunk_length - prefix_skip) < 2:
-                    (_, _, _, _, _, actual_effective) = self.context._compute_prefix_match(
+                    _, _, _, _, _, actual_effective = self.context._compute_prefix_match(
                         req, prefill_chunk_length
                     )
                     if self.context.active_token_count + actual_effective > self.context.max_tokens:
@@ -2084,6 +2095,12 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
+        # Discard registrations left by an interrupted prior step before this
+        # step's scheduling queues new registrations.
+        dynamo_helper = getattr(self.context, "dynamo_helper", None)
+        if dynamo_helper is not None:
+            dynamo_helper.discard_pending_kv_stored_events()
+
         mode = self.context.config.async_sched_mode
         if mode == AsyncScheduleMode.LEGACY:
             self.schedule_waiting_requests()
@@ -2141,6 +2158,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.decode_only = controller_result.decode_only
         pre_step_context_state["decode_only"] = self.decode_only
         result = controller_result.output
+        if dynamo_helper is not None:
+            dynamo_helper.publish_pending_kv_stored_events()
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
@@ -2256,7 +2275,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
             # Process finished requests (adds FINISH events and returns records).
-            (active_request_ids, finished_request_records) = self.post_process_requests(
+            active_request_ids, finished_request_records = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
                 evict_request_ids,

@@ -690,6 +690,15 @@ def _build_default_pg_collection() -> ProcessGroupCollection:
     pg_collection.dp = parallel_state.get_data_parallel_group(
         with_context_parallel=False, partial_data_parallel=False
     )
+    # gtp_remat axis: consumers read these with getattr and silently skip the gtp_remat
+    # reduction when absent, so populate them even when GTP_remat is inactive.
+    pg_collection.gtp_remat = parallel_state.get_gtp_weight_remat_group(check_initialized=False)
+    pg_collection.expt_gtp_remat = parallel_state.get_expert_gtp_weight_remat_group(
+        check_initialized=False
+    )
+    pg_collection.dp_cp_gtp_remat = parallel_state.get_data_parallel_group(
+        with_context_parallel=True, partial_data_parallel=False
+    )
     return pg_collection
 
 
@@ -1614,7 +1623,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_next = True
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
-                (input_tensor, output_tensor_grad) = (
+                input_tensor, output_tensor_grad = (
                     p2p_communicator.send_forward_backward_recv_forward_backward(
                         output_tensor,
                         input_tensor_grad,
@@ -1678,7 +1687,7 @@ def forward_backward_pipelining_with_interleaving(
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
 
-                (bwd_recv_buffer[-1], bwd_wait_handles) = (
+                bwd_recv_buffer[-1], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -1831,7 +1840,7 @@ def forward_backward_pipelining_with_interleaving(
                     backward_k, forward=False
                 )
 
-                (bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles) = (
+                bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -1904,7 +1913,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_prev = False
 
             # Communicate tensors.
-            (input_tensor, output_tensor_grad) = (
+            input_tensor, output_tensor_grad = (
                 p2p_communicator.send_forward_backward_recv_forward_backward(
                     output_tensor,
                     input_tensor_grad,

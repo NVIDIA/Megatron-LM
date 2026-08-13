@@ -43,7 +43,7 @@ def _mock_llm_reporting(monkeypatch):
 
 @pytest.fixture
 def notify_module(monkeypatch):
-    pytest.importorskip("nemo_ci_triage.slack_notification")
+    pytest.importorskip("cerno.slack_notification")
     monkeypatch.setenv("GITLAB_ENDPOINT", "ci.example.com")
     from tests.test_utils.python_scripts import notify
 
@@ -117,6 +117,31 @@ def test_error_extraction_is_opt_in_for_generated_jobs(
     else:
         assert "extract-errors" not in job["script"][0]
         assert job["artifacts"]["paths"] == ["results/"]
+
+
+def test_cerno_hard_cutover_contract():
+    pipeline = yaml.safe_load(Path(".gitlab-ci.yml").read_text())
+    triage = Path(".gitlab/stages/06.triage.yml").read_text()
+    dockerfile = Path("docker/Dockerfile.linting").read_text()
+    build_script = Path(".gitlab/scripts/build.sh").read_text()
+
+    assert pipeline["variables"]["CERNO_CONFIG"] == ".gitlab/cerno.yml"
+    assert triage.count("cerno-linear") == 3
+    assert triage.count("cerno-notify") == 2
+    assert triage.count('--config "${CERNO_CONFIG}"') == 3
+    assert '"cerno @ git+${CI_SERVER_URL}/dl/nemo/cerno.git@${CERNO_COMMIT}"' in dockerfile
+    assert "id=CERNO_TOKEN" in dockerfile
+    assert "/run/secrets/CERNO_TOKEN" in dockerfile
+    assert "--secret id=CERNO_TOKEN,env=PAT" in build_script
+
+
+def test_linear_write_assigns_new_issues_to_scheduled_oncall():
+    triage = yaml.safe_load(Path(".gitlab/stages/06.triage.yml").read_text())
+    script = "\n".join(triage["triage:linear_write"]["script"])
+
+    assert "resolve_oncall_assignee.py" in script
+    assert "--schedule-file .github/oncall_schedule.json" in script
+    assert '--assignee "${ONCALL_ASSIGNEE}"' in script
 
 
 def test_notification_rules_use_expected_pipeline_sources():
@@ -366,9 +391,9 @@ def test_failed_job_without_report_still_creates_a_safe_bucket(monkeypatch):
 
 
 def test_triage_config_selects_megatron_and_enables_write_actions():
-    linear_status = pytest.importorskip("nemo_ci_triage.linear.linear_status")
-    linear_write = pytest.importorskip("nemo_ci_triage.linear.linear_write")
-    config = Path(".gitlab/nemo-ci-triage.yml")
+    linear_status = pytest.importorskip("cerno.linear.linear_status")
+    linear_write = pytest.importorskip("cerno.linear.linear_write")
+    config = Path(".gitlab/cerno.yml")
 
     assert linear_status.modules_for_regex("^megatron-lm$", config) == [
         (
@@ -409,7 +434,7 @@ def test_slack_followup_uses_upstream_detailed_and_execution_summaries():
 
 
 @pytest.mark.parametrize("pipeline_context", ["mr", "nightly", "weekly", "release"])
-def test_notification_delegates_to_triage_package(monkeypatch, notify_module, pipeline_context):
+def test_notification_delegates_to_cerno(monkeypatch, notify_module, pipeline_context):
     notify = notify_module
     project = Mock()
     pipeline_jobs = [("functional:run_dev_dgx_h100", 101, [{"status": "failed"}])]
@@ -447,7 +472,7 @@ def test_notification_delegates_to_triage_package(monkeypatch, notify_module, pi
         webhook_url="https://slack.invalid/webhook",
         slack_bot_token=None,
         slack_channel_id=None,
-        config=notify.TRIAGE_CONFIG,
+        config=notify.CERNO_CONFIG,
     )
     collector.assert_called_once_with(123, notify.JOB_PREFIXES["functional-tests"], project=project)
 
@@ -531,7 +556,7 @@ def test_notification_records_bot_thread_context(monkeypatch, tmp_path, notify_m
         webhook_url=None,
         slack_bot_token="xoxb-test",
         slack_channel_id="C0123456789",
-        config=notify.TRIAGE_CONFIG,
+        config=notify.CERNO_CONFIG,
     )
     assert json.loads(slack_output.read_text()) == {
         "channel_id": "C0123456789",
