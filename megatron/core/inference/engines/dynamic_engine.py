@@ -1496,9 +1496,18 @@ class DynamicInferenceEngine(AbstractEngine):
             imgs_sizes = imgs_sizes.to(device=device)
 
         is_dynamic_resolution = imgs_sizes is not None and imgs is not None
-        total_num_tiles = int(num_tiles.sum().item()) if num_tiles is not None else 0
-        num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
-        has_images = is_dynamic_resolution or num_img_embeddings > 0
+        # Dynamic-resolution requests derive their embedding count from
+        # imgs_sizes downstream and don't need num_tiles.sum() at admission.
+        # Static-tiling requests do; only pay the D2H sync on that path so
+        # dynamic-res admissions stay sync-free here.
+        if is_dynamic_resolution:
+            total_num_tiles = 0
+            num_img_embeddings = 0
+            has_images = True
+        else:
+            total_num_tiles = int(num_tiles.sum().item()) if num_tiles is not None else 0
+            num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
+            has_images = num_img_embeddings > 0
 
         mask_tensor: Optional[Tensor] = None
         image_embeddings: Optional[Tensor] = None
