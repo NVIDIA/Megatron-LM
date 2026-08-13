@@ -13,4 +13,4 @@ coverage:
 fixes:
   - "/opt/megatron-lm/::"
 ignore:
-  - "megatron/core/fusions/*"
+  - "megatron/core/fusions/fused_pre_gated_delta_rule.py"
