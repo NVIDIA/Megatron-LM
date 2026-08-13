@@ -167,6 +167,15 @@ class TestFusedPreGatedDeltaRule:
                 msg=lambda msg, output_name=name: f"{output_name} mismatch: {msg}",
             )
 
+    def _make_pre_gated_delta_rule_grad_outputs(self, outputs):
+        grad_outputs = []
+        for output_idx, output in enumerate(outputs):
+            grad = torch.linspace(
+                -0.1, 0.1, output.numel(), device=output.device, dtype=torch.float32
+            ).reshape(output.shape)
+            grad_outputs.append(grad + (output_idx - 2.5) * 0.01)
+        return grad_outputs
+
     def test_fused_and_unfused_forward_match(self):
         hidden_states = torch.randn(
             (32, 2, self.unfused_gdn.config.hidden_size),
@@ -360,6 +369,7 @@ class TestFusedPreGatedDeltaRule:
 
         batch = 2
         seq_len = 32
+        torch.manual_seed(1234)
         qkvzba = torch.randn(
             (seq_len, batch, reference_gdn.in_proj_dim),
             device=torch.cuda.current_device(),
@@ -375,7 +385,7 @@ class TestFusedPreGatedDeltaRule:
             qkvzba_unfused, batch, seq_len, reference_gdn.cp_size, reference_gdn.pg_collection.cp
         )
         fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(qkvzba_fused)
-        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+        grad_outputs = self._make_pre_gated_delta_rule_grad_outputs(unfused_outputs)
 
         unfused_loss = sum(
             (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
@@ -497,6 +507,7 @@ class TestFusedPreGatedDeltaRule:
             [0, 1, 4, 6, 11], device=torch.cuda.current_device(), dtype=torch.int32
         )
         seq_len = cu_seqlens[-1].item()
+        torch.manual_seed(1234)
         qkvzba = torch.randn(
             (seq_len, batch, reference_gdn.in_proj_dim),
             device=torch.cuda.current_device(),
@@ -514,7 +525,7 @@ class TestFusedPreGatedDeltaRule:
         fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(
             qkvzba_fused, cu_seqlens_q=cu_seqlens
         )
-        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+        grad_outputs = self._make_pre_gated_delta_rule_grad_outputs(unfused_outputs)
 
         unfused_loss = sum(
             (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
@@ -581,7 +592,7 @@ class TestFusedPreGatedDeltaRule:
         fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(
             qkvzba_fused, cu_seqlens_q=cu_seqlens
         )
-        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+        grad_outputs = self._make_pre_gated_delta_rule_grad_outputs(unfused_outputs)
 
         unfused_loss = sum(
             (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
@@ -820,6 +831,7 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
                 cu_seqlens[i + 1] - cu_seqlens[i] for i in range(len(cu_seqlens) - 1)
             ),
             total_tokens=cu_seqlens[-1] // cp_size,
+            cp_partition_mode="contiguous",
         )
 
     @staticmethod

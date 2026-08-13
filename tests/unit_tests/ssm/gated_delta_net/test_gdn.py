@@ -66,6 +66,18 @@ def _make_gdn_config(**overrides):
     return TransformerConfig(**config_kwargs)
 
 
+def _set_gdn_test_cp_partition_mode(packed_seq_params, cp_size, linear_cp_mode):
+    if cp_size <= 1:
+        return packed_seq_params
+    if linear_cp_mode == "headwise":
+        packed_seq_params.cp_partition_mode = "zigzag"
+    elif linear_cp_mode == "chunkwise":
+        packed_seq_params.cp_partition_mode = "contiguous"
+    else:
+        raise ValueError(f"Invalid linear CP mode: {linear_cp_mode}")
+    return packed_seq_params
+
+
 def test_gdn_pre_gated_delta_rule_fusion_defaults_to_disabled():
     config = _make_gdn_config()
     assert not config.gdn_pre_gated_delta_rule_fusion
@@ -667,6 +679,7 @@ class TestGatedDeltaNet:
         hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
         attention_mask_thd = None
         packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+        _set_gdn_test_cp_partition_mode(packed_seq_params, self.cp_size, self.linear_cp_mode)
 
         # THD format
         output_thd, _ = self.gdn(
@@ -718,6 +731,7 @@ class TestGatedDeltaNet:
         padded_params = make_test_packed_seq_params_with_padding(
             cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 128]
         )
+        _set_gdn_test_cp_partition_mode(padded_params, self.cp_size, self.linear_cp_mode)
         output_thd_padded, _ = self.gdn(hidden_states_thd, None, packed_seq_params=padded_params)
         output_thd2bshd = output_thd_padded.view(*output_bshd.shape)
         torch.testing.assert_close(
@@ -730,6 +744,7 @@ class TestGatedDeltaNet:
 
         # B) no-padded branch: use actual cu_seqlens when it matches total_sequence_length.
         no_padding_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 128])
+        _set_gdn_test_cp_partition_mode(no_padding_params, self.cp_size, self.linear_cp_mode)
         output_thd_no_padding, _ = self.gdn(
             hidden_states_thd, None, packed_seq_params=no_padding_params
         )
@@ -755,11 +770,13 @@ class TestGatedDeltaNet:
         padded_mismatch_params = make_test_packed_seq_params_with_padding(
             cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 126]
         )
+        _set_gdn_test_cp_partition_mode(padded_mismatch_params, self.cp_size, self.linear_cp_mode)
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=padded_mismatch_params)
 
         # E) actual mismatch branch without *_padded: should raise.
         actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 129])
+        _set_gdn_test_cp_partition_mode(actual_mismatch_params, self.cp_size, self.linear_cp_mode)
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
 

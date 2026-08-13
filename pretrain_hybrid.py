@@ -24,12 +24,13 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
+from megatron.core.context_parallel_layout import prebuild_thd_cp_partition_routes
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_dynamic_data_context_parallel_groups,
@@ -74,6 +75,16 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+
+
+def _finalize_packed_seq_params(packed_seq_params):
+    """Resolve CP group metadata and prebuild THD CP layout routes."""
+    if packed_seq_params is None:
+        return None
+    cp_group = resolve_cp_group(get_context_parallel_group(), packed_seq_params)
+    packed_seq_params.cp_group = cp_group
+    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+    return packed_seq_params
 
 
 def get_batch(data_iterator, vp_stage=None):
@@ -125,6 +136,7 @@ def get_batch(data_iterator, vp_stage=None):
             dynamic_cp=is_dynamic_cp,
             config=config,
         )
+        _finalize_packed_seq_params(packed_seq_params)
         return (
             attention_mask,
             None,
@@ -328,6 +340,7 @@ def forward_step(data_iterator, model: HybridModel):
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
         )
+        _finalize_packed_seq_params(packed_seq_params)
 
     timers('batch-generator').stop()
 

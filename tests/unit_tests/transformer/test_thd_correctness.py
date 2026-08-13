@@ -30,13 +30,30 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.core import parallel_state
+from megatron.core.context_parallel_layout import prebuild_thd_cp_partition_routes
+from megatron.core.datasets.data_schedule_utils import get_cp_slice_for_thd
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_transformer_block_with_experimental_attention_variant_spec,
+)
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, MTPLossLoggingHelper
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    import fla  # noqa: F401
+
+    HAVE_FLA = True
+except ImportError:
+    HAVE_FLA = False
 
 # =============================================================================
 # Constants
@@ -1062,3 +1079,282 @@ def test_dynamic_cp_format(tc: DynamicCPTestCase):
 
     # === Cleanup ===
     Utils.destroy_model_parallel()
+
+
+# =============================================================================
+# Mixed GDN/GQA Model Correctness
+# =============================================================================
+
+
+def _make_mixed_model_config(
+    *,
+    linear_cp_mode: str,
+    cp_partition_mode: str,
+    dynamic_context_parallel: bool,
+    context_parallel_size: int,
+) -> TransformerConfig:
+    layer_pattern = [1, 1, 0, 1, 0]
+    return TransformerConfig(
+        num_layers=len(layer_pattern),
+        hidden_size=128,
+        ffn_hidden_size=256,
+        num_attention_heads=8,
+        num_query_groups=2,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+        activation_func=torch.nn.functional.silu,
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=layer_pattern,
+        linear_cp_mode=linear_cp_mode,
+        cp_partition_mode=cp_partition_mode,
+        context_parallel_size=context_parallel_size,
+        dynamic_context_parallel=dynamic_context_parallel,
+        cp_comm_type="p2p",
+        sequence_packing_scheduler=(
+            "default_dynamic_cp" if dynamic_context_parallel else "dp_balanced"
+        ),
+        pad_packed_seq_alignment="max",
+        max_seqlen_per_dp_cp_rank=128,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        calculate_per_token_loss=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        mtp_num_layers=1,
+    )
+
+
+def _build_mixed_model(model_type: str, config: TransformerConfig):
+    model_kwargs = {
+        "config": config,
+        "vocab_size": 512,
+        "max_sequence_length": config.max_seqlen_per_dp_cp_rank,
+        "position_embedding_type": "rope",
+    }
+    if model_type == "gpt":
+        transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+            config=config
+        )
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=transformer_layer_spec, use_transformer_engine=True
+        )
+        model = GPTModel(
+            transformer_layer_spec=transformer_layer_spec,
+            mtp_block_spec=mtp_block_spec,
+            **model_kwargs,
+        )
+    elif model_type == "hybrid":
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+        from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+        model = HybridModel(
+            hybrid_stack_spec=hybrid_stack_spec, hybrid_layer_pattern="GG*G*/*", **model_kwargs
+        )
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+
+    return model.cuda()
+
+
+def _prepare_mixed_model_batch(seq_indices, cp_group, config, vocab_size):
+    all_sequence_lengths = (37, 53, 61, 71, 43, 59, 67, 79)
+    sequence_lengths = [all_sequence_lengths[i] for i in seq_indices]
+    padded_lengths = [_round_up(sequence_length, 16) for sequence_length in sequence_lengths]
+    total_tokens = sum(padded_lengths)
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    tokens = torch.zeros(total_tokens, device=device, dtype=torch.long)
+    labels = torch.zeros_like(tokens)
+    loss_mask = torch.zeros(total_tokens, device=device, dtype=torch.float32)
+    padding_mask = torch.ones(total_tokens, device=device, dtype=torch.bool)
+    position_ids = torch.zeros_like(tokens)
+    cu_seqlens = [0]
+    cu_seqlens_padded = [0]
+
+    offset = 0
+    for sequence_index, sequence_length, padded_length in zip(
+        seq_indices, sequence_lengths, padded_lengths
+    ):
+        valid_end = offset + sequence_length
+        sequence_tokens = (
+            torch.arange(sequence_length, device=device, dtype=torch.long) + 17 * sequence_index + 3
+        ) % vocab_size
+        tokens[offset:valid_end] = sequence_tokens
+        labels[offset:valid_end] = (sequence_tokens + 11) % vocab_size
+        loss_mask[offset:valid_end] = 1.0
+        padding_mask[offset:valid_end] = False
+        position_ids[offset:valid_end] = torch.arange(
+            sequence_length, device=device, dtype=torch.long
+        )
+        cu_seqlens.append(cu_seqlens[-1] + sequence_length)
+        offset += padded_length
+        cu_seqlens_padded.append(offset)
+
+    cu_seqlens = torch.tensor(cu_seqlens, device=device, dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor(cu_seqlens_padded, device=device, dtype=torch.int32)
+    sequence_keys = ("tokens", "labels", "loss_mask", "padding_mask", "position_ids")
+    batch = {
+        "tokens": tokens,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "padding_mask": padding_mask,
+        "position_ids": position_ids,
+        "cu_seqlens_padded": cu_seqlens_padded,
+    }
+    get_cp_slice_for_thd(
+        batch, cp_group, keys=sequence_keys, cp_partition_mode=config.cp_partition_mode
+    )
+    batch = {name: batch[name].view(1, -1) for name in sequence_keys}
+
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=max(padded_lengths),
+        max_seqlen_kv=max(padded_lengths),
+        local_cp_size=cp_group.size() if config.dynamic_context_parallel else None,
+        cp_group=cp_group,
+        cp_partition_mode=config.cp_partition_mode,
+        pad_between_seqs=True,
+    )
+    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+    return batch, packed_seq_params
+
+
+def _run_mixed_model(model, batch, packed_seq_params, dp_cp_group):
+    MTPLossLoggingHelper.tracker = {}
+    MTPLossLoggingHelper.configure_acceptance_collection(enabled=False)
+
+    loss = model(
+        input_ids=batch["tokens"],
+        position_ids=batch["position_ids"],
+        attention_mask=None,
+        labels=batch["labels"],
+        loss_mask=batch["loss_mask"],
+        packed_seq_params=packed_seq_params,
+        padding_mask=batch["padding_mask"],
+    )
+    local_numerator = (loss.float() * batch["loss_mask"]).sum()
+    local_denominator = batch["loss_mask"].sum()
+    global_stats = torch.stack([local_numerator.detach(), local_denominator.detach()])
+    dist.all_reduce(global_stats, group=dp_cp_group)
+    global_denominator = global_stats[1].clamp(min=1)
+
+    MTPLossAutoScaler.set_loss_scale(global_denominator.reciprocal())
+    (local_numerator / global_denominator).backward()
+
+    MTPLossLoggingHelper.reduce_loss_in_tracker()
+    assert "values" in MTPLossLoggingHelper.tracker
+    mtp_loss = MTPLossLoggingHelper.tracker["values"].detach().float().clone()
+
+    grads = [
+        (name, param.grad) for name, param in model.named_parameters() if param.grad is not None
+    ]
+    assert grads, "Mixed GDN/GQA model did not produce parameter gradients."
+    grad_names, grad_tensors = zip(*grads)
+    grad_vector = torch.cat([grad.detach().float().reshape(-1) for grad in grad_tensors])
+    dist.all_reduce(grad_vector, group=dp_cp_group)
+    return global_stats[0] / global_denominator, mtp_loss, grad_names, grad_vector
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.parametrize("model_type", ("gpt", "hybrid"))
+@pytest.mark.parametrize("dynamic_context_parallel", (False, True), ids=("thd_cp", "dcp"))
+def test_mixed_gdn_gqa_model_cp_correctness(model_type, dynamic_context_parallel):
+    """Compare mixed GDN/GQA/MTP models against a THD CP=1 baseline.
+
+    Each of the {fixed THD CP, DCP} x {GPTModel, HybridModel} cases uses a no-CP
+    reference that processes one complete packed sequence per rank.
+    """
+    if not torch.cuda.is_available() or Utils.world_size != 8:
+        pytest.skip("Mixed GDN/GQA model CP correctness requires exactly 8 CUDA ranks.")
+
+    seed = 1234
+    reference_config = _make_mixed_model_config(
+        linear_cp_mode="chunkwise",
+        cp_partition_mode="zigzag",
+        dynamic_context_parallel=False,
+        context_parallel_size=1,
+    )
+    Utils.initialize_model_parallel(context_parallel_size=1)
+    try:
+        reference_dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        reference_cp_group = parallel_state.get_context_parallel_group()
+        reference_seq_indices = [dist.get_rank(group=reference_dp_cp_group)]
+
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        reference_model = _build_mixed_model(model_type, reference_config)
+        reference_batch, reference_packed_seq_params = _prepare_mixed_model_batch(
+            reference_seq_indices, reference_cp_group, reference_config, reference_model.vocab_size
+        )
+        reference_stats = _run_mixed_model(
+            reference_model, reference_batch, reference_packed_seq_params, reference_dp_cp_group
+        )
+        reference_state_dict = {
+            name: value.detach().cpu().clone() if torch.is_tensor(value) else value
+            for name, value in reference_model.state_dict().items()
+        }
+
+        assert reference_cp_group.size() == 1
+        assert reference_packed_seq_params.qkv_format == "thd"
+        assert reference_packed_seq_params.cp_partition_mode == "zigzag"
+    finally:
+        MTPLossLoggingHelper.tracker = {}
+        Utils.destroy_model_parallel()
+
+    del reference_model, reference_batch, reference_packed_seq_params
+
+    candidate_config = _make_mixed_model_config(
+        linear_cp_mode="chunkwise",
+        cp_partition_mode="contiguous",
+        dynamic_context_parallel=dynamic_context_parallel,
+        context_parallel_size=2,
+    )
+    Utils.initialize_model_parallel(
+        context_parallel_size=2, dynamic_context_parallel=dynamic_context_parallel
+    )
+    try:
+        candidate_dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        if dynamic_context_parallel:
+            dp_cp_rank = dist.get_rank(group=candidate_dp_cp_group)
+            if dp_cp_rank < 4:
+                local_cp_size, candidate_seq_indices = 4, range(4)
+            elif dp_cp_rank < 6:
+                local_cp_size, candidate_seq_indices = 2, range(4, 6)
+            else:
+                local_cp_size, candidate_seq_indices = 1, [dp_cp_rank]
+            candidate_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
+                group_size=local_cp_size
+            )
+        else:
+            dp_rank = parallel_state.get_data_parallel_rank()
+            candidate_seq_indices = range(2 * dp_rank, 2 * dp_rank + 2)
+            candidate_cp_group = parallel_state.get_context_parallel_group()
+
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        candidate_model = _build_mixed_model(model_type, candidate_config)
+        candidate_model.load_state_dict(reference_state_dict)
+        candidate_batch, candidate_packed_seq_params = _prepare_mixed_model_batch(
+            candidate_seq_indices, candidate_cp_group, candidate_config, candidate_model.vocab_size
+        )
+        candidate_stats = _run_mixed_model(
+            candidate_model, candidate_batch, candidate_packed_seq_params, candidate_dp_cp_group
+        )
+        reference_loss, reference_mtp_loss, reference_grad_names, reference_grads = reference_stats
+        candidate_loss, candidate_mtp_loss, candidate_grad_names, candidate_grads = candidate_stats
+
+        assert reference_grad_names == candidate_grad_names
+        assert candidate_packed_seq_params.cp_partition_mode == "contiguous"
+        torch.testing.assert_close(candidate_loss, reference_loss, atol=5e-3, rtol=0.0)
+        torch.testing.assert_close(candidate_mtp_loss, reference_mtp_loss, atol=5e-3, rtol=0.0)
+        assert_close("aggregated parameter gradients", candidate_grads, reference_grads, False)
+    finally:
+        MTPLossLoggingHelper.tracker = {}
+        Utils.destroy_model_parallel()
