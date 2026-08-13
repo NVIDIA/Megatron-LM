@@ -100,15 +100,13 @@ def test_parser_mapping_registers_nemotron_v3_reasoning():
 
 def test_tool_call_marker_implicitly_ends_reasoning_for_downstream_parser():
     tool_text = (
-        "<tool_call><function=bash><parameter=command>echo hi</parameter>"
-        "</function></tool_call>"
+        "<tool_call><function=bash><parameter=command>echo hi</parameter>" "</function></tool_call>"
     )
     model_output = f"I should inspect this first.\n{tool_text}"
     tool_parser = PARSER_MAPPING["qwen3-coder-tool"]
 
     content, reasoning_info = DeepSeekR1ReasoningParser.parse(
-        model_output,
-        implicit_reasoning_end_markers=tool_parser.implicit_reasoning_end_markers,
+        model_output, implicit_reasoning_end_markers=tool_parser.implicit_reasoning_end_markers
     )
     parsed_content, tool_info = tool_parser.parse(
         content,
@@ -117,10 +115,7 @@ def test_tool_call_marker_implicitly_ends_reasoning_for_downstream_parser():
                 "type": "function",
                 "function": {
                     "name": "bash",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"command": {"type": "string"}},
-                    },
+                    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
                 },
             }
         ],
@@ -137,7 +132,4 @@ def test_tool_call_marker_implicitly_ends_reasoning_for_downstream_parser():
 def test_tool_call_marker_does_not_end_reasoning_unless_configured():
     model_output = "reasoning<tool_call>not enabled</tool_call>"
 
-    assert DeepSeekR1ReasoningParser.parse(model_output) == (
-        "",
-        {"reasoning": model_output},
-    )
+    assert DeepSeekR1ReasoningParser.parse(model_output) == ("", {"reasoning": model_output})
