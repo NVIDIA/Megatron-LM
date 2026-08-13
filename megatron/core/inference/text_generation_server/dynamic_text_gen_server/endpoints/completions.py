@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import time
-import uuid
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
@@ -208,8 +207,11 @@ try:
         prompt_tokens_counts = []
 
         request_idx = 0
+        response_uid = None
         for completed_request in batch_results:
             result = unwrap_serialized_tensors(completed_request)
+            if response_uid is None:
+                response_uid = result["uid"]
             full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
@@ -296,11 +298,6 @@ try:
                 "generation_token_ids": result["generated_tokens"],
                 "generation_log_probs": result.get("generated_log_probs", []),
             }
-            choice_data["policy_epoch"] = result["policy_epoch"]
-            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
-            choice_data["num_evictions"] = sum(
-                1 for e in result["events"] if e.get("type") == "EVICT"
-            )
 
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
@@ -318,7 +315,7 @@ try:
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         return jsonify(
             {
-                "id": str(uuid.uuid4()),
+                "id": response_uid,
                 "object": "text_completion",  # as per the openAI spec
                 "created": int(time.time()),
                 "model": "EMPTY",

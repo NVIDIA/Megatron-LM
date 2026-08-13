@@ -28,6 +28,7 @@ from wandb import wandb_run
 from megatron.core import mpu
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
+from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
     prefetch_managed_module_parameters,
@@ -307,6 +308,8 @@ class RLRuntimeState:
     def __init__(self):
         self.packing_context = None
         self.last_collection_iteration = 0
+        # Persistent ledger of per-request metadata (e.g. staleness stats).
+        self.request_ledger = {}
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
         # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
@@ -610,7 +613,7 @@ def get_rollout_generator(
 
 def get_environment_rollouts(
     model: LanguageModule, inference_model: LanguageModule, optimizer: MegatronOptimizer, n_prompts: int, samples_per_group: int
-):
+) -> tuple[GroupedRollouts, dict[str, FinishedRequestRecord]]:
     """Sample environment rollouts from an LLM.
 
     Args:
@@ -620,7 +623,7 @@ def get_environment_rollouts(
         samples_per_group: Amount of trajectories per prompt.
 
     Returns:
-        GroupedRollouts object which is a nested list with each element being a list of rollouts of a group.
+        (GroupedRollouts, per-request metadata ledger)
     """
     args = get_args()
     nvtx_range = get_nvtx_range()
@@ -716,10 +719,13 @@ def get_environment_rollouts(
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
-        with nvtx_range("rl/sync-rollouts", time=True):
+        with nvtx_range("rl/sync-rollout-state", time=True):
             # Wait for Rollouts to be collected
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
+
+            with nvtx_range("rl/sync-request-ledger", time=True):
+                request_ledger = inference_interface.merge_global_request_ledgers()
         logger.debug(f"Got rollouts on rank {rank}")
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
@@ -731,7 +737,7 @@ def get_environment_rollouts(
         ) as f:
             json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
-    return rollouts
+    return rollouts, request_ledger
 
 
 def selective_log_softmax(logits, index):
@@ -886,7 +892,10 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
 
 
 def compute_group_stats(
-    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int,
+    rollouts: GroupedRollouts,
+    tokenizer: MegatronTokenizer,
+    seq_len: int,
+    request_ledger: dict[str, FinishedRequestRecord],
 ) -> RolloutStats:
     """Add group-based rollout stats for logging.
 
@@ -894,6 +903,7 @@ def compute_group_stats(
         rollouts: Rollouts to generate the stats for. Each inner list is a group (as in GRPO group), i.e. all rollouts are for the same prompt.
         tokenizer: Tokenizer to tokenize the rollouts in case they are raw strings.
         seq_len: Maximum sequence length.
+        request_ledger: Per-turn ledger of additional metadata (e.g. staleness stats).
 
     Returns:
        RolloutStats object containing all the stats.
@@ -958,16 +968,19 @@ def compute_group_stats(
                 roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
-            assert rollout.policy_epoch, "Rollout has no policy_epoch data"
-            assert rollout.kv_cache_epoch, "Rollout has no kv_cache_epoch data"
-            group_policy_epoch.append([epoch for turn in rollout.policy_epoch for _, epoch in turn])
-            group_kv_epoch.append([epoch for turn in rollout.kv_cache_epoch for _, epoch in turn])
-            # completed_epochs is per-turn, so it cannot be masked per-rollout downstream
-            if rollout.trajectory:
-                group_completed_epochs.extend(
-                    turn[-1][1] for turn in rollout.policy_epoch
-                )
-            group_num_evictions.append(sum(rollout.num_evictions))
+            turn_records = (
+                [request_ledger.pop(completion_id) for completion_id in rollout.completion_ids]
+                if isinstance(rollout, TokenRollout)
+                else []
+            )
+            group_policy_epoch.append(
+                [epoch for record in turn_records for _, epoch in record.policy_epoch]
+            )
+            group_kv_epoch.append(
+                [epoch for record in turn_records for _, epoch in record.kv_cache_epoch]
+            )
+            group_completed_epochs.extend(record.policy_epoch[-1][1] for record in turn_records)
+            group_num_evictions.append(sum(record.num_evictions for record in turn_records))
         all_policy_epoch.append(group_policy_epoch)
         all_kv_cache_epoch.append(group_kv_epoch)
         all_completed_epochs.append(group_completed_epochs)
@@ -1085,35 +1098,37 @@ def prep_wandb_metrics(
             [x for x, keep in zip(g, m) if keep] for g, m in zip(grouped, real_mask)
         ]
 
-    # Reward metrics include failures. All other metrics do not.
-    table_rewards = [r for g in _real(rewards) for r in g]
+    # Reward metrics include failures. All other metrics do not. Staleness and
+    # eviction telemetry filters through `joined` instead: placeholders pop no
+    # ledger records, so they have no epoch rows and never join.
     traj_lens_real = _real(traj_lens)
     num_turns_real = _real(num_turns)
-    policy_epoch_real = _real(policy_epoch)
-    kv_cache_epoch_real = _real(kv_cache_epoch)
 
     group_table = wandb_writer.Table(
         columns=['group_means', 'group_stds'],
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
+    flat_rewards = [r for g in rewards for r in g]
+    flat_traj_lens = [l for g in traj_lens for l in g]
+    flat_num_evictions = [e for g in num_evictions for e in g]
+    flat_policy_epochs = [r for g in policy_epoch for r in g]
+    flat_kv_epochs = [r for g in kv_cache_epoch for r in g]
+    joined = [i for i, row in enumerate(flat_policy_epochs) if row]
+    joined_rewards = [flat_rewards[i] for i in joined]
+    joined_traj_lens = [flat_traj_lens[i] for i in joined]
+    joined_num_evictions = [flat_num_evictions[i] for i in joined]
+    per_rollout_policy_epochs = [flat_policy_epochs[i] for i in joined]
+    per_rollout_kv_epochs = [flat_kv_epochs[i] for i in joined]
     # Per-rollout staleness (oldest token)
-    rollout_policy_staleness = [current_iteration - r[0] for g in policy_epoch_real for r in g]
-    rollout_kv_staleness = [current_iteration - r[0] for g in kv_cache_epoch_real for r in g]
+    rollout_policy_staleness = [current_iteration - r[0] for r in per_rollout_policy_epochs]
+    rollout_kv_staleness = [current_iteration - r[0] for r in per_rollout_kv_epochs]
     # Per-rollout staleness (newest token)
-    rollout_policy_last_token_staleness = [
-        current_iteration - r[-1] for g in policy_epoch_real for r in g
-    ]
-    rollout_kv_last_token_staleness = [
-        current_iteration - r[-1] for g in kv_cache_epoch_real for r in g
-    ]
+    rollout_policy_last_token_staleness = [current_iteration - r[-1] for r in per_rollout_policy_epochs]
+    rollout_kv_last_token_staleness = [current_iteration - r[-1] for r in per_rollout_kv_epochs]
     # Per-token staleness
-    per_token_policy_staleness = [
-        current_iteration - e for g in policy_epoch_real for r in g for e in r
-    ]
-    per_token_kv_staleness = [
-        current_iteration - e for g in kv_cache_epoch_real for r in g for e in r
-    ]
+    per_token_policy_staleness = [current_iteration - e for r in per_rollout_policy_epochs for e in r]
+    per_token_kv_staleness = [current_iteration - e for r in per_rollout_kv_epochs for e in r]
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -1134,28 +1149,6 @@ def prep_wandb_metrics(
                 ),
                 'advantages', 'Advantages'
             ),
-            # One row per real rollout.
-            'rollout_table': wandb_writer.Table(
-                columns=[
-                    'reward', 'traj_length', 'num_evictions',
-                    'policy_staleness', 'kv_staleness',
-                    'policy_last_token_staleness', 'kv_last_token_staleness',
-                ],
-                data=list(zip(
-                    table_rewards,
-                    [l for g in traj_lens_real for l in g],
-                    [e for g in _real(num_evictions) for e in g],
-                    rollout_policy_staleness,
-                    rollout_kv_staleness,
-                    rollout_policy_last_token_staleness,
-                    rollout_kv_last_token_staleness,
-                )),
-            ),
-            # NOTE: This table can get very large (one row per token across all rollouts).
-            'per_token_table': wandb_writer.Table(
-                columns=['policy_staleness', 'kv_staleness'],
-                data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
-            ),
             # Group-level length/turn stats skip groups with all failed rollouts.
             'mean_turn_length': np.mean([np.mean(g) for g in turn_lens if g]),
             'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens if g]),
@@ -1172,6 +1165,33 @@ def prep_wandb_metrics(
             'mean_advantage': np.mean(advantages),
             'nonzero_groups_ratio': np.count_nonzero(advantages)
             / len(advantages),
+            **failure_metrics,
+    }
+
+    # Staleness/eviction telemetry: joined rollouts only; skip when nothing joined.
+    if joined:
+        metrics |= {
+            'rollout_table': wandb_writer.Table(
+                columns=[
+                    'reward', 'traj_length', 'num_evictions',
+                    'policy_staleness', 'kv_staleness',
+                    'policy_last_token_staleness', 'kv_last_token_staleness',
+                ],
+                data=list(zip(
+                    joined_rewards,
+                    joined_traj_lens,
+                    joined_num_evictions,
+                    rollout_policy_staleness,
+                    rollout_kv_staleness,
+                    rollout_policy_last_token_staleness,
+                    rollout_kv_last_token_staleness,
+                )),
+            ),
+            # NOTE: This table can get very large (one row per token across all rollouts).
+            'per_token_table': wandb_writer.Table(
+                columns=['policy_staleness', 'kv_staleness'],
+                data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
+            ),
             'mean_policy_staleness': np.mean(rollout_policy_staleness),
             'max_policy_staleness': max(rollout_policy_staleness),
             'min_policy_staleness': min(rollout_policy_staleness),
@@ -1184,8 +1204,8 @@ def prep_wandb_metrics(
             'mean_kv_cache_last_token_staleness': np.mean(rollout_kv_last_token_staleness),
             'max_kv_cache_last_token_staleness': max(rollout_kv_last_token_staleness),
             'min_kv_cache_last_token_staleness': min(rollout_kv_last_token_staleness),
-            'total_eviction_count': sum([sum(g) for g in num_evictions]),
-            'max_num_evictions': max([max(g) for g in num_evictions]),
+            'total_eviction_count': sum(joined_num_evictions),
+            'max_num_evictions': max(joined_num_evictions),
             'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
             'per_token_policy_staleness_hist': wandb_writer.plot.histogram(
                 wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_policy_staleness]),
@@ -1195,8 +1215,9 @@ def prep_wandb_metrics(
                 wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_kv_staleness]),
                 'staleness', 'Per-Token KV Cache Staleness'
             ),
-            **failure_metrics,
-    }
+        }
+
+
     if example_group:
         if tokenizer is None:
             raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
@@ -1372,6 +1393,7 @@ def maybe_log_training_metrics(
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
         policy_epoch=policy_epoch, kv_cache_epoch=kv_cache_epoch, completed_epochs=completed_epochs,
         num_evictions=num_evictions, current_iteration=current_iteration)
+
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
 
@@ -1639,6 +1661,7 @@ def prepare_data_for_update(
     tokenizer: MegatronTokenizer,
     sequence_packing: bool,
     is_correction: bool,
+    request_ledger: dict[str, FinishedRequestRecord],
 ) -> tuple[RerunDataIterator, RolloutStats, dict]:
     """Extract data for the update from raw rollouts.
 
@@ -1649,6 +1672,7 @@ def prepare_data_for_update(
         tokenizer: Tokenizer to pad/tokenize data.
         sequence_packing: Use sequence packing if True.
         is_correction: Prepare data for IS correction if True.
+        request_ledger: Finished-request records keyed by the completion id.
 
     Returns:
         Tuple of (cycled iterator over dataset batches, group stats, example groups per env).
@@ -1668,7 +1692,7 @@ def prepare_data_for_update(
 
     with nvtx_range("rl/prepare-data-for-update", time=True):
         with nvtx_range("rl/compute-group-stats", time=True):
-            group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
+            group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length, request_ledger)
             # TODO(vitalyk): why do we need global_advantages here? go inside packing
             advantages = global_advantages = torch.tensor(group_stats.advantages, dtype=dtype).cuda()
 
@@ -1992,9 +2016,12 @@ def get_grpo_data_iterator(
         (grpo_iterations * global_batches_per_collection)
     ):
 
-        rollouts = get_environment_rollouts(
+        rollouts, fresh_ledger = get_environment_rollouts(
             model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
         )
+        # Records persist until their rollout's join pops them (partial rollouts
+        # deliver across window boundaries); never-joined residents are accepted.
+        runtime_state.request_ledger.update(fresh_ledger)
         buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
             model=model,
             ref_state_dict=ref_state_dict,
@@ -2002,6 +2029,7 @@ def get_grpo_data_iterator(
             tokenizer=tokenizer,
             sequence_packing=sequence_packing,
             is_correction=is_correction,
+            request_ledger=runtime_state.request_ledger,
         )
         if optimizer_is_on_cpu:
             nvtx_range = get_nvtx_range()
