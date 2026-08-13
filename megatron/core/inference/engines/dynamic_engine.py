@@ -3067,14 +3067,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 # bounded ThreadPoolExecutor here or, better, on the
                 # server/coordinator side before the ZMQ hop so the engine
                 # receives ready tensors.
-                vlm_kwargs = resolve_multimodal_data_for_engine(
-                    multi_modal_data,
-                    image_preprocessing_config=self.context.config.image_preprocessing_config,
-                )
-                if vlm_kwargs:
-                    self.add_request(request_id, prompt, sampling_params, **vlm_kwargs)
-                else:
-                    self.add_request(request_id, prompt, sampling_params)
+                try:
+                    vlm_kwargs = resolve_multimodal_data_for_engine(
+                        multi_modal_data,
+                        image_preprocessing_config=self.context.config.image_preprocessing_config,
+                    )
+                    if vlm_kwargs:
+                        self.add_request(request_id, prompt, sampling_params, **vlm_kwargs)
+                    else:
+                        self.add_request(request_id, prompt, sampling_params)
+                except Exception as error:  # pylint: disable=broad-except
+                    self._fail_submission(request_id, sampling_params, error)
                 nvtx_range_pop("add_request")
             elif header == Headers.SUBMIT_REQUEST_WITH_KV:
                 # Decode-side KV import.

@@ -290,8 +290,13 @@ def _extract_images_from_messages(messages):
     the rewritten messages and the ordered list of image bytes. Messages
     with plain string ``content`` are passed through unchanged.
 
+    Fetching a remote ``image_url`` blocks, so call this off the event loop.
+
     Returns:
         (messages_with_markers, image_bytes_list)
+
+    Raises:
+        ValueError: an ``image_url`` could not be loaded.
     """
     if not isinstance(messages, list):
         return messages, []
@@ -319,8 +324,10 @@ def _extract_images_from_messages(messages):
                 try:
                     image_bytes_list.append(_extract_image_url_bytes(url))
                 except Exception as e:
-                    logger.warning(f"Failed to decode image_url: {e}")
-                    continue
+                    # Dropping the image would answer the request as if it were
+                    # text-only, handing the client a confident answer about an
+                    # image the model never saw. Surface it as a 400 instead.
+                    raise ValueError(f"Failed to load image_url: {e}") from e
                 new_chunks.append({"type": "text", "text": "<image>"})
                 found_image = True
             else:
@@ -572,8 +579,15 @@ try:
             return Response("'messages' must be a list", status=400)
         # Extract any image_url blocks before template sanitization, which would
         # otherwise drop them. Replaces each image block with an inline <image>
-        # text marker that the chat template can substitute.
-        messages, image_bytes_list = _extract_images_from_messages(messages)
+        # text marker that the chat template can substitute. Runs in a worker
+        # thread because a remote image_url fetch blocks, which would otherwise
+        # stall every other in-flight generation on this rank.
+        try:
+            messages, image_bytes_list = await asyncio.to_thread(
+                _extract_images_from_messages, messages
+            )
+        except ValueError as e:
+            return Response(str(e), status=400)
         template_messages = _sanitize_messages_for_template(messages)
         template_tools = _sanitize_tools_for_template(tools)
 

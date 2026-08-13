@@ -38,14 +38,7 @@ def _image_embedding_counts(imgs_sizes: torch.Tensor, patch_dim: int) -> torch.T
 
 
 class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
-    """Dynamic-inference adapter for canonical, expanded-sequence Nemotron Omni.
-
-    The dynamic engine submits compact prompts containing one image placeholder
-    per image. This adapter expands those placeholders to the exact number of
-    projected RADIO tokens, precomputes image embeddings, and feeds the nested
-    HybridModel with combined text/image embeddings. It intentionally does not
-    implement the legacy LLaVA static-tiling contract.
-    """
+    """Dynamic-inference adapter for canonical, expanded-sequence Nemotron Omni."""
 
     def run_one_forward_step(
         self, inference_input: Dict[str, Any], recv_buffer_seq_len: Optional[int] = None
@@ -124,11 +117,6 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             vision_packed_seq_params=None,
             num_frames=torch.ones(imgs_sizes.shape[0], dtype=torch.int32, device=imgs_sizes.device),
         )
-        if embeddings.ndim != 2:
-            raise RuntimeError(
-                "NemotronOmniModel._encode_images must return "
-                f"[image_tokens, hidden], got {tuple(embeddings.shape)}."
-            )
         return embeddings.unsqueeze(1)
 
     def _forward(self, inference_input: Dict[str, Any]) -> torch.Tensor:
