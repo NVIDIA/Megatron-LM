@@ -721,6 +721,39 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         # Check that gradient is non-trivial (not all zeros)
         assert hidden_states.grad.abs().sum() > 0
 
+    @pytest.mark.parametrize("norm_attr", ["input_layernorm", "pre_mlp_layernorm"])
+    def test_residual_returning_layernorm_is_rejected(self, norm_attr):
+        """A norm returning (output, residual) must fail fast, not feed a tuple downstream.
+
+        Base TransformerLayer accepts that contract and uses the returned residual;
+        mHC cannot, because its residual is the n-stream tensor captured before
+        hyper-connection aggregation.
+        """
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+
+        layer, _ = self._create_layer_with_hyper_connection(hidden_size, num_streams)
+        layer.train()
+
+        class _ResidualReturningNorm(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, x):
+                return self.inner(x), x
+
+        setattr(layer, norm_attr, _ResidualReturningNorm(getattr(layer, norm_attr)).cuda())
+
+        n_channels = num_streams * hidden_size
+        hidden_states = torch.randn(seq_len, batch_size, n_channels, device='cuda')
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        with pytest.raises(ValueError, match=norm_attr):
+            layer(hidden_states=hidden_states, attention_mask=attention_mask)
+
 
 class TestMHCRecomputeMemorySaving:
     """Verify that 'mhc' in recompute_modules actually reduces peak GPU memory."""
