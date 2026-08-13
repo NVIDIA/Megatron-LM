@@ -13,6 +13,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     _CudagraphGlobalRecord,
+    _CudaGraphRunner,
     create_cudagraphs,
 )
 from megatron.core.transformer.enums import CudaGraphModule
@@ -20,6 +21,36 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_make_pipeline_output_viewless_guard_and_passthrough():
+    """Exercise the helper's guard, non-tensor passthrough, and autograd preservation."""
+    runner = object.__new__(_CudaGraphRunner)
+
+    runner.is_last_layer = False
+    runner.deallocate_pipeline_outputs = True
+    sentinel = torch.randn(4)
+    assert runner._make_pipeline_output_viewless(sentinel) is sentinel
+
+    runner.is_last_layer = True
+    runner.deallocate_pipeline_outputs = False
+    assert runner._make_pipeline_output_viewless(sentinel) is sentinel
+
+    runner.deallocate_pipeline_outputs = True
+    view_base = torch.randn(4, 4, requires_grad=True)
+    tensor_view = view_base[0]
+    out = runner._make_pipeline_output_viewless((tensor_view, None))
+
+    assert out[0]._base is None
+    assert torch.equal(out[0], tensor_view)
+    assert out[0].data_ptr() == tensor_view.data_ptr()
+    assert out[1] is None
+
+    out[0].sum().backward()
+    assert view_base.grad is not None
+    expected_grad = torch.zeros_like(view_base)
+    expected_grad[0] = 1
+    assert torch.equal(view_base.grad, expected_grad)
 
 
 @pytest.mark.skipif(
