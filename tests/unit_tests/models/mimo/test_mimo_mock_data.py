@@ -105,6 +105,7 @@ def test_data_adapter_builds_independent_role_specific_loaders(adapter):
         _args(), _topology(language_rank=True)
     )
     assert all(loader.batch_size == 2 for loader in language_loaders)
+    assert all(loader.pin_memory for loader in language_loaders)
     assert len({id(loader.dataset) for loader in language_loaders}) == 3
     assert len({loader.dataset.seed for loader in language_loaders}) == 3
     language_batch = next(iter(language_loaders[0]))
@@ -115,6 +116,7 @@ def test_data_adapter_builds_independent_role_specific_loaders(adapter):
         _args(), _topology(encoder_rank=True, language_rank=False)
     )
     assert all(loader.batch_size == 4 for loader in encoder_loaders)
+    assert all(loader.pin_memory for loader in encoder_loaders)
     encoder_batch = next(iter(encoder_loaders[0]))
     assert encoder_batch["input_ids"].shape == (4, 8)
     encoder_inputs = encoder_batch["modality_inputs"][RADIO_ENCODER_MODULE_NAME][

@@ -174,6 +174,15 @@ class DistributedDataParallel(_BaseDataParallel):
 
         self.full_param_layout = full_param_layout
 
+        # GTP_remat needs average_in_collective=False: the per-bucket collective runs over the
+        # replicate group, so NCCL AVG would miss the 1/gtp_remat factor. arguments.py
+        # guards the training path; this assert covers direct megatron-core users.
+        gtp_active = ProcessGroupCollection.is_gtp_remat_active(process_group_dict)
+        assert not (gtp_active and self.ddp_config.average_in_collective), (
+            "GTP requires average_in_collective=False (the default); averaged collectives reduce "
+            "over the GTP-excluded group and would miss the 1/gtp_remat gradient scaling factor."
+        )
+
         # Compute gradient scaling factors.
         if config.calculate_per_token_loss:
             assert (
@@ -377,8 +386,20 @@ class DistributedDataParallel(_BaseDataParallel):
                     param_tmp = param.expand_as(param)
                     # Get the gradient accumulator function.
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    grad_acc.register_hook(self._make_backward_post_hook(param))
-                    self.grad_accs.append(grad_acc)
+                    if getattr(param, 'is_gtp_weight_remat', False) and hasattr(
+                        param, 'register_grad_accum_hook'
+                    ):
+                        # GTP_remat computes wgrad via an async reduce-scatter, so autograd's
+                        # AccumulateGrad sees only a dummy; grad-ready is driven manually from
+                        # _handle_megatron_grad_accum (the hook passed here). RETAINING the node
+                        # keeps it on the capture stream for full-iteration CUDA-graph capture.
+                        # No autograd hook or grad_accs entry: either would fire on a stale grad.
+                        param.register_grad_accum_hook(
+                            grad_acc, self._make_backward_post_hook(param)
+                        )
+                    else:
+                        grad_acc.register_hook(self._make_backward_post_hook(param))
+                        self.grad_accs.append(grad_acc)
 
         # Note: overlap_param_gather covers both the distributed optimizer and the
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True
@@ -472,9 +493,13 @@ class DistributedDataParallel(_BaseDataParallel):
                 assert param.requires_grad
                 cudagraph_wgrad_ready_event = getattr(param, '_cudagraph_wgrad_ready_event', None)
                 if self.ddp_config.overlap_grad_reduce and cudagraph_wgrad_ready_event is None:
-                    assert (
-                        param.grad is not None
-                    ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                    # GTP_remat keeps its real wgrad in main_grad (via finalize); param.grad here is
+                    # throwaway (None or a dummy), so skip this assert and rely on
+                    # grad_added_to_main_grad below.
+                    if not getattr(param, 'is_gtp_weight_remat', False):
+                        assert (
+                            param.grad is not None
+                        ), 'param.grad being None is not safe when overlap_grad_reduce is True'
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):

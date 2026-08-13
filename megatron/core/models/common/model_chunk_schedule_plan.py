@@ -35,7 +35,8 @@ class TransformerLayerSchedulePlan:
     MLP, MoE dispatch and combine, optional mHC recomputation, and MTP post-processing nodes.
 
     layer (TransformerLayerSchedulePlan)
-    ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
+    ├── pre_dispatch_computation (TransformerLayerNode):
+    │     attention -> layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All (incl. MLP-side mHC post-processing)
@@ -43,13 +44,15 @@ class TransformerLayerSchedulePlan:
     └── mtp_post_process (PostProcessNode): mtp post process
 
     Note that MTP layer has the same operation and execution order with TransformerLayer regarding
-    moe_dispatch, mlp, moe_combine, but contains extra operations in attn and mtp_post_process:
-    * mtp.attn wraps around transformer_layer.attn with extra norm, proj and embedding operations.
+    moe_dispatch, mlp, moe_combine, but contains extra operations in
+    pre_dispatch_computation and mtp_post_process:
+    * mtp.pre_dispatch_computation wraps around transformer_layer.pre_dispatch_computation with
+      extra norm, proj and embedding operations.
     * mtp.mtp_post_process contains output_layer, mtp loss operations, whereas
       transformer_layer.mtp_post_process is empty.
     """
 
-    attn = None
+    pre_dispatch_computation = None
     moe_dispatch = None
     mlp = None
     moe_combine = None
@@ -72,10 +75,10 @@ class TransformerLayerSchedulePlan:
         The event and chunk_state are binded to the TransformerModelChunkSchedulePlan
         and shared across all layers in the model chunk.
         """
-        from megatron.core.models.gpt.fine_grained_callables import TransformerLayerState
+        from megatron.core.models.common.utils import LayerState
 
         self.config = layer.config
-        self.layer_state = TransformerLayerState()
+        self.layer_state = LayerState()
         self.chunk_state = chunk_state
         self.layer = layer
         self.event = event
@@ -87,9 +90,9 @@ class TransformerLayerSchedulePlan:
 
     def release_state(self):
         """Release reference, this helps avoid memory leak."""
-        if hasattr(self, 'attn') and self.attn is not None:
-            del self.attn
-            self.attn = None
+        if hasattr(self, 'pre_dispatch_computation') and self.pre_dispatch_computation is not None:
+            del self.pre_dispatch_computation
+            self.pre_dispatch_computation = None
         if hasattr(self, 'moe_dispatch') and self.moe_dispatch is not None:
             del self.moe_dispatch
             self.moe_dispatch = None
@@ -114,23 +117,20 @@ class TransformerLayerSchedulePlan:
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
-            attn, mlp, moe_dispatch, moe_combine, and mtp_post_process.
+            pre_dispatch_computation, moe_dispatch, mlp, moe_combine,
+            and mtp_post_process.
         """
-        from megatron.core.models.gpt.fine_grained_callables import (
-            TransformerLayerNode,
+        from megatron.core.models.common.fine_grained_callables import (
             build_layer_callables,
+            get_layer_moe_metadata,
         )
-        from megatron.core.transformer.moe.moe_layer import MoELayer
+        from megatron.core.models.common.utils import TransformerLayerNode
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
-        # build the forward and backward callables for the transformer/mtp layer
         fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
+        is_moe, num_local_experts = get_layer_moe_metadata(self.layer)
 
-        # get flags for latter use
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
-        transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
-        is_moe = isinstance(transformer_layer.mlp, MoELayer)
-        num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
@@ -153,7 +153,7 @@ class TransformerLayerSchedulePlan:
             )
 
         (
-            attn_module,
+            pre_dispatch_module,
             moe_dispatch_module,
             mlp_module,
             moe_combine_module,
@@ -162,7 +162,9 @@ class TransformerLayerSchedulePlan:
 
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy
-        self.attn = create_node(comp_stream, attn_module, "attn")
+        self.pre_dispatch_computation = create_node(
+            comp_stream, pre_dispatch_module, "pre_dispatch_computation"
+        )
         self.mlp = create_node(comp_stream, mlp_module, "mlp")
         if is_moe:
             self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
@@ -211,21 +213,25 @@ class TransformerLayerSchedulePlan:
             post_backward_hook: Callable(module) that releases backward-pass params
                 (bwd=True). Typically ``fsdp_wrapper.post_backward_release_module``.
         """
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
-        assert isinstance(self.layer, (TransformerLayer, MultiTokenPredictionLayer)), (
+        assert isinstance(self.layer, (TransformerLayer, HybridStack, MultiTokenPredictionLayer)), (
             f"Megatron FSDP with EP Overlap only supports TransformerLayer, "
+            f"HybridStack and MultiTokenPredictionLayer, "
             f"but got {type(self.layer).__name__}."
         )
 
-        if isinstance(self.layer, TransformerLayer):
+        if isinstance(self.layer, (TransformerLayer, HybridStack)):
             hook_module = self.layer
         else:
             hook_module = self.layer.mtp_model_layer
 
-        # After the last backward op (attn), release backward-pass params.
-        self.attn.set_post_backward_hook(lambda: post_backward_hook(hook_module))
+        # After the last backward op (pre_dispatch_computation), release backward-pass params.
+        self.pre_dispatch_computation.set_post_backward_hook(
+            lambda: post_backward_hook(hook_module)
+        )
 
         # Determine the last node in forward order.
         if isinstance(self.moe_combine, NoopScheduleNode):
@@ -241,7 +247,7 @@ class TransformerLayerSchedulePlan:
         from megatron.core.pipeline_parallel.utils import ScheduleNode
 
         for node in (
-            self.attn,
+            self.pre_dispatch_computation,
             self.moe_dispatch,
             self.mlp,
             self.moe_combine,
@@ -300,12 +306,13 @@ class TransformerLayerSchedulePlan:
         """Schedule one-forward-one-backward operations for a single transformer layer.
 
         This function interleaves forward and backward operations, overlapping the communications
-        (dispatch or combine) of one with the computations (att or mlp) of the other
+        (dispatch or combine) of one with the computations (pre_dispatch or mlp) of the other
         to maximize parallelism and efficiency.
 
         When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
-        comm_stream: combine_bwd | dispatch_fwd->dispatch_bwd  | combine_fwd
-        comp_stream: attn_fwd    | mlp_bwd->mlp_bwd_dw->mlp_fwd| attn_bwd
+        comm_stream: combine_bwd       | dispatch_fwd->dispatch_bwd  | combine_fwd
+        comm_stream: combine_bwd       | dispatch_fwd->dispatch_bwd  | combine_fwd
+        comp_stream: pre_dispatch_fwd  | mlp_bwd->mlp_bwd_dw->mlp_fwd| pre_dispatch_bwd
         MLP-side mHC post-processing runs inside the combine node on the communication stream.
         Group recompute runs on the normal compute stream immediately before the node containing
         mHC post-processing backward.
@@ -332,7 +339,7 @@ class TransformerLayerSchedulePlan:
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
-                f_input = f_layer.attn.forward(f_input)
+                f_input = f_layer.pre_dispatch_computation.forward(f_input)
 
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
@@ -346,7 +353,7 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.moe_dispatch.backward(b_grad)
 
         if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
-            b_grad = b_layer.attn.backward(b_grad)
+            b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
@@ -357,16 +364,16 @@ class TransformerLayerSchedulePlan:
                 f_input = f_layer.moe_combine.forward(f_input)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
-            b_grad = b_layer.attn.backward(b_grad)
+            b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.mtp_post_process.forward(f_input)
 
-        # Delay the last attn_dw in backward pass (attn_dw of the first layer)
-        # for overlapping with the p2p comm
+        # Delay the last pre_dispatch_computation wgrad in backward pass (wgrad
+        # of the first layer) for overlapping with the p2p comm.
         if b_layer is not None and not is_last_layer_in_bwd:
-            b_layer.attn.backward_dw()
+            b_layer.pre_dispatch_computation.backward_dw()
 
         return f_input, b_grad
 
@@ -384,7 +391,26 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     │   ├── layer[1]: TransformerLayerSchedulePlan
     │   └── ...
     └── post_process: PostProcessNode
+
+    Subclasses can swap the per-layer schedule plan by overriding the
+    ``LAYER_SCHEDULE_PLAN_CLASS`` class attribute (e.g. HybridStack uses a
+    layer plan that understands grouped/inferred layer types). They can also
+    swap the pre/post-process node classes via ``PRE_PROCESS_NODE_CLASS`` /
+    ``POST_PROCESS_NODE_CLASS`` so each model owns its own embedding / output
+    layer node implementations.
     """
+
+    #: The TransformerLayerSchedulePlan-compatible class used to build per-layer
+    #: schedule plans. Subclasses override this to inject a layer-plan variant.
+    LAYER_SCHEDULE_PLAN_CLASS = None
+
+    #: Pre/post-process node classes. Defaults below pull in the GPT-side
+    #: ``PreProcessNode`` / ``PostProcessNode`` (which call ``GPTModel._preprocess`` /
+    #: ``GPTModel._postprocess``). Subclasses set these to model-specific node
+    #: classes so the node calls the right model's ``_preprocess`` /
+    #: ``_postprocess`` methods.
+    PRE_PROCESS_NODE_CLASS = None
+    POST_PROCESS_NODE_CLASS = None
 
     def __init__(
         self,
@@ -400,7 +426,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         loss_mask: Optional[Tensor] = None,
         padding_mask=None,
         *,
-        output_processor: Optional[Callable[..., Tensor]] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ):
         """Initialize the schedule plan of all Transformer layers' sub-modules.
@@ -427,7 +453,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         Returns:
             The model chunk schedule plan.
         """
-        from megatron.core.models.gpt.fine_grained_callables import PostProcessNode, PreProcessNode
+        from megatron.core.models.common.utils import PostProcessNode, PreProcessNode
+
+        pre_process_cls = self.PRE_PROCESS_NODE_CLASS or PreProcessNode
+        post_process_cls = self.POST_PROCESS_NODE_CLASS or PostProcessNode
 
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
@@ -471,7 +500,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.attention_bias = None
 
         # build preprocess
-        self.pre_process = PreProcessNode(
+        self.pre_process = pre_process_cls(
             model, self._model_chunk_state, self._event, get_comp_stream
         )
 
@@ -487,7 +516,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # build post process
         if model.post_process:
-            self.post_process = PostProcessNode(
+            self.post_process = post_process_cls(
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
 
@@ -501,9 +530,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     def _build_layer_schedule_plan(self, module, comp_stream, comm_stream, module_tag):
         if module is None:
             return
+        plan_cls = self.LAYER_SCHEDULE_PLAN_CLASS or TransformerLayerSchedulePlan
 
         from megatron.core.tensor_parallel.random import CheckpointManager
 
+        plan_cls = self.LAYER_SCHEDULE_PLAN_CLASS or TransformerLayerSchedulePlan
         num_layers = len(module.layers)
         config = module.config
         use_mhc_recompute = (
@@ -524,15 +555,16 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 mhc_recompute_manager is not None
                 and (layer_idx == num_layers - 1 or (layer_idx + 1) % group_size == 0)
             )
-            extra_args = {
-                "is_first_layer": layer_idx == 0,
-                "is_last_layer": layer_idx == num_layers - 1,
-                "mhc_recompute_manager": mhc_recompute_manager,
-                "is_last_layer_in_mhc_recompute_group": is_group_end,
-                "mhc_recompute_group_index": group_index,
-                "mhc_recompute_module_tag": module_tag,
-            }
-            layer_plan = TransformerLayerSchedulePlan(
+            extra_args = self._extra_args_for_layer(module, layer_idx, num_layers)
+            extra_args.update(
+                {
+                    "mhc_recompute_manager": mhc_recompute_manager,
+                    "is_last_layer_in_mhc_recompute_group": is_group_end,
+                    "mhc_recompute_group_index": group_index,
+                    "mhc_recompute_module_tag": module_tag,
+                }
+            )
+            layer_plan = plan_cls(
                 module.layers[layer_idx],
                 self.event,
                 self.state,
@@ -545,6 +577,16 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             if is_group_end and layer_idx != num_layers - 1:
                 group_index += 1
                 mhc_recompute_manager = CheckpointManager()
+
+    def _extra_args_for_layer(self, module, layer_idx, num_layers):
+        """Per-layer ``extra_args`` dict passed to the layer plan constructor.
+
+        Subclasses extend this hook to thread additional metadata (e.g. hybrid
+        layer-type symbols) without overriding ``_build_layer_schedule_plan``.
+        The mHC recompute keys are added by ``_build_layer_schedule_plan`` on
+        top of whatever this hook returns.
+        """
+        return {"is_first_layer": layer_idx == 0, "is_last_layer": layer_idx == num_layers - 1}
 
     @property
     def event(self):
@@ -789,22 +831,22 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         if f_schedule_plan is not None and post_forward is not None:
             # post_forward()/send_forward_recv_forward() is running in the communication stream,
-            # so the p2p comm could be overlapped with the attn backward
+            # so the p2p comm could be overlapped with the pre_dispatch backward
             with torch.cuda.stream(get_comm_stream()):
                 f_schedule_plan.wait_current_stream()
                 post_forward(f_input, f_schedule_plan.vp_stage)
 
         # post_backward()/send_backward_recv_backward() is running in the computation stream,
-        # so the p2p comm could be overlapped with the wgrad of attn backward
+        # so the p2p comm could be overlapped with the wgrad of pre_dispatch backward
         if b_schedule_plan is not None and post_backward is not None:
             b_schedule_plan.wait_current_stream()
             post_backward(b_grad, b_schedule_plan.vp_stage)
 
-        # Delay the last attn_dw in backward pass (attn_dw of the first layer)
-        # for overlapping with the p2p comm
+        # Delay the last pre_dispatch_computation wgrad in backward pass (wgrad
+        # of the first layer) for overlapping with the p2p comm.
         if b_num_layers > 0:
             assert b_layer is not None
-            b_layer.attn.backward_dw()
+            b_layer.pre_dispatch_computation.backward_dw()
             b_layer.release_state()
 
         # post process forward

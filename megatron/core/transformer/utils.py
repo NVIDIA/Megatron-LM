@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
+
 import gc
 import logging
 from operator import itemgetter
@@ -131,6 +132,28 @@ def make_sharded_tensors_for_checkpoint(
     if tp_group is None and dp_cp_group is None:
         tp_group = get_tensor_model_parallel_group_if_none(tp_group)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+    # GTP-sharded weights need the GTP axis layered onto the TP/DP offsets. The GTP helper
+    # is a no-op for non-GTP state_dicts, but importing it eagerly would be circular, so
+    # gate on HAVE_GTP and the presence of a GTP param before delegating.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.tensor_parallel.gtp_api import (
+            is_gtp_param,
+            make_sharded_tensors_for_checkpoint_with_gtp_remat,
+        )
+
+        if any(is_gtp_param(t) for t in state_dict.values()):
+            return make_sharded_tensors_for_checkpoint_with_gtp_remat(
+                state_dict,
+                prefix,
+                tensor_parallel_layers_axis_map,
+                sharded_offsets,
+                extra_state_suffix=extra_state_suffix,
+                tp_group=tp_group,
+                dp_cp_group=dp_cp_group,
+            )
 
     sharded_state_dict = {}
     for layer_name in state_dict.keys():
@@ -276,6 +299,41 @@ def sharded_state_dict_default(
 
 # Initialize cache for sequence parallel modules
 _sequence_parallel_attr_cache = None
+
+
+def set_model_config_attribute(model: Any, attribute: str, value: Any) -> None:
+    """Set a config attribute on a model and all distinct child-module configs.
+
+    Some models give individual layers separate config objects. Runtime model-wide
+    toggles must update those configs just as they did when every layer shared the
+    model's root config.
+
+    Args:
+        model: Model whose configs should be updated.
+        attribute: Config attribute to set.
+        value: Value to assign. The same value object is assigned to every config.
+    """
+    root_config = model.config
+    setattr(root_config, attribute, value)
+    updated_config_ids = {id(root_config)}
+
+    module_root = model
+    visited_wrapper_ids = set()
+    while not isinstance(module_root, torch.nn.Module) or not hasattr(module_root, "_modules"):
+        visited_wrapper_ids.add(id(module_root))
+        module_root = getattr(module_root, "module", None)
+        if module_root is None or id(module_root) in visited_wrapper_ids:
+            return
+
+    for module in module_root.modules():
+        config = getattr(module, "config", None)
+        if (
+            config is not None
+            and id(config) not in updated_config_ids
+            and hasattr(config, attribute)
+        ):
+            setattr(config, attribute, value)
+            updated_config_ids.add(id(config))
 
 
 def _init_sequence_parallel_cache(model, exclude_modules):

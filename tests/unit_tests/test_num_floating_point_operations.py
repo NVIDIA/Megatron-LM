@@ -96,6 +96,7 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     args.mamba_head_dim = 64
     args.mamba_num_groups = 8
     args.mamba_num_heads = 128
+    args.gdp_num_householder = 3
     return args
 
 
@@ -378,6 +379,36 @@ class TestHybridMatchesStandard:
             args.v_head_dim = 64
 
         self._assert_match(configure)
+
+
+class TestGatedDeltaProductFlops:
+    """GDP FLOPs must use the Householder count from the model configuration."""
+
+    def test_householder_count_changes_flops(self):
+        args = _make_hybrid_args()
+        args.spec = ["megatron.core.models.hybrid.hybrid_layer_specs", "gdp_stack_spec"]
+        batch_size = 4
+
+        flops_m3 = num_floating_point_operations(args, batch_size)
+        args.gdp_num_householder = 4
+        flops_m4 = num_floating_point_operations(args, batch_size)
+
+        total_tokens = batch_size * args.seq_length
+        d_inner = args.mamba_num_heads * args.mamba_head_dim
+        group_state_dim = args.mamba_num_groups * args.mamba_state_dim
+        forward_delta_per_layer = (
+            2
+            * total_tokens
+            * (
+                args.hidden_size * (d_inner + group_state_dim + args.mamba_num_heads)
+                + 4 * (d_inner + group_state_dim)
+            )
+            + 4 * total_tokens * d_inner * args.mamba_state_dim
+        )
+        num_gdp_layers = 2
+        expected_delta = 3 * num_gdp_layers * forward_delta_per_layer
+
+        assert flops_m4 - flops_m3 == expected_delta
 
 
 class TestPaddingRemoval:

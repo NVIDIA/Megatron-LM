@@ -18,7 +18,10 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    set_batch_invariant_mode,
+    te_supports_batch_invariant_attention,
+)
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -35,6 +38,23 @@ try:
     HAVE_FA3 = True
 except ImportError:
     HAVE_FA3 = False
+
+try:
+    # Blackwell (e.g. GB200) ships FlashAttention-4 instead of FA3; the batch-invariant
+    # attention paths honor config.flash_attention_version, so these tests run there too.
+    from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen_func  # noqa: F401
+
+    HAVE_FA4 = True
+except ImportError:
+    HAVE_FA4 = False
+
+# Batch-invariant mode requires an explicit FlashAttention version; pick the newest
+# one available so training and inference run the same kernel.
+_BIK_FA_VERSION = 4 if HAVE_FA4 else 3
+pytestmark = pytest.mark.skipif(
+    not te_supports_batch_invariant_attention(),
+    reason="Batch-invariant attention requires TransformerEngine PR #3204 or >= 2.18.",
+)
 
 
 class DummyTokenizer:
@@ -86,6 +106,7 @@ def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int 
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        flash_attention_version=_BIK_FA_VERSION,
         normalization="RMSNorm",
         params_dtype=torch.bfloat16,
         attention_backend=AttnBackend.flash,
@@ -112,14 +133,21 @@ def _train_forward_logprobs(model: torch.nn.Module, tokens: torch.Tensor) -> tor
         batch_size, 1, seq_len, seq_len, dtype=torch.bool, device=tokens.device
     )
     with torch.no_grad():
-        logits = model(input_ids=tokens, position_ids=position_ids, attention_mask=attention_mask)
+        # runtime_gather_output matches rl_utils.get_logprobs; without it the model
+        # asserts once it has served inference requests (in-inference-mode postprocess).
+        logits = model(
+            input_ids=tokens,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            runtime_gather_output=True,
+        )
     logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
     return logprobs
 
 
 @pytest.mark.skipif(
-    not (is_te_min_version("2.10.0") and HAVE_FA3),
-    reason="TestGPTModelBatchInvariant requires TE >= 2.10.0 and FlashAttention-3",
+    not (is_te_min_version("2.10.0") and (HAVE_FA3 or HAVE_FA4)),
+    reason="TestGPTModelBatchInvariant requires TE >= 2.10.0 and FlashAttention-3 or -4",
 )
 class TestGPTModelBatchInvariant:
     """End-to-end batch-invariance tests for GPT."""
@@ -199,9 +227,7 @@ class TestGPTModelBatchInvariant:
         wrapper = GPTInferenceWrapper(inference_model, ctx)
         tokenizer = DummyTokenizer(vocab_size=vocab_size, bos=None, eod=vocab_size - 1, pad=0)
         controller = TextGenerationController(wrapper, tokenizer)
-        engine = DynamicInferenceEngine(
-            controller=controller, context=ctx, enable_cuda_graph=False, random_seed=123
-        )
+        engine = DynamicInferenceEngine(controller=controller, context=ctx)
 
         base_vals = [3, 15, 27, 39]
         lengths = [18, 11, 23, 13]
@@ -262,7 +288,7 @@ class TestGPTModelBatchInvariant:
 
         def _run_engine_with_order(order):
             ctx = DynamicInferenceContext(
-                model_config=based_model.config,
+                model_config=base_model.config,
                 inference_config=InferenceConfig(
                     max_sequence_length=seq_len,
                     buffer_size_gb=0.125,
@@ -277,9 +303,7 @@ class TestGPTModelBatchInvariant:
             wrapper = GPTInferenceWrapper(inference_model, ctx)
             tokenizer = DummyTokenizer(vocab_size=vocab_size, bos=None, eod=vocab_size - 1, pad=0)
             controller = TextGenerationController(wrapper, tokenizer)
-            engine = DynamicInferenceEngine(
-                controller=controller, context=ctx, enable_cuda_graph=False, random_seed=123
-            )
+            engine = DynamicInferenceEngine(controller=controller, context=ctx)
 
             base_vals = [3, 15, 27, 39]
             lengths = [18, 11, 23, 13]

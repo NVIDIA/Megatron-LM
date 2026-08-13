@@ -88,10 +88,22 @@ if not HAVE_FA3:
     except ImportError as e:
         pass
 
+# The FA4 version is tracked by the `flash-attn-4` distribution metadata,
+# not `flash_attn.__version__` (which reports the 2.x version) or
+# `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
+# `is_fa_min_version` here.
+_MIN_FA4_VERSION = "4.0.0b20"
 try:
-    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _get_dist_version
 
-    HAVE_FA4 = True
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+    from packaging.version import Version as _Version
+
+    try:
+        HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
+    except PackageNotFoundError:
+        HAVE_FA4 = False
 except ImportError:
     HAVE_FA4 = False
 
@@ -314,6 +326,7 @@ class Attention(MegatronModule, ABC):
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
+        self.flash_attention_version = config.flash_attention_version
 
         # Cache the YaRN concentration factor (a.k.a. attention factor / mscale),
         # which is a pure function of the config and is reused on every forward
@@ -417,6 +430,7 @@ class Attention(MegatronModule, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".linear_proj") if name is not None else None,
         )
 
@@ -530,7 +544,7 @@ class Attention(MegatronModule, ABC):
                 checkpoint_inputs.append(kwarg_value)
 
         def custom_forward(*inputs):
-            (query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values) = inputs
+            query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values = inputs
             attn_mask_type = AttnMaskType(attn_mask_type.item())
             extra_kwargs = dict(core_attention_extra_kwargs)
             for name, kwarg_value in zip(tensor_kwarg_names, tensor_kwarg_values):
@@ -1061,6 +1075,29 @@ class Attention(MegatronModule, ABC):
         )
         return output_total, softmax_lse
 
+    def _resolve_flash_version(self) -> Tuple[bool, bool]:
+        """Resolve which FlashAttention generation this attention should run.
+
+        Honors ``config.flash_attention_version`` when pinned, otherwise falls back
+        to the auto preference order (FA4 > FA3 > FA2). Returns ``(use_fa4, use_fa3)``;
+        when both are False the FA2 kernel is used.
+        """
+        pinned = self.flash_attention_version
+        if pinned == 4:
+            assert (
+                HAVE_FA4
+            ), "flash_attention_version=4 requested but FlashAttention-4 is not installed"
+            return True, False
+        if pinned == 3:
+            assert (
+                HAVE_FA3
+            ), "flash_attention_version=3 requested but FlashAttention-3 is not installed"
+            return False, True
+        if pinned == 2:
+            return False, False
+        # Auto: prefer the newest available generation.
+        return HAVE_FA4, (HAVE_FA3 and not HAVE_FA4)
+
     def flash_decode_and_prefill(
         self,
         q: Tensor,
@@ -1119,6 +1156,8 @@ class Attention(MegatronModule, ABC):
         # the sink (off-by-one / learnable) softmax correction post-hoc.
         need_lse = softmax_offset is not None
 
+        use_fa4, use_fa3 = self._resolve_flash_version()
+
         # Flash attn kernel.
         if not is_decode_only:
             q = q.squeeze(1)
@@ -1126,7 +1165,7 @@ class Attention(MegatronModule, ABC):
                 softmax_scale = self.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
-            if HAVE_FA4:
+            if use_fa4:
                 output_total, softmax_lse = flash_attn4_varlen_func(
                     q,
                     k,
@@ -1139,9 +1178,9 @@ class Attention(MegatronModule, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                     window_size=window_size,
-                    num_splits=1,
+                    num_splits=0 if not self.batch_invariant_mode else 1,
                 )
-            elif HAVE_FA3:
+            elif use_fa3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
                 fa3_ret = self._flash_attention_3_forward_wrapper(
@@ -1242,7 +1281,7 @@ class Attention(MegatronModule, ABC):
                         output_total, softmax_lse, softmax_offset
                     )
             else:
-                if HAVE_FA4:
+                if use_fa4:
                     if getattr(self, "softmax_scale", None) is not None:
                         softmax_scale = self.softmax_scale
                     else:
@@ -1261,7 +1300,7 @@ class Attention(MegatronModule, ABC):
                         softmax_scale=softmax_scale,
                         causal=True,
                         window_size=window_size,
-                        num_splits=1,
+                        num_splits=0 if not self.batch_invariant_mode else 1,
                     )
                     if need_lse:
                         # output_total: (B*S, H, D); softmax_lse: (H, B*S)
@@ -1285,12 +1324,12 @@ class Attention(MegatronModule, ABC):
                         "softmax_scale": softmax_scale,
                         "causal": True,
                         "window_size": window_size,
-                        "page_table" if HAVE_FA3 else "block_table": block_table,
+                        "page_table" if use_fa3 else "block_table": block_table,
                         "num_splits": 0 if not self.batch_invariant_mode else 1,
                     }
                     if need_lse:
                         flash_attn_args["return_softmax_lse"] = True
-                    if HAVE_FA3:
+                    if use_fa3:
                         kvcache_ret = flash_attn3_with_kvcache(**flash_attn_args)
                     else:
                         assert (
@@ -1787,6 +1826,7 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".linear_qkv") if name is not None else None,
         )
 
@@ -2003,9 +2043,9 @@ class SelfAttention(Attention):
             ]
 
             if SplitAlongDim is not None:
-                (query, gate, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+                query, gate, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
-                (query, gate, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+                query, gate, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
         else:
             # If no output gate: [sq, b, ng, (np/ng + 2) * hn]
             # --> [sq, b, ng, np/ng * hn], None, [sq, b, ng, hn], [sq, b, ng, hn]
@@ -2020,9 +2060,9 @@ class SelfAttention(Attention):
                 return mixed_qkv, split_arg_list
 
             if SplitAlongDim is not None:
-                (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+                query, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
-                (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+                query, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
 
         # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
@@ -2354,7 +2394,7 @@ class CrossAttention(Attention):
         mixed_kv = mixed_kv.view(*new_tensor_shape)
 
         # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
-        (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
+        key, value = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
         query, _ = apply_module(self.linear_q)(hidden_states)

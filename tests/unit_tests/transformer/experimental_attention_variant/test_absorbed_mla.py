@@ -125,6 +125,7 @@ def get_mock_mla_config(
     context_parallel_size: int,
     sequence_parallel: bool,
     recompute_mla_up_proj: bool,
+    qk_layernorm: bool,
 ) -> MLATransformerConfig:
     """Create test config with all attributes used in MLA."""
     return MLATransformerConfig(
@@ -141,6 +142,7 @@ def get_mock_mla_config(
         params_dtype=torch.bfloat16,
         layernorm_epsilon=1e-5,
         normalization="RMSNorm",
+        qk_layernorm=qk_layernorm,
         layernorm_zero_centered_gamma=False,
         expert_model_parallel_size=1,
         tensor_model_parallel_size=tensor_model_parallel_size,
@@ -266,21 +268,23 @@ def test_functionality(
     model_parallel_cuda_manual_seed(123)
 
     # Create model
+    qk_layernorm = True
     config = get_mock_mla_config(
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
         sequence_parallel=sp,
         recompute_mla_up_proj=recompute_mla_up_proj,
+        qk_layernorm=qk_layernorm,
     )
     absorbed_submodules = get_absorbed_mla_submodules(
         down_proj_use_column_parallel=down_proj_use_column_parallel,
-        qk_layernorm=True,
+        qk_layernorm=qk_layernorm,
         rms_norm=True,
         combined_kv_up_projection=combined_kv_up_projection,
     )
     standard_submodules = get_mla_submodules(
         down_proj_use_column_parallel=down_proj_use_column_parallel,
-        qk_layernorm=True,
+        qk_layernorm=qk_layernorm,
         rms_norm=True,
     )
     absorbed_mla = AbsorbedMLASelfAttention(

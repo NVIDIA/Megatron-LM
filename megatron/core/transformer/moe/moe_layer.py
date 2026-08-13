@@ -13,7 +13,7 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
 from megatron.core.transformer.moe.moe_utils import (
@@ -278,6 +278,11 @@ class MoELayer(BaseMoELayer):
                 linear_cls = InferenceLinear
             else:
                 linear_cls = TELinear
+            gtp_remat_group = (
+                resolve_gtp_remat_group(pg_collection, is_expert=False)
+                if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
+                else None
+            )
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -289,6 +294,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
+                gtp_remat_group=gtp_remat_group,
             )
             self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
@@ -301,6 +307,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
+                gtp_remat_group=gtp_remat_group,
             )
 
         # Initialize token dispatcher
@@ -616,8 +623,17 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
         else:
+            # NCCL-EP zero-copy: experts write fc2 output and fc1 dgrad straight into the combine /
+            # dispatch symm buffers. Passed only when set (non-TEGroupedMLP experts don't accept
+            # these kwargs).
+            output_buffer, grad_input_buffer = self.token_dispatcher.get_expert_zero_copy_buffers()
+            expert_kwargs = {}
+            if output_buffer is not None:
+                expert_kwargs["output_buffer"] = output_buffer
+            if grad_input_buffer is not None:
+                expert_kwargs["grad_input_buffer"] = grad_input_buffer
             expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs
+                dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)

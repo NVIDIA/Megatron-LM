@@ -602,12 +602,15 @@ class MegatronCheckpointSaverBase:
                             "mlp_norm_weight": post_norm_weight,
                         }
                         if self.margs.num_experts:
-                            params_dict.update(
-                                {
-                                    "mlp_fc1_weight": mlp_l0_weight[ep_rank][tp_rank],
-                                    "mlp_fc2_weight": mlp_l1_weight[ep_rank][tp_rank],
-                                }
-                            )
+                            num_local_experts = self.margs.num_experts // self.args.target_expert_parallel_size
+                            params_dict.update({
+                                f"mlp_fc1_weight.{i}": mlp_l0_weight[ep_rank][tp_rank][i]
+                                for i in range(num_local_experts)
+                            })
+                            params_dict.update({
+                                f"mlp_fc2_weight.{i}": mlp_l1_weight[ep_rank][tp_rank][i]
+                                for i in range(num_local_experts)
+                            })
                         else:
                             params_dict.update(
                                 {

@@ -14,7 +14,14 @@ class MambaMetadata:
     """Manages the metadata tensors required for Mamba layers during inference."""
 
     def __init__(
-        self, max_requests: int, max_tokens: int, mamba_chunk_size: int = 128, d_conv: int = 0
+        self,
+        max_requests: int,
+        max_tokens: int,
+        *,
+        max_intermediate_count: int,
+        mamba_chunk_size: int = 128,
+        d_conv: int = 0,
+        decode_indices_dtype: torch.dtype = torch.int64,
     ):
         """
         Initializes the Mamba slot allocator.
@@ -22,15 +29,23 @@ class MambaMetadata:
         Args:
             max_requests (int): The maximum number of concurrent requests.
             max_tokens (int): The maximum number of tokens.
+            max_intermediate_count (int): Per-step upper bound on Mamba
+                intermediate-state extractions; sizes the intermediate metadata
+                buffers. Computed once by DynamicInferenceContext (as
+                max_mamba_intermediate_states_per_step) and shared with
+                MambaSlotAllocator.
             mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
             d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
+            decode_indices_dtype (torch.dtype): Dtype for decode state-slot indices.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
         self.mamba_chunk_size = mamba_chunk_size
         self.d_conv = d_conv
         self.device = torch.cuda.current_device()
+        assert decode_indices_dtype in (torch.int32, torch.int64)
+        self.decode_indices_dtype = decode_indices_dtype
 
         # Maximum possible chunks across all batch configurations
         self.max_chunks = max_tokens // mamba_chunk_size + max_requests
@@ -41,9 +56,10 @@ class MambaMetadata:
         )
 
         # Map from requests to slots in the static Mamba state buffer for active decode requests.
-        # int64 so selective_state_update can index directly without a per-layer upcast kernel;
+        # Non-BIK decode uses int64 for selective_state_update; BIK uses int32
+        # for the exact causal-conv1d update kernel.
         self._batch_indices_decode_buffer = torch.full(
-            (self.max_requests,), -1, dtype=torch.int64, device=self.device
+            (self.max_requests,), -1, dtype=self.decode_indices_dtype, device=self.device
         )
 
         # Map from requests to slots in the static Mamba state buffer for active prefill requests
@@ -91,22 +107,20 @@ class MambaMetadata:
         )
         self.mamba_state_free_slot_count = self.max_requests
 
-        # Intermediate state extraction buffers (CUDA graph compatible)
-        # Each prefill request can produce up to 3 intermediate offsets
-        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * max_requests
+        # Intermediate state extraction buffers (CUDA graph compatible). Sized by
+        # the per-step token-budget cap shared from DynamicInferenceContext.
+        self.max_intermediate_count = max_intermediate_count
         self._intermediate_chunk_indices_buffer = torch.zeros(
             self.max_intermediate_count, dtype=torch.int64, device=self.device
         )
         self._intermediate_abs_positions_buffer = torch.full(
             (self.max_intermediate_count,), d_conv, dtype=torch.int32, device=self.device
         )
-        # Constant gather offsets for conv state extraction: [-d_conv, ..., -1]
-        if d_conv > 0:
-            self.conv_gather_offsets = torch.arange(
-                -d_conv, 0, dtype=torch.int32, device=self.device
-            )
-        else:
-            self.conv_gather_offsets = None
+        # Runtime real-count tensor read by the fused gather+scatter Triton
+        # kernels (intermediate_extraction.py). Fixed-address, rewritten each step
+        # so captured CUDA graphs stay valid while the kernels skip padded slots
+        # (pid_slot >= real_count).
+        self._intermediate_real_count_buffer = torch.zeros(1, dtype=torch.int32, device=self.device)
 
         # Coalesced production path: pinned CPU views + shared GPU views bound
         # by DynamicInferenceContext so that the per-step Mamba metadata fields
@@ -169,6 +183,7 @@ class MambaMetadata:
         # Intermediate state extraction views
         self.intermediate_chunk_indices = None
         self.intermediate_abs_positions = None
+        self.intermediate_real_count = None
         self.intermediate_count = 0
         self.per_request_intermediate_counts = []
 
@@ -381,13 +396,24 @@ class MambaMetadata:
             intermediate_counts_gpu: [real_prefill_count] int32 GPU tensor of
                 per-request offset counts (0-3), or None.
             real_prefill_count: Number of real (non-padding) prefill requests.
+            padded_prefill_count: Prefill request count after batch padding
+                (equals the captured graph bucket under CUDA graphs, or the
+                round-up-padded count in eager mode; always >= real_prefill_count).
+                Bounds the exposed/padded extent of the intermediate views via
+                ``max_count`` so CUDA graph replay always touches a fixed-size
+                region within the scratch buffers.
             cu_seqlens_gpu: GPU cu_seqlens tensor to read from. Defaults to
                 the legacy standalone ``_cu_seqlens_buffer`` used by
                 :meth:`update`; the coalesced production path passes the
                 shared ``ContextGPUView.mamba_cu_seqlens`` view.
         """
         chunk_size = self.mamba_chunk_size
-        max_count = padded_prefill_count * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
+        # Cap at the token-budget bound so the per-step views never exceed the
+        # buffers, even for high-prefill-count graph buckets where
+        # padded_prefill_count * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST would.
+        max_count = min(
+            padded_prefill_count * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, self.max_intermediate_count
+        )
         if cu_seqlens_gpu is None:
             cu_seqlens_gpu = self._cu_seqlens_buffer
 
@@ -438,6 +464,13 @@ class MambaMetadata:
                 valid_abs_positions = abs_positions_2d[valid_mask]
 
                 real_count = valid_chunk_indices.numel()
+                # The token-budget bound guarantees this; fail loudly rather than
+                # silently overrun the scratch buffers if the candidate-offset
+                # logic in MambaSlotAllocator.compute_and_store_offsets changes.
+                assert real_count <= self.max_intermediate_count, (
+                    f"Mamba intermediate count {real_count} exceeds buffer size "
+                    f"{self.max_intermediate_count}"
+                )
                 self._intermediate_chunk_indices_buffer[:real_count] = valid_chunk_indices
                 self._intermediate_abs_positions_buffer[:real_count] = valid_abs_positions.to(
                     torch.int32
@@ -445,8 +478,11 @@ class MambaMetadata:
 
                 # Pad unused slots with safe defaults for CUDA graph replay:
                 # - chunk_indices=0: reads from chunk 0 (always exists), output ignored
-                # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1],
-                #   which are within bounds and produce a valid but unused state
+                # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1].
+                #   These are within bounds only when the prefill has at least
+                #   d_conv tokens; shorter sequences (e.g. small CUDA-graph warmup
+                #   buckets) would overrun the token axis, so ssm_prefill clamps
+                #   the gather positions into range. The gathered state is unused.
                 if real_count < max_count:
                     self._intermediate_chunk_indices_buffer[real_count:max_count].fill_(0)
                     self._intermediate_abs_positions_buffer[real_count:max_count].fill_(self.d_conv)
@@ -462,15 +498,24 @@ class MambaMetadata:
 
             self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+            # Publish real_count to the fixed-address GPU tensor the scatter
+            # kernels consult. fill_ is async (no host sync) and keeps the tensor
+            # at the same address captured graphs reference.
+            self._intermediate_real_count_buffer.fill_(self.intermediate_count)
+            self.intermediate_real_count = self._intermediate_real_count_buffer
         else:
             # No extraction: fill with safe defaults for CUDA graph warmup
-            # (same rationale as padding comment above)
+            # (same rationale as padding comment above; abs_positions=d_conv may
+            # exceed a sub-d_conv warmup sequence, so ssm_prefill clamps the
+            # gather positions into range and the gathered state is unused)
             self._intermediate_chunk_indices_buffer[:max_count] = 0
             self._intermediate_abs_positions_buffer[:max_count] = self.d_conv
             self.intermediate_count = 0
             self.per_request_intermediate_counts = []
             self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
+            self._intermediate_real_count_buffer.fill_(0)
+            self.intermediate_real_count = self._intermediate_real_count_buffer
 
     def compute_cpu_metadata(
         self,
