@@ -75,6 +75,7 @@ class FullyParallelSaveStrategyWrapper:
         do_cache_distribution: bool = False,
         backend: str = "torch_dist",
         version: int = 1,
+        validate_access_integrity: bool = True,
     ):
         """ """
         self.base_strategy = strategy
@@ -84,6 +85,12 @@ class FullyParallelSaveStrategyWrapper:
         self.do_cache_distribution = do_cache_distribution
         self.backend = backend
         self.version = version
+        # When False, skip the first-save sharding-integrity validation (its
+        # determine_global_metadata all_gather_object). Mirrors the
+        # validate_access_integrity used by dist_checkpointing.save, so
+        # --no-ckpt-load-validate-sharding-integrity skips *both* save-side
+        # validation collectives, not just the one in save_preprocess.
+        self.validate_access_integrity = validate_access_integrity
 
         self.cached_distribution: Optional[ShardDistribution] = None
 
@@ -130,7 +137,7 @@ class FullyParallelSaveStrategyWrapper:
         distribute_main_replicas_with_precomputed_distribution(
             sharded_state_dict, self.parallelization_group, precomputed_distribution
         )
-        if self.cached_distribution is None:
+        if self.cached_distribution is None and self.validate_access_integrity:
             # First time applying the parallelization
             validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
         if self.do_cache_distribution:
@@ -171,6 +178,7 @@ class FullyParallelLoadStrategyWrapper:
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
         exchange_algo: str = 'broadcast',
+        per_rank_object_load: bool = False,
     ):
         self.base_strategy = strategy
         if parallelization_group is None:
@@ -180,6 +188,11 @@ class FullyParallelLoadStrategyWrapper:
         self.parallelization_group = parallelization_group
         self.do_cache_distribution = do_cache_distribution
         self.exchange_algo = exchange_algo
+        # When True, every rank loads *all* of its ShardedObjects directly from
+        # storage instead of loading only its main replicas and exchanging them
+        # with a WORLD-wide `all_gather_object`. Opt-in; defaults to the legacy
+        # gather-based exchange. See `load` for correctness rationale.
+        self.per_rank_object_load = per_rank_object_load
 
         self.cached_distribution: Optional[ShardDistribution] = None
         self.cached_global_metadata: Optional[Metadata] = None
@@ -249,15 +262,47 @@ class FullyParallelLoadStrategyWrapper:
         assert (
             len(sharded_state_dict) == 0
         ), "sharded_state_dict is not empty after deferring tensors and objects"
-        with debug_time("base_load_ShardedObjects", logger):
-            # Load sharded objects first
-            loaded_objects = self.base_strategy.load(
-                to_load_objects, checkpoint_dir, async_strategy
-            )
 
-        with debug_time("base_load_ShardedTensors", logger):
-            # Load sharded tensors separately
-            loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir, async_strategy)
+        if self.per_rank_object_load:
+            # Opt-in: every rank loads *all* of its own objects directly from
+            # storage, so no inter-rank object exchange is needed. This is correct
+            # because an object is addressed in the checkpoint by its `unique_key`
+            # (key + global_offset + global_shape), which excludes `replica_id`;
+            # each distinct object position is therefore written to disk exactly
+            # once (by its main replica) and any rank that needs it can read it
+            # locally. We merge both the main (`to_load_objects`) and non-main
+            # (`unloaded_objects`) replica maps so this rank loads every object in
+            # its state dict. This replaces the WORLD-wide `all_gather_object`
+            # collective with extra (but cheap) local reads of small artifacts
+            # (RNG states, `_extra_state`, ...).
+            #
+            # Objects are loaded together with this rank's tensor shards in a
+            # single base-strategy `.load()` call: `mcore_to_pyt_state_dict`
+            # supports a mixed tensor/object state dict, and one call means one
+            # metadata read and one load plan instead of two.
+            all_objects_to_load = {**to_load_objects, **unloaded_objects}
+            with debug_time("base_load_ShardedTensorsAndObjects", logger):
+                loaded = self.base_strategy.load(
+                    {**to_load_shards, **all_objects_to_load}, checkpoint_dir, async_strategy
+                )
+            # The base strategy returns the loaded values keyed by the same shard
+            # ids we passed in; split them back into tensors and objects. Tensor
+            # and object shard ids never collide (a given key is either a tensor
+            # or an object), so membership in the original maps is an unambiguous
+            # split.
+            loaded_tensors = {shard_id: loaded[shard_id] for shard_id in to_load_shards}
+            loaded_objects = {shard_id: loaded[shard_id] for shard_id in all_objects_to_load}
+        else:
+            # Default (legacy): load only this rank's main-replica objects and
+            # exchange them across ranks below.
+            with debug_time("base_load_ShardedObjects", logger):
+                loaded_objects = self.base_strategy.load(
+                    to_load_objects, checkpoint_dir, async_strategy
+                )
+            with debug_time("base_load_ShardedTensors", logger):
+                loaded_tensors = self.base_strategy.load(
+                    to_load_shards, checkpoint_dir, async_strategy
+                )
 
         with debug_time("self.exchange_loaded_tensors", logger):
 
@@ -279,14 +324,17 @@ class FullyParallelLoadStrategyWrapper:
             with debug_time("torch.cuda.synchronize", logger):
                 torch.cuda.synchronize()
 
-        all_loaded_objects = exchange_loaded_objects_gather_object(loaded_objects)
-
-        if not set(unloaded_objects.keys()).issubset(all_loaded_objects.keys()):
-            missing_object_shards = set(unloaded_objects.keys()) - all_loaded_objects.keys()
-            raise CheckpointingException(
-                f'Missing object shards after fully parallel loading: {missing_object_shards}'
-            )
-        torch.cuda.synchronize()
+        if self.per_rank_object_load:
+            # No object exchange: each rank already loaded every object it needs.
+            all_loaded_objects = loaded_objects
+        else:
+            all_loaded_objects = exchange_loaded_objects_gather_object(loaded_objects)
+            if not set(unloaded_objects.keys()).issubset(all_loaded_objects.keys()):
+                missing_object_shards = set(unloaded_objects.keys()) - all_loaded_objects.keys()
+                raise CheckpointingException(
+                    f'Missing object shards after fully parallel loading: {missing_object_shards}'
+                )
+            torch.cuda.synchronize()
 
         self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
         self.fill_in_deferred_sharded_objects(sharded_objects, all_loaded_objects)

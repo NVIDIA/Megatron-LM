@@ -1172,6 +1172,40 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_active_row_block_table_tail_uses_dummy_block(self) -> None:
+        """A real request's unallocated trailing block-table columns must be
+        staged as the dummy block, not the -1 sentinel: graphed decode
+        advertises max_seqlen_k = max_sequence_length, so the kernel's
+        page-table reach can include the tail of a near-limit request."""
+        test_config = DynamicEngineTestConfig(
+            num_requests=1,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_cuda_graphs=1,
+            context_max_requests=4,
+            max_sequence_length=512,
+        )
+        env = self._build_test_env(test_config)
+        context = env.engine.context
+
+        env.engine._add_request(env.requests[0])
+        self._run_step(env)  # prefill
+        self._run_step(env)  # decode: graphed, one real row
+
+        assert context.using_cuda_graph_this_step()
+        # The 512-token budget spans two 256-token pages. 8-token prompt allocates only the first.
+        # So the real row genuinely has an unallocated tail to pin.
+        block_count = int(context.request_kv_block_counts[0].item())
+        staged_row = context._cpu_mha_block_table[0]
+        assert 0 < block_count < staged_row.numel()
+        assert (staged_row != -1).all()
+        assert (staged_row[block_count:] == context.kv_block_allocator.dummy_block_idx).all()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_multi_add(self, model_provider: str) -> None:
         """Test adding multiple requests simultaneously."""

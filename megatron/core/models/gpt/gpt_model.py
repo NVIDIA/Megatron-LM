@@ -66,6 +66,9 @@ class GPTModel(LanguageModule):
             Include an output layer (used with pipeline parallelism). Defaults to True.
         fp16_lm_cross_entropy (bool, optional):
             Defaults to False.
+        logit_dtype (torch.dtype, optional):
+            Dtype for the output-layer GEMM result. Defaults to None, which uses
+            the hidden-state dtype.
         parallel_output (bool, optional):
             Do not gather the outputs, keep them split across tensor
             parallel ranks. Defaults to True.
@@ -100,6 +103,7 @@ class GPTModel(LanguageModule):
         pre_process: bool = True,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
+        logit_dtype: Optional[torch.dtype] = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         position_embedding_type: Literal[
@@ -133,6 +137,7 @@ class GPTModel(LanguageModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
+        self.logit_dtype = logit_dtype
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.vp_stage = vp_stage
@@ -283,6 +288,7 @@ class GPTModel(LanguageModule):
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.pg_collection.tp,
+                output_dtype=self.logit_dtype,
             )
 
         if self.pre_process or self.post_process or self.mtp_process:
@@ -531,9 +537,9 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        output_processor: Optional[Callable[..., Tensor]] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
-    ) -> Tensor:
+    ) -> Any:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
@@ -810,7 +816,7 @@ class GPTModel(LanguageModule):
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         *,
-        output_processor: Optional[Callable[..., Tensor]] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ):
         """Builds a computation schedule plan for the model.
