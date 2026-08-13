@@ -164,20 +164,14 @@ class FsdpParameterGroup:
         else:
             self._symm_mem_pool = None
 
+        # Match the optimizer post-step and checkpoint-load state: compute weights
+        # begin as a cast of the optimizer weights and are restored to their
+        # configured placements by the first pre-forward unshard.
+        self.model_weight = self.main_weight.cast(self.dtype)
         with self._symmetric_memory_context():
             self._unsharded_model_weight = DBuffer(
                 mesh=self.mesh,
                 placements=[Replicate()] * self.mesh.ndim,
-                tensor_shapes=tensor_shapes,
-                dtype=self.dtype,
-                device=self.main_weight.device,
-            )
-        if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
-            self.model_weight = self.main_weight
-        else:
-            self.model_weight = DBuffer(
-                mesh=self.mesh,
-                placements=model_weight_placements,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
                 device=self.main_weight.device,
@@ -236,12 +230,6 @@ class FsdpParameterGroup:
             )
         self.fsdp_parameters = tuple(fsdp_parameters)
 
-        # Initialize compute weights on the construction stream. Subsequent casts happen
-        # on the all-gather stream so their temporary buffers can be consumed there safely.
-        if self.main_weight is not self.model_weight:
-            self.main_weight.cast(self.model_weight.dtype).redistribute(
-                self.model_weight.placements, out=self.model_weight
-            )
         self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
 
