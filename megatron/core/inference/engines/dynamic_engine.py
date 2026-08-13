@@ -1445,6 +1445,22 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return self._add_request(request)
 
+    def _resolve_image_token_id(self) -> Optional[int]:
+        """Return the model's image token id, whichever wrapper level holds it.
+
+        None when the model marks images with a negative sentinel instead of a
+        real vocabulary entry (LLaVA's DEFAULT_IMAGE_TOKEN_INDEX), since such an
+        id is no more decodable than the padding it would replace.
+        """
+        module = getattr(self.controller.inference_wrapped_model, "model", None)
+        while module is not None:
+            image_token_index = getattr(module, "image_token_index", None)
+            if image_token_index is not None:
+                image_token_index = int(image_token_index)
+                return image_token_index if image_token_index >= 0 else None
+            module = getattr(module, "module", None)
+        return None
+
     def _build_vlm_request(
         self,
         *,
@@ -1498,7 +1514,18 @@ class DynamicInferenceEngine(AbstractEngine):
                     token_list, num_tiles=num_tiles, imgs_sizes=imgs_sizes
                 )
             )
-            tokens = torch.tensor(expanded_tokens_list[0], dtype=torch.int64, device=device)
+            # expand_image_tokens pads the embedding slots with -1, but the mask
+            # below is what splices the embeddings in, so keep a real token id in
+            # prompt_tokens where the model has one: they are echoed to HTTP
+            # clients, detokenized for raw_text and hashed for prefix caching, and
+            # none of those accept a negative id.
+            expanded_tokens = expanded_tokens_list[0]
+            image_token_id = self._resolve_image_token_id()
+            if image_token_id is not None:
+                expanded_tokens = [
+                    image_token_id if token < 0 else token for token in expanded_tokens
+                ]
+            tokens = torch.tensor(expanded_tokens, dtype=torch.int64, device=device)
             mask_tensor = torch.tensor(
                 [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
             )
