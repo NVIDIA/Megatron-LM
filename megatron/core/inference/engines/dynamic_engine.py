@@ -1409,6 +1409,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 imgs_sizes=imgs_sizes,
                 precomputed_block_hashes=precomputed_block_hashes,
             )
+            # _build_vlm_request has already registered the image embeddings
+            # and token mask into the context (add_vlm_request_data). If
+            # _add_request now rejects the request (oversized prompt, cache
+            # exhaustion, ...), those tensors would linger in the context
+            # dicts and leak GPU memory. Clean them up on failure.
+            try:
+                return self._add_request(request)
+            except Exception:
+                self.context.remove_vlm_request_data(request_id)
+                raise
         else:
             request = DynamicInferenceRequest(
                 request_id=request_id,
