@@ -141,16 +141,32 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         identical keyspace. These are the groups ``preprocess_state_dict_for_uneven_dtensor``
         gathers over, so a collective run here reaches the same ranks the save and load
         collectives do.
+
+        Raises:
+            NotImplementedError: If the parameters do not all share one device mesh, which
+                is what expert parallelism produces.
         """
-        for param in self._trainable_parameters():
-            if isinstance(param, DTensor):
-                mesh = param.device_mesh
-                return [
-                    mesh.get_group(mesh_dim)
-                    for mesh_dim, placement in enumerate(param.placements)
-                    if isinstance(placement, Shard) and mesh.size(mesh_dim) > 1
-                ]
-        return []
+        sharded_parameters = [
+            param for param in self._trainable_parameters() if isinstance(param, DTensor)
+        ]
+        if len({param.device_mesh for param in sharded_parameters}) > 1:
+            # MFSDP v2 shards expert parameters over the expert-DP mesh and everything else
+            # over the DP mesh (see FullyShardedDataParallelV2). Expert parallelism also gives
+            # each rank a different set of expert FQNs, so the DTensor keyspace this method
+            # exists to equalize is rank-dependent for a reason no gather can repair.
+            raise NotImplementedError(
+                "MFSDP v2 optimizer checkpointing does not support expert parallelism: its "
+                "parameters span more than one device mesh."
+            )
+        if not sharded_parameters:
+            return []
+
+        mesh = sharded_parameters[0].device_mesh
+        return [
+            mesh.get_group(mesh_dim)
+            for mesh_dim, placement in enumerate(sharded_parameters[0].placements)
+            if isinstance(placement, Shard) and mesh.size(mesh_dim) > 1
+        ]
 
     def _gather_state_keys_by_fqn(self) -> dict[str, list[str]]:
         """Map every parameter's FQN to the keys of its ``DTensor`` optimizer state entries.
