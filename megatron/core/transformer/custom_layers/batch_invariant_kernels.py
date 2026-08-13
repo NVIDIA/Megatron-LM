@@ -625,7 +625,7 @@ def _import_module_if_available(name: str):
     return importlib.import_module(name)
 
 
-def _te_patch_for_batch_invariant(skip_gemm: bool = False):
+def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = False):
     """Patch Transformer Engine modules to use batch-invariant GEMM and RMSNorm.
 
     This monkey-patches TE's GEMM and RMSNorm entry points to dispatch to the
@@ -672,6 +672,9 @@ def _te_patch_for_batch_invariant(skip_gemm: bool = False):
         if _MEG_TE_GENERAL_GEMM_ORIG is None and hasattr(meg_te, "general_gemm"):
             _MEG_TE_GENERAL_GEMM_ORIG = meg_te.general_gemm
             meg_te.general_gemm = _te_general_gemm_patched
+
+    if skip_rmsnorm:
+        return
 
     # Patch RMSNorm.forward once (class may be on te or te.pytorch)
     rms_cls = getattr(te, "RMSNorm", None)
@@ -1678,6 +1681,11 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
         pass
 
 
+def get_batch_invariant_backend() -> str:
+    """Return the active batch-invariant GEMM backend name."""
+    return _BATCH_INVARIANT_BACKEND
+
+
 def enable_batch_invariant_mode(backend: str = "deepgemm"):
     """Enable global batch-invariant mode and patch Aten/TE kernels.
 
@@ -1721,7 +1729,11 @@ def enable_batch_invariant_mode(backend: str = "deepgemm"):
     # TE's native GEMMs — invariance comes from the starved workspace — but
     # still applies the non-GEMM TE patches, e.g. the attention gate).
     if backend == "te_native":
-        _te_patch_for_batch_invariant(skip_gemm=True)
+        # te_native also keeps TE's NATIVE RMSNorm: its M%32 reduction
+        # bit-class is held constant by the 64-multiple alignment discipline
+        # (CUDA-graph bucket floor + eager TOKEN_ROUNDER + scoring-side
+        # sequence-length rounding), so no kernel substitution is needed.
+        _te_patch_for_batch_invariant(skip_gemm=True, skip_rmsnorm=True)
     else:
         _te_patch_for_batch_invariant()
     # Pin the Mamba autotuners so rollout and training processes can't end
