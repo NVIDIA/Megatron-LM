@@ -1716,6 +1716,8 @@ class TestCheckpointParameterDiscovery:
             use_cpu_initialization=True,
             cuda_graph_impl="local",
             cuda_graph_warmup_steps=0,
+            recompute_granularity="selective",
+            recompute_modules=["layernorm"],
         )
         torch.manual_seed(123)
         reference = _CheckpointDependencyModule(config).cuda()

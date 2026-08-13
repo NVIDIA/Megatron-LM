@@ -864,11 +864,9 @@ class _CudagraphReplayNode(torch.autograd.Function):
         runner.bwd_graph_replay_complete_event.record(torch.cuda.current_stream())
         for param in runner.params_to_backprop:
             param._cudagraph_wgrad_ready_event = runner.bwd_graph_replay_complete_event
-            if id(param) in runner.checkpoint_param_grad_ids:
-                # Only nested checkpoint backward leaves param.grad after replay; ordinary
-                # parameters use the returned wgrad and leave it unset. Mark that gradient as
-                # already added so the standard DDP hook skips a duplicate add, then clears
-                # param.grad and registers readiness. The GTP path below does both explicitly.
+            if id(param) in runner.param_ids_to_skip_ddp_grad_add_on_replay:
+                # The backward graph already added param.grad to main_grad. Restore the
+                # Python-side flag so DDP skips that add, clears param.grad, and marks readiness.
                 param.grad_added_to_main_grad = True
         runner.status = _GraphStatus.FWD_READY
 
@@ -939,6 +937,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fp4_runtime_enabled = None
         self.deallocate_pipeline_outputs = False
         self.num_warmup_steps = 0
+        self.needs_recompute_param_discovery = False
         self.use_stream = False
         self.gtp_remat = False
         self.fwd_side_streams = []
@@ -970,6 +969,9 @@ class _CudaGraphRunner(torch.nn.Module):
             self.backward_retain_grad = self.base_module.config.cuda_graph_retain_backward_graph
             self.deallocate_pipeline_outputs = self.base_module.config.deallocate_pipeline_outputs
             self.num_warmup_steps = self.base_module.config.cuda_graph_warmup_steps
+            self.needs_recompute_param_discovery = (
+                self.grad_enabled and self.base_module.config.recompute_granularity is not None
+            )
             self.fp8_enabled = self.base_module.config.fp8 is not None
             self.fp4_enabled = self.base_module.config.fp4 is not None
             self.fp8_runtime_enabled = None
@@ -1081,12 +1083,10 @@ class _CudaGraphRunner(torch.nn.Module):
         else:
             return nullcontext()
 
-    def get_connected_param_ids(self, outputs):
-        """Find base-module parameters reachable from the autograd graphs of ``outputs``.
-
-        The traversal identifies leaf parameters through their AccumulateGrad nodes and returns
-        only IDs of parameters recursively owned by ``base_module``.
-        """
+    def get_connected_params(self, outputs):
+        """Iterate through the autograd graph of 'outputs' and returns all parameters connected.
+        In theory this should return all parameters that return a nonzero wgrad when computing
+        the backward pass of 'outputs'."""
         # Flatten outputs and start traversal from roots that require gradients
         args = (outputs,) if torch.is_tensor(outputs) else outputs
         stack = [
@@ -1104,18 +1104,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     p_ids.add(id(fn.variable))
                 stack.extend(f for f, _ in fn.next_functions if f)
 
-        module_param_ids = {id(param) for param in self.base_module.parameters()}
-        return p_ids & module_param_ids
-
-    def get_connected_params(self, outputs, warmup_param_ids=()):
-        """Build the ordered parameter inputs required by the captured backward graph.
-
-        This combines parameters reachable from the captured outputs with parameters discovered
-        while warmup bypassed CheckpointWithoutOutput. The result follows ``base_module`` parameter
-        order so the capture and replay input layouts are stable.
-        """
-        p_ids = self.get_connected_param_ids(outputs)
-        p_ids.update(warmup_param_ids)
+        # Return module params that were found in the graph, preserving original order
         return tuple(p for p in self.base_module.parameters() if id(p) in p_ids)
 
     def _weakref_forward_buffers(self, preserve_forward_to_backward_lifetimes: bool) -> None:
@@ -1300,15 +1289,11 @@ class _CudaGraphRunner(torch.nn.Module):
             # warmup again as case graph capture mode may execute a different codepath
             _set_warmup_start()
 
-            warmup_param_ids = None
-            # The outer autograd graph of CheckpointWithoutOutput has no edges to parameters used
-            # only by its recompute function. Warmup bypasses the checkpoint and runs that function
-            # with autograd, exposing those parameters through AccumulateGrad. Always run at least
-            # one training warmup so they can be included in the captured backward graph inputs.
-            num_internal_warmups = (
-                max(self.num_warmup_steps, 1) if self.grad_enabled else self.num_warmup_steps
-            )
-            for _ in range(num_internal_warmups):
+            # Recompute parameter discovery needs one warmup output: graph warmup bypasses
+            # CheckpointWithoutOutput, making parameters hidden by its nested backward reachable
+            # from that output's autograd graph. Force this pass even when configured warmup is 0.
+            num_warmup_steps = max(self.num_warmup_steps, int(self.needs_recompute_param_discovery))
+            for _ in range(num_warmup_steps):
                 with self.get_quantization_context():
 
                     def clone_ten(ten):
@@ -1323,8 +1308,6 @@ class _CudaGraphRunner(torch.nn.Module):
                 if self.grad_enabled:
                     warmup_outputs = self.get_tensors(warmup_outputs)
                     warmup_outputs = tuple(o for o in warmup_outputs if o.requires_grad)
-                    if warmup_param_ids is None:
-                        warmup_param_ids = self.get_connected_param_ids(warmup_outputs)
                     input_tensors = self.get_tensors(warmup_args, warmup_kwargs)
                     torch.autograd.grad(
                         outputs=warmup_outputs,
@@ -1419,9 +1402,10 @@ class _CudaGraphRunner(torch.nn.Module):
             # Preserve only forward buffers whose lifetime crosses into backward capture.
             self._weakref_forward_buffers(preserve_forward_to_backward_lifetimes=True)
 
-            self.params_to_backprop = self.get_connected_params(
-                fwd_graph_outputs, warmup_param_ids=warmup_param_ids or ()
-            )
+            if self.needs_recompute_param_discovery:
+                self.params_to_backprop = self.get_connected_params(warmup_outputs)
+            else:
+                self.params_to_backprop = self.get_connected_params(fwd_graph_outputs)
             self.num_dgrads = len(self.fwd_graph_input_surface)
             self.fwd_graph_input_surface = self.fwd_graph_input_surface + self.params_to_backprop
 
@@ -1498,23 +1482,17 @@ class _CudaGraphRunner(torch.nn.Module):
             n_act_grads = sum(
                 1 for i in self.fwd_graph_input_surface[: self.num_dgrads] if i.requires_grad
             )
-            self.checkpoint_param_grad_ids = set()
-            # allow_unused=True preserves one slot per requested parameter. A parameter hidden by
-            # CheckpointWithoutOutput therefore has wgrad=None here even though its nested
-            # recompute backward accumulated the real gradient into param.grad.
+            self.param_ids_to_skip_ddp_grad_add_on_replay = set()
             for param, wgrad in zip(self.params_to_backprop, grad_inputs[n_act_grads:]):
                 grad_already_accumulated = getattr(param, 'grad_added_to_main_grad', False)
                 if wgrad is not None and not grad_already_accumulated:
                     param.main_grad.add_(wgrad)
                 if param.grad is not None and not grad_already_accumulated:
-                    # CheckpointWithoutOutput's nested backward accumulates gradients for
-                    # closed-over parameters into param.grad instead of returning them through the
-                    # outer autograd.grad call. This is a separate contribution from wgrad, which
-                    # covers uses visible to the outer graph; a parameter used in both places needs
-                    # both contributions added to main_grad.
+                    # A nested backward can accumulate directly into param.grad instead of
+                    # returning that contribution through the outer autograd.grad call.
                     param.main_grad.add_(param.grad)
                     param.grad_added_to_main_grad = True
-                    self.checkpoint_param_grad_ids.add(id(param))
+                    self.param_ids_to_skip_ddp_grad_add_on_replay.add(id(param))
 
             # GTP cross-graph RS overlap, two phases:
             #   Phase 1 — drain AG, fence runner_stream past ag_stream's tail,
@@ -1694,12 +1672,6 @@ class _CudaGraphRunner(torch.nn.Module):
 
         inp_tensors = self.get_tensors(args, kwargs, check_types=False)
         if self.grad_enabled:
-            # Passing parameters as synthetic replay-node inputs creates autograd edges to their
-            # existing AccumulateGrad nodes, where ordinary DDP registered its hooks. This is
-            # essential for parameters discovered only during checkpoint warmup: replay backward
-            # returns None for the synthetic inputs, but visiting AccumulateGrad still lets DDP
-            # skip the already-transferred gradient and mark its bucket ready. GTP hooks are
-            # invoked explicitly in _CudagraphReplayNode.backward instead.
             func_args = inp_tensors + self.params_to_backprop
         else:
             func_args = inp_tensors
