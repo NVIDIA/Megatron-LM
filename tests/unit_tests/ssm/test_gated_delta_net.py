@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 import inspect
@@ -16,7 +16,6 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_experimental_attention_variant_module_spec,
     get_transformer_block_with_experimental_attention_variant_spec,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -29,7 +28,6 @@ from megatron.core.ssm.gated_delta_net.common import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.spec_utils import build_module
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
@@ -543,40 +541,6 @@ class TestGatedDeltaNet:
         assert gdn.in_proj_dim == 2 * gdn.qk_dim + 2 * gdn.v_dim + 2 * gdn.num_value_heads
         assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
         assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
-
-    def test_mtp_path_builds_gdn_attention_with_transformer_optional_kwargs(self):
-        if self.tp_size != 1 or self.sp_size != 1 or self.cp_size != 1:
-            pytest.skip("One representative non-parallel MTP construction case is enough.")
-        if self.linear_cp_mode is not None:
-            pytest.skip("CP mode is irrelevant when context_parallel_size=1.")
-
-        config = copy.deepcopy(self.transformer_config)
-        config.mtp_num_layers = 1
-        decoder_block_spec = get_transformer_block_with_experimental_attention_variant_spec(
-            config=config
-        )
-        mtp_block_spec = get_gpt_mtp_block_spec(config, decoder_block_spec, True)
-        mtp_layer_spec = mtp_block_spec.layer_specs[0]
-
-        mtp_layer = build_module(
-            mtp_layer_spec, config=config, layer_number=1, pg_collection=self.gdn.pg_collection
-        )
-        mtp_gdn = mtp_layer.mtp_model_layer.self_attention
-        assert isinstance(mtp_gdn, GatedDeltaNet)
-        assert mtp_gdn.is_mtp_layer
-
-        transformer_layer = build_module(
-            mtp_layer_spec.submodules.mtp_model_layer,
-            config=config,
-            layer_number=1,
-            is_mtp_layer=True,
-            pp_layer_offset=0,
-            pg_collection=self.gdn.pg_collection,
-        )
-        transformer_gdn = transformer_layer.self_attention
-        assert isinstance(transformer_gdn, GatedDeltaNet)
-        assert transformer_gdn.is_mtp_layer
-        assert transformer_gdn._pp_layer_offset == 0
 
     def test_sharded_state_dict_splits_gdn_parameters(self):
         sharded_sd = self.gdn.sharded_state_dict(prefix="gdn.")

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 
 # Some of this code was adopted from https://github.com/huggingface/transformers
@@ -329,7 +329,7 @@ class GatedDeltaNet(_GDNBase):
                     "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
                     "chunk-local causal-conv inputs can change later chunk numerics."
                 )
-            kernel_inputs = self.pre_gated_delta_rule(
+            query, key, value, gate, beta, g = self.pre_gated_delta_rule(
                 qkvzba,
                 batch,
                 seq_len_post_headwise,
@@ -339,7 +339,7 @@ class GatedDeltaNet(_GDNBase):
                 chunkwise_cp_context,
                 packed_seq_params=packed_seq_params,
             )
-            gate = kernel_inputs.pop("gate")
+            kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
@@ -541,7 +541,16 @@ class GatedDeltaNet(_GDNBase):
         )
         nvtx_range_pop(suffix="prepare_input_for_gated_delta_rule")
 
-        return kernel_inputs
+        gate = kernel_inputs.pop("gate")
+
+        return (
+            kernel_inputs["q"],
+            kernel_inputs["k"],
+            kernel_inputs["v"],
+            gate,
+            kernel_inputs["beta"],
+            kernel_inputs["g"],
+        )
 
     def _fused_streamed_pre_gated_delta_rule(
         self, qkvzba, cu_seqlens_q=None, seq_idx=None, cp_group=None, cp_group_headwise=None
