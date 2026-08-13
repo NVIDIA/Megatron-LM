@@ -33,6 +33,16 @@ def load_script(config_path: str) -> str:
     "--test-case", required=False, type=str, help="Returns a single test-case with matching name."
 )
 @click.option(
+    "--platform",
+    required=False,
+    type=str,
+    help=(
+        "Filters all tests by matching platform (e.g. 'dgx_h100', 'dgx_gb200'). "
+        "A test case may be defined for multiple platforms; without this filter every "
+        "matching platform is generated."
+    ),
+)
+@click.option(
     "--environment",
     required=True,
     type=str,
@@ -67,6 +77,7 @@ def main(
     model: Optional[str],
     scope: Optional[str],
     test_case: Optional[str],
+    platform: Optional[str],
     environment: str,
     output_path: str,
     enable_lightweight_mode: bool = False,
@@ -77,6 +88,7 @@ def main(
         scope=scope,
         model=model,
         test_case=test_case,
+        platform=platform,
         environment=environment,
         container_tag="none",
     )
