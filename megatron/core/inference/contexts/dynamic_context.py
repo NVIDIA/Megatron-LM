@@ -4844,6 +4844,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not self._request_to_image_embeddings:
             return None
 
+        # Decode steps consume no image tokens, so the concatenated embedding
+        # is unused. Short-circuit before the .tolist() sync + torch.cat to
+        # keep the decode critical path free of the D2H stall that would
+        # otherwise fire on every step, mirroring the mask helper above.
+        if self.is_decode_only():
+            return None
+
         active_request_ids = self.request_ids[
             self.paused_request_count : self.total_request_count
         ].tolist()
