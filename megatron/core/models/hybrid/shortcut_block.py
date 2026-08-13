@@ -348,11 +348,6 @@ class ShortcutMoEBlock:
                 raise ValueError("Repeated MTP shortcut CUDA graphs require mtp_num_layers > 0")
             self._persistent_slot_count = compute_layer.config.mtp_num_layers
         self._next_persistent_slot = 0
-        self._router_dtoh_event = (
-            torch.cuda.Event()
-            if self.execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP
-            else None
-        )
         self.route_input_compute = _RouteInputCompute(
             compute_layer,
             moe_layer,
@@ -593,11 +588,6 @@ class ShortcutMoEBlock:
                 persistent_slot=persistent_slot,
             )
 
-        # Match partial-MoE CUDA graphs: dispatcher D2H copies returned by the route graph must
-        # complete before eager dispatch reads their CPU-side metadata.
-        self._router_dtoh_event.record()
-        self._router_dtoh_event.synchronize()
-
         attr_names = self.moe_layer._local_cudagraph_attr_names or ()
         attr_count = len(attr_names)
         if attr_count:
@@ -607,6 +597,9 @@ class ShortcutMoEBlock:
             paired_state = tuple(route_outputs)
             token_dispatcher_attr_outputs = ()
 
+        # The dispatch stream waits on the external event recorded immediately after routing
+        # and preprocessing, before the paired Mamba/attention input projection. Its D2H stream
+        # therefore waits only for router metadata while the CUDA graph continues independently.
         self.launch_dispatch(
             persistent_slot,
             paired_state[0],
