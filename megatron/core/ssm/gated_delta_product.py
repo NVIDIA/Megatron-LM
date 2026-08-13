@@ -433,18 +433,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             dim=-1,
         )
 
-        # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor.
-        # But the expected memory layout varies depending on whether seq_idx is set.
-        if seq_idx_packed is None:
-            # Default path: the split view is already channels-last in memory, so the
-            # transpose alone yields channels-contiguous [B, D, L] (stride(1) == 1).
-            # ``causal_conv1d_fn`` handles that layout directly, so skip the copy.
-            VKQ = rearrange(VKQ, "b l d -> b d l")
-        else:
-            # ``causal_conv1d_fn(seq_idx=...)`` requires channels-last memory but [B, D, L]
-            # logical shape. This keeps the channels contiguous in memory.
-            VKQ = VKQ.contiguous()
-            VKQ = rearrange(VKQ, "b l d -> b d l")
+        # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor in channels-last memory,
+        # which is also what it requires when ``seq_idx`` is set. ``VKQ`` is a view into
+        # the channels-last ``zVKQba``, so the transpose alone already gives
+        # stride(1) == 1 and no copy is needed on either path.
+        VKQ = rearrange(VKQ, "b l d -> b d l")
 
         if conv_state is not None:
             # Static-batching prefill: seed the conv state from the prompt's tail.
