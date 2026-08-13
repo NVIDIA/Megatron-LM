@@ -4743,8 +4743,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
 
         if self.is_decode_only():
+            # Return the same [1, padded_active_token_count] shape the prefill
+            # branch does. Callers advanced-index a batch-first [b, seq, h]
+            # embedding tensor with this mask; the 2D form is the one that
+            # broadcasts correctly across the batch axis, a 1D mask would
+            # attempt to select along dim 0 and either error or silently
+            # index wrong.
             return torch.full(
-                (self.padded_active_token_count,),
+                (1, self.padded_active_token_count),
                 -1,
                 dtype=torch.long,
                 device=torch.cuda.current_device(),
