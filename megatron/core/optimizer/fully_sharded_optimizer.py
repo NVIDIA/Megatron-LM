@@ -86,8 +86,15 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
         self.is_stub_optimizer = optimizer is None
         self._casted_grads = []
-        # Lazily built by _param_fqn.
-        self._param_to_fqn: dict[torch.nn.Parameter, str] | None = None
+        # Each parameter's globally unique checkpoint name, mirroring
+        # :class:`DistributedOptimizer`'s ``param_to_name``. Keyed by parameter because that
+        # is the direction the checkpoint path resolves, and because the optimizer names each
+        # parameter once: a tied parameter is one ``nn.Parameter`` with one state entry, and
+        # its several FQNs are the model state dict's business, not this map's.
+        self._param_to_fqn: dict[torch.nn.Parameter, str] = {
+            param: get_global_unique_param_name(self.model_chunks, param)
+            for param in self._trainable_parameters()
+        }
 
     @staticmethod
     def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
@@ -126,20 +133,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             "MFSDP v2 optimizer checkpointing goes through sharded_state_dict "
             "(--ckpt-format fsdp_dtensor)."
         )
-
-    def _param_fqn(self, param: torch.nn.Parameter) -> str:
-        """Return a model parameter's globally unique checkpoint name.
-
-        ``get_global_unique_param_name`` rescans every model chunk on each call and the
-        checkpoint path resolves each name several times, so the mapping is built once and
-        cached, mirroring :class:`DistributedOptimizer`'s ``param_to_name``.
-        """
-        if self._param_to_fqn is None:
-            self._param_to_fqn = {
-                candidate: get_global_unique_param_name(self.model_chunks, candidate)
-                for candidate in self._trainable_parameters()
-            }
-        return self._param_to_fqn[param]
 
     def _trainable_parameters(self) -> Iterator[torch.nn.Parameter]:
         """Yield the parameters the base optimizer owns before the empty-shard filter.
@@ -200,7 +193,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         stepped yet) is simply absent.
         """
         state_keys_by_fqn = {
-            self._param_fqn(param): sorted(
+            self._param_to_fqn[param]: sorted(
                 key for key, value in state.items() if isinstance(value, DTensor)
             )
             for param, state in self.optimizer.state.items()
@@ -221,7 +214,9 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         round-trips here rather than in the per-parameter state.
         """
         return {
-            self._param_fqn(param): {key: value for key, value in group.items() if key != "params"}
+            self._param_to_fqn[param]: {
+                key: value for key, value in group.items() if key != "params"
+            }
             for group in self.optimizer.param_groups
             for param in group["params"]
         }
@@ -237,7 +232,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """
         param_groups = []
         for group in self.optimizer.param_groups:
-            fqns = [self._param_fqn(param) for param in group["params"]]
+            fqns = [self._param_to_fqn[param] for param in group["params"]]
             missing = [fqn for fqn in fqns if fqn not in param_to_group_meta]
             if missing:
                 raise ValueError(
@@ -321,13 +316,13 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
         state_keys_by_fqn = self._gather_state_keys_by_fqn()
         state_by_fqn = {
-            self._param_fqn(param): param_state
+            self._param_to_fqn[param]: param_state
             for param, param_state in self.optimizer.state.items()
         }
 
         packed_state: dict[str, Any] = {}
         for param in self._trainable_parameters():
-            fqn = self._param_fqn(param)
+            fqn = self._param_to_fqn[param]
             if fqn in state_by_fqn:
                 packed_state[fqn] = state_by_fqn[fqn]
             else:
