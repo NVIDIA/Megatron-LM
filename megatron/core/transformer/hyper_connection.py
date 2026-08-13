@@ -1,18 +1,54 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
-if TYPE_CHECKING:
-    from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
+
+def build_mhc_recompute_layer_plan(
+    num_layers: int, mhc_recompute_layer_num: Optional[int], use_mhc_recompute: bool
+) -> Tuple[list[Optional[CheckpointWithoutOutputManager]], list[bool]]:
+    """Build per-layer mHC recompute managers and recompute-block end markers."""
+    layer_managers: list[Optional[CheckpointWithoutOutputManager]] = [None] * num_layers
+    is_recompute_block_end = [False] * num_layers
+
+    if not use_mhc_recompute or num_layers == 0:
+        return layer_managers, is_recompute_block_end
+
+    mhc_manager = CheckpointWithoutOutputManager()
+    for layer_index in range(num_layers):
+        is_last_in_transformer_block = layer_index == num_layers - 1
+        is_last_in_recompute_block = is_last_in_transformer_block
+        if mhc_recompute_layer_num is not None:
+            is_last_in_recompute_block = is_last_in_transformer_block or (
+                (layer_index + 1) % mhc_recompute_layer_num == 0
+            )
+
+        layer_managers[layer_index] = mhc_manager
+        is_recompute_block_end[layer_index] = is_last_in_recompute_block
+
+        if is_last_in_recompute_block and not is_last_in_transformer_block:
+            mhc_manager = CheckpointWithoutOutputManager()
+
+    return layer_managers, is_recompute_block_end
+
+
+def finalize_mhc_recompute_layer(
+    mhc_manager: Optional[CheckpointWithoutOutputManager],
+    hidden_states: Tensor,
+    is_last_in_recompute_block: bool,
+) -> None:
+    """Finalize mHC recompute state when the current recompute block ends."""
+    if mhc_manager is not None and is_last_in_recompute_block:
+        mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
 
 class SinkhornKnopp(torch.autograd.Function):
@@ -134,7 +170,7 @@ class HyperConnectionModule(MegatronModule):
         super().__init__(config)
         self.config = config
         self.layer_number = layer_number
-        self.n = config.num_residual_streams
+        self.n = config.mhc_num_residual_streams
         self.hidden_size = config.hidden_size
         self.sinkhorn_iterations = config.mhc_sinkhorn_iterations
 

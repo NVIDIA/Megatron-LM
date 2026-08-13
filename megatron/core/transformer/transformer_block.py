@@ -22,10 +22,13 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
-from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection import (
+    HyperConnectionModule,
+    build_mhc_recompute_layer_plan,
+    finalize_mhc_recompute_layer,
+)
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -299,7 +302,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
 
         if get_cpu_offload_context is not None:
-            (self.offload_context, self.group_prefetch_offload_commit_async) = (
+            self.offload_context, self.group_prefetch_offload_commit_async = (
                 get_cpu_offload_context(
                     self.config.cpu_offloading,
                     self.config.cpu_offloading_num_layers,
@@ -321,7 +324,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
             self.config._cpu_offloading_context = None
 
-        self.num_residual_streams = config.num_residual_streams
+        self.mhc_num_residual_streams = config.mhc_num_residual_streams
+        self.mhc_recompute_enabled = (
+            config.enable_mhc_connections
+            and config.recompute_granularity == 'selective'
+            and 'mhc' in config.recompute_modules
+        )
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
@@ -487,46 +495,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
-    def _build_mhc_recompute_layer_plan(
-        self, use_mhc_recompute: bool
-    ) -> Tuple[List[Optional[CheckpointWithoutOutputManager]], List[bool]]:
-        """Pre-build per-layer MHC recompute managers and block-end markers."""
-        num_layers = len(self.layers)
-        layer_managers: List[Optional[CheckpointWithoutOutputManager]] = [None] * num_layers
-        is_recompute_block_end: List[bool] = [False] * num_layers
-
-        if not use_mhc_recompute or num_layers == 0:
-            return layer_managers, is_recompute_block_end
-
-        mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
-        mhc_manager = CheckpointWithoutOutputManager()
-
-        for l_no in range(num_layers):
-            is_last_in_transformer_block = l_no == num_layers - 1
-            is_last_in_recompute_block = is_last_in_transformer_block
-            if mhc_recompute_layer_num is not None:
-                is_last_in_recompute_block = is_last_in_transformer_block or (
-                    (l_no + 1) % mhc_recompute_layer_num == 0
-                )
-
-            layer_managers[l_no] = mhc_manager
-            is_recompute_block_end[l_no] = is_last_in_recompute_block
-
-            if is_last_in_recompute_block and not is_last_in_transformer_block:
-                mhc_manager = CheckpointWithoutOutputManager()
-
-        return layer_managers, is_recompute_block_end
-
-    @staticmethod
-    def _finalize_mhc_recompute_layer(
-        mhc_manager: Optional[CheckpointWithoutOutputManager],
-        hidden_states: Tensor,
-        is_last_in_recompute_block: bool,
-    ) -> None:
-        """Finalize MHC recompute state for the current layer when block ends."""
-        if mhc_manager is not None and is_last_in_recompute_block:
-            mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
-
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -638,9 +606,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Expand hidden states for hyper connections at the start of the block
         # Only expand at the first PP stage; subsequent stages receive n-stream from previous stage
-        if self.config.enable_hyper_connections and self.pre_process:
+        if self.config.enable_mhc_connections and self.pre_process:
             hidden_states = HyperConnectionModule.input_expand(
-                hidden_states, self.num_residual_streams
+                hidden_states, self.mhc_num_residual_streams
             )  # [s, b, C] -> [s, b, n*C]
 
         if self.config.sequence_parallel:
@@ -670,16 +638,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             use_inner_quantization_context = False
             outer_quantization_context = nullcontext()
 
-        # Determine if MHC recompute should be used
-        # Only enable when: training mode AND hyper connections AND 'mhc' in recompute_modules
-        use_mhc_recompute = (
-            self.training
-            and self.config.enable_hyper_connections
-            and self.config.recompute_granularity == 'selective'
-            and "mhc" in self.config.recompute_modules
-        )
-        mhc_layer_managers, mhc_is_last_in_recompute_block = self._build_mhc_recompute_layer_plan(
-            use_mhc_recompute
+        # Managers retain per-forward checkpoint state, so allocate them for each training pass.
+        mhc_layer_managers, mhc_is_last_in_recompute_block = build_mhc_recompute_layer_plan(
+            num_layers=len(self.layers),
+            mhc_recompute_layer_num=self.config.mhc_recompute_layer_num,
+            use_mhc_recompute=self.training and self.mhc_recompute_enabled,
         )
 
         with rng_context, outer_quantization_context:
@@ -753,7 +716,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             padding_mask=padding_mask,
                             **extra_layer_kwargs,
                         )
-                    self._finalize_mhc_recompute_layer(
+                    finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
                         hidden_states=hidden_states,
                         is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
@@ -771,9 +734,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         intermediate_hidden_states.append(hidden_states)
 
         # Only contract if the final layer norm is in this stage
-        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+        if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
             hidden_states = HyperConnectionModule.output_contract(
-                hidden_states, self.num_residual_streams
+                hidden_states, self.mhc_num_residual_streams
             )  # [s, b, n*C] -> [s, b, C]
 
         # Final layer norm.

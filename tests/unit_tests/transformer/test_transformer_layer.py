@@ -68,8 +68,8 @@ def _make_mhc_config(hidden_size=64, num_streams=4, **extra):
         hidden_size=hidden_size,
         num_attention_heads=4,
         use_cpu_initialization=True,
-        enable_hyper_connections=True,
-        num_residual_streams=num_streams,
+        enable_mhc_connections=True,
+        mhc_num_residual_streams=num_streams,
         mhc_sinkhorn_iterations=5,
         mhc_init_gating_factor=0.01,
         hidden_dropout=0.0,
@@ -746,7 +746,7 @@ class TestMHCRecomputeMemorySaving:
 
         When use_recompute=True, a new CheckpointWithoutOutputManager is created every
         `recompute_block_size` layers, mirroring TransformerBlock's
-        _build_mhc_recompute_layer_plan logic.
+        build_mhc_recompute_layer_plan logic.
         """
         config = _make_mhc_config(
             hidden_size=hidden_size,
@@ -868,10 +868,10 @@ class TestMHCWithCudaGraph:
         static_inputs = layer.get_layer_static_inputs(seq_length, micro_batch_size)
         hidden_states = static_inputs["hidden_states"]
 
-        expected_hidden_dim = config.num_residual_streams * config.hidden_size
+        expected_hidden_dim = config.mhc_num_residual_streams * config.hidden_size
         assert hidden_states.shape[-1] == expected_hidden_dim, (
             f"get_layer_static_inputs returns hidden dim {hidden_states.shape[-1]} "
-            f"but mHC expects {expected_hidden_dim} (n={config.num_residual_streams} * "
+            f"but mHC expects {expected_hidden_dim} (n={config.mhc_num_residual_streams} * "
             f"C={config.hidden_size}). "
             f"HyperConnectionTransformerLayer must override get_layer_static_inputs."
         )
@@ -905,7 +905,7 @@ class TestMHCWithCudaGraph:
 
         seq_len = 8
         batch_size = 2
-        n_channels = config.num_residual_streams * config.hidden_size
+        n_channels = config.mhc_num_residual_streams * config.hidden_size
 
         hidden_states = torch.randn(seq_len, batch_size, n_channels, device='cuda')
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
@@ -938,7 +938,7 @@ class TestMHCWithCudaGraph:
 
         seq_len = 8
         batch_size = 2
-        n_channels = config.num_residual_streams * config.hidden_size
+        n_channels = config.mhc_num_residual_streams * config.hidden_size
 
         static_input = torch.randn(
             seq_len, batch_size, n_channels, device='cuda', requires_grad=True
@@ -1020,7 +1020,7 @@ class TestMHCWithCudaGraph:
 
         seq_len = 8
         batch_size = 2
-        n_channels = config.num_residual_streams * config.hidden_size
+        n_channels = config.mhc_num_residual_streams * config.hidden_size
 
         static_input = torch.randn(
             seq_len, batch_size, n_channels, device='cuda', requires_grad=True
@@ -1127,7 +1127,7 @@ class TestMHCWithCudaGraph:
 
         seq_len = 8
         batch_size = 2
-        n_channels = config.num_residual_streams * config.hidden_size
+        n_channels = config.mhc_num_residual_streams * config.hidden_size
 
         hidden_states = torch.randn(
             seq_len, batch_size, n_channels, device='cuda', requires_grad=True
@@ -1150,7 +1150,7 @@ class TestMHCWithCudaGraph:
 
         seq_len = 8
         batch_size = 2
-        n_channels = config.num_residual_streams * config.hidden_size
+        n_channels = config.mhc_num_residual_streams * config.hidden_size
 
         hidden_states = torch.randn(
             seq_len, batch_size, n_channels, device='cuda', requires_grad=True
@@ -1210,7 +1210,7 @@ class TestMHCWithOffloading:
 
         seq_len = 8
         batch_size = 2
-        n_channels = config.num_residual_streams * config.hidden_size
+        n_channels = config.mhc_num_residual_streams * config.hidden_size
 
         hidden_states = torch.randn(
             seq_len, batch_size, n_channels, device='cuda', requires_grad=True

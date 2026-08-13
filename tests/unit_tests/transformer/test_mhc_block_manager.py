@@ -8,6 +8,7 @@ from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutputManager,
     initialize_rng_tracker,
 )
+from megatron.core.transformer.hyper_connection import build_mhc_recompute_layer_plan
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -403,9 +404,9 @@ class TestCheckpointManagerPartialCheckpoint:
 #
 # These tests instantiate a full ``TransformerBlock`` with mHC enabled to
 # exercise:
-#   * ``_build_mhc_recompute_layer_plan`` (per-layer ``CheckpointWithoutOutputManager``
+#   * ``build_mhc_recompute_layer_plan`` (per-layer ``CheckpointWithoutOutputManager``
 #     allocation, including the ``mhc_recompute_layer_num`` boundary case),
-#   * ``_finalize_mhc_recompute_layer`` (manager finalization at block end),
+#   * ``finalize_mhc_recompute_layer`` (manager finalization at block end),
 #   * the ``HyperConnectionModule.input_expand`` / ``output_contract`` calls
 #     in ``TransformerBlock.forward`` for ``pre_process`` / ``post_process``
 #     stages.
@@ -440,8 +441,8 @@ class TestTransformerBlockMHCRecompute:
             hidden_size=64,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            enable_hyper_connections=True,
-            num_residual_streams=num_streams,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=num_streams,
             mhc_sinkhorn_iterations=5,
             mhc_init_gating_factor=0.01,
             mhc_recompute_layer_num=mhc_recompute_layer_num,
@@ -457,9 +458,13 @@ class TestTransformerBlockMHCRecompute:
         return TransformerBlock(config, spec, pre_process=True, post_process=True).cuda(), config
 
     def _check_recompute_plan(self, block, expected_block_ends):
-        """Drive ``_build_mhc_recompute_layer_plan`` directly and check the boundary list."""
+        """Build the mHC recompute plan directly and check the boundary list."""
         block.train()
-        managers, ends = block._build_mhc_recompute_layer_plan(use_mhc_recompute=True)
+        managers, ends = build_mhc_recompute_layer_plan(
+            num_layers=len(block.layers),
+            mhc_recompute_layer_num=block.config.mhc_recompute_layer_num,
+            use_mhc_recompute=True,
+        )
         assert len(managers) == len(block.layers)
         assert ends == expected_block_ends, f"got {ends}, expected {expected_block_ends}"
         # Layers in the same recompute block share a manager; new block → new manager.
@@ -487,9 +492,18 @@ class TestTransformerBlockMHCRecompute:
     def test_recompute_plan_disabled(self):
         """``use_mhc_recompute=False`` returns an all-None / all-False plan."""
         block, _ = self._make_mhc_block(num_layers=3)
-        managers, ends = block._build_mhc_recompute_layer_plan(use_mhc_recompute=False)
+        managers, ends = build_mhc_recompute_layer_plan(
+            num_layers=len(block.layers),
+            mhc_recompute_layer_num=block.config.mhc_recompute_layer_num,
+            use_mhc_recompute=False,
+        )
         assert managers == [None, None, None]
         assert ends == [False, False, False]
+
+    def test_recompute_enablement_initialized(self):
+        """TransformerBlock records static mHC recompute enablement during initialization."""
+        block, _ = self._make_mhc_block(num_layers=2)
+        assert block.mhc_recompute_enabled
 
     def test_block_forward_input_expand_output_contract(self):
         """Forward exercises ``input_expand`` (pre) and ``output_contract`` (post)."""

@@ -565,7 +565,7 @@ class TransformerConfig(ModelParallelConfig):
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
-            enable_hyper_connections=True. Cannot be used with "mlp".
+            enable_mhc_connections=True. Cannot be used with "mlp".
     "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", and "mhc" use
     output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
@@ -1115,10 +1115,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # Hyper-Connection Configuration
     ####################
-    enable_hyper_connections: bool = False
+    enable_mhc_connections: bool = False
     """Enable mHC residual connections."""
 
-    num_residual_streams: int = 4
+    mhc_num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
 
     mhc_sinkhorn_iterations: int = 20
@@ -1956,10 +1956,8 @@ class TransformerConfig(ModelParallelConfig):
 
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
-            if not self.enable_hyper_connections:
-                raise ValueError(
-                    "'mhc' in recompute_modules requires enable_hyper_connections=True."
-                )
+            if not self.enable_mhc_connections:
+                raise ValueError("'mhc' in recompute_modules requires enable_mhc_connections=True.")
             if "mlp" in self.recompute_modules:
                 raise ValueError(
                     "'mhc' and 'mlp' in recompute_modules cannot be used together. "
@@ -1982,7 +1980,7 @@ class TransformerConfig(ModelParallelConfig):
                     "on a None chunk. Disable one of them."
                 )
 
-        if self.enable_hyper_connections and not (
+        if self.enable_mhc_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
         ):
             warnings.warn(
@@ -1992,9 +1990,9 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         # Validation for hyper_connections with MTP
-        if self.enable_hyper_connections and self.mtp_num_layers is not None:
+        if self.enable_mhc_connections and self.mtp_num_layers is not None:
             raise ValueError(
-                "enable_hyper_connections is not compatible with Multi-Token Prediction (MTP). "
+                "enable_mhc_connections is not compatible with Multi-Token Prediction (MTP). "
                 "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
             )
 
