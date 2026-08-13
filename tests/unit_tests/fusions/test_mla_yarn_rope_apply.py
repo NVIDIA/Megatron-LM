@@ -52,6 +52,47 @@ class FakeCPGroup:
 
 
 class TestApplyRotaryPosEmbTHD:
+    @pytest.mark.parametrize(
+        ("unsupported_kwargs", "warning_text"),
+        [
+            ({"inverse": True}, "inverse RoPE is not supported"),
+            (
+                {"mla_rotary_interleaved": True, "mla_output_remove_interleaving": True},
+                "MLA-style interleaving",
+            ),
+            ({"mscale": 2.0}, "mscale=2.0 is not supported"),
+        ],
+    )
+    def test_unsupported_fusion_options_use_unfused(self, unsupported_kwargs, warning_text):
+        cp_group = FakeCPGroup()
+        t = torch.randn(4, 2, 8)
+        freqs = torch.randn(2, 1, 1, 8)
+        cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
+        config = TransformerConfig(
+            num_attention_heads=2, num_layers=1, apply_rope_fusion=True, rotary_interleaved=False
+        )
+        expected = rope_utils_module._apply_rotary_pos_emb_thd(
+            t, cu_seqlens, freqs, cp_group=cp_group, max_seqlen=2, **unsupported_kwargs
+        )
+
+        fused_mock = MagicMock(return_value=t.clone())
+        with (
+            patch.object(rope_utils_module, "fused_apply_rotary_pos_emb_thd", fused_mock),
+            pytest.warns(UserWarning, match=warning_text),
+        ):
+            output = apply_rotary_pos_emb(
+                t,
+                freqs,
+                config,
+                cu_seqlens=cu_seqlens,
+                cp_group=cp_group,
+                max_seqlen=2,
+                **unsupported_kwargs,
+            )
+
+        fused_mock.assert_not_called()
+        torch.testing.assert_close(output, expected)
+
     def test_packed_freqs_returns_offset_mapped_output_for_context_parallel(self):
         cp_group = FakeCPGroup(size=2, rank=0)
         cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)

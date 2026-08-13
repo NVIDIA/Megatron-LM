@@ -370,15 +370,37 @@ def apply_rotary_pos_emb(
                 assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
-            assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
-            return fused_apply_rotary_pos_emb_thd(
-                t,
-                cu_seqlens,
-                freqs,
-                cp_size=cp_group.size(),
-                cp_rank=cp_group.rank(),
-                interleaved=config.rotary_interleaved,
-            )
+            use_unfused = False
+            if mscale != 1.0:
+                warnings.warn(
+                    f"mscale={mscale} is not supported by TE's fused RoPE. "
+                    "Using unfused implementation."
+                )
+                use_unfused = True
+            if mla_rotary_interleaved:
+                warnings.warn(
+                    "apply_rope_fusion does not support MLA-style interleaving in RoPE."
+                    "Using unfused implementation."
+                )
+                use_unfused = True
+            if inverse:
+                warnings.warn(
+                    "inverse RoPE is not supported by TE's fused RoPE. "
+                    "Using unfused implementation."
+                )
+                use_unfused = True
+            if not use_unfused:
+                assert (
+                    fused_apply_rotary_pos_emb_thd is not None
+                ), "apply_rope_fusion is not available."
+                return fused_apply_rotary_pos_emb_thd(
+                    t,
+                    cu_seqlens,
+                    freqs,
+                    cp_size=cp_group.size(),
+                    cp_rank=cp_group.rank(),
+                    interleaved=config.rotary_interleaved,
+                )
     # use unfused implementation
     if cu_seqlens is None:
         return _apply_rotary_pos_emb_bshd(
