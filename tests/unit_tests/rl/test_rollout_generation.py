@@ -539,8 +539,8 @@ class TestGroupedRollouts:
         ]
         mt = WeightedMultiTask(configs)
         with pytest.raises(ValueError, match="starved"):
-            mt.rollout_group_layout(1)
-        assert mt.rollout_group_layout(8) == [6, 2]
+            mt.rollout_group_counts_by_env(1)
+        assert mt.rollout_group_counts_by_env(8) == [6, 2]
 
         # Evaluation-only envs take no groups and never count as starved.
         mt = WeightedMultiTask(
@@ -554,7 +554,7 @@ class TestGroupedRollouts:
                 )
             ]
         )
-        assert mt.rollout_group_layout(8) == [6, 2]
+        assert mt.rollout_group_counts_by_env(8) == [6, 2]
 
 
 def make_response(epochs, prompt_length, total_len, content="resp", finish_reason="stop"):

@@ -28,6 +28,7 @@ class _GranularityConfig(NamedTuple):
     submission: SubmissionGranularity
     consumption: ConsumptionGranularity
     num_groups_per_batch: int
+    rollouts_per_group: int
     num_groups_per_env: tuple[int, ...]
 
     @classmethod
@@ -48,6 +49,7 @@ class _GranularityConfig(NamedTuple):
             submission=request.submission_granularity,
             consumption=request.consumption_granularity,
             num_groups_per_batch=request.num_groups,
+            rollouts_per_group=request.rollouts_per_group,
             num_groups_per_env=tuple(num_groups_per_env),
         )
 
@@ -69,17 +71,14 @@ class _GranularityConfig(NamedTuple):
             f"index_in_batch {index_in_batch} outside batch of {self.num_groups_per_batch}"
         )
 
-    def units_per_batch(self, rollouts_per_group: int) -> int:
+    def units_per_batch(self) -> int:
         """Submission units in one batch; gate capacity = depth-in-batches x this.
-
-        Args:
-            rollouts_per_group: Rollouts per group, needed only for R granularity.
 
         Returns:
             The number of submission units one trainer batch contains.
         """
         return {
-            "R": self.num_groups_per_batch * rollouts_per_group,
+            "R": self.num_groups_per_batch * self.rollouts_per_group,
             "G": self.num_groups_per_batch,
             "B": 1,
         }[self.submission]
@@ -223,11 +222,11 @@ class RolloutPipeline:
         self.agent = agent
         self.request = request
         self.gran_policy = _GranularityConfig.from_request(
-            request, agent.rollout_group_layout(request.num_groups)
+            request, agent.rollout_group_counts_by_env(request.num_groups)
         )
         self.gate = _SubmissionGate(
             capacity=parallel_generation_tasks
-            * self.gran_policy.units_per_batch(request.rollouts_per_group),
+            * self.gran_policy.units_per_batch(),
             submission=self.gran_policy.submission,
         )
         self.num_infer_workers = (
@@ -315,12 +314,8 @@ class RolloutPipeline:
                 await self.gate.acquire_for("B")
                 batch_id = group_id // self.gran_policy.num_groups_per_batch
 
-                env_index = -1
-                next_env_start = 0
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
-                    if index_in_batch == next_env_start:
-                        env_index += 1
-                        next_env_start += self.gran_policy.num_groups_per_env[env_index]
+                    env_index = self.gran_policy.env_of_index(index_in_batch)
                     await self.gate.acquire_for("G")
                     params: GroupRolloutParams = await self.agent.prepare_group_rollout(
                         self.request, env_index=env_index
@@ -444,7 +439,7 @@ class RolloutPipeline:
         self.yielded_count += 1
         self.yielded_groups_per_env[self.gran_policy.env_of_index(group.index_in_batch)] += 1
 
-    async def _next_group(self) -> RolloutGroup | None:
+    async def _next_complete_group(self) -> RolloutGroup | None:
         """Pop the next group off output_queue and record its dwell."""
         try:
             group = await self.output_queue.get()
@@ -464,24 +459,30 @@ class RolloutPipeline:
 
     async def _consume_completion_order(self) -> AsyncIterator[RolloutGroup]:
         """G consumption: deliver groups in completion order, balanced across envs."""
-        quotas = self.gran_policy.num_groups_per_env
-        parked: list[deque[RolloutGroup]] = [deque() for _ in quotas]
-        delivered = [0] * len(quotas)
-        while (group := await self._next_group()) is not None:
-            parked[self.gran_policy.env_of_index(group.index_in_batch)].append(group)
-            progressed = True
-            while progressed:
-                progressed = False
-                for env, queue in enumerate(parked):
-                    if queue and delivered[env] < quotas[env]:
+        groups_per_env_per_batch = self.gran_policy.num_groups_per_env
+        pending_groups_by_env: list[deque[RolloutGroup]] = [
+            deque() for _ in groups_per_env_per_batch
+        ]
+        delivered_groups_by_env = [0] * len(groups_per_env_per_batch)
+        while (group := await self._next_complete_group()) is not None:
+            env_index = self.gran_policy.env_of_index(group.index_in_batch)
+            pending_groups_by_env[env_index].append(group)
+            yielded_any = True
+            while yielded_any:
+                yielded_any = False
+                for env, queue in enumerate(pending_groups_by_env):
+                    if queue and delivered_groups_by_env[env] < groups_per_env_per_batch[env]:
                         yield queue.popleft()
                         self.gate.release_for("G")
-                        delivered[env] += 1
-                        progressed = True
-                if all(count == quota for count, quota in zip(delivered, quotas)):
-                    delivered = [0] * len(quotas)
-        # The stream is over; nothing is left to balance against, so drain any parked groups.
-        for queue in parked:
+                        delivered_groups_by_env[env] += 1
+                        yielded_any = True
+                if all(
+                    count == quota
+                    for count, quota in zip(delivered_groups_by_env, groups_per_env_per_batch)
+                ):
+                    delivered_groups_by_env = [0] * len(groups_per_env_per_batch)
+        # The stream is over; nothing is left to balance against, so drain any pending groups.
+        for queue in pending_groups_by_env:
             while queue:
                 yield queue.popleft()
                 self.gate.release_for("G")
@@ -490,7 +491,7 @@ class RolloutPipeline:
         """B consumption: deliver whole batches in dataset order."""
         next_batch_id = 0
         pending = self._consume_pending
-        while (group := await self._next_group()) is not None:
+        while (group := await self._next_complete_group()) is not None:
             pending.setdefault(group.batch_id, []).append(group)
             while (
                 len(pending.get(next_batch_id, []))

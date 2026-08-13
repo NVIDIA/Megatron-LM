@@ -205,7 +205,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         """Return the params for one group's rollouts."""
         ...
 
-    def rollout_group_layout(self, num_groups: int) -> list[int]:
+    def rollout_group_counts_by_env(self, num_groups: int) -> list[int]:
         """Returns the groups within a batch that each env contributes, in env order."""
         return [num_groups]
 

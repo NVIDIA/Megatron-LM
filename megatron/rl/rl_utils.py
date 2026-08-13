@@ -14,7 +14,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 import numpy as np
 import torch
@@ -73,9 +73,11 @@ from megatron.rl.agent.api import (
 )
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
+from megatron.rl.inference import ReturnsRaw
 from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
+from megatron.rl.rollout_granularity import ConsumptionGranularity, SubmissionGranularity
 from megatron.rl.sequence_packing_utils import (
     compute_packed_inference_logprobs_stats,
     get_default_packed_seq_params,
@@ -566,18 +568,18 @@ _ROLLOUT_PIPELINE = None
 
 
 def get_rollout_generator(
-    inference_interface,
-    n_prompts,
-    samples_per_group,
+    inference_interface: ReturnsRaw,
+    n_prompts: int,
+    samples_per_group: int,
     *,
-    streaming,
-    generation_args,
-    filter_groups_with_same_reward,
-    submission_granularity,
-    consumption_granularity,
-    generation_lag,
-    env_config_path,
-):
+    streaming: bool,
+    generation_args: dict[str, Any],
+    filter_groups_with_same_reward: bool,
+    submission_granularity: SubmissionGranularity,
+    consumption_granularity: ConsumptionGranularity,
+    generation_lag: int,
+    env_config_path: str,
+) -> AsyncIterator[RolloutGroup]:
     """Return the rollout group iterator for this step.
 
     Returns:

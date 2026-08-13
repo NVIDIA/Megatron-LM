@@ -147,7 +147,7 @@ class WeightedMultiTask(
 
         return final_counts
 
-    def rollout_group_layout(self, num_groups: int) -> list[int]:
+    def rollout_group_counts_by_env(self, num_groups: int) -> list[int]:
         """Per-batch groups for each weighted env, in env_index order."""
         counts = self._distribute_counts(num_groups)
         env_ids = [
@@ -183,7 +183,7 @@ class WeightedMultiTask(
         return [count for count in counts if count > 0]
 
     def _active_rollout_agents(self, num_groups: int) -> list:
-        """Sub-agents receiving groups, aligned with rollout_group_layout's env order."""
+        """Sub-agents receiving groups, aligned with rollout_group_counts_by_env's env order."""
         counts = self._distribute_counts(num_groups)
         return [agent for agent, count in zip(self.agents, counts) if count > 0]
 
