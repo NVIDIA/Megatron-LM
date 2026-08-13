@@ -9,6 +9,7 @@ import socket
 import time
 import traceback
 import urllib.parse
+import urllib.error
 import urllib.request
 import uuid
 import warnings
@@ -243,6 +244,24 @@ def _coerce_arguments_mapping(arguments):
     return {}
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject HTTP redirects so a 3xx to a private address can't bypass the
+    pre-fetch allowlist check."""
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        raise urllib.error.HTTPError(
+            req.full_url, code, "redirects disabled for image_url fetches", headers, fp
+        )
+
+    http_error_302 = http_error_301
+    http_error_303 = http_error_301
+    http_error_307 = http_error_301
+    http_error_308 = http_error_301
+
+
+_no_redirect_opener = urllib.request.build_opener(_NoRedirectHandler())
+
+
 def _extract_image_url_bytes(url: str) -> bytes:
     """Extract raw bytes from an OpenAI-style image_url value.
 
@@ -272,7 +291,7 @@ def _extract_image_url_bytes(url: str) -> bytes:
         ):
             raise ValueError(f"Refusing to fetch image from non-public address: {parsed.hostname}")
         req = urllib.request.Request(url, headers={"User-Agent": _IMAGE_FETCH_USER_AGENT})
-        with urllib.request.urlopen(req, timeout=_IMAGE_FETCH_TIMEOUT_S) as response:
+        with _no_redirect_opener.open(req, timeout=_IMAGE_FETCH_TIMEOUT_S) as response:
             data = response.read(_MAX_IMAGE_BYTES + 1)
         if len(data) > _MAX_IMAGE_BYTES:
             raise ValueError(f"Image at {parsed.hostname} exceeds {_MAX_IMAGE_BYTES} byte limit")
