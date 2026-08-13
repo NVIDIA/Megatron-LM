@@ -86,6 +86,69 @@ def _squared_relu_with_probs_kernel(
                     tl.store(output_ptr + row * hidden_size + cols, value, mask=mask)
 
 
+@triton.jit
+def _swiglu_with_probs_kernel(
+    input_ptr,
+    output_ptr,
+    permutation_map_ptr,
+    n_used_ptr,
+    probs_ptr,
+    ffn_size,  # output width; input row width is 2*ffn_size (gate | up)
+    max_rows,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+):
+    """Apply gated SiLU (SwiGLU) and router probabilities in training order.
+
+    Matches the training fused weighted-swiglu rounding: SiLU(gate)*up*prob is
+    computed in FP32 with a single BF16 round at the end. Input row width is
+    2*ffn_size: gate = first half, up = second half (megatron chunk
+    convention). Fixed NUM_BLOCKS CTAs iterating rows -> CUDA-graph safe.
+    """
+    pid = tl.program_id(0)
+    n_used = tl.load(n_used_ptr)
+    if pid >= n_used:
+        return
+    two_n = 2 * ffn_size
+
+    for row in tl.range(pid, max_rows, NUM_BLOCKS):
+        if row < n_used:
+            if tl.load(permutation_map_ptr + row) >= 0:
+                prob = tl.load(probs_ptr + row)
+                for offset in tl.range(0, ffn_size, BLOCK_SIZE):
+                    cols = offset + tl.arange(0, BLOCK_SIZE)
+                    mask = cols < ffn_size
+                    gate = tl.load(input_ptr + row * two_n + cols, mask=mask).to(tl.float32)
+                    up = tl.load(input_ptr + row * two_n + ffn_size + cols, mask=mask).to(
+                        tl.float32
+                    )
+                    value = gate * tl.sigmoid(gate) * up * prob
+                    tl.store(output_ptr + row * ffn_size + cols, value.to(tl.bfloat16), mask=mask)
+
+
+def swiglu_with_probs(
+    x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor, probs: torch.Tensor
+) -> torch.Tensor:
+    """Gated-SiLU counterpart of squared_relu_with_probs (SwiGLU models)."""
+    num_rows, two_ffn = x.shape
+    ffn_size = two_ffn // 2
+    out = torch.empty(num_rows, ffn_size, dtype=x.dtype, device=x.device)
+    block_size = min(triton.next_power_of_2(ffn_size), 1024)
+    num_blocks = min(num_rows, 512)
+    _swiglu_with_probs_kernel[(num_blocks,)](
+        x,
+        out,
+        permutation_map,
+        n_used,
+        probs,
+        ffn_size,
+        num_rows,
+        BLOCK_SIZE=block_size,
+        NUM_BLOCKS=num_blocks,
+    )
+    return out
+
+
 def squared_relu_with_probs(
     x: torch.Tensor, permutation_map: torch.Tensor, n_used: torch.Tensor, probs: torch.Tensor
 ) -> torch.Tensor:
