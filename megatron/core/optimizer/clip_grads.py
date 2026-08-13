@@ -171,9 +171,10 @@ def clip_grad_by_total_norm_fp32(
                 grads.append(to_local_if_dtensor(param.decoupled_grad).detach())
         else:
             if param.grad is not None:
-                assert param.grad.type() == 'torch.cuda.FloatTensor'
+                local_grad = to_local_if_dtensor(param.grad)
+                assert local_grad.type() == 'torch.cuda.FloatTensor'
                 params.append(param)
-                grads.append(to_local_if_dtensor(param.grad).detach())
+                grads.append(local_grad.detach())
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
