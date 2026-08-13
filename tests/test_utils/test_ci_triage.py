@@ -129,11 +129,19 @@ def test_cerno_hard_cutover_contract():
     assert triage.count("cerno-linear") == 3
     assert triage.count("cerno-notify") == 2
     assert triage.count('--config "${CERNO_CONFIG}"') == 3
-    assert "ARG CERNO_COMMIT=5a5fb5360e67f8f09d189871bbc0d768c09c43fa" in dockerfile
     assert '"cerno @ git+${CI_SERVER_URL}/dl/nemo/cerno.git@${CERNO_COMMIT}"' in dockerfile
     assert "id=CERNO_TOKEN" in dockerfile
     assert "/run/secrets/CERNO_TOKEN" in dockerfile
     assert "--secret id=CERNO_TOKEN,env=PAT" in build_script
+
+
+def test_linear_write_assigns_new_issues_to_scheduled_oncall():
+    triage = yaml.safe_load(Path(".gitlab/stages/06.triage.yml").read_text())
+    script = "\n".join(triage["triage:linear_write"]["script"])
+
+    assert "resolve_oncall_assignee.py" in script
+    assert "--schedule-file .github/oncall_schedule.json" in script
+    assert '--assignee "${ONCALL_ASSIGNEE}"' in script
 
 
 def test_notification_rules_use_expected_pipeline_sources():

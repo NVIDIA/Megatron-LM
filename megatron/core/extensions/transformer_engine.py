@@ -1749,7 +1749,7 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
     ``delay_wgrad_compute`` is forced off to mirror its no-op ``backward_dw``,
     and ``get/set_extra_state`` match the bf16 LM head's state-dict shim. The
     LM-head kwargs ``keep_master_weight_for_test``, ``skip_weight_param_allocation``,
-    ``defer_embedding_wgrad_compute`` buffers, and ``disable_grad_reduce`` are
+    ``defer_embedding_wgrad_compute`` buffers, ``disable_grad_reduce``, and ``output_dtype`` are
     accepted to preserve the ``ColumnParallelLinear`` signature but currently
     raise when set non-default — TE will not support them natively, so they
     would have to be implemented in this subclass, which has not been done yet.
@@ -1776,6 +1776,7 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         tp_comm_buffer_name: Optional[str] = None,
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        output_dtype: Optional[torch.dtype] = None,
     ):
         from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 
@@ -1794,6 +1795,8 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
             )
         if disable_grad_reduce:
             raise ValueError("TE output projection does not support disable_grad_reduce.")
+        if output_dtype is not None:
+            raise ValueError("TE MXFP8 output projection does not support output_dtype.")
 
         te_config = copy.copy(config)
         # Match ColumnParallelLinear.backward_dw's no-op so the LM head keeps

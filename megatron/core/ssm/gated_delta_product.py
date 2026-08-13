@@ -17,9 +17,7 @@ from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
-    tensor_get_slice_after,
     tensor_masked_update,
-    tensor_merge,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
@@ -28,6 +26,7 @@ from megatron.core.ssm.packed_seq_helpers import (
     check_fla_sequence_packing_support,
     get_cu_seqlens,
 )
+from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
@@ -36,7 +35,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, is_using_quantization_scales
+from megatron.core.utils import deprecate_inference_params
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
@@ -98,7 +97,7 @@ class GatedDeltaProductMixerSubmodules:
     out_proj: Union[ModuleSpec, type] = None
 
 
-class GatedDeltaProductMixer(MegatronModule):
+class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
     """Gated Delta Product (GDP) sequence mixer for hybrid models.
 
     The mixer accepts hidden states with shape ``[sequence, batch, hidden]`` and returns
@@ -381,7 +380,12 @@ class GatedDeltaProductMixer(MegatronModule):
         conv_state, ssm_state = None, None
         if inference_context is not None:
             if inference_context.is_dynamic_batching():
-                return self._dynamic_inference(hidden_states, inference_context)
+                ok, reason = check_fla_sequence_packing_support()
+                assert ok, reason
+                assert (
+                    self.cp.cp_size == 1
+                ), "Context parallel is not supported for GDP dynamic inference"
+                return self.ssm_dynamic_inference(hidden_states, inference_context)
             assert (
                 inference_context.is_static_batching()
             ), "GDP inference must be either static or dynamic batching."
@@ -391,6 +395,9 @@ class GatedDeltaProductMixer(MegatronModule):
                 "Packing is only wired through the training/prefill (chunk) path."
             )
             conv_state, ssm_state = self._get_states_from_cache(inference_context, batch_size)
+            if inference_context.seqlen_offset > 0:
+                # The states are updated in place.
+                return self._static_decode(hidden_states, conv_state, ssm_state)
 
         # Build cu_seqlens for the chunked recurrence (FLA) when running with
         # packed (THD) sequences on the training/prefill path.
@@ -437,32 +444,19 @@ class GatedDeltaProductMixer(MegatronModule):
             VKQ = VKQ.contiguous()
             VKQ = rearrange(VKQ, "b l d -> b d l")
 
-        # Decode
-        if inference_context is not None and inference_context.seqlen_offset > 0:
-            VKQ = causal_conv1d_update(
-                VKQ,
-                conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
-                self.activation,
-            )
-        else:
-            # Prefill
-            if conv_state is not None:
-                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                conv_state.copy_(
-                    F.pad(VKQ, (self.d_conv - VKQ.shape[-1], 0))
-                )  # Update state (B D W)
-            # Train
-            # causal_conv1d uses seq_idx_packed to reset the convolution boundaries
-            VKQ = causal_conv1d_fn(
-                x=VKQ,
-                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                bias=self.cp.get_conv1d_bias(),
-                activation=self.activation,
-                seq_idx=seq_idx_packed,
-            )
+        if conv_state is not None:
+            # Static-batching prefill: seed the conv state from the prompt's tail.
+            # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+            # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+            conv_state.copy_(F.pad(VKQ, (self.d_conv - VKQ.shape[-1], 0)))  # Update state (B D W)
+        # causal_conv1d uses seq_idx_packed to reset the convolution boundaries
+        VKQ = causal_conv1d_fn(
+            x=VKQ,
+            weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+            bias=self.cp.get_conv1d_bias(),
+            activation=self.activation,
+            seq_idx=seq_idx_packed,
+        )
 
         VKQ = rearrange(VKQ, "b d l ->  b l d").contiguous()
 
@@ -506,46 +500,18 @@ class GatedDeltaProductMixer(MegatronModule):
                 self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp, dim=2
             )
 
-        # Decode
-        if inference_context is not None and inference_context.seqlen_offset > 0:
-
-            g_new = g.new_zeros(g.shape[0], g.shape[1], self.num_householder, g.shape[2])
-            g_new[:, :, 0] = g
-            g = rearrange(g_new, '... t n h -> ... (t n) h')
-
-            query_new = query.new_zeros(
-                query.shape[0], query.shape[1], self.num_householder, query.shape[2], query.shape[3]
-            )
-            query_new[:, :, -1] = query
-            query = rearrange(query_new, '... t n h d-> ... (t n) h d')
-
-            core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=ssm_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-            )
-            core_attn_out = rearrange(
-                core_attn_out, '... (t n) h d -> ... t n h d', n=self.num_householder
-            )[..., -1, :, :].contiguous()
-        # Train or Prefill
-        else:
-            core_attn_out, last_recurrent_state = chunk_gated_delta_product(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=(ssm_state is not None),
-                num_householder=self.num_householder,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens_packed,
-            )
+        core_attn_out, last_recurrent_state = chunk_gated_delta_product(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=(ssm_state is not None),
+            num_householder=self.num_householder,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens_packed,
+        )
 
         if ssm_state is not None:
             ssm_state.copy_(last_recurrent_state)
@@ -561,112 +527,70 @@ class GatedDeltaProductMixer(MegatronModule):
 
         return out, out_bias
 
+    # ==================================================================
+    # Static / eager inference
+    #
+    # ``_static_decode`` implements legacy static-batching decode. It is
+    # deliberately kept separate from the dynamic inference hooks below so that
+    # static-batching bookkeeping does not pollute the interface defined by
+    # ``SSMDynamicInferenceMixin``. Static-batching prefill shares the training
+    # body in ``forward``, which seeds the conv/SSM state when the caches are
+    # present. Mirrors ``MambaMixer._static_decode``.
+    # ==================================================================
+    def _static_decode(
+        self, hidden_states: torch.Tensor, conv_state: torch.Tensor, ssm_state: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Single-token static-batching decode step (updates state in place)."""
+        assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
+        assert self.cp.cp_size == 1, "Context parallel not supported for GDP inference decode"
+
+        # (1, b, d_model) -> (1, b, proj_dim)
+        zVKQba, _ = self.in_proj(hidden_states)
+
+        # The decode kernels are batch-first: (1, b, proj_dim) -> (b, 1, proj_dim).
+        # Static batching has no slot remapping, so batch_indices is None.
+        y = self.ssm_decode(
+            zVKQba.transpose(0, 1), conv_state=conv_state, ssm_state=ssm_state, batch_indices=None
+        )
+
+        # (b, 1, d_inner) -> (1, b, d_inner), which is what out_proj expects.
+        return self.out_proj(y.transpose(0, 1))
+
     # ------------------------------------------------------------------
     # Dynamic-batching inference.
     #
-    # Mirrors ``MambaMixer._dynamic_inference`` / ``_ssm_decode`` / ``_ssm_prefill``
-    # (same ``_ssm_`` naming and the same request-level control flow), but runs
-    # the Gated Delta Product kernels instead of the Mamba2 scan. The per-request
-    # recurrent state (short-conv state + matrix-valued SSM state) is read/written
-    # through the slot-indexed caches owned by ``DynamicInferenceContext``.
+    # These are the two hooks required by ``SSMDynamicInferenceMixin``; the
+    # mixin owns the surrounding decode/prefill partitioning and merge. They run
+    # the Gated Delta Product kernels instead of the Mamba2 scan. The
+    # per-request recurrent state (short-conv state + matrix-valued SSM state)
+    # is read/written through the slot-indexed caches owned by
+    # ``DynamicInferenceContext``.
     #
     # MVP scope: this path does not yet support context parallelism (cp_size > 1),
     # speculative decoding, chunked prefill, Mamba prefix caching, or CUDA-graph
     # capture. The reshapes mirror the static ``forward`` math with batch/seq
     # repurposed for the packed dynamic layout.
     # ------------------------------------------------------------------
-    def _dynamic_inference(
-        self, hidden_states: torch.Tensor, context: DynamicInferenceContext
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Execute one dynamic inference step by separating decode and prefill
-        requests, running each through the GDP kernels independently, and merging
-        the results back into packed token order."""
-        ok, reason = check_fla_sequence_packing_support()
-        assert ok, reason
-        assert self.cp.cp_size == 1, "Context parallel is not supported for GDP dynamic inference"
-        assert (
-            not context.is_chunked_prefill_enabled()
-        ), "GDP dynamic inference does not support chunked prefill yet."
-
-        # GDP-style layers register as Mamba layers, so the same (conv_state,
-        # ssm_state) accessor and per-layer slab layout apply.
-        conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
-
-        padded_dims = context.padded_batch_dimensions
-        token_count = padded_dims.token_count
-        decode_req_count = padded_dims.decode_req_count
-        prefill_req_count = padded_dims.prefill_req_count
-        metadata = context.mamba_metadata
-
-        # Input projection over the full packed batch.
-        zVKQba, _ = self.in_proj(hidden_states)
-
-        y_decode = None
-        y_prefill = None
-
-        # --- Decode partition (placed first in the packed batch) ---------
-        if decode_req_count > 0:
-            # MVP: exactly one token per decode request (no speculative tokens).
-            zVKQba_decode = zVKQba[:decode_req_count] if prefill_req_count > 0 else zVKQba
-            y_decode = self._ssm_decode(
-                zVKQba_decode.transpose(0, 1), conv_state, ssm_state, metadata.batch_indices_decode
-            ).transpose(0, 1)
-
-        # --- Prefill partition -------------------------------------------
-        if prefill_req_count > 0:
-            if decode_req_count > 0:
-                # Mixed batch: gather the prefill tokens out of the packed tensor.
-                zVKQba_prefill = torch.empty_like(zVKQba)
-                tensor_get_slice_after(
-                    zVKQba, zVKQba_prefill, metadata.device_decode_prefill, check_bounds=False
-                )
-            else:
-                zVKQba_prefill = zVKQba
-            y_prefill = self._ssm_prefill(
-                zVKQba_prefill,
-                conv_state=conv_state,
-                ssm_state=ssm_state,
-                seq_idx=metadata.seq_idx,
-                cu_seqlens=metadata.cu_seqlens,
-                batch_indices=metadata.batch_indices_prefill,
-            )
-
-        # --- Merge back into packed token order --------------------------
-        if y_decode is not None and y_prefill is not None:
-            y = torch.empty(
-                [token_count, 1, y_prefill.shape[-1]],
-                dtype=y_prefill.dtype,
-                device=y_prefill.device,
-            )
-            tensor_merge(y_decode, y_prefill, metadata.device_decode_prefill, output_tensor=y)
-        elif y_decode is not None:
-            y = y_decode
-        elif y_prefill is not None:
-            y = y_prefill
-        else:
-            raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
-
-        # Zero padding positions to avoid corrupting quantization amax calculations.
-        if is_using_quantization_scales(self.config):
-            y[context.padding_slice] = 0.0
-
-        out, out_bias = self.out_proj(y)
-        return out, out_bias
-
-    def _ssm_decode(
+    def ssm_decode(
         self,
         zVKQba: torch.Tensor,
         conv_state: torch.Tensor,
         ssm_state: torch.Tensor,
         batch_indices: Optional[torch.Tensor] = None,
+        intermediate_conv_state: Optional[torch.Tensor] = None,
+        intermediate_ssm_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Single-token-per-request decode. ``zVKQba`` is ``[1, decode_req_count,
-        proj_dim]``; returns ``[1, decode_req_count, d_inner]``. The conv and SSM
-        states are read/written in place at the slots named by ``batch_indices``
-        (``-1`` marks padding slots)."""
-        seq_len, _, _ = zVKQba.shape
+        """Single-token-per-request decode. ``zVKQba`` is ``[n, seq_len,
+        proj_dim]``; returns ``[n, seq_len, d_inner]``. The conv and SSM states
+        are read/written in place at the slots named by ``batch_indices``
+        (``-1`` marks padding slots); ``batch_indices=None`` means static
+        batching, where the caches are already in request order."""
+        _, seq_len, _ = zVKQba.shape
         assert seq_len == 1, "GDP decode supports one token per request"
-        zVKQba = zVKQba.squeeze(0)  # [n, proj_dim]
+        assert (
+            intermediate_conv_state is None and intermediate_ssm_state is None
+        ), "GDP decode does not support speculative decoding yet"
+        zVKQba = zVKQba.squeeze(1)  # [n, proj_dim]
         M = self.num_householder
 
         z, VKQ, ba = torch.split(
@@ -729,11 +653,14 @@ class GatedDeltaProductMixer(MegatronModule):
         query_new[:, :, -1] = query
         query = rearrange(query_new, "n t m h d -> n (t m) h d")
 
-        # Gather this step's per-request initial states. ``.clamp`` (NOT in-place)
-        # returns a new tensor, so ``batch_indices`` keeps its -1 padding sentinels
-        # for the scatter below; the padding rows' outputs are never scattered back.
-        gather_idx = batch_indices.clamp(min=0)
-        initial_state = ssm_state[gather_idx]
+        if batch_indices is None:
+            # Static batching: the cache rows are already in request order.
+            initial_state = ssm_state
+        else:
+            # Gather this step's per-request initial states. ``.clamp`` (NOT in-place)
+            # returns a new tensor, so ``batch_indices`` keeps its -1 padding sentinels
+            # for the scatter below; the padding rows' outputs are never scattered back.
+            initial_state = ssm_state[batch_indices.clamp(min=0)]
 
         core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule(
             query,
@@ -749,29 +676,37 @@ class GatedDeltaProductMixer(MegatronModule):
             ..., -1, :, :
         ].contiguous()  # [n, 1, h, d]
 
-        # Scatter updated states back into the cache (skips -1 padding slots).
-        tensor_masked_update(ssm_state, batch_indices, last_recurrent_state)
+        if batch_indices is None:
+            ssm_state.copy_(last_recurrent_state)
+        else:
+            # Scatter updated states back into the cache (skips -1 padding slots).
+            tensor_masked_update(ssm_state, batch_indices, last_recurrent_state)
 
-        y = rearrange(core_attn_out, "n t h p -> t n (h p)").contiguous()  # [1, n, d_inner]
+        y = rearrange(core_attn_out, "n t h p -> n t (h p)").contiguous()  # [n, 1, d_inner]
         if self.rmsnorm:
-            z = rearrange(z, "n t h p -> t n (h p)").contiguous()
+            z = rearrange(z, "n t h p -> n t (h p)").contiguous()
             y = self.norm(y, z)
         return y
 
-    def _ssm_prefill(
+    def ssm_prefill(
         self,
         zVKQba: torch.Tensor,
-        conv_state: Optional[torch.Tensor] = None,
-        ssm_state: Optional[torch.Tensor] = None,
-        seq_idx: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        batch_indices: Optional[torch.Tensor] = None,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        context: DynamicInferenceContext,
     ) -> torch.Tensor:
         """Variable-length prefill over all prefill requests in one varlen call.
         ``zVKQba`` is ``[l, 1, proj_dim]``; returns ``[l, 1, d_inner]``. Fresh
         requests start from a zero recurrent state (no prefix caching in the MVP);
         the resulting final conv/SSM states are written back into the caches."""
-        is_dynamic_batching = seq_idx is not None
+        assert (
+            not context.is_chunked_prefill_enabled()
+        ), "GDP dynamic inference does not support chunked prefill yet."
+
+        metadata = context.mamba_metadata
+        seq_idx = metadata.seq_idx
+        cu_seqlens = metadata.cu_seqlens
+        batch_indices = metadata.batch_indices_prefill
         M = self.num_householder
 
         # l b d -> b l d
@@ -788,18 +723,14 @@ class GatedDeltaProductMixer(MegatronModule):
             dim=-1,
         )
 
-        if conv_state is not None and is_dynamic_batching:
-            assert batch_indices is not None
-            # Capture per-request final conv states (before the conv consumes the
-            # inputs) and write them into the prefill requests' cache rows.
-            conv_varlen_states = causal_conv1d_varlen_states(
-                VKQ.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
-            )
-            tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
-            # Maintain channels-last memory layout so causal_conv1d_fn can use seq_idx.
-            VKQ = VKQ.transpose(1, 2)
-        else:
-            VKQ = rearrange(VKQ, "b l d -> b d l").contiguous()
+        # Capture per-request final conv states (before the conv consumes the
+        # inputs) and write them into the prefill requests' cache rows.
+        conv_varlen_states = causal_conv1d_varlen_states(
+            VKQ.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
+        )
+        tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
+        # Maintain channels-last memory layout so causal_conv1d_fn can use seq_idx.
+        VKQ = VKQ.transpose(1, 2)
 
         seqlen = VKQ.size(2)
         if causal_conv1d_fn is None:
@@ -846,15 +777,14 @@ class GatedDeltaProductMixer(MegatronModule):
             g=g,
             beta=beta,
             initial_state=None,
-            output_final_state=ssm_state is not None,
+            output_final_state=True,
             num_householder=M,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=cu_seqlens,
         )
 
         # Write per-request final SSM states into the cache for subsequent decode.
-        if ssm_state is not None and is_dynamic_batching:
-            tensor_masked_update(ssm_state, batch_indices, last_recurrent_state)
+        tensor_masked_update(ssm_state, batch_indices, last_recurrent_state)
 
         y = rearrange(core_attn_out, "b l h p -> l b (h p)").contiguous()
         if self.rmsnorm:
