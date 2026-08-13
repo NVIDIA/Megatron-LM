@@ -21,6 +21,7 @@ from megatron.core.utils import null_decorator
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra import libdevice
 
     HAVE_TRITON = True
 except ImportError:
@@ -145,6 +146,70 @@ def swiglu_with_probs(
         num_rows,
         BLOCK_SIZE=block_size,
         NUM_BLOCKS=num_blocks,
+    )
+    return out
+
+
+@triton.jit
+def _weighted_silu_mul_bounded_kernel(
+    in_ptr0, in_ptr1, out_ptr0, bound_ptr, xnumel, HALF_N: tl.constexpr, XBLOCK: tl.constexpr
+):
+    """Device-bounded weighted SwiGLU with training-parity rounding.
+
+    The per-element instruction sequence is copied VERBATIM from Inductor's
+    emitted Triton for the training fused weighted-swiglu
+    (bf16 -> fp32 silu(gate) * up * prob -> bf16, single final rounding), so a
+    token's activation bits match the training forward exactly. Elementwise
+    kernels have no cross-element reduction, so only the per-element sequence
+    determines bits; the schedule below is a persistent 1D grid (static launch,
+    CUDA-graph-safe) striding while xoffset < a DEVICE element bound
+    (= valid_tokens * topk * HALF_N — the live prefix of the flat token-major
+    layout). Rows beyond the bound are neither read nor written.
+    """
+    xbound = tl.load(bound_ptr)
+    num_progs = tl.num_programs(0)
+    xoffset = tl.program_id(0) * XBLOCK
+    while xoffset < xbound:
+        xindex = xoffset + tl.arange(0, XBLOCK)[:]
+        xmask = (xindex < xbound) & (xindex < xnumel)
+        x0 = xindex % HALF_N
+        x1 = xindex // HALF_N
+        tmp0 = tl.load(in_ptr0 + (x0 + 2 * HALF_N * x1), xmask).to(tl.float32)
+        tmp8 = tl.load(in_ptr0 + (HALF_N + x0 + 2 * HALF_N * x1), xmask).to(tl.float32)
+        tmp11 = tl.load(in_ptr1 + (x1), xmask, eviction_policy='evict_last')
+        tmp1 = tmp0.to(tl.float32)
+        tmp2 = -tmp1
+        tmp3 = libdevice.exp(tmp2)
+        tmp4 = tl.full([1], 1.0, tl.float32)
+        tmp5 = tmp3 + tmp4
+        tmp6 = tmp1 / tmp5
+        tmp7 = tmp6.to(tl.float32)
+        tmp9 = tmp7 * tmp8
+        tmp10 = tmp9.to(tl.float32)
+        tmp12 = tmp10 * tmp11
+        tmp13 = tmp12.to(tl.float32)
+        tl.store(out_ptr0 + xindex, tmp13, xmask)
+        xoffset += num_progs * XBLOCK
+
+
+def weighted_silu_mul_bounded(
+    y: torch.Tensor,
+    weights_flat: torch.Tensor,
+    bound_elems: torch.Tensor,
+    num_programs: int = 1184,
+    xblock: int = 1024,
+) -> torch.Tensor:
+    """SwiGLU with routing weights applied at the activation (training parity).
+
+    y: [rows, 2*half_n] bf16 (gate | up); weights_flat: [rows] fp32 routing
+    probabilities; bound_elems: device scalar = live_rows * half_n.
+    Returns [rows, half_n] bf16; rows beyond the live bound are untouched.
+    """
+    rows, two_half_n = y.shape
+    half_n = two_half_n // 2
+    out = torch.empty(rows, half_n, dtype=y.dtype, device=y.device)
+    _weighted_silu_mul_bounded_kernel[(num_programs,)](
+        y, weights_flat, out, bound_elems, rows * half_n, HALF_N=half_n, XBLOCK=xblock
     )
     return out
 
