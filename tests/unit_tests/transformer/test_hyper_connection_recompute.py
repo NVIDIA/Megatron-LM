@@ -415,6 +415,9 @@ class TestTransformerConfigRecomputeMhc:
                 num_attention_heads=4,
                 enable_mhc_connections=True,
                 pipeline_model_parallel_size=2,
+                # ModelParallelConfig.__post_init__ runs first and requires this
+                # whenever pipeline_model_parallel_size > 1.
+                pipeline_dtype=torch.bfloat16,
             )
 
     def test_config_rejects_fp32_residual_connection(self):
