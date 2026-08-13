@@ -401,14 +401,30 @@ try:
         message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None
     ):
         """Runs CPU-intensive text parsing."""
-        meta = {}
         for parser in parsers_list:
             if parser not in PARSER_MAPPING:
                 raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
 
+        implicit_reasoning_end_markers = (
+            tuple(
+                marker
+                for parser_name in parsers_list
+                for marker in getattr(
+                    PARSER_MAPPING[parser_name], "implicit_reasoning_end_markers", ()
+                )
+            )
+            if tools_requested
+            else ()
+        )
+
+        meta = {}
+        for parser in parsers_list:
             prev_text = message_text
             parsed_text, new_info = PARSER_MAPPING[parser].parse(
-                message_text, tools=tools, chat_template_kwargs=chat_template_kwargs
+                message_text,
+                tools=tools,
+                chat_template_kwargs=chat_template_kwargs,
+                implicit_reasoning_end_markers=implicit_reasoning_end_markers,
             )
             if "tool_calls" in new_info:
                 new_info["tool_calls"] = _normalize_tool_calls(

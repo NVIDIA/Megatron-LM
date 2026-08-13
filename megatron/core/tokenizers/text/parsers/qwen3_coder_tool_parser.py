@@ -266,6 +266,7 @@ class _Qwen3CoderToolParser:
 class Qwen3CoderToolParser(BaseParser):
     """Parser for Qwen3 Coder style tool calls."""
 
+    implicit_reasoning_end_markers = ("<tool_call>",)
     streaming_markers = ("<tool_call>", "<function=")
 
     @staticmethod
