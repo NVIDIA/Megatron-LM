@@ -13,8 +13,8 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.paged_stash import (
-    PagedStashManager,
     PagedStashBuffer,
+    PagedStashManager,
     PagedStashRunner,
     PagedTensor,
     PipelinePostScheduleFunction,
@@ -233,18 +233,19 @@ _MXFP8_SKIP_REASON = (
 
 
 @pytest.mark.parametrize(
-    "enabled,config_overrides,expected",
+    "enabled,config_overrides,expected_runtime,expected_stash",
     [
-        (False, {}, False),
-        (True, {"cuda_graph_impl": "none"}, False),
-        (True, {"cuda_graph_granularity": "layer"}, False),
-        (True, {"cuda_graph_dynamic_microbatches": False}, False),
-        (True, {"moe_paged_stash": False}, False),
-        (True, {}, True),
+        (False, {}, False, False),
+        (True, {"cuda_graph_impl": "none"}, False, False),
+        (True, {"cuda_graph_granularity": "layer"}, False, False),
+        (True, {"cuda_graph_dynamic_microbatches": False}, False, False),
+        (True, {"moe_paged_stash": False}, False, False),
+        (True, {"pipeline_model_parallel_size": 1}, True, False),
+        (True, {}, True, True),
     ],
 )
 def test_chunk_graph_runtime_schedule_is_strictly_gated(
-    monkeypatch, enabled, config_overrides, expected
+    monkeypatch, enabled, config_overrides, expected_runtime, expected_stash
 ):
     """Legacy eager/layer/static schedules must retain their existing paged-stash behavior."""
     manager = PagedStashManager.__new__(PagedStashManager)
@@ -263,34 +264,8 @@ def test_chunk_graph_runtime_schedule_is_strictly_gated(
     config_values.update(config_overrides)
     paged_stash_reset(enabled=enabled, config=SimpleNamespace(**config_values))
 
-    assert manager.chunk_graph_runtime_schedule is expected
-    assert manager.chunk_graph_runtime_stash_activations is expected
-
-
-def test_chunk_graph_runtime_schedule_activation_policy_follows_pp_size(monkeypatch):
-    """PP1 keeps activations while pipelined execution captures stash/reload."""
-    manager = PagedStashManager.__new__(PagedStashManager)
-    manager.iteration = 0
-    manager.status = 'begin'
-    monkeypatch.setattr(PagedStashManager, 'get_instance', lambda: manager)
-
-    config = SimpleNamespace(
-        cuda_graph_impl='local',
-        cuda_graph_granularity='chunk',
-        cuda_graph_dynamic_microbatches=True,
-        moe_paged_stash=True,
-        pipeline_model_parallel_size=1,
-        moe_paged_stash_page_size=64,
-    )
-    paged_stash_reset(enabled=True, config=config)
-    assert manager.chunk_graph_runtime_schedule
-    assert not manager.chunk_graph_runtime_stash_activations
-
-    manager.status = 'begin'
-    config.pipeline_model_parallel_size = 2
-    paged_stash_reset(enabled=True, config=config)
-    assert manager.chunk_graph_runtime_schedule
-    assert manager.chunk_graph_runtime_stash_activations
+    assert manager.chunk_graph_runtime_schedule is expected_runtime
+    assert manager.chunk_graph_runtime_stash_activations is expected_stash
 
 
 def test_chunk_graph_missing_slots_extend_capacity_profile(monkeypatch):
@@ -321,12 +296,13 @@ def test_chunk_graph_missing_slots_extend_capacity_profile(monkeypatch):
     assert manager.current_microbatch == [0, 0]
 
 
-def test_chunk_graph_runtime_schedule_stashes_and_reloads_matching_layer(monkeypatch):
-    """Runtime chunk slots must not inspect neighboring PP schedule entries."""
+@pytest.mark.parametrize("stash_activations", [False, True])
+def test_chunk_graph_runtime_schedule_uses_matching_activation(monkeypatch, stash_activations):
+    """PP1 discards immediately; PP>1 stashes and reloads the matching activation."""
     manager = PagedStashManager.__new__(PagedStashManager)
     manager.status = 'captured'
     manager.chunk_graph_runtime_schedule = True
-    manager.chunk_graph_runtime_stash_activations = True
+    manager.chunk_graph_runtime_stash_activations = stash_activations
     manager.vp_size = 1
     manager.current_vp_stage = 0
     manager.current_layer = [1]
@@ -337,9 +313,12 @@ def test_chunk_graph_runtime_schedule_stashes_and_reloads_matching_layer(monkeyp
 
     events = []
     manager.stash_paged_tensors = lambda key: events.append(('stash', key))
+    manager.remove_paged_tensor_from_stash = lambda: events.append(('discard', None))
     manager.reload_paged_tensors = lambda key: events.append(('reload', key))
     manager.wait_for_stash_to_complete = lambda: events.append(('wait', None))
-    monkeypatch.setattr(torch.cuda, 'current_stream', lambda: SimpleNamespace(wait_stream=lambda _: None))
+    monkeypatch.setattr(
+        torch.cuda, 'current_stream', lambda: SimpleNamespace(wait_stream=lambda _: None)
+    )
 
     ctx = SimpleNamespace()
     tensor = torch.ones(1, requires_grad=True)
@@ -349,36 +328,12 @@ def test_chunk_graph_runtime_schedule_stashes_and_reloads_matching_layer(monkeyp
     PipelinePostScheduleFunction.backward(ctx, torch.ones_like(tensor))
 
     schedule_layer = manager.get_schedule_layer(1, 1, 7)
-    assert events == [('stash', schedule_layer), ('reload', schedule_layer), ('wait', None)]
-    assert manager.current_schedule_index == 2
-
-
-def test_chunk_graph_runtime_schedule_pp1_keeps_matching_activation(monkeypatch):
-    """PP1 has no in-flight gap, so runtime chunk graphs keep the original activation."""
-    manager = PagedStashManager.__new__(PagedStashManager)
-    manager.status = 'captured'
-    manager.chunk_graph_runtime_schedule = True
-    manager.chunk_graph_runtime_stash_activations = False
-    manager.vp_size = 1
-    manager.current_vp_stage = 0
-    manager.current_layer = [1]
-    manager.current_microbatch = [3]
-    manager.current_schedule_index = 0
-    manager._pp_schedule = [999999999]
-    manager._unpack_stream_status = 'idle'
-
-    events = []
-    manager.remove_paged_tensor_from_stash = lambda: events.append(('discard', None))
-    manager.reload_paged_tensors = lambda key: events.append(('reload', key))
-    manager.wait_for_stash_to_complete = lambda: events.append(('wait', None))
-    monkeypatch.setattr(torch.cuda, 'current_stream', lambda: SimpleNamespace(wait_stream=lambda _: None))
-
-    ctx = SimpleNamespace()
-    tensor = torch.ones(1, requires_grad=True)
-    assert PipelinePostScheduleFunction.forward(ctx, tensor, manager) is tensor
-    PipelinePostScheduleFunction.backward(ctx, torch.ones_like(tensor))
-
-    assert events == [('discard', None), ('wait', None)]
+    expected = (
+        [('stash', schedule_layer), ('reload', schedule_layer), ('wait', None)]
+        if stash_activations
+        else [('discard', None), ('wait', None)]
+    )
+    assert events == expected
     assert manager.current_schedule_index == 2
 
 
@@ -417,9 +372,7 @@ def test_local_chunk_graph_retry_runs_eager_and_restores_config():
     runner.model = []
 
     seen_graph_impls = []
-    runner.forward_backward_func = lambda **_kwargs: seen_graph_impls.append(
-        config.cuda_graph_impl
-    )
+    runner.forward_backward_func = lambda **_kwargs: seen_graph_impls.append(config.cuda_graph_impl)
     runner.data_read = lambda data_iterator, _model, _training, _num_microbatches: (
         data_iterator,
         [],
@@ -428,13 +381,7 @@ def test_local_chunk_graph_retry_runs_eager_and_restores_config():
     runner.check_moe_overflow = lambda: next(overflow_results)
     runner.prepare_for_rerun = lambda is_training: None
 
-    runner(
-        model=[],
-        data_iterator=None,
-        num_microbatches=1,
-        seq_length=1,
-        forward_only=False,
-    )
+    runner(model=[], data_iterator=None, num_microbatches=1, seq_length=1, forward_only=False)
 
     assert seen_graph_impls == ['local', 'none']
     assert config.cuda_graph_impl == 'local'
@@ -454,9 +401,7 @@ def test_local_chunk_graph_retry_preserves_captured_stash_buffers(
     )
     release_calls = []
     stash_manager = SimpleNamespace(
-        overflow=None,
-        host_spill=None,
-        release_stash_buffers=lambda: release_calls.append(True),
+        overflow=None, host_spill=None, release_stash_buffers=lambda: release_calls.append(True)
     )
     runner = PagedStashRunner.__new__(PagedStashRunner)
     runner.config = config
@@ -571,9 +516,9 @@ def test_paged_stash_cuda_graph_replay_accepts_variable_token_counts():
     # The default reload mode is the legacy path: only the valid prefix is restored and the
     # caller-owned tail remains untouched.
     legacy_num_tokens = 3
-    expected = torch.arange(
-        max_num_tokens * hidden_size, dtype=torch.float32, device=device
-    ).view(max_num_tokens, hidden_size)
+    expected = torch.arange(max_num_tokens * hidden_size, dtype=torch.float32, device=device).view(
+        max_num_tokens, hidden_size
+    )
     source.copy_(expected)
     restored.fill_(-1)
     num_tokens.fill_(legacy_num_tokens)
@@ -655,16 +600,10 @@ def test_paged_stash_cuda_graph_replay_reports_empty_pool_overflow():
     assert overflow.item() == 1
     assert host_spill.item() == 0
     torch.testing.assert_close(
-        stash_buffer.free_list_head,
-        torch.zeros_like(stash_buffer.free_list_head),
-        rtol=0,
-        atol=0,
+        stash_buffer.free_list_head, torch.zeros_like(stash_buffer.free_list_head), rtol=0, atol=0
     )
     torch.testing.assert_close(
-        stash_buffer.free_list_tail,
-        torch.zeros_like(stash_buffer.free_list_tail),
-        rtol=0,
-        atol=0,
+        stash_buffer.free_list_tail, torch.zeros_like(stash_buffer.free_list_tail), rtol=0, atol=0
     )
 
 

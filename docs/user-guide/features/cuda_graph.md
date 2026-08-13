@@ -27,7 +27,6 @@ CUDA graph behavior is set by the following flags:
 | `--cuda-graph-granularity` | `layer` / `chunk` | Training capture boundary; `chunk` is supported only by `local` |
 | `--cuda-graph-modules` | `attn` / `mlp` / `moe` / `moe_router` / `moe_preprocess` / `mamba` | Per-layer **training** capture coverage; must be empty for `chunk` and `full_iteration` |
 | `--cuda-graph-dynamic-microbatches` | flag | Support changing runtime microbatch counts for TE layer and local chunk graphs, including local chunk graphs with paged stash |
-| `--cuda-graph-num-microbatch-slots` | positive integer | Optional local-chunk in-flight slot count; requires dynamic microbatches |
 | `--inference-cuda-graph-scope` | `none` / `layer` / `block` | Granularity of CUDA graphs during **inference**; only `local` supports non-`none` values |
 
 Supported combinations:
@@ -96,13 +95,10 @@ Operationally, this path is tightly integrated into MCore training and inference
 ### Chunk granularity
 
 Local chunk graphs derive physical activation-slot assignments from the actual 1F1B or interleaved
-schedule and reuse a slot only after the corresponding backward has completed. An omitted
-`--cuda-graph-num-microbatch-slots` derives the exact rank-local topology maximum, including every
-legal partial VPP tail-group shape. An explicit value must be at least as large as that topology
-maximum. Capture remains deferred until real execution has exercised every topology-required slot,
-so a later larger microbatch schedule cannot request a graph runner that was never captured. An
-explicitly overprovisioned slot count must likewise be exercised before capture and can therefore
-delay capture unnecessarily.
+schedule and reuse a slot only after the corresponding backward has completed. The slot count is
+the exact rank-local topology maximum derived from PP/VPP, including every legal partial VPP
+tail-group shape. Capture remains deferred until real execution has exercised every required slot,
+so a later larger microbatch schedule cannot request a graph runner that was never captured.
 
 Chunk granularity is not compatible with `--overlap-moe-expert-parallel-comm`, whose combined
 schedule executes individual layers instead of calling the enclosing `TransformerBlock`, or with

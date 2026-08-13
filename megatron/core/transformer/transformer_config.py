@@ -1212,11 +1212,6 @@ class TransformerConfig(ModelParallelConfig):
     stash/reload schedule, so their graph identity does not depend on the absolute microbatch count
     or warmup/steady/cooldown boundary."""
 
-    cuda_graph_num_microbatch_slots: Optional[int] = None
-    """Number of CUDA graph slots to capture per local model chunk for dynamic replay.
-    Only supported for cuda_graph_impl=local with cuda_graph_granularity=chunk. This is the
-    per-chunk in-flight slot count and may be smaller than the total runtime microbatch count."""
-
     ####################
     # Hyper-Connection Configuration
     ####################
@@ -3052,12 +3047,9 @@ class TransformerConfig(ModelParallelConfig):
                         and self.moe_token_dispatcher_type == "flex"
                         and self.moe_flex_dispatcher_backend == "hybridep"
                     )
-                    has_graph_static_expert_shapes = (
-                        has_static_hybridep_rank_budget
-                        or (
-                            self.moe_expert_capacity_factor is not None
-                            and self.moe_pad_expert_input_to_capacity
-                        )
+                    has_graph_static_expert_shapes = has_static_hybridep_rank_budget or (
+                        self.moe_expert_capacity_factor is not None
+                        and self.moe_pad_expert_input_to_capacity
                     )
                     assert has_graph_static_expert_shapes, (
                         "chunk CUDA graphs capture the complete MoE path and cannot capture "
@@ -3072,20 +3064,6 @@ class TransformerConfig(ModelParallelConfig):
                         "paged-stash chunk CUDA graphs require "
                         "cuda_graph_dynamic_microbatches for schedule-derived runtime slots."
                     )
-            if self.cuda_graph_num_microbatch_slots is not None:
-                assert (
-                    self.cuda_graph_impl == "local"
-                    and self.cuda_graph_granularity == "chunk"
-                    and self.cuda_graph_dynamic_microbatches
-                ), (
-                    "cuda_graph_num_microbatch_slots is only supported with "
-                    "cuda_graph_impl=local, cuda_graph_granularity=chunk, and "
-                    "cuda_graph_dynamic_microbatches."
-                )
-                assert (
-                    self.cuda_graph_num_microbatch_slots >= 1
-                ), "cuda_graph_num_microbatch_slots must be >= 1."
-
             # Check cuda graph scopes for per-layer implementations.
             if self.cuda_graph_impl in ("local", "transformer_engine"):
                 if self.cuda_graph_impl == "local":
@@ -3105,11 +3083,6 @@ class TransformerConfig(ModelParallelConfig):
                         assert self.cuda_graph_granularity == "chunk", (
                             "cuda_graph_dynamic_microbatches with cuda_graph_impl=local requires "
                             "cuda_graph_granularity=chunk."
-                        )
-                    else:
-                        assert self.cuda_graph_num_microbatch_slots is None, (
-                            "cuda_graph_num_microbatch_slots requires "
-                            "cuda_graph_dynamic_microbatches when cuda_graph_impl=local."
                         )
 
                 assert (

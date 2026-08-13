@@ -32,7 +32,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.chunk_cuda_graphs import (
     ChunkCudaGraphRuntimeSlots,
-    build_chunk_cuda_graph_slot_plan_from_schedule,
+    get_chunk_cuda_graph_slot_counts_from_schedule,
     get_chunk_cuda_graph_topology_probe_microbatch_counts,
 )
 from megatron.core.transformer.enums import CudaGraphModule
@@ -93,9 +93,8 @@ def _prepare_paged_stash_for_cuda_graph_capture():
     if stash_manager is None or stash_manager.status != 'captured':
         return None
 
-    if (
-        stash_manager._pp_schedule is not None
-        and not getattr(stash_manager, 'chunk_graph_runtime_schedule', False)
+    if stash_manager._pp_schedule is not None and not getattr(
+        stash_manager, 'chunk_graph_runtime_schedule', False
     ):
         assert stash_manager.current_schedule_index == len(stash_manager._pp_schedule), (
             "Paged stash schedule was not fully consumed before CUDA graph capture: "
@@ -103,8 +102,7 @@ def _prepare_paged_stash_for_cuda_graph_capture():
             f"size={len(stash_manager._pp_schedule)}"
         )
     assert all(
-        len(paged_tensors) == 0
-        for paged_tensors in stash_manager.paged_tensors_to_reload.values()
+        len(paged_tensors) == 0 for paged_tensors in stash_manager.paged_tensors_to_reload.values()
     ), "Paged stash reload queues must be empty before CUDA graph capture."
 
     return stash_manager
@@ -448,9 +446,7 @@ def alloc_tensor_from_graph_mempool(meta: ArgMetadata, mempool=None):
     if mempool is None:
         mempool = CudaGraphManager.global_mempool
 
-    torch._C._cuda_beginAllocateCurrentThreadToPool(
-        torch.cuda.current_device(), mempool
-    )
+    torch._C._cuda_beginAllocateCurrentThreadToPool(torch.cuda.current_device(), mempool)
     out = meta.zeros_like()
     out.is_from_global_mempool = True
     out.requires_grad_(meta.requires_grad)
@@ -1845,7 +1841,7 @@ class CudaGraphManager(torch.nn.Module):
             physical_slot = 0
             if cache_key is not None:
                 assert (
-                    isinstance(cache_key, tuple) and len(cache_key) >= 2 and cache_key[0] == "chunk"
+                    isinstance(cache_key, tuple) and len(cache_key) == 2 and cache_key[0] == "chunk"
                 ), f"Invalid local chunk CUDA graph cache key: {cache_key}"
                 physical_slot = int(cache_key[1])
             if physical_slot not in self.chunk_mempools:
@@ -1861,14 +1857,7 @@ class CudaGraphManager(torch.nn.Module):
     def should_defer_local_chunk_capture(self):
         """Whether real execution has not yet exercised every required physical slot."""
         required_slots = getattr(self, 'local_chunk_capture_required_slots', None)
-        if (
-            required_slots is None
-            or self.reuse_cudagraphs
-            or (
-                getattr(self.config, 'moe_paged_stash', False)
-                and not _uses_chunk_graph_runtime_paged_stash(self.config)
-            )
-        ):
+        if required_slots is None or self.reuse_cudagraphs:
             return False
 
         recorded_slots = {
@@ -1876,7 +1865,7 @@ class CudaGraphManager(torch.nn.Module):
             for cache_key, runner in self.custom_cudagraphs_lookup_table.items()
             if runner is not None
             and isinstance(cache_key, tuple)
-            and len(cache_key) >= 2
+            and len(cache_key) == 2
             and cache_key[0] == "chunk"
         }
         if not recorded_slots:
@@ -3256,39 +3245,13 @@ def _is_local_chunk_dynamic_microbatch_config(config):
     )
 
 
-def _uses_chunk_graph_runtime_paged_stash(config):
-    """Return whether paged stash is owned by reusable physical chunk slots."""
-    return bool(
-        getattr(config, 'moe_paged_stash', False)
-        and _is_local_chunk_dynamic_microbatch_config(config)
-    )
-
-
-def _normalize_chunk_cuda_graph_slot_counts(num_slots_per_chunk, num_model_chunks):
-    """Normalize an int/list slot count into one entry per model chunk."""
-    if isinstance(num_slots_per_chunk, int):
-        num_slots_per_chunk = (num_slots_per_chunk,) * num_model_chunks
-    else:
-        num_slots_per_chunk = tuple(num_slots_per_chunk)
-
-    assert len(num_slots_per_chunk) == num_model_chunks, (
-        "num_slots_per_chunk must have one entry per model chunk: "
-        f"got {num_slots_per_chunk}, num_model_chunks={num_model_chunks}"
-    )
-    assert all(
-        num_slots >= 1 for num_slots in num_slots_per_chunk
-    ), f"num_slots_per_chunk must all be >= 1, got {num_slots_per_chunk}"
-    return num_slots_per_chunk
-
-
 @lru_cache(maxsize=None)
-def _get_cached_non_paged_chunk_capture_slot_counts(
+def _get_cached_chunk_capture_slot_counts(
     pipeline_parallel_size,
     pipeline_parallel_rank,
     virtual_pipeline_parallel_size,
     num_model_chunks,
     group_size,
-    requested_slots,
 ):
     """Compute and cache rank-local capture slots for one immutable PP/VPP topology."""
     from megatron.core.pipeline_parallel.schedules import (
@@ -3300,9 +3263,7 @@ def _get_cached_non_paged_chunk_capture_slot_counts(
     # key so reinitialized model-parallel topologies cannot reuse an incompatible result.
     del pipeline_parallel_rank, virtual_pipeline_parallel_size
     probe_num_microbatch_counts = get_chunk_cuda_graph_topology_probe_microbatch_counts(
-        pipeline_parallel_size,
-        num_model_chunks,
-        group_size,
+        pipeline_parallel_size, num_model_chunks, group_size
     )
     slot_counts = [0] * num_model_chunks
     for probe_num_microbatches in probe_num_microbatch_counts:
@@ -3313,75 +3274,30 @@ def _get_cached_non_paged_chunk_capture_slot_counts(
             forward_only=False,
             overlap_moe_expert_parallel_comm=False,
         )
-        schedule_table = get_schedule_table(
-            probe_num_microbatches, num_model_chunks, group_size
-        )
-        probe_slot_counts = build_chunk_cuda_graph_slot_plan_from_schedule(
+        schedule_table = get_schedule_table(probe_num_microbatches, num_model_chunks, group_size)
+        probe_slot_counts = get_chunk_cuda_graph_slot_counts_from_schedule(
             num_warmup_microbatches, num_model_chunks, schedule_table
-        ).num_slots_per_chunk
+        )
         slot_counts = [
             max(slot_count, probe_slot_count)
             for slot_count, probe_slot_count in zip(slot_counts, probe_slot_counts)
         ]
-    slot_counts = tuple(slot_counts)
-    if requested_slots is not None:
-        assert all(slot_count <= requested_slots for slot_count in slot_counts), (
-            "cuda_graph_num_microbatch_slots is smaller than the topology-required local chunk "
-            f"graph slots: requested={requested_slots}, required_per_chunk={slot_counts}"
-        )
-        return (requested_slots,) * num_model_chunks
-    return slot_counts
+    return tuple(slot_counts)
 
 
-def _get_non_paged_chunk_capture_slot_counts(config, num_model_chunks):
+def _get_chunk_capture_slot_counts(config, num_model_chunks):
     """Return the rank-local capture slot count for each local model chunk."""
-    if getattr(config, 'moe_paged_stash', False) and not _uses_chunk_graph_runtime_paged_stash(
-        config
-    ):
-        return None
-
     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     group_size = getattr(config, 'microbatch_group_size_per_vp_stage', None)
     if group_size is None:
         group_size = pipeline_parallel_size
-    return _get_cached_non_paged_chunk_capture_slot_counts(
+    return _get_cached_chunk_capture_slot_counts(
         pipeline_parallel_size,
         parallel_state.get_pipeline_model_parallel_rank(),
         parallel_state.get_virtual_pipeline_model_parallel_world_size(),
         num_model_chunks,
         group_size,
-        getattr(config, "cuda_graph_num_microbatch_slots", None),
     )
-
-
-def _set_decoder_chunk_cuda_graph_slot_metadata(
-    model_with_decoder, slot, op_type, forward_slot, backward_slot, runner_signature
-):
-    """Set active chunk CUDA graph slot metadata on a decoder and its layers."""
-    decoder = model_with_decoder.decoder
-    decoder.cuda_graph_current_slot = slot
-    decoder.cuda_graph_current_op = op_type
-    decoder.cuda_graph_forward_slot = forward_slot
-    decoder.cuda_graph_backward_slot = backward_slot
-    decoder.cuda_graph_runner_signature = runner_signature
-
-    for layer in decoder.layers:
-        layer.cuda_graph_current_slot = decoder.cuda_graph_current_slot
-        layer.cuda_graph_current_op = decoder.cuda_graph_current_op
-        layer.cuda_graph_forward_slot = decoder.cuda_graph_forward_slot
-        layer.cuda_graph_backward_slot = decoder.cuda_graph_backward_slot
-        layer.cuda_graph_runner_signature = decoder.cuda_graph_runner_signature
-
-    if hasattr(model_with_decoder, 'mtp'):
-        for layer in model_with_decoder.mtp.layers:
-            assert hasattr(
-                layer, 'mtp_model_layer'
-            ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
-            layer.mtp_model_layer.cuda_graph_current_slot = decoder.cuda_graph_current_slot
-            layer.mtp_model_layer.cuda_graph_current_op = decoder.cuda_graph_current_op
-            layer.mtp_model_layer.cuda_graph_forward_slot = decoder.cuda_graph_forward_slot
-            layer.mtp_model_layer.cuda_graph_backward_slot = decoder.cuda_graph_backward_slot
-            layer.mtp_model_layer.cuda_graph_runner_signature = decoder.cuda_graph_runner_signature
 
 
 def _get_model_with_decoder(model):
@@ -3392,9 +3308,9 @@ def _get_model_with_decoder(model):
         return None
 
 
-def _assert_current_chunk_schedule_was_captured(models, slot_plan):
-    """Reject a runtime schedule that needs a local chunk graph that was not captured."""
-    if not _CudagraphGlobalRecord.cudagraph_created or slot_plan is None:
+def _assert_chunk_slots_were_captured(models, num_slots_per_chunk):
+    """Reject replay unless every physical slot has a captured local chunk graph."""
+    if not _CudagraphGlobalRecord.cudagraph_created:
         return
 
     for model_chunk_id, model_chunk in enumerate(models):
@@ -3408,33 +3324,19 @@ def _assert_current_chunk_schedule_was_captured(models, slot_plan):
         if manager is None or getattr(manager, 'reuse_cudagraphs', False):
             continue
 
-        plan_chunk_id = model_chunk_id if len(models) > 1 else 0
-        slots = slot_plan.forward_slot_by_chunk_microbatch[plan_chunk_id]
-        signatures = slot_plan.runner_signature_by_chunk_microbatch[plan_chunk_id]
-        for microbatch_id, slot in enumerate(slots):
-            if slot is None:
-                continue
-            cache_key = ("chunk", int(slot))
-            paged_stash = getattr(decoder.config, 'moe_paged_stash', False)
-            runtime_paged_stash = _uses_chunk_graph_runtime_paged_stash(decoder.config)
-            if paged_stash and not runtime_paged_stash:
-                cache_key += (microbatch_id, signatures[microbatch_id])
-            missing_runner_detail = (
-                "Paged stash requires a fixed packed-microbatch schedule in legacy schedule mode."
-                if paged_stash and not runtime_paged_stash
-                else "All configured physical slots must be exercised before graph capture."
-            )
+        slot_chunk_id = model_chunk_id if len(models) > 1 else 0
+        for slot in range(num_slots_per_chunk[slot_chunk_id]):
+            cache_key = ("chunk", slot)
             assert manager.custom_cudagraphs_lookup_table.get(cache_key) is not None, (
-                "Current local chunk CUDA graph schedule was not captured: "
-                f"chunk={plan_chunk_id}, microbatch={microbatch_id}, cache_key={cache_key}. "
-                f"{missing_runner_detail} A created training graph cannot silently fall back to "
-                "eager execution."
+                "A required local chunk CUDA graph slot was not captured: "
+                f"chunk={slot_chunk_id}, cache_key={cache_key}. "
+                "All physical slots must be exercised before graph capture; a created training "
+                "graph cannot silently fall back to eager execution."
             )
 
 
 def reset_chunk_cuda_graph_runtime_slots(
     model,
-    num_slots_per_chunk=None,
     num_microbatches=None,
     num_model_chunks=1,
     num_warmup_microbatches=None,
@@ -3451,7 +3353,6 @@ def reset_chunk_cuda_graph_runtime_slots(
         return
 
     num_model_chunks = len(models) if len(models) > 1 else int(num_model_chunks)
-    requested_slots = getattr(config, "cuda_graph_num_microbatch_slots", None)
     graph_training_iteration = False
     for model_chunk in models:
         model_with_decoder = _get_model_with_decoder(model_chunk)
@@ -3466,49 +3367,41 @@ def reset_chunk_cuda_graph_runtime_slots(
         for model_with_decoder in (_get_model_with_decoder(model_chunk) for model_chunk in models)
     )
     capture_slot_counts = (
-        _get_non_paged_chunk_capture_slot_counts(config, num_model_chunks)
+        _get_chunk_capture_slot_counts(config, num_model_chunks)
         if has_chunk_manager and graph_training_iteration
         else None
     )
-    slot_plan = None
     if schedule_table is None and num_microbatches is not None:
         schedule_table = tuple((microbatch_id, 0) for microbatch_id in range(num_microbatches))
 
-    required_slot_plan = None
+    required_slot_counts = None
     if schedule_table is not None:
         assert num_warmup_microbatches is not None
-        required_slot_plan = build_chunk_cuda_graph_slot_plan_from_schedule(
+        required_slot_counts = get_chunk_cuda_graph_slot_counts_from_schedule(
             num_warmup_microbatches, num_model_chunks, schedule_table
         )
 
-    if num_slots_per_chunk is None:
-        assert required_slot_plan is not None, (
-            "Chunk CUDA graph slots require a microbatch schedule when no explicit slot count "
-            "is provided."
-        )
-        num_slots_per_chunk = required_slot_plan.num_slots_per_chunk
-
-        if requested_slots is not None:
-            assert all(num_slots <= requested_slots for num_slots in num_slots_per_chunk), (
-                "cuda_graph_num_microbatch_slots is smaller than the topology-required local "
-                f"chunk graph slots: requested={requested_slots}, "
-                f"required_per_chunk={num_slots_per_chunk}"
-            )
-            num_slots_per_chunk = (requested_slots,) * num_model_chunks
-        elif capture_slot_counts is not None:
-            num_slots_per_chunk = capture_slot_counts
-    num_slots_per_chunk = _normalize_chunk_cuda_graph_slot_counts(
-        num_slots_per_chunk, num_model_chunks
+    assert (
+        required_slot_counts is not None
+    ), "Chunk CUDA graph slots require the current microbatch schedule."
+    num_slots_per_chunk = (
+        capture_slot_counts if capture_slot_counts is not None else required_slot_counts
     )
-    if schedule_table is not None:
-        slot_plan = build_chunk_cuda_graph_slot_plan_from_schedule(
-            num_warmup_microbatches,
-            num_model_chunks,
-            schedule_table,
-            num_slots_per_chunk=num_slots_per_chunk,
-        )
+    num_slots_per_chunk = tuple(num_slots_per_chunk)
+    assert len(num_slots_per_chunk) == num_model_chunks, (
+        "Chunk CUDA graph slot counts must have one entry per model chunk: "
+        f"got {num_slots_per_chunk}, num_model_chunks={num_model_chunks}."
+    )
+    assert all(count >= 1 for count in num_slots_per_chunk)
+    assert all(
+        available >= required
+        for available, required in zip(num_slots_per_chunk, required_slot_counts)
+    ), (
+        "The PP/VPP topology-derived chunk CUDA graph slot count is smaller than the current "
+        f"schedule requirement: available={num_slots_per_chunk}, required={required_slot_counts}."
+    )
 
-    _assert_current_chunk_schedule_was_captured(models, slot_plan)
+    _assert_chunk_slots_were_captured(models, num_slots_per_chunk)
 
     for model_chunk_id, model_chunk in enumerate(models):
         model_with_decoder = _get_model_with_decoder(model_chunk)
@@ -3529,21 +3422,7 @@ def reset_chunk_cuda_graph_runtime_slots(
         manager = getattr(model_with_decoder.decoder, 'cudagraph_manager', None)
         if manager is not None:
             manager.local_chunk_capture_required_slots = capture_slots
-        model_with_decoder.decoder.cuda_graph_runner_signatures = (
-            None
-            if slot_plan is None
-            else slot_plan.runner_signature_by_chunk_microbatch[
-                model_chunk_id if len(models) > 1 else 0
-            ]
-        )
-        _set_decoder_chunk_cuda_graph_slot_metadata(
-            model_with_decoder,
-            slot=None,
-            op_type=None,
-            forward_slot=None,
-            backward_slot=None,
-            runner_signature=None,
-        )
+        model_with_decoder.decoder.cuda_graph_forward_slot = None
 
 
 def _set_chunk_cuda_graph_slot(model, microbatch_id, forward):
@@ -3572,29 +3451,9 @@ def _set_chunk_cuda_graph_slot(model, microbatch_id, forward):
     assert runtime_slots is not None, "Chunk CUDA graph runtime slots must be initialized."
     if forward:
         slot = runtime_slots.forward(microbatch_id)
-        op_type = "forward"
+        decoder.cuda_graph_forward_slot = slot
     else:
-        slot = runtime_slots.backward(microbatch_id)
-        op_type = "backward"
-    forward_slot = slot
-    backward_slot = slot
-    runner_signature = None
-    runner_signatures = getattr(decoder, 'cuda_graph_runner_signatures', None)
-    if runner_signatures is not None:
-        assert 0 <= int(microbatch_id) < len(runner_signatures), (
-            f"Missing chunk CUDA graph runner signature for microbatch {microbatch_id}; "
-            f"available={len(runner_signatures)}"
-        )
-        runner_signature = runner_signatures[int(microbatch_id)]
-
-    _set_decoder_chunk_cuda_graph_slot_metadata(
-        model_with_decoder,
-        slot=slot,
-        op_type=op_type,
-        forward_slot=forward_slot,
-        backward_slot=backward_slot,
-        runner_signature=runner_signature,
-    )
+        runtime_slots.backward(microbatch_id)
 
 
 def set_current_cuda_graph_slot(model, microbatch_id, forward=True):

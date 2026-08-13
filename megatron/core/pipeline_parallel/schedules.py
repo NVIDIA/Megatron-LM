@@ -733,7 +733,6 @@ def forward_backward_no_pipelining(
     config = get_model_config(model)
     reset_chunk_cuda_graph_runtime_slots(
         model,
-        num_slots_per_chunk=1,
         num_microbatches=num_microbatches,
         num_model_chunks=1,
         num_warmup_microbatches=0,

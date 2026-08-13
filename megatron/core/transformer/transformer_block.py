@@ -828,25 +828,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             slot = getattr(self, 'current_microbatch', None)
         if slot is None:
             return None
-        cache_key = ("chunk", int(slot))
-        if self.config.moe_paged_stash and not (
-            self.config.cuda_graph_dynamic_microbatches
-            and self.config.cuda_graph_impl == "local"
-            and self.config.cuda_graph_granularity == "chunk"
-        ):
-            microbatch = getattr(self, 'current_microbatch', None)
-            assert (
-                microbatch is not None
-            ), "Paged-stash chunk CUDA graph requires the current microbatch id."
-            runner_signature = getattr(self, 'cuda_graph_runner_signature', None)
-            assert (
-                runner_signature is not None
-            ), "Paged-stash chunk CUDA graph requires a schedule-derived runner signature."
-            # PagedTensor queues are keyed by the absolute PP schedule. Keep one logical runner
-            # per microbatch so ordered capture reproduces every stash/reload transition, while
-            # CudaGraphManager shares physical storage across runners assigned to the same slot.
-            cache_key += (int(microbatch), runner_signature)
-        return cache_key
+        return ("chunk", int(slot))
 
     @staticmethod
     def _make_local_chunk_output_pipeline_safe(output):

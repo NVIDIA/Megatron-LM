@@ -33,11 +33,8 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.chunk_cuda_graphs import (
     ChunkCudaGraphRuntimeSlots,
-    build_chunk_cuda_graph_slot_plan,
-    build_chunk_cuda_graph_slot_plan_from_schedule,
+    get_chunk_cuda_graph_slot_counts_from_schedule,
     get_chunk_cuda_graph_topology_probe_microbatch_counts,
-    get_cuda_graph_schedule_stage_order_from_counts,
-    get_required_num_microbatch_slots_per_chunk,
 )
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
@@ -84,6 +81,12 @@ fp8_available, _ = check_fp8_support()
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
     return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
+
+
+def _local_chunk_cuda_graph_config(**kwargs) -> TransformerConfig:
+    return _base_cuda_graph_config(
+        cuda_graph_impl='local', cuda_graph_modules=[], cuda_graph_granularity='chunk', **kwargs
+    )
 
 
 def test_create_cudagraphs_waits_for_paged_stash_profile(monkeypatch):
@@ -337,9 +340,7 @@ class TestCudaGraphConfigAndArguments:
             )
 
     def test_chunk_granularity_requires_local_full_chunk_scope(self):
-        cfg = _base_cuda_graph_config(
-            cuda_graph_impl='local', cuda_graph_modules=[], cuda_graph_granularity='chunk'
-        )
+        cfg = _local_chunk_cuda_graph_config()
         assert cfg.cuda_graph_granularity == 'chunk'
 
         for impl in ('full_iteration', 'transformer_engine'):
@@ -357,24 +358,9 @@ class TestCudaGraphConfigAndArguments:
                 cuda_graph_granularity='chunk',
             )
 
-    def test_local_chunk_granularity_allows_dynamic_microbatch_slots(self):
-        topology_derived_cfg = _base_cuda_graph_config(
-            cuda_graph_impl='local',
-            cuda_graph_modules=[],
-            cuda_graph_granularity='chunk',
-            cuda_graph_dynamic_microbatches=True,
-        )
-        assert topology_derived_cfg.cuda_graph_num_microbatch_slots is None
-
-        cfg = _base_cuda_graph_config(
-            cuda_graph_impl='local',
-            cuda_graph_modules=[],
-            cuda_graph_granularity='chunk',
-            cuda_graph_dynamic_microbatches=True,
-            cuda_graph_num_microbatch_slots=8,
-        )
+    def test_local_chunk_granularity_allows_dynamic_microbatches(self):
+        cfg = _local_chunk_cuda_graph_config(cuda_graph_dynamic_microbatches=True)
         assert cfg.cuda_graph_dynamic_microbatches is True
-        assert cfg.cuda_graph_num_microbatch_slots == 8
 
         with pytest.raises(AssertionError, match="requires cuda_graph_granularity=chunk"):
             _base_cuda_graph_config(
@@ -384,40 +370,19 @@ class TestCudaGraphConfigAndArguments:
                 cuda_graph_dynamic_microbatches=True,
             )
 
-        with pytest.raises(AssertionError, match="cuda_graph_dynamic_microbatches"):
-            _base_cuda_graph_config(
-                cuda_graph_impl='local',
-                cuda_graph_modules=[],
-                cuda_graph_granularity='chunk',
-                cuda_graph_num_microbatch_slots=8,
-            )
-
     def test_chunk_granularity_rejects_layer_scheduled_moe_overlap(self):
         with pytest.raises(
             AssertionError, match="does not support overlap_moe_expert_parallel_comm"
         ):
-            _base_cuda_graph_config(
-                cuda_graph_impl='local',
-                cuda_graph_modules=[],
-                cuda_graph_granularity='chunk',
-                overlap_moe_expert_parallel_comm=True,
-            )
+            _local_chunk_cuda_graph_config(overlap_moe_expert_parallel_comm=True)
 
     def test_chunk_granularity_rejects_dynamic_context_parallel(self):
         with pytest.raises(AssertionError, match="does not support dynamic context parallel"):
-            _base_cuda_graph_config(
-                cuda_graph_impl='local',
-                cuda_graph_modules=[],
-                cuda_graph_granularity='chunk',
-                dynamic_context_parallel=True,
-            )
+            _local_chunk_cuda_graph_config(dynamic_context_parallel=True)
 
     def test_sequence_packed_chunk_granularity_requires_dynamic_microbatches(self):
         with pytest.raises(AssertionError, match="sequence-packed chunk CUDA graphs require"):
-            _base_cuda_graph_config(
-                cuda_graph_impl='local',
-                cuda_graph_modules=[],
-                cuda_graph_granularity='chunk',
+            _local_chunk_cuda_graph_config(
                 sequence_packing_scheduler='dp_balanced',
                 max_seqlen_per_dp_cp_rank=128,
                 pad_packed_seq_alignment='max',
@@ -425,18 +390,10 @@ class TestCudaGraphConfigAndArguments:
 
     def test_chunk_granularity_requires_graph_static_moe_shapes(self):
         with pytest.raises(AssertionError, match="cannot capture native dropless dispatch"):
-            _base_cuda_graph_config(
-                cuda_graph_impl='local',
-                cuda_graph_modules=[],
-                cuda_graph_granularity='chunk',
-                num_moe_experts=8,
-            )
+            _local_chunk_cuda_graph_config(num_moe_experts=8)
 
         with pytest.raises(AssertionError, match="cannot capture native dropless dispatch"):
-            _base_cuda_graph_config(
-                cuda_graph_impl='local',
-                cuda_graph_modules=[],
-                cuda_graph_granularity='chunk',
+            _local_chunk_cuda_graph_config(
                 num_moe_experts=8,
                 moe_token_dispatcher_type='flex',
                 moe_flex_dispatcher_backend='hybridep',
@@ -444,20 +401,12 @@ class TestCudaGraphConfigAndArguments:
                 moe_expert_rank_capacity_factor=None,
             )
 
-        cfg = _base_cuda_graph_config(
-            cuda_graph_impl='local',
-            cuda_graph_modules=[],
-            cuda_graph_granularity='chunk',
-            num_moe_experts=8,
-            moe_expert_capacity_factor=1.0,
-            moe_pad_expert_input_to_capacity=True,
+        cfg = _local_chunk_cuda_graph_config(
+            num_moe_experts=8, moe_expert_capacity_factor=1.0, moe_pad_expert_input_to_capacity=True
         )
         assert cfg.moe_expert_capacity_factor == 1.0
 
-        rank_capacity_cfg = _base_cuda_graph_config(
-            cuda_graph_impl='local',
-            cuda_graph_modules=[],
-            cuda_graph_granularity='chunk',
+        rank_capacity_cfg = _local_chunk_cuda_graph_config(
             num_moe_experts=8,
             moe_token_dispatcher_type='flex',
             moe_flex_dispatcher_backend='hybridep',
@@ -467,10 +416,7 @@ class TestCudaGraphConfigAndArguments:
         assert rank_capacity_cfg.moe_expert_rank_capacity_factor == 1.0
 
         with pytest.raises(AssertionError, match="with the flex HybridEP dispatcher"):
-            _base_cuda_graph_config(
-                cuda_graph_impl='local',
-                cuda_graph_modules=[],
-                cuda_graph_granularity='chunk',
+            _local_chunk_cuda_graph_config(
                 num_moe_experts=8,
                 moe_flex_dispatcher_backend='hybridep',
                 use_transformer_engine_op_fuser=True,
@@ -479,25 +425,15 @@ class TestCudaGraphConfigAndArguments:
 
     def test_chunk_granularity_rejects_fine_grained_activation_offloading(self):
         with pytest.raises(
-            AssertionError,
-            match="fine-grained activation offloading with cuda_graph_impl='local'",
+            AssertionError, match="fine-grained activation offloading with cuda_graph_impl='local'"
         ):
-            _base_cuda_graph_config(
-                cuda_graph_impl='local',
-                cuda_graph_modules=[],
-                cuda_graph_granularity='chunk',
-                fine_grained_activation_offloading=True,
-                offload_modules=['expert_fc1'],
+            _local_chunk_cuda_graph_config(
+                fine_grained_activation_offloading=True, offload_modules=['expert_fc1']
             )
 
-    def test_paged_stash_chunk_granularity_requires_runtime_slots(self):
-        with pytest.raises(
-            AssertionError, match="require cuda_graph_dynamic_microbatches"
-        ):
-            _base_cuda_graph_config(
-                cuda_graph_impl='local',
-                cuda_graph_modules=[],
-                cuda_graph_granularity='chunk',
+    def test_paged_stash_chunk_granularity_requires_dynamic_microbatches(self):
+        with pytest.raises(AssertionError, match="require cuda_graph_dynamic_microbatches"):
+            _local_chunk_cuda_graph_config(
                 moe_paged_stash=True,
                 moe_expert_rank_capacity_factor=1.0,
                 moe_token_dispatcher_type='flex',
@@ -581,24 +517,6 @@ class TestCudaGraphConfigAndArguments:
         )
         assert args.cuda_graph_impl == 'local'
         assert any("--enable-cuda-graph is deprecated" in msg for msg in print_messages)
-
-    def test_chunk_dynamic_microbatch_cli_flags_are_generated_from_config(self, monkeypatch):
-        args, _, _ = _validated_cuda_graph_cli_args(
-            monkeypatch,
-            [
-                '--cuda-graph-impl',
-                'local',
-                '--cuda-graph-granularity',
-                'chunk',
-                '--cuda-graph-dynamic-microbatches',
-                '--cuda-graph-num-microbatch-slots',
-                '3',
-            ],
-        )
-
-        assert args.cuda_graph_granularity == 'chunk'
-        assert args.cuda_graph_dynamic_microbatches is True
-        assert args.cuda_graph_num_microbatch_slots == 3
 
     def test_full_iteration_inference_scope_cli_migrates_to_block_scope(self, monkeypatch):
         args, warning_messages, _ = _validated_cuda_graph_cli_args(
@@ -866,7 +784,7 @@ class TestLocalChunkCudaGraphOutput:
 
 
 class TestChunkCudaGraphRuntimeSlots:
-    def test_omitted_slot_count_uses_rank_local_topology_maximum(self, monkeypatch):
+    def test_topology_slot_count_controls_all_required_capture_slots(self, monkeypatch):
         import megatron.core.transformer.cuda_graphs as cuda_graphs
 
         class DummyModel(torch.nn.Module):
@@ -876,19 +794,17 @@ class TestChunkCudaGraphRuntimeSlots:
                     cuda_graph_impl="local",
                     cuda_graph_granularity="chunk",
                     cuda_graph_dynamic_microbatches=True,
-                    cuda_graph_num_microbatch_slots=None,
                     moe_paged_stash=False,
                 )
-                self.decoder = SimpleNamespace(
-                    layers=[],
-                    cudagraph_manager=SimpleNamespace(
-                        reuse_cudagraphs=False, custom_cudagraphs_lookup_table={}
-                    ),
-                )
+                manager = CudaGraphManager.__new__(CudaGraphManager)
+                manager.reuse_cudagraphs = False
+                manager.custom_cudagraphs_lookup_table = {}
+                self.decoder = SimpleNamespace(layers=[], cudagraph_manager=manager)
 
         monkeypatch.setattr(
-            cuda_graphs, "_get_non_paged_chunk_capture_slot_counts", lambda _config, _chunks: (3,)
+            cuda_graphs, "_get_chunk_capture_slot_counts", lambda _config, _chunks: (3,)
         )
+        monkeypatch.setattr(cuda_graphs, "log_single_rank", lambda *args, **kwargs: None)
         monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_created", False)
         model = DummyModel()
 
@@ -897,68 +813,13 @@ class TestChunkCudaGraphRuntimeSlots:
         )
 
         assert model.decoder.cuda_graph_runtime_slots.num_slots == 3
-        assert model.decoder.cudagraph_manager.local_chunk_capture_required_slots == 3
-
-    def test_capture_waits_until_all_topology_slots_are_recorded(self, monkeypatch):
-        import megatron.core.transformer.cuda_graphs as cuda_graphs
-
-        monkeypatch.setattr(cuda_graphs, "log_single_rank", lambda *args, **kwargs: None)
-        manager = CudaGraphManager.__new__(CudaGraphManager)
-        manager.config = SimpleNamespace(moe_paged_stash=False)
-        manager.reuse_cudagraphs = False
-        manager.local_chunk_capture_required_slots = 2
-        manager.custom_cudagraphs_lookup_table = {("chunk", 0): object()}
-
-        assert manager.should_defer_local_chunk_capture()
-
-        manager.custom_cudagraphs_lookup_table[("chunk", 1)] = object()
-        assert not manager.should_defer_local_chunk_capture()
-
-    def test_explicit_slot_count_waits_for_every_requested_slot(self, monkeypatch):
-        import megatron.core.transformer.cuda_graphs as cuda_graphs
-
-        monkeypatch.setattr(cuda_graphs, "log_single_rank", lambda *args, **kwargs: None)
-        manager = CudaGraphManager.__new__(CudaGraphManager)
-        manager.config = SimpleNamespace(moe_paged_stash=False)
-        manager.reuse_cudagraphs = False
-        manager.local_chunk_capture_required_slots = 4
-        manager.custom_cudagraphs_lookup_table = {
-            ("chunk", 0): object(),
-            ("chunk", 1): object(),
-        }
-
-        assert manager.should_defer_local_chunk_capture()
+        manager = model.decoder.cudagraph_manager
+        assert manager.local_chunk_capture_required_slots == 3
         manager.custom_cudagraphs_lookup_table.update(
-            {("chunk", 2): object(), ("chunk", 3): object()}
+            {("chunk", 0): object(), ("chunk", 1): object()}
         )
-        assert not manager.should_defer_local_chunk_capture()
-
-    def test_legacy_paged_stash_does_not_use_topology_slot_deferral(self):
-        manager = CudaGraphManager.__new__(CudaGraphManager)
-        manager.config = SimpleNamespace(moe_paged_stash=True)
-        manager.reuse_cudagraphs = False
-        manager.local_chunk_capture_required_slots = 2
-        manager.custom_cudagraphs_lookup_table = {("chunk", 0): object()}
-
-        assert not manager.should_defer_local_chunk_capture()
-
-    def test_runtime_paged_stash_waits_for_all_topology_slots(self, monkeypatch):
-        import megatron.core.transformer.cuda_graphs as cuda_graphs
-
-        monkeypatch.setattr(cuda_graphs, "log_single_rank", lambda *args, **kwargs: None)
-        manager = CudaGraphManager.__new__(CudaGraphManager)
-        manager.config = SimpleNamespace(
-            cuda_graph_impl="local",
-            cuda_graph_granularity="chunk",
-            cuda_graph_dynamic_microbatches=True,
-            moe_paged_stash=True,
-        )
-        manager.reuse_cudagraphs = False
-        manager.local_chunk_capture_required_slots = 2
-        manager.custom_cudagraphs_lookup_table = {("chunk", 0): object()}
-
         assert manager.should_defer_local_chunk_capture()
-        manager.custom_cudagraphs_lookup_table[("chunk", 1)] = object()
+        manager.custom_cudagraphs_lookup_table[("chunk", 2)] = object()
         assert not manager.should_defer_local_chunk_capture()
 
     def test_runtime_slots_reuse_released_forward_slots(self):
@@ -974,41 +835,13 @@ class TestChunkCudaGraphRuntimeSlots:
         assert runtime_slots.backward(3) == 1
         assert list(runtime_slots.available_slots) == [0, 1]
 
-    def test_runtime_slots_support_more_total_microbatches_than_slots(self):
-        runtime_slots = ChunkCudaGraphRuntimeSlots(2)
-        seen_slots = set()
-        for microbatch_id in range(32):
-            slot = runtime_slots.forward(microbatch_id)
-            seen_slots.add(slot)
-            assert runtime_slots.backward(microbatch_id) == slot
-
-        assert seen_slots == {0, 1}
-        assert list(runtime_slots.available_slots) == [0, 1]
-
-    def test_smaller_iteration_replays_only_captured_slot_subset(self):
-        runtime_slots = ChunkCudaGraphRuntimeSlots(4)
-
-        def run_two_microbatches():
-            used_slots = []
-            for microbatch_id in range(2):
-                used_slots.append(runtime_slots.forward(microbatch_id))
-            for microbatch_id, slot in enumerate(used_slots):
-                assert runtime_slots.backward(microbatch_id) == slot
-            return used_slots
-
-        assert run_two_microbatches() == [0, 1]
-        assert set(runtime_slots.available_slots) == {0, 1, 2, 3}
-
-        runtime_slots.reset()
-        assert run_two_microbatches() == [0, 1]
-
     def test_runtime_slots_reject_slot_exhaustion(self):
         runtime_slots = ChunkCudaGraphRuntimeSlots(1)
         runtime_slots.forward(0)
-        with pytest.raises(AssertionError, match="No free chunk CUDA graph runtime slot"):
+        with pytest.raises(AssertionError, match="No free chunk CUDA graph slot"):
             runtime_slots.forward(1)
 
-    def test_reset_runtime_slots_sets_decoder_metadata(self):
+    def test_reset_runtime_slots_sets_forward_slot(self):
         class DummyModel(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -1016,7 +849,6 @@ class TestChunkCudaGraphRuntimeSlots:
                     cuda_graph_impl="local",
                     cuda_graph_granularity="chunk",
                     cuda_graph_dynamic_microbatches=True,
-                    cuda_graph_num_microbatch_slots=2,
                 )
                 self.decoder = SimpleNamespace(layers=[])
 
@@ -1029,8 +861,6 @@ class TestChunkCudaGraphRuntimeSlots:
         set_current_microbatch(model, 1)
         assert model.decoder.cuda_graph_forward_slot == 1
         set_current_cuda_graph_slot(model, 0, forward=False)
-        assert model.decoder.cuda_graph_current_slot == 0
-        assert model.decoder.cuda_graph_current_op == "backward"
         set_current_microbatch(model, 2)
         assert model.decoder.cuda_graph_forward_slot == 0
 
@@ -1042,7 +872,6 @@ class TestChunkCudaGraphRuntimeSlots:
                     cuda_graph_impl="local",
                     cuda_graph_granularity="chunk",
                     cuda_graph_dynamic_microbatches=True,
-                    cuda_graph_num_microbatch_slots=1,
                 )
                 self.decoder = SimpleNamespace(layers=[])
 
@@ -1073,7 +902,6 @@ class TestChunkCudaGraphRuntimeSlots:
                     cuda_graph_impl="local",
                     cuda_graph_granularity="chunk",
                     cuda_graph_dynamic_microbatches=True,
-                    cuda_graph_num_microbatch_slots=3,
                     moe_paged_stash=True,
                 )
                 self.decoder = SimpleNamespace(layers=[], config=self.config)
@@ -1084,7 +912,7 @@ class TestChunkCudaGraphRuntimeSlots:
             reuse_cudagraphs=False, custom_cudagraphs_lookup_table=captured_runners
         )
         monkeypatch.setattr(
-            cuda_graphs, "_get_non_paged_chunk_capture_slot_counts", lambda _config, _chunks: (3,)
+            cuda_graphs, "_get_chunk_capture_slot_counts", lambda _config, _chunks: (3,)
         )
         monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_created", True)
 
@@ -1096,8 +924,7 @@ class TestChunkCudaGraphRuntimeSlots:
             model, num_microbatches=3, num_model_chunks=1, num_warmup_microbatches=1
         )
 
-        # Moving the warmup/steady boundary changes the legacy prefetch signature, but the
-        # runtime schedule always stashes a slot on forward and reloads it on matching backward.
+        # The physical slots stay valid when the warmup/steady boundary moves.
         reset_chunk_cuda_graph_runtime_slots(
             model, num_microbatches=4, num_model_chunks=1, num_warmup_microbatches=2
         )
@@ -1112,81 +939,6 @@ class TestChunkCudaGraphRuntimeSlots:
             forward_only=True,
         )
         assert not model.decoder.cuda_graph_training_iteration
-
-    def test_runtime_paged_stash_reuses_slots_across_legacy_signatures(self):
-        class DummyModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.config = SimpleNamespace(
-                    cuda_graph_impl="local",
-                    cuda_graph_granularity="chunk",
-                    cuda_graph_dynamic_microbatches=True,
-                    cuda_graph_num_microbatch_slots=None,
-                    moe_paged_stash=True,
-                )
-                self.decoder = SimpleNamespace(layers=[])
-
-        model = DummyModel()
-        reset_chunk_cuda_graph_runtime_slots(
-            model, num_microbatches=4, num_model_chunks=1, num_warmup_microbatches=1
-        )
-
-        slots = []
-        for microbatch_id in range(4):
-            slots.append(model.decoder.cuda_graph_runtime_slots.forward(microbatch_id))
-            if microbatch_id > 0:
-                model.decoder.cuda_graph_runtime_slots.backward(microbatch_id - 1)
-
-        assert slots == [0, 1, 0, 1]
-        signatures = model.decoder.cuda_graph_runner_signatures
-        assert all(signature is not None for signature in signatures)
-        assert signatures[0] != signatures[2]
-
-    def test_runtime_paged_stash_cache_key_is_physical_slot_only(self):
-        block = TransformerBlock.__new__(TransformerBlock)
-        torch.nn.Module.__init__(block)
-        block.config = SimpleNamespace(
-            cuda_graph_impl="local",
-            cuda_graph_granularity="chunk",
-            cuda_graph_dynamic_microbatches=True,
-            moe_paged_stash=True,
-        )
-        block.cudagraph_manager = SimpleNamespace(reuse_cudagraphs=False)
-        block.cuda_graph_forward_slot = 0
-        block.current_microbatch = 2
-        block.cuda_graph_runner_signature = ("steady",)
-
-        assert block._get_local_chunk_cuda_graph_cache_key() == ("chunk", 0)
-
-    def test_chunk_cache_keys_share_pool_by_physical_slot(self, monkeypatch):
-        import megatron.core.transformer.cuda_graphs as cuda_graphs
-
-        created_pools = iter(("pool-0", "pool-1"))
-        monkeypatch.setattr(torch.cuda, "graph_pool_handle", lambda: next(created_pools))
-        monkeypatch.setattr(
-            cuda_graphs,
-            "_CudaGraphRunner",
-            lambda _module, mempool, *_args: SimpleNamespace(mempool=mempool),
-        )
-
-        manager = CudaGraphManager.__new__(CudaGraphManager)
-        torch.nn.Module.__init__(manager)
-        manager.config = SimpleNamespace(
-            cuda_graph_impl="local",
-            cuda_graph_granularity="chunk",
-            cuda_graph_dynamic_microbatches=True,
-        )
-        manager.chunk_mempools = {}
-        manager.func = None
-        manager.need_backward = True
-        manager._num_warmup_steps = None
-
-        runner_0a = manager._create_runner(None, (), {}, cache_key=("chunk", 0, 0))
-        runner_0b = manager._create_runner(None, (), {}, cache_key=("chunk", 0, 2))
-        runner_1 = manager._create_runner(None, (), {}, cache_key=("chunk", 1, 1))
-
-        assert runner_0a.mempool == runner_0b.mempool == "pool-0"
-        assert runner_1.mempool == "pool-1"
 
 
 class TestParallelTransformerBlockCudagraphs:
@@ -2033,35 +1785,7 @@ class TestRequiredNumMicrobatchSlots:
             self._slots([-1], 1)
 
 
-class TestChunkCudaGraphScheduleStageOrder:
-    @staticmethod
-    def _stages(num_warmup_microbatches, num_scheduled_microbatches):
-        return list(
-            get_cuda_graph_schedule_stage_order_from_counts(
-                num_warmup_microbatches, num_scheduled_microbatches
-            )
-        )
-
-    def test_pp2_1f1b_stage_boundaries(self):
-        assert self._stages(1, 4) == [
-            "warmup",
-            "steady",
-            "steady",
-            "steady",
-            "steady",
-            "steady",
-            "steady",
-            "cooldown",
-        ]
-
-    def test_single_microbatch_has_no_steady_region(self):
-        assert self._stages(1, 1) == ["warmup", "cooldown"]
-
-    def test_single_microbatch_without_warmup_is_steady(self):
-        assert self._stages(0, 1) == ["steady", "steady"]
-
-
-class TestChunkCudaGraphSlotPlan:
+class TestChunkCudaGraphSlotCounts:
     def test_topology_probe_covers_partial_vpp_tail_group(self):
         def make_schedule_table(num_microbatches, group_size=4):
             return [
@@ -2075,93 +1799,24 @@ class TestChunkCudaGraphSlotPlan:
 
         # PP2/VPP2 rank 1 has four warmup virtual microbatches. A full final group misses the
         # second live slot needed by chunk 1 when the legal tail-group size is two.
-        full_group_plan = build_chunk_cuda_graph_slot_plan_from_schedule(
+        full_group_slots = get_chunk_cuda_graph_slot_counts_from_schedule(
             4, 2, make_schedule_table(16)
         )
-        partial_group_plan = build_chunk_cuda_graph_slot_plan_from_schedule(
+        partial_group_slots = get_chunk_cuda_graph_slot_counts_from_schedule(
             4, 2, make_schedule_table(6)
         )
-        assert full_group_plan.num_slots_per_chunk == (5, 1)
-        assert partial_group_plan.num_slots_per_chunk == (5, 2)
+        assert full_group_slots == (5, 1)
+        assert partial_group_slots == (5, 2)
 
         probe_counts = get_chunk_cuda_graph_topology_probe_microbatch_counts(2, 2, 4)
         assert probe_counts == (16, 18, 19)
         probe_slot_counts = [
-            build_chunk_cuda_graph_slot_plan_from_schedule(
+            get_chunk_cuda_graph_slot_counts_from_schedule(
                 4, 2, make_schedule_table(num_microbatches)
-            ).num_slots_per_chunk
+            )
             for num_microbatches in probe_counts
         ]
         assert tuple(max(counts) for counts in zip(*probe_slot_counts)) == (5, 2)
-
-    def test_pp2_rank0_reuses_two_slots(self):
-        order = [1, 1, -1, 1, -1, 1, -1, -1]
-        plan = build_chunk_cuda_graph_slot_plan(order, num_model_chunks=1)
-
-        assert plan.num_slots_per_chunk == (2,)
-        assert plan.slot_ids == (0, 1, 0, 0, 1, 1, 0, 1)
-        assert plan.op_types == (
-            "forward",
-            "forward",
-            "backward",
-            "forward",
-            "backward",
-            "forward",
-            "backward",
-            "backward",
-        )
-
-    def test_pp2_rank1_only_needs_one_slot(self):
-        order = [1, -1, 1, -1, 1, -1, 1, -1]
-        plan = build_chunk_cuda_graph_slot_plan(order, num_model_chunks=1)
-
-        assert plan.num_slots_per_chunk == (1,)
-        assert plan.slot_ids == (0, 0, 0, 0, 0, 0, 0, 0)
-
-    def test_slots_are_per_chunk(self):
-        order = [1, 2, -2, 1, -1, -1]
-        assert get_required_num_microbatch_slots_per_chunk(order, 2) == (2, 1)
-
-        plan = build_chunk_cuda_graph_slot_plan(order, num_model_chunks=2)
-        assert plan.num_slots_per_chunk == (2, 1)
-        assert plan.chunk_ids == (0, 1, 1, 0, 0, 0)
-        assert plan.slot_ids == (0, 0, 0, 1, 0, 1)
-
-    def test_non_integer_entries_are_auxiliary(self):
-        plan = build_chunk_cuda_graph_slot_plan([1, -1.5, -1], num_model_chunks=1)
-
-        assert plan.num_slots_per_chunk == (1,)
-        assert plan.op_types == ("forward", "aux", "backward")
-        assert plan.slot_ids == (0, None, 0)
-        assert plan.chunk_ids == (0, None, 0)
-
-    def test_invalid_order_asserts(self):
-        with pytest.raises(AssertionError, match="negative outstanding"):
-            build_chunk_cuda_graph_slot_plan([-1], num_model_chunks=1)
-
-    def test_schedule_table_preserves_virtual_microbatch_slots(self):
-        schedule_table = [(0, 0), (1, 0), (2, 0), (3, 0)]
-        plan = build_chunk_cuda_graph_slot_plan_from_schedule(
-            num_warmup_microbatches=1, num_model_chunks=1, schedule_table=schedule_table
-        )
-
-        assert plan.order == (1, 1, -1, 1, -1, 1, -1, -1)
-        assert plan.virtual_microbatch_ids == (0, 1, 0, 2, 1, 3, 2, 3)
-        assert plan.microbatch_ids == (0, 1, 0, 2, 1, 3, 2, 3)
-        assert plan.slot_ids == (0, 1, 0, 0, 1, 1, 0, 1)
-        assert plan.forward_slot_by_chunk_microbatch == ((0, 1, 0, 1),)
-        assert plan.backward_slot_by_chunk_microbatch == ((0, 1, 0, 1),)
-        assert plan.get_forward_slot(0, 2) == 0
-        assert plan.get_backward_slot(0, 3) == 1
-
-    def test_schedule_table_preserves_chunk_local_microbatch_slots(self):
-        schedule_table = [(0, 0), (1, 0), (0, 1), (1, 1)]
-        plan = build_chunk_cuda_graph_slot_plan_from_schedule(
-            num_warmup_microbatches=3, num_model_chunks=2, schedule_table=schedule_table
-        )
-
-        assert plan.forward_slot_by_chunk_microbatch == ((0, 1), (0, 1))
-        assert plan.backward_slot_by_chunk_microbatch == ((0, 1), (0, 1))
 
     def test_required_slots_stabilize_for_larger_microbatch_count(self):
         def make_schedule_table(num_microbatches):
@@ -2171,54 +1826,11 @@ class TestChunkCudaGraphSlotPlan:
                 for chunk_id in range(2)
             ]
 
-        short_plan = build_chunk_cuda_graph_slot_plan_from_schedule(3, 2, make_schedule_table(4))
-        long_plan = build_chunk_cuda_graph_slot_plan_from_schedule(3, 2, make_schedule_table(12))
+        short_slots = get_chunk_cuda_graph_slot_counts_from_schedule(3, 2, make_schedule_table(4))
+        long_slots = get_chunk_cuda_graph_slot_counts_from_schedule(3, 2, make_schedule_table(12))
 
-        assert short_plan.num_slots_per_chunk == (3, 2)
-        assert long_plan.num_slots_per_chunk == short_plan.num_slots_per_chunk
-
-    def test_paged_stash_signatures_identify_repeated_schedule_actions(self):
-        plan = build_chunk_cuda_graph_slot_plan_from_schedule(
-            1, 1, [(microbatch_id, 0) for microbatch_id in range(8)]
-        )
-
-        runner_keys = {
-            (plan.get_forward_slot(0, microbatch_id), plan.get_runner_signature(0, microbatch_id))
-            for microbatch_id in range(8)
-        }
-        assert len(runner_keys) == 5
-
-        warmup = plan.get_runner_signature(0, 0)
-        first_steady = plan.get_runner_signature(0, 1)
-        repeated_steady = plan.get_runner_signature(0, 3)
-        cooldown_source = plan.get_runner_signature(0, 6)
-        assert warmup.forward_action == "stash"
-        assert not warmup.forward_wait_for_stash
-        assert first_steady.forward_wait_for_stash
-        assert first_steady.forward_action == "stash_prefetch"
-        assert first_steady.forward_target == (0, 0)
-        assert not repeated_steady.forward_wait_for_stash
-        assert cooldown_source.backward_action == "reload"
-        assert cooldown_source.backward_target == (0, 1)
-
-    def test_schedule_signatures_follow_overprovisioned_physical_slots(self):
-        plan = build_chunk_cuda_graph_slot_plan_from_schedule(
-            1, 1, [(microbatch_id, 0) for microbatch_id in range(5)], num_slots_per_chunk=3
-        )
-
-        assert plan.num_slots_per_chunk == (3,)
-        assert plan.forward_slot_by_chunk_microbatch == ((0, 1, 2, 0, 1),)
-        assert plan.get_runner_signature(0, 2).forward_target == (0, 1)
-
-    def test_interleaved_signatures_pair_chunk_local_forward_and_backward(self):
-        schedule_table = [
-            (microbatch_id, chunk_id) for microbatch_id in range(4) for chunk_id in range(2)
-        ]
-        plan = build_chunk_cuda_graph_slot_plan_from_schedule(3, 2, schedule_table)
-
-        for chunk_id in range(2):
-            for microbatch_id in range(4):
-                assert plan.get_runner_signature(chunk_id, microbatch_id) is not None
+        assert short_slots == (3, 2)
+        assert long_slots == short_slots
 
 
 def is_deep_ep_available():
