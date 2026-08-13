@@ -64,6 +64,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
 
       - name: Get PR info
         id: get-pr-info
@@ -454,11 +455,8 @@ jobs:
       - configure
       - cicd-wait-in-queue
       - cicd-parse-downstream-testing
-    # skip downstream mbridge testing on PR pushes by
-    # default. They still run for merge_group and nightly (schedule /
-    # workflow_dispatch) triggers, and PR authors can opt in by adding the
-    # "Run MBridge tests" label — all three cases set
-    # configure.outputs.run_mbridge == 'true'.
+    # Raw App credentials are available only on the explicitly approved
+    # pull-request/<number> push path. Other trigger types skip this job.
     if: |
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
@@ -487,7 +485,7 @@ jobs:
           MBRIDGE_MCORE_REF: ${{ needs.configure.outputs.sha }}
           MBRIDGE_TEST_SUITE: ${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}
           MBRIDGE_POLL_TIMEOUT_SECONDS: "12600"
-        run: python3 .github/scripts/orchestrate_mbridge.py
+        run: python3 .github/scripts/trigger_workflow_and_wait.py
 
   cicd-mbridge-testing-notify:
     runs-on: ubuntu-latest
@@ -507,148 +505,6 @@ jobs:
             • Trigger: `${{ github.event_name }}` on `${{ github.ref_name }}`
             • Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow run #${{ github.run_id }}>
             ${{ needs.cicd-mbridge-testing.result == 'failure' && format('cc <!subteam^{0}>', secrets.SLACK_NEMO_MB_CODEOWNERS_GROUP_ID) || '' }}
-
-  cicd-mbridge-testing-trusted:
-    runs-on: ubuntu-latest
-    needs:
-      - pre-flight
-      - configure
-      - cicd-wait-in-queue
-      - cicd-parse-downstream-testing
-    # skip downstream mbridge testing on PR pushes by
-    # default. They still run for merge_group and nightly (schedule /
-    # workflow_dispatch) triggers, and PR authors can opt in by adding the
-    # "Run MBridge tests" label — all three cases set
-    # configure.outputs.run_mbridge == 'true'.
-    if: |
-      needs.pre-flight.result != 'cancelled'
-      && needs.configure.result != 'cancelled'
-      && needs.cicd-wait-in-queue.result != 'cancelled'
-      && needs.cicd-parse-downstream-testing.result != 'cancelled'
-      && vars.ENABLE_CICD_MBRIDGE_TESTING == 'true'
-      && !(github.event_name == 'push' && startsWith(github.ref, 'refs/heads/pull-request/'))
-      && needs.configure.outputs.run_mbridge == 'true'
-      && (
-        success()
-        || needs.pre-flight.outputs.is_ci_workload == 'true'
-        || needs.pre-flight.outputs.force_run_all == 'true'
-        || needs.pre-flight.outputs.is_merge_group == 'true'
-      )
-      && !cancelled()
-    timeout-minutes: 300
-    steps:
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
-
-      - name: Generate MBridge branch token
-        id: branch-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-          owner: NVIDIA-NeMo
-          repositories: Megatron-Bridge
-          permission-contents: write
-
-      - name: Checkout Megatron-LM
-        uses: actions/checkout@v6
-
-      - name: Checkout MBridge and create testing branch
-        uses: actions/checkout@v6
-        with:
-          ref: main
-          repository: NVIDIA-NeMo/Megatron-Bridge
-          path: megatron-bridge
-          token: ${{ steps.branch-token.outputs.token }}
-
-      - name: Create testing branch
-        env:
-          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
-        run: |
-          cd megatron-bridge
-          git fetch origin main
-          git checkout -b ${{ env.MBRIDGE_BRANCH_NAME }} origin/main
-          git push origin ${{ env.MBRIDGE_BRANCH_NAME }} --force
-
-      - name: Generate MBridge trigger token
-        id: trigger-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-          owner: NVIDIA-NeMo
-          repositories: Megatron-Bridge
-          permission-actions: write
-
-      - name: Trigger MBridge tests
-        id: trigger-mbridge
-        env:
-          CLIENT_PAYLOAD: >-
-            {"mcore_ref":"${{ needs.configure.outputs.sha }}","test_suite":"${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}","triggered_by":"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"}
-          GH_TOKEN: ${{ steps.trigger-token.outputs.token }}
-          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
-        run: |
-          python3 .github/scripts/trigger_workflow_and_wait.py \
-            --owner NVIDIA-NeMo \
-            --repo Megatron-Bridge \
-            --wait-interval 60 \
-            trigger \
-            --workflow cicd-main.yml \
-            --ref "${{ env.MBRIDGE_BRANCH_NAME }}" \
-            --client-payload "${CLIENT_PAYLOAD}"
-
-      - name: Wait for MBridge tests
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 .github/scripts/trigger_workflow_and_wait.py \
-            --owner NVIDIA-NeMo \
-            --repo Megatron-Bridge \
-            --wait-interval 60 \
-            poll \
-            --run-id "${{ steps.trigger-mbridge.outputs.workflow_id }}" \
-            --poll-timeout 12600
-
-      - name: Generate cleanup token
-        if: always()
-        id: cleanup-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ vars.BOT_ID }}
-          private-key: ${{ secrets.BOT_KEY }}
-          owner: NVIDIA-NeMo
-          repositories: Megatron-Bridge
-          permission-contents: write
-
-      - name: Delete testing branch
-        if: always() && steps.cleanup-token.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ steps.cleanup-token.outputs.token }}
-          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
-        run: |
-          gh api --method DELETE \
-            "/repos/NVIDIA-NeMo/Megatron-Bridge/git/refs/heads/${{ env.MBRIDGE_BRANCH_NAME }}"
-
-  cicd-mbridge-testing-trusted-notify:
-    runs-on: ubuntu-latest
-    needs: [cicd-mbridge-testing-trusted]
-    # Notify on both success and failure of the MBridge downstream tests.
-    # Skipped/cancelled runs are intentionally not announced.
-    if: |
-      always()
-      && (needs.cicd-mbridge-testing-trusted.result == 'success' || needs.cicd-mbridge-testing-trusted.result == 'failure')
-    steps:
-      - name: Send Slack alert
-        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@main
-        with:
-          webhook: ${{ secrets.SLACK_WH_MLM_MB_ALERTS }}
-          message: |
-            ${{ needs.cicd-mbridge-testing-trusted.result == 'success' && ':white_check_mark: *MBridge downstream tests passed*' || ':rotating_light: *MBridge downstream tests failed*' }}
-            • Trigger: `${{ github.event_name }}` on `${{ github.ref_name }}`
-            • Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow run #${{ github.run_id }}>
-            ${{ needs.cicd-mbridge-testing-trusted.result == 'failure' && format('cc <!subteam^{0}>', secrets.SLACK_NEMO_MB_CODEOWNERS_GROUP_ID) || '' }}
 
   cicd-compute-build-matrix:
     runs-on: ubuntu-latest
@@ -1317,7 +1173,6 @@ jobs:
               and (.conclusion == "failure" or .conclusion == "cancelled")
               and .name != "merge-queue-notification"
               and .name != "cicd-mbridge-testing"
-              and .name != "cicd-mbridge-testing-trusted"
             )] | length
           ') || BAD_JOBS=0
 
@@ -1329,7 +1184,6 @@ jobs:
                 and (.conclusion == "failure" or .conclusion == "cancelled")
                 and .name != "merge-queue-notification"
                 and .name != "cicd-mbridge-testing"
-              and .name != "cicd-mbridge-testing-trusted"
               ) | .name + " → " + .conclusion
             '
             FAILED=true
