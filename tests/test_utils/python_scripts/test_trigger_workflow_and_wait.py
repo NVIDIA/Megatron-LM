@@ -80,10 +80,7 @@ def test_create_app_jwt_is_short_lived_and_invokes_openssl():
 
 def test_poll_run_refreshes_actions_read_tokens():
     credentials = iter(
-        [
-            MODULE.Credential("token-1", 15 * 60 * 1000),
-            MODULE.Credential("token-2", 60 * 60 * 1000),
-        ]
+        [MODULE.Credential("token-1", 15 * 60 * 1000), MODULE.Credential("token-2", 60 * 60 * 1000)]
     )
     minted = []
 
@@ -146,9 +143,7 @@ def test_orchestrate_scopes_tokens_and_cleans_up():
         requests.append((token, method, path, body))
         if path.endswith("/git/ref/heads/main"):
             return {"object": {"sha": "b" * 40}}
-        if path.endswith(
-            "/runs?event=workflow_dispatch&branch=mcore-testing-456-2&per_page=100"
-        ):
+        if path.endswith("/runs?event=workflow_dispatch&branch=mcore-testing-456-2&per_page=100"):
             count = sum(1 for request_entry in requests if request_entry[2] == path)
             if count == 1:
                 return {"workflow_runs": []}
@@ -168,11 +163,7 @@ def test_orchestrate_scopes_tokens_and_cleans_up():
 
     times = iter([1_000, 1_000, 1_000, 1_000, 1_000, 1_000, 1_000])
     MODULE.orchestrate(
-        config(),
-        request=request,
-        now=lambda: next(times),
-        sleep=lambda _: None,
-        mint_token=mint,
+        config(), request=request, now=lambda: next(times), sleep=lambda _: None, mint_token=mint
     )
     assert minted == [
         {"contents": "write"},
