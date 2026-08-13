@@ -153,6 +153,22 @@ class GatedDeltaNet(_GDNBase):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
+        if cp_size_headwise > 1 and (
+            (
+                packed_seq_params is not None
+                and packed_seq_params.qkv_format == "thd"
+                and packed_seq_params.cp_partition_mode != "zigzag"
+            )
+            or (
+                (packed_seq_params is None or packed_seq_params.qkv_format != "thd")
+                and self.config.cp_partition_mode != "zigzag"
+            )
+        ):
+            raise ValueError(
+                "GatedDeltaNet with headwise CP requires zigzag layout. CP partition "
+                "conversion must be handled before calling GatedDeltaNet."
+            )
+
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (

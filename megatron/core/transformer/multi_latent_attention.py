@@ -349,6 +349,18 @@ class MultiLatentAttention(Attention):
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             self.pg_collection.cp = packed_seq_params.cp_group
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == "thd"
+            and self.pg_collection.cp is not None
+            and get_pg_size(self.pg_collection.cp) > 1
+            and packed_seq_params.cp_partition_mode != "zigzag"
+        ):
+            raise ValueError(
+                "MultiLatentAttention requires cp_partition_mode='zigzag', but "
+                f"packed_seq_params has {packed_seq_params.cp_partition_mode!r}. CP partition "
+                "conversion must be handled before entering MLA."
+            )
 
         # =====================
         # Query, Key, and Value
@@ -760,7 +772,7 @@ class MLASelfAttention(MultiLatentAttention):
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
-        if packed_seq_params is not None:
+        if thd_packed_seq:
             # If sequence packing, TE expect [t, h, d] shaped qkv input.
             # In Megatron-Core, the qkv shape is [t, 1, h, d].
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
@@ -915,7 +927,7 @@ class MLASelfAttention(MultiLatentAttention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif packed_seq_params is None or self.config.context_parallel_size == 1:
+                elif not thd_packed_seq or self.config.context_parallel_size == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always

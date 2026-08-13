@@ -545,7 +545,7 @@ class AbsorbedMLASelfAttention(Attention):
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
 
-        if packed_seq_params is not None:
+        if packed_seq:
             assert q_compressed.ndim == 3 and q_compressed.size(1) == 1
             assert kv_compressed.ndim == 3 and kv_compressed.size(1) == 1
             assert k_pos_emb.ndim == 3 and k_pos_emb.size(1) == 1
@@ -648,7 +648,7 @@ class AbsorbedMLASelfAttention(Attention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif packed_seq_params is None or self.config.context_parallel_size == 1:
+                elif not packed_seq or self.config.context_parallel_size == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always
@@ -914,13 +914,24 @@ class AbsorbedMLASelfAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for AbsorbedMLA"
 
-        # Set the right cp group for dynamic-cp. Mirrors Attention.forward:
-        # downstream RoPE uses self.pg_collection.cp, which must point at this
-        # microbatch's dynamic CP group. Restored before every return.
+        # Set the right cp group for dynamic-cp. Downstream RoPE and CSA core
+        # attention use self.pg_collection.cp, which must point at this
+        # microbatch's dynamic CP group. Restored before returning.
         _orig_cp_group = self.pg_collection.cp
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             self.pg_collection.cp = packed_seq_params.cp_group
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == "thd"
+            and self.pg_collection.cp is not None
+            and get_pg_size(self.pg_collection.cp) > 1
+            and packed_seq_params.cp_partition_mode != "zigzag"
+        ):
+            raise ValueError(
+                "AbsorbedMLASelfAttention requires cp_partition_mode='zigzag'. "
+                "CP partition conversion must be handled before entering AbsorbedMLA."
+            )
 
         # =====================
         # Query, Key, and Value
