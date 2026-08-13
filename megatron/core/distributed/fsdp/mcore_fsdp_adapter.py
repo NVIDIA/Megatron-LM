@@ -698,7 +698,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         self._replace_param_with_raw_if_needed = _replace_param_with_raw_if_needed
         self.post_forward_release_module = partial(release_module, reduce_grad=False)
         self.post_backward_release_module = partial(release_module, reduce_grad=True)
-        self.pre_backward = self.module.pre_backward
+        self.pre_backward = partial(self.module.pre_backward, register_final_callback=False)
         self.post_backward = self.module.post_backward
 
     @staticmethod
