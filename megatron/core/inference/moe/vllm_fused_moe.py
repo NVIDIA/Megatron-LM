@@ -736,5 +736,5 @@ def vllm_fused_moe(
         # for SwiGLU (training parity), so the reduction uses unit weights;
         # fp64 accumulation makes the topk sum order-independent by precision.
         apply_weights=not (batch_invariant_mode and is_swiglu),
-        acc_fp64=batch_invariant_mode,
+        acc_fp64=batch_invariant_mode and is_swiglu,
     )
