@@ -401,15 +401,18 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                     # _forward_vision_encoder (which produced image_embeddings).
                     # Class-token handling or pixel-shuffle rounding differing
                     # between the two would otherwise silently index out of bounds.
+                    # Raise instead of asserting so ``python -O`` doesn't strip
+                    # the check and turn a mismatch into out-of-bounds indexing.
                     if image_indices.numel() > 0:
                         max_idx = int(image_indices.max().item())
-                        assert max_idx < image_embeddings_flat.shape[0], (
-                            f"image_indices max ({max_idx}) exceeds "
-                            f"image_embeddings_flat size "
-                            f"({image_embeddings_flat.shape[0]}); "
-                            f"expand_image_tokens count disagrees with "
-                            f"_forward_vision_encoder output"
-                        )
+                        if max_idx >= image_embeddings_flat.shape[0]:
+                            raise RuntimeError(
+                                f"image_indices max ({max_idx}) exceeds "
+                                f"image_embeddings_flat size "
+                                f"({image_embeddings_flat.shape[0]}); "
+                                f"expand_image_tokens count disagrees with "
+                                f"_forward_vision_encoder output"
+                            )
 
                     final_embedding[image_positions] = image_embeddings_flat[image_indices]
 
