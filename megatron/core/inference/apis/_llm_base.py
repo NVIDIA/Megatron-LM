@@ -13,7 +13,7 @@ helpers, the public sync bridge (``submit``/``run_sync``), and the private
 import asyncio
 import concurrent.futures
 import threading
-from typing import Coroutine, List, Optional, Tuple, Type, Union
+from typing import Any, Coroutine, List, Optional, Tuple, Type, Union
 
 import torch.distributed as dist
 
@@ -478,7 +478,10 @@ class _MegatronLLMBase:
     # loop to our runtime loop
 
     async def _generate_impl(
-        self, prompts: Union[List[str], List[List[int]]], sp: SamplingParams, multi_modal_data_list
+        self,
+        prompts: Union[List[str], List[List[int]]],
+        sp: SamplingParams,
+        multi_modal_data_list: Optional[List[Any]] = None,
     ) -> List["DynamicInferenceRequest"]:
         """Run inference for a non-empty list of prompts; returns input-ordered list.
 
@@ -487,8 +490,13 @@ class _MegatronLLMBase:
           ``client.add_request`` and gathers all futures.
         - Direct mode: runs on the caller's event loop; offloads the synchronous
           ``engine.generate`` to a thread.
+
+        multi_modal_data_list may be ``None`` (text-only, backward-compatible
+        with pre-VLM callers) or a list the same length as ``prompts``.
         """
-        if len(multi_modal_data_list) != len(prompts):
+        if multi_modal_data_list is None:
+            multi_modal_data_list = [None] * len(prompts)
+        elif len(multi_modal_data_list) != len(prompts):
             raise ValueError(
                 "multi_modal_data_list must be the same length as prompts "
                 f"(got {len(multi_modal_data_list)} vs {len(prompts)})."
