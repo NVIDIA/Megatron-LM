@@ -1875,8 +1875,11 @@ class DSAttention(MegatronModule):
         single_packed_thd_sequence = False
         if packed_thd:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
+            # Whether the pack holds one sequence is a fact about the pack, not about
+            # context parallelism; which kernels accept that layout is the scoring
+            # plan's decision. Consumers that genuinely need CP already test cp_size.
             single_packed_thd_sequence = (
-                cp_size > 1 and cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
+                cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
             )
             packed_query_output_size = (
                 sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
@@ -2082,9 +2085,11 @@ class DSAttention(MegatronModule):
         )
         use_fused_kernels = dsa_kernels.use_fused_dsa_kernels(self.config)
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
+        # Reports a packed causal layout with identity key positions. cp_size is not
+        # part of that statement: _get_multi_packed_cp_thd_metadata still declines at
+        # cp_size <= 1, and the scoring plan decides which layouts a kernel accepts.
         use_local_indexer_varlen = (
             packed_thd
-            and cp_size > 1
             and attn_mask_type == AttnMaskType.causal
             and varlen_starts is not None
             and varlen_ends is not None

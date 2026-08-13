@@ -119,26 +119,29 @@ def resolve_indexer_scoring_plan(
             IndexerScoringPlan.PLAIN_CAUSAL, "whole-sequence causal bounds are reconstructible"
         )
 
-    if packed_thd and cp_size > 1 and mask_is_causal:
+    if packed_thd and mask_is_causal:
+        # The zigzag-segment kernel degenerates correctly when the rank holds the whole
+        # sequence (its ``sk == local_query_len`` branch is plain causal split in two),
+        # so a single-sequence pack does not need cp_size > 1.
         if single_sequence_pack:
             return IndexerScoringDecision(
-                IndexerScoringPlan.PACKED_CP_SINGLE, "one sequence per pack, split across CP ranks"
+                IndexerScoringPlan.PACKED_CP_SINGLE, "one sequence per pack, split into causal segments"
             )
-        if packed_metadata_available:
+        if cp_size > 1 and packed_metadata_available:
             return IndexerScoringDecision(
                 IndexerScoringPlan.PACKED_CP_MULTI, "multi-sequence pack with cu_seqlens metadata"
             )
+        if cp_size > 1:
+            return IndexerScoringDecision(
+                IndexerScoringPlan.UNFUSED_BOUNDS, "packed CP without cu_seqlens metadata"
+            )
         return IndexerScoringDecision(
-            IndexerScoringPlan.UNFUSED_BOUNDS, "packed CP without cu_seqlens metadata"
+            IndexerScoringPlan.UNFUSED_BOUNDS,
+            "multi-sequence pack at cp_size=1: the cu_seqlens kernel requires cp_size>1",
         )
 
     # Everything below is a layout no fused kernel currently claims. Name the specific
     # reason: these are the configurations worth widening a gate for.
-    if packed_thd and cp_size == 1:
-        return IndexerScoringDecision(
-            IndexerScoringPlan.UNFUSED_BOUNDS,
-            "packed sequences at cp_size=1: the packed fused kernels require cp_size>1",
-        )
     if not packed_thd and cp_size > 1:
         return IndexerScoringDecision(
             IndexerScoringPlan.UNFUSED_BOUNDS,
