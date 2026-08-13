@@ -175,7 +175,7 @@ class InferenceBatchDimensions:
         if ep_zmq_communicator is not None:
             # CPU-only sync via ZMQ: avoids a NCCL AllReduce kernel on the
             # compute stream plus the H2D/D2H pair that sandwiches it.
-            (max_token_count, max_is_non_decode) = ep_zmq_communicator.sync_all_reduce_max(
+            max_token_count, max_is_non_decode = ep_zmq_communicator.sync_all_reduce_max(
                 local_batch_dims.token_count, int(is_non_decode)
             )
         else:

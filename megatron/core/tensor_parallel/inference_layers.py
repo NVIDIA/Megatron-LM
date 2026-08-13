@@ -26,9 +26,9 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    get_batch_invariant_backend,
     is_batch_invariant_mode_enabled,
     rmsnorm_batch_invariant,
-    get_batch_invariant_backend,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none

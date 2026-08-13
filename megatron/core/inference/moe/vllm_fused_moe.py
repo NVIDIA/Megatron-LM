@@ -29,8 +29,8 @@ if not HAVE_TRITON:
     triton.jit = null_decorator
     tl = MagicMock()
 
-from megatron.core.inference.moe.activations import bounded_silu_mul
 from megatron.core.inference.moe import batch_invariant
+from megatron.core.inference.moe.activations import bounded_silu_mul
 from megatron.core.inference.moe.fused_moe import ActivationType
 from megatron.core.inference.moe.permute import (
     _get_num_sms,
@@ -683,9 +683,7 @@ def vllm_fused_moe(
             # (single bf16 round of fp32 silu(gate)*up*prob). The reduction
             # below then sums with unit weights. Device-bounded to the live
             # valid_tokens*topk prefix; CUDA-graph safe.
-            bound_elems = valid_tokens.to(torch.int64) * (
-                topk * (intermediate1.shape[1] // 2)
-            )
+            bound_elems = valid_tokens.to(torch.int64) * (topk * (intermediate1.shape[1] // 2))
             intermediate1 = batch_invariant.weighted_silu_mul_bounded(
                 intermediate1, topk_weights_flat, bound_elems
             )
