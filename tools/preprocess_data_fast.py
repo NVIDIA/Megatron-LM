@@ -61,10 +61,9 @@ def process_key(args, key, level):
         bin_file,
         dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
     )
-    for doc in encoded_docs:
-        if args.append_eod:
-            doc = ak.concatenate([doc, [tokenizer.eod]])
-        builder.add_document(doc, [len(doc)])
+    print("Tokenization is finished")
+
+    builder.add_documents(encoded_docs)
 
     builder.finalize(idx_file)
 

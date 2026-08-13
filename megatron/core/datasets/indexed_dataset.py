@@ -5,6 +5,7 @@
 
 # Essentially re-written in entirety
 
+import awkward as ak
 import gc
 import logging
 import os
@@ -975,6 +976,34 @@ class IndexedDatasetBuilder(object):
         self.document_indices.append(len(self.sequence_lengths))
         if self.multimodal:
             self.sequence_modes.extend(modes if modes is not None else [0] * lengths)
+
+    def add_documents(
+        self,
+        documents: ak.Array,
+        modes: Optional[List[int]] = None
+    ) -> None:
+        """Add a list of documents to the dataset in a single batched write
+
+        Each document is treated as a single item; per-item lengths are derived
+        from the document lengths themselves.
+
+        Args:
+            documents (ak.Array): A jagged array of documents, where each element holds
+                the token ids for that document
+
+            modes (Optional[List[int]], optional): The mode for each document. Defaults to None.
+        """
+        np_array = numpy.asarray(ak.flatten(documents), dtype=self.dtype)
+        self.data_file.write(np_array.tobytes(order="C"))
+
+        doc_lengths = numpy.asarray(ak.num(documents, axis=1))
+        offset = len(self.sequence_lengths)
+        self.sequence_lengths.extend(doc_lengths.tolist())
+        self.document_indices.extend((offset + numpy.cumsum(doc_lengths)).tolist())
+
+        if self.multimodal:
+            flat_modes = numpy.asarray(modes) if modes is not None else numpy.zeros(len(doc_lengths), dtype=int)
+            self.sequence_modes.extend(flat_modes.tolist())
 
     def end_document(self) -> None:
         """Finalize the document, for use with IndexedDatasetBuilder.add_item"""
