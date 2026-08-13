@@ -44,7 +44,7 @@ from tests.unit_tests.test_utilities import Utils
 def _make_mhc_layer_spec(**kwargs):
     """Build a layer spec with HyperConnectionModule submodules.
 
-    The ``enable_hyper_connection`` kwarg on ``gpt_layer_specs`` is added by
+    The ``enable_mhc_connections`` kwarg on ``gpt_layer_specs`` is added by
     the GPT-wiring follow-up split, so this helper patches the mHC submodules
     directly to keep the unit tests self-contained for this split.
     """
