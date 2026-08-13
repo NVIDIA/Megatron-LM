@@ -334,15 +334,31 @@ class LLaVAModel(MegatronModule):
                     ln_post_impl = None
                     use_mask_token = False
 
-                # Allow overriding class_token_len from constructor arg.
+                # Override precedence for class_token_len:
+                #   1. Constructor arg (highest, user intent).
+                #   2. vision_transformer_config.class_token_len (typically set
+                #      by the encoder registry when a checkpoint carries one).
+                #   3. Per-model-type default computed above.
                 if _class_token_len_override is not None:
                     radio_class_token_len = _class_token_len_override
+                else:
+                    config_class_token_len = getattr(
+                        vision_transformer_config, "class_token_len", None
+                    )
+                    if config_class_token_len is not None:
+                        radio_class_token_len = config_class_token_len
 
                 if vision_transformer_config.fp8 or use_vision_backbone_fp8_arch:
                     # FP8 padding for final sequence length to be a multiple of 16 or 32.
                     radio_class_token_len = (
                         32 if vision_transformer_config.fp8_recipe == "mxfp8" else 16
                     )
+
+                # Propagate the resolved value up so ``self._class_token_len``
+                # (used by downstream tokens/embedding sizing) reflects what
+                # the RADIO ViT was actually built with, not the placeholder
+                # value 1 set for the CLIP-family fallback above.
+                class_token_len = radio_class_token_len
 
                 self.vision_model = RADIOViTModel(
                     vision_transformer_config,
