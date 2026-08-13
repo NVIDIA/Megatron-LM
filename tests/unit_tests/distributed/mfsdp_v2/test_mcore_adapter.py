@@ -186,7 +186,11 @@ class TestMcoreAdapterDense:
             reference_optimizer_config, [reference_model], use_gloo_process_groups=False
         )
         optimizer_config = replace(
-            reference_optimizer_config, optimizer_cuda_graph=optimizer_cuda_graph
+            reference_optimizer_config,
+            optimizer_cuda_graph=optimizer_cuda_graph,
+            use_precision_aware_optimizer=True,
+            exp_avg_dtype=torch.bfloat16,
+            exp_avg_sq_dtype=torch.bfloat16,
         )
         with pytest.raises(
             ValueError, match="MFSDP v2 currently requires use_distributed_optimizer=False"
@@ -242,6 +246,10 @@ class TestMcoreAdapterDense:
             # The first step is eager; capture replays once and every subsequent step replays.
             graph_launches = sum(event.name == "cudaGraphLaunch" for event in prof.events())
             assert graph_launches == len(steps) - 1
+
+        for state in optimizer.optimizer.state.values():
+            assert state["exp_avg"].dtype == torch.bfloat16
+            assert state["exp_avg_sq"].dtype == torch.bfloat16
 
         losses = torch.stack(losses)
         reference_losses = torch.stack(reference_losses)

@@ -434,10 +434,6 @@ class OptimizerConfig:
             assert (
                 self.optimizer == 'adam'
             ), '--use-precision-aware-optimizer only supported with adam'
-            assert (
-                self.use_distributed_optimizer
-            ), '--use-precision-aware-optimizer only supported with distributed optimizer'
-
             if not is_te_min_version("2.1.0"):
                 self.store_param_remainders = False
 

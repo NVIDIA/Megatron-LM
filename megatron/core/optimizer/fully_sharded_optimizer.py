@@ -77,8 +77,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             raise ValueError("MFSDP v2 does not support optimizer-step parameter-gather overlap.")
         if config.optimizer_cpu_offload:
             raise ValueError("MFSDP v2 does not currently support optimizer CPU offload.")
-        if config.use_precision_aware_optimizer:
-            raise ValueError("MFSDP v2 does not currently support precision-aware optimizer.")
         if config.use_layer_wise_distributed_optimizer:
             raise ValueError(
                 "MFSDP v2 does not currently support layer-wise distributed optimizer."

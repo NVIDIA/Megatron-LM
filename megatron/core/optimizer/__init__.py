@@ -573,7 +573,9 @@ def _get_megatron_optimizer_based_on_param_groups(
                 # Otherwise, master weight will be managed by TransformerEngine.
                 # Delayed scaling is an exception because casting as well as the computation
                 # of the scaling factor can be conducted in the adam kernel.
-                if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 and not isinstance(
+                    model_chunks[0], FullyShardedDataParallelV2
+                ):
                     kwargs.update(
                         {
                             "master_weights": True,
@@ -1052,6 +1054,10 @@ def get_megatron_optimizer(
     if is_mfsdp_v2:
         if config.use_distributed_optimizer:
             raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
+    elif config.use_precision_aware_optimizer and not config.use_distributed_optimizer:
+        raise ValueError(
+            "--use-precision-aware-optimizer only supported with distributed optimizer"
+        )
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
@@ -1142,6 +1148,7 @@ def get_megatron_optimizer(
             if (
                 not USING_PYTORCH_OPTIMIZER
                 and config.use_precision_aware_optimizer
+                and not is_mfsdp_v2
                 and getattr(optimizer_part.optimizer, "master_weights", None) is not None
             ):
                 # NOTE(@cspades): FusedAdam is provided Megatron-FSDP's main weights as
