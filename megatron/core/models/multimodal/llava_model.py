@@ -1360,12 +1360,16 @@ class LLaVAModel(MegatronModule):
                 cu = cu[keep]
                 if cu[-1] != actual_seq_len:
                     cu = torch.cat([cu, cu.new_tensor([actual_seq_len])])
+                # Compute the max segment length once and sync a single scalar.
+                # The previous code did the subtract+max twice and hit two D2H
+                # syncs per training forward, both on the critical path.
+                max_seqlen = int((cu[1:] - cu[:-1]).max().item())
                 packed_seq_params = PackedSeqParams(
                     qkv_format=packed_seq_params.qkv_format,
                     cu_seqlens_q=cu,
                     cu_seqlens_kv=cu,
-                    max_seqlen_q=(cu[1:] - cu[:-1]).max().item(),
-                    max_seqlen_kv=(cu[1:] - cu[:-1]).max().item(),
+                    max_seqlen_q=max_seqlen,
+                    max_seqlen_kv=max_seqlen,
                 )
 
         if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
