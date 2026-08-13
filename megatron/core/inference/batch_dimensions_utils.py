@@ -216,7 +216,8 @@ def _batch_invariant_token_floor(token_count: int) -> int:
     graphed norms execute in a different bit-class, breaking cross-batch
     bit-equality.  Request counts are untouched (mirrors eager semantics).
     """
-    return max(64, ((token_count + 63) // 64) * 64)
+    rounded_up = math.ceil(token_count / 64) * 64
+    return max(64, rounded_up)
 
 
 def _batch_invariant_mode_enabled() -> bool:
