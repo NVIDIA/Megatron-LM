@@ -1630,9 +1630,13 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if self.batch_invariant_mode:
-                if self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TORCH:
+                if self.inference_grouped_gemm_backend not in (
+                    InferenceGroupedGemmBackend.TORCH,
+                    InferenceGroupedGemmBackend.VLLM,
+                ):
                     raise ValueError(
-                        "batch_invariant_mode requires " "inference_grouped_gemm_backend='torch'."
+                        "batch_invariant_mode requires inference_grouped_gemm_backend "
+                        "'torch' or 'vllm'."
                     )
                 if (
                     self.expert_model_parallel_size > 1
