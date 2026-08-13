@@ -526,7 +526,7 @@ def mean_dim(
 
 # Production uses DeepGEMM for bf16 and the deterministic Triton kernel for
 # intentional higher-precision operations such as the fp32 MoE router.
-_BATCH_INVARIANT_BACKENDS = ("deepgemm", "triton")
+_BATCH_INVARIANT_BACKENDS = ("deepgemm", "triton", "te_native")
 _BATCH_INVARIANT_BACKEND: str = "deepgemm"
 
 
@@ -625,47 +625,53 @@ def _import_module_if_available(name: str):
     return importlib.import_module(name)
 
 
-def _te_patch_for_batch_invariant():
+def _te_patch_for_batch_invariant(skip_gemm: bool = False):
     """Patch Transformer Engine modules to use batch-invariant GEMM and RMSNorm.
 
     This monkey-patches TE's GEMM and RMSNorm entry points to dispatch to the
     batch-invariant implementations when batch-invariant mode is enabled.
     Safe no-op if TE is unavailable.
+
+    Args:
+        skip_gemm: leave TE's native general_gemm in place (used by the
+            "te_native" backend, where GEMM batch invariance comes from
+            cuBLASLt workspace starvation rather than kernel substitution).
     """
     global _TE_GENERAL_GEMM_ORIG, _TE_RMSNORM_ORIG_FWD, _MEG_TE_GENERAL_GEMM_ORIG
     import transformer_engine.pytorch as te
     import transformer_engine.pytorch.cpp_extensions as te_cpp
 
-    # Patch general_gemm once
-    if _TE_GENERAL_GEMM_ORIG is None and hasattr(te_cpp, "general_gemm"):
-        _TE_GENERAL_GEMM_ORIG = te_cpp.general_gemm
-        te_cpp.general_gemm = _te_general_gemm_patched
+    if not skip_gemm:
+        # Patch general_gemm once
+        if _TE_GENERAL_GEMM_ORIG is None and hasattr(te_cpp, "general_gemm"):
+            _TE_GENERAL_GEMM_ORIG = te_cpp.general_gemm
+            te_cpp.general_gemm = _te_general_gemm_patched
 
-    # Also patch the symbol imported inside TE's module.linear
-    # (from ..cpp_extensions import general_gemm)
-    import transformer_engine.pytorch.module.linear as te_linear_mod
+        # Also patch the symbol imported inside TE's module.linear
+        # (from ..cpp_extensions import general_gemm)
+        import transformer_engine.pytorch.module.linear as te_linear_mod
 
-    if hasattr(te_linear_mod, "general_gemm"):
-        if "module.linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
-            _TE_GEMM_FUNC_ORIGS["module.linear.general_gemm"] = te_linear_mod.general_gemm
-            te_linear_mod.general_gemm = _te_general_gemm_patched
+        if hasattr(te_linear_mod, "general_gemm"):
+            if "module.linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
+                _TE_GEMM_FUNC_ORIGS["module.linear.general_gemm"] = te_linear_mod.general_gemm
+                te_linear_mod.general_gemm = _te_general_gemm_patched
 
-    # Also patch the symbol imported inside TE's module.layernorm_linear
-    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
+        # Also patch the symbol imported inside TE's module.layernorm_linear
+        import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
 
-    if hasattr(te_layernorm_linear_mod, "general_gemm"):
-        if "module.layernorm_linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
-            _TE_GEMM_FUNC_ORIGS["module.layernorm_linear.general_gemm"] = (
-                te_layernorm_linear_mod.general_gemm
-            )
-            te_layernorm_linear_mod.general_gemm = _te_general_gemm_patched
+        if hasattr(te_layernorm_linear_mod, "general_gemm"):
+            if "module.layernorm_linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
+                _TE_GEMM_FUNC_ORIGS["module.layernorm_linear.general_gemm"] = (
+                    te_layernorm_linear_mod.general_gemm
+                )
+                te_layernorm_linear_mod.general_gemm = _te_general_gemm_patched
 
-    # Also patch the symbol imported into Megatron's TE wrapper module
-    import megatron.core.extensions.transformer_engine as meg_te
+        # Also patch the symbol imported into Megatron's TE wrapper module
+        import megatron.core.extensions.transformer_engine as meg_te
 
-    if _MEG_TE_GENERAL_GEMM_ORIG is None and hasattr(meg_te, "general_gemm"):
-        _MEG_TE_GENERAL_GEMM_ORIG = meg_te.general_gemm
-        meg_te.general_gemm = _te_general_gemm_patched
+        if _MEG_TE_GENERAL_GEMM_ORIG is None and hasattr(meg_te, "general_gemm"):
+            _MEG_TE_GENERAL_GEMM_ORIG = meg_te.general_gemm
+            meg_te.general_gemm = _te_general_gemm_patched
 
     # Patch RMSNorm.forward once (class may be on te or te.pytorch)
     rms_cls = getattr(te, "RMSNorm", None)
@@ -1636,6 +1642,42 @@ def is_batch_invariant_mode_enabled():
     return _batch_invariant_MODE
 
 
+_TE_NATIVE_WORKSPACE_BYTES = 1024
+
+
+def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WORKSPACE_BYTES):
+    """Make the NATIVE cuBLASLt GEMM kernels batch-invariant via workspace starvation.
+
+    cuBLASLt selects split-K reduction variants per M (the co-batch token count),
+    which changes the fp32 accumulation order across batch compositions. Split-K
+    variants require workspace; starving the workspace to ~1KB disqualifies them,
+    pinning every M to the same serial-K reduction recipe — batch-invariant at
+    native kernel speed, with no kernel substitution. (Tile shape selection may
+    still vary with M, but M/N tiling does not affect bits: bf16 products are
+    exact in fp32, so only the K-reduction order matters.)
+
+    Two knobs must both land:
+    - cuBLASLt env pins for kernels that honor them (set before first use).
+    - Transformer Engine's own workspace: TE (<= 2.15 verified) hardcodes 32MiB in
+      get_cublas_workspace_size_bytes() and ignores CUBLASLT_WORKSPACE_SIZE, so the
+      env pin alone never engages for TE-launched GEMMs — patch the size fn and
+      clear its lru_cache.
+    """
+    import os
+
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":0:0")
+    os.environ.setdefault("CUBLASLT_WORKSPACE_SIZE", "0")
+    try:
+        import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
+
+        if hasattr(_te_gemm_mod, "get_cublas_workspace_size_bytes"):
+            _te_gemm_mod.get_cublas_workspace_size_bytes = lambda: workspace_bytes
+            if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
+                _te_gemm_mod.get_cublas_workspace.cache_clear()
+    except ImportError:
+        pass
+
+
 def enable_batch_invariant_mode(backend: str = "deepgemm"):
     """Enable global batch-invariant mode and patch Aten/TE kernels.
 
@@ -1663,12 +1705,25 @@ def enable_batch_invariant_mode(backend: str = "deepgemm"):
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
-    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
+    if backend == "te_native":
+        # Keep the NATIVE cuBLASLt kernels for every dense GEMM (aten and TE);
+        # batch invariance comes from workspace starvation (split-K
+        # disqualified => fixed K-reduction recipe at every M) instead of
+        # kernel substitution — native speed, verified bitwise-identical to
+        # the training forward in NeMo-RL true on-policy GRPO (gen_kl == 0.0).
+        _enable_te_native_workspace_starvation()
+    else:
+        _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
-    # Also patch Transformer Engine kernels when available
-    _te_patch_for_batch_invariant()
+    # Also patch Transformer Engine kernels when available (te_native keeps
+    # TE's native GEMMs — invariance comes from the starved workspace — but
+    # still applies the non-GEMM TE patches, e.g. the attention gate).
+    if backend == "te_native":
+        _te_patch_for_batch_invariant(skip_gemm=True)
+    else:
+        _te_patch_for_batch_invariant()
     # Pin the Mamba autotuners so rollout and training processes can't end
     # up on different tile configs (and therefore different fp32 reduction
     # orders) through autotune timing noise.
