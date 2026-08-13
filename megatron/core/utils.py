@@ -73,6 +73,7 @@ _fa_version = None
 _flashinfer_version = None
 _mamba_ssm_version = None
 _causal_conv1d_version = None
+_emerging_optimizers_version = None
 
 
 _Wrapped = TypeVar('_Wrapped', bound=Callable)
@@ -487,6 +488,39 @@ def is_flashinfer_min_version(version, check_equality=True):
     return flashinfer_version > PkgVersion(version)
 
 
+def get_emerging_optimizers_version():
+    """Get emerging_optimizers version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_emerging_optimizers_version_str():
+        import emerging_optimizers
+
+        if hasattr(emerging_optimizers, "__version__"):
+            return str(emerging_optimizers.__version__)
+        else:
+            # The distribution name is hyphenated even though the module is not.
+            return version("emerging-optimizers")
+
+    global _emerging_optimizers_version
+    if _emerging_optimizers_version is None:
+        _emerging_optimizers_version = PkgVersion(get_emerging_optimizers_version_str())
+    return _emerging_optimizers_version
+
+
+def is_emerging_optimizers_min_version(version, check_equality=True):
+    """Check if minimum version of `emerging_optimizers` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_emerging_optimizers_version() >= PkgVersion(version)
+    return get_emerging_optimizers_version() > PkgVersion(version)
+
+
 _VALID_DSA_KERNEL_BACKENDS = ("none", "tilelang", "cudnn")
 
 
@@ -859,6 +893,8 @@ def mup_scaled_init_method_normal(sigma, num_layers, width_mult, multiplier=2.0)
 
 def log_on_each_pipeline_stage(
     logger: logging.Logger,
+    level: int,
+    msg: object,
     *args: Any,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -869,23 +905,32 @@ def log_on_each_pipeline_stage(
     Args:
         logger (logging.Logger): The logger to write the logs
 
-        args (Tuple[Any]): All logging.Logger.log positional arguments
+        level (int): Logging level for the message.
+
+        msg (object): Message format string.
+
+        args (Tuple[Any]): Message format arguments.
 
         kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
     """
     assert torch.distributed.is_initialized()
 
+    if (tp_group is None) != (dp_cp_group is None):
+        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
+
+    if not logger.isEnabledFor(level):
+        return
+
     if tp_group is None and dp_cp_group is None:
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    elif tp_group is not None and dp_cp_group is not None:
+    else:
+        assert tp_group is not None and dp_cp_group is not None
         tp_rank = tp_group.rank()
         dp_cp_rank = dp_cp_group.rank()
-    else:
-        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
 
     if tp_rank == 0 and dp_cp_rank == 0:
-        logger.log(*args, **kwargs)
+        logger.log(level, msg, *args, **kwargs)
 
 
 def check_param_hashes_across_dp_replicas(
@@ -934,7 +979,10 @@ def check_param_hashes_across_dp_replicas(
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [parallel_state.get_data_parallel_group(), parallel_state.get_expert_data_parallel_group()],
+        [
+            parallel_state.get_data_parallel_group(with_gtp_remat=False),
+            parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
+        ],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
@@ -1008,8 +1056,11 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
 
-    if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        # TP + FSDP2 sharding
+    is_torch_fsdp2_param = (
+        hasattr(tensor, "is_torch_fsdp2_param") and HAVE_DTENSOR and isinstance(tensor, DTensor)
+    )
+    if is_torch_fsdp2_param:
+        # When using FSDP2, every DP shard is a main replica.
         dp_replica_id = 0
         tensor = tensor._local_tensor
 
@@ -1022,10 +1073,54 @@ def make_tp_sharded_tensor_for_checkpoint(
             # FSDP2 shards axis 0 and TP shards some other axis
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
+    # GTP: a GTP param additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
+    # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
+    # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
+    # allow_shape_mismatch) still save GTP weights with correct global offsets/shape.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.fp8_utils import is_float8tensor
+        from megatron.core.tensor_parallel.gtp_api import dequantize_gtp_native_fp8, is_gtp_param
+
+        if is_gtp_param(tensor):
+            gtp_rank = get_pg_rank(tensor.group)
+            gtp_remat_size = get_pg_size(tensor.group)
+            if tp_axis == 0:
+                # same axis as TP → one composite axis-0 offset
+                new_offsets[0] = (
+                    prepend_axis_num,
+                    tp_rank * gtp_remat_size + gtp_rank,
+                    tp_size * gtp_remat_size,
+                )
+            else:
+                # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
+                new_offsets.append((prepend_axis_num, gtp_rank, gtp_remat_size))
+            # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas).
+            dp_replica_id = parallel_state.get_data_parallel_rank(
+                with_context_parallel=True, with_gtp_remat=False
+            )
+            # Saved global is the padded shape when GTP padded out_features for alignment.
+            if getattr(tensor, "pad_length", 0):
+                kwargs.setdefault("allow_shape_mismatch", True)
+            # Native-FP8 GTP shard: the param IS a QuantizedTensor (reports a fake BF16 dtype
+            # over FP8 bytes). Dequantize to real BF16 so the checkpoint stores portable
+            # high-precision values, not raw FP8 bytes mislabeled as BF16. Offsets above were
+            # already read from the FP8 param's GTP attrs; shape is preserved by dequantize.
+            # (dequantize_gtp_native_fp8 restores the base FP8 class for the dequantize call —
+            # TE's tex.dequantize does not recognize the dynamic GTP_<Fp8Tensor> subclass.)
+            if is_float8tensor(tensor):
+                fp8_param = tensor
+                tensor = dequantize_gtp_native_fp8(tensor)
+                # Backlink to the live FP8 param: optimizer sharded_state_dict matches params
+                # to model entries by id(entry.data), which this dequantized copy would break
+                # (see _backfill_gtp_sharded_param_map in optimizer.py).
+                tensor._gtp_dequant_src = fp8_param
+
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
-    return ShardedTensor.from_rank_offsets(
+    sharded_tensor = ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
@@ -1034,6 +1129,11 @@ def make_tp_sharded_tensor_for_checkpoint(
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+    if is_torch_fsdp2_param:
+        # Marker used downstream for FSDP2-related logic, such as TP-DP
+        # sharding / loading for non-trivial parameters like SwiGLU.
+        sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
+    return sharded_tensor
 
 
 def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
@@ -1051,6 +1151,18 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
             - dp_cp_group: Data parallel + context parallel group
               (default: None, falls back to parallel_state)
     """
+    # Sanity guard.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+
+        assert not is_gtp_param(tensor), (
+            f"GTP weight-remat param '{key}' reached make_sharded_tensor_for_checkpoint (the "
+            "replicated path); route GTP-sharded weights through "
+            "make_tp_sharded_tensor_for_checkpoint or make_sharded_tensors_for_checkpoint instead."
+        )
+
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
@@ -1069,16 +1181,20 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     dp_size = get_pg_size(dp_cp_group)
     dp_replica_id = get_pg_rank(dp_cp_group)
 
-    if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        # FSDP2 sharding
+    is_torch_fsdp2_param = (
+        hasattr(tensor, "is_torch_fsdp2_param") and HAVE_DTENSOR and isinstance(tensor, DTensor)
+    )
+    if is_torch_fsdp2_param:
+        # When using FSDP2, every DP shard is a main replica.
         dp_replica_id = 0
         tensor = get_full_tensor_if_necessary(tensor)
+        # Add FSDP sharding rank offsets.
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     if replica_id is None:
         replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
 
-    return ShardedTensor.from_rank_offsets(
+    sharded_tensor = ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
@@ -1087,10 +1203,19 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+    if is_torch_fsdp2_param:
+        # Marker used downstream for FSDP2-related logic, such as TP-DP
+        # sharding / loading for non-trivial parameters like SwiGLU.
+        sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
+    return sharded_tensor
 
 
 def get_full_tensor_if_necessary(tensor):
-    """For DTensor gets full tensor if some ranks will not have a local copy"""
+    """
+    Captures an edge case where devices out-number elements in a DTensor,
+    for instance when generating a ShardedTensor. Replicate the DTensor
+    on all ranks to avoid empty DTensors on any rank.
+    """
     need_full_tensor = False
     for i in range(tensor.device_mesh.ndim):
         if (
@@ -2740,11 +2865,18 @@ def unwrap_model(model, module_instances=None):
         from megatron.core.distributed import DistributedDataParallel as DDP
         from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
         from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-            FullyShardedDataParallel as megatron_FSDP,
+            FullyShardedDataParallelV1,
+            FullyShardedDataParallelV2,
         )
         from megatron.core.transformer.module import Float16Module
 
-        module_instances = (DDP, torch_FSDP, megatron_FSDP, Float16Module)
+        module_instances = (
+            DDP,
+            torch_FSDP,
+            FullyShardedDataParallelV1,
+            FullyShardedDataParallelV2,
+            Float16Module,
+        )
 
     return_list = True
     if not isinstance(model, list):

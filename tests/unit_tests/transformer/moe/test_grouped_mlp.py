@@ -62,6 +62,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
             single_grouped_weight,
             single_grouped_bias=False,
             delay_wgrad_compute=False,
+            scale_bias=False,
         ):
             super().__init__()
             self.num_gemms = num_gemms
@@ -74,6 +75,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.scale_bias = scale_bias
 
         def need_backward_dw(self):
             return False
@@ -144,17 +146,20 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
     assert ops[0].weight1 is module.linear_fc1.weight1
     assert ops[0].bias0 is module.linear_fc1.bias0
     assert ops[0].bias1 is module.linear_fc1.bias1
+    assert ops[0].scale_bias is False
     assert ops[1].glu_interleave_size == 16
     assert ops[2].device == "meta"
     assert ops[2].weight is module.linear_fc2.weight
+    assert ops[2].scale_bias is False
     assert hasattr(ops, "forward_pre_hook")
 
 
-def test_fused_forward_caches_ops_and_forwards_expected_arguments():
+@pytest.mark.parametrize("fc2_bias", [False, True], ids=["no_fc2_bias", "fc2_bias"])
+def test_fused_forward_caches_ops_and_forwards_expected_arguments(fc2_bias):
     class FakeFusedOps:
-        def __call__(self, hidden_states, fc1_tokens, probs, fc2_tokens):
-            self.args = (hidden_states, fc1_tokens, probs, fc2_tokens)
-            return hidden_states + 1
+        def __call__(self, *args):
+            self.args = args
+            return args[0] + 1
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     # `_fused_forward` calls `skip_routed_expert_padding(config)` (added by PR 4071), which
@@ -169,6 +174,7 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
         moe_paged_stash=False,
     )
     module._fused_ops = None
+    module.linear_fc2 = SimpleNamespace(use_bias=fc2_bias)
     fused_ops = FakeFusedOps()
     module._make_fused_ops = lambda: fused_ops
     hidden_states = torch.zeros(2, 4)
@@ -183,6 +189,10 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
     assert fused_ops.args[1] is tokens_per_expert
     assert fused_ops.args[2] is probs
     assert fused_ops.args[3] is tokens_per_expert
+    if fc2_bias:
+        assert fused_ops.args[4] is probs
+    else:
+        assert len(fused_ops.args) == 4
 
 
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():
@@ -253,6 +263,43 @@ def test_make_fused_impl_pre_forward_hook_rejects_input_modifying_hook():
         hook(object())
 
 
+def test_make_fused_impl_pre_forward_hook_exposes_fsdp_main_grad_for_fused_wgrad():
+    class FakeGroupedLinear(torch.nn.Module):
+        def __init__(self, *, fuse_wgrad_accumulation):
+            super().__init__()
+            self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+            self.weight = torch.nn.Parameter(torch.ones(2, 2))
+            self.bias = torch.nn.Parameter(torch.zeros(2))
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.linear_fc1 = FakeGroupedLinear(fuse_wgrad_accumulation=True)
+    module.linear_fc2 = FakeGroupedLinear(fuse_wgrad_accumulation=False)
+
+    fc1_main_grad = torch.empty_like(module.linear_fc1.weight)
+    module.linear_fc1.weight.get_main_grad = lambda: fc1_main_grad
+    module.linear_fc1.weight.overwrite_main_grad = False
+
+    existing_main_grad = torch.empty_like(module.linear_fc1.bias)
+    module.linear_fc1.bias.main_grad = existing_main_grad
+    module.linear_fc1.bias.get_main_grad = pytest.fail
+    module.linear_fc1.bias.overwrite_main_grad = False
+
+    fc2_main_grad = torch.empty_like(module.linear_fc2.weight)
+    module.linear_fc2.weight.get_main_grad = lambda: fc2_main_grad
+    module.linear_fc2.weight.overwrite_main_grad = False
+
+    hook = module._make_fused_impl_pre_forward_hook()
+    hook(object())
+
+    assert module.linear_fc1.weight.main_grad is fc1_main_grad
+    assert module.linear_fc1.weight.overwrite_main_grad is True
+    assert module.linear_fc1.bias.main_grad is existing_main_grad
+    assert module.linear_fc1.bias.overwrite_main_grad is True
+    assert getattr(module.linear_fc2.weight, "main_grad", None) is None
+    assert module.linear_fc2.weight.overwrite_main_grad is False
+
+
 def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     class FakeGroupedLinear(torch.nn.Module):
         def __init__(
@@ -268,6 +315,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
             single_grouped_weight,
             single_grouped_bias=False,
             delay_wgrad_compute=False,
+            scale_bias=False,
         ):
             super().__init__()
             self.num_gemms = num_gemms
@@ -280,6 +328,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.scale_bias = scale_bias
 
         def need_backward_dw(self):
             return False
@@ -346,12 +395,19 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
     ops = module._make_fused_ops()
 
     assert ops[0].weight is module.linear_fc1.weight
+    assert ops[0].weight0 is None
+    assert ops[0].weight1 is None
+    fc1_named_params = dict(ops[0].named_parameters())
+    assert fc1_named_params["weight"] is module.linear_fc1.weight
+    assert "weight0" not in fc1_named_params
+    assert "weight1" not in fc1_named_params
     assert ops[1].glu_interleave_size == 8
     assert ops[1].activation_recompute_in_mlp is True
     assert ops[2].weight0 is module.linear_fc2.weight0
     assert ops[2].weight1 is module.linear_fc2.weight1
     assert ops[2].bias0 is module.linear_fc2.bias0
     assert ops[2].bias1 is module.linear_fc2.bias1
+    assert ops[2].scale_bias is True
 
 
 def _make_fake_te_namespace():
@@ -371,6 +427,7 @@ def _make_fake_te_namespace():
             single_grouped_weight,
             single_grouped_bias=False,
             delay_wgrad_compute=False,
+            scale_bias=False,
         ):
             super().__init__()
             self.num_gemms = num_gemms
@@ -383,6 +440,7 @@ def _make_fake_te_namespace():
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.scale_bias = scale_bias
 
         def need_backward_dw(self):
             return False
@@ -591,6 +649,28 @@ def test_is_fused_impl_supported_uses_config_activation_for_swiglu(monkeypatch):
     assert module._is_fused_impl_supported() is True
 
 
+def test_is_fused_impl_supported_requires_scaled_fc2_bias(monkeypatch):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+
+    class FakeGroupedLinearWithoutScaleBias(FakeGroupedLinear):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+    fake_te.pytorch.GroupedLinear = FakeGroupedLinearWithoutScaleBias
+    fake_te.pytorch.ops.GroupedLinear = FakeGroupedLinearWithoutScaleBias
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinearWithoutScaleBias, activation_func=F.silu, gated_linear_unit=True
+    )
+    module.linear_fc2.use_bias = True
+
+    assert module._is_fused_impl_supported() is False
+
+
 @pytest.mark.parametrize(
     ("use_fused_weighted_squared_relu", "gated_linear_unit", "expected"),
     [(True, False, True), (False, False, False), (True, True, False)],
@@ -664,10 +744,13 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
 
     assert ops[0].weight0 is module.linear_fc1.weight0
     assert ops[0].weight1 is module.linear_fc1.weight1
-    assert ops[0].bias is module.linear_fc1.bias  # ← single grouped bias attached at "bias"
-    assert not hasattr(
-        ops[0], "bias0"
-    ), "bias should not be split into bias{idx} when single_grouped_bias=True"
+    assert ops[0].bias is module.linear_fc1.bias
+    assert ops[0].bias0 is None
+    assert ops[0].bias1 is None
+    fc1_named_params = dict(ops[0].named_parameters())
+    assert fc1_named_params["bias"] is module.linear_fc1.bias
+    assert "bias0" not in fc1_named_params
+    assert "bias1" not in fc1_named_params
 
 
 def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():
@@ -995,6 +1078,91 @@ class TestTEGroupedMLP:
                 assert getattr(ops[2], f"weight{idx}") is getattr(
                     experts.linear_fc2, f"weight{idx}"
                 )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_gpu_fused_path_scales_fc2_bias(self):
+        """FC2 bias and its gradients must use the per-token router probability."""
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+        import inspect
+
+        if "scale_bias" not in inspect.signature(GroupedLinear.__init__).parameters:
+            pytest.skip("Installed TE op fuser GroupedLinear lacks `scale_bias` support")
+
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+
+        tf_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=False,
+            add_bias_linear=True,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=False,
+            bias_dropout_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        layer = MoELayer(tf_config, submodules)
+        layer = Float16Module(layer.config, layer).module
+        layer.cuda()
+        experts = layer.experts
+        assert isinstance(experts, TEGroupedMLP)
+
+        with torch.no_grad():
+            for linear in (experts.linear_fc1, experts.linear_fc2):
+                for expert_idx in range(self.num_experts):
+                    getattr(linear, f"weight{expert_idx}").zero_()
+                    getattr(linear, f"bias{expert_idx}").zero_()
+            experts.linear_fc2.bias0.fill_(2.0)
+            experts.linear_fc2.bias1.fill_(4.0)
+
+        hidden_states = torch.zeros(
+            3, self.hidden_size, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        tokens_per_expert = torch.tensor([2, 1], dtype=torch.int32, device="cuda")
+        probs = torch.tensor(
+            [0.25, 0.5, 0.125], dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+
+        output, _ = experts(hidden_states, tokens_per_expert, probs)
+        expected_output = torch.cat(
+            (
+                probs[:2, None] * torch.full_like(output[:2], 2.0),
+                probs[2:, None] * torch.full_like(output[2:], 4.0),
+            )
+        )
+        torch.testing.assert_close(output, expected_output)
+
+        output.sum().backward()
+        expected_prob_grad = (
+            torch.tensor([2.0, 2.0, 4.0], dtype=torch.bfloat16, device="cuda") * self.hidden_size
+        )
+        torch.testing.assert_close(probs.grad, expected_prob_grad)
+        torch.testing.assert_close(
+            experts.linear_fc2.bias0.grad,
+            torch.ones_like(experts.linear_fc2.bias0) * probs[:2].detach().sum(),
+        )
+        torch.testing.assert_close(
+            experts.linear_fc2.bias1.grad,
+            torch.ones_like(experts.linear_fc2.bias1) * probs[2:].detach().sum(),
+        )
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal

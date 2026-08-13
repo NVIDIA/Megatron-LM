@@ -1,4 +1,8 @@
+# Files directly in the repository root without a more specific owner.
+/* @NVIDIA/core-nemo
+
 megatron/core/ @NVIDIA/core-adlr @NVIDIA/core-nemo
+megatron/core/tensor_parallel/generalized_tensor_parallelism.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gtp
 
 megatron/core/models/bert/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 

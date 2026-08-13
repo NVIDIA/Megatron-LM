@@ -14,7 +14,14 @@ class TestMambaMetadata:
         """Fixture to initialize MambaMetadata with standard constraints."""
         max_requests = 16
         max_tokens = 2048
-        metadata = MambaMetadata(max_requests=max_requests, max_tokens=max_tokens)
+        # Per-step intermediate-state cap (token budget / block_size + margin);
+        # value is irrelevant to these update() tests, which don't extract state.
+        max_intermediate_count = 17
+        metadata = MambaMetadata(
+            max_requests=max_requests,
+            max_tokens=max_tokens,
+            max_intermediate_count=max_intermediate_count,
+        )
 
         # Manually allocate some slots to simulate a running state.
         # We assume request_id i maps to mamba_slot i for simplicity in assertions.
@@ -23,6 +30,15 @@ class TestMambaMetadata:
 
         yield metadata
         metadata.reset()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    def test_decode_indices_dtype(self, dtype):
+        metadata = MambaMetadata(
+            max_requests=4, max_tokens=16, max_intermediate_count=1, decode_indices_dtype=dtype
+        )
+
+        assert metadata._batch_indices_decode_buffer.dtype == dtype
 
     def _run_update_test(
         self,

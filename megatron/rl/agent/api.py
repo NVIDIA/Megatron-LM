@@ -19,12 +19,7 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
-from ..rollout_granularity import (
-    RELEASE_STATE_BY_SUBMISSION,
-    ConsumptionGranularity,
-    ReleaseState,
-    SubmissionGranularity,
-)
+from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -102,14 +97,23 @@ class RolloutGroup(AgentBaseModel):
 GroupedRollouts = list[RolloutGroup]
 
 
+class EpisodeResult(NamedTuple):
+    """All per-turn responses of one (possibly multi-turn) episode plus the final conversation."""
+
+    responses: list[InferenceResponse]
+    conversation: list[LLMChatMessage]
+
+
 class GroupRolloutParams(NamedTuple):
     """Returned by agent.prepare_group_rollout.
 
     One instance is created per group call and reused for all rollouts in that group.
+    Every rollout is an episode: run_episode generates it (one or more turns), while
+    build_rollout turns the completed episode into a Rollout.
     """
 
-    inference_request: InferenceRequest
-    build_rollout: Callable[[InferenceResponse], Awaitable[Rollout]]
+    run_episode: Callable[[], Awaitable[EpisodeResult]]
+    build_rollout: Callable[[EpisodeResult], Awaitable[Rollout]]
 
 
 class ContrastiveRollout(AgentBaseModel):
@@ -227,7 +231,14 @@ class _GranularityConfig(NamedTuple):
 
 
 class _SubmissionGate:
-    """Gate capacity is measured in units of the configured submission granularity."""
+    """Gate capacity is measured in units of the configured submission granularity.
+
+    Each granularity has a single release point: R slots free when inference
+    completes, so the gate bounds engine concurrency in rollouts. G and B
+    slots free when the trainer consumes the group/batch, so the gate
+    enforces the --rl-generation-lag run-ahead cap in groups/batches
+    respectively.
+    """
 
     def __init__(
         self,
@@ -237,7 +248,6 @@ class _SubmissionGate:
     ) -> None:
         self._sem = asyncio.Semaphore(capacity)
         self._submission = submission
-        self._release_on = RELEASE_STATE_BY_SUBMISSION[submission]
         self.capacity = capacity
         # Observability counters, updated only on the configured submission
         # granularity (the only path that touches the semaphore). `held`
@@ -256,8 +266,8 @@ class _SubmissionGate:
             self.held += 1
             self.acquire_calls += 1
 
-    def release_after(self, state: ReleaseState) -> None:
-        if self._release_on == state:
+    def release_for(self, granularity: SubmissionGranularity) -> None:
+        if self._submission == granularity:
             self._sem.release()
             self.held -= 1
             self.release_calls += 1
@@ -284,7 +294,7 @@ class _InferredItem(NamedTuple):
     """One rollout post-inference, flowing from infer to assemble."""
 
     item: _InferWorkItem
-    response: InferenceResponse
+    episode: EpisodeResult
     inferred_at: float = 0.0
 
 
@@ -397,16 +407,14 @@ class _RolloutPipeline:
 
     @trace_async_exceptions(verbose=True)
     async def _infer_one(self, item: _InferWorkItem) -> None:
-        response = await self.agent.get_rollout_response(
-            self.request, item.params.inference_request
-        )
+        episode = await item.params.run_episode()
         inferred_at = time.monotonic()
-        self.gate.release_after("inferred")
+        self.gate.release_for("R")
         if item.infer_dequeued_at:
             self.engine_dwell.append(inferred_at - item.infer_dequeued_at)
         self.inferred_count += 1
         await self.assemble_queue.put(
-            _InferredItem(item=item, response=response, inferred_at=inferred_at)
+            _InferredItem(item=item, episode=episode, inferred_at=inferred_at)
         )
 
     async def stage_assemble(self) -> None:
@@ -428,15 +436,17 @@ class _RolloutPipeline:
                 completed = pending.pop(inferred.item.group_id)
                 completed.sort(key=lambda item: item.item.rollout_idx)
                 rollouts = await asyncio.gather(
-                    *[item.item.params.build_rollout(item.response) for item in completed]
+                    *[item.item.params.build_rollout(item.episode) for item in completed]
                 )
-                self.gate.release_after("assembled")
                 self.assembled_count += 1
                 # NOTE: this filter is currently non-functional dead code:
                 # _GranularityConfig._validate rejects filter_groups_with_same_reward
                 # at pipeline construction, so `keep` is always True. Kept for a
                 # future PR that regenerates dropped groups instead of
-                # under-delivering to the caller.
+                # under-delivering to the caller. That PR must also release the
+                # gate slot on the drop path: G/B slots free on consumption, and
+                # a dropped group never reaches stage_consume, so its slot (and
+                # eventually its batch's) would leak permanently.
                 keep = (
                     not self.request.filter_groups_with_same_reward
                     or np.std([rollout.reward for rollout in rollouts]) > 1e-6
@@ -474,6 +484,7 @@ class _RolloutPipeline:
                     return
                 self._record_output_dwell(group)
                 yield group
+                self.gate.release_for("G")
 
         next_batch_id = 0
         pending = self._consume_pending
@@ -493,7 +504,8 @@ class _RolloutPipeline:
                 next_batch_id += 1
                 for group in batch:
                     yield group
-                self.gate.release_after("consumed")
+                    self.gate.release_for("G")
+                self.gate.release_for("B")
 
 
 class GroupedRolloutGenerator(Agent, ABC):
@@ -511,12 +523,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         self,
         request: GroupedRolloutRequest,
     ) -> GroupRolloutParams:
-        """Return the params for one group's rollouts.
-
-        Called once per group by _RolloutPipeline.stage_prepare. The returned
-        build_rollout closure is invoked once per inference response in
-        _RolloutPipeline.stage_assemble.
-        """
+        """Return the params for one group's rollouts."""
         ...
 
     async def get_grouped_rollouts(

@@ -64,7 +64,7 @@ def execute_reshard_plan(
     transform: Optional[ReshardTransform] = None,
 ) -> None:
     """
-    Execute a reshard plan (from centralized controller).
+    Execute a reshard plan (built locally on each rank).
     A communication service must be provided to abstract transport.
     Expected service API: submit_send(tensor, dest_rank, task_id),
     submit_recv(tensor, src_rank, task_id), run().
@@ -195,7 +195,8 @@ def execute_reshard_plan(
     logger.info(f"Executing {len(plan.send_ops)} sends + {len(plan.recv_ops)} recvs")
     service.run()
     torch.cuda.synchronize()
-    dist.barrier(group=group)
+    if service.requires_process_group_barrier:
+        dist.barrier(group=group)
 
     # Write back received buffers into their destination parameter slices.
     #
