@@ -161,6 +161,10 @@ class InferenceStateHandoffMixin:
             raise RuntimeError(
                 "Cannot reset while KV handoff transfers may still access cache storage"
             )
+        if self._pinned_handoff_blocks:
+            raise RuntimeError(
+                "Cannot reset while KV handoff blocks remain pinned; wait for RELEASE_KV"
+            )
         self._handoff_completion_notifications.clear()
 
     def schedule_waiting_requests(self) -> None:

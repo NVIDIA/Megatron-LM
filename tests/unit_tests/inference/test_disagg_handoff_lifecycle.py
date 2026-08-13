@@ -10,6 +10,8 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
 from megatron.core.inference.disaggregation.decode_admission import (
     additional_decode_blocks,
     admit_prefilled_decode,
@@ -365,6 +367,16 @@ def test_reset_rejects_an_active_prefill_push(handoff_loop):
     assert engine._pending_kv_pushes == [(7, [handle])]
 
 
+def test_reset_rejects_pinned_prefill_blocks(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    engine._pinned_handoff_blocks[7] = [10]
+
+    with pytest.raises(RuntimeError, match="KV handoff blocks remain pinned"):
+        engine._reset_pending_kv_imports()
+
+    assert engine._pinned_handoff_blocks == {7: [10]}
+
+
 def test_reset_does_not_release_unsafe_import_destinations(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
@@ -377,6 +389,55 @@ def test_reset_does_not_release_unsafe_import_destinations(handoff_loop):
 
     assert engine.context.kv_block_allocator.releases == []
     assert list(engine._pending_kv_imports) == [pending]
+
+
+def test_prefill_handoff_pins_protect_blocks_and_restore_capacity(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    engine.context.prefix_cache_lru_clock = 0
+    allocator = KVBlockAllocator(
+        engine.context,
+        pool_size=7,
+        paused_limit=0,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+    )
+    engine.context.kv_block_allocator = allocator
+    baseline_capacity = allocator.get_allocatable_count()
+
+    blocks = allocator.allocate_memory_blocks(4).tolist()
+    first_handoff = blocks[:2]
+    second_handoff = blocks[2:]
+    registered_blocks = [first_handoff[0], second_handoff[0]]
+    partial_tail_blocks = [first_handoff[1], second_handoff[1]]
+    allocator.register_kv_block_hashes(registered_blocks, [101, 201], [0, 0])
+
+    for request_id, request_blocks in ((11, first_handoff), (12, second_handoff)):
+        allocator.retain_memory_blocks(request_blocks)
+        allocator.release_memory_blocks(torch.tensor(request_blocks, dtype=torch.int32))
+        engine._pinned_handoff_blocks[request_id] = request_blocks
+
+    assert allocator.block_ref_counts[blocks].tolist() == [1, 1, 1, 1]
+    assert int(allocator.get_evictable_block_count()) == 0
+    assert allocator.get_allocatable_count() == baseline_capacity - 4
+    assert allocator.evict_lru_blocks(1) is False
+    assert allocator.allocate_memory_blocks(3) is None
+
+    engine.release_handoff_blocks(11)
+    assert allocator.get_allocatable_count() == baseline_capacity - 2
+    assert allocator.block_ref_counts[first_handoff].tolist() == [0, 0]
+    assert allocator.block_hashes[first_handoff[0]].item() == 101
+    assert first_handoff[1] in allocator.block_bag[: allocator.pool_avail].tolist()
+
+    engine.release_handoff_blocks(11)
+    engine.release_handoff_blocks(999)
+    assert allocator.get_allocatable_count() == baseline_capacity - 2
+
+    engine.release_handoff_blocks(12)
+    assert allocator.get_allocatable_count() == baseline_capacity
+    assert allocator.block_ref_counts[blocks].tolist() == [0, 0, 0, 0]
+    assert allocator.block_hashes[registered_blocks].tolist() == [101, 201]
+    free_blocks = allocator.block_bag[: allocator.pool_avail].tolist()
+    assert all(block in free_blocks for block in partial_tail_blocks)
 
 
 def test_peer_failure_quarantines_an_unfinished_local_transfer(handoff_loop):
