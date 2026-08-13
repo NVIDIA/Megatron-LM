@@ -301,6 +301,13 @@ class TransformerConfig(ModelParallelConfig):
     'gated_delta_net' is a deprecated alias of 'gdn': it is normalized to 'gdn' in
     __post_init__ and emits a DeprecationWarning."""
 
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    """How THD sequence rows are partitioned across context-parallel ranks.
+
+    Contiguous partitioning is defined only for THD inputs; BSHD context parallelism uses the
+    standard zigzag layout.
+    """
+
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
 
@@ -1397,6 +1404,15 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
             raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
+
+        if self.cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+
+        if self.cp_partition_mode == "contiguous" and self.context_parallel_size > 1:
+            raise ValueError(
+                "cp_partition_mode='contiguous' with context parallelism requires a "
+                "contiguous-layout batch partitioning path, which is not currently available."
+            )
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

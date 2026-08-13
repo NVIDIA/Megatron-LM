@@ -37,11 +37,12 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
+from megatron.core.context_parallel_layout import prebuild_thd_cp_partition_routes
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -90,6 +91,17 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+
+
+def _finalize_packed_seq_params(packed_seq_params):
+    """Resolve CP group metadata and prebuild THD CP layout routes."""
+    if packed_seq_params is None:
+        return None
+    cp_group = packed_seq_params.cp_group or get_context_parallel_group()
+    packed_seq_params.cp_group = cp_group
+    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+    return packed_seq_params
+
 
 # Canonical, ordered schema of the fields ``get_batch`` returns. Kept alphabetical
 # to match the historical ``sorted(batch.keys())`` order that callers unpack into.
@@ -341,6 +353,7 @@ def forward_step(data_iterator, model: HybridModel):
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
         )
+        _finalize_packed_seq_params(packed_seq_params)
 
     timers('batch-generator').stop()
 
