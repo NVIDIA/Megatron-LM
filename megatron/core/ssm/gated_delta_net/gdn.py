@@ -201,6 +201,19 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             config=self.config,
         )
 
+        internal_partition_mode = (
+            packed_seq_params.cp_partition_mode
+            if packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+            else (
+                "zigzag" if back_to_input_converter is not None else self.config.cp_partition_mode
+            )
+        )
+        if cp_group is not None and cp_group.size() > 1 and internal_partition_mode != "zigzag":
+            raise ValueError(
+                "GatedDeltaNet with headwise CP requires zigzag layout. CP partition "
+                "conversion must be handled before GatedDeltaNet computation."
+            )
+
         seq_len, batch, _ = hidden_states.shape
         seq_len = seq_len * self.sp_size * self.cp_size
 
