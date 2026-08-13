@@ -43,6 +43,11 @@ from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     register_capture_params_to_ensure_ready,
     register_capture_wgrad_ring_slot,
 )
+from megatron.core.tensor_parallel.gtp_symmetric_memory import (
+    is_gtp_symm_pool_registered,
+    register_gtp_symm_pool,
+    symmetric_wgrad_pool,
+)
 from megatron.core.utils import ensure_params_ready, log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -308,6 +313,37 @@ _wgrad_buf_pool: Dict[tuple, list] = {}
 _GTP_GROUPED_BUF_PARITY_COUNTER: Dict[tuple, int] = {}
 
 
+def _use_symmetric_wgrad_buffer(weight) -> bool:
+    """True when this weight's reduce-scatter should send from the window-registered pool.
+
+    A registered pool takes precedence over fp32-accum on its group: the group keeps the
+    plain (symmetric) reduce-scatter, and fp32-accum applies only to unregistered groups.
+    """
+    return getattr(weight, "gtp_smr", False) and is_gtp_symm_pool_registered(weight.group)
+
+
+def _use_fp32_accum_rs(group) -> bool:
+    """True when this group's wgrad reduction runs as the fp32-accum all-to-all.
+
+    Size <= 2 gains nothing (one addition) and still costs the scratch, so it bypasses. A
+    registered symmetric pool takes precedence (see _use_symmetric_wgrad_buffer).
+    """
+    return (
+        GTP_CONFIG.reduce_scatter_with_fp32_accumulation
+        and group.size() > 2
+        and not is_gtp_symm_pool_registered(group)
+    )
+
+
+def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
+    """Padded send buffer from the registered LIFO, pad tail zeroed (the RS sends the
+    whole buffer, and recycled LIFO storage may hold stale rows)."""
+    buf = symmetric_wgrad_pool.alloc(weight._unsharded_shape_padded, dtype, device, weight.group)
+    if weight.pad_length:
+        buf[weight._unsharded_shape[0] :].zero_()
+    return buf
+
+
 def _wgrad_pool_get(shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
     """Get a pool buffer or allocate fresh, tagged so _wgrad_pool_put accepts only
     pool-owned buffers (other callers fall through to the caching allocator on release)."""
@@ -439,6 +475,12 @@ class GTPRematConfig:
     # TODO: Infer each domain's ring size automatically.
     graph_wgrad_ring_size: int = 2
 
+    # Symmetric-memory registration: back the wgrad reduce-scatter send buffers with
+    # ncclMemAlloc pools registered on the GTP / EGTP group, so NCCL can use its
+    # symmetric (NVLS) kernels. Independent of --use-nccl-ub, which covers the DP group.
+    gtp_nccl_ub: bool = False
+    egtp_nccl_ub: bool = False
+
 
 GTP_CONFIG = GTPRematConfig()
 
@@ -469,10 +511,14 @@ def configure_gtp_remat_from_recipe(
     fp8=False,
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
+    gtp_nccl_ub=False,
+    egtp_nccl_ub=False,
+    pg_collection=None,
 ):
     """
-    Configure GTP weight-remat (padding + loss reduction) from the quantization recipe.
-    Must be called once BEFORE model construction.
+    Configure GTP weight-remat (padding + loss reduction + symm mem) from the training recipe.
+    Must be called once BEFORE model construction. ``pg_collection`` (optional) supplies the
+    GTP/EGTP groups whose symmetric pools to register; without it the MPU globals are used.
     """
     # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
     # check_param_states=False: GTP buffer reuse (notably under CUDA-graph capture) trips the
@@ -481,6 +527,8 @@ def configure_gtp_remat_from_recipe(
         calculate_per_token_loss=calculate_per_token_loss,
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
+        gtp_nccl_ub=gtp_nccl_ub,
+        egtp_nccl_ub=egtp_nccl_ub,
     )
     if fp4:
         update_gtp_config(pad_for_alignment=16)
@@ -488,6 +536,28 @@ def configure_gtp_remat_from_recipe(
         update_gtp_config(pad_for_alignment=32)
     elif fp8:
         update_gtp_config(pad_for_alignment=16)
+
+    if reduce_scatter_with_fp32_accumulation and (gtp_nccl_ub or egtp_nccl_ub):
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "--gtp-nccl-ub/--egtp-nccl-ub take precedence over "
+            "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NCCL "
+            "symmetric reduce-scatters provide equivalent numerics with better performance.",
+        )
+
+    # Register the dense-GTP and EGTP pools centrally (pre-construction, before any forward),
+    # so all modules -- including TE pre-sharded ones -- share the registered per-group pools.
+    # resolve_gtp_remat_group prefers the caller's pg_collection (custom groups included) and
+    # falls back to the MPU globals; register_gtp_symm_pool no-ops on None/single-rank groups.
+    # Local import: process_groups_config reaches parallel_state, which imports this module.
+    if gtp_nccl_ub or egtp_nccl_ub:
+        from megatron.core.process_groups_config import resolve_gtp_remat_group
+
+        if gtp_nccl_ub:
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
+        if egtp_nccl_ub:
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         logger.info("> GTP_remat enabled. %s", GTP_CONFIG)
@@ -576,7 +646,9 @@ def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
     return gtp_shard
 
 
-def _gtp_attach_attrs(gtp_shard, gtp_remat_group, *, is_grouped=False, expert_idx=0):
+def _gtp_attach_attrs(
+    gtp_shard, gtp_remat_group, *, is_grouped=False, expert_idx=0, is_expert=False
+):
     """Attach group / gtp_remat_size / routed-expert tags and register in _GTP_PARAMS.
 
     Separate from _gtp_slice_one_param so attrs land on the post-quantize param (when
@@ -595,6 +667,9 @@ def _gtp_attach_attrs(gtp_shard, gtp_remat_group, *, is_grouped=False, expert_id
         gtp_shard.chain_id = GTPChain.UNGRAPHED.value
     gtp_shard.group = gtp_remat_group
     gtp_shard.gtp_remat_size = gtp_remat_group.size()
+    # gtp_smr: draw this param's reduce-scatter send buffers from the per-group
+    # window-registered pool. Expert vs dense comes from the caller's is_expert.
+    gtp_shard.gtp_smr = GTP_CONFIG.egtp_nccl_ub if is_expert else GTP_CONFIG.gtp_nccl_ub
     global _GTP_PARAMS
     _GTP_PARAMS.append(gtp_shard)
 
@@ -647,7 +722,9 @@ def _gtp_reclass_native_fp8_shard(param):
     return param
 
 
-def attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grouped=False):
+def attach_gtp_to_presharded_module(
+    module, gtp_remat_group, pad_length, is_grouped=False, is_expert=False
+):
     """Turn each pre-sharded weight into a GTP param (FP8/BF16) and attach GTP wiring."""
     # GTP shards per-expert weight0..weight{num_gemms-1}; a coalesced single weight has no sibling
     # shards to attach, so reject it here (once, at setup) instead of silently attaching nothing.
@@ -672,7 +749,9 @@ def attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grou
         else:
             gtp_param = _gtp_wrap_bf16_shard(module, name, param)
         gtp_param.pad_length = pad_length
-        _gtp_attach_attrs(gtp_param, gtp_remat_group, is_grouped=is_grouped, expert_idx=idx)
+        _gtp_attach_attrs(
+            gtp_param, gtp_remat_group, is_grouped=is_grouped, expert_idx=idx, is_expert=is_expert
+        )
         new_weights.append(gtp_param)
     if is_grouped and new_weights:
         new_weights[0].weight_list = new_weights
@@ -774,7 +853,7 @@ def gtp_native_fp8_load_context(module):
             param.__class__ = sub_cls
 
 
-def wrap_module_params_gtp(module, weight_names, gtp_remat_group, is_grouped=None):
+def wrap_module_params_gtp(module, weight_names, gtp_remat_group, is_grouped=None, is_expert=False):
     """Shard and re-register module params as GTPShardedParam (post-init slice).
 
     Called post-init for Megatron-style local modules (ColumnParallelLinear, etc.), which build
@@ -798,7 +877,13 @@ def wrap_module_params_gtp(module, weight_names, gtp_remat_group, is_grouped=Non
         delattr(module, name)
         gtp_shard = _gtp_slice_one_param(param, gtp_remat_group, name=name)
         del param
-        _gtp_attach_attrs(gtp_shard, gtp_remat_group, is_grouped=bool(is_grouped), expert_idx=idx)
+        _gtp_attach_attrs(
+            gtp_shard,
+            gtp_remat_group,
+            is_grouped=bool(is_grouped),
+            expert_idx=idx,
+            is_expert=is_expert,
+        )
         # register the newly sharded param back to the module
         module._parameters[name] = gtp_shard
 
@@ -907,6 +992,8 @@ def _init_gtp_runtime_attrs(obj):
     obj.rs_event = torch.cuda.Event(external=True)
     obj._rs_ticket = None
     obj._rs_a2a_bufs = None  # all-to-all scratch held by an in-flight fp32-accum RS
+    # Symmetric wgrad slot
+    obj._wgrad_symm_slot = None
     # Padding
     obj.pad_length = 0
     # Debug
@@ -1736,13 +1823,22 @@ class GTPShardedParam(torch.nn.Parameter):
         return self.all_gather_and_prefetch(**kwargs)
 
     def get_wgrad_tensor(self):
-        """Return a logical-shape view of stable ring storage or ordinary scratch.
-
-        Capture ownership is registered later, when the final RS input is selected.
-        """
+        """Return a logical-shape view of stable ring storage or ordinary scratch."""
         ring_slot = getattr(self, "_gtp_graph_wgrad_ring_slot", None)
         if ring_slot is not None:
             return self._gtp_graph_wgrad_ring_view
+
+        # TODO: Merge the ring wgrad slot and symmetric wgrad slot into a single slot.
+        if _use_symmetric_wgrad_buffer(self):
+            # Lifecycle invariant: get_wgrad_tensor -> GEMM -> _prepare consumes the slot -> RS.
+            if self._wgrad_symm_slot is not None:
+                raise RuntimeError(
+                    "[GTP] get_wgrad_tensor called again before the previous symmetric "
+                    f"wgrad buffer was consumed ({self._debug_name})."
+                )
+            buf = _alloc_symmetric_wgrad_buffer(self, self.main_grad.dtype, self.device)
+            self._wgrad_symm_slot = buf
+            return buf[: self._unsharded_shape[0]]
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
 
     def register_grad_accum_hook(
@@ -1841,6 +1937,11 @@ class GTPShardedParam(torch.nn.Parameter):
             if not _chain_is_graphed(self.chain_id):
                 for buf in bufs:
                     _wgrad_pool_put(buf)
+            for buf in bufs:
+                # Return symm LIFO parents (tag-gated no-op for plain and ring buffers).
+                # Unconditional on chain kind: the LIFO's captured alloc/free pops replay
+                # at stable addresses.
+                symmetric_wgrad_pool.free(buf)
             setattr(self, attr, None)
 
     def _record_graph_wgrad_ring_slots_ready(self) -> None:
@@ -1945,9 +2046,8 @@ class GTPShardedParam(torch.nn.Parameter):
             rs_ctx = nullcontext()
 
         with rs_ctx:
-            # Size <= 2 gains nothing (one addition) and still costs the scratch, so it bypasses.
             # self.group is per chain, so each axis decides on its own.
-            if GTP_CONFIG.reduce_scatter_with_fp32_accumulation and self.group.size() > 2:
+            if _use_fp32_accum_rs(self.group):
                 nvtx_range_push(f"{nvtx_label}.gtp_rs_fp32accum")
                 outputs, sum_handles = [], []
                 if len(wgrads) > 1:
@@ -2009,9 +2109,29 @@ class GTPShardedParam(torch.nn.Parameter):
         that prefix, copy it there before RS.
         """
         prepared = []
-        for weight, wgrad in zip(self._weights, wgrads):
+        for index, (weight, wgrad) in enumerate(zip(self._weights, wgrads)):
             slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
+
             if slot is None:
+
+                # With SMR, send the padded parent tensor of the logical view
+                # that get_wgrad_tensor handed the GEMM.
+                if _use_symmetric_wgrad_buffer(weight):
+                    symm_slot = weight._wgrad_symm_slot
+                    weight._wgrad_symm_slot = None
+                    if symm_slot is None:
+                        symm_slot = _alloc_symmetric_wgrad_buffer(weight, wgrad.dtype, wgrad.device)
+
+                    # Alias check and copy
+                    if wgrad.data_ptr() != symm_slot.data_ptr():
+                        symm_slot[: weight._unsharded_shape[0]].copy_(wgrad)
+                        _wgrad_pool_put(wgrad)
+
+                    # Required to free the slot after the RS is waited on.
+                    wgrads[index] = symm_slot
+                    prepared.append(symm_slot)
+                    continue
+
                 if weight.pad_length > 0:
                     wgrad = torch.nn.functional.pad(wgrad, (0, 0, 0, weight.pad_length))
                 prepared.append(wgrad)
@@ -2065,7 +2185,11 @@ class GTPShardedParam(torch.nn.Parameter):
             self._wgrad_input_bufs = wgrads
             ret = tuple([None] * len(wgrads)) if batched else None
         else:
-            # Sync reduce-scatter — reached as the natural chain-head case, recycle immediately
+            # Sync reduce-scatter — reached as the natural chain-head case, recycle immediately.
+            # Keep a handle on the RS inputs: the name is rebound to the outputs below, and
+            # symm LIFO scratch among the inputs must go back to the LIFO (not leak to the
+            # allocator, which would starve the free list the CG capture guard relies on).
+            rs_inputs = wgrads
             wgrads, _ = self._reduce_scatter(wgrads, async_op=False, nvtx_label=nvtx_label)
             nvtx_range_push(f"{nvtx_label}.gtp_wgrad_accum")
             if len(weights) == 1:
@@ -2078,6 +2202,8 @@ class GTPShardedParam(torch.nn.Parameter):
             if poolable:
                 for buf in wgrads:
                     _wgrad_pool_put(buf)
+            for buf in rs_inputs:
+                symmetric_wgrad_pool.free(buf)  # tag-gated: symm LIFO parents only
             ret = result if batched else result[0]
 
         # Wait for last reduce scatter if it was async

@@ -454,7 +454,7 @@ def _gtp_pre_init(
     return shard_out, gtp_ctx
 
 
-def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
+def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False, is_expert=False):
     """Attach the GTP surface to a pre-sharded TE module's weights and restore logical out_features.
 
     ``is_grouped=True`` for GroupedLinear (per-expert weight0..N, coalesced AG via weight_list).
@@ -466,7 +466,9 @@ def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False):
     # super().__init__): downstream code reads it, e.g. the grouped-MLP fusion gate checks
     # fc1.out_features == 2 * fc2.in_features (a shard-sized fc1 would silently disable fusion).
     module.out_features = logical_out_features
-    attach_gtp_to_presharded_module(module, gtp_remat_group, pad_length, is_grouped=is_grouped)
+    attach_gtp_to_presharded_module(
+        module, gtp_remat_group, pad_length, is_grouped=is_grouped, is_expert=is_expert
+    )
 
 
 @contextmanager
@@ -499,7 +501,7 @@ def _init_gtp_remat_context(
         out_split_size=out_split_size,
     )
     yield out_features
-    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped)
+    _gtp_attach_post_init(module, gtp_ctx, is_grouped=is_grouped, is_expert=is_expert)
 
 
 def split_te_layernorm_column_parallel_linear(
@@ -1502,6 +1504,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             output_size,
             gtp_remat_group,
             extra_kwargs,
+            is_expert=is_expert,
             rng_via_kwarg=False,
             out_split_size=self.tp_size,
         )

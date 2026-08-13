@@ -48,6 +48,7 @@ Both `GTP_remat` collectives are prefetched one step ahead, so they overlap the 
     - [2.4 Minimal end-to-end example](#24-minimal-end-to-end-example)
     - [2.5 Tuning knobs](#25-tuning-knobs)
     - [2.6 FP32-accumulation wgrad reduce-scatter (optional)](#26-fp32-accumulation-wgrad-reduce-scatter-optional)
+    - [2.7 NCCL symmetric-memory wgrad reduce-scatter (optional)](#27-nccl-symmetric-memory-wgrad-reduce-scatter-optional)
   - [3. Implementation details](#3-implementation-details)
     - [3.1 GTP\_remat architecture (Mcore ↔ TE integration)](#31-gtp_remat-architecture-mcore--te-integration)
       - [What the flags do under the hood](#what-the-flags-do-under-the-hood)
@@ -362,7 +363,8 @@ it** — a different collective over a different process group, so enable either
   applies either way.
 - **Auto-bypass at axis size ≤ 2.** The gate reads the per-chain group, so each axis decides
   independently: a `GTP_remat=8 × EGTP_remat=2` run gets FP32 accumulation on the dense weights
-  and the plain reduce-scatter on the experts.
+  and the plain reduce-scatter on the experts. A group with a registered symmetric pool (§2.7)
+  also bypasses — the pool takes precedence.
 - **Scratch lifetime.** The buffer comes from GTP's wgrad pool rather than a fresh `empty_like`,
   and is returned only once the handle is waited — it is the *input* to the deferred FP32 sum.
 - **Batched (grouped / routed-expert) path.** The all-to-alls share one `ncclGroupStart/End` via
@@ -371,6 +373,36 @@ it** — a different collective over a different process group, so enable either
   behind it in one composite handle — which is why the all-to-alls are issued with
   `async_op=True`: for this primitive that flag defers the sum, it does not merely return a
   handle. (DDP's own flag sidesteps all this by asserting a single bucket.)
+
+### 2.7 NCCL symmetric-memory wgrad reduce-scatter (optional)
+
+```bash
+--gtp-nccl-ub        # dense gtp_remat group          default: off
+--egtp-nccl-ub       # routed-expert egtp_remat group  default: off
+```
+
+**Allocates the wgrad reduce-scatter send buffers from an NCCL-window-registered memory pool on the gtp_remat / egtp_remat group, so NCCL runs the reduce-scatter as a single symmetric device kernel — NVLS multimem within an NVLink domain, rail kernels when the group spans domains — instead of a ring.** Only the send side needs registration; the sharded output lands in the ordinary `main_grad`.
+
+| | |
+|---|---|
+| **Use when** | NVLS-capable systems (NVSwitch, NCCL with symmetric-kernel support) where the gtp_remat wgrad reduce-scatter is exposed |
+| **Skip when** | `--disable-symmetric-registration` is set (asserted incompatible) |
+| **Gain** | in-switch reduction: fewer SMs and lower latency per reduce-scatter |
+| **Cost** | a persistent registered pool of unsharded-wgrad-sized buffers per group, plus a one-time registration warmup; deregistered at shutdown |
+
+**Behaviour notes**
+
+- **Zero-copy producers.** Wgrads are written straight into the registered buffer — TE modules
+  via the `DistributedWeight.grad_buffer` protocol, Megatron-native linears via an `out=` matmul
+  (when the wgrad dtype matches `main_grad`). The untied embedding's wgrad is materialized by
+  `F.embedding`'s own backward and pays one copy into the buffer.
+- **FP32-accumulation interplay.** A registered pool takes precedence over §2.6 on its group:
+  NCCL symmetric reduce-scatters provide equivalent numerics with better performance, so the
+  group keeps the symmetric reduce-scatter and the fp32-accum all-to-all applies only to axes
+  without a pool. E.g. `--gtp-nccl-ub` + §2.6 gives a symmetric dense-GTP reduce-scatter and
+  the fp32-accum all-to-all on the EGTP axis.
+- **Independent of `--use-nccl-ub`.** That flag registers DP-group (DDP bucket) buffers; these
+  flags cover the gtp_remat axes only. Enable either, both, or neither.
 
 ---
 
