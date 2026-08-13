@@ -477,6 +477,11 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
         )
+        # FP8 dispatch: the FC1 input arrives as an opaque MXFP8 carrier tensor (TE EP dispatch
+        # packs E4M3 data + scales into a plain tensor's storage); tell TE to rebuild the
+        # grouped view at the op boundary.
+        # TODO: remove after TE support the grouped tensor path
+        op.ep_mxfp8_carrier_input = self.config.moe_dispatch_fwd_dtype == 'mxfp8'
         ops.append(op)
 
         # Activation and post-multiply probs (SwiGLU, clamped quick-GeGLU, or SReLU)
@@ -563,6 +568,11 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
+        # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
+        # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
+        # view at the op boundary.
+        # TODO: remove after TE support the grouped tensor path
+        op.ep_mxfp8_carrier_grad = self.config.moe_combine_bwd_dtype == 'mxfp8'
         ops.append(op)
 
         # Emulate submodule pre-forward hooks
