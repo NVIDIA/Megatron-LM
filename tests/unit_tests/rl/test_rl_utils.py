@@ -771,6 +771,17 @@ class TestRLUtils:
         advs = rl_utils.calculate_grpo_advantages([[-1, 1], [4, 4]], num_turns)
         torch.testing.assert_close(torch.tensor(advs), torch.tensor(expected), atol=1e-4, rtol=1e-5)
 
+    def test_bounded_artifact_key(self):
+        short = "env_rollout_table"
+        assert rl_utils._bounded_artifact_key(short) == short
+        long_key = "nemo_gym:" + "x" * 120 + "_staleness_hist"
+        bounded = rl_utils._bounded_artifact_key(long_key)
+        assert len(bounded) == 100
+        assert bounded.startswith(long_key[:91])
+        # Deterministic, and distinct keys stay distinct after bounding.
+        assert bounded == rl_utils._bounded_artifact_key(long_key)
+        assert bounded != rl_utils._bounded_artifact_key(long_key + "y")
+
     @pytest.mark.parametrize(
         "scenario, expected_turn_lens, expected_traj_lens, expected_num_turns",
         [

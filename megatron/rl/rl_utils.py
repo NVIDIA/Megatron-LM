@@ -2,6 +2,7 @@
 
 import copy
 import gc
+import hashlib
 
 # Keep this to make the env registered.
 import itertools
@@ -1006,6 +1007,28 @@ def compute_group_stats(
     return stats
 
 
+def _bounded_artifact_key(key, limit=100):
+    """Bound a metric key so the artifact name wandb derives from it stays within wandb's limit.
+
+    wandb rejects artifact names longer than 128 characters with a ValueError
+    (`NAME_MAXLEN` in wandb/sdk/artifacts/_validators.py)
+
+    A table or plot logged under key K is stored as artifact 'run-{run.id}-{K}'
+    (13 chars of prefix with the default 8-char run id)
+
+    wandb.plot.* charts log their backing table under '{K}_table' (6 more)
+
+    keys containing characters outside [a-zA-Z0-9_.-] (env ids contain ':') are given
+    a 7-char CRC suffix by wandb's sanitizer.
+    
+    Worst-case key budget: 128 - 13 - 6 - 7 = 102 ~= 100.
+    """
+    if len(key) <= limit:
+        return key
+    # 9 = 1 ('_' separator) + 8 (hex chars of the md5 digest).
+    digest = hashlib.md5(key.encode()).hexdigest()[:8]
+    return f'{key[: limit - 9]}_{digest}'
+
 
 def prep_wandb_metrics(
         wandb_writer: wandb_run.Run,
@@ -1376,7 +1399,12 @@ def maybe_log_training_metrics(
             tokenizer=tokenizer,
         )
         for k, v in env_metrics.items():
-            metrics[f"{env_id}_{k}"] = v
+            # Only table/plot values have a character length limit.
+            # Scalar keys are fine.
+            full_key = f"{env_id}_{k}"
+            if not isinstance(v, (int, float, bool)):
+                full_key = _bounded_artifact_key(full_key)
+            metrics[full_key] = v
 
     # Per-pipeline instrumentation (queue sizes, gate state, per-stage
     # timings) and the multi-task work distribution, collected on rank 0
