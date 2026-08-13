@@ -1131,7 +1131,7 @@ class TransformerConfig(ModelParallelConfig):
        training and inference as the kernels are not full optimized.
        Defaults to False."""
 
-    batch_invariant_backend: str = "te_native"
+    batch_invariant_backend: Literal["te_native", "deepgemm", "triton"] = "te_native"
     """Which batch-invariant GEMM backend to use when batch_invariant_mode is
     enabled: "te_native" (default: keep the native cuBLASLt kernels and obtain
     invariance via workspace starvation — lowest overhead, no extra
