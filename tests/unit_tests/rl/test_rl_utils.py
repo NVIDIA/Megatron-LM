@@ -1483,9 +1483,10 @@ class TestRLUtils:
         assert metrics["rollout/env_timeout_count"] == 1
         assert metrics["rollout/env_timeout_rate"] == (0.125 if inject_placeholders else 0.25)
         if inject_placeholders:
-            assert metrics["rollout/failure_reason/http_500"] == 4
+            assert metrics["rollout/failure_reason/http_500_count"] == 4
+            assert metrics["rollout/failure_reason/http_500_rate"] == 0.5
         else:
-            assert "rollout/failure_reason/http_500" not in metrics
+            assert "rollout/failure_reason/http_500_count" not in metrics
         # The raw delivery aggregate keeps the placeholder zeros (mean of group
         # means becomes 1/3 instead of 0.75); the valid view masks them. The
         # pair diverging is the infrastructure-failure signature.
@@ -1697,8 +1698,9 @@ class TestRLUtils:
             metrics["rollout/placeholder_count"] + metrics["rollout/masked_count"]
             == metrics["failed_rollouts/count"]
         )
-        assert metrics["rollout/failure_reason/judge_unparseable"] == 1
-        assert metrics["rollout/failure_reason/http_500"] == 1
+        assert metrics["rollout/failure_reason/judge_unparseable_count"] == 1
+        assert np.isclose(metrics["rollout/failure_reason/judge_unparseable_rate"], 1 / 6)
+        assert metrics["rollout/failure_reason/http_500_count"] == 1
 
     def test_request_ledger_join(self):
         """compute_group_stats joins finished-request records to rollouts by each
@@ -1784,7 +1786,7 @@ class TestRLUtils:
         rollout_table = next(
             c for c in writer.Table.call_args_list if "traj_length" in c.kwargs.get("columns", [])
         )
-        assert rollout_table.kwargs["data"] == [(1.0, 3, 2, 2, 2, 1, 1, 'ok', None)]
+        assert rollout_table.kwargs["data"] == [(1.0, 3, 2, 2, 2, 1, 1, 'ok')]
 
         # A window where nothing joined emits no staleness/eviction metrics at all.
         metrics = rl_utils.prep_wandb_metrics(

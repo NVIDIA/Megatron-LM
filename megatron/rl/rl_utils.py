@@ -1310,11 +1310,6 @@ def prep_wandb_metrics(
     real_mask = [[nt > 0 for nt in g] for g in num_turns]
     total_rollouts = sum(len(g) for g in num_turns)
     failed_rollouts = sum(not keep for g in real_mask for keep in g)
-    if rollout_statuses is None:
-        rollout_statuses = [['ok'] * len(g) for g in rewards]
-    if failure_reasons is None:
-        failure_reasons = [[None] * len(g) for g in rewards]
-    status_counts = Counter(s for g in rollout_statuses for s in g)
     rollout_metrics = {
         'rollout/count': total_rollouts,
         'failed_rollouts/count': failed_rollouts,
@@ -1327,20 +1322,23 @@ def prep_wandb_metrics(
         """Sanitize a free-form label for use inside a wandb metric key."""
         return ''.join(c if c.isalnum() or c in ('_', '-') else '_' for c in label)
 
-    # Union so that adapter-stamped statuses beyond the known vocabulary are still
-    # counted, while known statuses keep emitting a stable series (zeros included)
-    # even in iterations where they never occur.
-    for status in sorted(set(status_counts) | set(KNOWN_ROLLOUT_STATUSES)):
-        safe_status = _safe_key(status)
-        count = status_counts[status]
-        rollout_metrics[f'rollout/{safe_status}_count'] = count
-        rollout_metrics[f'rollout/{safe_status}_rate'] = (
-            count / total_rollouts if total_rollouts else 0.0
-        )
-    for failure_reason, count in Counter(
-        r for g in failure_reasons for r in g if r
-    ).items():
-        rollout_metrics[f'rollout/failure_reason/{_safe_key(failure_reason)}'] = count
+    if rollout_statuses is None:
+        rollout_statuses = [['ok'] * len(g) for g in rewards]
+    if failure_reasons is None:
+        failure_reasons = [[None] * len(g) for g in rewards]
+    status_counts = Counter(s for g in rollout_statuses for s in g)
+    status_counts.update({status: 0 for status in KNOWN_ROLLOUT_STATUSES})
+    reason_counts = Counter(r for g in failure_reasons for r in g if r)
+    for prefix, counts in (
+        ('rollout/', status_counts),
+        ('rollout/failure_reason/', reason_counts),
+    ):
+        for label, count in sorted(counts.items()):
+            safe_label = _safe_key(label)
+            rollout_metrics[f'{prefix}{safe_label}_count'] = count
+            rollout_metrics[f'{prefix}{safe_label}_rate'] = (
+                count / total_rollouts if total_rollouts else 0.0
+            )
 
     # All-empty wave: every episode failed and was dropped (nothing to aggregate),
     # or every surviving rollout is a zero-turn placeholder (rewards exist but the
@@ -1381,7 +1379,6 @@ def prep_wandb_metrics(
     flat_traj_lens = [l for g in traj_lens for l in g]
     flat_num_evictions = [e for g in num_evictions for e in g]
     flat_statuses = [s for g in rollout_statuses for s in g]
-    flat_reasons = [r for g in failure_reasons for r in g]
     flat_policy_epochs = [r for g in policy_epoch for r in g]
     flat_kv_epochs = [r for g in kv_cache_epoch for r in g]
     joined = [i for i, row in enumerate(flat_policy_epochs) if row]
@@ -1389,7 +1386,6 @@ def prep_wandb_metrics(
     joined_traj_lens = [flat_traj_lens[i] for i in joined]
     joined_num_evictions = [flat_num_evictions[i] for i in joined]
     joined_statuses = [flat_statuses[i] for i in joined]
-    joined_reasons = [flat_reasons[i] for i in joined]
     per_rollout_policy_epochs = [flat_policy_epochs[i] for i in joined]
     per_rollout_kv_epochs = [flat_kv_epochs[i] for i in joined]
     # Per-rollout staleness (oldest token)
@@ -1449,7 +1445,7 @@ def prep_wandb_metrics(
                     'reward', 'traj_length', 'num_evictions',
                     'policy_staleness', 'kv_staleness',
                     'policy_last_token_staleness', 'kv_last_token_staleness',
-                    'rollout_status', 'failure_reason',
+                    'rollout_status',
                 ],
                 data=list(zip(
                     joined_rewards,
@@ -1460,7 +1456,6 @@ def prep_wandb_metrics(
                     rollout_policy_last_token_staleness,
                     rollout_kv_last_token_staleness,
                     joined_statuses,
-                    joined_reasons,
                 )),
             ),
             # NOTE: This table can get very large (one row per token across all rollouts).

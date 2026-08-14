@@ -40,7 +40,6 @@ class GroupedRolloutRequest(Request):
     consumption_granularity: ConsumptionGranularity = "B"
 
 
-# Known rollout-status vocabulary.
 KNOWN_ROLLOUT_STATUSES = ('ok', 'placeholder', 'masked', 'graded')
 
 
