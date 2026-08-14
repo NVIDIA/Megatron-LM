@@ -2,7 +2,26 @@
 
 """FLA-compatible public interface for the internal chunked GDR backend."""
 
+from functools import lru_cache
+from typing import Callable
+
 import torch
+
+
+@lru_cache(maxsize=1)
+def _load_optimized_chunk_gated_delta_rule() -> Callable[
+    ..., tuple[torch.Tensor, torch.Tensor | None]
+]:
+    """Load the optional CuTe DSL GDR package only when this backend is used."""
+    try:
+        from mcore_gdn_opt.gated_delta_rule import chunk_gated_delta_rule
+    except ImportError as exc:
+        raise RuntimeError(
+            "The internal GDR backend requires the mcore_gdn_opt package. Initialize "
+            "third_party/mcore_gdn_opt and install it and its kernel packages in the "
+            "Megatron-LM development container."
+        ) from exc
+    return chunk_gated_delta_rule
 
 
 def chunk_gated_delta_rule(
@@ -23,16 +42,37 @@ def chunk_gated_delta_rule(
     cp_context: object | None = None,
     **kwargs: object,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run the internal chunked gated delta rule implementation.
+    """Run the CuTe DSL-backed internal chunked gated delta rule implementation.
 
     The signature intentionally matches FLA's chunk_gated_delta_rule API so callers can switch
-    backends without reshaping inputs or translating recurrence options. Internal low-level kernels
-    should live in the sibling kernels package and be composed behind this stable entry point.
-
-    Raises:
-        NotImplementedError: Until the internal kernel implementation is added.
+    backends without reshaping inputs. The optimized wrapper selects supported SM100 kernels and,
+    in its default ``auto`` mode, falls back to FLA for unsupported stages or shapes.
     """
-    raise NotImplementedError(
-        "The internal chunked gated delta rule API is available, but its kernels have not been "
-        "added yet."
+    if use_beta_sigmoid_in_kernel:
+        raise ValueError("The internal GDR backend does not support in-kernel beta sigmoid.")
+    if allow_neg_eigval:
+        raise ValueError("The internal GDR backend does not support negative eigenvalues.")
+
+    transpose_state_layout = kwargs.pop("transpose_state_layout", None)
+    if transpose_state_layout is not None:
+        if state_v_first and not bool(transpose_state_layout):
+            raise ValueError("state_v_first conflicts with transpose_state_layout=False.")
+        state_v_first = bool(transpose_state_layout)
+
+    implementation = _load_optimized_chunk_gated_delta_rule()
+    return implementation(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        cp_context=cp_context,
+        transpose_state_layout=state_v_first,
+        **kwargs,
     )

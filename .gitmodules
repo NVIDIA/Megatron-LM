@@ -1,0 +1,3 @@
+[submodule "third_party/mcore_gdn_opt"]
+	path = third_party/mcore_gdn_opt
+	url = ssh://git@gitlab-master.nvidia.com:12051/bhsueh/mcore_gdn_opt.git
