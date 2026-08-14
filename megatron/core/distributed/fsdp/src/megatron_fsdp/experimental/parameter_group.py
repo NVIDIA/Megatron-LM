@@ -405,10 +405,9 @@ class FsdpParameterGroup:
                 if has_sharded_grads:
                     self.main_grad.local_buffer.zero_()
 
-        can_reduce_into_main_grad = (
+        if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
-        )
-        if can_reduce_into_main_grad:
+        ):
             partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
             reduced_grad = self.main_grad
         else:
