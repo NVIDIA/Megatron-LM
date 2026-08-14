@@ -800,11 +800,11 @@ class KimiLearned2DPosEmbed(nn.Module):
         nn.init.normal_(self.weight)
 
     def forward(self, h_patches: int, w_patches: int, device: torch.device) -> torch.Tensor:
-        """Returns (h_patches * w_patches, hidden_size)."""
-        if h_patches == self.height and w_patches == self.width:
-            return self.weight.reshape(-1, self.weight.shape[-1])
-        # Bicubic interpolation: (H, W, C) → (1, C, H, W) → interpolate → flatten
+        """Returns (h_patches * w_patches, hidden_size) on ``device``."""
         w = self.weight.to(device=device)
+        if h_patches == self.height and w_patches == self.width:
+            return w.reshape(-1, w.shape[-1])
+        # Bicubic interpolation: (H, W, C) → (1, C, H, W) → interpolate → flatten
         x = w.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
         x = F.interpolate(x, size=(h_patches, w_patches), mode='bicubic', align_corners=False)
         return x.squeeze(0).permute(1, 2, 0).reshape(-1, w.shape[-1])  # (h*w, C)
