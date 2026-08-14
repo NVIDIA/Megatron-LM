@@ -20,7 +20,7 @@ from typing import Any, NamedTuple
 import torch
 from torch import nn
 
-from .parameter_group import cast_model_weights_from_main_weights, get_containing_parameter_group
+from .parameter_group import get_containing_parameter_group, sync_model_weights_from_main_weights
 
 
 def fully_shard_optimizer(
@@ -110,7 +110,7 @@ def fully_shard_optimizer(
             set_grad(parameter, original_grad)
         casted_grads.clear()
 
-        cast_model_weights_from_main_weights(
+        sync_model_weights_from_main_weights(
             chain.from_iterable(group["params"] for group in hooked_optimizer.param_groups)
         )
 

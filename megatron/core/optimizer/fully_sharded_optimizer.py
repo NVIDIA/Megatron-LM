@@ -9,7 +9,7 @@ import torch
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
-    cast_model_weights_from_main_weights,
+    sync_model_weights_from_main_weights,
 )
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
@@ -124,7 +124,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
     def _copy_main_params_to_model_params(self) -> None:
         """Refresh MFSDP V2 compute weights after updating optimizer weights."""
-        cast_model_weights_from_main_weights(self.get_parameters())
+        sync_model_weights_from_main_weights(self.get_parameters())
 
     def _copy_model_params_to_main_params(self, state_dict=None) -> None:
         """No-op: model loads already write into MFSDP v2's main weights."""

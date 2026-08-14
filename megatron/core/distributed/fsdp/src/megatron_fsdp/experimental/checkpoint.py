@@ -41,7 +41,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from ..uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
-from .parameter_group import cast_model_weights_from_main_weights
+from .parameter_group import sync_model_weights_from_main_weights
 
 __all__ = ["save_checkpoint", "load_checkpoint"]
 
@@ -122,4 +122,4 @@ def load_checkpoint(
     set_model_state_dict(model, model_state_dict)
     set_optimizer_state_dict(model, optimizer, optimizer_state_dict)
     if sync_model_weights:
-        cast_model_weights_from_main_weights(model.parameters())
+        sync_model_weights_from_main_weights(model.parameters())
