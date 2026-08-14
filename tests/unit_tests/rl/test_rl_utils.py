@@ -118,7 +118,7 @@ class DummyLogprobsModel(torch.nn.Module):
         super().__init__()
         self.config = config
         self.layer = DummyConfigModule(layer_config)
-        self.pg_collection = SimpleNamespace(pp=object())
+        self.pg_collection = SimpleNamespace(pp=object(), cp=None)
         self.config_values_during_forward = None
 
     def forward(self, tokens, position_ids, attention_mask, **kwargs):
