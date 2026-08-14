@@ -1131,6 +1131,7 @@ class TestRLUtils:
             use_cpu_initialization=True,
             cuda_graph_impl="local",
             bf16=True,
+            pipeline_dtype=torch.bfloat16,
         )
         model = GPTModel(
             config=transformer_config,
