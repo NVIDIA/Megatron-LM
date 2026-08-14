@@ -357,6 +357,12 @@ jobs:
       - name: Test CI cache keys
         run: .github/scripts/test_cache_keys.sh
 
+      - name: Test queue approval topology
+        run: .github/scripts/test_approve_test_queue.sh
+
+      - name: Test superseded merge-group cleanup
+        run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
+
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
@@ -695,6 +701,8 @@ jobs:
 
       - name: Build and push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        env:
+          BUILDX_NO_DEFAULT_OCI_ARTIFACT: "true"
         with:
           file: ${{ steps.base-image.outputs.dockerfile }}
           push: true

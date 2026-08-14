@@ -14,6 +14,7 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
+from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from weakref import ReferenceType, ref
@@ -39,6 +40,22 @@ def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGro
     if parameter_group_ref is None:
         return None
     return parameter_group_ref()
+
+
+def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> None:
+    """Refresh MFSDP compute weights for parameter groups represented by ``parameters``.
+
+    Parameters outside the experimental MFSDP path are ignored. A parameter group
+    may own multiple parameters, but its compute-weight buffer is refreshed once.
+    """
+    seen_parameter_groups = set()
+    for parameter in parameters:
+        if (parameter_group := get_containing_parameter_group(parameter)) is None:
+            continue
+        if parameter_group in seen_parameter_groups:
+            continue
+        seen_parameter_groups.add(parameter_group)
+        parameter_group.sync_model_weight_from_main_weight()
 
 
 @dataclass(frozen=True, eq=False)
@@ -67,6 +84,7 @@ class FsdpParameterGroup:
     main_grad: DBuffer | None
     _unsharded_model_weight: DBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
+    grad_divisor: int
 
     def __init__(
         self,
@@ -76,7 +94,8 @@ class FsdpParameterGroup:
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
         reduce_scatter_stream: torch.cuda.Stream,
-        use_symm_mem: bool = False,
+        grad_divisor: int = 1,
+        use_symmetric_memory: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -87,11 +106,15 @@ class FsdpParameterGroup:
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
             reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
-            use_symm_mem: Allocate communication staging buffers from PyTorch's
+            use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
+            grad_divisor: Additional divisor applied on top of the mesh-size
+                averaging. See ``fully_shard``.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
+        if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
+            raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
@@ -105,6 +128,7 @@ class FsdpParameterGroup:
         # fsdp_parameters define the same stable DBuffer tensor order.
         self._owning_module = ref(owning_module)
         self.mesh = mesh
+        self.grad_divisor = grad_divisor
         first_parameter = next(iter(parameter_to_fqns))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
@@ -128,7 +152,7 @@ class FsdpParameterGroup:
             placements=main_weight_placements,
         )
 
-        if use_symm_mem:
+        if use_symmetric_memory:
             # PyTorch caches this in C++ and returns early when the backend is already NCCL.
             symm_mem.set_backend("NCCL")
             self._symm_mem_pool = symm_mem.get_mem_pool(self.main_weight.device)
@@ -294,9 +318,6 @@ class FsdpParameterGroup:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
 
-        # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
-        # Preserve AVG semantics by reducing SUM and scaling the output below.
-        partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
         grads: list[torch.Tensor] = []
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:
@@ -305,7 +326,7 @@ class FsdpParameterGroup:
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
-                placements=[Partial(partial_op)] * self.mesh.ndim,
+                placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
@@ -357,6 +378,9 @@ class FsdpParameterGroup:
         # DP-outer to a smaller optimizer-sharded buffer, so allocate a fresh one
         # (zeroed only when we accumulate into it, i.e. sharded grads are still set).
         if self.main_grad.placements != self._accumulation_placements:
+            assert self.main_grad.allocation_stream == (
+                torch.cuda.current_stream(self.main_grad.device)
+            )
             reset_axis = changed_mesh_axis(self.main_grad.placements, self._accumulation_placements)
             assert reset_axis is not None  # the placements differ, so an axis changed
             if isinstance(self.main_grad.placements[reset_axis], Replicate):
@@ -385,18 +409,21 @@ class FsdpParameterGroup:
         reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
         if reduce_axis is None:
             raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
-        partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
-        grad_divisor = self.mesh.size(reduce_axis) if partial_reduce_op == dist.ReduceOp.SUM else 1
         if self._symm_mem_pool is not None:
             partial_grad.rendezvous(reduce_axis)
+        # Divide this backward's contribution, not the accumulated total: with plain
+        # all-Flat DP every backward is a last microbatch, so main_grad accumulates
+        # across microbatches below and a scale applied to the running sum would
+        # compound. Dividing before the deferred DP-outer reduction is equivalent because
+        # both that reduction and this scale are linear.
         if can_reduce_into_main_grad:
             partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
-            if grad_divisor != 1:
-                self.main_grad.local_buffer.div_(grad_divisor)
+            if self.grad_divisor != 1:
+                self.main_grad.local_buffer.div_(self.grad_divisor)
         else:
             reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-            if grad_divisor != 1:
-                reduced_grad.local_buffer.div_(grad_divisor)
+            if self.grad_divisor != 1:
+                reduced_grad.local_buffer.div_(self.grad_divisor)
             if has_sharded_grads:
                 self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
             else:
@@ -405,6 +432,9 @@ class FsdpParameterGroup:
         if is_last_microbatch:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
             # reduce-scatter for HFSDP) before binding the sharded parameter grads.
+            assert self.main_grad.allocation_stream == (
+                torch.cuda.current_stream(self.main_grad.device)
+            )
             self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
 
         # Make each sharded parameter's .grad consistent with the final main_grad.

@@ -21,11 +21,10 @@ on:
 
 jobs:
   community-bot:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_community_bot.yml@0af357dc15c04c3f28d33478d5055b1ca88a9ea1 # v1.8.8
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_community_bot.yml@affd689912d7975a1aa29ea60c1b983f12dfb7e7 # v1.8.9
     with:
       community_project_id: ${{ vars.COMMUNITY_PROJECT_ID }}
-      app-id: ${{ vars.BOT_ID }}
+      app-id: ${{ vars.COMMUNITY_BOT_ID }}
     if: github.repository == 'NVIDIA/Megatron-LM'
     secrets:
-      BOT_KEY: ${{ secrets.BOT_KEY }}
-      GH_TOKEN: ${{ secrets.PAT }}
+      BOT_KEY: ${{ secrets.COMMUNITY_BOT_KEY }}

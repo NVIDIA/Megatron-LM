@@ -24,6 +24,7 @@ from megatron.training.checkpointing import (
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
+    load_args_from_checkpoint,
     load_checkpoint,
     maybe_save_dataloader_state,
     read_metadata,
@@ -147,6 +148,31 @@ def test_maybe_save_dataloader_state_skips_empty_state_after_barriers(tmp_path):
 
     assert barriers == [group, group]
     save.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_args", "configured_num_householder", "expected_num_householder"),
+    [(SimpleNamespace(gdp_num_householder=5), 3, 5), (SimpleNamespace(), 5, 3)],
+)
+def test_load_args_restores_gdp_num_householder_from_checkpoint(
+    checkpoint_args, configured_num_householder, expected_num_householder
+):
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        gdp_num_householder=configured_num_householder,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.gdp_num_householder == expected_num_householder
 
 
 def create_checkpoint(load_path, ckpt_format):
@@ -308,6 +334,7 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
 
     with TempNamedDir(tmp_path_dist_ckpt / "test_save_checkpoint", sync=True) as save_dir:
         args.save = save_dir
+        args.save_tokenizer_assets = False
         set_args(args)
 
         save_checkpoint(
@@ -344,6 +371,7 @@ def test_load_checkpoint(
     with TempNamedDir(tmp_path_dist_ckpt / "test_load_checkpoint", sync=True) as ckpt_dir:
         args.load = ckpt_dir
         args.save = ckpt_dir
+        args.save_tokenizer_assets = False
         set_args(args)
 
         # Create and save a checkpoint first.
@@ -391,6 +419,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
     ) as ckpt_dir:
         args.load = ckpt_dir
         args.save = ckpt_dir
+        args.save_tokenizer_assets = False
         set_args(args)
 
         # Create and save a checkpoint first.

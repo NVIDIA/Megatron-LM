@@ -606,9 +606,11 @@ def compute_packed_inference_logprobs_stats(
         # poisons the mismatch stats with spurious |p_old - 1| terms.
         mask = mask & filled_mask.to(mask.device)
 
-    # Ensure shapes match
     if mask.shape != old_logprobs.shape:
-        return
+        raise RuntimeError(
+            f"packed inference-logprob stats shape mismatch: loss-mask "
+            f"{tuple(mask.shape)} vs old_logprobs {tuple(old_logprobs.shape)}"
+        )
 
     # Update group statistics using common helper
     update_inference_logprobs_group_stats(
