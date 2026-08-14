@@ -1531,6 +1531,7 @@ def test_parallel_multi_latent_attention_correctness(
     with TempNamedDir(tmp_path_dist_ckpt / 'test_parallel_mla', sync=True) as ckpt_dir:
         # Set argument
         mock_args = parse_args(ignore_unknown_args=True)
+        mock_args.save_tokenizer_assets = False
         set_args(mock_args)
 
         # Initialize baseline model

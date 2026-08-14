@@ -8,6 +8,9 @@ import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
+from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    sync_model_weights_from_main_weights,
+)
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer
@@ -80,8 +83,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             raise ValueError(
                 "MFSDP v2 does not currently support layer-wise distributed optimizer."
             )
-        if config.optimizer_cuda_graph:
-            raise ValueError("MFSDP v2 does not currently support optimizer CUDA graphs.")
 
     def state_dict(self):
         """Return optimizer state.
@@ -120,7 +121,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """No-op: MFSDP v2 reduces directly into optimizer-visible sharded grads."""
 
     def _copy_main_params_to_model_params(self) -> None:
-        """No-op: MFSDP v2 currently syncs compute weights in its forward pre-hook."""
+        """Refresh MFSDP V2 compute weights after updating optimizer weights."""
+        sync_model_weights_from_main_weights(self.get_parameters())
 
     def _copy_model_params_to_main_params(self, state_dict=None) -> None:
         """No-op: model loads already write into MFSDP v2's main weights."""

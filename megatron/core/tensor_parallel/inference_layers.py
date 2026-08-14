@@ -20,6 +20,7 @@ from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
@@ -91,6 +92,7 @@ class InferenceLinear(TELinear):
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -107,6 +109,8 @@ class InferenceLinear(TELinear):
             symmetric_ar_type=symmetric_ar_type,
             tp_group=tp_group,
             name=name,
+            # TELinear takes the resolved group rather than the collection.
+            gtp_remat_group=resolve_gtp_remat_group(pg_collection, is_expert),
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
@@ -139,6 +143,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -155,6 +160,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
             name=name,
+            pg_collection=pg_collection,
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
@@ -172,11 +178,26 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
 
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
 
+        # Explicit toggle for the pre-all-gather buffer-reuse barrier. Left False by
+        # default; a caller sets it True when this layer's input all-gather directly
+        # follows another all-gather on the shared symmetric buffer with no
+        # reduce-scatter in between (e.g. the MTP eh_proj projection).
+        self.barrier_before_all_gather = False
+
         # Boolean to be toggled externally for skipping norm and all-gather.
         # This is used when enabling fused reduce-scatter + add + rms-norm + all-gather
         # in tensor parallelism. In this case, the preceeding RowParallelLinear layer
         # has already applied the rms-norm and all-gather.
         self.skip_norm_and_all_gather = False
+
+    def set_barrier_before_all_gather(self, value: bool = True) -> None:
+        """Request a barrier before this layer's input all-gather reuses the buffer.
+
+        Set by callers whose op sequence places another all-gather on the shared
+        symmetric buffer immediately before this layer's all-gather (e.g. the MTP
+        eh_proj projection), so the kernel synchronizes ranks before overwriting.
+        """
+        self.barrier_before_all_gather = value
 
     def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
         """
@@ -204,8 +225,14 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             and symm_mem_buffer["handle"] is not None
         )
         if can_use_nvls:
-            # do multimem all gather
-            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
+            # do multimem all gather; barrier before reusing the buffer only when this
+            # all-gather follows another all-gather on it (see barrier_before_all_gather).
+            multimem_all_gather(
+                symm_mem_buffer["tensor"],
+                x,
+                symm_mem_buffer["handle"],
+                barrier_before=self.barrier_before_all_gather,
+            )
             return symm_mem_buffer["tensor"]
         else:
             # revert to torch dist (NCCL) all gather
@@ -268,6 +295,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -284,6 +312,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
             name=name,
+            pg_collection=pg_collection,
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
@@ -298,6 +327,21 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             ), "--transformer-impl=inference_optimized requires --sequence-parallel"
 
         self.triton_nvls_kernels_allowed = not config.inference_disable_triton_nvls_kernels
+
+        # Explicit toggle for the pre-all-gather buffer-reuse barrier. Left False by
+        # default; a caller sets it True when this layer's input all-gather directly
+        # follows another all-gather on the shared symmetric buffer with no
+        # reduce-scatter in between (e.g. the MTP eh_proj projection).
+        self.barrier_before_all_gather = False
+
+    def set_barrier_before_all_gather(self, value: bool = True) -> None:
+        """Request a barrier before this layer's input all-gather reuses the buffer.
+
+        Set by callers whose op sequence places another all-gather on the shared
+        symmetric buffer immediately before this layer's all-gather (e.g. the MTP
+        eh_proj projection), so the kernel synchronizes ranks before overwriting.
+        """
+        self.barrier_before_all_gather = value
 
     def _maybe_allocate_symmetric_buffer(self, x: torch.Tensor):
         """
@@ -323,7 +367,14 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
             and symm_mem_buffer["handle"] is not None
         )
         if can_use_nvls:
-            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
+            # Barrier before reusing the buffer only when this all-gather follows
+            # another all-gather on it (see barrier_before_all_gather).
+            multimem_all_gather(
+                symm_mem_buffer["tensor"],
+                x,
+                symm_mem_buffer["handle"],
+                barrier_before=self.barrier_before_all_gather,
+            )
             return symm_mem_buffer["tensor"]
         else:
             x, _ = gather_along_first_dim(x, process_group=self.tp_group)
@@ -366,6 +417,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
         super().__init__(
@@ -380,6 +432,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
             name=name,
+            pg_collection=pg_collection,
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
@@ -497,8 +550,23 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             return x, None
 
 
+def is_inference_column_parallel_linear(module) -> bool:
+    """Whether ``module`` is an inference-optimized column-parallel linear.
+
+    These are the layers that perform a symmetric-memory all-gather and therefore
+    expose ``set_barrier_before_all_gather``. Returns ``False`` for anything else
+    (including ``None`` and non-inference linear implementations).
+    """
+    return isinstance(
+        module, (InferenceColumnParallelLinear, InferenceLayerNormColumnParallelLinear)
+    )
+
+
 def inference_all_gather_from_tensor_model_parallel_region(
-    x: torch.Tensor, tp_group: torch.distributed.ProcessGroup, config: TransformerConfig
+    x: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup,
+    config: TransformerConfig,
+    barrier_before: bool = False,
 ) -> torch.Tensor:
     """NVLS-optimized all-gather along the last dimension, with NCCL fallback.
 
@@ -509,6 +577,10 @@ def inference_all_gather_from_tensor_model_parallel_region(
     along dim-0), then rearranges the result to the last dimension — the same
     semantics as `_gather_along_last_dim` but using hardware multicast when
     possible.
+
+    ``barrier_before`` is forwarded to `multimem_all_gather`: pass ``True`` when
+    this all-gather directly follows another all-gather on the shared symmetric
+    buffer so it barriers before overwriting the previous contents.
     """
     tp_size = dist.get_world_size(tp_group)
     if tp_size == 1:
@@ -525,7 +597,12 @@ def inference_all_gather_from_tensor_model_parallel_region(
         symm_mem_buffer = buf.maybe_get_tensor(ag_buffer_dims, dtype=x.dtype)
 
         if are_tensors_nvls_eligible(x) and symm_mem_buffer["handle"] is not None:
-            multimem_all_gather(symm_mem_buffer["tensor"], x, symm_mem_buffer["handle"])
+            multimem_all_gather(
+                symm_mem_buffer["tensor"],
+                x,
+                symm_mem_buffer["handle"],
+                barrier_before=barrier_before,
+            )
             tensor_list = symm_mem_buffer["tensor"].chunk(tp_size, dim=0)
             return torch.cat(tensor_list, dim=-1).contiguous()
 

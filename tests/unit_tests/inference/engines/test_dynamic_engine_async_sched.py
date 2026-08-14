@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 
 from megatron.core.inference.config import AsyncScheduleMode
+from megatron.core.inference.contexts.dynamic_context import DynamoHelper
 from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
@@ -271,6 +272,7 @@ def test_async_forward_routes_one_controller_iteration(
         num_prefill_requests=1 if expected_nvtx_range == "Prefill" else 0,
         chunked_prefill_request_id=17,
         is_decode_only=mock.Mock(return_value=decode_only.launched),
+        dynamo_helper=DynamoHelper(),
     )
     output = None if primer_only else {"sample": "tokens"}
     engine.controller = SimpleNamespace(

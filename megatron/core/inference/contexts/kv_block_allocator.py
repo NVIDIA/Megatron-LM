@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import heapq
 from collections import deque
@@ -9,6 +9,9 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+
+# Block deregistration observers are currently registered only by DynamoHelper.
+BlocksDeregisteredObserver = Callable[[list[int], set[int]], None]
 
 
 class KVBlockAllocator:
@@ -41,6 +44,7 @@ class KVBlockAllocator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
+        self._blocks_deregistered_observers: list[BlocksDeregisteredObserver] = []
 
         # Handoff blocks remain pinned until decode finishes pulling them.
         # Pinning at request finish only happens on engines with KV transfer
@@ -409,6 +413,13 @@ class KVBlockAllocator:
                     torch.ones(int(has_parent.sum()), dtype=torch.int64),
                 )
 
+    def add_blocks_deregistered_observer(self, observer: BlocksDeregisteredObserver) -> None:
+        """Register a callback invoked when cached blocks are deregistered.
+
+        Currently used only by DynamoHelper.
+        """
+        self._blocks_deregistered_observers.append(observer)
+
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
 
@@ -423,6 +434,7 @@ class KVBlockAllocator:
 
         # Gather hashes via batched tensor indexing
         block_ids_i64 = block_ids.to(torch.int64)
+        block_ids_list = block_ids.tolist()
         hashes = self.block_hashes[block_ids_i64].tolist()
 
         # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
@@ -431,10 +443,6 @@ class KVBlockAllocator:
             map(self.kv_hash_to_block_id.pop, keys_to_delete & self.kv_hash_to_block_id.keys()),
             maxlen=0,
         )
-
-        # Notify Mamba slot allocator (if wired) to clean up its state
-        if self.on_blocks_deregistered is not None:
-            self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
 
         # Reset block state (batched tensor ops)
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
@@ -458,6 +466,13 @@ class KVBlockAllocator:
         # Return blocks to free pool
         self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = block_ids
         self.pool_avail += num_blocks
+
+        # Notify dependent allocators and external observers only after KV allocator
+        # bookkeeping commits, so callback failures cannot leave this allocator partial.
+        if self.on_blocks_deregistered is not None:
+            self.on_blocks_deregistered(block_ids_list, keys_to_delete)
+        for observer in tuple(self._blocks_deregistered_observers):
+            observer(block_ids_list, keys_to_delete)
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.

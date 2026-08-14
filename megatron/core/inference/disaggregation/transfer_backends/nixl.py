@@ -12,6 +12,7 @@ explicitly by the launcher.
 from __future__ import annotations
 
 import base64
+import importlib.metadata as importlib_metadata
 import logging
 import os
 import time
@@ -27,12 +28,29 @@ from megatron.core.inference.disaggregation.utils import transfer_peer_records
 
 logger = logging.getLogger(__name__)
 
+
+def _detect_nixl_variant(api_module_name: str) -> Optional[str]:
+    """Return the installed distribution that provides the active NIXL API module."""
+    package_name = api_module_name.split(".", maxsplit=1)[0]
+    for distribution_name in importlib_metadata.packages_distributions().get(package_name, []):
+        normalized = distribution_name.lower().replace("-", "_")
+        if normalized.startswith("nixl_cu"):
+            return normalized
+    return None
+
+
 try:
-    from nixl._api import nixl_agent  # type: ignore[import-not-found]
+    from nixl import _api as _nixl_api  # type: ignore[import-not-found]
+
+    nixl_agent = _nixl_api.nixl_agent
+    nixl_agent_config = _nixl_api.nixl_agent_config
+    _NIXL_VARIANT = _detect_nixl_variant(_nixl_api.__name__)
 
     _HAVE_NIXL = True
 except ImportError:
     nixl_agent = None  # type: ignore[assignment]
+    nixl_agent_config = None  # type: ignore[assignment]
+    _NIXL_VARIANT = None
     _HAVE_NIXL = False
 
 
@@ -40,6 +58,68 @@ except ImportError:
 # fabric failure, so cap the wait.
 _POLL_INTERVAL_S = 0.0005  # 0.5 ms
 _POLL_TIMEOUT_S = 30.0
+
+
+def _validate_ucx_transport_config(memory_buffer: torch.Tensor) -> None:
+    """Configure safe UCX memory detection and reject host-only transports."""
+    # Explicit registration makes the UCX memtype cache unnecessary and avoids
+    # stale host classifications for reused CUDA virtual addresses.
+    os.environ.setdefault("UCX_MEMTYPE_CACHE", "n")
+
+    if not memory_buffer.is_cuda:
+        return
+
+    configured_tls = os.environ.get("UCX_TLS")
+    if not configured_tls:
+        return
+
+    tokens = {
+        token.strip().lower().lstrip("\\")
+        for token in configured_tls.lstrip("^").split(",")
+        if token.strip()
+    }
+    cuda_transports = {"cuda_copy", "cuda_ipc", "gdr_copy"}
+    if configured_tls.startswith("^"):
+        excludes_all_cuda = "cuda" in tokens or cuda_transports.issubset(tokens)
+        if not excludes_all_cuda:
+            return
+    elif "all" in tokens or "cuda" in tokens or tokens & cuda_transports:
+        return
+
+    raise RuntimeError(
+        f"UCX_TLS={configured_tls!r} does not enable a CUDA transport for NIXL GPU "
+        "buffers. Remove the override to let UCX select transports automatically, or "
+        "include a CUDA transport such as cuda_copy or cuda_ipc."
+    )
+
+
+def _validate_nixl_cuda_support(agent: Any, memory_buffer: torch.Tensor) -> None:
+    """Reject a NIXL/UCX runtime that cannot safely register CUDA memory."""
+    if not memory_buffer.is_cuda:
+        return
+
+    cuda_version = torch.version.cuda
+    if cuda_version and _NIXL_VARIANT:
+        expected_variant = f"nixl_cu{cuda_version.split('.', maxsplit=1)[0]}"
+        if _NIXL_VARIANT.startswith("nixl_cu") and _NIXL_VARIANT != expected_variant:
+            expected_package = expected_variant.replace("_", "-")
+            raise RuntimeError(
+                f"PyTorch uses CUDA {cuda_version}, but NIXL selected {_NIXL_VARIANT}. "
+                f"Install the matching backend with `pip install {expected_package}` "
+                "before starting a disaggregated worker. A mismatched NIXL backend can make "
+                "UCX classify GPU buffers as host memory."
+            )
+
+    get_memory_types = getattr(agent, "get_backend_mem_types", None)
+    if get_memory_types is None:
+        return
+    ucx_memory_types = {str(mem_type).lower() for mem_type in get_memory_types("UCX")}
+    if not any("cuda" in mem_type or "vram" in mem_type for mem_type in ucx_memory_types):
+        raise RuntimeError(
+            "The NIXL UCX backend does not report CUDA/VRAM memory support "
+            f"(reported memory types: {sorted(ucx_memory_types)}). Install a NIXL backend "
+            "built for this CUDA major version, or rebuild UCX with `--with-cuda=<cuda-root>`."
+        )
 
 
 @dataclass
@@ -94,8 +174,38 @@ class NixlPullHandle:
             time.sleep(_POLL_INTERVAL_S)
 
 
+class _NixlAgentContext:
+    """NIXL resources shared by the state buffers on one rank."""
+
+    def __init__(self, agent_name: str):
+        # One-sided reads require the passive peer to make transport progress.
+        # A single shared progress thread avoids contention with model execution
+        # while still progressing KV, convolution-state, and SSM-state transfers.
+        agent_config = nixl_agent_config(enable_prog_thread=True)
+        self.agent_name = agent_name
+        self.agent = nixl_agent(agent_name, agent_config)
+        self.known_peers: Dict[str, Any] = {}
+        self.ref_count = 0
+
+    def acquire(self) -> Any:
+        """Retain the shared agent for one buffer registration."""
+        if self.agent is None:
+            raise RuntimeError("NIXL agent context is closed")
+        self.ref_count += 1
+        return self.agent
+
+    def release(self) -> None:
+        """Release one registration and drop the agent after the last user closes."""
+        if self.ref_count <= 0:
+            raise RuntimeError("NIXL agent context released without an owner")
+        self.ref_count -= 1
+        if self.ref_count == 0:
+            self.known_peers.clear()
+            self.agent = None
+
+
 class NixlTransferBackend:
-    """Per-rank NIXL agent owning a registration over the paged KV buffer.
+    """Per-buffer registration on a rank's NIXL agent.
 
     Per-block transfers are descriptor ranges over that registration. Peer
     metadata is exchanged by the control plane and registered lazily on first
@@ -124,6 +234,7 @@ class NixlTransferBackend:
         layer_end: Optional[int] = None,
         ssm_layout: Optional[SSMShardLayout] = None,
         ssm_state_kind: Optional[str] = None,
+        _shared_context: Optional[_NixlAgentContext] = None,
     ):
         if not _HAVE_NIXL:
             raise RuntimeError(
@@ -131,7 +242,6 @@ class NixlTransferBackend:
                 "NIXL runtime and `pip install nixl` before launching "
                 "disaggregated workers."
             )
-        self.agent_name = agent_name
         self._memory_buffer = memory_buffer
 
         # Addressing geometry shared with the other backends.
@@ -171,21 +281,22 @@ class NixlTransferBackend:
         self._ssm_layout = ssm_layout
         self._ssm_state_kind = ssm_state_kind
 
-        # Configure UCX before agent construction. Avoid TCP for VRAM addresses;
-        # operators may override this by setting UCX_TLS before launch.
-        os.environ.setdefault("UCX_TLS", "cuda_ipc,cuda_copy,cma,shm,self")
-        # Explicit registration makes the UCX memtype cache unnecessary and
-        # avoids stale VRAM/host classifications.
-        os.environ.setdefault("UCX_MEMTYPE_CACHE", "n")
-
-        self._agent = nixl_agent(agent_name)
-        self._reg_handle = self._agent.register_memory(memory_buffer)
-
-        # Base64 keeps NIXL metadata safe for msgpack/json control messages.
-        self._agent_metadata = self._agent.get_agent_metadata()
+        _validate_ucx_transport_config(memory_buffer)
+        if _shared_context is None:
+            _shared_context = _NixlAgentContext(agent_name)
+        self._agent_context = _shared_context
+        self._agent = _shared_context.acquire()
+        try:
+            _validate_nixl_cuda_support(self._agent, memory_buffer)
+            self._reg_handle = self._agent.register_memory(memory_buffer)
+        except Exception:
+            self._agent = None
+            self._agent_context = None
+            _shared_context.release()
+            raise
 
         # Peer agent_name -> id returned by add_remote_agent.
-        self._known_peers: Dict[str, Any] = {}
+        self._known_peers = _shared_context.known_peers
 
         logger.info(
             "NixlTransferBackend[%s] registered %d-block buffer "
@@ -201,15 +312,23 @@ class NixlTransferBackend:
             shape,
         )
 
+    def new_registered_buffer(self, **kwargs) -> "NixlTransferBackend":
+        """Register another state buffer on this backend's NIXL agent."""
+
+        if self._agent_context is None:
+            raise RuntimeError("cannot register a buffer on a closed NIXL backend")
+        return type(self)(_shared_context=self._agent_context, **kwargs)
+
     def export_meta(self) -> Dict[str, Any]:
         """Return JSON/msgpack-safe metadata for shipping to a decode peer.
 
         Layout fields describe the scatter-gather address ranges needed to pull
         source blocks into decode-owned blocks.
         """
+        agent_metadata = self._agent.get_agent_metadata()
         meta = {
-            "agent_name": self.agent_name,
-            "agent_metadata_b64": base64.b64encode(self._agent_metadata).decode("ascii"),
+            "agent_name": self._agent_context.agent_name,
+            "agent_metadata_b64": base64.b64encode(agent_metadata).decode("ascii"),
             "base_addr": self._buf_ptr,
             "outer_stride_bytes": self._outer_stride_bytes,
             "device_id": self._device_id,
@@ -253,7 +372,9 @@ class NixlTransferBackend:
         peer_id = self._agent.add_remote_agent(base64.b64decode(metadata_b64))
         resolved = peer_id if peer_id else peer_name
         self._known_peers[peer_name] = resolved
-        logger.info("NixlTransferBackend[%s] registered peer %s", self.agent_name, peer_name)
+        logger.info(
+            "NixlTransferBackend[%s] registered peer %s", self._agent_context.agent_name, peer_name
+        )
         return resolved
 
     def _validate_peer(
@@ -616,11 +737,18 @@ class NixlTransferBackend:
         return xfer, ctx
 
     def close(self) -> None:
-        """Release the registration and agent."""
+        """Release this buffer registration and its reference to the shared agent."""
         if self._agent is None:
             return
+        agent = self._agent
+        agent_context = self._agent_context
         try:
-            self._agent.deregister_memory(self._reg_handle)
+            agent.deregister_memory(self._reg_handle)
         except Exception:  # noqa: BLE001 - shutdown path
             logger.exception("NixlTransferBackend: deregister_memory failed")
-        self._agent = None
+        finally:
+            self._agent = None
+            self._agent_context = None
+            self._known_peers = {}
+            self._reg_handle = None
+            agent_context.release()
