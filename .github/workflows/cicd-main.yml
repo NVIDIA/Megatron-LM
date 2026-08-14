@@ -521,8 +521,8 @@ jobs:
 
       - name: Trigger and wait for MBridge tests
         env:
-          BOT_ID: ${{ vars.BOT_ID }}
-          BOT_KEY: ${{ secrets.BOT_KEY }}
+          BOT_ID: ${{ vars.COMMUNITY_BOT_ID }}
+          BOT_KEY: ${{ secrets.COMMUNITY_BOT_KEY }}
           MBRIDGE_MCORE_REF: ${{ needs.configure.outputs.sha }}
           MBRIDGE_TEST_SUITE: ${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}
           MBRIDGE_POLL_TIMEOUT_SECONDS: "12600"
