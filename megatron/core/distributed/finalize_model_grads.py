@@ -451,6 +451,47 @@ maintain for legacy tests. We can remove this proxy in mcore 0.14.
 _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
+def _rescale_expert_grads_for_gtp_remat(
+    model, gtp_remat_group, egtp_remat_group, calculate_per_token_loss
+):
+    """Give expert grads the share of the DP normalization that GTP took away.
+
+    GTP carves its ranks out of the data-parallel axis, so DDP's 1/DP scaling shrinks as GTP
+    grows. Dense params get the missing factor back from the gtp_remat AVG below. Expert params
+    only ever see compensation sized to the EGTP axis — the AVG when they are unsharded and
+    EGTP > 1, or the reduce-scatter mean when they are EGTP-sharded — so a factor GTP/EGTP is
+    left over and their gradients come out that many times too large.
+
+    Measured on Qwen3.5-VL MTP proxy, 8xH100: backward emits the same expert grad in both
+    layouts (sumsq 31.483 for 3D against 31.509 for GTP4/EGTP1), then 3D's DP sync divides it
+    by 15.76 while GTP4's leaves it untouched (31.988). 31.99/2.00 = 16.0 = (GTP/EGTP)^2.
+
+    A scalar divide is the right operation rather than an average: within one dense gtp_remat
+    group the ranks hold DIFFERENT experts (ranks 0 and 2 of [0,2,4,6] sit at ep 0 and ep 2),
+    so there is no replica-consistency requirement along that axis. The ranks that do share an
+    expert live in the same expert-DP group and DDP has already made them agree; scaling both
+    by the same constant keeps them agreeing.
+
+    Skipped under calculate_per_token_loss, where the gtp axis is SUM-reduced and the per-token
+    divisor already counts the gtp peers' tokens.
+    """
+    if calculate_per_token_loss:
+        return
+    gtp = gtp_remat_group.size() if gtp_remat_group is not None else 1
+    egtp = egtp_remat_group.size() if egtp_remat_group is not None else 1
+    if gtp <= egtp:
+        return
+    scale = 1.0 / (gtp / egtp)
+    for model_chunk in model:
+        for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
+            if not param.requires_grad or getattr(param, 'allreduce', True):
+                continue
+            grad = getattr(param, _get_main_grad_attr(param), None)
+            if grad is None:
+                continue
+            _unshard_if_dtensor(grad).data.mul_(scale)
+
+
 def _allreduce_replicated_grads_over_gtp_remat_group(
     model: List[torch.nn.Module],
     gtp_remat_group: Optional[torch.distributed.ProcessGroup],
@@ -619,6 +660,9 @@ def finalize_model_grads(
             barrier=config.barrier_with_L1_time
         )
     _allreduce_non_tensor_model_parallel_grads(model, config, tp_group)
+    _rescale_expert_grads_for_gtp_remat(
+        model, gtp_remat_group, egtp_remat_group, config.calculate_per_token_loss
+    )
     _allreduce_replicated_grads_over_gtp_remat_group(
         model,
         gtp_remat_group,
