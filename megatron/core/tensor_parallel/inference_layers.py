@@ -190,6 +190,13 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         # has already applied the rms-norm and all-gather.
         self.skip_norm_and_all_gather = False
 
+        # Set externally (one decode step at a time) by the preceding transformer
+        # layer's fused mlp_bda add + input-RMSNorm kernel, which produces this
+        # layer's normalized QKV input as a by-product of the residual add. When
+        # present it replaces the norm launch below and is consumed immediately.
+        # Only the tp_size == 1 path honors it; see MCORE_FUSED_ADD_NORM_QKV.
+        self.prenormed_input = None
+
     def set_barrier_before_all_gather(self, value: bool = True) -> None:
         """Request a barrier before this layer's input all-gather reuses the buffer.
 
@@ -253,7 +260,14 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             return super().forward(x)
 
         if self.tp_size == 1:
-            x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
+            prenormed = self.prenormed_input
+            if prenormed is not None:
+                # The preceding layer's fused add+norm already produced this; consume
+                # it so a stale tensor can never leak into a later step.
+                self.prenormed_input = None
+                x = prenormed
+            else:
+                x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = _apply_linear(x, self.weight, self.config)
             return x, None
 

@@ -5,6 +5,12 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.inference import insitu_timing as _insitu
+from megatron.core.inference.moe.router_topk import (
+    can_fuse_route_mask,
+    can_use_fused_softmax_topk,
+    fused_softmax_topk,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -955,6 +961,29 @@ class InferenceTopKRouter(TopKRouter):
         precomputed_indices = None
         if self.qb_beta is not None:
             precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
+
+        # The fused kernel selects on the logits themselves, so it cannot honor a
+        # qb_beta-shifted selection; leave those models on the reference path. Batch-
+        # invariant mode stays on the reference path too: it picks its own routing
+        # implementation below, and this kernel is not one of them. That test sits
+        # after the gate check so the gate-off path does not pay for it.
+        if (
+            self.qb_beta is None
+            and can_use_fused_softmax_topk(
+                logits,
+                self.topk,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
+                router_replay=self.router_replay,
+            )
+            and not is_batch_invariant_mode_enabled()
+        ):
+            with _insitu.site("router_topk"):
+                return fused_softmax_topk(logits, self.topk, mask_padding=can_fuse_route_mask())
 
         routing = (
             topk_routing_with_score_function

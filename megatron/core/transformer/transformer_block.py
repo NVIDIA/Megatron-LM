@@ -321,6 +321,31 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
+    def _wire_fused_add_norm_qkv_chain(self):
+        """Let each layer's mlp_bda add absorb the next layer's QKV input RMSNorm.
+
+        The residual add at the end of layer i is immediately followed by the input
+        RMSNorm at the start of layer i+1, which for the non-MLA inference path lives
+        inside ``linear_qkv`` rather than as a standalone module. Handing each layer a
+        reference to the next layer's ``linear_qkv`` lets the two collapse into one
+        kernel. Only the last local layer is left out, since its output feeds
+        ``final_layernorm`` instead.
+
+        Storing references costs nothing when the fusion is disabled -- the runtime
+        guard in the layer decides per step -- so this is wired unconditionally.
+        """
+        layers = getattr(self, "layers", None)
+        if layers is None or len(layers) < 2:
+            return
+        for cur, nxt in zip(layers[:-1], layers[1:]):
+            if not hasattr(cur, "_next_layer_qkv"):
+                continue
+            qkv = getattr(getattr(nxt, "self_attention", None), "linear_qkv", None)
+            # Only the inference QKV layer exposes the prenormed_input hand-off and a
+            # raw layer_norm_weight; anything else keeps the reference path.
+            if qkv is not None and hasattr(qkv, "prenormed_input"):
+                cur._next_layer_qkv = [qkv]
+
     def _build_layers(self):
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?
@@ -368,6 +393,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
+
+        self._wire_fused_add_norm_qkv_chain()
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline

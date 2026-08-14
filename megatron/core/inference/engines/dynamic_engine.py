@@ -5,6 +5,7 @@ import concurrent.futures
 import logging
 import math
 import multiprocessing
+import os
 import socket
 import time
 import warnings
@@ -55,6 +56,7 @@ from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
+    configure_nvtx_profiling,
     deprecate_args,
     experimental_api,
     get_asyncio_loop,
@@ -70,6 +72,13 @@ from megatron.core.utils import (
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator
+
+# Collapsed per-request loop body in `post_process_requests` for the plain decode
+# case. Off by default; see `DynamicInferenceEngine._post_process_requests_decode_fast`.
+_FAST_POST_PROCESS = os.environ.get("MCORE_INFER_FAST_POST_PROCESS", "0") == "1"
+# Debug mode: take the fast path, then replay the same step through the reference
+# loop on a deep copy of the request state and assert the two agree exactly.
+_FAST_POST_PROCESS_VERIFY = os.environ.get("MCORE_INFER_FAST_POST_PROCESS_VERIFY", "0") == "1"
 
 try:
     from tqdm import tqdm
@@ -273,6 +282,35 @@ class DynamicInferenceEngine(AbstractEngine):
         self.controller = controller
         self.context = context
 
+        # Profiling aid: the engine's per-step NVTX ranges (bookkeeping,
+        # detokenization, console_logging, ...) are inert unless NVTX profiling
+        # is enabled, which only the training loop does. Allow the inference
+        # server to opt in via env so an nsys ``cuda,nvtx`` capture can attribute
+        # the host chain between decode steps. Default off (no-op).
+        if os.environ.get("MCORE_INFER_NVTX", "0") == "1":
+            configure_nvtx_profiling(True)
+
+        # Zero-nsys host-phase timing: patches the decode loop's NVTX range
+        # push/pop names with perf_counter self-timers and prints a per-step
+        # breakdown. Env-gated (``MCORE_INFER_HOST_TIMING``); no-op by default.
+        from megatron.core.inference.host_phase_timing import install as _install_host_timing
+
+        _install_host_timing()
+
+        # GPU-side step accounting: times the transformer-block CUDA graph with
+        # CUDA events and records per-rank step-entry timestamps for EP skew.
+        # Env-gated (``MCORE_INFER_STEP_GPU_TIMING``); no-op by default.
+        from megatron.core.inference.step_gpu_timing import install as _install_step_gpu_timing
+
+        _install_step_gpu_timing()
+
+        # Host cost of CUDA graph replay, measured with no profiler attached, because
+        # the profiled figure is confounded by node-level graph tracing.
+        # Env-gated (``MCORE_GRAPH_LAUNCH_TIMING``); no-op by default.
+        from megatron.core.inference.graph_launch_timing import install as _install_graph_timing
+
+        _install_graph_timing()
+
         self.num_speculative_tokens = inference_config.num_speculative_tokens
         self.materialize_only_last_token_logits = (
             inference_config.materialize_only_last_token_logits
@@ -363,6 +401,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
         self.stop_word_being_finished_ids: set[int] = set()
+
+        # Resolved (request object, token limit) pairs for the decode fast path in
+        # `post_process_requests`, keyed by the active request-id tuple and an epoch
+        # that any mutation of `self.requests` or of a request record bumps.
+        self._ppr_cache_epoch: int = 0
+        self._ppr_fast_key: Optional[Tuple] = None
+        self._ppr_fast_requests: List[DynamicInferenceRequest] = []
+        self._ppr_fast_limits: List[int] = []
 
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
@@ -903,6 +949,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Checkpoint active requests that are marked for recompute.
         for request_id in recompute_active_ids:
             self.requests[request_id].record.checkpoint()
+            self._ppr_cache_epoch += 1
 
         # If we are not using the inference coordinator, we need to manually handle state.
         if not self.use_coordinator:
@@ -1084,6 +1131,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 record=DynamicInferenceRequestRecord.from_request(request),
                 future=self._loop.create_future(),
             )
+            self._ppr_cache_epoch += 1
             request.add_event_add_engine()  # Record when request enters engine
 
             # Stamp new request with the current generation epoch.
@@ -1283,6 +1331,21 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
         """
+        if _FAST_POST_PROCESS:
+            fast_result = self._post_process_requests_decode_fast(
+                request_ids,
+                finished_request_ids,
+                evict_request_ids,
+                step_time,
+                sample,
+                accepted_tokens,
+                log_probs,
+                top_n_logprobs,
+                finished_routing_block_ids,
+            )
+            if fast_result is not None:
+                return fast_result
+
         active_request_ids: list[int] = []
         finished_request_ids = set(finished_request_ids.tolist())
         finished_request_records: list[DynamicInferenceRequestRecord] = []
@@ -1566,12 +1629,118 @@ class DynamicInferenceEngine(AbstractEngine):
             # Checkpoint requests (i.e., prompt += generations) + add eviction event.
             for request_id in evict_request_ids:
                 self.requests[request_id].record.checkpoint()
+                self._ppr_cache_epoch += 1
                 self.get_request(request_id).add_event_evict()
 
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
 
         return active_request_ids, finished_request_records
+
+    def _post_process_requests_decode_fast(
+        self,
+        request_ids: torch.Tensor,
+        finished_request_ids: torch.Tensor,
+        evict_request_ids: Optional[torch.Tensor],
+        step_time: float,
+        sample: torch.Tensor,
+        accepted_tokens: Optional[torch.Tensor],
+        log_probs: Optional[List],
+        top_n_logprobs: Optional[Dict],
+        finished_routing_block_ids: Optional[Dict],
+    ) -> Optional[Tuple[List[int], List[DynamicInferenceRequestRecord]]]:
+        """Collapsed `post_process_requests` body for a plain decode step.
+
+        Returns `None` whenever anything about the step is not the plain case, in
+        which case the caller runs the full loop. The plain case is: one sampled
+        token per request, no request finishing, no speculative decoding, no stop
+        words, no log probs or top-n log probs, no chunked prefill, no eviction,
+        no token event tracking, and no TPOT sample due this step.
+
+        Deliberately excluding steps where a request finishes is what keeps this
+        safe: the request termination state machine — pop, future resolution,
+        routing reconstruction, status and finish events — is never reached from
+        here, so it stays on the single well-tested path. At BS256 steady-state
+        decode essentially every step has no finisher, so almost all of the work
+        is still avoided.
+
+        The only per-request state this touches is appending one token, under the
+        same `num_tokens_to_generate` bound the reference applies, plus the
+        first-token TTFT sample.
+        """
+        if (
+            self.num_speculative_tokens > 0
+            or accepted_tokens is not None
+            or log_probs
+            or top_n_logprobs is not None
+            or finished_routing_block_ids
+            or self.track_generated_token_events
+            or self.stop_word_being_finished_ids
+            or self.stop_word_finished_request_ids
+            or self.context.chunked_prefill_request_id != -1
+            or step_time > 0
+            or finished_request_ids.numel() > 0
+            or (evict_request_ids is not None and evict_request_ids.numel() > 0)
+        ):
+            self._ppr_fast_key = None
+            return None
+
+        request_id_list = request_ids.tolist()
+        key = (self._ppr_cache_epoch, tuple(request_id_list))
+        if self._ppr_fast_key != key:
+            entries = self.requests
+            if not all(request_id in entries for request_id in request_id_list):
+                self._ppr_fast_key = None
+                return None
+            requests = [entries[request_id].record[-1] for request_id in request_id_list]
+            # A configured stop word would need the post-append scan, which is the
+            # one piece of per-request work here that is not a bounded append.
+            if any(request.stop_word_ids for request in requests):
+                self._ppr_fast_key = None
+                return None
+            self._ppr_fast_key = key
+            self._ppr_fast_requests = requests
+            self._ppr_fast_limits = [
+                request.sampling_params.num_tokens_to_generate for request in requests
+            ]
+
+        requests = self._ppr_fast_requests
+        limits = self._ppr_fast_limits
+        tokens = sample.tolist()
+
+        if _FAST_POST_PROCESS_VERIFY:
+            expected = [
+                list(request.generated_tokens)
+                + ([token] if len(request.generated_tokens) < limit else [])
+                for request, limit, token in zip(requests, limits, tokens)
+            ]
+
+        for i, token in enumerate(tokens):
+            request = requests[i]
+            generated = request.generated_tokens
+            num_generated = len(generated)
+            # Mirrors the reference trim: with one token the whole append is kept
+            # when the request is below its limit and dropped entirely when it is
+            # already at or past it.
+            if num_generated < limits[i]:
+                generated.append(token)
+                if num_generated == 0:
+                    request.ttft = (
+                        DynamicInferenceEvent(
+                            type=DynamicInferenceEventType.GENERATED_TOKEN,
+                            payload={"token_id": token},
+                        ).timestamp
+                        - request.event_add_engine.timestamp
+                    )
+
+        if _FAST_POST_PROCESS_VERIFY:
+            for request, want in zip(requests, expected):
+                assert request.generated_tokens == want, (
+                    f"fast post_process_requests mismatch for request {request.request_id}: "
+                    f"got {request.generated_tokens[-4:]} want {want[-4:]}"
+                )
+
+        return request_id_list, []
 
     def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
         """Get and clear the set of request IDs that should be finished due to stop words.

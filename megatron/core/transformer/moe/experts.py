@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -86,6 +87,12 @@ from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 
 logger = logging.getLogger(__name__)
+
+# Fuse SiLU(gate)*up into the decode FC1 GEMM epilogue, removing the standalone
+# bounded_silu_mul kernel and the 2N intermediate HBM round-trip. No-op for
+# non-SwiGLU activations. Not bit-exact (max_abs 3.9e-5), so it is opt-in. Read
+# once here rather than per forward: the consumer is on the per-layer decode path.
+_FUSE_FC1_ACT: bool = os.environ.get("MCORE_FUSE_FC1_ACT", "0") == "1"
 
 
 class GroupedLinearFc1Interface(Protocol):
@@ -1222,6 +1229,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             routing_map=routing_map,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
+            fuse_fc1_activation=_FUSE_FC1_ACT,
         )
         return output, None
 
