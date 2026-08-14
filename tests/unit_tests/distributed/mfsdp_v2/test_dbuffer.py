@@ -240,7 +240,11 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
     local_buffer = replicated_buffer.local_buffer.narrow(0, offset, local_numel)
 
     sharded_buffer = DBuffer.from_local(
-        local_buffer, mesh, iter([Flat()]), replicated_buffer.layout.tensor_shapes
+        local_buffer,
+        mesh,
+        iter([Flat()]),
+        replicated_buffer.layout.tensor_shapes,
+        allocation_stream=replicated_buffer.allocation_stream,
     )
 
     assert sharded_buffer.placements == (Flat(),)
