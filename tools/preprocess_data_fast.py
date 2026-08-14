@@ -72,7 +72,7 @@ def process_key(args, key, level):
 
     # Add encoded documents to the IndexedDataset
     print("Adding encoded documents to IndexedDataset...")
-    builder.add_documents_parallel(encoded_docs, num_workers=128)
+    builder.add_documents(encoded_docs)
     builder.finalize(idx_file)
 
 
@@ -80,9 +80,11 @@ def main():
     args = get_args()
     level = "document"
 
-    ctx = multiprocessing.get_context('spawn')
-    with ctx.Pool(processes=len(args.json_keys)) as pool:
-        pool.starmap(process_key, [(args, key, level) for key in args.json_keys])
+    #ctx = multiprocessing.get_context('spawn')
+    #with ctx.Pool(processes=len(args.json_keys)) as pool:
+    #    pool.starmap(process_key, [(args, key, level) for key in args.json_keys])
+    for key in args.json_keys:
+        process_key(args, key, level)
 
 
 if __name__ == '__main__':

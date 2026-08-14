@@ -7,6 +7,7 @@
 
 import awkward as ak
 import gc
+import multiprocessing
 import logging
 import os
 import shutil
