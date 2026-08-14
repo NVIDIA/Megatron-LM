@@ -150,6 +150,28 @@ def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
+def _zero0_placements() -> Placements:
+    return Placements(
+        dp_axes=[0],
+        parameter=[Replicate()],
+        gradient=[Partial(dist.ReduceOp.AVG)],
+        optimizer=[Replicate()],
+    )
+
+
+def _zero1_placements() -> Placements:
+    return Placements(
+        dp_axes=[0],
+        parameter=[Replicate()],
+        gradient=[Partial(dist.ReduceOp.AVG)],
+        optimizer=[Flat()],
+    )
+
+
+def _zero2_placements() -> Placements:
+    return Placements(dp_axes=[0], parameter=[Replicate()], gradient=[Flat()], optimizer=[Flat()])
+
+
 def _hsdp_placements() -> Placements:
     """HSDP: params/optimizer replicated across DP-outer (axis 0), sharded within
     DP-inner (axis 1). main_grad rests [Partial, Flat] between microbatches and is
@@ -175,27 +197,14 @@ _GEMM_OP_NAME_SUBSTRING = "aten::mm"
 
 
 @pytest.mark.parametrize(
-    "placements",
-    [
-        Placements(
-            dp_axes=[0],
-            parameter=[Replicate()],
-            gradient=[Partial(dist.ReduceOp.AVG)],
-            optimizer=[Replicate()],
-        ),
-        Placements(
-            dp_axes=[0],
-            parameter=[Replicate()],
-            gradient=[Partial(dist.ReduceOp.AVG)],
-            optimizer=[Flat()],
-        ),
-        Placements(dp_axes=[0], parameter=[Replicate()], gradient=[Flat()], optimizer=[Flat()]),
-        Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]),
-    ],
-    ids=["no_shard", "optim", "optim_grads", "optim_grads_params"],
+    "placements_factory",
+    [_zero0_placements, _zero1_placements, _zero2_placements, _flat_placements],
+    ids=["zero0", "zero1", "zero2", "zero3"],
 )
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatches, placements):
+def test_fully_shard_sgd_losses_match_baseline(
+    distributed_setup, num_microbatches, placements_factory
+):
     """Every supported sharding strategy should match single-rank SGD."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
@@ -204,6 +213,7 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
         pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
+    placements = placements_factory()
     torch.manual_seed(1234)
     baseline = TinyModel().to(device)
     model = TinyModel().to(device)
@@ -541,10 +551,6 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, foreach=False)
     fully_shard_optimizer(optimizer)
 
-    # Warm up.
-    with torch.no_grad():
-        for _ in range(2):
-            model(x)
     # Initialize sharded Adam states.
     model(x).sum().backward()
     optimizer.step()
@@ -680,7 +686,14 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     )
 
 
-@pytest.mark.parametrize("strategy", ["zero1", "zero2", "zero3"])
+@pytest.mark.parametrize(
+    "strategy,placements_factory",
+    [
+        pytest.param("zero1", _zero1_placements, id="zero1"),
+        pytest.param("zero2", _zero2_placements, id="zero2"),
+        pytest.param("zero3", _flat_placements, id="zero3"),
+    ],
+)
 @pytest.mark.parametrize(
     "use_symmetric_memory",
     [
@@ -695,7 +708,9 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     ],
     ids=["default", "symmetric_memory"],
 )
-def test_overlaps_communication_and_compute(distributed_setup, strategy, use_symmetric_memory):
+def test_overlaps_communication_and_compute(
+    distributed_setup, strategy, placements_factory, use_symmetric_memory
+):
     """ZeRO-1/2/3 communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -713,12 +728,7 @@ def test_overlaps_communication_and_compute(distributed_setup, strategy, use_sym
     num_children = 4
     num_microbatches = 3
     dtype = torch.bfloat16
-    placements = Placements(
-        dp_axes=[0],
-        parameter=[Flat() if strategy == "zero3" else Replicate()],
-        gradient=[Partial(dist.ReduceOp.AVG) if strategy == "zero1" else Flat()],
-        optimizer=[Flat()],
-    )
+    placements = placements_factory()
 
     # new_group requires a default process group. Initialize it here so this test works
     # in isolation. Do not eagerly initialize it with device_id in the shared fixture:
@@ -792,7 +802,7 @@ def test_overlaps_communication_and_compute(distributed_setup, strategy, use_sym
     # per iteration. ZeRO-1 reduces only the last microbatch; ZeRO-2 reduces every
     # microbatch. ZeRO-3 gathers for every forward and backward and reduces every
     # microbatch.
-    expected = {
+    expected_collective_counts = {
         "zero1": (2 * num_children, num_children, num_children - 1, num_children - 1),
         "zero2": (
             2 * num_children,
@@ -807,17 +817,22 @@ def test_overlaps_communication_and_compute(distributed_setup, strategy, use_sym
             num_microbatches * (num_children - 1),
         ),
     }
-    expected_ag, expected_rs, expected_ag_overlap, expected_rs_overlap = expected[strategy]
+    (
+        expected_allgather_count,
+        expected_reduce_scatter_count,
+        expected_allgather_overlap_count,
+        expected_reduce_scatter_overlap_count,
+    ) = expected_collective_counts[strategy]
 
-    expected_allgather_kernel_count = 0 if use_symmetric_memory else expected_ag
+    expected_allgather_kernel_count = 0 if use_symmetric_memory else expected_allgather_count
     # Zero-CTA moves the all-gather to copy-engine memcpys, so it should not emit
     # all-gather kernels.
     assert len(allgather_kernels) == expected_allgather_kernel_count, (
         f"Expected {expected_allgather_kernel_count} all-gather kernels, got "
         f"{len(allgather_kernels)}: {[kernel.name for kernel in allgather_kernels]}"
     )
-    assert len(reduce_scatter_kernels) == expected_rs, (
-        f"Expected {expected_rs} reduce-scatter kernels, got "
+    assert len(reduce_scatter_kernels) == expected_reduce_scatter_count, (
+        f"Expected {expected_reduce_scatter_count} reduce-scatter kernels, got "
         f"{len(reduce_scatter_kernels)}: {[kernel.name for kernel in reduce_scatter_kernels]}"
     )
 
@@ -839,12 +854,12 @@ def test_overlaps_communication_and_compute(distributed_setup, strategy, use_sym
         for kernel in reduce_scatter_kernels
     )
     if not use_symmetric_memory:
-        assert allgather_overlap_count >= expected_ag_overlap, (
-            f"Expected at least {expected_ag_overlap} all-gathers to "
+        assert allgather_overlap_count >= expected_allgather_overlap_count, (
+            f"Expected at least {expected_allgather_overlap_count} all-gathers to "
             f"overlap compute, got {allgather_overlap_count}/{len(allgather_kernels)}."
         )
-    assert reduce_scatter_overlap_count >= expected_rs_overlap, (
-        f"Expected at least {expected_rs_overlap} reduce-scatters to overlap "
+    assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap_count, (
+        f"Expected at least {expected_reduce_scatter_overlap_count} reduce-scatters to overlap "
         f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_kernels)}."
     )
 
