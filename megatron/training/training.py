@@ -175,7 +175,6 @@ from .global_vars import (
     get_signal_handler,
     get_tensorboard_writer,
     get_timers,
-    get_tokenizer,
     get_wandb_writer,
 )
 from .theoretical_memory_usage import report_theoretical_memory
