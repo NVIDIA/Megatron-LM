@@ -1767,6 +1767,74 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
         alloc.release_memory_blocks(filler_blocks)
 
+    @pytest.mark.internal
+    def test_async_sched_overlap_handles_hidden_chunked_prefill(self):
+        """Overlap ignores a continuing chunk outside the active request rows."""
+        self.setup_model(
+            torch.float32, batch_size=3, static=False, block_size_tokens=4, max_requests=4
+        )
+        controller = self.text_generation_controller
+        context = controller.inference_wrapped_model.inference_context
+        context.reset()
+
+        active_slice = slice(0, 3)
+        context.total_request_count = 3
+        context.active_token_count = 3
+        context.num_prefill_requests = 1
+        context.request_ids[active_slice] = torch.tensor([10, 11, 12], dtype=torch.int32)
+        context.request_in_prefill_status_tensor[active_slice] = torch.tensor(
+            [0, 0, 1], dtype=torch.int32
+        )
+        context.request_query_lengths[active_slice] = 1
+        context.request_output_lengths[active_slice] = 16
+        context.request_kv_length_offsets[active_slice] = 3
+        context.request_last_kv_block_offset[active_slice] = torch.tensor(
+            [context.block_size_tokens - 1, 0, 0], dtype=torch.int32
+        )
+        context.request_metadata["termination_id"][active_slice] = 99
+        context.chunked_prefill_request_id = 12
+        context.build_active_slices(3)
+
+        block_ids = context.kv_block_allocator.allocate_memory_blocks(3)
+        context.request_to_kv_block_ids[active_slice, 0] = block_ids
+        context.request_last_kv_block_id[active_slice] = block_ids
+        context.request_kv_block_counts[active_slice] = 1
+        context.token_to_input_ids[active_slice] = torch.tensor([80, 81, 82])
+
+        alloc = context.kv_block_allocator
+        alloc.paused_limit = 0
+        filler_blocks = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert filler_blocks is not None
+        filler_blocks = filler_blocks.clone()
+        assert alloc.get_allocatable_count() == 0
+
+        sampled_tokens = torch.tensor([90, 91, 92], dtype=torch.int64)
+        request_result = controller._run_async_sched_update_requests(
+            SimpleNamespace(
+                sampled_tokens_cpu_view=sampled_tokens,
+                sampled_mtp_tokens_cpu_view=None,
+                accepted_tokens_cpu_view=None,
+            ),
+            resolved_sequence_lengths=torch.tensor([4, 4, 4]),
+        )
+
+        assert request_result.evict_request_ids.tolist() == [10]
+        assert context.total_request_count == 1
+        assert context.request_ids[:2].tolist() == [11, 12]
+        assert context.get_index_of_chunked_prefill_request(safe=True) == -1
+        assert context.get_index_of_chunked_prefill_request(safe=False) == 1
+
+        active_request_ids, finished_request_ids, active_request_mask = (
+            controller._build_async_sched_request_state(
+                torch.tensor([93]), resolved_sequence_lengths=torch.tensor([5])
+            )
+        )
+
+        assert active_request_ids.tolist() == [11]
+        assert finished_request_ids.numel() == 0
+        assert active_request_mask.tolist() == [1]
+        alloc.release_memory_blocks(filler_blocks)
+
     def test_sample_from_logits(self):
         self.setup_model(torch.float32)
 

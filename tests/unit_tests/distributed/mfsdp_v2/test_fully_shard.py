@@ -262,16 +262,16 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
 
     # Backward completes each module before recomputing the previous one, so
     # every module-local phase must be cleared after its matching backward.
-    assert model._phase is FsdpModule.Phase.RESTING
-    assert model.fc1._phase is FsdpModule.Phase.RESTING
-    assert model.fc2._phase is FsdpModule.Phase.RESTING
+    assert model.phase is FsdpModule.Phase.RESTING
+    assert model.fc1.phase is FsdpModule.Phase.RESTING
+    assert model.fc2.phase is FsdpModule.Phase.RESTING
 
     # A second forward after backward runs in the forward phase again, so
     # forward-order prefetch resumes and the module phases return to resting.
     model(x).sum().backward()
-    assert model._phase is FsdpModule.Phase.RESTING
-    assert model.fc1._phase is FsdpModule.Phase.RESTING
-    assert model.fc2._phase is FsdpModule.Phase.RESTING
+    assert model.phase is FsdpModule.Phase.RESTING
+    assert model.fc1.phase is FsdpModule.Phase.RESTING
+    assert model.fc2.phase is FsdpModule.Phase.RESTING
 
 
 @pytest.mark.parametrize("set_to_none", [True, False])
@@ -594,7 +594,20 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     )
 
 
-@pytest.mark.parametrize("use_symmetric_memory", [False, True], ids=["default", "symmetric_memory"])
+@pytest.mark.parametrize(
+    "use_symmetric_memory",
+    [
+        # Both variants' all-gathers are launch-timing sensitive, but default-CTA
+        # kernels occupy more compute CTAs, making the profiler overlap count less
+        # stable across ranks (see
+        # https://github.com/NVIDIA/Megatron-LM/actions/runs/31615942188).
+        # The symmetric-memory variant uses zero-CTA all-gather kernels, so its overlap
+        # measurement is more stable and remains enabled.
+        pytest.param(False, marks=(pytest.mark.flaky, pytest.mark.flaky_in_dev)),
+        pytest.param(True),
+    ],
+    ids=["default", "symmetric_memory"],
+)
 def test_overlaps_communication_and_compute(distributed_setup, use_symmetric_memory):
     """Forward and backward communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size

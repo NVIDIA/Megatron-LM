@@ -40,6 +40,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    FinishedRequestRecord,
     Status,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -356,6 +357,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
+        self.local_metadata_ledger_enabled: bool = False
+        self.local_metadata_ledger: dict[str, FinishedRequestRecord] = {}
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
@@ -2222,6 +2225,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     partial["new_log_probs"] = list(
                         (request.generated_log_probs or [])[already:emit_end]
                     )
+                    partial["new_top_n_logprobs"] = list(
+                        (getattr(request, "generated_top_n_logprobs", None) or [])[already:]
+                    )
+                    if already == 0 and not request.sampling_params.skip_prompt_log_probs:
+                        partial["prompt_log_probs"] = list(
+                            getattr(request, "prompt_log_probs", None) or []
+                        )
+                        partial["prompt_top_n_logprobs"] = list(
+                            getattr(request, "prompt_top_n_logprobs", None) or []
+                        )
                 partials.append(partial)
                 emit_lengths[rid] = emit_end
 
@@ -2335,8 +2348,18 @@ class DynamicInferenceEngine(AbstractEngine):
             ]
             if records_to_send:
                 nvtx_range_push("coordinator_communication")
+                merged_requests = [r.merge() for r in records_to_send]
+                if self.local_metadata_ledger_enabled:
+                    # Index every finished request's extra metadata before it is dropped.
+                    for merged in merged_requests:
+                        assert (
+                            merged.uid not in self.local_metadata_ledger
+                        ), f"finished-request ledger: duplicate uid {merged.uid!r}"
+                        self.local_metadata_ledger[merged.uid] = FinishedRequestRecord.from_request(
+                            merged
+                        )
                 payload = msgpack.packb(
-                    [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
+                    [Headers.ENGINE_REPLY.value, [m.serialize() for m in merged_requests]],
                     use_bin_type=True,
                 )
                 self.socket_for_receiving_requests.send(payload)
