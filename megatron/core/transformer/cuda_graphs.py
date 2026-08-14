@@ -864,9 +864,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
         runner.bwd_graph_replay_complete_event.record(torch.cuda.current_stream())
         for param in runner.params_to_backprop:
             param._cudagraph_wgrad_ready_event = runner.bwd_graph_replay_complete_event
-            if id(param) in runner.param_ids_to_skip_ddp_grad_add_on_replay:
-                # The backward graph already added param.grad to main_grad. Restore the
-                # Python-side flag so DDP skips that add, clears param.grad, and marks readiness.
+            if hasattr(param, 'grad_added_to_main_grad'):
                 param.grad_added_to_main_grad = True
         runner.status = _GraphStatus.FWD_READY
 
@@ -884,8 +882,6 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 with torch.cuda.stream(gtp_rs_stream):
                     for param in params:
                         param.grad = None
-                        if hasattr(param, 'grad_added_to_main_grad'):
-                            param.grad_added_to_main_grad = True
                         hook = getattr(param, '_grad_accum_hook', None)
                         if hook is not None:
                             hook()
@@ -1482,7 +1478,6 @@ class _CudaGraphRunner(torch.nn.Module):
             n_act_grads = sum(
                 1 for i in self.fwd_graph_input_surface[: self.num_dgrads] if i.requires_grad
             )
-            self.param_ids_to_skip_ddp_grad_add_on_replay = set()
             for param, wgrad in zip(self.params_to_backprop, grad_inputs[n_act_grads:]):
                 grad_already_accumulated = getattr(param, 'grad_added_to_main_grad', False)
                 if wgrad is not None and not grad_already_accumulated:
@@ -1491,8 +1486,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     # A nested backward can accumulate directly into param.grad instead of
                     # returning that contribution through the outer autograd.grad call.
                     param.main_grad.add_(param.grad)
-                    param.grad_added_to_main_grad = True
-                    self.param_ids_to_skip_ddp_grad_add_on_replay.add(id(param))
+                param.grad_added_to_main_grad = True
 
             # GTP cross-graph RS overlap, two phases:
             #   Phase 1 — drain AG, fence runner_stream past ag_stream's tail,
