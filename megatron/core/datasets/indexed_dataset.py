@@ -1010,52 +1010,10 @@ class IndexedDatasetBuilder(object):
         doc_lengths = numpy.asarray(ak.num(documents, axis=1))
         offset = len(self.sequence_lengths)
         self.sequence_lengths.extend(doc_lengths.tolist())
-        self.document_indices.extend((offset + numpy.cumsum(doc_lengths)).tolist())
+        self.document_indices.extend((offset + numpy.arange(1, len(doc_lengths) + 1)).tolist())
 
         if self.multimodal:
             self.sequence_modes.extend(modes if modes is not None else [0] * len(doc_lengths))
-
-    def add_documents_parallel(
-        self,
-        documents: ak.Array,
-        modes: List[int] | None = None,
-        num_workers: int = 1,
-    ) -> None:
-        """Add a list of documents to the dataset, optionally parallelizing the
-        flatten/length computation across worker processes
-
-        Args:
-            documents (ak.Array): A jagged array of documents, where each element holds
-                the token ids for that document
-
-            modes (List[int] | None, optional): The mode for each document. Defaults to None.
-
-            num_workers (int, optional): Number of worker processes to prepare chunks
-                with. Defaults to 1 (no parallelism).
-        """
-        if num_workers <= 1 or len(documents) < num_workers:
-            chunks = [documents]
-        else:
-            boundaries = numpy.linspace(0, len(documents), num_workers + 1, dtype=int)
-            chunks = [documents[boundaries[i] : boundaries[i + 1]] for i in range(num_workers)]
-
-        chunk_args = [(chunk, self.dtype) for chunk in chunks]
-        if num_workers <= 1:
-            results = [_prepare_chunk(a) for a in chunk_args]
-        else:
-            with multiprocessing.Pool(num_workers) as pool:
-                results = pool.map(_prepare_chunk, chunk_args)
-
-        offset = len(self.sequence_lengths)
-        for flat, lengths in results:
-            self.data_file.write(flat.tobytes(order="C"))
-            self.sequence_lengths.extend(lengths.tolist())
-            self.document_indices.extend((offset + numpy.cumsum(lengths)).tolist())
-            offset += len(lengths)
-
-        if self.multimodal:
-            total_docs = sum(len(lengths) for _, lengths in results)
-            self.sequence_modes.extend(modes if modes is not None else [0] * total_docs)
 
     def end_document(self) -> None:
         """Finalize the document, for use with IndexedDatasetBuilder.add_item"""
