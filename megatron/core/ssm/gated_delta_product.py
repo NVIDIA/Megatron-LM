@@ -858,7 +858,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         assert (
             intermediate_conv_state is None and intermediate_ssm_state is None
         ), "GDP decode does not support speculative decoding yet"
-        M = self.num_householder
 
         # Keep the length-1 sequence dimension so the shared helpers apply: with l == 1
         # their (b, l, ...) reshapes collapse to exactly the layouts the fla recurrent
@@ -873,13 +872,13 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         beta, g = self._compute_gating(ba)
 
-        # Interleave the (length-1) query / decay with householder zeros so the
-        # recurrent kernel sees an (1 * M)-length sequence (matches static decode).
-        g_new = g.new_zeros(g.shape[0], g.shape[1], M, g.shape[2])
+        # Interleave the (length-1) query / decay with householder zeros so the recurrent
+        # kernel sees an (1 * num_householder)-length sequence (matches static decode).
+        g_new = g.new_zeros(g.shape[0], g.shape[1], self.num_householder, g.shape[2])
         g_new[:, :, 0] = g
         g = rearrange(g_new, "n t m h -> n (t m) h")
         query_new = query.new_zeros(
-            query.shape[0], query.shape[1], M, query.shape[2], query.shape[3]
+            query.shape[0], query.shape[1], self.num_householder, query.shape[2], query.shape[3]
         )
         query_new[:, :, -1] = query
         query = rearrange(query_new, "n t m h d -> n (t m) h d")
@@ -903,7 +902,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
         )
-        core_attn_out = rearrange(core_attn_out, "n (t m) h d -> n t m h d", m=M)[
+        core_attn_out = rearrange(
+            core_attn_out, "n (t m) h d -> n t m h d", m=self.num_householder
+        )[
             ..., -1, :, :
         ].contiguous()  # [n, 1, h, d]
 
