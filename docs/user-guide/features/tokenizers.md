@@ -178,7 +178,7 @@ tokenizer = MegatronTokenizer.from_pretrained(
 ### Fast Tokenization with GigaToken
 
 Hugging Face and Megatron tokenizers can optionally use [GigaToken](https://pypi.org/project/gigatoken/),
-a faster tokenizer backend for encoding whole JSONL files in parallel instead of tokenizing
+a faster tokenizer backend for encoding whole **JSONL** files in parallel instead of tokenizing
 document-by-document.
 
 Enable it by passing `use_gigatoken=True` when building the tokenizer, or `--use-gigatoken` on the CLI:
