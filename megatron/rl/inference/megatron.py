@@ -28,7 +28,6 @@ from ..inference.inference_interface import (
     ReturnsRaw,
     ReturnsTokens,
 )
-from ..rollout_granularity import get_rl_parallel_generation_tasks
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
@@ -140,7 +139,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         concurrency_limit = (
             args.grpo_prompts_per_step
             * args.grpo_group_size
-            * get_rl_parallel_generation_tasks(args)
+            * (args.rl_generation_lag + 1)
         )
         custom_limits = httpx.Limits(
             max_connections=concurrency_limit,
