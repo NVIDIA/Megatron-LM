@@ -73,7 +73,8 @@ def _resolve_use_syrk(use_syrk: bool) -> bool:
     Newton-Schulz GEMMs (``A = X Xᵀ`` and ``B = bA + cA²``) by computing only one
     triangle. Requires the Triton tensor-descriptor API (>= 3.4.0) and a validated
     SM architecture; it only takes effect on the bf16 (``fp32_matmul_prec="medium"``)
-    2-D path inside ``newton_schulz``.
+    paths inside ``newton_schulz`` (the batched 3-D path additionally needs the
+    batched SYRK kernel — see :func:`_has_batched_syrk`).
     """
     if not use_syrk:
         return False
@@ -91,6 +92,17 @@ def _resolve_use_syrk(use_syrk: bool) -> bool:
         )
         return False
     return True
+
+
+def _has_batched_syrk() -> bool:
+    """Whether the installed emerging-optimizers has the batched (3-D) SYRK kernel.
+
+    ``batched_tsyrk_ex`` landed on emerging-optimizers main with PR #276 (>= 0.5.0a0);
+    on such installs ``newton_schulz`` dispatches 3-D inputs to the batched SYRK step,
+    so batched chunks no longer need to fall back to baddbmm. Detected by symbol
+    rather than version so pre-release mains qualify.
+    """
+    return hasattr(triton_kernels, 'batched_tsyrk_ex')
 
 
 # Phase-level NVTX ranges. Kernel-name classification cannot separate the forward
@@ -151,9 +163,10 @@ class LayerShardedMuon(Muon):
             NS input is bit-identical. None (default) keeps the two-stage path.
         use_syrk: Use the Triton SYRK kernel for the two symmetric-output NS GEMMs
             (``A = X Xᵀ`` and ``B = bA + cA²``), computing one triangle only —
-            roughly a third off total NS FLOPs for near-square matrices. 2-D only:
-            applies to unbatched chunks (the big dense matrices); batched chunks
-            fall back to baddbmm. Only takes effect with
+            roughly a third off total NS FLOPs for near-square matrices. Applies to
+            unbatched chunks always; batched (3-D) chunks additionally require an
+            emerging-optimizers with the batched SYRK kernel (>= 0.5.0a0, PR #276)
+            and otherwise fall back to baddbmm. Only takes effect with
             ``fp32_matmul_prec="medium"`` and 8-aligned dims; auto-disabled when
             Triton/SM requirements are unmet. Same math, different kernel — results
             differ from the GEMM path by kernel-level rounding.
@@ -225,6 +238,17 @@ class LayerShardedMuon(Muon):
         self.fused_group = fused_group
         self.ns_batch_size = max(1, ns_batch_size)
         self.use_syrk = _resolve_use_syrk(use_syrk)
+        # Batched (3-D) chunks can use SYRK only when the installed emerging-optimizers
+        # ships the batched kernel; otherwise they fall back to baddbmm as before.
+        self._batched_syrk = self.use_syrk and _has_batched_syrk()
+        if self.use_syrk and self.ns_batch_size > 1 and not self._batched_syrk:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                'use_syrk is set but this emerging-optimizers has no batched SYRK '
+                'kernel (needs >= 0.5.0a0, PR #276): batched chunks fall back to '
+                'baddbmm; only unbatched chunks get SYRK.',
+            )
         self.coefficient_type = coefficient_type
         self.num_ns_steps = num_ns_steps
         self.scale_mode = scale_mode
@@ -287,15 +311,15 @@ class LayerShardedMuon(Muon):
                 chunk = ks[start : start + self.ns_batch_size]
                 batched = len(chunk) > 1
                 x = torch.stack([full_by_k[k] for k in chunk]) if batched else full_by_k[chunk[0]]
-                # SYRK (halves the two symmetric-output NS GEMMs) is 2-D only, so it
-                # applies to unbatched chunks — exactly the big dense matrices; small
-                # expert weights take the batched path instead. Complementary, not
-                # conflicting.
+                # SYRK halves the two symmetric-output NS GEMMs. Unbatched (2-D)
+                # chunks — the big dense matrices — always qualify; batched (3-D)
+                # chunks additionally need the batched SYRK kernel (emerging-
+                # optimizers >= 0.5.0a0, PR #276), else they fall back to baddbmm.
                 orth = newton_schulz(
                     x,
                     steps=self.num_ns_steps,
                     coefficient_type=self.coefficient_type,
-                    use_syrk=self.use_syrk and not batched,
+                    use_syrk=self._batched_syrk if batched else self.use_syrk,
                 )
                 scale = get_muon_scale_factor(orth.size(-2), orth.size(-1), mode=self.scale_mode)
                 # Two sequential multiplies, NOT a pre-combined scalar: matches
