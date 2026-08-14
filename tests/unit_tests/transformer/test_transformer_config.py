@@ -46,6 +46,19 @@ def test_gdp_num_householder_accepts_positive_values():
     assert config.gdp_num_householder == 5
 
 
+@pytest.mark.parametrize(
+    "removed_field",
+    [
+        "moe_shortcut_output_norm",
+        "moe_shortcut_tied_norm",
+        "moe_shortcut_untied_norm",
+        "moe_shortcut_post_norm",
+    ],
+)
+def test_shortcut_norm_options_are_removed(removed_field: str):
+    assert removed_field not in TransformerConfig.__dataclass_fields__
+
+
 @pytest.mark.parametrize("num_householder", [0, -1])
 def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
     with pytest.raises(ValueError, match="gdp_num_householder must be positive"):

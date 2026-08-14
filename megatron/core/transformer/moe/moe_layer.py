@@ -371,10 +371,6 @@ class MoELayer(BaseMoELayer):
         # Shortcut gating and normalization modules
         self._shortcut_scalar_gate = None
         self._shortcut_gate_vector = None
-        self._shortcut_output_norm = None
-        self._shortcut_tied_norm = None
-        self._shortcut_untied_routed_norm = None
-        self._shortcut_untied_shared_norm = None
         self._shortcut_post_norm = None
 
         if self.config.moe_shortcut_scalar_gate:
@@ -385,47 +381,17 @@ class MoELayer(BaseMoELayer):
                 torch.zeros(self.config.hidden_size)
             )
 
-        if (
-            self.config.moe_shortcut_output_norm
-            or self.config.moe_shortcut_tied_norm
-            or self.config.moe_shortcut_untied_norm
-            or self.config.moe_shortcut_post_norm
-        ):
+        if self.config.moe_shortcut_connection:
             # Use plain torch RMSNorm since the forward normalization is local to each token.
-            eps = self.config.layernorm_epsilon
-            if self.config.moe_shortcut_output_norm:
-                self._shortcut_output_norm = torch.nn.RMSNorm(
-                    self.config.hidden_size, eps=eps
-                )
-            if self.config.moe_shortcut_tied_norm:
-                # One weight-tied norm reused for both parallel paths: LN(routed) + LN(shared).
-                self._shortcut_tied_norm = torch.nn.RMSNorm(
-                    self.config.hidden_size, eps=eps
-                )
-            if self.config.moe_shortcut_untied_norm:
-                # Two independent norms, one per parallel path: LN_r(routed) + LN_s(shared).
-                self._shortcut_untied_routed_norm = torch.nn.RMSNorm(
-                    self.config.hidden_size, eps=eps
-                )
-                self._shortcut_untied_shared_norm = torch.nn.RMSNorm(
-                    self.config.hidden_size, eps=eps
-                )
-            if self.config.moe_shortcut_post_norm:
-                self._shortcut_post_norm = torch.nn.RMSNorm(
-                    self.config.hidden_size, eps=eps
-                )
+            self._shortcut_post_norm = torch.nn.RMSNorm(
+                self.config.hidden_size, eps=self.config.layernorm_epsilon
+            )
 
         # These parameters are replicated across TP ranks, but under sequence parallel each
         # rank sees a different sequence shard. Mark them so finalize_model_grads performs the
         # required TP gradient all-reduce, just as it does for router and normalization weights.
         replicated_parameters = [self._shortcut_scalar_gate, self._shortcut_gate_vector]
-        replicated_modules = [
-            self._shortcut_output_norm,
-            self._shortcut_tied_norm,
-            self._shortcut_untied_routed_norm,
-            self._shortcut_untied_shared_norm,
-            self._shortcut_post_norm,
-        ]
+        replicated_modules = [self._shortcut_post_norm]
         for parameter in replicated_parameters:
             if parameter is not None:
                 setattr(parameter, 'sequence_parallel', self.config.sequence_parallel)
@@ -682,13 +648,10 @@ class MoELayer(BaseMoELayer):
         Operation order:
           1. combine_postprocess (un-permute, weight)
           2. latent projection (if moe_latent_size)
-          3. routed-path norm: output_norm (legacy routed-only) or tied_norm or untied routed norm
-          4. scalar_gate: sigmoid(alpha) * output (if moe_shortcut_scalar_gate)
-          5. shared-path norm: tied_norm (same module as step 3) or untied shared norm. tied_norm
-             reuses one weight-tied module for both paths; untied_norm uses two separate modules.
-          6. combine with shared: vector_gate interpolation or plain addition
-          7. add zero expert output
-          8. post_norm (if moe_shortcut_post_norm)
+          3. scalar_gate: sigmoid(alpha) * output (if moe_shortcut_scalar_gate)
+          4. combine with shared: vector_gate interpolation or plain addition
+          5. add zero expert output
+          6. post_norm
 
         _latent_shared_expert_output is inference-only (latent-MoE + NVLS dispatcher with
         shared-expert overlap). It is populated in preprocess and joined here, after
@@ -704,25 +667,9 @@ class MoELayer(BaseMoELayer):
                 output = self.fc2_norm(output)
             output, _ = self.fc2_latent_proj(output)
 
-        # Normalize routed path before combining. output_norm: legacy routed-only norm.
-        # tied_norm: one shared norm for both paths. untied_norm: per-path routed norm.
-        if self._shortcut_output_norm is not None:
-            output = self._shortcut_output_norm(output)
-        elif self._shortcut_tied_norm is not None:
-            output = self._shortcut_tied_norm(output)
-        elif self._shortcut_untied_routed_norm is not None:
-            output = self._shortcut_untied_routed_norm(output)
-
         # Scale routed output with learned scalar gate
         if self._shortcut_scalar_gate is not None:
             output = torch.sigmoid(self._shortcut_scalar_gate) * output
-
-        # Normalize shared path before combining. tied_norm reuses the SAME module as the routed
-        # path above; untied_norm uses its own separate module.
-        if self._shortcut_tied_norm is not None and shared_expert_output is not None:
-            shared_expert_output = self._shortcut_tied_norm(shared_expert_output)
-        elif self._shortcut_untied_shared_norm is not None and shared_expert_output is not None:
-            shared_expert_output = self._shortcut_untied_shared_norm(shared_expert_output)
 
         # Combine with shared expert output
         if self._shortcut_gate_vector is not None and shared_expert_output is not None:
@@ -740,8 +687,8 @@ class MoELayer(BaseMoELayer):
             output = output + self._latent_shared_expert_output
             self._latent_shared_expert_output = None
 
-        # Normalize combined output
-        if self._shortcut_post_norm is not None:
+        # Shortcut MoE always normalizes the final combined output.
+        if self.config.moe_shortcut_connection:
             output = self._shortcut_post_norm(output)
 
         return output
@@ -755,17 +702,8 @@ class MoELayer(BaseMoELayer):
             if self.config.moe_use_norm_before_up_proj:
                 modules.append(self.fc2_norm)
             modules.append(self.fc2_latent_proj)
-        modules.extend(
-            module
-            for module in (
-                self._shortcut_output_norm,
-                self._shortcut_tied_norm,
-                self._shortcut_untied_routed_norm,
-                self._shortcut_untied_shared_norm,
-                self._shortcut_post_norm,
-            )
-            if module is not None
-        )
+        if self.config.moe_shortcut_connection:
+            modules.append(self._shortcut_post_norm)
         parameters = tuple(
             parameter
             for parameter in (self._shortcut_scalar_gate, self._shortcut_gate_vector)

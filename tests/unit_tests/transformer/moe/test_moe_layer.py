@@ -86,16 +86,9 @@ class TestMoELayerInit:
     @pytest.mark.parametrize(
         "shortcut_options",
         [
-            {
-                "moe_shortcut_vector_gate": True,
-                "moe_shortcut_tied_norm": True,
-                "moe_shortcut_post_norm": True,
-            },
-            {
-                "moe_shortcut_scalar_gate": True,
-                "moe_shortcut_untied_norm": True,
-            },
-            {"moe_shortcut_output_norm": True},
+            {"moe_shortcut_vector_gate": True},
+            {"moe_shortcut_scalar_gate": True},
+            {},
         ],
     )
     def test_shortcut_parameters_marked_sequence_parallel(self, shortcut_options):
@@ -119,6 +112,8 @@ class TestMoELayerInit:
             get_gpt_layer_local_submodules(num_experts=1, moe_grouped_gemm=False).mlp
         )
         moe_layer = MoELayer(config, submodules)
+
+        assert isinstance(moe_layer._shortcut_post_norm, torch.nn.RMSNorm)
 
         shortcut_parameters = {
             name: parameter

@@ -747,28 +747,6 @@ class TransformerConfig(ModelParallelConfig):
     learnable vector of shape [hidden_size] initialized to 0. Requires
     moe_shortcut_connection = True. Mutually exclusive with moe_shortcut_scalar_gate."""
 
-    moe_shortcut_output_norm: bool = False
-    """Apply RMSNorm to the routed expert output before combining with the shared expert output.
-    Normalizes the routed output to stabilize the representation space mismatch between the
-    shortcut-routed and current-layer shared expert paths. Requires
-    moe_shortcut_connection = True."""
-
-    moe_shortcut_tied_norm: bool = False
-    """Normalize both parallel paths then sum, using a single weight-tied RMSNorm:
-    LN(routed) + LN(shared), where the SAME RMSNorm module (one set of weights) is applied to both
-    paths. Mutually exclusive with moe_shortcut_untied_norm and moe_shortcut_output_norm.
-    Requires moe_shortcut_connection = True."""
-
-    moe_shortcut_untied_norm: bool = False
-    """Normalize both parallel paths then sum, using two independent (untied) RMSNorms:
-    LN_routed(routed) + LN_shared(shared), where each path has its OWN RMSNorm weights. Mutually
-    exclusive with moe_shortcut_tied_norm and moe_shortcut_output_norm.
-    Requires moe_shortcut_connection = True."""
-
-    moe_shortcut_post_norm: bool = False
-    """Apply RMSNorm after combining routed, shared, and zero expert outputs. Normalizes the
-    final MoE layer output. Requires moe_shortcut_connection = True."""
-
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
@@ -1772,10 +1750,6 @@ class TransformerConfig(ModelParallelConfig):
         for flag_name in [
             'moe_shortcut_scalar_gate',
             'moe_shortcut_vector_gate',
-            'moe_shortcut_output_norm',
-            'moe_shortcut_tied_norm',
-            'moe_shortcut_untied_norm',
-            'moe_shortcut_post_norm',
         ]:
             if getattr(self, flag_name):
                 assert self.moe_shortcut_connection, (
@@ -1786,20 +1760,6 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "moe_shortcut_scalar_gate and moe_shortcut_vector_gate are mutually exclusive. "
                 "Use only one gating strategy."
-            )
-
-        if self.moe_shortcut_tied_norm and self.moe_shortcut_untied_norm:
-            raise ValueError(
-                "moe_shortcut_tied_norm (one weight-tied norm for both paths) and "
-                "moe_shortcut_untied_norm (separate norm per path) are mutually exclusive."
-            )
-
-        if (self.moe_shortcut_tied_norm or self.moe_shortcut_untied_norm) and (
-            self.moe_shortcut_output_norm
-        ):
-            raise ValueError(
-                "moe_shortcut_tied_norm / moe_shortcut_untied_norm already normalize the routed "
-                "path and are mutually exclusive with moe_shortcut_output_norm."
             )
 
         if self.moe_shared_expert_intermediate_size is not None:

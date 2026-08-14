@@ -918,18 +918,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
 
-        # Add shared experts output. Defer the add to MoELayer.postprocess when it needs the
-        # shared-expert output separately: moe_shortcut_vector_gate (learned interpolation), or
-        # moe_shortcut_tied_norm / moe_shortcut_untied_norm (normalize the shared path before the
-        # sum). Otherwise add it here.
+        # Add shared experts output. Defer the add to MoELayer.postprocess only when vector-gate
+        # interpolation needs the shared-expert output separately.
         deferred_shared_expert_output = None
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
-            if (
-                self.config.moe_shortcut_vector_gate
-                or self.config.moe_shortcut_tied_norm
-                or self.config.moe_shortcut_untied_norm
-            ):
+            if self.config.moe_shortcut_vector_gate:
                 deferred_shared_expert_output = shared_expert_output
             else:
                 output += shared_expert_output
