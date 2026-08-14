@@ -526,7 +526,7 @@ jobs:
           MBRIDGE_MCORE_REF: ${{ needs.configure.outputs.sha }}
           MBRIDGE_TEST_SUITE: ${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}
           MBRIDGE_POLL_TIMEOUT_SECONDS: "12600"
-        run: python3 .github/scripts/trigger_workflow_and_wait.py
+        run: python3 -u .github/scripts/trigger_workflow_and_wait.py
 
   cicd-mbridge-testing-notify:
     runs-on: ubuntu-latest
