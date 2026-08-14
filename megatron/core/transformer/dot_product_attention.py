@@ -118,10 +118,16 @@ class DotProductAttention(MegatronModule):
         if self.config.softmax_type == "vanilla":
             self.softmax_offset = None
         elif self.config.softmax_type == "off-by-one":
-            self.softmax_offset = torch.zeros(
-                self.num_attention_heads_per_partition,
-                device="cpu" if self.config.use_cpu_initialization else torch.cuda.current_device(),
-                dtype=self.config.params_dtype,
+            self.register_buffer(
+                "softmax_offset",
+                torch.zeros(
+                    self.num_attention_heads_per_partition,
+                    device=(
+                        "cpu" if self.config.use_cpu_initialization else torch.cuda.current_device()
+                    ),
+                    dtype=self.config.params_dtype,
+                ),
+                persistent=False,
             )
         elif self.config.softmax_type == "learnable":
             self.register_parameter(
