@@ -128,6 +128,9 @@ class FsdpParameterGroup:
         main_grad_placements = tuple(placements.gradient)
         main_weight_placements = tuple(placements.optimizer)
         self._model_weight_placements = model_weight_placements
+        # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
+        # is finalized to main_weight's placements after the last microbatch.
+        self._main_grad_placements = main_grad_placements
 
         # Python dicts preserve insertion order, so parameter_to_fqns and
         # fsdp_parameters define the same stable DBuffer tensor order.
@@ -177,9 +180,6 @@ class FsdpParameterGroup:
                 device=self.main_weight.device,
             )
 
-        # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
-        # is finalized to main_weight's placements after the last microbatch.
-        self._accumulation_placements = main_grad_placements
         self.main_grad = None
         if self.requires_grad:
             grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
@@ -377,10 +377,10 @@ class FsdpParameterGroup:
         # A non-accumulation main_grad means the previous step finalized it; this
         # only happens on the first microbatch. Start with fresh accumulation storage
         # rather than trying to redistribute a Flat optimizer shard back to Partial.
-        if self.main_grad.placements != self._accumulation_placements:
+        if self.main_grad.placements != self._main_grad_placements:
             self.main_grad = DBuffer(
                 mesh=self.mesh,
-                placements=self._accumulation_placements,
+                placements=self._main_grad_placements,
                 tensor_shapes=self.main_weight.layout.tensor_shapes,
                 dtype=self.main_grad.dtype,
                 device=self.main_weight.device,
