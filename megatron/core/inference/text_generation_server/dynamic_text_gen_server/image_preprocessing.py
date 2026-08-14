@@ -120,7 +120,15 @@ def preprocess_image_bytes(
         imgs_sizes shape: [1, 2] with [H, W] in pixels.
     """
     from PIL import Image
-    from torchvision import transforms as T
+
+    try:
+        from torchvision import transforms as T
+    except ImportError as exc:
+        raise ImportError(
+            "torchvision is required for VLM image preprocessing. Install a "
+            "torchvision build matching your torch version, or use the NGC "
+            "PyTorch container that ships one."
+        ) from exc
 
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
