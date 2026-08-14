@@ -41,6 +41,7 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
 # First-party.
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core import mpu, nccl_allocator, tensor_parallel
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -174,7 +175,6 @@ from .global_vars import (
     get_signal_handler,
     get_tensorboard_writer,
     get_timers,
-    get_tokenizer,
     get_wandb_writer,
 )
 from .theoretical_memory_usage import report_theoretical_memory
@@ -2928,12 +2928,12 @@ def training_log(
 
     # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
-        if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
-            snapshot = torch.cuda.memory._snapshot()
-            from pickle import dump
-
-            with open(args.memory_snapshot_path, 'wb') as f:
-                dump(snapshot, f)
+        should_prof_rank = (args.profile_ranks == [] or safe_get_rank() in args.profile_ranks)  # [] is all ranks
+        if args.record_memory_history and (should_prof_rank or torch.distributed.get_backend() == 'fake'):
+            rank = safe_get_rank()
+            base, ext = os.path.splitext(args.memory_snapshot_path)
+            snapshot_filename = f"{base}_{rank}{ext}"
+            torch.cuda.memory._dump_snapshot(snapshot_filename)
 
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
@@ -3165,13 +3165,11 @@ def save_checkpoint_and_time(
 
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    # Free overlap param-gather buffers and release cached GPU memory so
-    # that the async checkpoint worker process has enough GPU headroom for
-    # D2H tensor transfers.
+    # Free overlap param-gather buffers so that the async checkpoint worker
+    # process has enough GPU headroom for D2H tensor transfers.
     for model_chunk in model:
         if hasattr(model_chunk, 'free_overlap_buffers'):
             model_chunk.free_overlap_buffers()
-    torch.cuda.empty_cache()
 
     # timer.log() reports the min & max time. We do not need a barrier here.
     timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
