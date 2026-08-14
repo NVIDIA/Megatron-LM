@@ -360,6 +360,9 @@ jobs:
       - name: Test queue approval topology
         run: .github/scripts/test_approve_test_queue.sh
 
+      - name: Test superseded merge-group cleanup
+        run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
+
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
