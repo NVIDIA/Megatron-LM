@@ -201,13 +201,10 @@ for group in self._parameter_groups:
    resident but whose reshard was *not* skipped (e.g. prefetched modules)?
 3. How should the optimization path interact with the MXFP8 scale-inverse
    grids when a payload is kept resident across optimizer steps?
-4. Should `complete_trace()` compile a more elaborate plan (keep/resident
-   windows, prefetch distances) instead of the event cursor? See
-   `vpp_1f1b_design.md` §3.
+4. Should `complete_trace()` compile a more elaborate plan with residency
+   windows and configurable prefetch distances instead of the event cursor?
 
 ## 7. Sources
 
 - `megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/execution_runner.py`
 - `megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/module.py`
-- `megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/docs/vpp_1f1b_design.md`
-- `megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/docs/mfsdp_v2_vpp2_1f1b_schedule.md`

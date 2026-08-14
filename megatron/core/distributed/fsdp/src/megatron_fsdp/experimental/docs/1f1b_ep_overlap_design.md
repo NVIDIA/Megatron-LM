@@ -1,4 +1,4 @@
-# 1F1B EP Overlap — Experimental FSDP Integration Design
+# 1F1B EP Overlap — M-FSDP v2 Integration Design
 
 This document describes the FSDP-side contract required by the 1F1B EP-overlap
 schedule (`combined_1f1b`) and how the experimental Megatron FSDP
@@ -408,92 +408,22 @@ Extend to detect `FsdpModule` instances (currently only finds v1 `MegatronFSDP`)
 
 ---
 
-## 5. Implementation Phases
+## 5. Edge Cases
 
-### Phase 1 — Public APIs on `FsdpModule`
-**Files:** `experimental/module.py`, `experimental/fully_shard.py`, `experimental/__init__.py`
+### 5.1 Activation recomputation with overlap
 
-- Rename `_unshard_parameter_groups()` → `unshard_parameters()` (public)
-- Rename `_reshard_parameter_groups()` → `reshard_parameters()` (public)
-- Rename `_reduce_gradient_groups()` → `reduce_grad()` (public)
-- Make `pre_backward()` public
-- Make `post_backward()` public
-- Add `_replace_param_with_raw_if_needed()` as the root-context schedule entry point
-- Add `post_forward_release_module` / `post_backward_release_module` attributes
+The module phase and active autograd `GraphTask` identify recomputed forwards.
+They still unshard the current module, but skip forward-order prefetch and do
+not reshard parameters that the ongoing backward still needs.
 
-### Phase 2 — Extend `find_megatron_fsdp()`
-**File:** `megatron_fsdp/utils.py`
+### 5.2 Interleaved pipeline parallelism + EP overlap
 
-- Add `FsdpModule` detection alongside existing v1 detection
+All virtual-pipeline model chunks on a rank share one `FsdpContext`.
+Fine-grained hooks record occurrence-based unshard and reshard events in the
+shared execution runner, which learns the interleaved schedule order; see
+[execution-runner trace optimization](execution_runner_trace_optimization.md).
 
-### Phase 3 — Fine-grained hook registration
-**Files:** `experimental/fully_shard.py`, `experimental/module.py`, `mcore_fsdp_adapter.py`
-
-- Add `fine_grained` parameter to `fully_shard()`
-- Implement sub-module pre-forward hook registration
-- Implement sub-module pre-backward hook registration
-- Wire `fine_grained` flag from adapter config
-
-### Phase 4 — `no_sync()` context manager
-**File:** `mcore_fsdp_adapter.py`
-
-- Add `no_sync()` to `FullyShardedDataParallelV2`
-- Remove validation gate blocking EP overlap with v2
-
-### Phase 5 — `delay_wgrad_compute` support
-**Files:** `experimental/module.py`, `mcore_fsdp_adapter.py`
-
-- Add `skip_backward_callback` parameter to `fully_shard()` / `_register_hooks()`
-- Wire from adapter when `config.delay_wgrad_compute`
-
-### Phase 6 — Activation recomputation guard
-**File:** `experimental/module.py`
-
-- Add `_training_state` flag to skip `reshard_parameters()` during recompute
-
----
-
-## 6. Files Touched
-
-| File | Phase | Change |
-|---|---|---|
-| `experimental/module.py` | 1, 3, 5, 6 | Public APIs, fine-grained hooks, skip_backward_callback, recompute guard |
-| `experimental/fully_shard.py` | 1, 3, 5 | New params, hook registration, release callables |
-| `experimental/__init__.py` | 1 | New public exports |
-| `mcore_fsdp_adapter.py` | 3, 4, 5 | Wire fine_grained/skip_backward, add no_sync, remove validation gate |
-| `megatron_fsdp/utils.py` | 2 | Extend `find_megatron_fsdp()` |
-| `combined_1f1b.py` | — | No changes needed |
-| `model_chunk_schedule_plan.py` | — | No changes needed |
-
----
-
-## 7. Edge Cases
-
-### 7.1 Activation recomputation with overlap
-
-When activation recomputation overlaps with backward, the forward pass
-reconstructs activations that are still needed by the ongoing backward.
-`post_forward()` must NOT reshard parameters during recompute (they're still
-needed).  Add a training-state flag to `FsdpContext`:
-
-```python
-ctx.is_recompute = False  # set by the schedule or autograd
-```
-
-In `post_forward()`:
-```python
-if ctx.is_recompute:
-    return  # skip reshard
-module.reshard_parameters()
-```
-
-### 7.2 Interleaved pipeline parallelism + EP overlap
-
-Not supported with FSDP in the current schedule.  The schedule explicitly
-rejects multi-chunk models with EP overlap (`combined_1f1b.py:317-321`).
-No additional validation needed in the experimental API.
-
-### 7.3 `fsdp_double_buffer` incompatibility
+### 5.3 `fsdp_double_buffer` incompatibility
 
 Double buffering is incompatible with per-sub-module parameter management.
 The experimental API does not implement double buffering, so no additional
@@ -501,7 +431,7 @@ validation needed.
 
 ---
 
-## 8. Reference — v1 Contract
+## 6. Reference — v1 Contract
 
 For context, here is the exact v1 API contract that the schedule calls:
 
