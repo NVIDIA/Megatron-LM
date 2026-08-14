@@ -965,7 +965,7 @@ class TestRLUtils:
         assert rl_utils.calculate_grpo_advantages([[0, 0]], [[0, 0]]) == []
 
     def test_advantage_shape_mismatch_raises(self):
-        with pytest.raises(AssertionError, match="matching shapes"):
+        with pytest.raises(AssertionError, match="matching shape"):
             rl_utils.calculate_grpo_advantages([[1.0, 0.0]], [[1, 1, 1]])
 
     @pytest.mark.parametrize(
@@ -1784,7 +1784,7 @@ class TestRLUtils:
         rollout_table = next(
             c for c in writer.Table.call_args_list if "traj_length" in c.kwargs.get("columns", [])
         )
-        assert rollout_table.kwargs["data"] == [(1.0, 3, 2, 2, 2, 1, 1)]
+        assert rollout_table.kwargs["data"] == [(1.0, 3, 2, 2, 2, 1, 1, 'ok', None)]
 
         # A window where nothing joined emits no staleness/eviction metrics at all.
         metrics = rl_utils.prep_wandb_metrics(
