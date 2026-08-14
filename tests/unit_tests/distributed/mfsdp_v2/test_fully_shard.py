@@ -977,7 +977,7 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
 
 
 def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, monkeypatch):
-    """Optimizer model-weight sync should run once per group, not once per microbatch."""
+    """Optimizer synchronization should run once per group, not once per microbatch."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
