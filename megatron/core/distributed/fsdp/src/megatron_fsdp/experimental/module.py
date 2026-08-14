@@ -464,6 +464,9 @@ class FsdpModule:
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
         self.phase = FsdpModule.Phase.RESTING
+        # 1F1B cooldown can run consecutive backward passes without an intervening
+        # pre_forward(), so reset the hook counter as soon as this pass is finalized.
+        self._num_ready_grad_parameters = 0
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
