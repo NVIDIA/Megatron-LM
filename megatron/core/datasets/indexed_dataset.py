@@ -980,7 +980,7 @@ class IndexedDatasetBuilder(object):
     def add_documents(
         self,
         documents: ak.Array,
-        modes: Optional[List[int]] = None
+        modes: Optional[List[int]] = None,
     ) -> None:
         """Add a list of documents to the dataset in a single batched write
 
@@ -1002,8 +1002,7 @@ class IndexedDatasetBuilder(object):
         self.document_indices.extend((offset + numpy.cumsum(doc_lengths)).tolist())
 
         if self.multimodal:
-            flat_modes = numpy.asarray(modes) if modes is not None else numpy.zeros(len(doc_lengths), dtype=int)
-            self.sequence_modes.extend(flat_modes.tolist())
+            self.sequence_modes.extend(modes if modes is not None else [0] * len(doc_lengths))
 
     def end_document(self) -> None:
         """Finalize the document, for use with IndexedDatasetBuilder.add_item"""

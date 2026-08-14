@@ -32,15 +32,12 @@ def get_args():
                        help='space separate listed of keys to extract from json')
     group.add_argument('--output-prefix', type=str, required=True,
                        help='Path to binary output file without suffix')
-    group.add_argument('--log-interval', type=int, required=False, default=10000,
-                       help='Interval to log the progress')
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
     args = parser.parse_args()
     args.keep_empty = False
 
-    # some default/dummy values for the tokenizer
-    args.use_gigatoken = True
+    # Some default/dummy values for the tokenizer
     args.rank = 1
     args.make_vocab_size_divisible_by = 128
     args.tensor_model_parallel_size = 1
@@ -50,21 +47,32 @@ def get_args():
 
 
 def process_key(args, key, level):
-    tokenizer = build_tokenizer(args)  # each process needs its own tokenizer
+    print("Processing key: {} for {}...".format(key, args.input))
+    tokenizer = build_tokenizer(args)
 
+    # Encode file
+    print("Tokenizing file...")
     encoded_docs = tokenizer.tokenize_files(args.input, key)
 
+    # bin/idx file names
     bin_file = "{}_{}_{}.bin".format(args.output_prefix, key, level)
     idx_file = "{}_{}_{}.idx".format(args.output_prefix, key, level)
 
+    # Create an IndexedDatasetBuilder
     builder = indexed_dataset.IndexedDatasetBuilder(
         bin_file,
         dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
     )
-    print("Tokenization is finished")
 
+    # Append EOD token
+    if args.append_eod:
+        print("Appending EOD token...")
+        eod_column = ak.singletons(ak.Array(numpy.full(len(encoded_docs), tokenizer.eod, dtype=encoded_docs.type)))
+        encoded_docs = ak.concatenate([encoded_docs, eod_column], axis=1)
+
+    # Add encoded documents to the IndexedDataset
+    print("Adding encoded documents to IndexedDataset...")
     builder.add_documents(encoded_docs)
-
     builder.finalize(idx_file)
 
 
@@ -83,4 +91,4 @@ if __name__ == '__main__':
     end_time = time.perf_counter()
 
     elapsed_time = end_time - start_time
-    print(f"Elapsed time: {elapsed_time:.2f} seconds")
+    print(f"Data preprocessing is finished. Elapsed time: {elapsed_time:.2f} seconds")
