@@ -594,7 +594,13 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                             else:
-                                opt.initialize_state(p)
+                                # TE >= 2.1.0.dev0 (the same versions that accept the
+                                # store_param_remainders kwarg above) requires it as a
+                                # positional arg here as well.
+                                if is_te_min_version("2.1.0.dev0"):
+                                    opt.initialize_state(p, config.store_param_remainders)
+                                else:
+                                    opt.initialize_state(p)
 
         elif config.optimizer == 'lion':
             if not HAVE_EMERGING_OPTIMIZERS:

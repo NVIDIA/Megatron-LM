@@ -382,6 +382,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         shard_float16_groups = []
         shard_fp32_groups = []
         shard_fp32_from_float16_groups = []
+        shard_fp32_from_float16_cpu_buffers = []
+        init_mcore_master_weights_on_cpu = (
+            config.offload_optimizer_states
+            and config.offload_optimizer_states_chunk_numel > 0
+            and not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        )
 
         # Allocate (or slice) each group's param shard.
         for group_range in opt_group_ranges:
@@ -392,11 +398,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             shard_float16_params_this_group = []
             shard_fp32_params_this_group = []
             shard_fp32_from_float16_params_this_group = []
+            shard_fp32_from_float16_cpu_buffers_this_group = []
             model_float16_groups.append(model_float16_params_this_group)
             model_fp32_groups.append(model_fp32_params_this_group)
             shard_float16_groups.append(shard_float16_params_this_group)
             shard_fp32_groups.append(shard_fp32_params_this_group)
             shard_fp32_from_float16_groups.append(shard_fp32_from_float16_params_this_group)
+            if init_mcore_master_weights_on_cpu:
+                shard_fp32_from_float16_cpu_buffers.append(
+                    shard_fp32_from_float16_cpu_buffers_this_group
+                )
 
             for model_param in group_range["params"]:
 
@@ -428,29 +439,69 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     # Generate main param.
                     if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                        shard_main_param_cpu = None
                         # If we use FP8 params to initialize FP32 main params (compared to using the
                         # bf16/fp16 params to initialize the main params), there will be a loss of
                         # precision at the beginning of training (this problem will not occur if the
                         # training is long enough or if the main params are loaded from a
                         # checkpoint).
-                        if cls._is_distopt_quantized_param(model_param) or is_nvfp4tensor(
-                            model_param
-                        ):
-                            if hasattr(model_param, 'get_high_precision_init_val'):
-                                shard_main_param = (
-                                    model_param.get_high_precision_init_val()
-                                    .view(-1)[param_range.start : param_range.end]
-                                    .clone()
-                                    .to(model_param.device)
-                                    .float()
-                                )
-                                model_param.clear_high_precision_init_val()
+                        if init_mcore_master_weights_on_cpu:
+                            if cls._is_distopt_quantized_param(model_param) or is_nvfp4tensor(
+                                model_param
+                            ):
+                                if hasattr(model_param, 'get_high_precision_init_val'):
+                                    init_val = model_param.get_high_precision_init_val()
+                                    source_shard = init_val.view(-1)[
+                                        param_range.start : param_range.end
+                                    ]
+                                    model_param.clear_high_precision_init_val()
+                                else:
+                                    source_shard = model_param.float().view(-1)[
+                                        param_range.start : param_range.end
+                                    ]
                             else:
-                                shard_main_param = model_param.float().view(-1)[
-                                    param_range.start : param_range.end
-                                ]
+                                source_shard = shard_model_param
+                            shard_main_param_cpu = torch.empty(
+                                source_shard.size(),
+                                dtype=torch.float32,
+                                layout=source_shard.layout,
+                                device='cpu',
+                                pin_memory=True,
+                            )
+                            shard_main_param_cpu.copy_(source_shard)
+                            shard_main_param = torch.empty(
+                                source_shard.size(), dtype=torch.float32, device=model_param.device
+                            )
+                            shard_main_param.untyped_storage().resize_(0)
+                            shard_fp32_from_float16_cpu_buffers_this_group.append(
+                                shard_main_param_cpu
+                            )
                         else:
-                            shard_main_param = shard_model_param.clone().float()
+                            if cls._is_distopt_quantized_param(model_param) or is_nvfp4tensor(
+                                model_param
+                            ):
+                                if hasattr(model_param, 'get_high_precision_init_val'):
+                                    shard_main_param = (
+                                        model_param.get_high_precision_init_val()
+                                        .view(-1)[param_range.start : param_range.end]
+                                        .clone()
+                                        .to(model_param.device)
+                                        .float()
+                                    )
+                                    model_param.clear_high_precision_init_val()
+                                else:
+                                    shard_main_param = model_param.float().view(-1)[
+                                        param_range.start : param_range.end
+                                    ]
+                            else:
+                                shard_main_param = shard_model_param.clone().float()
+
+                        if shard_main_param_cpu is not None:
+                            tensor_parallel.copy_tensor_model_parallel_attributes(
+                                shard_main_param_cpu, model_param
+                            )
+                            if hasattr(model_param, 'shared'):
+                                shard_main_param_cpu.shared = model_param.shared
 
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
@@ -506,6 +557,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             shard_float16_groups,
             shard_fp32_groups,
             shard_fp32_from_float16_groups,
+            shard_fp32_from_float16_cpu_buffers,
         )
 
     @staticmethod
@@ -782,6 +834,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_float16_groups,
             self.shard_fp32_groups,
             self.shard_fp32_from_float16_groups,
+            self.shard_fp32_from_float16_cpu_buffers,
         ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
@@ -796,6 +849,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         if self.config.offload_optimizer_states:
             self._state_offloader = OptimizerStateOffloader(self)
+            if self.shard_fp32_from_float16_cpu_buffers:
+                self._state_offloader.initialize_offloaded_mcore_master_weights(
+                    self.shard_fp32_from_float16_cpu_buffers
+                )
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
@@ -1076,6 +1133,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Return a dict containing the main param and optimizer states corresponding to the input
         model_param.
 
+        If optimizer states are offloaded to CPU, the offloaded tensors are returned as
+        their CPU copies directly, so checkpoint save never re-materializes the full
+        optimizer state on GPU.
+
         The structure of the returned dict:
         tensors = {
             "param": torch.Tensor
@@ -1086,9 +1147,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         group_index, group_order = self.model_param_group_index_map[model_param]
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
+            offloaded = self._offloaded_states_for_read(sharded_model_param)
             tensors = {}
             for k in self.optimizer.state[sharded_model_param]:
                 if not isinstance(self.optimizer.state[sharded_model_param][k], torch.Tensor):
+                    continue
+                if k in offloaded:
+                    cpu_tensor = offloaded[k]
+                    # Mirror get_unscaled_state(): bf16 states are checkpointed as fp32.
+                    tensors[k] = (
+                        cpu_tensor.float() if cpu_tensor.dtype == torch.bfloat16 else cpu_tensor
+                    )
                     continue
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
                     tensors[k] = self.optimizer.state[sharded_model_param][k]
@@ -1098,11 +1167,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             tensors["param"] = tensors.pop("master_param")
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
+            offloaded = self._offloaded_states_for_read(main_param)
             optim_state = self.optimizer.state[main_param]
-            tensors = {"param": main_param}
+            tensors = {
+                "param": offloaded.get(OptimizerStateOffloader.MASTER_WEIGHT_KEY, main_param)
+            }
             for k, v in optim_state.items():
                 if isinstance(v, torch.Tensor):
-                    tensors[k] = v
+                    tensors[k] = offloaded.get(k, v)
         return tensors
 
     @staticmethod
@@ -1179,6 +1251,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return expanded_model_params, expanded_shard_main_params, expanded_start_offsets
 
+    def _reload_offloaded_optimizer_states_for_state_dict(self):
+        if self._state_offloader is None:
+            return
+        self._state_offloader.reload()
+        self._state_offloader.sync_pending_h2d()
+
+    def _offloaded_states_for_read(self, main_param):
+        """CPU copies of main_param's offloaded states for checkpoint save."""
+        if self._state_offloader is None:
+            return {}
+        return self._state_offloader.get_offloaded_states_for_read(main_param)
+
     def _set_main_param_and_optimizer_states(self, model_param, tensors):
         """Set the main param and optimizer states corresponding to the input model_param.
 
@@ -1189,6 +1273,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             "exp_avg_sq": torch.Tensor
         }
         """
+        self._reload_offloaded_optimizer_states_for_state_dict()
         group_index, group_order = self.model_param_group_index_map[model_param]
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
@@ -2875,6 +2960,59 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             model_chunk.zero_grad_buffer()
         self._copy_main_params_to_param_buffer()
 
+    def _copy_main_params_to_model_params_for_params(
+        self, params: List[torch.Tensor], copy_fp8_params: bool = True
+    ):
+        """Copy selected main params to model params after a chunked optimizer step."""
+        if self.is_stub_optimizer or self.ddp_config.use_megatron_fsdp:
+            return
+
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            return
+
+        param_ids = {id(param) for param in params}
+        if copy_fp8_params:
+            fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8 = (
+                self._get_fp8_params_and_shard_fp32_from_fp8()
+            )
+            fp8_triplets = [
+                (model_param, shard_main_param, offset)
+                for model_param, shard_main_param, offset in zip(
+                    fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
+                )
+                if shard_main_param is not None and id(shard_main_param) in param_ids
+            ]
+            if fp8_triplets:
+                raise RuntimeError(
+                    "Chunked optimizer-state offload does not support per-chunk FP8 "
+                    "param copy when fp8_param_gather is disabled. Enable "
+                    "fp8_param_gather for FP8 primary weights, or use the non-chunked "
+                    "optimizer copy path."
+                )
+
+        def copy_group_params(shard_main_groups, model_groups):
+            for shard_main_group, model_group in zip(shard_main_groups, model_groups):
+                for shard_main_param, model_param in zip(shard_main_group, model_group):
+                    if id(shard_main_param) not in param_ids or (
+                        self._is_distopt_quantized_param(model_param) or is_nvfp4tensor(model_param)
+                    ):
+                        continue
+
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    world_range = param_range_map["gbuf_world_in_bucket"]
+                    assert world_range.size == shard_main_param.nelement()
+
+                    gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
+                    model_param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
+
+                    shard_model_param = model_param_buffer.view(-1)[
+                        world_range.start : world_range.end
+                    ]
+                    shard_model_param.data.copy_(shard_main_param)
+
+        copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
+        copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
+
     def _copy_main_params_to_param_buffer(self):
         """
         This function is only used for MXFP8 params.
@@ -3100,6 +3238,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 state_dict
             )
 
+        if (
+            self._state_offloader is not None
+            and self._state_offloader._offloaded_mcore_master_weights
+        ):
+            assert state_dict is not None and model_param_to_state_dict_param_map is not None, (
+                "Cannot initialize offloaded main params from live model params. "
+                "Use --load-main-params-from-ckpt when optimizer state offload is enabled "
+                "and optimizer state is not loaded from the checkpoint."
+            )
+            self._copy_model_params_to_offloaded_main_params(
+                model_param_to_state_dict_param_map=model_param_to_state_dict_param_map
+            )
+            return
+
         # Utility method for copying group params.
         def copy_group_params(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
@@ -3112,6 +3264,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     if state_dict is not None:
                         # Use param from state_dict to initialize main_param
                         model_param = model_param_to_state_dict_param_map[model_param]
+                        assert not self.ddp_config.fp8_param_gather or not (
+                            self._is_distopt_quantized_param(model_param)
+                            or is_nvfp4tensor(model_param)
+                        ), (
+                            "fp8_param_gather must initialize master params from high-precision "
+                            "checkpoint tensors, not quantized checkpoint/model tensors."
+                        )
 
                     if self._is_distopt_quantized_param(model_param):
                         if self._is_grouped_quantized_tensor(model_param):
@@ -3130,6 +3289,202 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Copy model groups to shard groups.
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
+
+    def _copy_model_params_to_offloaded_main_params(self, model_param_to_state_dict_param_map):
+        chunk_numel = self.config.offload_optimizer_states_chunk_numel
+
+        def copy_one_param(model_param, shard_main_param):
+            param_range_map = self._get_model_param_range_map(model_param)
+            param_range = param_range_map["param"]
+            assert param_range.size == shard_main_param.nelement()
+
+            source_param = model_param_to_state_dict_param_map[model_param]
+
+            assert not self.ddp_config.fp8_param_gather or not self._is_distopt_quantized_param(
+                source_param
+            ), (
+                "fp8_param_gather must initialize master params from high-precision "
+                "checkpoint tensors, not FP8 checkpoint/model tensors."
+            )
+
+            if self._is_distopt_quantized_param(source_param):
+                if self._is_grouped_quantized_tensor(source_param):
+                    dequantized_source_param = source_param.float()
+                else:
+                    dequantized_source_param = dequantize_fp8_tensor(source_param)
+                shard_model_param = dequantized_source_param.view(-1)[
+                    param_range.start : param_range.end
+                ]
+            else:
+                shard_model_param = source_param.view(-1)[param_range.start : param_range.end]
+            shard_main_param.data.copy_(shard_model_param)
+
+        def flush_chunk(chunk):
+            if not chunk:
+                return
+            shard_main_params = [shard_main_param for _, shard_main_param in chunk]
+            self._state_offloader.reload_master_weights_for_params(shard_main_params)
+            for model_param, shard_main_param in chunk:
+                copy_one_param(model_param, shard_main_param)
+            self._state_offloader.offload_initialized_states_for_params(
+                shard_main_params, offload_optimizer_states=False, offload_master_weights=True
+            )
+
+        chunk = []
+        chunk_size = 0
+        for model_group, shard_main_group in zip(
+            self.model_float16_groups, self.shard_fp32_from_float16_groups
+        ):
+            for model_param, shard_main_param in zip(model_group, shard_main_group):
+                if shard_main_param is None:
+                    continue
+                if (
+                    chunk_numel > 0
+                    and chunk
+                    and chunk_size + shard_main_param.numel() > chunk_numel
+                ):
+                    flush_chunk(chunk)
+                    chunk = []
+                    chunk_size = 0
+                chunk.append((model_param, shard_main_param))
+                chunk_size += shard_main_param.numel()
+        flush_chunk(chunk)
+
+        for model_group, shard_main_group in zip(self.model_fp32_groups, self.shard_fp32_groups):
+            for model_param, shard_main_param in zip(model_group, shard_main_group):
+                copy_one_param(model_param, shard_main_param)
+
+    @staticmethod
+    def _copy_optimizer_step_value(step):
+        if isinstance(step, torch.Tensor):
+            return step.clone()
+        return step
+
+    @staticmethod
+    def _iter_chunks_by_numel(items, numel_fn, chunk_numel):
+        current_chunk = []
+        current_numel = 0
+
+        for item in items:
+            item_numel = numel_fn(item)
+            if current_chunk and current_numel + item_numel > chunk_numel:
+                yield current_chunk
+                current_chunk = []
+                current_numel = 0
+            current_chunk.append(item)
+            current_numel += item_numel
+
+        if current_chunk:
+            yield current_chunk
+
+    def _iter_optimizer_param_chunks(self, params: List[torch.Tensor]):
+        yield from self._iter_chunks_by_numel(
+            params, lambda param: param.numel(), self.config.offload_optimizer_states_chunk_numel
+        )
+
+    def _use_chunked_optimizer_state_reload(self) -> bool:
+        return (
+            self._state_offloader is not None
+            and self.config.offload_optimizer_states_chunk_numel > 0
+            and not self.is_stub_optimizer
+        )
+
+    def _copy_main_params_after_chunked_optimizer_step(
+        self, params: List[torch.Tensor], copy_fp8_params: bool = True
+    ):
+        assert not self.config.reuse_grad_buf_for_mxfp8_param_ag, (
+            "Chunked optimizer-state offload does not support "
+            "reuse_grad_buf_for_mxfp8_param_ag. This feature is intended for MXFP8 "
+            "param all-gather and needs a separate chunked param-buffer copy path."
+        )
+        self._copy_main_params_to_model_params_for_params(params, copy_fp8_params=copy_fp8_params)
+
+    def _iter_fp8_param_copy_chunks(self):
+        fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8 = (
+            self._get_fp8_params_and_shard_fp32_from_fp8()
+        )
+        yield from self._iter_chunks_by_numel(
+            zip(fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8),
+            lambda entry: entry[0].numel(),
+            self.config.offload_optimizer_states_chunk_numel,
+        )
+
+    def _copy_fp8_params_after_chunked_optimizer_step(self):
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            # FusedAdam updates the fp8 model params in-kernel during the chunked step, so there
+            # is nothing to copy here (mirrors the non-chunked _copy_main_params_to_model_params).
+            return
+        if not self.ddp_config.fp8_param_gather:
+            return
+
+        for fp8_chunk in self._iter_fp8_param_copy_chunks():
+            shard_main_params = [shard_main_param for _, shard_main_param, _ in fp8_chunk]
+            params_to_reload = [
+                shard_main_param
+                for shard_main_param in shard_main_params
+                if isinstance(shard_main_param, torch.Tensor)
+            ]
+            self._state_offloader.reload_master_weights_for_params(params_to_reload)
+
+            model_params = []
+            expanded_shard_main_params = []
+            expanded_offsets = []
+            for model_param, shard_main_param, offset in fp8_chunk:
+                expanded_model_params, expanded_masters, expanded_starts = (
+                    self._expand_quantized_param_shard_for_cast(
+                        model_param, shard_main_param, offset
+                    )
+                )
+                model_params.extend(expanded_model_params)
+                expanded_shard_main_params.extend(expanded_masters)
+                expanded_offsets.extend(expanded_starts)
+
+            quantize_param_shard(
+                model_params, expanded_shard_main_params, expanded_offsets, self.data_parallel_group
+            )
+
+            self._state_offloader.offload_initialized_states_for_params(
+                params_to_reload, offload_optimizer_states=False, offload_master_weights=True
+            )
+
+    def _optimizer_step_with_chunked_state_reload(self, reload_optimizer_states: bool):
+        """Run the inner optimizer step in chunks while keeping Adam states offloaded."""
+        original_param_groups = self.optimizer.param_groups
+        next_steps = {}
+
+        try:
+            for group_index, group in enumerate(original_param_groups):
+                starting_step = self._copy_optimizer_step_value(group.get("step", None))
+                group_next_step = None
+
+                for chunk in self._iter_optimizer_param_chunks(group["params"]):
+                    chunk_group = group.copy()
+                    chunk_group["params"] = chunk
+                    if starting_step is None:
+                        chunk_group.pop("step", None)
+                    else:
+                        chunk_group["step"] = self._copy_optimizer_step_value(starting_step)
+
+                    self._state_offloader.reload_master_weights_for_params(chunk)
+                    if reload_optimizer_states:
+                        self._state_offloader.reload_optimizer_states_for_params(chunk)
+                    self.optimizer.param_groups = [chunk_group]
+                    self.optimizer.step()
+                    group_next_step = self._copy_optimizer_step_value(chunk_group.get("step", None))
+                    self._copy_main_params_after_chunked_optimizer_step(
+                        chunk, copy_fp8_params=not self.ddp_config.fp8_param_gather
+                    )
+                    self._state_offloader.offload_initialized_states_for_params(
+                        chunk, offload_master_weights=True
+                    )
+
+                if group_next_step is not None:
+                    next_steps[group_index] = group_next_step
+        finally:
+            self.optimizer.param_groups = original_param_groups
+
+        for group_index, next_step in next_steps.items():
+            original_param_groups[group_index]["step"] = next_step
 
     def start_param_sync_for_bucket_group_subset(self) -> None:
         """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
@@ -3167,7 +3522,29 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         if self._state_offloader is not None:
             self._state_offloader.sync_before_step()
-        update_successful = super().step_with_ready_grads()
+        use_incremental_state_init = (
+            self._use_chunked_optimizer_state_reload()
+            and not self._state_offloader._optimizer_states_initialized
+        )
+        use_chunked_state_reload = (
+            self._use_chunked_optimizer_state_reload()
+            and self._state_offloader._optimizer_states_initialized
+        )
+
+        if use_incremental_state_init or use_chunked_state_reload:
+            timers = self.config.timers
+            if timers is not None:
+                timers('optimizer-inner-step', log_level=1).start(
+                    barrier=self.config.barrier_with_L1_time
+                )
+            self._optimizer_step_with_chunked_state_reload(use_chunked_state_reload)
+            self._copy_fp8_params_after_chunked_optimizer_step()
+            if timers is not None:
+                timers('optimizer-inner-step').stop()
+
+            update_successful = True
+        else:
+            update_successful = super().step_with_ready_grads()
 
         should_sync_params = not self.ddp_config.overlap_param_gather and not getattr(
             self, '_defer_param_sync', False
@@ -3204,9 +3581,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self._state_offloader.offload()
 
     def reload_offloaded_states(self):
-        """Start async reload of offloaded states."""
-        if self._state_offloader is not None:
+        """Start async reload of offloaded states.
+
+        In chunked mode the reload is deferred: the optimizer step reloads master weights and
+        states per chunk instead.
+        """
+        if self._state_offloader is not None and not self._use_chunked_optimizer_state_reload():
             self._state_offloader.reload()
+
+    def on_step_skipped(self):
+        """Synchronize any pending offloaded-state reload before skipping an update."""
+        if self._state_offloader is not None:
+            self._state_offloader.sync_pending_h2d()
 
     def release_offloaded_gpu_states(self):
         """Release GPU memory after D2H completes. For delayed release case."""

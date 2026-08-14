@@ -24,6 +24,7 @@ import torch
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
+from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
@@ -35,6 +36,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
+from megatron.core.fp8_utils import dequantize_fp8_tensor, is_float8tensor
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
@@ -1483,6 +1485,8 @@ def _load_global_dist_base_checkpoint(
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
+    if _should_load_fp8_skeleton_on_cpu(args):
+        _replace_fp8_skeleton_data_with_cpu_placeholders(sharded_state_dict)
     state_dict = dist_checkpointing.load(
         sharded_state_dict,
         checkpoint_name,
@@ -1492,6 +1496,27 @@ def _load_global_dist_base_checkpoint(
         verify_integrity=args.verify_integrity,
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
+
+
+def _should_load_fp8_skeleton_on_cpu(args):
+    return (
+        getattr(args, 'offload_optimizer_states', False)
+        and getattr(args, 'fp8_param_gather', False)
+        and getattr(args, 'load_main_params_from_ckpt', False)
+        and (getattr(args, 'no_load_optim', False) or getattr(args, 'finetune', False))
+    )
+
+
+def _replace_fp8_skeleton_data_with_cpu_placeholders(sharded_state_dict):
+    """Move FP8 load targets to CPU to avoid a full-model GPU dequantization peak."""
+    for value in nested_values(sharded_state_dict):
+        if hasattr(value, "data") and is_float8tensor(value.data):
+            dtype = getattr(value, "dtype", value.data.dtype)
+            placeholder = torch.empty(tuple(value.data.shape), dtype=dtype, device="cpu")
+            placeholder.copy_(dequantize_fp8_tensor(value.data))
+            value.data = placeholder
+            if hasattr(value, "dtype"):
+                value.dtype = placeholder.dtype
 
 
 def _get_checkpoint_format(checkpoint_name, args):
@@ -2259,6 +2284,16 @@ def load_checkpoint(
                     update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format,
                 )
 
+            if getattr(args, 'offload_optimizer_states', False) and optimizer is not None:
+                for optim_instance in getattr(optimizer, 'chained_optimizers', []):
+                    state_offloader = getattr(optim_instance, '_state_offloader', None)
+                    if state_offloader is not None and any(
+                        'exp_avg' in state for state in optim_instance.optimizer.state.values()
+                    ):
+                        state_offloader.mark_optimizer_states_initialized()
+                        optim_instance.offload_states()
+                        optim_instance.release_offloaded_gpu_states()
+
             # Load scheduler.
             if opt_param_scheduler is not None:
                 if 'lr_scheduler' in state_dict:  # backward compatbility
@@ -2275,6 +2310,13 @@ def load_checkpoint(
             raise e
     else:
         if (args.fp16 or args.bf16) and optimizer is not None:
+            if getattr(args, 'offload_optimizer_states', False) and (
+                args.no_load_optim or args.finetune
+            ):
+                assert args.load_main_params_from_ckpt, (
+                    "--offload-optimizer-states without optimizer state requires "
+                    "--load-main-params-from-ckpt"
+                )
             if args.load_main_params_from_ckpt:
                 optimizer.reload_model_params(state_dict=state_dict)
             else:

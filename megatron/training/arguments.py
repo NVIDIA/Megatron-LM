@@ -1979,7 +1979,9 @@ def validate_args(args, defaults={}):
             )
 
     if args.load_main_params_from_ckpt:
-        assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
+        assert (
+            args.no_load_optim or args.finetune
+        ), '--load-main-params-from-ckpt must be used with --no-load-optim or --finetune.'
 
     if args.use_dist_ckpt and args.async_save:
         if not args.use_persistent_ckpt_worker:
@@ -2049,6 +2051,45 @@ def validate_args(args, defaults={}):
         assert (
             not args.use_megatron_fsdp
         ), "offload_optimizer_states does not support Megatron-FSDP for now."
+        assert not args.optimizer_cuda_graph, (
+            "offload_optimizer_states releases and reallocates optimizer-state "
+            "storage between steps; a CUDA-graph-captured optimizer step would "
+            "replay on freed pointers."
+        )
+        assert not args.rl_offload_optimizer_during_inference, (
+            "offload_optimizer_states is incompatible with "
+            "rl_offload_optimizer_during_inference, which reads optimizer state "
+            "directly and would touch offload-released storage."
+        )
+        assert not args.optimizer_cpu_offload, (
+            "offload_optimizer_states is incompatible with optimizer_cpu_offload "
+            "(HybridDeviceOptimizer); pick one."
+        )
+        assert not args.async_save, (
+            "offload_optimizer_states serves checkpoint saves from the offloaded CPU "
+            "copies; an async writer would race the next step's offloads overwriting "
+            "those same CPU buffers."
+        )
+        if (args.no_load_optim or args.finetune) and (
+            args.load is not None or args.pretrained_checkpoint is not None
+        ):
+            if not args.load_main_params_from_ckpt:
+                args.load_main_params_from_ckpt = True
+                print(
+                    'Warning: enabling --load-main-params-from-ckpt because '
+                    '--offload-optimizer-states is used without loading optimizer state.'
+                )
+        assert (
+            args.offload_optimizer_states_chunk_numel >= 0
+        ), "offload_optimizer_states_chunk_numel must be non-negative"
+        if args.offload_optimizer_states_chunk_numel > 0:
+            assert not args.reuse_grad_buf_for_mxfp8_param_ag, (
+                "chunked offload_optimizer_states does not support "
+                "reuse_grad_buf_for_mxfp8_param_ag"
+            )
+            assert not args.fp4_param_gather, (
+                "chunked offload_optimizer_states does not support fp4_param_gather"
+            )
 
     if args.non_persistent_ckpt_type == "local":
         assert (
@@ -3751,6 +3792,14 @@ def _add_training_args(parser):
         'Only support TE FusedAdam optimizer.'
         'Note that this still uses pure GPU optimizer instead of '
         'HybridDeviceOptimizer for --optimizer-cpu-offload.',
+    )
+    group.add_argument(
+        '--offload-optimizer-states-chunk-numel',
+        type=int,
+        default=0,
+        help='If positive, run each offloaded optimizer step in chunks of at '
+        'most this many local parameter elements (a larger parameter forms its '
+        'own chunk). If 0, fully reload states for each step.',
     )
     group.add_argument(
         '--dataloader-type',

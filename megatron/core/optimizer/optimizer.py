@@ -158,6 +158,10 @@ class MegatronOptimizer(ABC):
         self.config = config
         self.init_state_fn = init_state_fn
 
+    def on_step_skipped(self):
+        """Hook for subclasses that need cleanup when a step is skipped."""
+        return
+
     def get_parameters(self) -> List[torch.nn.Parameter]:
         """
         Get list of parameters wrapped in optimizer.
@@ -747,6 +751,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
+            self.on_step_skipped()
             return False, None, None
 
         # Clip the main gradients.
@@ -1145,6 +1150,7 @@ class FP32Optimizer(MegatronOptimizer):
 
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
+            self.on_step_skipped()
             return False, None, None
 
         # Clip gradients.
@@ -1704,6 +1710,8 @@ class ChainedOptimizer(MegatronOptimizer):
         self.grad_norms_by_group = {}
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
+            for optimizer in self.chained_optimizers:
+                optimizer.on_step_skipped()
             return False, None, None
 
         grad_norm = self.get_grad_norm()

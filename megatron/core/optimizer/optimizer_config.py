@@ -372,6 +372,14 @@ class OptimizerConfig:
     """
     If True, offload optimizer states to CPU after each optimizer step and
     reload them before the next optimizer step.
+    Checkpoint save temporarily reloads all offloaded states back to GPU.
+    """
+
+    offload_optimizer_states_chunk_numel: int = 0
+    """
+    When > 0, run each offloaded optimizer step in chunks of at most this many
+    local parameter elements (reload, update, offload per chunk; a larger
+    parameter forms its own chunk). When 0, fully reload states for each step.
     """
 
     ################
@@ -488,6 +496,25 @@ class OptimizerConfig:
             assert (
                 self.exp_avg_sq_dtype == torch.float32
             ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
+
+        if self.offload_optimizer_states:
+            assert not self.optimizer_cuda_graph, (
+                "offload_optimizer_states releases optimizer-state storage between "
+                "steps and cannot be captured by an optimizer CUDA graph"
+            )
+            # Checkpoint save reads offloaded states straight from the CPU buffers, which
+            # is byte-exact only for unscaled dtypes: TE FusedAdam stores fp16/fp8 states
+            # scaled and store_param_remainders masters as int16 remainders.
+            assert self.exp_avg_dtype in (torch.float32, torch.bfloat16) and (
+                self.exp_avg_sq_dtype in (torch.float32, torch.bfloat16)
+            ), "offload_optimizer_states requires fp32/bf16 exp_avg/exp_avg_sq dtypes"
+            if self.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                assert (
+                    self.main_params_dtype == torch.float32 and not self.store_param_remainders
+                ), (
+                    "offload_optimizer_states with TE-managed master weights requires "
+                    "main_params_dtype=fp32 and store_param_remainders=False"
+                )
 
 
 # Backward-compatible aliases (deprecated; use OptimizerConfig directly).
