@@ -440,6 +440,62 @@ class TestMuonDecoupleFP8ParamGather:
                     if isinstance(value, torch.Tensor) and value.numel() == param.numel():
                         assert value.device.type == 'cpu'
 
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    def test_pending_distopt_gather_does_not_break_next_offload_iteration(self):
+        """A speculative DistOpt gather must be safely consumed by the next iteration."""
+
+        if torch.distributed.get_world_size() < 2:
+            pytest.skip("Requires at least two data-parallel ranks")
+        if get_device_arch_version() < 10:
+            pytest.skip("MXFP8 requires Blackwell architecture or newer")
+
+        args, model, optimizer = self._build(
+            True, "mxfp8", True, chunked_optimizer_state_offload=True
+        )
+        self._run_steps(args, model, optimizer, 1)
+
+        ddp = model[0]
+        distopt = next(
+            child
+            for child in optimizer.chained_optimizers
+            if isinstance(child, DistributedOptimizer)
+        )
+
+        # Stage a valid DistOpt payload, then model the speculative successor gather
+        # that can survive the end of forward.
+        distopt._copy_main_params_to_param_buffer()
+        distopt_groups = []
+        for group in ddp.bucket_groups + ddp.expert_parallel_bucket_groups:
+            if not group.buckets or not group.buckets[0].params_list:
+                continue
+            first_param = group.buckets[0].params_list[0]
+            if not getattr(first_param, "is_managed_by_layer_wise_optimizer", False):
+                distopt_groups.append(group)
+        assert distopt_groups, "test precondition: expected a DistOpt-owned bucket group"
+
+        pending_group = distopt_groups[0]
+        ddp._start_bucket_group_param_sync(pending_group, force_sync=False)
+        assert pending_group.param_gather_handle is not None
+        assert pending_group.param_gather_dispatched
+
+        # Wait for the GPU work so the test does not intentionally race buffer writes,
+        # but retain the handle object to reproduce the pending ownership state.
+        stale_handle = pending_group.param_gather_handle
+        stale_handle.wait()
+        pending_group.finish_grad_sync()
+
+        try:
+            second_step = self._run_steps(args, model, optimizer, 1)
+        finally:
+            # Preserve the real failure while preventing the intentionally retained
+            # handle from leaking into distributed teardown.
+            if pending_group.param_gather_handle is stale_handle:
+                pending_group.param_gather_handle = None
+
+        assert all(len(values) == 1 for values in second_step)
+
     @pytest.mark.parametrize("overlap", [False, True])
     @pytest.mark.parametrize("expt_dp_gt_1", [False, True])
     @pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])

@@ -2960,6 +2960,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
         self.ensure_master_weights_for_param_sync()
         self.assert_master_weights_resident("_copy_main_params_to_param_buffer")
+
+        # A speculative next-bucket gather can still own the shared MXFP8 parameter
+        # buffer here. Finish only outstanding gathers before overwriting that buffer.
+        # force_sync consumes an existing handle without dispatching a new gather and
+        # is safe even if gradient finalization already reset the logical dispatch flag.
+        for model_chunk in self.model_chunks:
+            for bucket_group in (
+                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+            ):
+                if bucket_group.param_gather_handle is not None:
+                    model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=True)
+
         for shard_main_group, model_group in zip(
             self.shard_fp32_from_float16_groups, self.model_float16_groups
         ):
