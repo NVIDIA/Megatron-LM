@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -498,8 +499,12 @@ def align_unpacked_inference_logprobs(
     first_gen_tok = gen_masks_for_alignment.int().argmax(dim=1) - 1
 
     # Align inference logprobs with old_logprobs
-    # Note: We use old_logprobs_for_data as template since it has correct shape
-    padded_inference_logprobs = old_logprobs_for_data.clone()
+    # Note: We use old_logprobs_for_data as template since it has correct shape.
+    # Inference logprobs ride in float32, matching pack_inference_logprobs: the
+    # IS-correction ratio is precision-sensitive, and under bf16 training
+    # old_logprobs arrives bf16 while the wire logprobs are float32 — cloning
+    # the template dtype would silently downcast them in the assignment below.
+    padded_inference_logprobs = old_logprobs_for_data.clone().float()
 
     # We need to align old_logprobs and inference logprobs as the latter are only for generations
     for i, inf_logprobs in enumerate(inference_logprobs):
@@ -512,7 +517,9 @@ def align_unpacked_inference_logprobs(
         end_idx = min(first_gen_idx + len(inf_logprobs), padded_inference_logprobs.shape[1])
         actual_len = end_idx - first_gen_idx
         if actual_len > 0:
-            padded_inference_logprobs[i, first_gen_idx:end_idx] = inf_logprobs[:actual_len]
+            padded_inference_logprobs[i, first_gen_idx:end_idx] = inf_logprobs[:actual_len].to(
+                padded_inference_logprobs.dtype
+            )
 
     # Create truncated mask for statistics
     if old_logprobs_for_data.shape[1] + 1 < gen_masks_for_alignment.shape[1]:
@@ -554,9 +561,43 @@ def get_agent(env_config_path):
 _INFERENCE_INTERFACE = None
 
 
+def _eager_train_comm_warmup():
+    """Run one tiny allreduce per training process group to initialize NCCL communicators."""
+    group_getters = {
+        'dp': partial(mpu.get_data_parallel_group),
+        'dp_cp': partial(mpu.get_data_parallel_group, with_context_parallel=True),
+        'cp': mpu.get_context_parallel_group,
+        'mp': mpu.get_model_parallel_group,
+        'tp_dp_cp': partial(mpu.get_tensor_and_data_parallel_group, with_context_parallel=True),
+        'expert_dp': mpu.get_expert_data_parallel_group,
+        'expert_tp': mpu.get_expert_tensor_parallel_group,
+        'expert_mp': mpu.get_expert_model_parallel_group,
+    }
+    warmed = []
+    start = time.perf_counter()
+    for name, getter in group_getters.items():
+        try:
+            group = getter()
+        except AssertionError:
+            continue
+        if group is None:
+            continue
+        group_start = time.perf_counter()
+        dist.all_reduce(torch.zeros(1, device='cuda'), group=group)
+        torch.cuda.synchronize()
+        warmed.append(f'{name}={time.perf_counter() - group_start:.2f}s')
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f'[EagerCommWarmup] initialized NCCL communicators in '
+        f'{time.perf_counter() - start:.2f}s: {warmed}',
+    )
+
+
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
+        _eager_train_comm_warmup()
         _INFERENCE_INTERFACE = loop.run_until_complete(
             MegatronLocal.launch(
                 model[0],
@@ -1091,6 +1132,21 @@ def prep_wandb_metrics(
             failed_rollouts / total_rollouts if total_rollouts else 0.0
         ),
     }
+
+    # All-empty wave: every episode failed and was dropped (nothing to aggregate),
+    # or every surviving rollout is a zero-turn placeholder (rewards exist but the
+    # length/turn stats below would reduce over empty sequences). Keep the failure
+    # counters: they are the one signal such a wave still carries.
+    if (
+        len(advantages) == 0
+        or not rewards
+        or not any(keep for g in real_mask for keep in g)
+    ):
+        logger.warning(
+            "prep_wandb_metrics: empty wave (0 usable rollouts); "
+            "skipping rollout metrics this iteration."
+        )
+        return failure_metrics
 
     def _real(grouped):
         """Grouped per-rollout entries with placeholder (zero-turn) rollouts removed."""
@@ -2151,7 +2207,18 @@ def evaluate_and_print_results_rl(
                         tb_writer.add_scalar(k, v, iteration)
             wandb_writer = get_wandb_writer()
             if wandb_writer:
-                wandb_writer.log(eval_metrics, step=iteration)
+                if args.do_train:
+                    wandb_writer.log(eval_metrics, step=iteration)
+                else:
+                    # Without a training loop the eval may target an arbitrary (older) checkpoint,
+                    # breaking wandb step monotonicity.
+                    wandb_writer.define_metric('eval_only/*', step_metric='eval_checkpoint_iter')
+                    wandb_writer.log(
+                        {
+                            'eval_checkpoint_iter': iteration,
+                            **{f'eval_only/{k}': v for k, v in eval_metrics.items()},
+                        }
+                    )
             logger.info(
                 "Evaluation results:"
                 + "".join([f"\n\t{k}: {v:0.4f}" for k, v in eval_metrics.items()])
