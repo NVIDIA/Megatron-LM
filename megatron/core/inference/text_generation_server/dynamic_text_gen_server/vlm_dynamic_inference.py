@@ -17,21 +17,14 @@ re-exported here for backwards compatibility with older standalone callers.
 """
 
 import json
-import os
-import sys
 from functools import partial
 
-# ``examples/multimodal/model.py`` and its siblings (``config.py``,
-# ``layer_specs.py``) use bare imports like ``from config import ...``, so
-# they must be importable as top-level modules. The script that calls into
-# this module is expected to put the repo root on sys.path; we add the
-# multimodal subdirectory here so callers don't have to.
-_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-# dynamic_text_gen_server -> text_generation_server -> inference -> core -> megatron -> ROOT
-_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, *(os.path.pardir,) * 5))
-_EXAMPLES_MULTIMODAL = os.path.join(_REPO_ROOT, "examples", "multimodal")
-if _EXAMPLES_MULTIMODAL not in sys.path:
-    sys.path.append(_EXAMPLES_MULTIMODAL)
+# NOTE: ``get_model`` below does a ``from model import model_provider`` for the
+# ``examples/multimodal/model.py`` file, whose siblings use bare imports like
+# ``from config import ...``. The *caller* of this module (typically
+# ``tools/run_dynamic_text_generation_server.py``) is expected to have already
+# added the repo root and ``examples/multimodal/`` to ``sys.path`` before
+# invoking ``get_model``. ``megatron/core`` does not mutate ``sys.path`` here.
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.inference.utils import add_inference_args
