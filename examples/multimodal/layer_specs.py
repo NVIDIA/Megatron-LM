@@ -129,17 +129,27 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
 
 
 def get_hybrid_layer_spec_te(config=None, padding=False) -> ModuleSpec:
+    """Hybrid (Mamba + attention + MLP [+ MoE]) layer spec.
+
+    Args:
+        config: language-model ``TransformerConfig``. Required for MoE hybrids
+            (e.g. nemotron6-moe): the moe_layer branch reads
+            ``num_moe_experts`` / ``moe_grouped_gemm`` off it to match the
+            checkpoint's architecture. Non-MoE hybrids may pass ``None``;
+            they never traverse the moe_layer branch.
+        padding: use padding-causal attention mask (needed for context
+            parallel + sequence parallel).
+    """
     attn_mask_type = AttnMaskType.causal
     # Padding mask is needed for e.g. Context Parallel.
     if padding:
         attn_mask_type = AttnMaskType.padding_causal
 
-    # MoE expert count / grouped-GEMM come from the language model's
-    # TransformerConfig so this spec matches the checkpoint's architecture.
-    # The moe_layer branch is only used by MoE hybrid checkpoints (e.g.
-    # nemotron6-moe); non-MoE hybrids never traverse it, so a None config is
-    # fine there — assert only when it would actually be consulted.
     if config is not None:
+        assert config.num_moe_experts is not None, (
+            "get_hybrid_layer_spec_te: config.num_moe_experts must be set to "
+            "build the MoE branch of the hybrid stack."
+        )
         num_experts = config.num_moe_experts
         moe_grouped_gemm = config.moe_grouped_gemm
     else:
