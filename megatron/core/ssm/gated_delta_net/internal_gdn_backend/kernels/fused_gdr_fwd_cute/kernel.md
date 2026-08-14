@@ -1,62 +1,100 @@
-# Forward H Kernel Design Notes
+# SM100 fused GDR forward
 
-## Current Stage
+This package implements the chunked Gated Delta Rule forward path for
+Blackwell SM100 with CuTe DSL. It computes the sequence output while carrying
+the recurrent state across 64-token chunks and can materialize the auxiliary
+tensors needed by training.
 
-The correctness-first CUDA rewrite and WMMA fallback have been removed. The
-compiled entry point now routes only to the SM100 port kernel and raises for
-unsupported inputs instead of falling back.
+## Recommended usage
 
-The exposed port path supports the scalar `g` gate used by GatedDeltaNet. The
-Python wrapper accepts FLA layout `[B, T, H]` and passes contiguous port layout
-`[B, H, T]` into the extension. Unsupported input shapes still raise directly
-instead of falling back.
+Select the internal backend through `TransformerConfig`:
 
-The bwd CUTE/TMA/TMEM files have been copied into
-`csrc/ops/chunk_delta_h_fwd_sm100_bwd_port*.cuh` as the editable port scaffold.
-The compiled source is `chunk_delta_h_fwd_sm100.cu`, and it launches
-`chunk_delta_fwd_port_kernel` through the port scaffold. The scaffold's
-top-level `ParamsHost`/`ParamsBase` contract has already been changed to fwd
-tensors (`k`, `w`, `u`, optional `h0`, outputs `h`, `ht`, `v_new`).
-
-Verified in Docker on `umbriel-b200-035`:
-
-```text
-Quick correctness check PASSED
-Full correctness check PASSED
-Performance case: B=2 T=8192 H=64 K=128 V=128
-CUDA first baseline: 63.2480 ms
-FLA Triton:    0.4127 ms
-CUDA/FLA:      153.2485x
+```python
+config = TransformerConfig(..., gdn_gdr_backend="internal")
 ```
 
-The full correctness run uses smaller random input scale for long sequences
-(`T>=1024`) to avoid recurrence overflow unrelated to kernel correctness.
+`MCORE_GDN_INTERNAL_BACKEND` controls dispatch inside the internal backend:
 
-## Root Cause Fixed
+- `auto` (default) uses CuTe DSL for supported inputs and otherwise falls back
+  to FLA.
+- `cute` requires the CuTe DSL path and reports unsupported inputs as errors.
+- `fla` bypasses the CuTe DSL path.
 
-FLA stores `v_new = u - w @ h` before applying the scalar `g` gate. The gated
-value is used only for the hidden-state update. The initial CUDA baseline wrote
-the gated value to `v_new`, which failed the FLA `USE_G=True` comparison. The
-kernel and local PyTorch reference now store ungated `v_new`.
-
-For the SM100 port, `H *= exp2(g_last)` must be applied by epilogue warps that
-cover all TMEM subpartitions. Applying it only from the MMA consumer warp scales
-one subpartition and leaves the other `V` lanes stale.
-
-## Optimization Direction
-
-The original baseline performed scalar loops in one CTA per `(B,H,V tile)` and
-was expected to be far slower than FLA. The next implementation stage should
-continue replacing the mainloop with the planned SM100/CuTe dataflow:
+The production call path is:
 
 ```text
-store h_i = H
-tmp_v[V,T] = H[V,K] @ W[T,K]^T
-v_new[T,V] = u[T,V] - tmp_v[V,T]^T
-apply gate to the TMEM-bound update value, not the stored v_new
-H[V,K] += gated_v_new[V,T] @ K[K,T]^T
-store ht after the final chunk
+implementation._cutedsl_forward
+  -> chunk_gated_delta_rule_prefill_cute
+  -> cutedsl_fused_chunk_gdn_fwd_sm100
+  -> GatedDeltaNetChunkedKernel
 ```
 
-The existing tests should be kept unchanged while the CUDA implementation is
-replaced under the wrapper.
+Model code should use the configured GDN layer rather than invoking the
+launcher directly.
+
+## Supported wrapper contract
+
+`chunk_gated_delta_rule_prefill_cute` accepts packed THD tensors:
+
+- CUDA 13 or newer on an SM100 GPU.
+- Contiguous `q`, `k`, and `v` with shape `[total_tokens, heads, 128]`.
+- `q`, `k`, and `v` must share the same FP16 or BF16 dtype.
+- `g` and `beta` have shape `[total_tokens, output_heads]` and are converted
+  to contiguous FP32 tensors before launch.
+- `cu_seqlens` is required; every sequence length must be a multiple of the
+  64-token chunk size.
+- In-kernel QK L2 normalization and non-empty initial state are not supported
+  by the public Megatron wrapper.
+
+The wrapper returns the output tensor, or `(output, final_state)` when
+`output_final_state=True`. It also accepts preallocated output, `A`, final
+state, and checkpoint buffers for the training path.
+
+## Algorithm
+
+For each 64-token chunk, the kernel keeps the recurrent state `S` in TMEM and
+performs seven tensor-core GEMM stages:
+
+1. `K @ K^T` builds lower-triangular intra-chunk scores.
+2. `Q @ K^T` builds output scores.
+3. `K @ S` applies the previous state to the keys.
+4. `Q @ S` computes the inter-chunk output contribution.
+5. `A_inverse @ V` produces corrected value vectors.
+6. The scaled QK scores multiply the corrected values for the intra-chunk
+   output.
+7. `K^T @ delta` produces the recurrent-state update.
+
+The epilogue combines the intra- and inter-chunk output terms and advances the
+state using the final cumulative gate value for the chunk. When requested, the
+kernel also stores `A`, corrected values, `W`, chunk states, final state, or
+periodic state checkpoints.
+
+## SM100 execution structure
+
+The persistent kernel launches 12 warps with specialized roles:
+
+- Warps 0-3 compute gate transfer factors, score epilogues, and the
+  hierarchical triangular inverse.
+- Warps 4-7 compute state/value corrections, state updates, and output
+  epilogues.
+- Warp 8 issues the seven `tcgen05` MMA stages.
+- Warps 9-10 perform TMA loads for Q/K/V and gate/beta tensors.
+- Warp 11 stores the output epilogue.
+
+The implementation uses approximately 225.5 KB of shared memory for staged
+Q/K/V, intermediate matrices, output staging, and gate data. TMEM holds the
+FP32 recurrent state and MMA accumulators. K is double-buffered so the next
+chunk can be prefetched while the current chunk is processed.
+
+## Notes
+
+- The token dimension is dynamic, while head counts, dtypes, and optional
+  output features are part of the CuTe DSL compilation-cache key.
+- Dense BTHD inputs are flattened to packed THD layout by the Megatron adapter.
+- The adapter supplies chunk-local cumulative log2 gates to the kernel and
+  requests `A` for the backward path.
+- Native partial chunk tails are not enabled by the public wrapper; supported
+  sequence lengths are 64-token aligned.
+- This document does not record performance numbers. Benchmark results should
+  identify the exact commit, GPU, CUDA/CuTe DSL version, shape, warmup, and
+  iteration count.
