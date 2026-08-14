@@ -853,12 +853,12 @@ def test_overlaps_communication_and_compute(
         for kernel in reduce_scatter_kernels
     )
     if not use_symmetric_memory:
-        assert allgather_overlap_count >= expected_allgather_overlap_count, (
-            f"Expected at least {expected_allgather_overlap_count} all-gathers to "
+        assert allgather_overlap_count == expected_allgather_overlap_count, (
+            f"Expected exactly {expected_allgather_overlap_count} all-gathers to "
             f"overlap compute, got {allgather_overlap_count}/{len(allgather_kernels)}."
         )
-    assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap_count, (
-        f"Expected at least {expected_reduce_scatter_overlap_count} reduce-scatters to overlap "
+    assert reduce_scatter_overlap_count == expected_reduce_scatter_overlap_count, (
+        f"Expected exactly {expected_reduce_scatter_overlap_count} reduce-scatters to overlap "
         f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_kernels)}."
     )
 
