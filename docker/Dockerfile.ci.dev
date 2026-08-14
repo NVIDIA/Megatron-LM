@@ -30,8 +30,8 @@ RUN bash -ex <<"EOF"
     esac 
     wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/local/bin/yq
     chmod a+x /usr/local/bin/yq
-    curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
-    install -m 0755 /root/.local/bin/uv /usr/local/bin/uv
+    curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | \
+        env UV_UNMANAGED_INSTALL=/usr/local/bin sh
 EOF
 
 RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_nccl.sh \
@@ -129,10 +129,15 @@ ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
 ARG RUNTIME_UID=65532
 ARG RUNTIME_GID=65532
-RUN groupadd --gid "${RUNTIME_GID}" nemo-runtime && \
-    useradd --no-log-init --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
-        --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime && \
+RUN if ! getent group "${RUNTIME_GID}" >/dev/null; then \
+        groupadd --gid "${RUNTIME_GID}" nemo-runtime; \
+    fi && \
+    if ! getent passwd "${RUNTIME_UID}" >/dev/null; then \
+        useradd --no-log-init --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
+            --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime; \
+    fi && \
     install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" \
+        /home/nemo-runtime \
         /home/gitlab-runner/data/gpt3_data \
         /opt/megatron-lm \
         /tmp/regent-cache/pip \
@@ -145,17 +150,21 @@ RUN groupadd --gid "${RUNTIME_GID}" nemo-runtime && \
     find "${UV_PROJECT_ENVIRONMENT}" -type d \
         -exec chown "${RUNTIME_UID}:${RUNTIME_GID}" {} +
 
-ENV HOME=/home/nemo-runtime \
-    PIP_CACHE_DIR=/tmp/regent-cache/pip \
-    XDG_CACHE_HOME=/tmp/regent-cache/xdg \
-    UV_CACHE_DIR=/tmp/regent-cache/uv
-
 USER ${RUNTIME_UID}:${RUNTIME_GID}
 
 # The CI harness materializes an immutable test commit here rather than over
-# the dependency-build checkout in /workspace. Prove that this canonical
-# coverage path and all runtime cache roots work under the final image user.
-RUN test "$(id -u)" = "${RUNTIME_UID}" && \
+# the dependency-build checkout in /workspace. Runtime callers select this UID
+# and set HOME/cache variables explicitly; the published image remains root by
+# default. Prove that the non-root contract works before restoring that default.
+RUN export HOME=/home/nemo-runtime \
+        PIP_CACHE_DIR=/tmp/regent-cache/pip \
+        XDG_CACHE_HOME=/tmp/regent-cache/xdg \
+        UV_CACHE_DIR=/tmp/regent-cache/uv && \
+    test "$(id -u)" = "${RUNTIME_UID}" && \
+    test -w "${HOME}" && \
+    test -w "${PIP_CACHE_DIR}" && \
+    test -w "${XDG_CACHE_HOME}" && \
+    test -w "${UV_CACHE_DIR}" && \
     test -x /usr/local/bin/uv && \
     test -x /opt/venv/bin/python && \
     venv_site_packages="$(python -c 'import site; print(site.getsitepackages()[0])')" && \
@@ -167,9 +176,10 @@ RUN test "$(id -u)" = "${RUNTIME_UID}" && \
     touch /opt/megatron-lm/.nonroot-write-probe && \
     rm /opt/megatron-lm/.nonroot-write-probe
 
+USER root
+
 ##### For NVIDIANS only #####
 FROM main AS jet
-USER root
 ARG JET_API_VERSION
 ENV PATH="$PATH:/opt/jet/bin"
 RUN --mount=type=secret,id=JET_INDEX_URLS bash -ex <<"EOF"
@@ -188,7 +198,5 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=4.0" 
 EOF
 
-ARG RUNTIME_UID=65532
-ARG RUNTIME_GID=65532
-USER ${RUNTIME_UID}:${RUNTIME_GID}
+USER root
 ###
