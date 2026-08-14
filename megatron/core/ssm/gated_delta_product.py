@@ -506,17 +506,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         Static-batching prefill runs the same computation and passes conv_state and
         ssm_state so the trailing conv window and the final recurrent state are cached
-        for the decode steps. It also turns off the recompute and offload paths, which
-        only pay off when there is a backward pass to feed: the checkpoints would still
-        free their output storages and the offload group would still drive
-        PipelineOffloadManager, which is set up per training microbatch.
+        for the decode steps.
         """
-        is_prefill = conv_state is not None
-        recompute_in_proj = self.recompute_in_proj and not is_prefill
-        recompute_qkv = self.recompute_qkv and not is_prefill
-        offload_gdp_qkv = self.offload_gdp_qkv and not is_prefill
-
-        if recompute_in_proj:
+        if self.recompute_in_proj:
             # Checkpoint the input projection and its preprocessing, discard the z, VKQ,
             # and ba outputs after the forward pass, and recompute them in the backward
             # pass to save memory. Only the (much smaller) hidden_states input is kept.
@@ -544,9 +536,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # The offload group captures the tensors saved for backward inside the causal
         # conv and QKV preparation: the checkpoint's saved input VKQ when QKV recompute
         # is enabled, or the conv/QKV-prep internal saves otherwise.
-        qkv_manager = off_interface(offload_gdp_qkv, VKQ, "gdp_qkv")
+        qkv_manager = off_interface(self.offload_gdp_qkv, VKQ, "gdp_qkv")
         with qkv_manager as VKQ:
-            if recompute_qkv:
+            if self.recompute_qkv:
                 # Checkpoint the causal conv and QKV preparation, discard the
                 # query/key/value outputs after the forward pass, and recompute them
                 # in the backward pass to save memory.
@@ -576,7 +568,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         if ssm_state is not None:
             ssm_state.copy_(last_recurrent_state)
 
-        if recompute_qkv:
+        if self.recompute_qkv:
             qkv_checkpoint.discard_output_and_register_recompute(core_attn_out)
 
         y = self._postprocess(core_attn_out, z, packed_seq_params=packed_seq_params)
@@ -586,7 +578,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # hook on core_attn_out unpacks the saved conv input.
         y = qkv_manager.group_offload(y, forced_released_tensors=[])
 
-        if recompute_in_proj:
+        if self.recompute_in_proj:
             # Hook on the mixer output so the recompute runs at the very start of this
             # mixer's backward: z is needed by the output norm, and VKQ is needed by the
             # causal conv backward or by the QKV recompute hook on core_attn_out, all of
