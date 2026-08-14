@@ -722,7 +722,6 @@ def test_overlaps_communication_and_compute(
     # overlap becomes deterministic. (dim=8192 was flaky under coverage.)
     dim = 16384
     num_children = 4
-    num_microbatches = 3
     dtype = torch.bfloat16
     placements = placements_factory()
 
@@ -762,19 +761,20 @@ def test_overlaps_communication_and_compute(
     fully_shard_optimizer(optimizer)
     x = torch.randn(8192, dim, device=device, dtype=dtype, requires_grad=True)
 
-    def train_two_iterations() -> None:
+    def train_two_steps() -> None:
+        """Run two optimizer steps, each consuming two microbatches."""
         for _ in range(2):
             optimizer.zero_grad(set_to_none=True)
-            for microbatch_index in range(num_microbatches):
-                with microbatch(context, is_last=microbatch_index == num_microbatches - 1):
+            for microbatch_index in range(2):
+                with microbatch(context, is_last=microbatch_index == 1):
                     model(x).sum().backward()
             optimizer.step()
 
-    train_two_iterations()
+    train_two_steps()
     torch.cuda.synchronize(device)
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        train_two_iterations()
+        train_two_steps()
         # Synchronize inside the profiler context so in-flight device kernels
         # complete and get recorded before the profiler stops on __exit__.
         # Synchronizing after the context would finalize the trace first and
@@ -784,7 +784,7 @@ def test_overlaps_communication_and_compute(
     gemm_kernels = collect_linked_kernels(prof, _GEMM_OP_NAME_SUBSTRING)
     # Each child Linear runs one forward and two backward matmuls per microbatch.
     # aten::mm may also launch auxiliary kernels, so check only the matmul lower bound.
-    expected_gemm_count = 6 * num_microbatches * num_children
+    expected_gemm_count = 12 * num_children
     assert len(gemm_kernels) >= expected_gemm_count, (
         f"Expected at least {expected_gemm_count} kernels linked to GEMMs, got "
         f"{len(gemm_kernels)}: "
@@ -793,9 +793,9 @@ def test_overlaps_communication_and_compute(
 
     allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
     reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
-    # ZeRO-1/2 all-gather once per iteration. ZeRO-1 reduces only the last microbatch;
-    # ZeRO-2 reduces every microbatch. ZeRO-3 gathers for every forward and backward
-    # and reduces every microbatch.
+    # ZeRO-1/2 all-gather once per optimizer step. ZeRO-1 reduces only the second
+    # microbatch, while ZeRO-2 reduces both. ZeRO-3 gathers for every forward and
+    # backward and reduces every microbatch.
     expected_collective_counts = {
         "zero1": (
             2 * num_children,
@@ -805,15 +805,15 @@ def test_overlaps_communication_and_compute(
         ),
         "zero2": (
             2 * num_children,
-            2 * num_microbatches * num_children,
+            4 * num_children,
             2 * (num_children - 1),
-            2 * num_microbatches * (num_children - 1),
+            4 * (num_children - 1),
         ),
         "zero3": (
-            4 * num_microbatches * num_children,
-            2 * num_microbatches * num_children,
-            4 * num_microbatches * (num_children - 1),
-            2 * num_microbatches * (num_children - 1),
+            8 * num_children,
+            4 * num_children,
+            8 * (num_children - 1),
+            4 * (num_children - 1),
         ),
     }
     (
