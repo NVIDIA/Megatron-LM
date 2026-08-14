@@ -11,6 +11,7 @@ from torch import nn
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.profiler import ProfilerActivity, profile
+from torch.utils.checkpoint import checkpoint
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
@@ -18,9 +19,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     Replicate,
     fully_shard,
+    fully_shard_context,
     fully_shard_optimizer,
     microbatch,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import (
     collect_linked_kernels,
@@ -42,6 +45,19 @@ class TinyModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the tiny model."""
         return self.fc2(self.relu(self.fc1(x)))
+
+
+class CheckpointedTinyModel(TinyModel):
+    """Tiny model that activation-checkpoints each shardable module."""
+
+    def __init__(self, use_reentrant: bool) -> None:
+        super().__init__()
+        self.use_reentrant = use_reentrant
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run each linear layer through activation checkpointing."""
+        x = checkpoint(self.fc1, x, use_reentrant=self.use_reentrant)
+        return checkpoint(self.fc2, self.relu(x), use_reentrant=self.use_reentrant)
 
 
 class NestedModel(nn.Module):
@@ -71,6 +87,32 @@ class MultiChildModel(nn.Module):
         for layer in self.layers:
             x = torch.relu(layer(x))
         return x
+
+
+class ElementwiseModel(nn.Module):
+    """Small activation path over a large FSDP-managed weight."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim, dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the first weight row to an activation tensor."""
+        return torch.relu(x + self.weight[0])
+
+
+class TiedLM(nn.Module):
+    """Tiny language model with shared input and output embedding weights."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(8, 4, dtype=torch.bfloat16)
+        self.lm_head = nn.Linear(4, 8, bias=False, dtype=torch.bfloat16)
+        self.lm_head.weight = self.embed_tokens.weight
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Compute a scalar loss using both aliases of the shared weight."""
+        return self.lm_head(self.embed_tokens(token_ids)).float().sum()
 
 
 class SaveNonLeafWeightView(torch.autograd.Function):
@@ -147,8 +189,9 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
     model = TinyModel().to(device)
     model.load_state_dict(baseline.state_dict())
 
-    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
@@ -189,6 +232,48 @@ def test_fully_shard_sgd_losses_match_baseline(distributed_setup, num_microbatch
     )
 
 
+@pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
+def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup, use_reentrant):
+    """Activation recomputation should leave every FSDP module resharded.
+
+    Backward completes ``fc2`` before recomputing ``fc1``. Without suppressing
+    forward prefetch during recomputation, ``fc1`` unshards ``fc2`` again after
+    its backward hook has run, leaving ``fc2.weight`` as an unsharded Parameter
+    instead of a sharded DTensor at the end of backward.
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = CheckpointedTinyModel(use_reentrant=use_reentrant).to(device)
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    x = torch.randn(2, 8, device=device, requires_grad=True)
+    model(x).sum().backward()
+
+    # Without the forward-prefetch suppression, ``fc1``'s recomputed forward
+    # would unshard ``fc2`` after ``fc2``'s backward already resharded it,
+    # leaving an unsharded Parameter here.
+    assert isinstance(model.fc1.weight, DTensor)
+    assert isinstance(model.fc2.weight, DTensor)
+
+    # Backward completes each module before recomputing the previous one, so
+    # every module-local phase must be cleared after its matching backward.
+    assert model.phase is FsdpModule.Phase.RESTING
+    assert model.fc1.phase is FsdpModule.Phase.RESTING
+    assert model.fc2.phase is FsdpModule.Phase.RESTING
+
+    # A second forward after backward runs in the forward phase again, so
+    # forward-order prefetch resumes and the module phases return to resting.
+    model(x).sum().backward()
+    assert model.phase is FsdpModule.Phase.RESTING
+    assert model.fc1.phase is FsdpModule.Phase.RESTING
+    assert model.fc2.phase is FsdpModule.Phase.RESTING
+
+
 @pytest.mark.parametrize("set_to_none", [True, False])
 @pytest.mark.parametrize("num_microbatches", [1, 3])
 def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
@@ -218,11 +303,10 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
     model = MultiChildModel(dim=dim, num_children=2).to(device)
     model.load_state_dict(baseline.state_dict())
 
-    # Shard the child layers, then the model, so the children share a root context
-    # and reduce through the overlap path instead of as independent roots.
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
-    fully_shard(model, mesh=mesh, placements=_hsdp_placements())
+    with fully_shard_context(device=device) as context:
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
+        fully_shard(model, mesh=mesh, placements=_hsdp_placements())
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
@@ -238,7 +322,7 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
 
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
                 is_last = microbatch_index == num_microbatches - 1
-                with microbatch(model, is_last=is_last):
+                with microbatch(context, is_last=is_last):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     (loss / num_microbatches).backward()
                 losses.append(loss.detach())
@@ -267,13 +351,10 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
 def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     """HSDP reduce-scatters DP-inner every microbatch but all-reduces DP-outer once.
 
-    ``fully_shard(model)`` makes the child units share a root context so their
-    reductions run through the overlap path rather than as independent roots.
-    Counting linked NCCL kernels over a multi-microbatch step, the DP-inner reduce-scatter
-    fires once per microbatch per group while the DP-outer all-reduce that
-    finalizes main_grad fires only on the last microbatch, so the reduce-scatter
-    count is exactly ``num_microbatches`` times the all-reduce count. This asserts
-    on kernel counts only, not numerics.
+    Counting linked NCCL kernels over a multi-microbatch step, the DP-inner
+    reduce-scatter fires once per microbatch per group while the DP-outer
+    all-reduce that finalizes main_grad fires only on the last microbatch. This
+    asserts on kernel counts only, not numerics.
     """
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -289,9 +370,10 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     dim = 8
     num_children = 2
     model = MultiChildModel(dim=dim, num_children=num_children).to(device)
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
-    fully_shard(model, mesh=mesh, placements=_hsdp_placements())
+    with fully_shard_context(device=device) as context:
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
+        fully_shard(model, mesh=mesh, placements=_hsdp_placements())
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
     num_microbatches = 3
@@ -304,7 +386,7 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
             is_last = microbatch_index == num_microbatches - 1
-            with microbatch(model, is_last=is_last):
+            with microbatch(context, is_last=is_last):
                 loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                 (loss / num_microbatches).backward()
         optimizer.step()
@@ -339,14 +421,30 @@ def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     mesh = init_device_mesh(device.type, (world_size,))
     model = NestedModel().to(device)
 
-    fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    inner_names = [name for group in model.inner.parameter_groups for name in group.parameter_names]
-    outer_names = [name for group in model.parameter_groups for name in group.parameter_names]
+    (inner_group,) = model.inner.parameter_groups
+    (outer_group,) = model.parameter_groups
 
-    assert inner_names == ["weight"]
-    assert outer_names == ["bias"]
+    assert [parameter.fqns for parameter in inner_group.fsdp_parameters] == [("weight",)]
+    assert [parameter.fqns for parameter in outer_group.fsdp_parameters] == [("bias",)]
+
+
+def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
+    """Tied registrations should allocate one DBuffer entry and optimizer parameter."""
+    model = TiedLM()
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    (parameter_group,) = model.parameter_groups
+    (parameter,) = parameter_group.fsdp_parameters
+    assert parameter.fqns == ("embed_tokens.weight", "lm_head.weight")
+    assert parameter_group.main_weight.layout.size == 8 * 4
+    # Both aliases must expose the same optimizer-visible sharded parameter.
+    assert len(list(model.parameters())) == 1
 
 
 def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setup):
@@ -363,9 +461,9 @@ def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setu
     model = MultiChildModel(dim=dim, num_children=4).to(dtype=dtype, device=device)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     x = torch.randn(2, dim, device=device, dtype=dtype)
     with torch.no_grad():
@@ -395,6 +493,28 @@ def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setu
     )
 
 
+def test_deleted_model_releases_fsdp_storage(distributed_setup):
+    """Deleting an FSDP model should release its persistent storage."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    # Earlier tests may retain process-global CUDA allocations such as the
+    # CuBLAS workspace. Capture them before creating this model, so the test
+    # only detects storage retained by the deleted FSDP model itself.
+    allocated_before = torch.cuda.memory_allocated(device)
+    model = ElementwiseModel(dim=8192).to(dtype=torch.bfloat16, device=device)
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    x = torch.ones(1, 8192, dtype=torch.bfloat16, device=device)
+    output = model(x)
+    del output, x, model
+    torch.cuda.synchronize(device)
+
+    assert torch.cuda.memory_allocated(device) - allocated_before < 1024**2
+
+
 def test_root_forward_returns_to_resting_memory(distributed_setup):
     """Root forward should release child all-gather storage before returning."""
     rank = distributed_setup.rank
@@ -409,9 +529,10 @@ def test_root_forward_returns_to_resting_memory(distributed_setup):
     model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     x = torch.randn(2, dim, device=device, dtype=dtype)
     torch.cuda.synchronize(device)
@@ -447,9 +568,10 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     x = torch.randn(2, dim, device=device, dtype=dtype, requires_grad=True)
     output = model(x)
@@ -472,8 +594,21 @@ def test_root_backward_returns_to_resting_memory(distributed_setup):
     )
 
 
-@pytest.mark.parametrize("use_symm_mem", [False, True], ids=["default", "symmetric_memory"])
-def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
+@pytest.mark.parametrize(
+    "use_symmetric_memory",
+    [
+        # Both variants' all-gathers are launch-timing sensitive, but default-CTA
+        # kernels occupy more compute CTAs, making the profiler overlap count less
+        # stable across ranks (see
+        # https://github.com/NVIDIA/Megatron-LM/actions/runs/31615942188).
+        # The symmetric-memory variant uses zero-CTA all-gather kernels, so its overlap
+        # measurement is more stable and remains enabled.
+        pytest.param(False, marks=(pytest.mark.flaky, pytest.mark.flaky_in_dev)),
+        pytest.param(True),
+    ],
+    ids=["default", "symmetric_memory"],
+)
+def test_overlaps_communication_and_compute(distributed_setup, use_symmetric_memory):
     """Forward and backward communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -498,7 +633,7 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
-    if use_symm_mem:
+    if use_symmetric_memory:
         # Dedicated communicator with NCCL's zero-CTA policy. cta_policy is a
         # per-communicator property, so scoping it to this group leaves the rest of the
         # bucket on default-CTA symmetric-memory kernels (test_symmetric_memory.py asserts
@@ -517,24 +652,12 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
         dp_group = dist.new_group(backend="nccl")
 
     mesh = DeviceMesh.from_group(dp_group, device.type)
-    model = MultiChildModel(dim=dim, num_children=num_children).to(dtype=dtype)
+    model = MultiChildModel(dim=dim, num_children=num_children).to(device=device, dtype=dtype)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    for layer in model.layers:
-        fully_shard(
-            layer,
-            mesh=mesh,
-            placements=placements,
-            mixed_precision_policy=policy,
-            use_symm_mem=use_symm_mem,
-        )
-    fully_shard(
-        model,
-        mesh=mesh,
-        placements=placements,
-        mixed_precision_policy=policy,
-        use_symm_mem=use_symm_mem,
-    )
+    with fully_shard_context(device=device, use_symmetric_memory=use_symmetric_memory):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     x = torch.randn(4096, dim, device=device, dtype=dtype, requires_grad=True)
 
@@ -564,17 +687,16 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
 
     allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
     reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
-    # The num_children child layers plus the root are each a sharded module; each does a
-    # forward and a backward all-gather and one reduce-scatter. Zero-CTA moves the
-    # all-gather to copy-engine memcpys, so it should not emit all-gather kernels.
-    num_sharded_modules = num_children + 1
-    expected_allgather_kernel_count = 0 if use_symm_mem else 2 * num_sharded_modules
+    # Each child layer does a forward and a backward all-gather and one
+    # reduce-scatter. Zero-CTA moves the all-gather to copy-engine memcpys, so it
+    # should not emit all-gather kernels.
+    expected_allgather_kernel_count = 0 if use_symmetric_memory else 2 * num_children
     assert len(allgather_kernels) == expected_allgather_kernel_count, (
         f"Expected {expected_allgather_kernel_count} all-gather kernels, got "
         f"{len(allgather_kernels)}: {[kernel.name for kernel in allgather_kernels]}"
     )
-    assert len(reduce_scatter_kernels) == num_sharded_modules, (
-        f"Expected {num_sharded_modules} reduce-scatter kernels, got "
+    assert len(reduce_scatter_kernels) == num_children, (
+        f"Expected {num_children} reduce-scatter kernels, got "
         f"{len(reduce_scatter_kernels)}: {[kernel.name for kernel in reduce_scatter_kernels]}"
     )
 
@@ -597,7 +719,7 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symm_mem):
     )
     expected_allgather_overlap = 2 * (num_children - 1)
     expected_reduce_scatter_overlap = num_children - 1
-    if not use_symm_mem:
+    if not use_symmetric_memory:
         assert allgather_overlap_count >= expected_allgather_overlap, (
             f"Expected at least {expected_allgather_overlap} all-gathers to "
             f"overlap compute, got {allgather_overlap_count}/{len(allgather_kernels)}."
@@ -620,9 +742,10 @@ def test_parameterless_parent_with_child_modules_trains(distributed_setup):
     torch.manual_seed(5678)
     model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 2, bias=False)).to(device)
 
-    fully_shard(model[0], mesh=mesh, placements=_flat_placements())
-    fully_shard(model[1], mesh=mesh, placements=_flat_placements())
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model[0], mesh=mesh, placements=_flat_placements())
+        fully_shard(model[1], mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     assert model.parameter_groups == ()
 
@@ -646,7 +769,8 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
     model = nn.Linear(4, 4, bias=False).to(device)
     model.weight.requires_grad_(False)
 
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     (group,) = model.parameter_groups
     assert not group.requires_grad
@@ -666,7 +790,8 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     with torch.no_grad():
         model.weight.fill_(1.0)
 
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     x = torch.full((1, 1), float(rank + 1), device=device)
     model(x).sum().backward()
@@ -690,12 +815,13 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
     with torch.no_grad():
         model.weight.fill_(1.0)
 
-    fully_shard(
-        model,
-        mesh=mesh,
-        placements=_flat_placements(),
-        mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
-    )
+    with fully_shard_context(device=device):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
+        )
     # SGD's foreach/fused CUDA paths require matching parameter and gradient dtypes.
     # Use the scalar path to exercise FP32 main weights with default BF16 main grads.
     optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
@@ -725,8 +851,9 @@ def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, m
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
-    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     parameter_groups = (*model.fc1.parameter_groups, *model.fc2.parameter_groups)
     sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
 
@@ -769,8 +896,9 @@ def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setu
     baseline = TinyModel().to(device=device, dtype=torch.bfloat16)
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
     model.load_state_dict(baseline.state_dict())
-    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
 
     baseline_optimizer = torch.optim.Adam(baseline.parameters(), lr=0.01)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
@@ -793,22 +921,21 @@ def test_fully_shard_adam_mixed_precision_losses_match_baseline(distributed_setu
         optimizer.step()
 
 
-def test_microbatch_scopes_child_contexts(distributed_setup):
-    """microbatch() should scope FSDP child contexts under an unwrapped parent."""
+def test_microbatch_scopes_context(distributed_setup):
+    """microbatch() should scope state on the supplied FSDP context."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = nn.Sequential(nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)).to(device)
-    for layer in model:
-        fully_shard(layer, mesh=mesh, placements=_flat_placements())
-
-    with microbatch(model, is_last=False):
+    with fully_shard_context(device=device) as context:
         for layer in model:
-            assert not layer.context.is_last_microbatch
+            fully_shard(layer, mesh=mesh, placements=_flat_placements())
 
-    for layer in model:
-        assert layer.context.is_last_microbatch
+    with microbatch(context, is_last=False):
+        assert not context.is_last_microbatch
+
+    assert context.is_last_microbatch
 
 
 def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
@@ -826,7 +953,8 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
 
     # Shard the second layer's parameters onto the mesh device; the unwrapped
     # first layer's parameters remain on CPU until model.to(device) below.
-    fully_shard(model[1], mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model[1], mesh=mesh, placements=_flat_placements())
 
     assert model[0].weight.device.type == "cpu"
     assert isinstance(model[1].weight, DTensor)
@@ -838,6 +966,33 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
     torch.testing.assert_close(output, expected_output)
 
 
+def test_meta_parameters_shard_to_mesh_device(distributed_setup):
+    """A sharded meta model should support initialization and forward."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Sequential(
+        nn.Linear(4, 4, bias=False, device="meta", dtype=torch.bfloat16),
+        nn.Linear(4, 4, bias=False, device="meta", dtype=torch.bfloat16),
+    )
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    with torch.no_grad():
+        model[0].weight.fill_(2.0)
+        model[1].weight.fill_(3.0)
+    # The exposed parameters update FP32 main weights, while forward uses separate BF16
+    # model weights. This simulates load_checkpoint() until
+    # https://github.com/NVIDIA/Megatron-LM/pull/6024 lands and syncs after loading.
+    for parameter_group in model.parameter_groups:
+        parameter_group.sync_model_weight_from_main_weight()
+
+    output = model(torch.ones(1, 4, device=device, dtype=torch.bfloat16))
+    torch.testing.assert_close(output, torch.full_like(output, 96.0))
+
+
 def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     """A non-leaf parameter view saved for backward should survive full-storage resize."""
     world_size = distributed_setup.world_size
@@ -847,7 +1002,8 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = NonLeafViewModel().to(device)
-    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     group = model.parameter_groups[0]
     x = torch.randn(8, device=device, requires_grad=True)
@@ -899,15 +1055,16 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
 
     torch.manual_seed(4321)
     model = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(device)
-    for layer in model:
-        fully_shard(
-            layer,
-            mesh=mesh,
-            placements=_flat_placements(),
-            mixed_precision_policy=MixedPrecisionPolicy(
-                main_params_dtype=dtype, main_grads_dtype=dtype
-            ),
-        )
+    with fully_shard_context(device=device):
+        for layer in model:
+            fully_shard(
+                layer,
+                mesh=mesh,
+                placements=_flat_placements(),
+                mixed_precision_policy=MixedPrecisionPolicy(
+                    main_params_dtype=dtype, main_grads_dtype=dtype
+                ),
+            )
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     torch.cuda.empty_cache()
 

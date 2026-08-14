@@ -54,14 +54,14 @@ jobs:
       DISABLE_EXTERNAL_CONTRIBUTOR: ${{ vars.DISABLE_EXTERNAL_CONTRIBUTOR }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           token: ${{ env.GITHUB_TOKEN }}
 
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Check NVIDIA SSO membership
         id: check-sso
@@ -133,7 +133,7 @@ jobs:
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v1.0.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
 
   configure:
     runs-on: ubuntu-latest
@@ -154,7 +154,7 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       # Resolve a single SHA used by the build, every test job, and every
       # downstream checkout so that the container image, golden values, and
@@ -341,12 +341,12 @@ jobs:
       )
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           version: 0.7.2
 
@@ -354,10 +354,19 @@ jobs:
         run: |
           uv sync --locked --only-group linting
 
+      - name: Test CI cache keys
+        run: .github/scripts/test_cache_keys.sh
+
+      - name: Test queue approval topology
+        run: .github/scripts/test_approve_test_queue.sh
+
+      - name: Test superseded merge-group cleanup
+        run: python3 .github/scripts/test_cancel_superseded_merge_group_runs.py
+
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Validate updated golden values
         if: github.event_name == 'merge_group' || (startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push')
@@ -426,7 +435,7 @@ jobs:
       mbridge-test-suite: ${{ needs.configure.outputs.mbridge_suite }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: How-To
         run: bash .github/scripts/readme.sh
@@ -438,9 +447,9 @@ jobs:
       - configure
       - cicd-wait-in-queue
       - cicd-parse-downstream-testing
-    # skip downstream mbridge testing on PR pushes by
-    # default. They still run for merge_group and nightly (schedule /
-    # workflow_dispatch) triggers, and PR authors can opt in by adding the
+    # Skip downstream MBridge testing for docs-only changes and PR pushes by
+    # default. Non-docs merge_group and nightly (schedule / workflow_dispatch)
+    # triggers still run it, and PR authors can opt in by adding the
     # "Run MBridge tests" label — all three cases set
     # configure.outputs.run_mbridge == 'true'.
     if: |
@@ -450,6 +459,7 @@ jobs:
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
       && vars.ENABLE_CICD_MBRIDGE_TESTING == 'true'
       && needs.configure.outputs.run_mbridge == 'true'
+      && needs.pre-flight.outputs.docs_only == 'false'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -461,10 +471,10 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Checkout MBridge and create testing branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: main
           repository: NVIDIA-NeMo/Megatron-Bridge
@@ -481,7 +491,7 @@ jobs:
           git push origin ${{ env.MBRIDGE_BRANCH_NAME }} --force
 
       - name: Trigger MBridge tests
-        uses: convictional/trigger-workflow-and-wait@v1.6.5
+        uses: convictional/trigger-workflow-and-wait@f69fa9eedd3c62a599220f4d5745230e237904be # v1.6.5
         env:
           MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
         with:
@@ -517,7 +527,7 @@ jobs:
       && (needs.cicd-mbridge-testing.result == 'success' || needs.cicd-mbridge-testing.result == 'failure')
     steps:
       - name: Send Slack alert
-        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@main
+        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@209ac7913b0419a5ccbac47b02d00fbea4939243 # main
         with:
           webhook: ${{ secrets.SLACK_WH_MLM_MB_ALERTS }}
           message: |
@@ -576,20 +586,22 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
       - name: Setup python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: 3.12
 
       - name: Download test data
         shell: bash
+        env:
+          NEMO_TEST_DATA_ROOT: /mnt/datadrive/TestData/nemo-fw/TestData
         run: |
           echo "::group::Download test data"
           for attempt in 1 2 3; do
@@ -609,24 +621,45 @@ jobs:
       - name: Compute cache config
         id: cache_keys
         shell: bash
+        env:
+          BASE_REF: ${{ github.event.merge_group.base_ref || fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref || github.ref_name }}
+          CACHE_VARIANT: ${{ needs.configure.outputs.lts == 'true' && 'lts' || 'dev' }}
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}
+          REF: ${{ github.ref }}
         run: |
-          KEY="${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || 0 }}"
+          BASE_REF="${BASE_REF#refs/heads/}"
+          CACHE_NAMESPACE=$(printf '%s' "$BASE_REF" | tr '/:@' '-' | tr -cd '[:alnum:]_.-')
+          if [ -z "$CACHE_NAMESPACE" ]; then
+            echo "Unable to derive a cache namespace from base ref: $BASE_REF" >&2
+            exit 1
+          fi
 
-          # Single coherent cache donor. Dockerfile.ci builds non-reproducible
-          # from-source layers: the same BuildKit cache key yields a different
-          # result digest on every cold build. Listing more than one cache-from
-          # donor lets BuildKit chain from a conflicting copy of such a layer and
-          # miss every layer downstream — a long cold rebuild even when a warm
-          # cache exists. So read EXACTLY ONE donor.
-          #
-          # Key 0 is the no-PR build cache: it is written by the daily schedule
-          # (from main HEAD), the merge queue, and deploy-release builds, so it is
-          # the integration baseline. PR builds seed from it and write their own
-          # ${KEY}-buildcache; baseline builds (KEY=0) seed from and write 0.
-          SEED="0"
+          if [ "$PR_NUMBER" = "0" ] && [ -n "$MERGE_GROUP_HEAD_REF" ]; then
+            PR_NUMBER=$(printf '%s' "$MERGE_GROUP_HEAD_REF" | sed -nE 's#.*pr-([0-9]+)-.*#\1#p')
+          fi
+
+          BASELINE_KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-baseline"
+          if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "0" ]; then
+            KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-${PR_NUMBER}"
+          elif [ "$REF" = "refs/heads/$BASE_REF" ] || [ "$EVENT_NAME" = "schedule" ]; then
+            KEY="$BASELINE_KEY"
+          else
+            BRANCH_NAMESPACE=$(printf '%s' "$GITHUB_REF_NAME" | tr '/:@' '-' | tr -cd '[:alnum:]_.-')
+            KEY="${CACHE_NAMESPACE}-${CACHE_VARIANT}-${BRANCH_NAMESPACE}"
+          fi
+
+          if [ "${#KEY}" -gt 100 ]; then
+            KEY="${KEY:0:83}-$(printf '%s' "$KEY" | sha256sum | cut -c1-16)"
+          fi
+          if [ "${#BASELINE_KEY}" -gt 100 ]; then
+            BASELINE_KEY="${BASELINE_KEY:0:83}-$(printf '%s' "$BASELINE_KEY" | sha256sum | cut -c1-16)"
+          fi
 
           echo "key=$KEY" | tee -a "$GITHUB_OUTPUT"
-          echo "seed=$SEED" | tee -a "$GITHUB_OUTPUT"
+          echo "baseline=$BASELINE_KEY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Parse baseimage
         shell: bash
@@ -647,10 +680,27 @@ jobs:
           fi
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.0.0
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Select cache donor
+        id: cache_from
+        shell: bash
+        env:
+          BASELINE_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.baseline }}-buildcache-${{ matrix.cloud }}
+          LEGACY_CACHE: ${{ matrix.registry }}/megatron-lm:0-buildcache-${{ matrix.cloud }}
+          RUN_CACHE: ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }}
+        run: |
+          DONOR_CACHE="$RUN_CACHE"
+          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
+            DONOR_CACHE="$BASELINE_CACHE"
+          fi
+          if ! docker buildx imagetools inspect "$DONOR_CACHE" >/dev/null 2>&1; then
+            DONOR_CACHE="$LEGACY_CACHE"
+          fi
+          echo "donor=$DONOR_CACHE" | tee -a "$GITHUB_OUTPUT"
 
       - name: Build and push
-        uses: docker/build-push-action@v7.1.0
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           file: ${{ steps.base-image.outputs.dockerfile }}
           push: true
@@ -659,7 +709,7 @@ jobs:
           build-args: |
             FROM_IMAGE_NAME=${{ steps.base-image.outputs.version }}
             IMAGE_TYPE=${{ steps.base-image.outputs.image_type }}
-          cache-from: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.seed }}-buildcache-${{ matrix.cloud }},mode=max
+          cache-from: type=registry,ref=${{ steps.cache_from.outputs.donor }},mode=max
           cache-to: type=registry,ref=${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-buildcache-${{ matrix.cloud }},mode=max
           no-cache: false
           tags: |
@@ -691,7 +741,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
@@ -737,7 +787,7 @@ jobs:
       PIP_RETRIES: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -777,7 +827,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: Parse unit tests
@@ -825,7 +875,7 @@ jobs:
       PIP_RETRIES: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -916,7 +966,7 @@ jobs:
       integration-tests-h100: ${{ steps.main.outputs.integration-tests-h100 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
@@ -981,7 +1031,7 @@ jobs:
       && needs.cicd-parse-integration-tests-h100.result == 'success'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -1015,7 +1065,7 @@ jobs:
       integration-tests-gb200: ${{ steps.main.outputs.integration-tests-gb200 }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
 
@@ -1082,7 +1132,7 @@ jobs:
       && vars.ENABLE_GB200_TESTING == 'true'
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
       - name: main
@@ -1124,7 +1174,7 @@ jobs:
     permissions: write-all
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Get workflow result
         id: result
@@ -1234,7 +1284,7 @@ jobs:
       && github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Generate fake coverage report
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           github-token: ${{ secrets.PAT }}
           script: |
@@ -1265,13 +1315,13 @@ jobs:
       - name: Get PR info
         id: get-pr-info
         if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@main
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download coverage reports of current branch
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           pattern: coverage-${{ matrix.flag }}-*
 
@@ -1292,7 +1342,7 @@ jobs:
           ls -al
 
       - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           verbose: true
@@ -1300,7 +1350,7 @@ jobs:
           base_sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: coverage-${{ matrix.flag }}-aggregated
           path: |
@@ -1321,7 +1371,7 @@ jobs:
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
 
       - name: Comment on PR with action run URL
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           github-token: ${{ secrets.PAT }}
           script: |

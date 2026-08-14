@@ -1305,9 +1305,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # CUDA Graph captures the whole MLP/MoE part. CUDA Graph output is the layer output.
             assert len(cuda_graph_output) == 1, "CUDA Graph output should be the layer output."
             output = cuda_graph_output.pop()
-            assert (
-                not self.config.overlap_moe_expert_parallel_comm
-            ), "EP overlap must be \
+            assert not self.config.overlap_moe_expert_parallel_comm, "EP overlap must be \
                 disabled when CUDA graph captures the whole MLP/MoE part."
         elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
             # CUDA Graph partially captures the MoE.
@@ -1621,8 +1619,6 @@ class MoETransformerLayer(TransformerLayer):
                 and "moe" in self.config.recompute_modules
                 and self.config.cuda_graph_impl == "local"
             )
-            if not hasattr(self, '_router_dtoh_event'):
-                self._router_dtoh_event = torch.cuda.Event()
             if not hasattr(self, 'cudagraph_manager_router'):
                 self.cudagraph_manager_router = CudaGraphManager(
                     self.config, self, function_name="_forward_mlp_router"
@@ -1690,6 +1686,16 @@ class MoETransformerLayer(TransformerLayer):
                 token_dispatcher_attr_outputs.append(attr)
 
         return tuple(attr_names), token_dispatcher_attr_outputs
+
+    def _synchronize_router_host_outputs(self, attr_outputs):
+        """Wait for partial-router graph outputs only when they reside on the host."""
+        if not any(attr.device.type == "cpu" for attr in attr_outputs):
+            return
+
+        if not hasattr(self, '_router_dtoh_event'):
+            self._router_dtoh_event = torch.cuda.Event()
+        self._router_dtoh_event.record()
+        self._router_dtoh_event.synchronize()
 
     def _forward_mlp_router(
         self,
@@ -1820,12 +1826,9 @@ class MoETransformerLayer(TransformerLayer):
                 *token_dispatcher_attr_outputs,
             ) = router_outputs
 
-            # After the router graph replays, the captured .copy_() operations that update
-            # the returned dispatcher tensors via `_maybe_dtoh_and_synchronize` are queued on
-            # the current stream but may not have completed. Record an event after the router
-            # graph and wait on it, so we block only until the router's D2H copies complete.
-            self._router_dtoh_event.record()
-            self._router_dtoh_event.synchronize()
+            # CUDA outputs remain ordered by the graph-completion event. Only host outputs need
+            # a CPU-blocking wait before the eager dispatcher can consume them.
+            self._synchronize_router_host_outputs(token_dispatcher_attr_outputs)
 
             expert_output, mlp_bias = self._forward_mlp_expert_compute(
                 hidden_states, probs, token_dispatcher_attr_outputs

@@ -143,7 +143,6 @@ def create_args():
     args.vocab_file = None
     args.add_position_embedding = False
     args.ckpt_assume_constant_structure = True
-    args.stream_ckpt_dequant = True
     args.ckpt_load_validate_sharding_integrity = True
     args.dist_ckpt_strictness = "assume_ok_unexpected"
     args.fp16 = False
@@ -158,6 +157,7 @@ def create_args():
     args.distrib_optim_fully_reshardable_mem_efficient = False
     args.phase_transition_iterations = None
     args.verify_integrity = False
+    args.save_tokenizer_assets = False
 
     yield args
 

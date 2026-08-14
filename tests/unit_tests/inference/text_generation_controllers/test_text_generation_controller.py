@@ -41,18 +41,22 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_inference_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 
 class TextGenerationControllerTestBase:
@@ -79,7 +83,18 @@ class TextGenerationControllerTestBase:
         hybrid_layer_pattern: str = None,
         sampling_backend: str = 'torch',
         cuda_graph_impl: str = 'none',
+        transformer_impl: str = None,
     ):
+        # When transformer_impl == "inference_optimized" the model is built with the
+        # NVLS symmetric-memory inference linears (RMSNorm, no bias, flash attention);
+        # every other caller leaves it None and gets the unchanged local-spec build.
+        inference_optimized = transformer_impl == "inference_optimized"
+        if inference_optimized:
+            # The inference-optimized layers use TE attention with the "auto" backend,
+            # which conflicts with the NVTE_FLASH_ATTN/NVTE_FUSED_ATTN=0 pinned by the
+            # autouse conftest set_env fixture. Clear them so TE can select flash — the
+            # same thing the dynamic inference engine test does.
+            clear_nvte_env_vars()
         if use_training_random_init:
             # This is necessary to induce the training behavior which permutes the random seed
             # for every rank; otherwise, every rank will have the same seed.
@@ -95,7 +110,7 @@ class TextGenerationControllerTestBase:
             hidden_size=self.hidden_size,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            attention_backend=AttnBackend.local,
+            attention_backend=AttnBackend.auto if inference_optimized else AttnBackend.local,
             params_dtype=dtype,
             symmetric_ar_type=symmetric_ar_type,
             fp8="hybrid" if fp8 else None,
@@ -108,7 +123,12 @@ class TextGenerationControllerTestBase:
             sequence_parallel=sequence_parallel,
             expert_model_parallel_size=expert_model_parallel_size,
             num_moe_experts=num_moe_experts,
-            add_bias_linear=num_moe_experts is None,
+            add_bias_linear=num_moe_experts is None and not inference_optimized,
+            **(
+                dict(transformer_impl="inference_optimized", normalization="RMSNorm")
+                if inference_optimized
+                else {}
+            ),
             **(
                 dict(is_hybrid_model=True, mamba_num_heads=2, mamba_head_dim=16, mamba_num_groups=2)
                 if hybrid_layer_pattern
@@ -123,7 +143,9 @@ class TextGenerationControllerTestBase:
         if hybrid_layer_pattern:
             model = HybridModel(
                 config=transformer_config,
-                hybrid_stack_spec=hybrid_stack_spec,
+                hybrid_stack_spec=(
+                    hybrid_inference_stack_spec if inference_optimized else hybrid_stack_spec
+                ),
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.sequence_length,
                 parallel_output=True,
@@ -133,7 +155,11 @@ class TextGenerationControllerTestBase:
             ).cuda()
             mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
         else:
-            layer_spec = get_gpt_layer_local_spec()
+            layer_spec = (
+                get_gpt_layer_with_inference_spec()
+                if inference_optimized
+                else get_gpt_layer_local_spec()
+            )
 
             mtp_block_spec = None
             if mtp_num_layers > 0:
@@ -1689,10 +1715,13 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context.request_kv_block_counts[active_slice] = 1
         context.token_to_input_ids[active_slice] = torch.tensor([80, 81])
 
-        # Leave room in paused storage but no capacity to keep both requests active.
-        context.kv_block_allocator.active_count = context.kv_block_allocator.get_active_used()
-        context.kv_block_allocator.paused_count = 2
-        context.kv_block_allocator.total_avail = 0
+        # Retain one paused request, but exhaust shared-pool capacity with real allocations.
+        alloc = context.kv_block_allocator
+        alloc.paused_limit = 1
+        filler_blocks = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert filler_blocks is not None
+        filler_blocks = filler_blocks.clone()
+        assert alloc.get_allocatable_count() == 0
 
         sampled_tokens = torch.tensor([90, 91], dtype=torch.int64)
         controller._async_sched_logits = AsyncScheduleLogitsState(
@@ -1736,6 +1765,75 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         controller._run_async_sched_forward.assert_called_once_with(
             forward_input_ids, forward_position_ids
         )
+        alloc.release_memory_blocks(filler_blocks)
+
+    @pytest.mark.internal
+    def test_async_sched_overlap_handles_hidden_chunked_prefill(self):
+        """Overlap ignores a continuing chunk outside the active request rows."""
+        self.setup_model(
+            torch.float32, batch_size=3, static=False, block_size_tokens=4, max_requests=4
+        )
+        controller = self.text_generation_controller
+        context = controller.inference_wrapped_model.inference_context
+        context.reset()
+
+        active_slice = slice(0, 3)
+        context.total_request_count = 3
+        context.active_token_count = 3
+        context.num_prefill_requests = 1
+        context.request_ids[active_slice] = torch.tensor([10, 11, 12], dtype=torch.int32)
+        context.request_in_prefill_status_tensor[active_slice] = torch.tensor(
+            [0, 0, 1], dtype=torch.int32
+        )
+        context.request_query_lengths[active_slice] = 1
+        context.request_output_lengths[active_slice] = 16
+        context.request_kv_length_offsets[active_slice] = 3
+        context.request_last_kv_block_offset[active_slice] = torch.tensor(
+            [context.block_size_tokens - 1, 0, 0], dtype=torch.int32
+        )
+        context.request_metadata["termination_id"][active_slice] = 99
+        context.chunked_prefill_request_id = 12
+        context.build_active_slices(3)
+
+        block_ids = context.kv_block_allocator.allocate_memory_blocks(3)
+        context.request_to_kv_block_ids[active_slice, 0] = block_ids
+        context.request_last_kv_block_id[active_slice] = block_ids
+        context.request_kv_block_counts[active_slice] = 1
+        context.token_to_input_ids[active_slice] = torch.tensor([80, 81, 82])
+
+        alloc = context.kv_block_allocator
+        alloc.paused_limit = 0
+        filler_blocks = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert filler_blocks is not None
+        filler_blocks = filler_blocks.clone()
+        assert alloc.get_allocatable_count() == 0
+
+        sampled_tokens = torch.tensor([90, 91, 92], dtype=torch.int64)
+        request_result = controller._run_async_sched_update_requests(
+            SimpleNamespace(
+                sampled_tokens_cpu_view=sampled_tokens,
+                sampled_mtp_tokens_cpu_view=None,
+                accepted_tokens_cpu_view=None,
+            ),
+            resolved_sequence_lengths=torch.tensor([4, 4, 4]),
+        )
+
+        assert request_result.evict_request_ids.tolist() == [10]
+        assert context.total_request_count == 1
+        assert context.request_ids[:2].tolist() == [11, 12]
+        assert context.get_index_of_chunked_prefill_request(safe=True) == -1
+        assert context.get_index_of_chunked_prefill_request(safe=False) == 1
+
+        active_request_ids, finished_request_ids, active_request_mask = (
+            controller._build_async_sched_request_state(
+                torch.tensor([93]), resolved_sequence_lengths=torch.tensor([5])
+            )
+        )
+
+        assert active_request_ids.tolist() == [11]
+        assert finished_request_ids.numel() == 0
+        assert active_request_mask.tolist() == [1]
+        alloc.release_memory_blocks(filler_blocks)
 
     def test_sample_from_logits(self):
         self.setup_model(torch.float32)
@@ -2668,7 +2766,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # Initialize allocator and states
-        ctx.kv_block_allocator.total_avail = 100
+        ctx.kv_block_allocator.pool_avail = 100
         ctx.request_kv_length_offsets[:2] = torch.tensor([10, 15], device=context_device)
         ctx.request_kv_block_counts[:2] = torch.tensor([3, 4], device=context_device)
 
@@ -2720,7 +2818,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Assert released block is cleared
         assert ctx.request_to_kv_block_ids[1, 3].item() == -1
-        assert ctx.kv_block_allocator.total_avail == 101  # 1 block released
+        assert ctx.kv_block_allocator.pool_avail == 101  # 1 block released
 
         if is_hybrid_model:
             # Check Mamba state was restored from intermediate cache based on accepted counts
@@ -2924,7 +3022,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.kv_block_allocator.block_ref_counts[20] = 2
         ctx.kv_block_allocator.block_ref_counts[10] = 1
 
-        initial_avail = ctx.kv_block_allocator.total_avail
+        initial_avail = ctx.kv_block_allocator.pool_avail
 
         # Req 0 accepts 1 (rewinds 1), Req 1 accepts 0 (rewinds 2, crosses boundary).
         self.text_generation_controller._init_mtp_sampling_tensors()
@@ -2970,7 +3068,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         # Blocks 10, 20 are shared prefix blocks. Block 30, 40 are exclusive.
-        ctx.kv_block_allocator.total_avail = 50
+        ctx.kv_block_allocator.pool_avail = 50
 
         self.text_generation_controller._init_mtp_sampling_tensors()
         self.text_generation_controller._accepted_token_counts_per_request = torch.tensor(
@@ -2984,7 +3082,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert ctx.request_kv_block_counts[0].item() == 3
         assert ctx.request_last_kv_block_id[0].item() == 30
         assert ctx.request_to_kv_block_ids[0, 3].item() == -1
-        assert ctx.kv_block_allocator.total_avail == 51  # exactly 1 block released
+        assert ctx.kv_block_allocator.pool_avail == 51  # exactly 1 block released
 
         # Prefix blocks remain in request_to_kv_block_ids.
         assert ctx.request_to_kv_block_ids[0, 0].item() == 10
@@ -3055,6 +3153,69 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert torch.equal(
             captured_position_ids[1].squeeze(0), torch.tensor([14, 16], device='cuda')
         )
+
+    def test_serial_mtp_slices_block_cuda_graph_buffer_before_sp_gather(self):
+        """Only gather the valid local shard of a persistent block-graph buffer."""
+        self.setup_model(
+            torch.float32,
+            static=False,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            num_speculative_tokens=2,
+            max_requests=2,
+            mtp_num_layers=2,
+        )
+
+        controller = self.text_generation_controller
+        context = controller.inference_wrapped_model.inference_context
+        context.total_request_count = 2
+        context.paused_request_count = 0
+        context.request_kv_length_offsets[:2] = 0
+        context.request_query_lengths[:2] = 1
+        context.padded_active_token_count = 2
+        context.inference_cuda_graph_scope = InferenceCudaGraphScope.block
+
+        controller._init_mtp_sampling_tensors()
+        controller._sampled_tokens_cuda[:2] = torch.tensor([1, 2], device='cuda')
+        controller._last_accepted_seq_indices = torch.tensor([0, 1], device='cuda')
+
+        # Each TP rank writes one row, but block graphs retain a max-token-sized
+        # allocation. Poisoning the tail mirrors stale data from an earlier replay.
+        context.mtp_decoder_hidden_states = torch.full((8, 1, 32), -1.0, device='cuda')
+        context.mtp_decoder_hidden_states[0] = parallel_state.get_tensor_model_parallel_rank()
+
+        gathered_inputs = []
+
+        def mock_gather(local_hidden, group=None):
+            gathered_inputs.append(local_hidden.clone())
+            return torch.cat((local_hidden, local_hidden), dim=0)
+
+        model = controller._unwrapped_model
+        model.compute_mtp_single_step = mock.MagicMock(
+            side_effect=lambda hidden_states, **kwargs: (
+                hidden_states,
+                torch.zeros(2, 1, self.vocab_size, device='cuda'),
+            )
+        )
+        controller._sample_from_logits_2d = mock.MagicMock(
+            return_value=torch.tensor([3, 4], device='cuda')
+        )
+
+        controller_module = (
+            "megatron.core.inference.text_generation_controllers.text_generation_controller"
+        )
+        with (
+            mock.patch(f"{controller_module}.gather_from_sequence_parallel_region", mock_gather),
+            mock.patch(
+                f"{controller_module}.scatter_to_sequence_parallel_region",
+                side_effect=lambda hidden, group=None: hidden[:1],
+            ),
+        ):
+            controller._compute_serial_mtp_and_sample()
+
+        assert len(gathered_inputs) == 1
+        assert gathered_inputs[0].shape == (1, 1, 32)
+        assert not torch.any(gathered_inputs[0] == -1)
 
     @pytest.mark.parametrize("active_request_count", [2, 3, 4, 5])
     def test_mtp_sp_padding_real_ranks(self, active_request_count):
@@ -3176,6 +3337,168 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         assert hidden_out.shape == (1, 1, self.hidden_size)
         # Logits are gathered: [padded_count, 1, vocab_size] = [tp_size, 1, vocab_size].
         assert logits_out.shape == (tp_size, 1, self.vocab_size)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Symmetric-buffer all-gather barrier invariant (real inference-optimized MTP)
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _assert_no_unbarriered_consecutive_all_gathers(events):
+        """Enforce the buffer-reuse invariant over a recorded collective trace.
+
+        ``events`` is an ordered list of ``(multicast_ptr, kind, barrier_before)``,
+        where ``kind`` is "AG" (plain multimem all-gather), "RS" (multimem
+        reduce-scatter), or "FUSED_RS_AG" (fused reduce-scatter+add+norm+all-gather).
+
+        A plain all-gather overwrites its symmetric buffer. If the previous op on the
+        same buffer also left it written by an all-gather (another plain AG, or the
+        all-gather tail of a fused RS+AG) with no reduce-scatter in between, the
+        all-gather must have requested ``barrier_before`` so peers finish reading the
+        previous contents before the overwrite. A reduce-scatter synchronizes ranks
+        inside its own kernel, so it clears the hazard for the next all-gather.
+        """
+        last_write = {}  # multicast_ptr -> "AG" | "RS"
+        violations = []
+        for idx, (ptr, kind, barrier_before) in enumerate(events):
+            if kind == "AG":
+                if last_write.get(ptr) == "AG" and not barrier_before:
+                    violations.append((idx, ptr))
+                last_write[ptr] = "AG"
+            elif kind == "RS":
+                last_write[ptr] = "RS"
+            elif kind == "FUSED_RS_AG":
+                # Its own reduce-scatter precedes its all-gather (internally safe), but
+                # it leaves the buffer written by an all-gather for whatever runs next.
+                last_write[ptr] = "AG"
+            else:
+                raise AssertionError(f"unexpected collective kind {kind!r}")
+        assert not violations, (
+            f"{len(violations)} all-gather(s) reused a symmetric buffer immediately after "
+            f"another all-gather without barrier_before or an intervening reduce-scatter "
+            f"(event indices/ptrs: {violations}).\nFull trace: {events}"
+        )
+
+    def _run_serial_mtp_step(self, active_request_count=4):
+        """Drive _compute_serial_mtp_and_sample with a valid SP hidden-state cache.
+
+        Mirrors test_mtp_sp_padding_real_ranks but in the model's own param dtype
+        (bf16 for the inference-optimized path).
+        """
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        ctrl = self.text_generation_controller
+        ctx = ctrl.inference_wrapped_model.inference_context
+        dtype = next(ctrl.inference_wrapped_model.model.parameters()).dtype
+
+        ctx.total_request_count = active_request_count
+        ctx.paused_request_count = 0
+        ctx.request_kv_length_offsets[:active_request_count] = torch.arange(
+            active_request_count, dtype=torch.int32, device='cuda'
+        )
+        ctx.request_query_lengths[:active_request_count] = torch.ones(
+            active_request_count, dtype=torch.int32, device='cuda'
+        )
+
+        ctrl._init_mtp_sampling_tensors()
+        ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
+            torch.arange(active_request_count, device='cuda'), self.vocab_size
+        )
+
+        pad = (tp_size - active_request_count % tp_size) % tp_size
+        s_total = active_request_count + pad
+        torch.manual_seed(42)
+        full_hidden = torch.randn(s_total, 1, self.hidden_size, device='cuda', dtype=dtype)
+        torch.distributed.broadcast(full_hidden, src=0)
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        ctx.mtp_decoder_hidden_states = full_hidden.chunk(tp_size)[tp_rank].contiguous()
+
+        ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
+        ctx.active_request_metadata["temperature"][:active_request_count] = 1.0
+        ctx.active_request_metadata["top_k"][:active_request_count] = 1
+        ctx.active_request_metadata["top_p"][:active_request_count] = 0.0
+
+        ctrl._compute_serial_mtp_and_sample()
+
+    def _collect_symm_collective_trace(self):
+        """Run the serial-MTP inference step and record every symmetric collective.
+
+        The three buffer-writing collectives are instrumented at their call site
+        (megatron.core.tensor_parallel.inference_layers) so the real Triton kernels
+        still run; returns the ordered ``(ptr, kind, barrier_before)`` trace.
+        """
+        import megatron.core.tensor_parallel.inference_layers as il
+
+        real_ag = il.multimem_all_gather
+        real_rs = il.multimem_reduce_scatter
+        real_fused = il.fused_multimem_rs_add_norm_ag
+        events = []
+
+        def rec_ag(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs):
+            events.append(
+                (symm_mem_hdl.multicast_ptr, "AG", bool(kwargs.get("barrier_before", False)))
+            )
+            return real_ag(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs)
+
+        def rec_rs(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs):
+            events.append((symm_mem_hdl.multicast_ptr, "RS", False))
+            return real_rs(output_tensor, input_tensor, symm_mem_hdl, *args, **kwargs)
+
+        def rec_fused(residual, symm_buffer_tensor, symm_mem_hdl, *args, **kwargs):
+            events.append((symm_mem_hdl.multicast_ptr, "FUSED_RS_AG", False))
+            return real_fused(residual, symm_buffer_tensor, symm_mem_hdl, *args, **kwargs)
+
+        with (
+            mock.patch.object(il, "multimem_all_gather", rec_ag),
+            mock.patch.object(il, "multimem_reduce_scatter", rec_rs),
+            mock.patch.object(il, "fused_multimem_rs_add_norm_ag", rec_fused),
+        ):
+            self._run_serial_mtp_step()
+
+        return events
+
+    def _check_mtp_all_gather_barrier_invariant(self):
+        """Skip unless the NVLS path engaged, then enforce the barrier invariant."""
+        from megatron.core.inference.communication.torch_symm_triton.utils import (
+            is_device_nvls_capable,
+        )
+
+        if not is_device_nvls_capable(torch.device("cuda", torch.cuda.current_device())):
+            pytest.skip("NVLS multicast requires a Hopper+ GPU (SM >= 9)")
+        if parallel_state.get_tensor_model_parallel_world_size() < 2:
+            pytest.skip("requires a tensor-model-parallel world size >= 2")
+
+        events = self._collect_symm_collective_trace()
+
+        if not any(kind == "AG" for _, kind, _ in events):
+            pytest.skip("NVLS all-gather path did not engage (symmetric memory unavailable)")
+        # The MTP path must request at least one buffer-reuse barrier (eh_proj, output
+        # projection, or the inner-block qkv) — otherwise the wiring silently regressed.
+        assert any(barrier for _, kind, barrier in events if kind == "AG"), (
+            "expected the MTP inference path to request barrier_before on at least one "
+            f"all-gather, but none did. Trace: {events}"
+        )
+        self._assert_no_unbarriered_consecutive_all_gathers(events)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="needs flash attn for MTP decode")
+    @torch.inference_mode()
+    def test_mtp_inference_optimized_hybrid_no_unbarriered_consecutive_all_gathers(self):
+        """HybridModel + inference-optimized + SP + MTP: no consecutive AG lacks a barrier.
+
+        The main body is a Mamba/attention hybrid ("M*M*"); each of the two MTP depths
+        is a single attention section ("*").
+        """
+        self.setup_model(
+            torch.bfloat16,
+            static=False,
+            tensor_model_parallel_size=2,
+            num_speculative_tokens=2,
+            max_requests=8,
+            mtp_num_layers=2,
+            sequence_parallel=True,
+            transformer_impl="inference_optimized",
+            hybrid_layer_pattern="M*M*/*/*",
+        )
+        self._check_mtp_all_gather_barrier_invariant()
 
     def test_mtp_sp_dummy_hidden_uses_full_seq_len(self):
         """Test that chaining MTP depths produces correct SP-format shapes throughout.
