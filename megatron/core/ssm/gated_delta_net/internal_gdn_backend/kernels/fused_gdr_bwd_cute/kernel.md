@@ -1,9 +1,10 @@
 # SM100 fused GDR backward
 
-This package is vendored byte-for-byte from
-`mcore_gdn_opt@ca349c26549c0a6bf2f69dc2b29936013550a44f`.
-The production `kernel.py` source SHA256 is
-`29dec2291ee7f06792a8aec4f12b5377af71057420d32ca0eb65447a110ca271`.
+The executable body of this package is vendored byte-for-byte from
+`mcore_gdn_opt@ca349c26549c0a6bf2f69dc2b29936013550a44f`. The module
+docstring differs only to retain the upstream NOTICE directly in `kernel.py`.
+The executable body beginning at `from dataclasses import` has SHA256
+`9c3acca4808cdf3c518b26d228c05b2ae04334b6ea8296ce4431639e706d0864`.
 
 The kernel consumes two packed, 64-token-aligned sequences with 64 heads and
 head dimension 128. Dedicated warp roles stage inputs with TMA, execute the

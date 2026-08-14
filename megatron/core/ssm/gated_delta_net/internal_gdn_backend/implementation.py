@@ -529,7 +529,7 @@ def _cutedsl_forward(
     cu_seqlens: torch.Tensor | None,
     cu_seqlens_cpu: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from .kernels.gdn_prefill import chunk_gated_delta_rule_prefill_cute
+    from .kernels.fused_gdr_fwd_cute import chunk_gated_delta_rule_prefill_cute
 
     batch_size, seqlen, num_heads, head_size = q.shape
     chunk_indices = (

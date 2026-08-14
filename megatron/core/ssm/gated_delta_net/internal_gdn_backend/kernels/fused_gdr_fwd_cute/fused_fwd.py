@@ -194,7 +194,7 @@ def chunk_gated_delta_rule_prefill_cute(
     )
     kernel_scale = scale if scale is not None else 1.0 / math.sqrt(head_size)
 
-    from .gdn_prefill_kernel import cutedsl_fused_chunk_gdn_fwd_sm100
+    from .launcher import cutedsl_fused_chunk_gdn_fwd_sm100
 
     cutedsl_fused_chunk_gdn_fwd_sm100(
         q=q,

@@ -178,7 +178,7 @@ def _wrap_tma(ret):
     return TmaInfo(ret[0], ret[1])
 
 
-from .gdn_blackwell_tile_scheduler import GDNTileScheduler, GDNTileSchedulerParams
+from .tile_scheduler import GDNTileScheduler, GDNTileSchedulerParams
 
 # ---------------------------------------------------------------------------
 # Combined configuration + execution class

@@ -38,7 +38,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from .gdn_blackwell_chunked_kernel import GatedDeltaNetChunkedKernel
+from .kernel import GatedDeltaNetChunkedKernel
 
 
 @functools.cache

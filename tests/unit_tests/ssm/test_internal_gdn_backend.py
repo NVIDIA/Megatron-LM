@@ -62,7 +62,15 @@ def test_internal_backend_rejects_conflicting_state_layout_options():
         )
 
 
-def test_vendored_fused_backward_matches_latest_main_source():
+def test_fused_forward_package_exports_wrapper():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_fwd_cute
+
+    assert fused_gdr_fwd_cute.chunk_gated_delta_rule_prefill_cute.__module__.endswith(
+        ".fused_fwd"
+    )
+
+
+def test_vendored_fused_backward_body_matches_latest_main_source():
     root = Path(__file__).resolve().parents[3]
     kernel = (
         root
@@ -70,8 +78,11 @@ def test_vendored_fused_backward_matches_latest_main_source():
         / "fused_gdr_bwd_cute/kernel.py"
     )
 
-    assert hashlib.sha256(kernel.read_bytes()).hexdigest() == (
-        "29dec2291ee7f06792a8aec4f12b5377af71057420d32ca0eb65447a110ca271"
+    source = kernel.read_text()
+    executable_body = source[source.index("from dataclasses import") :]
+
+    assert hashlib.sha256(executable_body.encode()).hexdigest() == (
+        "9c3acca4808cdf3c518b26d228c05b2ae04334b6ea8296ce4431639e706d0864"
     )
 
 
