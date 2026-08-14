@@ -7,7 +7,6 @@ import pytest
 import torch
 from packaging import version
 
-from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX, IGNORE_INDEX
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.tokenizers.text.libraries.bytelevel_tokenizer import ByteLevelTokenizer
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -396,7 +395,7 @@ def test_multimodal_tokenizer():
     conversation = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "Hello! Can you summarize this image for me?"},
-        {"role": "user", "content": [{"type": "image"}]},
+        {"role": "user", "content": "<image>"},
         {"role": "assistant", "content": "Sure! The image shows a sunset over a mountain range."},
         {"role": "user", "content": "Thanks! Can you also give a short poem about it?"},
     ]
@@ -405,8 +404,6 @@ def test_multimodal_tokenizer():
         conversation, return_target=False, add_generation_prompt=False
     )
     assert len(conv_tokens) > 0, "failed to tokenize conversation"
-    image_positions = np.flatnonzero(conv_tokens == DEFAULT_IMAGE_TOKEN_INDEX)
-    assert len(image_positions) == 1
 
     conv_tokens, target_tokens = tokenizer.tokenize_conversation(
         conversation, return_target=True, add_generation_prompt=False
@@ -414,10 +411,14 @@ def test_multimodal_tokenizer():
     assert len(conv_tokens) > 0 and len(conv_tokens) == len(
         target_tokens
     ), "failed to tokenize conversation and return target tokens"
-    assert target_tokens[image_positions[0]] == IGNORE_INDEX
 
     # Try converting tokens to ids.
     assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."
+
+    assert tokenizer._tokenizer._apply_image_tag("<image>hello") == "<Image><image></Image>hello"
+    assert tokenizer._tokenizer._apply_image_tag([{"role": "user", "content": "<image>hello"}]) == [
+        {"role": "user", "content": "<Image><image></Image>hello"}
+    ]
 
 
 def test_null_multimodal_tokenizer():

@@ -3,21 +3,14 @@
 import numpy as np
 import pytest
 
-from megatron.core.models.multimodal.llava_model import (
-    DEFAULT_IMAGE_TOKEN_INDEX,
-    DEFAULT_SOUND_TOKEN_INDEX,
-    IGNORE_INDEX,
-    IMAGE_TOKEN,
-    SOUND_TOKEN,
-)
+from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, IMAGE_TOKEN
 from megatron.core.tokenizers.vision.libraries.multimodal_tokenizer import (
     MegatronMultimodalTokenizer,
 )
-from megatron.core.tokenizers.vision.vision_tokenizer import MegatronTokenizerVision
 
 
 class _FakeTokenizer:
-    """Minimal character tokenizer for testing multimodal marker replacement."""
+    """Minimal character tokenizer for lightweight multimodal-tokenizer tests."""
 
     @staticmethod
     def encode(text, add_special_tokens=False):
@@ -35,98 +28,42 @@ def tokenizer():
     instance = object.__new__(MegatronMultimodalTokenizer)
     instance._tokenizer = _FakeTokenizer()
     instance._image_tag = None
-    instance._image_token_index = DEFAULT_IMAGE_TOKEN_INDEX
-    instance._sound_token_index = DEFAULT_SOUND_TOKEN_INDEX
-    instance._sound_start_token_id = 1001
-    instance._sound_end_token_id = 1002
     return instance
 
 
-def test_render_and_encode_structured_parts(tokenizer):
-    """Image and audio parts should be replaced by their sentinel ID spans."""
-    parts = [
-        {"type": "text", "text": "A"},
-        {"type": "image"},
-        {"type": "text", "text": "B"},
-        {"type": "audio", "num_embeddings": 2},
-    ]
+def test_tokenize_uses_legacy_image_text_marker(tokenizer):
+    """Image tags should wrap the existing textual image marker before tokenization."""
+    tokenizer._image_tag = ("<img>", "</img>")
 
-    rendered, replacements = tokenizer._render_parts(parts)
+    tokens = tokenizer.tokenize(f"A{IMAGE_TOKEN}B")
 
-    assert rendered == f"A{tokenizer._MM_MARKER}B{tokenizer._MM_MARKER}"
-    assert replacements == [
-        [DEFAULT_IMAGE_TOKEN_INDEX],
-        [1001, DEFAULT_SOUND_TOKEN_INDEX, DEFAULT_SOUND_TOKEN_INDEX, 1002],
-    ]
-    assert tokenizer._encode_with_markers(rendered, replacements) == [
-        ord("A"),
-        DEFAULT_IMAGE_TOKEN_INDEX,
-        ord("B"),
-        1001,
-        DEFAULT_SOUND_TOKEN_INDEX,
-        DEFAULT_SOUND_TOKEN_INDEX,
-        1002,
-    ]
+    assert tokenizer.detokenize(tokens) == f"A<img>{IMAGE_TOKEN}</img>B"
 
 
-def test_render_structured_image_with_prompt_tags(tokenizer):
-    """Image prompt tags should wrap the sentinel without changing its ID."""
+def test_apply_image_tag_handles_conversations(tokenizer):
+    """Every textual image marker in a conversation should receive the configured tags."""
     tokenizer._image_tag = ("<Image>", "</Image>")
+    conversation = [{"role": "user", "content": f"{IMAGE_TOKEN}A{IMAGE_TOKEN}"}]
 
-    rendered, replacements = tokenizer._render_parts([{"type": "image"}])
-
-    assert rendered == f"<Image>{tokenizer._MM_MARKER}</Image>"
-    assert replacements == [[DEFAULT_IMAGE_TOKEN_INDEX]]
-
-
-def test_vision_wrapper_exposes_image_sentinel(tokenizer):
-    """The public vision wrapper should expose the inner tokenizer's image sentinel."""
-    wrapper = object.__new__(MegatronTokenizerVision)
-    wrapper._tokenizer = tokenizer
-
-    assert wrapper.image_token_index == DEFAULT_IMAGE_TOKEN_INDEX
-
-
-def test_render_parts_validates_reserved_marker_and_audio_length(tokenizer):
-    """Malformed structured parts should fail before reaching the base tokenizer."""
-    with pytest.raises(ValueError, match="reserved multimodal marker"):
-        tokenizer._render_parts([{"type": "text", "text": tokenizer._MM_MARKER}])
-
-    with pytest.raises(ValueError, match="Invalid num_embeddings"):
-        tokenizer._render_parts([{"type": "audio", "num_embeddings": -1}])
+    assert tokenizer._apply_image_tag(conversation) == [
+        {"role": "user", "content": f"<Image>{IMAGE_TOKEN}</Image>A<Image>{IMAGE_TOKEN}</Image>"}
+    ]
 
 
 def test_tokenize_raw_conversation_masks_non_assistant_turns(tokenizer):
     """Raw tokenization should train only on assistant content."""
     turns = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
 
-    tokens, target = tokenizer._tokenize_raw_conversation(turns, [[], []], return_target=True)
+    tokens, target = tokenizer._tokenize_raw_conversation(turns, return_target=True)
 
     np.testing.assert_array_equal(tokens, [ord("h"), ord("i"), ord("o"), ord("k")])
     np.testing.assert_array_equal(target, [IGNORE_INDEX, IGNORE_INDEX, ord("o"), ord("k")])
 
 
-def test_thinking_trace_detection_supports_structured_content(tokenizer):
+def test_thinking_trace_detection(tokenizer):
     """Only non-empty assistant thinking traces should be detected."""
     empty_trace = [{"role": "assistant", "content": "<think> </think>answer"}]
-    structured_trace = [
-        {
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "<think>reasoning</think>answer"},
-                {"type": "image"},
-            ],
-        }
-    ]
+    nonempty_trace = [{"role": "assistant", "content": "<think>reasoning</think>answer"}]
 
     assert not tokenizer._has_nonempty_thinking_trace(empty_trace)
-    assert tokenizer._has_nonempty_thinking_trace(structured_trace)
-
-
-def test_detokenize_surfaces_multimodal_sentinels(tokenizer):
-    """Negative sentinel IDs should be rendered as readable multimodal tokens."""
-    tokens = np.asarray(
-        [ord("A"), DEFAULT_IMAGE_TOKEN_INDEX, ord("B"), DEFAULT_SOUND_TOKEN_INDEX, ord("C")]
-    )
-
-    assert tokenizer.detokenize(tokens) == f"A{IMAGE_TOKEN}B{SOUND_TOKEN}C"
+    assert tokenizer._has_nonempty_thinking_trace(nonempty_trace)

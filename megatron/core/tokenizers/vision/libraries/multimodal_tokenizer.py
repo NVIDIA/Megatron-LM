@@ -3,7 +3,7 @@
 """Multimodal tokenizer."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Union
+from typing import Dict, List, Union
 
 import numpy as np
 
@@ -16,13 +16,7 @@ except (ImportError, ModuleNotFoundError):
 
 # Mark tokens that will be ignored in the loss function with this value.
 # Same ignore_index in https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html
-from megatron.core.models.multimodal.llava_model import (
-    DEFAULT_IMAGE_TOKEN_INDEX,
-    DEFAULT_SOUND_TOKEN_INDEX,
-    IGNORE_INDEX,
-    IMAGE_TOKEN,
-    SOUND_TOKEN,
-)
+from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, IMAGE_TOKEN
 
 IMAGE_TAGS = {
     "nvlm": ("<Image>", "</Image>"),
@@ -371,120 +365,21 @@ class MegatronMultimodalTokenizer:
         self._prompt_format = prompt_format
         self._image_tag = IMAGE_TAGS[image_tag_type]
         self._keep_history_thinking = keep_history_thinking
-        self._image_token_index = DEFAULT_IMAGE_TOKEN_INDEX
-        sound_id = self._lookup_special_token_id(SOUND_TOKEN)
-        self._sound_token_index = sound_id if sound_id is not None else DEFAULT_SOUND_TOKEN_INDEX
-        self._sound_start_token_id = self._lookup_special_token_id("<so_start>")
-        self._sound_end_token_id = self._lookup_special_token_id("<so_end>")
 
-    def _lookup_special_token_id(self, token: str) -> int | None:
-        """Return the vocab id for ``token`` if it is registered as a single token, else None."""
-        get_vocab = getattr(self._tokenizer, "get_vocab", None)
-        if callable(get_vocab):
-            token_id = get_vocab().get(token)
-            return token_id if isinstance(token_id, int) else None
+    def _apply_image_tag(self, text: Union[str, List[Dict]]):
+        """Surround <image> with image tags such as <img> and </img>."""
+        if self._image_tag is None:
+            return text
 
-        token_id = self._tokenizer.convert_tokens_to_ids(token)
-        if not isinstance(token_id, int):
-            return None
+        replacement = f"{self._image_tag[0]}{IMAGE_TOKEN}{self._image_tag[1]}"
 
-        encoded = self._tokenizer.encode(token, add_special_tokens=False)
-        return token_id if len(encoded) == 1 and encoded[0] == token_id else None
+        if isinstance(text, list):
+            for turn in text:
+                turn["content"] = turn["content"].replace(IMAGE_TOKEN, replacement)
+        else:
+            text = text.replace(IMAGE_TOKEN, replacement)
 
-    # Sentinel character used in chat-template text to mark the position of a
-    # multimodal slot. Picked from the Unicode Private Use Area so it cannot
-    # collide with normal text or appear in the base tokenizer's vocabulary.
-    _MM_MARKER = "\ue000"
-
-    @staticmethod
-    def _as_parts(content: Union[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-        """Coerce string content into a single text part."""
-        if isinstance(content, str):
-            return [{"type": "text", "text": content}]
-        return content
-
-    @staticmethod
-    def _plain_text(content: Union[str, List[Dict[str, Any]]]) -> str:
-        """Concatenate the text portions of a content value, ignoring multimodal parts."""
-        return "".join(
-            part["text"]
-            for part in MegatronMultimodalTokenizer._as_parts(content)
-            if part["type"] == "text"
-        )
-
-    def _render_parts(self, parts: List[Dict[str, Any]]) -> tuple[str, List[List[int]]]:
-        """Render content parts to (text-with-markers, ordered replacement id-spans)."""
-        rendered: List[str] = []
-        replacements: List[List[int]] = []
-        for part in parts:
-            kind = part["type"]
-            if kind == "text":
-                if self._MM_MARKER in part["text"]:
-                    raise ValueError("Text content contains the reserved multimodal marker.")
-                rendered.append(part["text"])
-            elif kind == "image":
-                if self._image_tag is None:
-                    rendered.append(self._MM_MARKER)
-                else:
-                    rendered.append(f"{self._image_tag[0]}{self._MM_MARKER}{self._image_tag[1]}")
-                replacements.append([self._image_token_index])
-            elif kind == "audio":
-                num_embeddings = int(part["num_embeddings"])
-                if num_embeddings < 0:
-                    raise ValueError(f"Invalid num_embeddings={num_embeddings} for audio part.")
-                if self._sound_start_token_id is None or self._sound_end_token_id is None:
-                    raise ValueError("<so_start>/<so_end> must be registered as special tokens.")
-                rendered.append(self._MM_MARKER)
-                replacements.append(
-                    [self._sound_start_token_id]
-                    + [self._sound_token_index] * num_embeddings
-                    + [self._sound_end_token_id]
-                )
-            else:
-                raise NotImplementedError(f"Unsupported content part type: {kind!r}")
-        return "".join(rendered), replacements
-
-    def _encode_with_markers(self, text: str, replacements: List[List[int]]) -> List[int]:
-        """Tokenize text, splicing replacement id-spans at every marker position."""
-        segments = text.split(self._MM_MARKER)
-        if len(segments) - 1 != len(replacements):
-            raise ValueError(
-                f"marker/replacement count mismatch: {len(segments) - 1} markers vs "
-                f"{len(replacements)} replacements"
-            )
-        tokens: List[int] = []
-        for i, segment in enumerate(segments):
-            if segment:
-                tokens.extend(self._tokenizer.encode(segment, add_special_tokens=False))
-            if i < len(replacements):
-                tokens.extend(replacements[i])
-        return tokens
-
-    def _render_conversation(
-        self, conversation: List[Dict[str, Any]]
-    ) -> tuple[List[Dict[str, Any]], List[List[List[int]]]]:
-        """Lower structured turns to chat-template-ready turns and replacement IDs."""
-        rendered_turns: List[Dict[str, Any]] = []
-        replacements_per_turn: List[List[List[int]]] = []
-        for turn in conversation:
-            text, replacements = self._render_parts(self._as_parts(turn["content"]))
-            rendered_turns.append({**turn, "content": text})
-            replacements_per_turn.append(replacements)
-        return rendered_turns, replacements_per_turn
-
-    def _apply_chat_template_to_text(
-        self, conversation: List[Dict[str, Any]], add_generation_prompt: bool, **kwargs
-    ) -> str:
-        rendered = self._tokenizer.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-            chat_template=self._prompt_config.custom_chat_template,
-            **kwargs,
-        )
-        if isinstance(rendered, list):
-            [rendered] = rendered
-        return rendered
+        return text
 
     def offsets(self, ids: list[int], text: str) -> list[int]:
         """
@@ -507,7 +402,7 @@ class MegatronMultimodalTokenizer:
         for turn in conversation:
             if turn.get("role") != "assistant":
                 continue
-            content = self._plain_text(turn.get("content") or "")
+            content = turn.get("content") or ""
             if "<think>" not in content or "</think>" not in content:
                 continue
             inner = content.split("<think>", 1)[1].split("</think>", 1)[0]
@@ -515,36 +410,25 @@ class MegatronMultimodalTokenizer:
                 return True
         return False
 
-    def _tokenize_raw_conversation(
-        self,
-        rendered_turns: List[Dict[str, Any]],
-        replacements_per_turn: List[List[List[int]]],
-        return_target: bool,
-    ):
-        """Tokenize a pre-rendered conversation without applying a chat template."""
-        if any(turn["content"] == "" for turn in rendered_turns):
-            raise ValueError(f"empty turn in conversation: {rendered_turns}. Skipping.")
+    def _tokenize_raw_conversation(self, conversation: List[Dict], return_target: bool):
+        """Tokenize a conversation without applying a chat template."""
+        if any(turn["content"] == "" for turn in conversation):
+            raise ValueError(f"empty turn in conversation: {conversation}. Skipping.")
 
         cumulative_text = ""
-        cumulative_replacements: List[List[int]] = []
         cumulative_lengths: List[int] = []
-        for turn, turn_replacements in zip(rendered_turns, replacements_per_turn):
+        for turn in conversation:
             cumulative_text += turn["content"]
-            cumulative_replacements.extend(turn_replacements)
-            cumulative_lengths.append(
-                len(self._encode_with_markers(cumulative_text, cumulative_replacements))
-            )
+            cumulative_lengths.append(len(self._tokenizer.encode(cumulative_text)))
 
-        tokens: np.ndarray = np.asarray(
-            self._encode_with_markers(cumulative_text, cumulative_replacements), dtype=np.int64
-        )
+        tokens: np.ndarray = np.asarray(self._tokenizer.encode(cumulative_text), dtype=np.int64)
 
         if not return_target:
             return tokens
 
         target = np.full_like(tokens, IGNORE_INDEX)
         start = 0
-        for turn, end in zip(rendered_turns, cumulative_lengths):
+        for turn, end in zip(conversation, cumulative_lengths):
             if turn["role"].lower() == "assistant":
                 target[start:end] = tokens[start:end]
             start = end
@@ -559,7 +443,12 @@ class MegatronMultimodalTokenizer:
                 text, return_target=False, add_generation_prompt=True, **kwargs
             ).tolist()
 
-        return list(self._tokenizer.encode(text))
+        return self._encode(text)
+
+    def _encode(self, text: str):
+        """Tokenize text input."""
+        text = self._apply_image_tag(text)
+        return self._tokenizer.encode(text)
 
     def tokenize_conversation(
         self,
@@ -572,11 +461,8 @@ class MegatronMultimodalTokenizer:
     ):
         """Convert a conversation to tokens.
 
-        Each turn's ``content`` may be either a plain string (treated as a single
-        text part) or a list containing text, image, or audio parts. Audio parts
-        must include the number of embeddings.
-        Multimodal parts are lowered to dedicated sentinel ids during encoding;
-        the literal string ``"<image>"`` in text content has no special meaning.
+        Conversation content is plain text. ``<image>`` marks image positions and
+        may be surrounded by the configured image tags before tokenization.
         """
         if train_only_on_last_assistant_turn:
             assert (
@@ -601,29 +487,29 @@ class MegatronMultimodalTokenizer:
                 tmp = turn['role']
                 turn['role'] = tmp[:1].upper() + tmp[1:]
 
-        rendered_turns, replacements_per_turn = self._render_conversation(conversation)
+        has_nonempty_thinking_trace = self._has_nonempty_thinking_trace(conversation)
+        conversation = self._apply_image_tag(conversation)
 
         if skip_chat_template:
             if add_generation_prompt:
                 raise ValueError(
                     "add_generation_prompt is not supported when skip_chat_template=True"
                 )
-            return self._tokenize_raw_conversation(
-                rendered_turns, replacements_per_turn, return_target
-            )
-
-        has_nonempty_thinking_trace = self._has_nonempty_thinking_trace(conversation)
+            return self._tokenize_raw_conversation(conversation, return_target)
 
         if self._keep_history_thinking:
             kwargs["truncate_history_thinking"] = False
 
-        rendered_text = self._apply_chat_template_to_text(
-            rendered_turns, add_generation_prompt=add_generation_prompt, **kwargs
-        )
-        flat_replacements = [r for reps in replacements_per_turn for r in reps]
-        tokens: np.ndarray = np.asarray(
-            self._encode_with_markers(rendered_text, flat_replacements), dtype=np.int64
-        )
+        tokens = self._tokenizer.apply_chat_template(
+            conversation,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            return_assistant_token_mask=False,
+            return_tensors="np",
+            return_dict=False,
+            chat_template=self._prompt_config.custom_chat_template,
+            **kwargs,
+        )[0]
 
         if not return_target:
             return tokens
@@ -737,16 +623,17 @@ class MegatronMultimodalTokenizer:
 
         # Mask system and user tokens in the target.
         idx = 0
-        for turn_idx, (raw_turn, rendered_turn, turn_replacements) in enumerate(
-            zip(conversation, rendered_turns, replacements_per_turn)
-        ):
-            if len(raw_turn["content"]) == 0:
+        for turn_idx, turn in enumerate(conversation):
+            if len(turn["content"]) == 0:
                 raise ValueError(f"empty turn in conversation: {conversation}. Skipping.")
 
-            rendered_turn_text = self._apply_chat_template_to_text(
-                [rendered_turn], add_generation_prompt=False, **kwargs
+            turn_tokens = self._tokenizer.apply_chat_template(
+                [turn],
+                tokenize=True,
+                return_dict=False,
+                chat_template=self._prompt_config.custom_chat_template,
+                **kwargs,
             )
-            turn_tokens = self._encode_with_markers(rendered_turn_text, turn_replacements)
 
             # There should be only one BOS at the very beginning.
             # After the first turn, skip BOS token.
@@ -764,23 +651,23 @@ class MegatronMultimodalTokenizer:
 
             turn_len = len(turn_tokens)
 
-            role = raw_turn["role"].lower()
+            role = turn["role"].lower()
             if role in ("system", "user"):
                 target[idx : idx + turn_len] = IGNORE_INDEX
             elif role == "assistant":
-                if any(part["type"] != "text" for part in self._as_parts(raw_turn["content"])):
-                    raise RuntimeError("multimodal parts are not allowed in assistant content!")
+                if IMAGE_TOKEN in turn["content"]:
+                    raise RuntimeError(f"{IMAGE_TOKEN} not allowed in assistant content!")
 
                 if self._prompt_config.assistant_prefix_len > 0:
                     target[idx : idx + self._prompt_config.assistant_prefix_len] = IGNORE_INDEX
 
             assert np.allclose(
                 tokens[idx : idx + turn_len], turn_tokens
-            ), f"expected turn tokens to match tokens in conversation {rendered_turns}"
+            ), f"expected turn tokens to match tokens in conversation {conversation}"
 
             idx += turn_len
 
-        assert idx == len(tokens), f"mismatch in target masking the conversation {rendered_turns}"
+        assert idx == len(tokens), f"mismatch in target masking the conversation {conversation}"
 
         return tokens, target
 
@@ -788,30 +675,9 @@ class MegatronMultimodalTokenizer:
         """Convert tokens to IDs."""
         return self._tokenizer.convert_tokens_to_ids(tokens)
 
-    def detokenize(self, tokens: List[int] | np.ndarray):
-        """Detokenize tokens, surfacing multimodal sentinels as readable text."""
-        sentinels = {
-            self._image_token_index: self._image_part_text(),
-            self._sound_token_index: SOUND_TOKEN,
-        }
-
-        token_list = tokens.tolist() if isinstance(tokens, np.ndarray) else list(tokens)
-        chunks: List[str] = []
-        buffer: List[int] = []
-        for token in token_list:
-            if token in sentinels:
-                if buffer:
-                    chunks.append(self._tokenizer.decode(buffer))
-                    buffer = []
-                chunks.append(sentinels[token])
-            else:
-                buffer.append(token)
-        if buffer:
-            chunks.append(self._tokenizer.decode(buffer))
-        return "".join(chunks)
-
-    def _image_part_text(self) -> str:
-        return IMAGE_TOKEN
+    def detokenize(self, tokens: List[int]):
+        """Detokenize tokens."""
+        return self._tokenizer.decode(tokens)
 
     def add_special_tokens(self, special_tokens: List[str]):
         """Add special tokens."""
@@ -845,13 +711,3 @@ class MegatronMultimodalTokenizer:
     def vocab_size(self):
         """Vocabulary size."""
         return self._vocab_size
-
-    @property
-    def image_token_index(self):
-        """Internal sentinel id used for image slots."""
-        return self._image_token_index
-
-    @property
-    def sound_token_index(self):
-        """Internal sound embedding token id."""
-        return self._sound_token_index

@@ -141,11 +141,3 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
     def eod(self):
         """End of sentence token ID."""
         return self._tokenizer.eod
-
-    @property
-    def image_token_index(self):
-        """Image sentinel token ID used by multimodal models."""
-        image_token_index = getattr(self._tokenizer, "image_token_index", None)
-        if image_token_index is not None:
-            return image_token_index
-        return self._tokenizer._image_token_id

@@ -643,21 +643,7 @@ def get_conversation(task, question, metadata=None):
         raise NotImplementedError(f"No prompting support for task {task}")
 
 
-    structured_conversation = []
-    for turn in conversation:
-        content = turn["content"]
-        if turn["role"] == "user" and isinstance(content, str) and IMAGE_TOKEN in content:
-            parts = []
-            segments = content.split(IMAGE_TOKEN)
-            for idx, segment in enumerate(segments):
-                if segment:
-                    parts.append({"type": "text", "text": segment})
-                if idx < len(segments) - 1:
-                    parts.append({"type": "image"})
-            turn = {**turn, "content": parts}
-        structured_conversation.append(turn)
-
-    return structured_conversation
+    return conversation
 
 
 def get_prompt_and_generated(prompt_and_generation, prompt_format):
