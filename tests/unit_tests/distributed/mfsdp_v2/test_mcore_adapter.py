@@ -258,6 +258,62 @@ class TestMcoreAdapterDense:
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
 
 
+    def test_fused_sgd_rejects_mismatched_grads(self):
+        """FusedSGD cannot consume V2's BF16 gradients for FP32 weights."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.bfloat16,
+            ),
+            module=_build_block(config),
+            pg_collection=self.pg_collection,
+        )
+        optimizer_config = OptimizerConfig(
+            optimizer="sgd",
+            lr=1.0e-3,
+            weight_decay=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_distributed_optimizer=False,
+            clip_grad=0.0,
+        )
+        optimizer = get_megatron_optimizer(
+            optimizer_config,
+            [model],
+            use_gloo_process_groups=False,
+            pg_collection=self.pg_collection,
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+        output = model(
+            hidden_states=torch.randn(
+                8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
+            ),
+            attention_mask=None,
+        )
+        output.float().square().mean().backward()
+
+        with pytest.raises(
+            RuntimeError, match="Unsupported combination of weight and gradient types"
+        ):
+            optimizer.step()
+
+
 class TestMcoreAdapterExpertParallel:
     """Exercise the MFSDP v2 adapter over an MoE model with EP=2."""
 
