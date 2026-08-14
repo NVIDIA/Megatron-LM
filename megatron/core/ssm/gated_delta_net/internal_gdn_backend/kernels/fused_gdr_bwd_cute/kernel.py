@@ -701,7 +701,7 @@ STATIC_TENSOR_CONTRACTS = (
     StaticTensorContract(
         "dht",
         4,
-        ((0, "two"), (1, "heads"), (2, "dk"), (3, "dv")),
+        ((0, "num_sequences"), (1, "heads"), (2, "dk"), (3, "dv")),
         (
             (0, "state_batch_stride"),
             (1, "state_head_stride"),
@@ -744,7 +744,7 @@ STATIC_TENSOR_CONTRACTS = (
     StaticTensorContract(
         "dh0",
         4,
-        ((0, "two"), (1, "heads"), (2, "dk"), (3, "dv")),
+        ((0, "num_sequences"), (1, "heads"), (2, "dk"), (3, "dv")),
         (
             (0, "state_batch_stride"),
             (1, "state_head_stride"),
@@ -1020,6 +1020,7 @@ class _CompileCacheKey:
     output_dtypes: tuple[str, ...]
     heads: int
     grouped_heads: int
+    num_sequences: int
     use_dht: bool
     state_v_first: bool
     device_index: int
@@ -1162,6 +1163,7 @@ class FusedGdrBwdKernel:
         *,
         heads: int = 64,
         grouped_heads: int = 64,
+        num_sequences: int,
         use_dht: bool = True,
         state_v_first: bool = False,
         uniform_sequence_length: int = 0,
@@ -1183,6 +1185,8 @@ class FusedGdrBwdKernel:
             raise ValueError(
                 "grouped_heads must equal heads; GQA head mapping is unsupported"
             )
+        if num_sequences <= 0:
+            raise ValueError("num_sequences must be positive")
         if uniform_sequence_length < 0 or uniform_sequence_length % self.bt:
             raise ValueError(
                 "uniform_sequence_length must be zero or a multiple of 64"
@@ -1192,6 +1196,7 @@ class FusedGdrBwdKernel:
         self.acc_dtype = acc_dtype
         self.heads = heads
         self.grouped_heads = grouped_heads
+        self.num_sequences = num_sequences
         self.use_dht = use_dht
         self.state_v_first = state_v_first
         self.uniform_sequence_length = uniform_sequence_length
@@ -1521,8 +1526,8 @@ class FusedGdrBwdKernel:
         }
         expected = {
             "one": 1,
-            "two": 2,
-            "metadata_size": 3,
+            "num_sequences": self.num_sequences,
+            "metadata_size": self.num_sequences + 1,
             "heads": self.heads,
             "grouped_heads": self.grouped_heads,
             "bt": self.bt,
@@ -6499,7 +6504,7 @@ class FusedGdrBwdKernel:
             family.staged_views["state_direct"],
             packed_layouts,
         ).launch(
-            grid=(2 * self.heads, 1, 1),
+            grid=(self.num_sequences * self.heads, 1, 1),
             block=(self.threads_per_cta, 1, 1),
             cluster=(1, 1, 1),
             smem=self.shared_storage.size_in_bytes(),
@@ -6555,6 +6560,7 @@ def prepare_fused_gdr_bwd_launch(
     use_dht = True
     state_v_first = False
     uniform_sequence_length = getattr(metadata, "uniform_sequence_length", 0)
+    num_sequences = metadata.num_sequences
     enable_iket = os.environ.get("FUSED_GDR_BWD_ENABLE_IKET") == "1"
 
     input_tensors = (
@@ -6598,6 +6604,7 @@ def prepare_fused_gdr_bwd_launch(
         ),
         heads=heads,
         grouped_heads=grouped_heads,
+        num_sequences=num_sequences,
         use_dht=use_dht,
         state_v_first=state_v_first,
         uniform_sequence_length=uniform_sequence_length,
@@ -6612,6 +6619,7 @@ def prepare_fused_gdr_bwd_launch(
             acc_dtype=_cutlass_dtype(dht.dtype),
             heads=heads,
             grouped_heads=grouped_heads,
+            num_sequences=num_sequences,
             use_dht=use_dht,
             state_v_first=state_v_first,
             uniform_sequence_length=uniform_sequence_length,

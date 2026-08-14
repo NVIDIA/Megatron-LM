@@ -24,16 +24,16 @@ calling the low-level wrapper directly.
 
 ## Input contract
 
-The low-level wrapper accepts exactly two packed sequences:
+The low-level wrapper accepts one or more packed sequences:
 
 - SM100 CUDA device and contiguous tensors on the same device.
 - `q`, `k`, `v`, and `do`: BF16 `[1, N, 64, 128]`.
 - `a`: BF16 `[1, N, 64, 64]`.
 - `g` and `beta`: FP32 `[1, N, 64]`.
 - `h`: BF16 `[1, N / 64, 64, 128, 128]`.
-- `dht`: FP32 `[2, 64, 128, 128]`.
-- `cu_seqlens`: contiguous CUDA int32 `[0, L0, L0 + L1]`, where both
-  sequence lengths are positive multiples of 64 and `N = L0 + L1`.
+- `dht`: FP32 `[B, 64, 128, 128]`.
+- `cu_seqlens`: contiguous CUDA int32 `[B + 1]`, beginning at zero and
+  ending at `N`. Every sequence length must be a positive multiple of 64.
 - `chunk_size` must be 64, `state_v_first` must be `False`, and `scale` must
   be finite and positive.
 
@@ -42,11 +42,14 @@ matching the corresponding inputs.
 
 ## Notes
 
-- Dense `B=2` inputs are packed by the Megatron adapter before launch.
+- Dense inputs with any positive batch size are packed by the Megatron
+  adapter before launch.
 - The adapter promotes gate and beta inputs to FP32 and restores their gradient
   dtypes after the kernel returns.
 - When no final-state gradient is requested, the adapter supplies a cached zero
   `dht` tensor.
 - Packed-sequence metadata is cached by `cu_seqlens` identity and tensor
   version; mutating the tensor invalidates the cached metadata.
+- The compiled kernel is specialized and cached per sequence count; the
+  launch grid contains `B * 64` CTAs.
 - Unsupported shapes and dtypes fall back only in `auto` mode.

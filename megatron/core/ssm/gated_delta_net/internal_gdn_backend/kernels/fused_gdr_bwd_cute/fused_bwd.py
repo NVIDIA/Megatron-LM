@@ -6,12 +6,11 @@ Licensed under the MIT License.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import weakref
+from dataclasses import dataclass
 
 import torch
-
 
 _BT = 64
 _H = 64
@@ -22,6 +21,7 @@ _D = 128
 class _VarlenMetadata:
     _cu_seqlens_ref: weakref.ReferenceType
     chunk_offsets: torch.Tensor
+    num_sequences: int
     num_chunks: int
     uniform_sequence_length: int
 
@@ -54,9 +54,7 @@ def _check_sm100(tensor: torch.Tensor) -> None:
         raise ValueError("fused_gdr_bwd requires CUDA tensors")
     capability = torch.cuda.get_device_capability(tensor.device)
     if capability != (10, 0):
-        raise ValueError(
-            f"fused_gdr_bwd requires SM100, got capability {capability}"
-        )
+        raise ValueError(f"fused_gdr_bwd requires SM100, got capability {capability}")
 
 
 def _prepare_varlen_metadata(
@@ -80,20 +78,18 @@ def _prepare_varlen_metadata(
         return cached.metadata
 
     values = cu_seqlens.detach().cpu().tolist()
-    if len(values) != 3 or values[0] != 0 or values[-1] != total_tokens:
+    if len(values) < 2 or values[0] != 0 or values[-1] != total_tokens:
         raise ValueError(
-            f"cu_seqlens must be [0, split, {total_tokens}], got {values}"
+            "cu_seqlens must contain at least one sequence and span "
+            f"[0, {total_tokens}], got {values}"
         )
-    lengths = [values[1] - values[0], values[2] - values[1]]
+    lengths = [end - start for start, end in zip(values, values[1:])]
     if any(length <= 0 or length % chunk_size for length in lengths):
         raise ValueError(
-            "sequence lengths must be positive multiples of "
-            f"{chunk_size}, got {lengths}"
+            "sequence lengths must be positive multiples of " f"{chunk_size}, got {lengths}"
         )
     chunk_offsets = torch.tensor(
-        [0, lengths[0] // chunk_size, sum(lengths) // chunk_size],
-        dtype=torch.int32,
-        device=cu_seqlens.device,
+        [offset // chunk_size for offset in values], dtype=torch.int32, device=cu_seqlens.device
     )
 
     def remove_cached_owner(owner_ref):
@@ -105,11 +101,10 @@ def _prepare_varlen_metadata(
     metadata = _VarlenMetadata(
         _cu_seqlens_ref=owner_ref,
         chunk_offsets=chunk_offsets,
+        num_sequences=len(lengths),
         num_chunks=sum(lengths) // chunk_size,
         uniform_sequence_length=(
-            lengths[0]
-            if lengths and all(length == lengths[0] for length in lengths)
-            else 0
+            lengths[0] if lengths and all(length == lengths[0] for length in lengths) else 0
         ),
     )
     _METADATA_CACHE[key] = _MetadataEntry(
@@ -131,15 +126,11 @@ def _require_tensor(
     device: torch.device,
 ) -> None:
     if not isinstance(tensor, torch.Tensor):
-        raise TypeError(
-            f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
-        )
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
     if tensor.dtype != dtype:
         raise TypeError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
     if tuple(tensor.shape) != shape:
-        raise ValueError(
-            f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
-        )
+        raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
     if tensor.device != device:
         raise ValueError(f"{name} must be on {device}, got {tensor.device}")
     if not tensor.is_contiguous():
@@ -147,90 +138,44 @@ def _require_tensor(
 
 
 def _validate_inputs(
-    *,
-    q,
-    k,
-    v,
-    a,
-    g,
-    beta,
-    do,
-    dht,
-    h,
-    scale,
-    cu_seqlens,
-    chunk_size,
-    state_v_first,
+    *, q, k, v, a, g, beta, do, dht, h, scale, cu_seqlens, chunk_size, state_v_first
 ) -> None:
     if not isinstance(q, torch.Tensor):
-        raise TypeError(
-            f"q must be a torch.Tensor, got {type(q).__name__}"
-        )
+        raise TypeError(f"q must be a torch.Tensor, got {type(q).__name__}")
     _check_sm100(q)
     if q.ndim != 4:
         raise ValueError(f"q must be rank 4, got rank {q.ndim}")
     if type(chunk_size) is not int or chunk_size != _BT:
         raise ValueError(f"chunk_size must be {_BT}, got {chunk_size}")
     if state_v_first is not False:
-        raise NotImplementedError(
-            f"state_v_first={state_v_first!r} is not supported"
-        )
+        raise NotImplementedError(f"state_v_first={state_v_first!r} is not supported")
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError(f"scale must be finite and positive, got {scale}")
+    if not isinstance(cu_seqlens, torch.Tensor):
+        raise TypeError("cu_seqlens must be a torch.Tensor")
+    if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+        raise ValueError("cu_seqlens must be 1D and contain at least two offsets")
 
     total_tokens = q.shape[1]
+    num_sequences = cu_seqlens.numel() - 1
     device = q.device
     io_shape = (1, total_tokens, _H, _D)
     scalar_shape = (1, total_tokens, _H)
+    _require_tensor("q", q, dtype=torch.bfloat16, shape=io_shape, device=device)
+    _require_tensor("k", k, dtype=torch.bfloat16, shape=io_shape, device=device)
+    _require_tensor("v", v, dtype=torch.bfloat16, shape=io_shape, device=device)
+    _require_tensor("do", do, dtype=torch.bfloat16, shape=io_shape, device=device)
+    _require_tensor("a", a, dtype=torch.bfloat16, shape=(1, total_tokens, _H, _BT), device=device)
+    _require_tensor("g", g, dtype=torch.float32, shape=scalar_shape, device=device)
+    _require_tensor("beta", beta, dtype=torch.float32, shape=scalar_shape, device=device)
     _require_tensor(
-        "q", q, dtype=torch.bfloat16, shape=io_shape, device=device
+        "dht", dht, dtype=torch.float32, shape=(num_sequences, _H, _D, _D), device=device
     )
     _require_tensor(
-        "k", k, dtype=torch.bfloat16, shape=io_shape, device=device
+        "h", h, dtype=torch.bfloat16, shape=(1, total_tokens // _BT, _H, _D, _D), device=device
     )
     _require_tensor(
-        "v", v, dtype=torch.bfloat16, shape=io_shape, device=device
-    )
-    _require_tensor(
-        "do", do, dtype=torch.bfloat16, shape=io_shape, device=device
-    )
-    _require_tensor(
-        "a",
-        a,
-        dtype=torch.bfloat16,
-        shape=(1, total_tokens, _H, _BT),
-        device=device,
-    )
-    _require_tensor(
-        "g", g, dtype=torch.float32, shape=scalar_shape, device=device
-    )
-    _require_tensor(
-        "beta",
-        beta,
-        dtype=torch.float32,
-        shape=scalar_shape,
-        device=device,
-    )
-    _require_tensor(
-        "dht",
-        dht,
-        dtype=torch.float32,
-        shape=(2, _H, _D, _D),
-        device=device,
-    )
-    _require_tensor(
-        "h",
-        h,
-        dtype=torch.bfloat16,
-        shape=(1, total_tokens // _BT, _H, _D, _D),
-        device=device,
-    )
-    _require_tensor(
-        "cu_seqlens",
-        cu_seqlens,
-        dtype=torch.int32,
-        shape=(3,),
-        device=device,
+        "cu_seqlens", cu_seqlens, dtype=torch.int32, shape=(num_sequences + 1,), device=device
     )
 
 
@@ -252,19 +197,7 @@ def _launch_fused_gdr_bwd_out(**kwargs):
 
 
 def fused_gdr_bwd(
-    q,
-    k,
-    v,
-    a,
-    g,
-    beta,
-    do,
-    dht,
-    h,
-    scale=None,
-    cu_seqlens=None,
-    chunk_size=64,
-    state_v_first=False,
+    q, k, v, a, g, beta, do, dht, h, scale=None, cu_seqlens=None, chunk_size=64, state_v_first=False
 ):
     if cu_seqlens is None:
         raise NotImplementedError("packed cu_seqlens are required")
@@ -286,9 +219,7 @@ def fused_gdr_bwd(
         chunk_size=chunk_size,
         state_v_first=state_v_first,
     )
-    metadata = _prepare_varlen_metadata(
-        cu_seqlens, total_tokens=q.shape[1], chunk_size=chunk_size
-    )
+    metadata = _prepare_varlen_metadata(cu_seqlens, total_tokens=q.shape[1], chunk_size=chunk_size)
     outputs = _allocate_outputs(q, k, v, g, beta, dht)
     _launch_fused_gdr_bwd_out(
         q=q,

@@ -38,7 +38,7 @@ _CHUNK_SIZE = 64
 _BACKEND_ENV = "MCORE_GDN_INTERNAL_BACKEND"
 _FUSED_BWD_HEADS = 64
 _FUSED_BWD_HEAD_DIM = 128
-_fused_bwd_zero_dht_cache: dict[tuple[str, int | None], torch.Tensor] = {}
+_fused_bwd_zero_dht_cache: dict[tuple[str, int | None, int], torch.Tensor] = {}
 
 
 def _call_fla_compat(function, **kwargs):
@@ -200,39 +200,47 @@ def _fused_bwd_support_reason(
         return "g and beta must match q's BTH shape"
     if A.dtype != torch.bfloat16 or A.shape != (*scalar_shape, _CHUNK_SIZE):
         return "A must be bf16 with shape BTH64"
-    if dht is not None and (
-        dht.dtype != torch.float32
-        or dht.shape != (2, _FUSED_BWD_HEADS, _FUSED_BWD_HEAD_DIM, _FUSED_BWD_HEAD_DIM)
-    ):
-        return "dht must be float32 with shape (2, 64, 128, 128)"
     if cu_seqlens is None:
-        if q.shape[0] != 2:
-            return "dense fused backward requires batch size 2"
+        num_sequences = q.shape[0]
+        if num_sequences < 1:
+            return "dense fused backward requires a positive batch size"
         if q.shape[1] % _CHUNK_SIZE:
             return "sequence length must be divisible by 64"
-        return None
-    if q.shape[0] != 1:
-        return "packed fused backward requires batch size 1"
-    if cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_contiguous() or cu_seqlens.numel() != 3:
-        return "cu_seqlens must be contiguous int32 for exactly two sequences"
-    bounds = cu_seqlens.detach().cpu().tolist()
-    if bounds[0] != 0 or bounds[-1] != q.shape[1]:
-        return "cu_seqlens bounds do not match the packed token count"
-    if any(end <= start or (end - start) % _CHUNK_SIZE for start, end in zip(bounds, bounds[1:])):
-        return "every packed sequence length must be a positive multiple of 64"
+    else:
+        if q.shape[0] != 1:
+            return "packed fused backward requires batch size 1"
+        if (
+            cu_seqlens.dtype != torch.int32
+            or not cu_seqlens.is_contiguous()
+            or cu_seqlens.numel() < 2
+        ):
+            return "cu_seqlens must be contiguous int32 with at least two offsets"
+        bounds = cu_seqlens.detach().cpu().tolist()
+        if bounds[0] != 0 or bounds[-1] != q.shape[1]:
+            return "cu_seqlens bounds do not match the packed token count"
+        if any(
+            end <= start or (end - start) % _CHUNK_SIZE for start, end in zip(bounds, bounds[1:])
+        ):
+            return "every packed sequence length must be a positive multiple of 64"
+        num_sequences = len(bounds) - 1
+    if dht is not None and (
+        dht.dtype != torch.float32
+        or dht.shape != (num_sequences, _FUSED_BWD_HEADS, _FUSED_BWD_HEAD_DIM, _FUSED_BWD_HEAD_DIM)
+    ):
+        return f"dht must be float32 with shape ({num_sequences}, 64, 128, 128)"
     return None
 
 
-def _fused_bwd_zero_dht(device: torch.device) -> torch.Tensor:
+def _fused_bwd_zero_dht(device: torch.device, num_sequences: int) -> torch.Tensor:
     device = torch.device(device)
     device_index = device.index
     if device.type == "cuda" and device_index is None:
         device_index = torch.cuda.current_device()
-    key = (device.type, device_index)
+    key = (device.type, device_index, num_sequences)
     cached = _fused_bwd_zero_dht_cache.get(key)
     if cached is None or cached.device != device:
         cached = torch.zeros(
-            (2, _FUSED_BWD_HEADS, _FUSED_BWD_HEAD_DIM, _FUSED_BWD_HEAD_DIM),
+            (num_sequences, _FUSED_BWD_HEADS, _FUSED_BWD_HEAD_DIM, _FUSED_BWD_HEAD_DIM),
             dtype=torch.float32,
             device=device,
         )
@@ -261,6 +269,7 @@ def _call_fused_gdr_bwd_cute(
     launch_cu_seqlens = (
         _dense_cu_seqlens(batch_size, seqlen, q.device) if cu_seqlens is None else cu_seqlens
     )
+    num_sequences = launch_cu_seqlens.numel() - 1
     h = _recompute_fused_bwd_h(
         k=k, v=v, g=g, beta=beta, A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
     )
@@ -268,7 +277,9 @@ def _call_fused_gdr_bwd_cute(
     launch_h = launch_h.to(torch.bfloat16).contiguous()
     launch_g = g.detach().reshape(1, total_tokens, num_heads).to(torch.float32).contiguous()
     launch_beta = beta.detach().reshape(1, total_tokens, num_heads).to(torch.float32).contiguous()
-    launch_dht = _fused_bwd_zero_dht(q.device) if dht is None else dht.detach().contiguous()
+    launch_dht = (
+        _fused_bwd_zero_dht(q.device, num_sequences) if dht is None else dht.detach().contiguous()
+    )
 
     dq, dk, dv, dg, db, _dh0 = fused_gdr_bwd(
         q=q.detach().reshape(1, total_tokens, num_heads, head_size).contiguous(),
@@ -426,12 +437,12 @@ def _can_use_fused_bwd_forward(
     if any(not tensor.is_contiguous() for tensor in (q, k, v)):
         return False
     if cu_seqlens is None:
-        return q.shape[0] == 2 and q.shape[1] % _CHUNK_SIZE == 0
+        return q.shape[0] >= 1 and q.shape[1] % _CHUNK_SIZE == 0
     return (
         q.shape[0] == 1
         and cu_seqlens.dtype == torch.int32
         and cu_seqlens.is_contiguous()
-        and cu_seqlens.numel() == 3
+        and cu_seqlens.numel() >= 2
         and _aligned_sequence_lengths(cu_seqlens, cu_seqlens_cpu)
     )
 
