@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import time
+import uuid
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
@@ -366,6 +367,9 @@ class DynamicInferenceRequest(InferenceRequest):
     """
 
     request_id: int
+    # `request_id` is per-engine, do not cross DP, and do not persist.
+    # A uuid is globally unique and can be used to track down individual requests.
+    uid: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
@@ -748,6 +752,7 @@ class DynamicInferenceRequestRecord:
         # Merged request.
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
+            uid=self.requests[0].uid,
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             prompt_log_probs=self.requests[0].prompt_log_probs,
@@ -800,6 +805,34 @@ class DynamicInferenceRequestRecord:
         request = cls(**obj)
         request.requests = [DynamicInferenceRequest.deserialize(r) for r in obj["requests"]]
         return request
+
+
+@dataclass
+class FinishedRequestRecord:
+    """Stores per-request metadata that is not meant to be passed through the RESTful server."""
+
+    policy_epoch: Optional[list[tuple[int, int]]]
+    kv_cache_epoch: Optional[list[tuple[int, int]]]
+    num_evictions: int
+
+    @classmethod
+    def from_request(cls, request: "DynamicInferenceRequest") -> "FinishedRequestRecord":
+        """Build the request's non-RESTful metadata from a finished request."""
+        # Epoch stamps exist only while the engine has a generation epoch set.
+        record = cls(
+            policy_epoch=(
+                None if request.policy_epoch is None else [tuple(b) for b in request.policy_epoch]
+            ),
+            kv_cache_epoch=(
+                None
+                if request.kv_cache_epoch is None
+                else [tuple(b) for b in request.kv_cache_epoch]
+            ),
+            num_evictions=sum(
+                1 for event in request.events if event.type is DynamicInferenceEventType.EVICT
+            ),
+        )
+        return record
 
 
 @dataclass(kw_only=True)

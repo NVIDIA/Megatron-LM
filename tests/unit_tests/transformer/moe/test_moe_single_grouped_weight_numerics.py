@@ -190,6 +190,7 @@ class TestMoESingleGroupedWeightNumerics:
         args.overlap_grad_reduce = overlap_grad_reduce
         args.accumulate_allreduce_grads_in_fp32 = grad_reduce_in_fp32
         args.ddp_bucket_size = 40960
+        args.save_tokenizer_assets = False
 
         args.num_experts = 2
         args.moe_layer_freq = 1

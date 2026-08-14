@@ -1475,3 +1475,50 @@ class TestGTPGraphWgradRing:
         assert rs_input is weights[1]._gtp_graph_wgrad_ring_slot.tensor
         torch.testing.assert_close(rs_input[:4], wgrad)
         assert torch.count_nonzero(rs_input[4:]) == 0
+
+
+class TestActivationRecomputePhaseFlag:
+    """GTP's forward-only readiness gate rests on TE's recompute flag being dtype-agnostic."""
+
+    def test_recompute_phase_flag_is_set_under_bf16(self):
+        """``in_activation_recompute_phase`` must be True for BF16 recompute, not just FP8.
+
+        GTP aliases TE's ``in_fp8_activation_recompute_phase`` under a name without ``fp8``
+        because TE assigns the underlying global unconditionally. ``_all_gather_weight`` uses it
+        to skip publishing during recompute (see
+        ``test_gtp_ddp_param_sync_race.py::test_recompute_forward_does_not_request_publication``).
+        If TE ever made it FP8-only, BF16 recompute would start asking DDP to publish inside
+        backward -- silently, since the failure is a wrong-buffer gather rather than an error.
+        """
+        _requires_multi_gpu(1)
+        import transformer_engine.pytorch as te
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        assert not FP8GlobalStateManager.is_fp8_enabled(), "must run outside fp8_autocast"
+
+        hidden, dtype = 128, torch.bfloat16
+        observed = []
+
+        class _Probe(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = te.Linear(hidden, hidden, bias=False, params_dtype=dtype, device="cuda")
+
+            def forward(self, x):
+                observed.append(gtp_module.in_activation_recompute_phase())
+                return self.lin(x)
+
+        x = torch.randn(8, hidden, dtype=dtype, device="cuda", requires_grad=True)
+        out = te.checkpoint(
+            _Probe(),
+            x,
+            distribute_saved_activations=False,
+            get_rng_state_tracker=None,
+            tp_group=None,
+        )
+        out.sum().backward()  # replays the forward -> second observation
+
+        assert observed == [False, True], (
+            f"expected [original fwd=False, recompute fwd=True], got {observed}: "
+            "in_activation_recompute_phase no longer tracks BF16 activation recompute"
+        )
