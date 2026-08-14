@@ -278,6 +278,30 @@ class FsdpParameterGroup:
         # stream before capture ends.
         current_stream.wait_stream(allgather_stream)
 
+    def sync_model_weight_from_unsharded_weight(self) -> None:
+        """Copy reset unsharded weights back into the sharded buffers, aligned across ranks.
+
+        After ``reset_parameters()`` writes the full (Replicate) unsharded weight,
+        each rank holds independently-sampled values. Broadcast the full weight from
+        rank 0 of every mesh dimension so all ranks align, then scatter it back into
+        the sharded optimizer main weight and the compute model weight.
+        """
+        unsharded = self._unsharded_model_weight
+        for mesh_dim in range(self.mesh.ndim):
+            group = self.mesh.get_group(mesh_dim=mesh_dim)
+            if torch.distributed.get_world_size(group) == 1:
+                continue
+            src_rank = torch.distributed.get_global_rank(group, 0)
+            torch.distributed.broadcast(unsharded.local_buffer, src=src_rank, group=group)
+
+        if self.main_weight is not self.model_weight:
+            unsharded.cast(self.main_weight.dtype).redistribute(
+                self.main_weight.placements, out=self.main_weight
+            )
+        unsharded.cast(self.model_weight.dtype).redistribute(
+            self.model_weight.placements, out=self.model_weight
+        )
+
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
         # In ZeRO-1, the post-step cast leaves model_weight sharded. Only the first
