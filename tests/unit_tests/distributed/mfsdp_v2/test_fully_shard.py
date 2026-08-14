@@ -978,7 +978,7 @@ def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, m
     sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
 
     def make_count_sync(parameter_group):
-        sync_model_weight = parameter_group.sync_main_weight_to_model_weight
+        sync_model_weight = parameter_group.sync_model_weight_from_main_weight
 
         def count_sync():
             sync_counts[parameter_group] += 1
@@ -988,7 +988,7 @@ def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, m
 
     for parameter_group in parameter_groups:
         monkeypatch.setattr(
-            parameter_group, "sync_main_weight_to_model_weight", make_count_sync(parameter_group)
+            parameter_group, "sync_model_weight_from_main_weight", make_count_sync(parameter_group)
         )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
@@ -1107,7 +1107,7 @@ def test_meta_parameters_shard_to_mesh_device(distributed_setup):
     # model weights. This simulates load_checkpoint() until
     # https://github.com/NVIDIA/Megatron-LM/pull/6024 lands and syncs after loading.
     for parameter_group in model.parameter_groups:
-        parameter_group.sync_main_weight_to_model_weight()
+        parameter_group.sync_model_weight_from_main_weight()
 
     output = model(torch.ones(1, 4, device=device, dtype=torch.bfloat16))
     torch.testing.assert_close(output, torch.full_like(output, 96.0))

@@ -50,7 +50,7 @@ def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> 
     """Sync MFSDP compute weights for parameter groups represented by ``parameters``.
 
     Parameters outside the experimental MFSDP path are ignored. A parameter group
-    may own multiple parameters, but its compute-weight buffer is cast once.
+    may own multiple parameters, but its compute-weight buffer is synced once.
     """
     seen_parameter_groups = set()
     for parameter in parameters:
@@ -59,7 +59,7 @@ def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> 
         if parameter_group in seen_parameter_groups:
             continue
         seen_parameter_groups.add(parameter_group)
-        parameter_group.sync_main_weight_to_model_weight()
+        parameter_group.sync_model_weight_from_main_weight()
 
 
 @dataclass(frozen=True, eq=False)
@@ -263,7 +263,7 @@ class FsdpParameterGroup:
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
-    def sync_main_weight_to_model_weight(self) -> None:
+    def sync_model_weight_from_main_weight(self) -> None:
         """Sync optimizer weights to the model-weight representation."""
         context = self._get_context()
         allgather_stream = context.allgather_stream
