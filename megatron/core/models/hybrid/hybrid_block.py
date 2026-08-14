@@ -269,9 +269,19 @@ class HybridStack(MegatronModule):
                     continue
 
                 paired_type = self.layer_type_list[i]
-                if paired_type not in (LayerSymbols.MAMBA, LayerSymbols.ATTENTION):
-                    raise ValueError("Shortcut MoE must be preceded by a Mamba or attention layer")
+                if paired_type not in (
+                    LayerSymbols.MAMBA,
+                    LayerSymbols.GDN,
+                    LayerSymbols.ATTENTION,
+                ):
+                    raise ValueError(
+                        "Shortcut MoE must be preceded by a Mamba, GDN, or attention layer"
+                    )
                 paired_layer = self.layers[i]
+                if not getattr(paired_layer, '_supports_split_input_output', False):
+                    raise ValueError(
+                        f"{paired_type.name} does not support split input/output execution"
+                    )
                 moe_layer = self.layers[i + 1]
                 enable_cudagraph = (
                     getattr(paired_layer, '_shortcut_graph_output_proj', False)

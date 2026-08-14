@@ -735,18 +735,6 @@ class TransformerConfig(ModelParallelConfig):
     num_moe_experts > 0. Mutually exclusive with moe_shared_expert_overlap and unsupported with
     full activation recomputation."""
 
-    moe_shortcut_scalar_gate: bool = False
-    """Enable a learned scalar gate for combining routed and shared expert outputs in ScMoE.
-    Applies sigmoid(alpha) * routed_output before adding shared expert output, where alpha
-    is a single learnable parameter initialized to 0 (sigmoid=0.5). Requires
-    moe_shortcut_connection = True. Mutually exclusive with moe_shortcut_vector_gate."""
-
-    moe_shortcut_vector_gate: bool = False
-    """Enable a learned vector gate for interpolating routed and shared expert outputs in ScMoE.
-    Computes sigmoid(v) * routed_output + (1 - sigmoid(v)) * shared_output, where v is a
-    learnable vector of shape [hidden_size] initialized to 0. Requires
-    moe_shortcut_connection = True. Mutually exclusive with moe_shortcut_scalar_gate."""
-
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
@@ -958,9 +946,6 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
-
-    moe_use_norm_before_up_proj: bool = False
-    """Apply normalization before the latent MoE up-projection. Requires moe_latent_size."""
 
     gtp_remat_opt_in_modules: list[str] = field(default_factory=list)
     """Extra modules to apply GTP_remat weight sharding to, beyond the default set (attention,
@@ -1727,6 +1712,11 @@ class TransformerConfig(ModelParallelConfig):
             assert self.num_moe_experts is not None and self.num_moe_experts > 0, (
                 "moe_shortcut_connection requires MoE to be enabled (num_moe_experts > 0)"
             )
+            if self.recompute_granularity == 'full':
+                raise ValueError(
+                    "moe_shortcut_connection is not supported with full activation "
+                    "recomputation"
+                )
             if self.moe_shared_expert_overlap:
                 raise ValueError(
                     "moe_shortcut_connection is mutually exclusive with "
@@ -1739,27 +1729,6 @@ class TransformerConfig(ModelParallelConfig):
             )
             assert self.num_moe_experts is not None and self.num_moe_experts > 0, (
                 "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
-            )
-            if self.recompute_granularity == 'full':
-                raise ValueError(
-                    "moe_shortcut_parallel is not supported with full activation recomputation; "
-                    "full recomputation executes layers sequentially and cannot preserve the "
-                    "shortcut communication-overlap schedule"
-                )
-
-        for flag_name in [
-            'moe_shortcut_scalar_gate',
-            'moe_shortcut_vector_gate',
-        ]:
-            if getattr(self, flag_name):
-                assert self.moe_shortcut_connection, (
-                    f"{flag_name} requires moe_shortcut_connection = True"
-                )
-
-        if self.moe_shortcut_scalar_gate and self.moe_shortcut_vector_gate:
-            raise ValueError(
-                "moe_shortcut_scalar_gate and moe_shortcut_vector_gate are mutually exclusive. "
-                "Use only one gating strategy."
             )
 
         if self.moe_shared_expert_intermediate_size is not None:

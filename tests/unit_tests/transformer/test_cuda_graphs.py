@@ -37,7 +37,6 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
-    create_cudagraphs,
     _copy_cudagraph_buffer_metadata,
     create_cudagraphs,
     mark_cuda_graph_prebound_input,

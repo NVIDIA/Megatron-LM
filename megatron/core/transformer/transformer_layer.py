@@ -276,7 +276,6 @@ class TransformerLayerSubmodules:
     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_mlp_layernorm: LayerNormBuilder = IdentityOp
-    shortcut_pre_mlp_layernorm: LayerNormBuilder = IdentityOp
     mlp: MlpBuilder | type[IdentityOp] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
@@ -378,6 +377,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             **attention_optional_kwargs,
             name=(name + ".self_attention") if name is not None else None,
         )
+        self._supports_split_input_output = getattr(
+            self.self_attention, '_supports_split_input_output', False
+        )
 
         # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
@@ -407,16 +409,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
-        # [Module 7b: Shortcut Pre MLP] Separate layernorm for ScMoE shortcut input.
-        # Uses a dedicated module so that its gradient accumulator hook fires independently
-        # from pre_mlp_layernorm, which is required for correct DDP overlap_grad_reduce
-        # bookkeeping when CUDA graphs are enabled.
-        if self.config.moe_shortcut_connection:
-            self.shortcut_pre_mlp_layernorm = submodules.shortcut_pre_mlp_layernorm(
-                config=self.config,
-                hidden_size=self.config.hidden_size,
-                eps=self.config.layernorm_epsilon,
-            )
         # [Module 8: MLP block]
         # import here to avoid circular import
         from megatron.core.extensions.transformer_engine import TEFusedMLP
@@ -708,8 +700,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if getattr(self.self_attention, '_supports_split_input_output', False):
             attention_output_with_bias = self.self_attention.output_proj(attention_intermediate)
         else:
-            # GDN, identity attention, and external attention implementations retain their
-            # original atomic forward. Only standard Attention subclasses are split.
+            # Identity attention and implementations with a specialized forward retain their
+            # original atomic path.
             attention_output_with_bias = attention_intermediate
 
         if self.recompute_input_layernorm:
@@ -980,7 +972,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Normalize shortcut for ScMoE routing
         shortcut_input = None
         if shortcut_hidden is not None and self.config.moe_shortcut_connection:
-            shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
+            shortcut_input = apply_module(self.pre_mlp_layernorm)(shortcut_hidden)
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -1275,12 +1267,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.is_moe_layer and CudaGraphModule.moe in self.config.cuda_graph_modules
         ):
             submodules += [self.pre_mlp_layernorm, self.mlp]
-            if self.is_moe_layer and self.config.moe_shortcut_connection:
-                submodules += [self.shortcut_pre_mlp_layernorm]
         elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
             submodules += [self.pre_mlp_layernorm, self.mlp.router]
-            if self.config.moe_shortcut_connection:
-                submodules += [self.shortcut_pre_mlp_layernorm]
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
@@ -1827,7 +1815,7 @@ class MoETransformerLayer(TransformerLayer):
         # Normalize shortcut for ScMoE routing
         shortcut_input = None
         if shortcut_hidden is not None and self.config.moe_shortcut_connection:
-            shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
+            shortcut_input = apply_module(self.pre_mlp_layernorm)(shortcut_hidden)
 
         hidden_states, probs, shared_expert_output = apply_module(self.mlp)(
             pre_mlp_layernorm_output,
@@ -1975,7 +1963,7 @@ class MoETransformerLayer(TransformerLayer):
 
     def shortcut_route_preprocess(self, shortcut_hidden, padding_mask=None):
         """Run shortcut normalization, routing, and dispatch preprocessing."""
-        shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
+        shortcut_input = apply_module(self.pre_mlp_layernorm)(shortcut_hidden)
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
         probs, routing_map = self.mlp.route(shortcut_input, padding_mask)

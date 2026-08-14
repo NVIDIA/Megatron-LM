@@ -226,10 +226,7 @@ hybrid_stack_spec = ModuleSpec(
         moe_layer=ModuleSpec(
             module=MoETransformerLayer,
             submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm,
-                shortcut_pre_mlp_layernorm=TENorm,
-                mlp=moe,
-                mlp_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),
         ),
         mtp_block_spec=_hybrid_mtp_block_spec,
@@ -364,10 +361,7 @@ hybrid_inference_stack_spec = ModuleSpec(
             # Use inference-optimized MoE layer for end-to-end CUDA graph support
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm,
-                shortcut_pre_mlp_layernorm=TENorm,
-                mlp=moe_inference,
-                mlp_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=TENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add
             ),
         ),
         mtp_block_spec=ModuleSpec(

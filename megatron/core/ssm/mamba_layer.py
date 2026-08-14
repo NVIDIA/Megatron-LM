@@ -90,6 +90,9 @@ class MambaLayer(GraphableMegatronModule):
             pp_layer_offset=pp_layer_offset,
             name=(name + f".mixer") if name is not None else None,
         )
+        self._supports_split_input_output = getattr(
+            self.mixer, '_supports_split_input_output', False
+        )
         self.norm = submodules.norm(
             config=self.config,
             hidden_size=self.config.hidden_size,
@@ -175,27 +178,48 @@ class MambaLayer(GraphableMegatronModule):
     def forward(
         self,
         hidden_states: Tensor,
-        attention_mask: Optional[Tensor] = None,
+        attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
         inference_context: Optional[BaseInferenceContext] = None,
-        rotary_pos_emb: Optional[Tensor] = None,
-        sequence_len_offset: Optional[int] = None,
-        padding_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
-        """Run the two Mamba phases with behavior identical to the original forward."""
-        ssm_output, residual = self.input_proj_ssm(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            sequence_len_offset=sequence_len_offset,
-            padding_mask=padding_mask,
-            inference_params=inference_params,
-            packed_seq_params=packed_seq_params,
+        """
+        Perform a forward pass through the Mamba layer.
+
+        This method implements the core computation of a Mamba layer, including
+        the convolution and the selective SSM/SSD.
+
+        Args:
+            hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
+                b is batch size, and h is hidden size.
+            attention_mask (Tensor): Mask tensor for self-attention. Not used by this layer.
+            inference_context (BaseInferenceContext, optional): Parameters for inference-time
+                optimizations.
+            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+
+        Returns:
+            output (Tensor): Transformed hidden states of shape [s, b, h].
+        """
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
+
+        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
+        hidden_states = apply_module(self.norm)(hidden_states)
+        mixer_out_with_bias = self.mixer(
+            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
         )
-        return self.output_proj(ssm_output, residual)
+
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self.mamba_bda(
+                training=self.training, fused=self.config.bias_dropout_fusion
+            )(mixer_out_with_bias, residual, self.hidden_dropout)
+
+        return hidden_states
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

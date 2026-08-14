@@ -74,7 +74,6 @@ def test_shortcut_composite_modules_propagate_layer_boundaries():
             self.layer_number = 2
             self.is_first_layer = False
             self.is_last_layer = True
-            self.shortcut_pre_mlp_layernorm = torch.nn.Identity()
             self.pre_mlp_layernorm = torch.nn.Identity()
             self.mlp = FakeMLP()
 
@@ -90,6 +89,10 @@ def test_shortcut_composite_modules_propagate_layer_boundaries():
     assert not block.route_input_compute.is_last_layer
     assert not block.output_shared.is_first_layer
     assert block.output_shared.is_last_layer
+    assert (
+        block.route_input_compute.shared_pre_mlp_layernorm
+        is block.output_shared.shared_pre_mlp_layernorm
+    )
 
 
 def test_persistent_buffer_releases_strong_reference_once(monkeypatch):

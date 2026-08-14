@@ -48,7 +48,7 @@ it does not pollute the dynamic decode/prefill hooks defined here.
 
 from __future__ import annotations
 
-from typing import Tuple, Union
+from typing import Tuple
 
 import torch
 
@@ -119,11 +119,8 @@ class SSMDynamicInferenceMixin:
     # Shared orchestration.
     # ------------------------------------------------------------------
     def ssm_dynamic_inference(
-        self,
-        hidden_states: torch.Tensor,
-        context: DynamicInferenceContext,
-        apply_output_proj: bool = True,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        self, hidden_states: torch.Tensor, context: DynamicInferenceContext
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Execute one dynamic inference step for a linear-attention mixer.
 
         Separates decode and prefill requests, runs them through the
@@ -207,4 +204,4 @@ class SSMDynamicInferenceMixin:
         if is_using_quantization_scales(self.config):
             y[context.padding_slice] = 0.0
 
-        return self.out_proj(y) if apply_output_proj else y
+        return self.out_proj(y)

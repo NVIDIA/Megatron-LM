@@ -212,9 +212,7 @@ class MoETokenDispatcher:
             hidden_states (torch.Tensor): Combined hidden states from token combination
 
         Returns:
-            A tuple (output, deferred_shared_expert_output). The second element is non-None
-            only when the dispatcher computed a shared-expert output (via overlap) but the
-            MoE layer wants to combine it itself (e.g., moe_shortcut_vector_gate).
+            The postprocessed output tensor.
         """
         raise NotImplementedError("combine_postprocess function not implemented.")
 
@@ -378,7 +376,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
     def combine_postprocess(self, hidden_states):
         """Restores the original tensor shape."""
-        return hidden_states.view(self.hidden_shape), None
+        return hidden_states.view(self.hidden_shape)
 
 
 class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
@@ -918,16 +916,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
 
-        # Add shared experts output. Defer the add to MoELayer.postprocess only when vector-gate
-        # interpolation needs the shared-expert output separately.
-        deferred_shared_expert_output = None
+        # Add shared experts output.
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
-            if self.config.moe_shortcut_vector_gate:
-                deferred_shared_expert_output = shared_expert_output
-            else:
-                output += shared_expert_output
-        return output, deferred_shared_expert_output
+            output += shared_expert_output
+        return output
 
     def _maybe_update_cuda_sync_point(self, point: str):
         """
@@ -2082,7 +2075,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.linear_fc2_forward(hidden_states)
             self.shared_experts.post_forward_comm()
             hidden_states += self.shared_experts.get_output()
-        return hidden_states.view(self.hidden_shape), None
+        return hidden_states.view(self.hidden_shape)
 
     def check_over_budget(self):
         """Check if the dispatcher has exceeded its budget."""

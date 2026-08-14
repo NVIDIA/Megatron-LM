@@ -105,7 +105,7 @@ class _RouteInputCompute(GraphableMegatronModule):
         self.is_first_layer = getattr(compute_layer, "is_first_layer", False)
         self.is_last_layer = getattr(compute_layer, "is_last_layer", False)
         self.compute_layer = compute_layer
-        self.shortcut_pre_mlp_layernorm = moe_layer.shortcut_pre_mlp_layernorm
+        self.shared_pre_mlp_layernorm = moe_layer.pre_mlp_layernorm
         self.moe_mlp = moe_layer.mlp
         self._is_mamba = is_mamba
 

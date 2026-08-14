@@ -249,6 +249,7 @@ class TestGDPPackedSequence:
     def test_split_compute_interface_matches_forward(self, seq_lens):
         """GDP's shortcut-MoE split interface preserves its regular forward output."""
         _, mixer, config, _, _ = _build_cp_pair()
+        assert mixer._supports_split_input_output
         mixer.eval()
         hidden_full, psp = _make_hidden_packed(seq_lens, config.hidden_size)
 

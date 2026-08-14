@@ -466,6 +466,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             D_has_hdim=self.D_has_hdim,
         )
         self.tp_group = pg_collection.tp
+        self._supports_split_input_output = True
 
     def input_proj_ssm(
         self,
@@ -489,9 +490,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         if in_inference_mode and inference_context is not None:
             if inference_context.is_dynamic_batching():
-                return self.ssm_dynamic_inference(
-                    hidden_states, inference_context, apply_output_proj=False
-                )
+                return self.ssm_dynamic_inference(hidden_states, inference_context)
             else:
                 assert inference_context.is_static_batching()
                 assert not self.config.batch_invariant_mode, (
@@ -502,7 +501,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
                 if inference_context.seqlen_offset > 0:
                     # The states are updated inplace
-                    return self._static_decode(hidden_states, conv_state, ssm_state)
+                    out, out_bias = self._static_decode(hidden_states, conv_state, ssm_state)
+                    return out, out_bias
 
         zxBCdt, _ = self.in_proj(hidden_states)
 
@@ -534,12 +534,21 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Run the input projection/SSM phase followed by the output projection."""
+        inference_context = deprecate_inference_params(inference_context, inference_params)
         y = self.input_proj_ssm(
             hidden_states,
             inference_context=inference_context,
-            inference_params=inference_params,
             packed_seq_params=packed_seq_params,
         )
+        if (
+            InferenceMode.is_active()
+            and inference_context is not None
+            and (
+                inference_context.is_dynamic_batching()
+                or inference_context.seqlen_offset > 0
+            )
+        ):
+            return y
         return self.output_proj(y)
 
     # ==================================================================
@@ -551,7 +560,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
     # `ssm_prefill`) so that static-batching bookkeeping does not pollute the
     # dynamic inference interface defined by `SSMDynamicInferenceMixin`.
     # ==================================================================
-    def _static_decode(self, hidden_states, conv_state, ssm_state) -> torch.Tensor:
+    def _static_decode(
+        self, hidden_states, conv_state, ssm_state
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Single-token static-batching decode step (updates state in place)."""
         # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
         assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
@@ -564,7 +575,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         # Static batching has no slot remapping, so batch_indices is None.
         y = self.ssm_decode(zxBCdt, conv_state=conv_state, ssm_state=ssm_state, batch_indices=None)
 
-        return y
+        # y has shape (1, b, d_inner), which is what out_proj expects
+        out, out_bias = self.out_proj(y)
+
+        return out, out_bias
 
     def _static_prefill(
         self,

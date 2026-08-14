@@ -2110,8 +2110,6 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     # ScMoE shortcut-connection args.
     _set_arg('moe_shortcut_connection', force=True)
     _set_arg('moe_shortcut_parallel', force=True)
-    _set_arg('moe_shortcut_scalar_gate', force=True)
-    _set_arg('moe_shortcut_vector_gate', force=True)
 
     # Mamba args.
     _set_arg('mamba_state_dim', force=True)

@@ -83,15 +83,7 @@ class TestMoELayerInit:
         moe_layer = MoELayer(self.transformer_config, submodules)
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize(
-        "shortcut_options",
-        [
-            {"moe_shortcut_vector_gate": True},
-            {"moe_shortcut_scalar_gate": True},
-            {},
-        ],
-    )
-    def test_shortcut_parameters_marked_sequence_parallel(self, shortcut_options):
+    def test_shortcut_parameters_marked_sequence_parallel(self):
         """Replicated shortcut parameters must have their gradients reduced across TP ranks."""
         Utils.initialize_model_parallel(1, 1)
         config = TransformerConfig(
@@ -106,7 +98,6 @@ class TestMoELayerInit:
             add_bias_linear=False,
             sequence_parallel=True,
             moe_shortcut_connection=True,
-            **shortcut_options,
         )
         submodules = get_submodules(
             get_gpt_layer_local_submodules(num_experts=1, moe_grouped_gemm=False).mlp

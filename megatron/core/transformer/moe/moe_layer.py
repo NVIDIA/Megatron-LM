@@ -67,9 +67,9 @@ except ImportError:
     HAVE_TRITON = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, TENorm, te_checkpoint
+    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 else:
-    TELinear, TENorm, te_checkpoint = None, None, None
+    TELinear, te_checkpoint = None, None
 
 
 class ExpertsInterface(Protocol):
@@ -299,12 +299,6 @@ class MoELayer(BaseMoELayer):
                 name=(name + ".fc1_latent_proj") if name is not None else None,
                 gtp_remat_group=gtp_remat_group,
             )
-            if self.config.moe_use_norm_before_up_proj:
-                self.fc2_norm = TENorm(
-                    config=self.config,
-                    hidden_size=self.config.moe_latent_size,
-                    eps=self.config.layernorm_epsilon,
-                )
             self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
@@ -368,18 +362,8 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
-        # Shortcut gating and normalization modules
-        self._shortcut_scalar_gate = None
-        self._shortcut_gate_vector = None
+        # Shortcut normalization module
         self._shortcut_post_norm = None
-
-        if self.config.moe_shortcut_scalar_gate:
-            self._shortcut_scalar_gate = torch.nn.Parameter(torch.zeros(1))
-
-        if self.config.moe_shortcut_vector_gate:
-            self._shortcut_gate_vector = torch.nn.Parameter(
-                torch.zeros(self.config.hidden_size)
-            )
 
         if self.config.moe_shortcut_connection:
             # Use plain torch RMSNorm since the forward normalization is local to each token.
@@ -390,11 +374,7 @@ class MoELayer(BaseMoELayer):
         # These parameters are replicated across TP ranks, but under sequence parallel each
         # rank sees a different sequence shard. Mark them so finalize_model_grads performs the
         # required TP gradient all-reduce, just as it does for router and normalization weights.
-        replicated_parameters = [self._shortcut_scalar_gate, self._shortcut_gate_vector]
         replicated_modules = [self._shortcut_post_norm]
-        for parameter in replicated_parameters:
-            if parameter is not None:
-                setattr(parameter, 'sequence_parallel', self.config.sequence_parallel)
         for module in replicated_modules:
             if module is not None:
                 for parameter in module.parameters():
@@ -648,34 +628,19 @@ class MoELayer(BaseMoELayer):
         Operation order:
           1. combine_postprocess (un-permute, weight)
           2. latent projection (if moe_latent_size)
-          3. scalar_gate: sigmoid(alpha) * output (if moe_shortcut_scalar_gate)
-          4. combine with shared: vector_gate interpolation or plain addition
-          5. add zero expert output
-          6. post_norm
+          3. combine with shared and zero expert outputs
+          4. post_norm
 
         _latent_shared_expert_output is inference-only (latent-MoE + NVLS dispatcher with
         shared-expert overlap). It is populated in preprocess and joined here, after
         fc2_latent_proj, so the dimensions match the full hidden dim."""
 
-        output, deferred_shared_expert_output = self.token_dispatcher.combine_postprocess(output)
-        if deferred_shared_expert_output is not None:
-            # Dispatcher computed the shared-expert output (via overlap) but deferred the
-            # combine so we can apply the vector gate below instead of a plain sum.
-            shared_expert_output = deferred_shared_expert_output
+        output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
-            if self.config.moe_use_norm_before_up_proj:
-                output = self.fc2_norm(output)
             output, _ = self.fc2_latent_proj(output)
 
-        # Scale routed output with learned scalar gate
-        if self._shortcut_scalar_gate is not None:
-            output = torch.sigmoid(self._shortcut_scalar_gate) * output
-
         # Combine with shared expert output
-        if self._shortcut_gate_vector is not None and shared_expert_output is not None:
-            gate = torch.sigmoid(self._shortcut_gate_vector)
-            output = gate * output + (1 - gate) * shared_expert_output
-        elif shared_expert_output is not None:
+        if shared_expert_output is not None:
             output = output + shared_expert_output
         elif (
             isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
@@ -699,17 +664,10 @@ class MoELayer(BaseMoELayer):
         """Return modules and standalone parameters used by shortcut postprocess."""
         modules = []
         if self.config.moe_latent_size:
-            if self.config.moe_use_norm_before_up_proj:
-                modules.append(self.fc2_norm)
             modules.append(self.fc2_latent_proj)
         if self.config.moe_shortcut_connection:
             modules.append(self._shortcut_post_norm)
-        parameters = tuple(
-            parameter
-            for parameter in (self._shortcut_scalar_gate, self._shortcut_gate_vector)
-            if parameter is not None
-        )
-        return tuple(modules), parameters
+        return tuple(modules), ()
 
     def launch_dispatch_async(
         self,
