@@ -575,9 +575,7 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     theoretical_forward_growth = dim * dim * bf16_size
 
     assert actual_optimizer_size == theoretical_optimizer_size
-    actual_forward_growth = (
-        torch.cuda.max_memory_allocated(device) - allocated_before_forward
-    )
+    actual_forward_growth = torch.cuda.max_memory_allocated(device) - allocated_before_forward
     assert abs(actual_forward_growth - theoretical_forward_growth) < 1024**2
 
 
@@ -1161,9 +1159,7 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
         pytest.param("zero3", _flat_placements, id="zero3"),
     ],
 )
-def test_fully_shard_reduces_peak_training_memory(
-    distributed_setup, strategy, placements_factory
-):
+def test_fully_shard_reduces_peak_training_memory(distributed_setup, strategy, placements_factory):
     """Per-layer FSDP should reduce peak CUDA memory for each sharding strategy."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
