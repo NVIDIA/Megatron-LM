@@ -299,27 +299,31 @@ class ViTModel(MegatronModule):
         if self.ln_pre is not None:
             x = self.ln_pre(x)
 
-        # 3. Positional embedding
+        # 3. CLS token. Prepend before learned_absolute so the CLS slot(s)
+        #    actually receive a position embedding (previously the arange was
+        #    computed over the patches-only tensor and only patches indexed
+        #    into the table; CLS got nothing and the patches were offset by
+        #    class_token_len twice — the arange shift did the offset, and the
+        #    prepended CLS shifted them again at concat time).
+        if self.add_class_token:
+            cls = self.class_token.expand(B, -1, -1)
+            x = torch.cat([cls, x], dim=1)
+
+        # 4. Positional embedding
         rotary_pos_emb = None
         if self.pos_emb_type == 'learned_absolute':
             assert not dynamic_resolution, "learned absolute ViT positions are fixed-size only"
             pos = torch.arange(x.shape[1], device=pixel_values.device)
-            if self.add_class_token:
-                pos = pos + self.class_token_len
             x = x + self.position_embeddings(pos)
         elif self.pos_emb_type == 'rope2d':
-            # Shape: (N, 1, 1, head_dim//2) — mcore rotary_pos_emb format
+            # Shape: (N, 1, 1, head_dim//2) — mcore rotary_pos_emb format.
+            # RoPE covers patch tokens only; CLS tokens are not rotated.
             if dynamic_resolution:
                 rotary_pos_emb = _cat_rope(
                     [self.rope(int(h), int(w), pixel_values.device) for h, w in patch_hw.tolist()]
                 )
             else:
                 rotary_pos_emb = self.rope(h_patches, w_patches, pixel_values.device)
-
-        # 4. CLS token
-        if self.add_class_token:
-            cls = self.class_token.expand(B, -1, -1)
-            x = torch.cat([cls, x], dim=1)
 
         # 5. TransformerBlock: expects (S, B, hidden)
         x = x.transpose(0, 1).contiguous()
