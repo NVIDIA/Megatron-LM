@@ -3,10 +3,16 @@
 import sys
 from dataclasses import fields
 
+import pytest
 import torch
 import transformer_engine as te
 
-from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
+from megatron.core.dist_checkpointing import load, save
+from megatron.core.dist_checkpointing.mapping import (
+    LocalNonpersistentObject,
+    ShardedObject,
+    ShardedTensor,
+)
 from megatron.core.extensions.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
@@ -16,7 +22,11 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
-from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_group
+from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_data_parallel_group,
+    get_tensor_model_parallel_group,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -27,7 +37,9 @@ from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import is_te_min_version
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -97,6 +109,40 @@ class TestTECheckpointCompatibility:
 
         assert "attention.softmax_offset" in sharded_state_dict
         assert isinstance(sharded_state_dict["attention._extra_state"], LocalNonpersistentObject)
+
+
+class TestTENormTensorParallelCheckpoint:
+    def setup_method(self, method):
+        if Utils.world_size < 2:
+            pytest.skip("requires at least two distributed ranks")
+        Utils.initialize_model_parallel(2, 1)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_save_load_uses_tensor_parallel_replica_rank(self, tmp_path_dist_ckpt):
+        config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=2)
+        norm = TENorm(config=config, hidden_size=config.hidden_size)
+        tp_group = get_tensor_model_parallel_group()
+        sharded_state_dict = sharded_state_dict_default(
+            norm,
+            prefix="norm.",
+            metadata={"dp_cp_group": get_data_parallel_group(with_context_parallel=True)},
+            tp_group=tp_group,
+        )
+
+        assert isinstance(sharded_state_dict["norm.weight"], ShardedTensor)
+        assert sharded_state_dict["norm.weight"].replica_id[1] == tp_group.rank()
+        assert isinstance(sharded_state_dict["norm._extra_state"], LocalNonpersistentObject)
+
+        expected_weight = norm.weight.detach().clone()
+        with TempNamedDir(tmp_path_dist_ckpt / "test_tenorm_tp_save_load") as checkpoint_dir:
+            save(sharded_state_dict, checkpoint_dir, validate_access_integrity=True)
+            loaded_state_dict = load(
+                sharded_state_dict, checkpoint_dir, validate_access_integrity=True
+            )
+
+        torch.testing.assert_close(loaded_state_dict["norm.weight"], expected_weight)
 
 
 class TestSpecCustomization:

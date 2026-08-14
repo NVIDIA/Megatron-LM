@@ -1037,6 +1037,7 @@ def _tenorm_sharded_state_dict(
     prefix: str = '',
     sharded_offsets: tuple = (),
     metadata: Optional[dict] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> ShardedStateDict:
     """Build a TE norm state dict without requiring empty quantization state on load."""
     state_dict = module.state_dict(prefix='', keep_vars=True)
@@ -1044,6 +1045,7 @@ def _tenorm_sharded_state_dict(
         state_dict,
         prefix,
         sharded_offsets=sharded_offsets,
+        tp_group=get_tensor_model_parallel_group_if_none(tp_group),
         dp_cp_group=(metadata or {}).get('dp_cp_group'),
     )
 
@@ -1054,6 +1056,7 @@ def _tenorm_sharded_state_dict(
 def _bind_tenorm_sharded_state_dict(module: torch.nn.Module) -> None:
     """Attach MCore distributed-checkpoint handling to a TE norm instance."""
     module.sharded_state_dict = MethodType(_tenorm_sharded_state_dict, module)
+    module._mcore_sharded_state_dict_accepts_tp_group = True
 
 
 class TENorm:
