@@ -177,6 +177,9 @@ class FsdpParameterGroup:
                 device=self.main_weight.device,
             )
 
+        # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
+        # is finalized to main_weight's placements after the last microbatch.
+        self._accumulation_placements = main_grad_placements
         self.main_grad = None
         if self.requires_grad:
             grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
@@ -197,9 +200,6 @@ class FsdpParameterGroup:
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
             )
-            # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
-            # is finalized to main_weight's placements after the last microbatch.
-            self._accumulation_placements = main_grad_placements
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
@@ -278,20 +278,28 @@ class FsdpParameterGroup:
         # and restores the replicated model weight.
         if self.model_weight.placements != self._model_weight_placements:
             with self._symmetric_memory_context():
+                # Allocate the restored destination in symmetric memory when enabled so the
+                # redistribution can use the faster symmetric-memory all-gather path.
                 self.model_weight = self.model_weight.redistribute(self._model_weight_placements)
-        with self._symmetric_memory_context():
-            self._unsharded_model_weight.reallocate_storage()
-        # This buffer backs unsharded Parameters whose views may be saved by autograd.
-        # Autograd records a tensor's version counter when saving it for backward, and
-        # in-place writes like the out= redistribution below increment that counter even
-        # under no_grad. Without preserving it, backward can fail with "modified by an
-        # inplace operation" even though FSDP only materialized internal storage.
-        with torch.autograd._unsafe_preserve_version_counter(
-            self._unsharded_model_weight.local_buffer
-        ):
-            self.model_weight.redistribute(
-                self._unsharded_model_weight.placements, out=self._unsharded_model_weight
-            )
+        if self.model_weight.placements == self._unsharded_model_weight.placements:
+            unsharded_model_weight = self.model_weight
+        else:
+            with self._symmetric_memory_context():
+                self._unsharded_model_weight.reallocate_storage()
+            # This buffer backs unsharded Parameters whose views may be saved by autograd.
+            # Autograd records a tensor's version counter when saving it for backward, and
+            # in-place writes like the out= redistribution below increment that counter even
+            # under no_grad. Without preserving it, backward can fail with "modified by an
+            # inplace operation" even though FSDP only materialized internal storage.
+            with torch.autograd._unsafe_preserve_version_counter(
+                self._unsharded_model_weight.local_buffer
+            ):
+                self.model_weight.redistribute(
+                    self._unsharded_model_weight.placements, out=self._unsharded_model_weight
+                )
+            unsharded_model_weight = self._unsharded_model_weight
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            fsdp_parameter.unsharded.data = unsharded_model_weight.get_local_tensor(index)
         self._switch_to_unsharded_parameters()
 
     def reshard_parameters(self) -> None:
