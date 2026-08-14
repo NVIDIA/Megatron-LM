@@ -1,7 +1,7 @@
 """Strict public wrapper for the SM100 fused GDR backward CuTeDSL kernel.
 
 Copyright (c) 2026 The Qwen team, Alibaba Group.
-Licensed under The MIT License [see LICENSE for details]
+Licensed under the MIT License.
 """
 
 from __future__ import annotations

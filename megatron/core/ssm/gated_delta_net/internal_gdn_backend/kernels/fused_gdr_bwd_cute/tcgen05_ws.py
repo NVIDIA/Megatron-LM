@@ -1,8 +1,7 @@
 """Low-level SM100 warp-specialized data-movement helpers.
 
 The inline-PTX patterns are adapted from TileLang's CuTeDSL backend. TileLang
-is distributed under the MIT license; its complete notice is retained in
-``LICENSE.tile-ai`` next to this module.
+is distributed under the MIT License; attribution is recorded in ``kernel.py``.
 """
 
 import cutlass

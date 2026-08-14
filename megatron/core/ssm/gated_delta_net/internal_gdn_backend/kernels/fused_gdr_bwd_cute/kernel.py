@@ -1,7 +1,16 @@
 """SM100 CuTeDSL layout and launch shell for fused GDR backward.
 
-Copyright (c) 2026 The Qwen team, Alibaba Group.
-Licensed under The MIT License [see LICENSE for details]
+This module is a CuTe DSL derivative of the fused GDR backward algorithm and
+warp-specialized schedule from QwenLM/FlashQLA commit
+050c6bbee9e03efbbfe41063fe4e33742c4a87cb, originally published as
+``flash_qla/ops/gated_delta_rule/chunk/blackwell/fused_bwd.py``.
+
+Copyright (c) 2026 The Qwen team, Alibaba Group. Licensed under the MIT License.
+The package, module, test, and symbol names used here are independent GDR names
+and do not imply endorsement by the upstream authors.
+
+The inline-PTX helpers in ``tcgen05_ws.py`` are adapted from TileLang's CuTeDSL
+backend. Copyright (c) Tile-AI. Licensed under the MIT License.
 """
 
 from dataclasses import dataclass, field
