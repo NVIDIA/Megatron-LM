@@ -537,12 +537,7 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     x = torch.ones(num_tokens, dim, device=device, dtype=dtype)
     model = ElementwiseModel(dim).to(device=device, dtype=dtype)
     mesh = init_device_mesh(device.type, (world_size,))
-    placements = Placements(
-        dp_axes=[0],
-        parameter=[Replicate()],
-        gradient=[Partial(dist.ReduceOp.AVG)],
-        optimizer=[Flat()],
-    )
+    placements = _zero1_placements()
     with fully_shard_context(device=device):
         fully_shard(model, mesh=mesh, placements=placements)
 
@@ -558,6 +553,7 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     torch.cuda.synchronize(device)
     torch.cuda.empty_cache()
     allocated_before_forward = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
 
     # Restore replicated model weight.
     with torch.no_grad():
@@ -575,13 +571,13 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     fp32_size = torch.empty((), dtype=torch.float32).element_size()
     bf16_size = torch.empty((), dtype=dtype).element_size()
     theoretical_optimizer_size = 2 * shard_numel * fp32_size
-    # Replicated weight replaces its Flat shard, plus the retained output.
-    theoretical_forward_growth = (
-        dim * dim - shard_numel
-    ) * bf16_size + num_tokens * dim * bf16_size
+    # Flat and replicated weights coexist during all-gather.
+    theoretical_forward_growth = dim * dim * bf16_size
 
     assert actual_optimizer_size == theoretical_optimizer_size
-    actual_forward_growth = torch.cuda.memory_allocated(device) - allocated_before_forward
+    actual_forward_growth = (
+        torch.cuda.max_memory_allocated(device) - allocated_before_forward
+    )
     assert abs(actual_forward_growth - theoretical_forward_growth) < 1024**2
 
 
@@ -764,22 +760,21 @@ def test_overlaps_communication_and_compute(
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
     fully_shard_optimizer(optimizer)
-    x = torch.randn(4096, dim, device=device, dtype=dtype, requires_grad=True)
+    x = torch.randn(8192, dim, device=device, dtype=dtype, requires_grad=True)
 
-    def train_one_iteration() -> None:
-        optimizer.zero_grad(set_to_none=True)
-        for microbatch_index in range(num_microbatches):
-            with microbatch(context, is_last=microbatch_index == num_microbatches - 1):
-                model(x).sum().backward()
-        optimizer.step()
+    def train_two_iterations() -> None:
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            for microbatch_index in range(num_microbatches):
+                with microbatch(context, is_last=microbatch_index == num_microbatches - 1):
+                    model(x).sum().backward()
+            optimizer.step()
 
-    train_one_iteration()
+    train_two_iterations()
     torch.cuda.synchronize(device)
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        train_one_iteration()
-        with torch.no_grad():
-            model(x)
+        train_two_iterations()
         # Synchronize inside the profiler context so in-flight device kernels
         # complete and get recorded before the profiler stops on __exit__.
         # Synchronizing after the context would finalize the trace first and
@@ -789,7 +784,7 @@ def test_overlaps_communication_and_compute(
     gemm_kernels = collect_linked_kernels(prof, _GEMM_OP_NAME_SUBSTRING)
     # Each child Linear runs one forward and two backward matmuls per microbatch.
     # aten::mm may also launch auxiliary kernels, so check only the matmul lower bound.
-    expected_gemm_count = 3 * num_microbatches * num_children
+    expected_gemm_count = 6 * num_microbatches * num_children
     assert len(gemm_kernels) >= expected_gemm_count, (
         f"Expected at least {expected_gemm_count} kernels linked to GEMMs, got "
         f"{len(gemm_kernels)}: "
@@ -798,23 +793,27 @@ def test_overlaps_communication_and_compute(
 
     allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
     reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
-    # The profile covers one iteration plus the next forward. ZeRO-1/2 all-gather once
-    # per iteration. ZeRO-1 reduces only the last microbatch; ZeRO-2 reduces every
-    # microbatch. ZeRO-3 gathers for every forward and backward and reduces every
-    # microbatch.
+    # ZeRO-1/2 all-gather once per iteration. ZeRO-1 reduces only the last microbatch;
+    # ZeRO-2 reduces every microbatch. ZeRO-3 gathers for every forward and backward
+    # and reduces every microbatch.
     expected_collective_counts = {
-        "zero1": (2 * num_children, num_children, num_children - 1, num_children - 1),
+        "zero1": (
+            2 * num_children,
+            2 * num_children,
+            2 * (num_children - 1),
+            2 * (num_children - 1),
+        ),
         "zero2": (
             2 * num_children,
-            num_microbatches * num_children,
-            num_children - 1,
-            num_microbatches * (num_children - 1),
+            2 * num_microbatches * num_children,
+            2 * (num_children - 1),
+            2 * num_microbatches * (num_children - 1),
         ),
         "zero3": (
-            (2 * num_microbatches + 1) * num_children,
-            num_microbatches * num_children,
-            (2 * num_microbatches + 1) * (num_children - 1),
-            num_microbatches * (num_children - 1),
+            4 * num_microbatches * num_children,
+            2 * num_microbatches * num_children,
+            4 * num_microbatches * (num_children - 1),
+            2 * num_microbatches * (num_children - 1),
         ),
     }
     (
@@ -1154,8 +1153,18 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
 
 
-def test_fully_shard_reduces_peak_training_memory(distributed_setup):
-    """Per-layer FSDP should reduce peak CUDA memory during training."""
+@pytest.mark.parametrize(
+    "strategy,placements_factory",
+    [
+        pytest.param("zero1", _zero1_placements, id="zero1"),
+        pytest.param("zero2", _zero2_placements, id="zero2"),
+        pytest.param("zero3", _flat_placements, id="zero3"),
+    ],
+)
+def test_fully_shard_reduces_peak_training_memory(
+    distributed_setup, strategy, placements_factory
+):
+    """Per-layer FSDP should reduce peak CUDA memory for each sharding strategy."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -1195,7 +1204,7 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
             fully_shard(
                 layer,
                 mesh=mesh,
-                placements=_flat_placements(),
+                placements=placements_factory(),
                 mixed_precision_policy=MixedPrecisionPolicy(
                     main_params_dtype=dtype, main_grads_dtype=dtype
                 ),
@@ -1209,10 +1218,14 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
     torch.cuda.synchronize(device)
     sharded_peak = torch.cuda.max_memory_allocated(device)
     logger.info(
-        "FSDP peak memory: rank=%s, baseline=%s, sharded=%s",
+        "FSDP peak memory: rank=%s, strategy=%s, baseline=%s, sharded=%s",
         rank,
+        strategy,
         _mb(baseline_peak),
         _mb(sharded_peak),
     )
 
-    assert sharded_peak < baseline_peak
+    assert sharded_peak < baseline_peak, (
+        f"Expected {strategy} to reduce peak training memory on rank {rank}: "
+        f"baseline={_mb(baseline_peak)}, sharded={_mb(sharded_peak)}"
+    )
