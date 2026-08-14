@@ -29,7 +29,6 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
-    _CudagraphGlobalRecord,
     create_cudagraphs,
     delete_cuda_graphs,
 )
@@ -186,6 +185,16 @@ def cleanup_global_state():
 
 class TestRLUtils:
     """Test class for RL utilities."""
+
+    def teardown_method(self, method):
+        # Runs even when a test fails: leaked capture state otherwise wedges the
+        # session-end distributed barrier into the 60-minute job timeout.
+        delete_cuda_graphs()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        CudaGraphManager.global_mempool = None
+        CudaGraphManager.fwd_mempools = None
+        CudaGraphManager.bwd_mempools = None
 
     def create_test_args(self, **kwargs):
         destroy_global_vars()
@@ -1203,24 +1212,6 @@ class TestRLUtils:
             assert logprobs.shape == (batch_size, seq_length - 1)
         else:
             assert logprobs is not None, "get_logprobs should return valid output"
-
-        # Destroy all captured graphs deterministically
-        for l in model.decoder.layers:
-            for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
-                # Safely delete both graphs if present
-                if hasattr(runner, "fwd_graph"):
-                    del runner.fwd_graph
-                if hasattr(runner, "bwd_graph"):
-                    del runner.bwd_graph
-
-        # Ensure all pending work is complete and graph destruction runs now
-        torch.cuda.synchronize()
-
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
-        CudaGraphManager.fwd_mempools = None
-        CudaGraphManager.bwd_mempools = None
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
