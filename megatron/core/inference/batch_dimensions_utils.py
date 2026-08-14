@@ -212,12 +212,18 @@ def _batch_invariant_token_align(token_count: int) -> int:
     the same M-alignment class as eager steps: TE rmsnorm (and other
     M-sensitive kernels) switch reduction codepaths at M % 32, and the eager
     path already pads token counts to TOKEN_ROUNDER (64) multiples.  Without
-    this floor, auto-sizing injects 1- and 2-token decode buckets whose
+    this alignment, auto-sizing injects 1- and 2-token decode buckets whose
     graphed norms execute in a different bit-class, breaking cross-batch
     bit-equality.  Request counts are untouched (mirrors eager semantics).
     """
-    rounded_up = math.ceil(token_count / 64) * 64
-    return max(64, rounded_up)
+    # Lazy import (dynamic_context imports this module at its top level).
+    # Tying to TOKEN_ROUNDER keeps the graph-bucket alignment and the eager
+    # path's padding multiple from drifting apart.
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+
+    rounder = DynamicInferenceContext.TOKEN_ROUNDER
+    rounded_up = math.ceil(token_count / rounder) * rounder
+    return max(rounder, rounded_up)
 
 
 def _batch_invariant_mode_enabled() -> bool:
@@ -372,7 +378,7 @@ class CUDAGraphBatchDimensionBuilder:
                 [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, cuda_graph_max_tokens + 1, 16))
             )
             if _batch_invariant_mode_enabled():
-                # Batch-invariant mode: floor every bucket to a 64-multiple
+                # Batch-invariant mode: align every bucket up to a 64-multiple
                 # (see _batch_invariant_token_align) and dedupe collisions.
                 sizes = [_batch_invariant_token_align(s) for s in sizes]
             # TP-align and dedupe in order; preserve original ordering for parity.
@@ -466,12 +472,12 @@ class CUDAGraphBatchDimensionBuilder:
             batch_dim = InferenceBatchDimensions(token_count, prefill_req_count, decode_req_count)
             if batch_dim.is_valid(max_requests, max_sequence_length, num_speculative_tokens):
                 if _batch_invariant_mode_enabled():
-                    # Batch-invariant mode: floor the bucket's token count to a
-                    # 64-multiple (see _batch_invariant_token_align). The floor
-                    # is alignment PADDING, mirroring the eager path's
+                    # Batch-invariant mode: align the bucket's token count up
+                    # to a 64-multiple (see _batch_invariant_token_align). The
+                    # alignment is PADDING, mirroring the eager path's
                     # TOKEN_ROUNDER (which already yields token counts above
                     # what the requests produce), so validity is judged on the
-                    # unpadded dims; request counts are untouched. Flooring can
+                    # unpadded dims; request counts are untouched. Aligning can
                     # collide previously-distinct buckets, so skip duplicates.
                     batch_dim = InferenceBatchDimensions(
                         _batch_invariant_token_align(token_count),
