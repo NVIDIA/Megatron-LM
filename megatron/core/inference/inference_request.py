@@ -393,6 +393,11 @@ class DynamicInferenceRequest(InferenceRequest):
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
 
+    # KV handoff metadata describing this request's pinned prefill state.
+    # Used by decode-side pulls and prefill-side pushes.
+    # Shape: {"request_id", "block_ids", "kv_meta"}.
+    disaggregated_params: Optional[dict] = None
+
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
@@ -748,6 +753,8 @@ class DynamicInferenceRequestRecord:
 
         policy_epoch = self.requests[-1].policy_epoch
         kv_cache_epoch = self.requests[-1].kv_cache_epoch
+        # Preserve KV handoff metadata when merging request segments.
+        disaggregated_params = self.requests[-1].disaggregated_params
 
         # Merged request.
         request = DynamicInferenceRequest(
@@ -775,6 +782,7 @@ class DynamicInferenceRequestRecord:
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
             num_cached_tokens=self.requests[0].num_cached_tokens,
+            disaggregated_params=disaggregated_params,
         )
 
         return request
