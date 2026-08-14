@@ -1328,17 +1328,20 @@ def prep_wandb_metrics(
         failure_reasons = [[None] * len(g) for g in rewards]
     status_counts = Counter(s for g in rollout_statuses for s in g)
     status_counts.update({status: 0 for status in KNOWN_ROLLOUT_STATUSES})
+    for status, count in sorted(status_counts.items()):
+        safe_status = _safe_key(status)
+        rollout_metrics[f'rollout/{safe_status}_count'] = count
+        rollout_metrics[f'rollout/{safe_status}_rate'] = (
+            count / total_rollouts if total_rollouts else 0.0
+        )
     reason_counts = Counter(r for g in failure_reasons for r in g if r)
-    for prefix, counts in (
-        ('rollout/', status_counts),
-        ('rollout/failure_reason/', reason_counts),
-    ):
-        for label, count in sorted(counts.items()):
-            safe_label = _safe_key(label)
-            rollout_metrics[f'{prefix}{safe_label}_count'] = count
-            rollout_metrics[f'{prefix}{safe_label}_rate'] = (
-                count / total_rollouts if total_rollouts else 0.0
-            )
+    rollout_metrics['failure_reason_table'] = wandb_writer.Table(
+        columns=['failure_reason', 'count', 'rate'],
+        data=[
+            [reason, count, count / total_rollouts if total_rollouts else 0.0]
+            for reason, count in sorted(reason_counts.items())
+        ],
+    )
 
     # All-empty wave: every episode failed and was dropped (nothing to aggregate),
     # or every surviving rollout is a zero-turn placeholder (rewards exist but the

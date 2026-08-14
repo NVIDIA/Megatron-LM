@@ -1482,11 +1482,16 @@ class TestRLUtils:
         # wandb-safe key.
         assert metrics["rollout/env_timeout_count"] == 1
         assert metrics["rollout/env_timeout_rate"] == (0.125 if inject_placeholders else 0.25)
-        if inject_placeholders:
-            assert metrics["rollout/failure_reason/http_500_count"] == 4
-            assert metrics["rollout/failure_reason/http_500_rate"] == 0.5
-        else:
-            assert "rollout/failure_reason/http_500_count" not in metrics
+        assert not any(k.startswith("rollout/failure_reason/") for k in metrics)
+        assert "failure_reason_table" in metrics
+        reason_table_calls = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["failure_reason", "count", "rate"]
+        ]
+        assert len(reason_table_calls) == 1
+        expected_reason_rows = [["http_500", 4, 0.5]] if inject_placeholders else []
+        assert reason_table_calls[0].kwargs["data"] == expected_reason_rows
         # The raw delivery aggregate keeps the placeholder zeros (mean of group
         # means becomes 1/3 instead of 0.75); the valid view masks them. The
         # pair diverging is the infrastructure-failure signature.
@@ -1698,9 +1703,12 @@ class TestRLUtils:
             metrics["rollout/placeholder_count"] + metrics["rollout/masked_count"]
             == metrics["failed_rollouts/count"]
         )
-        assert metrics["rollout/failure_reason/judge_unparseable_count"] == 1
-        assert np.isclose(metrics["rollout/failure_reason/judge_unparseable_rate"], 1 / 6)
-        assert metrics["rollout/failure_reason/http_500_count"] == 1
+        reason_rows = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["failure_reason", "count", "rate"]
+        ][0].kwargs["data"]
+        assert reason_rows == [["http_500", 1, 1 / 6], ["judge_unparseable", 1, 1 / 6]]
 
     def test_request_ledger_join(self):
         """compute_group_stats joins finished-request records to rollouts by each
