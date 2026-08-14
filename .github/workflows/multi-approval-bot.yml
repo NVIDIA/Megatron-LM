@@ -20,10 +20,17 @@ jobs:
       || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true')
     steps:
-      - name: Get PR info
-        id: get-pr-info
+      - name: Get PR number
+        id: get-pr-number
         if: startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
+        shell: bash
+        run: |
+          pr_number="${GITHUB_REF#refs/heads/pull-request/}"
+          if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+            echo "::error::Expected a pull-request/<number> ref, got $GITHUB_REF"
+            exit 1
+          fi
+          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
 
       - name: Checkout action
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -35,7 +42,7 @@ jobs:
       - name: Check Codeowners Approval
         uses: ./codeowner-multi-approval-action
         with:
-          pr-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          pr-number: ${{ steps.get-pr-number.outputs.number }}
           repo-name: ${{ github.repository }}
           github-token: ${{ secrets.PAT }}
 
