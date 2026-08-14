@@ -1,21 +1,33 @@
 # Internal GDR CuTe DSL backend
 
-Set `TransformerConfig.gdn_gdr_backend="internal"` to route the Gated Delta
-Rule through the FLA-compatible wrapper in `mcore_gdn_opt`. The wrapper uses
-the optimized SM100 CuTe DSL/CUTLASS stages for supported shapes and defaults
-to per-stage FLA fallback for unsupported shapes.
+Set `TransformerConfig.gdn_gdr_backend="internal"` to use the in-tree Gated
+Delta Rule backend. It runs a local SM100 CuTe DSL forward kernel for the
+general supported contract. For the narrower fused-backward contract, it uses
+FLA forward/state preparation and the fused CuTe DSL backward from
+`mcore_gdn_opt@ca349c26549c0a6bf2f69dc2b29936013550a44f`, matching that
+revision's verified configuration. Unsupported stages fall back to FLA
+automatically in `auto` mode.
 
-Initialize the pinned kernel source from the Megatron-LM checkout:
+The kernel sources live under
+`megatron/core/ssm/gated_delta_net/internal_gdn_backend/kernels`; no Git
+submodule or separate kernel package installation is required. CuTe DSL and
+FLA are provided by the Megatron Core development/CI environment. Build and
+run in that environment rather than installing dependencies on the host.
 
-```bash
-git submodule update --init --recursive third_party/mcore_gdn_opt
-```
+Runtime selection is controlled by `MCORE_GDN_INTERNAL_BACKEND`:
 
-Build and install it inside the Megatron-LM CI/GPU development container, not
-on the host. Follow `third_party/mcore_gdn_opt/README.md`; all kernel packages
-must be installed in the same environment that runs Megatron-LM.
+- `auto` (default): use CuTe DSL when the input is supported, otherwise FLA.
+- `cute`: require the CuTe DSL path and raise if the input is unsupported.
+- `fla`: always use FLA.
 
-Runtime policy is controlled by `MCORE_GDN_OPT_BACKEND=auto|cuda|fla` and the
-per-stage `MCORE_GDN_OPT_ENABLE_*` flags documented by `mcore_gdn_opt`. Use
-`auto` (the default) for production fallback, and `cuda` when validating that
-the requested shape takes only optimized kernels.
+The CuTe path currently requires CUDA 13+, an SM100 GPU, contiguous bf16/fp16
+BTHD tensors, equal Q/K/V head counts, head dimension 128, and sequence
+lengths divisible by 64. Initial/final state, context parallelism, grouped
+value attention, and in-kernel QK/beta transforms currently use the FLA
+fallback.
+
+The fused backward has a narrower verified contract: bf16, H=64, D=128, and
+exactly two 64-token-aligned sequences. Dense `B=2` inputs are packed as
+`[0,T,2T]`; packed inputs must provide three contiguous int32 offsets. The
+adapter promotes gate and beta tensors to FP32 and supplies a zero final-state
+gradient when the model does not request one.

@@ -2,6 +2,10 @@
 
 """Tests for the internal GDR backend adapter."""
 
+import hashlib
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -26,7 +30,7 @@ def test_internal_backend_forwards_fla_compatible_arguments(monkeypatch):
         calls.append(kwargs)
         return expected
 
-    monkeypatch.setattr(backend, "_load_optimized_chunk_gated_delta_rule", lambda: implementation)
+    monkeypatch.setattr(backend, "_load_internal_chunk_gated_delta_rule", lambda: implementation)
 
     result = backend.chunk_gated_delta_rule(
         **_inputs(),
@@ -40,7 +44,8 @@ def test_internal_backend_forwards_fla_compatible_arguments(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["scale"] == 0.5
     assert calls[0]["output_final_state"] is True
-    assert calls[0]["transpose_state_layout"] is True
+    assert calls[0]["state_v_first"] is True
+    assert "transpose_state_layout" not in calls[0]
     assert calls[0]["custom_option"] == "value"
 
 
@@ -55,3 +60,186 @@ def test_internal_backend_rejects_conflicting_state_layout_options():
         backend.chunk_gated_delta_rule(
             **_inputs(), state_v_first=True, transpose_state_layout=False
         )
+
+
+def test_vendored_fused_backward_matches_latest_main_source():
+    root = Path(__file__).resolve().parents[3]
+    kernel = (
+        root
+        / "megatron/core/ssm/gated_delta_net/internal_gdn_backend/kernels"
+        / "fused_gdr_bwd_cute/kernel.py"
+    )
+
+    assert hashlib.sha256(kernel.read_bytes()).hexdigest() == (
+        "29dec2291ee7f06792a8aec4f12b5377af71057420d32ca0eb65447a110ca271"
+    )
+
+
+def _implementation():
+    pytest.importorskip("fla")
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import implementation
+
+    return implementation
+
+
+def test_fla_mode_bypasses_cutedsl_capability_checks(monkeypatch):
+    implementation = _implementation()
+    expected = (torch.empty(1), None)
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")
+    monkeypatch.setattr(
+        implementation,
+        "_cutedsl_support_reason",
+        lambda **_kwargs: pytest.fail("CuTe capability checks must not run in FLA mode"),
+    )
+    monkeypatch.setattr(implementation, "fla_chunk_gated_delta_rule", lambda **_kwargs: expected)
+
+    assert implementation.chunk_gated_delta_rule(**_inputs()) is expected
+
+
+def test_auto_mode_falls_back_for_unsupported_inputs(monkeypatch):
+    implementation = _implementation()
+    expected = (torch.empty(1), None)
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.setattr(
+        implementation, "_cutedsl_support_reason", lambda **_kwargs: "unsupported test input"
+    )
+    monkeypatch.setattr(implementation, "fla_chunk_gated_delta_rule", lambda **_kwargs: expected)
+
+    assert implementation.chunk_gated_delta_rule(**_inputs()) is expected
+
+
+def test_cute_mode_rejects_unsupported_inputs(monkeypatch):
+    implementation = _implementation()
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "cute")
+    monkeypatch.setattr(
+        implementation, "_cutedsl_support_reason", lambda **_kwargs: "unsupported test input"
+    )
+
+    with pytest.raises(RuntimeError, match="unsupported test input"):
+        implementation.chunk_gated_delta_rule(**_inputs())
+
+
+@pytest.mark.parametrize("scale, expected_scale", [(None, 0.5), (0.0, 0.0)])
+def test_cute_mode_dispatches_to_local_autograd_function(monkeypatch, scale, expected_scale):
+    implementation = _implementation()
+    inputs = _inputs()
+    expected = (torch.empty(1), None)
+    calls = []
+
+    def apply(*args):
+        calls.append(args)
+        return expected
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "cute")
+    monkeypatch.setattr(implementation, "_cutedsl_support_reason", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        implementation, "InternalChunkGatedDeltaRuleFunction", SimpleNamespace(apply=apply)
+    )
+
+    assert implementation.chunk_gated_delta_rule(**inputs, scale=scale) is expected
+    assert calls[0][5] == expected_scale
+
+
+def test_cutedsl_backward_routes_supported_shape_to_fused_kernel(monkeypatch):
+    implementation = _implementation()
+    shape = (2, 64, 64, 128)
+    scalar_shape = shape[:-1]
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    inputs = {
+        "q": q,
+        "k": torch.empty_like(q),
+        "v": torch.empty_like(q),
+        "g": torch.empty(scalar_shape, dtype=torch.float32),
+        "beta": torch.empty(scalar_shape, dtype=torch.float32),
+        "A": torch.empty((*scalar_shape, 64), dtype=torch.bfloat16),
+        "do": torch.empty_like(q),
+    }
+    expected = tuple(torch.empty(1) for _ in range(5))
+    seen = {}
+
+    def fused(**kwargs):
+        seen.update(kwargs)
+        return expected
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.setattr(implementation, "_call_fused_gdr_bwd_cute", fused)
+    monkeypatch.setattr(
+        implementation,
+        "_fla_backward",
+        lambda **_kwargs: pytest.fail("supported shape must use fused backward"),
+    )
+
+    assert implementation._can_use_fused_bwd_forward(
+        inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"], None, None
+    )
+
+    result = implementation._cutedsl_backward(
+        **inputs, scale=128**-0.5, dht=None, cu_seqlens=None, chunk_indices=None
+    )
+
+    assert result is expected
+    assert seen["q"] is q
+    assert seen["dht"] is None
+
+
+def test_fused_backward_adapter_packs_dense_b2(monkeypatch):
+    implementation = _implementation()
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_bwd_cute
+
+    shape = (2, 64, 64, 128)
+    scalar_shape = shape[:-1]
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    g = torch.empty(scalar_shape, dtype=torch.bfloat16)
+    beta = torch.empty_like(g)
+    A = torch.empty((*scalar_shape, 64), dtype=torch.bfloat16)
+    do = torch.empty_like(q)
+    h = torch.empty((2, 1, 64, 128, 128), dtype=torch.bfloat16)
+    packed = q.reshape(1, 128, 64, 128)
+    packed_scalar = g.reshape(1, 128, 64)
+    fused_outputs = (
+        torch.full_like(packed, 1),
+        torch.full_like(packed, 2),
+        torch.full_like(packed, 3),
+        torch.full(packed_scalar.shape, 4.0, dtype=torch.float32),
+        torch.full(packed_scalar.shape, 5.0, dtype=torch.float32),
+        torch.empty((2, 64, 128, 128), dtype=torch.float32),
+    )
+    seen = {}
+
+    def fused(**kwargs):
+        seen.update(kwargs)
+        return fused_outputs
+
+    monkeypatch.setattr(implementation, "_recompute_fused_bwd_h", lambda **_kwargs: h)
+    monkeypatch.setattr(fused_gdr_bwd_cute, "fused_gdr_bwd", fused)
+
+    dq, dk, dv, db, dg = implementation._call_fused_gdr_bwd_cute(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A=A,
+        do=do,
+        dht=None,
+        scale=128**-0.5,
+        cu_seqlens=None,
+        chunk_indices=None,
+    )
+
+    assert seen["q"].shape == (1, 128, 64, 128)
+    assert seen["g"].dtype == torch.float32
+    assert seen["beta"].dtype == torch.float32
+    assert seen["a"].shape == (1, 128, 64, 64)
+    assert seen["h"].shape == (1, 2, 64, 128, 128)
+    assert seen["dht"].shape == (2, 64, 128, 128)
+    assert torch.count_nonzero(seen["dht"]) == 0
+    assert seen["cu_seqlens"].tolist() == [0, 64, 128]
+    assert dq.shape == q.shape and torch.all(dq == 1)
+    assert dk.shape == k.shape and torch.all(dk == 2)
+    assert dv.shape == v.shape and torch.all(dv == 3)
+    assert db.shape == beta.shape and torch.all(db == 5)
+    assert dg.shape == g.shape and torch.all(dg == 4)
+    assert db.dtype == beta.dtype and dg.dtype == g.dtype
