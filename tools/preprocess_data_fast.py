@@ -72,7 +72,7 @@ def process_key(args, key, level):
 
     # Add encoded documents to the IndexedDataset
     print("Adding encoded documents to IndexedDataset...")
-    builder.add_documents(encoded_docs)
+    builder.add_documents_parallel(encoded_docs, num_workers=128)
     builder.finalize(idx_file)
 
 
