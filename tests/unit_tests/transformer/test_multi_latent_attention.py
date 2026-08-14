@@ -2057,6 +2057,149 @@ class TestFusedMLAQUpProjIntegration:
         yield
         Utils.destroy_model_parallel()
 
+    def test_fused_vs_unfused_q_forward(self):
+        """MXFP8 Q from the cuDNN fused kernel matches unfused MXFP8 GEMM + Triton-RoPE + quantize.
+
+        Runs the same inputs through:
+          Fused:   FusedMLAQUpProjRopeQuant (cuDNN MXFP8 GEMM+RoPE+quant in one kernel)
+          Unfused: TE general_gemm MXFP8 GEMM (layout="TN", same as TE Linear forward)
+                   + fused_apply_mla_rope_for_q (Megatron Triton RoPE)
+                   + mxfp8_quantize_only (same quantizer used for K/V in the attention block)
+
+        Both the rowwise Q (used in QK^T) and columnwise Q (used in dK GEMM in the attention
+        backward) are compared, since a bug in the columnwise output would silently degrade
+        K-path gradients without any other test catching it.
+        """
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.attention import FusedMLAQUpProjRopeQuant
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            mxfp8_quantize_only,
+        )
+        from transformer_engine.pytorch.cpp_extensions import general_gemm as _te_general_gemm
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
+
+        if mla_module.FusedMLAQUpProjRopeQuant is None or not FusedMLAQUpProjRopeQuant.is_supported():
+            pytest.skip("Fused MLA Q up-projection requires SM100+ and cuDNN frontend 1.27+")
+        if mla_module.fused_apply_mla_rope_for_q is None:
+            pytest.skip("fused_apply_mla_rope_for_q not available")
+
+        fused_apply_rope = mla_module.fused_apply_mla_rope_for_q
+
+        # DSv3 671B dims
+        S, B = 256, 1
+        NH = 128
+        QK_HEAD_DIM = 128   # NOPE head dim
+        QK_ROPE_DIM = 64    # ROPE head dim
+        Q_HEAD_DIM = QK_HEAD_DIM + QK_ROPE_DIM   # 192
+        Q_LORA_RANK = 1536
+        PROJ_DIM = NH * Q_HEAD_DIM               # 24576
+        BLOCK = 32
+        E8M0_BIAS = 127
+        device = torch.device("cuda")
+
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+
+        x = torch.randn(S * B, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
+        w_bf16 = torch.randn(PROJ_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
+        w_mxfp8 = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)(
+            w_bf16
+        )
+
+        # cos/sin in (tokens, QK_ROPE_DIM) — the format both paths expect.
+        # Asymmetric halves (left ≠ right) to expose any half-swapping bugs.
+        inv_freq = 1.0 / (
+            10000
+            ** (torch.arange(0, QK_ROPE_DIM, 2, dtype=torch.float32, device=device) / QK_ROPE_DIM)
+        )
+        t = torch.arange(S, dtype=torch.float32, device=device)
+        freqs = torch.cat([torch.outer(t, inv_freq), torch.outer(t, inv_freq * 0.5)], dim=-1)
+        cos_flat = freqs.cos().to(torch.bfloat16)  # (S, 64)
+        sin_flat = freqs.sin().to(torch.bfloat16)  # (S, 64)
+
+        # ── Fused path ──────────────────────────────────────────────────────────────
+        query_fused, _ = FusedMLAQUpProjRopeQuant.run(x, w_mxfp8, cos_flat, sin_flat, S, B)
+
+        # ── Unfused path ─────────────────────────────────────────────────────────────
+        # Step 1: MXFP8 GEMM.  Same as TE Linear's forward under fp8_autocast.
+        # layout="TN": A=weight is transposed (transa=True), B=input is not (transb=False).
+        # Both are unwrapped from their rowwise MXFP8 data before the cuBLAS call.
+        x_mxfp8 = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)(x)
+        q_linear_out = _te_general_gemm(
+            w_mxfp8,  # A = weight (PROJ_DIM, Q_LORA_RANK), transposed in GEMM → Q_LORA_RANK rows
+            x_mxfp8,  # B = input  (S*B,       Q_LORA_RANK), not transposed
+            layout="TN",
+            out_dtype=torch.bfloat16,
+        )[0].view(S, B, NH, Q_HEAD_DIM)  # → (S*B, PROJ_DIM) then reshape
+
+        # Step 2: RoPE.  fused_apply_mla_rope_for_q expects (S, B, NH, Q_HEAD_DIM) when
+        # cu_seqlens_q=None, and cos/sin as (tokens, QK_ROPE_DIM).
+        query_bf16 = fused_apply_rope(
+            q_linear_out,
+            cos_flat,
+            sin_flat,
+            QK_HEAD_DIM,
+            QK_ROPE_DIM,
+            None,  # cu_seqlens_q
+            0,     # cp_rank
+            1,     # cp_size
+        )  # → (S, B, NH, Q_HEAD_DIM) bf16
+
+        # Step 3: Quantize.  Same quantizer + format as _QuantizeKVForFusedAttn uses for K/V.
+        q_quantizer = MXFP8Quantizer(
+            fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True
+        )
+        (query_unfused,) = mxfp8_quantize_only(
+            [(query_bf16.contiguous(), q_quantizer)], "sbhd"
+        )
+
+        # ── Compare ───────────────────────────────────────────────────────────────────
+        # Compare MXFP8 Q from both paths directly.  Each path applies E4M3 quantization
+        # (≤6.25% relative error) on top of a GEMM that may differ by ~2% between the
+        # cuDNN and cuBLAS accumulators, giving a worst-case combined rtol of ~0.14.
+        # We use rtol=0.1 as a tighter bar; flaky failures here would indicate a
+        # systematic bias beyond normal FP8 quantization noise.
+        def _deq_row(t: MXFP8Tensor) -> torch.Tensor:
+            tokens = S * B
+            q_2d = MXFP8Tensor(
+                shape=(tokens, PROJ_DIM),
+                dtype=torch.bfloat16,
+                rowwise_data=t._rowwise_data.view(tokens, PROJ_DIM),
+                rowwise_scale_inv=t._rowwise_scale_inv.view(tokens, PROJ_DIM // BLOCK),
+                columnwise_data=None,
+                columnwise_scale_inv=None,
+                quantizer=t._quantizer,
+                requires_grad=False,
+                fp8_dtype=t._fp8_dtype,
+                with_gemm_swizzled_scales=False,
+            )
+            return q_2d.dequantize().to(torch.bfloat16).view(S, B, NH, Q_HEAD_DIM)
+
+        def _deq_col(t: MXFP8Tensor) -> torch.Tensor:
+            tokens = S * B
+            fp8_col = t._columnwise_data.view(tokens, NH, Q_HEAD_DIM)
+            scale_col = t._columnwise_scale_inv.view(tokens // BLOCK, NH, Q_HEAD_DIM)
+            inv = torch.pow(2.0, scale_col.to(torch.float32) - E8M0_BIAS).unsqueeze(1)
+            # TE's C++ quantizer stores _columnwise_data as uint8 (raw E4M3 bit patterns).
+            # The cuDNN kernel returns out_fp8_col as float8_e4m3fn.
+            # Either way, reinterpret the bits as float8_e4m3fn before converting to float32.
+            if fp8_col.dtype == torch.uint8:
+                fp8_col = fp8_col.view(torch.float8_e4m3fn)
+            return (
+                fp8_col.to(torch.float32)
+                .view(tokens // BLOCK, BLOCK, NH, Q_HEAD_DIM)
+                .mul_(inv)
+                .reshape(S, B, NH, Q_HEAD_DIM)
+                .to(torch.bfloat16)
+            )
+
+        torch.testing.assert_close(
+            _deq_row(query_fused), _deq_row(query_unfused), atol=1.0, rtol=0.1
+        )
+        torch.testing.assert_close(
+            _deq_col(query_fused), _deq_col(query_unfused), atol=1.0, rtol=0.1
+        )
+
     def test_end_to_end_backward_uses_te_autograd(self):
         with mock.patch.dict(
             os.environ,
