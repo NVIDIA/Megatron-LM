@@ -668,12 +668,9 @@ class SequencePacker:
         bin_size: Size of each bin (padded sequence length).
         pad_token: Padding token id.
         max_sequences_per_bin: Maximum number of sequences per bin.
-        seq_length_multiple: Round every sequence's reserved footprint in the bin up
-            to a multiple of this value (sequences are placed at aligned offsets,
-            with pad tokens in the gaps). Context parallelism requires every padded
-            sequence length to be a multiple of 2*cp_size so TE's THD ring attention
-            can split each sequence evenly across CP ranks. The default of 1 keeps
-            the legacy back-to-back placement.
+        seq_length_multiple: Align sequences within a bin to multiples of this value:
+            the slot a sequence occupies is its length rounded up to the next multiple.
+            Context parallelism requires every padded sequence length to be a multiple of 2*cp_size.
     """
 
     def __init__(
@@ -692,10 +689,6 @@ class SequencePacker:
         self.pad_token = pad_token
         self.max_sequences_per_bin = max_sequences_per_bin
         self.seq_length_multiple = seq_length_multiple
-
-    def _reserved_footprint(self, length: int) -> int:
-        """Slot size a sequence reserves in a bin: length rounded up to seq_length_multiple."""
-        return round_up_to_nearest_multiple(length, self.seq_length_multiple)
 
     def pack_sequences(
         self, trajs: torch.Tensor, generation_masks: Optional[torch.Tensor] = None
@@ -719,12 +712,11 @@ class SequencePacker:
         current_bin_indices = []
         current_bin_length = 0
 
-        # Pack sequences into bins. Fit accounting uses each sequence's reserved
-        # footprint, matching placement.
+        # Pack sequences into bins.
         sequences_per_bin = []
         for idx in sorted_indices:
             seq = sequences[idx]
-            seq_len = self._reserved_footprint(len(seq))
+            seq_len = round_up_to_nearest_multiple(len(seq), self.seq_length_multiple)
 
             if (
                 current_bin_length + seq_len <= self.bin_size
@@ -800,7 +792,9 @@ class SequencePacker:
                 start = current_pos
                 end = start + len(seq)
                 seq_starts.append(start)
-                current_pos = start + self._reserved_footprint(len(seq))
+                current_pos = start + round_up_to_nearest_multiple(
+                    len(seq), self.seq_length_multiple
+                )
 
                 # Pack sequence
                 packed_sequences[bin_idx, start:end] = seq
@@ -1033,7 +1027,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
 
     with nvtx_range("rl/pack-sequences", time=True):
         # Create packer with max sequences per bin limit to prevent extreme imbalance.
-        # Context parallelism requires every packed sequence's reserved footprint to be
+        # Context parallelism requires every sequence's padded slot in the bin to be
         # divisible by 2*cp_size so TE's THD ring attention can split each sequence
         # evenly across CP ranks (see _scatter_for_context_parallel in rl_utils).
         cp_size = mpu.get_context_parallel_world_size()

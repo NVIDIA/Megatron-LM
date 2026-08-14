@@ -264,16 +264,16 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             )
         else:
             cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
+            # Make sure to omit `total_tokens` to prevent `seq_idx` from being auto-computed.
+            # That would cause a sequence packing kernel to be incorrectly used.
             packed_seq_params = PackedSeqParams(
                 qkv_format='thd',
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_kv=cu_seqlens,
                 max_seqlen_q=tokens.shape[1],
                 max_seqlen_kv=tokens.shape[1],
-                total_tokens=tokens.shape[1],
                 pad_between_seqs=False,
             )
-            packed_seq_params.seq_idx = None
 
     # Clear RoPE cache to avoid inference tensor errors
     try:

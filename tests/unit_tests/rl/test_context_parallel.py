@@ -18,7 +18,7 @@ VOCAB = 128
 MAX_SEQUENCES_PER_BIN = 4
 
 pytestmark = pytest.mark.skipif(
-    rl_utils.tex is None, reason="CP logprobs require Transformer Engine THD indices"
+    not rl_utils.HAVE_TEX, reason="CP logprobs require Transformer Engine THD indices"
 )
 
 CP_SIZES = [pytest.param(cp, id=f"cp{cp}") for cp in (2, 4, 8) if cp <= Utils.world_size]
@@ -148,7 +148,7 @@ class TestContextParallelLogprobs:
         assert packed_seq_params.local_cp_size is None
 
         # A second call must hit the memoized per-bin partition and return the same reference.
-        cp_scatter = packed_seq_params._rl_cp_scatter
+        cp_scatter = packed_seq_params.cp_scatter_cache
         logprobs_again = rl_utils.get_logprobs(
             model,
             tokens,
@@ -157,7 +157,7 @@ class TestContextParallelLogprobs:
             sequence_packing=True,
             packed_seq_params=packed_seq_params,
         )
-        assert packed_seq_params._rl_cp_scatter is cp_scatter
+        assert packed_seq_params.cp_scatter_cache is cp_scatter
         torch.testing.assert_close(logprobs_again, reference)
 
         if not no_grad:
