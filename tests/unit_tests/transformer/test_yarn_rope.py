@@ -7,7 +7,12 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import Yar
 
 
 class TestYarnRotaryEmbedding:
-    def test_cpu_initialization_keeps_cache_on_cpu(self):
+    def test_cpu_initialization_keeps_cache_on_cpu(self, monkeypatch):
+        monkeypatch.setattr(
+            torch.cuda,
+            "current_device",
+            lambda: pytest.fail("CPU-initialized YARN must not access CUDA"),
+        )
         rope = YarnRotaryEmbedding(
             kv_channels=8, use_cpu_initialization=True, original_max_position_embeddings=64
         )
@@ -29,3 +34,21 @@ class TestYarnRotaryEmbedding:
         assert rope.inv_freq_inter.device.type == 'cuda'
         assert rope.cos_cached.device.type == 'cuda'
         assert rope.sin_cached.device.type == 'cuda'
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_forward_cache_is_invalidated_after_device_migration(self):
+        rope = YarnRotaryEmbedding(
+            kv_channels=8, use_cpu_initialization=True, original_max_position_embeddings=64
+        )
+
+        cpu_embedding, cpu_mscale = rope(64)
+        assert cpu_embedding.device.type == 'cpu'
+
+        rope.cuda()
+        cuda_embedding, cuda_mscale = rope(64)
+
+        assert cuda_embedding.device.type == 'cuda'
+        assert rope.inv_freq_extra.device.type == 'cuda'
+        assert rope.inv_freq_inter.device.type == 'cuda'
+        assert cuda_mscale == cpu_mscale
+        torch.testing.assert_close(cuda_embedding.cpu(), cpu_embedding)

@@ -2,6 +2,7 @@
 
 import sys
 from dataclasses import fields
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -43,6 +44,10 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
+def _fake_process_group() -> SimpleNamespace:
+    return SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+
+
 class TestGptLayerCheckpointKeys:
     def test_dense_local_spec_uses_te_fused_layernorm_keys(self):
         submodules = get_gpt_layer_local_submodules()
@@ -78,7 +83,7 @@ class TestTECheckpointCompatibility:
         _bind_tenorm_sharded_state_dict(norm)
 
         sharded_state_dict = norm.sharded_state_dict(
-            prefix="norm.", metadata={"dp_cp_group": object()}
+            prefix="norm.", metadata={"dp_cp_group": _fake_process_group()}
         )
 
         assert isinstance(sharded_state_dict["norm._extra_state"], LocalNonpersistentObject)
@@ -89,7 +94,7 @@ class TestTECheckpointCompatibility:
         _bind_tenorm_sharded_state_dict(norm)
 
         sharded_state_dict = norm.sharded_state_dict(
-            prefix="norm.", metadata={"dp_cp_group": object()}
+            prefix="norm.", metadata={"dp_cp_group": _fake_process_group()}
         )
 
         assert isinstance(sharded_state_dict["norm._extra_state"], ShardedObject)
@@ -104,7 +109,7 @@ class TestTECheckpointCompatibility:
         attention._tp_group = None
 
         sharded_state_dict = TEDotProductAttention.sharded_state_dict(
-            attention, prefix="attention.", metadata={"dp_cp_group": object()}
+            attention, prefix="attention.", metadata={"dp_cp_group": _fake_process_group()}
         )
 
         assert "attention.softmax_offset" in sharded_state_dict

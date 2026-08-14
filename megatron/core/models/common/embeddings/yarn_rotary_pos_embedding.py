@@ -103,6 +103,14 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             # method causes a memory leak in NeMo-RL.
             self.forward.cache_clear()
 
+    def _apply(self, fn, recurse=True):
+        module = super()._apply(fn, recurse=recurse)
+        # ``forward`` is cached independently of registered buffers. Invalidate it after
+        # device or dtype migration so an identical call cannot return a tensor from the
+        # module's previous device.
+        self.forward.cache_clear()
+        return module
+
     def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
