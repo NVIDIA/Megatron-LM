@@ -154,6 +154,22 @@ class TestWeightedSwigluKernels:
         out2 = batch_invariant.weighted_silu_mul_bounded(y2, probs, bound)
         assert torch.equal(out2[:live], out[:live])
 
+    def test_weighted_silu_mul_bounded_grid_size_is_bit_inert(self):
+        # num_programs is an occupancy knob only: the kernel is elementwise
+        # with disjoint per-program index ranges, so any grid size must give
+        # bitwise-identical output (incl. 1184 = the B200 Inductor capture).
+        from megatron.core.inference.moe import batch_invariant
+
+        torch.manual_seed(11)
+        rows, ffn, live = 512, 256, 300
+        y = (torch.randn(rows, 2 * ffn, device="cuda") * 2.0).bfloat16()
+        probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+        bound = torch.tensor(live * ffn, dtype=torch.int64, device="cuda")
+        ref = batch_invariant.weighted_silu_mul_bounded(y, probs, bound)  # derived default
+        for np_ in (1, 148, 1184, 4096):
+            out = batch_invariant.weighted_silu_mul_bounded(y, probs, bound, num_programs=np_)
+            assert torch.equal(out[:live], ref[:live]), f"bits changed at num_programs={np_}"
+
 
 # ---------------------------------------------------------------------------
 # _moe_sum options
