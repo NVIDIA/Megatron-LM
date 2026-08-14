@@ -640,14 +640,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         """Switch the (l, b, proj_dim) input projection to the batch-first layout the
         causal conv and the kernels expect, and split it into the z, VKQ, and ba groups.
         """
-        return self._split_projection(rearrange(zVKQba, "l b d -> b l d").contiguous())
+        zVKQba = rearrange(zVKQba, "l b d -> b l d").contiguous()
 
-    def _split_projection(self, zVKQba):
-        """Split the (b, l, proj_dim) input projection into the z, VKQ, and ba groups.
-
-        The decode paths already receive the projection batch-first, so they split
-        without the transpose.
-        """
         return torch.split(
             zVKQba,
             [
@@ -869,7 +863,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # Keep the length-1 sequence dimension so the shared helpers apply: with l == 1
         # their (b, l, ...) reshapes collapse to exactly the layouts the fla recurrent
         # kernel wants here, i.e. "b (l m) h p" is "n m h p" and "b l g n" is "n 1 g n".
-        z, VKQ, ba = self._split_projection(zVKQba)
+        # ``_preprocess`` takes the sequence-first layout that in_proj produces, so hand
+        # it back the (1, n, proj_dim) view; both transposes are free at l == 1.
+        z, VKQ, ba = self._preprocess(zVKQba.transpose(0, 1))
 
         query, key, value = self._prepare_qkv(
             VKQ, conv_state=conv_state, is_decode=True, conv_state_indices=batch_indices
