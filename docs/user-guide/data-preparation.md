@@ -115,37 +115,22 @@ python tools/preprocess_data_fast.py \
 
 **Key Differences** from `preprocess_data.py`
 
-┌─────────────────┬──────────────────────────────────────────────┬────────────────────────────────────────────────┐
-│                 │              `preprocess_data.py`            │           `preprocess_data_fast.py`            │
-├─────────────────┼──────────────────────────────────────────────┼────────────────────────────────────────────────┤
-│ Tokenization    │ Per-document, split across `--workers`       │ Whole-file, parallelized internally by         │
-│                 │ processes                                    │ `gigatoken`                                    │
-├─────────────────┼──────────────────────────────────────────────┼────────────────────────────────────────────────┤
-│ Dataset writing │ `add_document()` per document                │ Batched `add_documents()` for the whole file   │
-├─────────────────┼──────────────────────────────────────────────┼────────────────────────────────────────────────┤
-│ Requires        │ —                                            │ `gigatoken` package, `--use-gigatoken`         │
-└─────────────────┴──────────────────────────────────────────────┴────────────────────────────────────────────────┘
-
+| | `preprocess_data.py` | `preprocess_data_fast.py` |
+|---|---|---|
+| Tokenization | Per-document, split across `--workers` processes | Whole-file, parallelized internally by `gigatoken` |
+| Dataset writing | `add_document()` per document | Batched `add_documents()` for the whole file |
+| Requires | — | `gigatoken` package, `--use-gigatoken` |
 
 **Key Arguments**
 
-┌──────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────┐
-│             Argument             │                                 Description                                  │
-├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
-│ `--input`                        │ Path to input **JSONL** file                                                 │
-├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
-│ `--output-prefix`                | Prefix for output binary files (`.bin` and `.idx`)                           │
-├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
-│ `--json-keys`                    │ Space-separated list of **JSON** fields to tokenize; each gets its own       │
-│                                  │ process and output shard                                                     │
-├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
-│ `--tokenizer-type` /             │ Same as `preprocess_data.py`                                                 │
-│ `--tokenizer-model`              │                                                                              │
-├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
-│ `--use-gigatoken`                │ Enable GigaToken-accelerated tokenization (required)                         │
-├──────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
-│ `--append-eod`                   │ Append an end-of-document token to each document                             │
-└──────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────┘
+| Argument | Description |
+|----------|-------------|
+| `--input` | Path to input **JSONL** file |
+| `--output-prefix` | Prefix for output binary files (`.bin` and `.idx`) |
+| `--json-keys` | Space-separated list of **JSON** fields to tokenize; each gets its own process and output shard |
+| `--tokenizer-type` / `--tokenizer-model` | Same as `preprocess_data.py` |
+| `--use-gigatoken` | Enable GigaToken-accelerated tokenization (required) |
+| `--append-eod` | Append an end-of-document token to each document |
 
 **Performance**
 
