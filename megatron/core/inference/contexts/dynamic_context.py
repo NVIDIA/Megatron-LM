@@ -3,6 +3,7 @@
 import logging
 import math
 import operator
+import os
 import warnings
 from contextlib import nullcontext
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -76,6 +77,38 @@ try:
     HAVE_TORCH_MEMORY_SAVER = True
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
+
+# Incremental steady-state decode path for `initialize_attention_state`. Off by
+# default; see `DynamicInferenceContext._incremental_attention_state_update`.
+_INCR_ATTN_STATE = os.environ.get("MCORE_INFER_INCR_ATTN_STATE", "0") == "1"
+# Debug mode: take the fast path, then recompute from scratch and assert that
+# every buffer the fast path served is identical. Very slow; correctness only.
+_INCR_ATTN_STATE_VERIFY = os.environ.get("MCORE_INFER_INCR_ATTN_STATE_VERIFY", "0") == "1"
+
+# Reduced-op path for the post-sampling bookkeeping in `update_requests`. Off by
+# default; see `DynamicInferenceContext._write_decode_token_bookkeeping_fast`.
+_VEC_UPDATE_REQS = os.environ.get("MCORE_INFER_VEC_UPDATE_REQS", "0") == "1"
+# Debug mode: run the reduced-op path, snapshot every buffer it wrote, restore
+# the inputs, run the reference path, and assert the two agree exactly.
+_VEC_UPDATE_REQS_VERIFY = os.environ.get("MCORE_INFER_VEC_UPDATE_REQS_VERIFY", "0") == "1"
+
+# Diagnostic: tally why the incremental fast path declines, so a single run answers
+# "which guard is rejecting every step" instead of requiring a guess per experiment.
+_INCR_DIAG = os.environ.get("MCORE_INFER_INCR_DIAG", "0") == "1"
+_incr_diag_counts: Dict[str, int] = {}
+
+
+def _incr_diag(reason: str) -> None:
+    """Count one fast-path outcome and periodically log the tally."""
+    _incr_diag_counts[reason] = _incr_diag_counts.get(reason, 0) + 1
+    total = sum(_incr_diag_counts.values())
+    if total % 500 == 0:
+        parts = ", ".join(
+            f"{k}={v} ({100*v/total:.1f}%)"
+            for k, v in sorted(_incr_diag_counts.items(), key=lambda x: -x[1])
+        )
+        logging.info("[INCR_DIAG] %d calls: %s", total, parts)
+
 
 DEPRECATED_ARGS = [
     "params_dtype",
@@ -317,6 +350,22 @@ class DynamicInferenceContext(BaseInferenceContext):
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
     TMS_TAG = "inference_context"
+
+    # Incremental attention-state cache (MCORE_INFER_INCR_ATTN_STATE). Declared
+    # at class scope so every construction path starts from a cold, invalid
+    # cache without depending on __init__ ordering.
+    _request_layout_version = 0
+    _incr_attn_state_key = None
+    _incr_attn_state_real_bs = 0
+    _incr_attn_state_padded_bs = 0
+    _incr_attn_state_max_seqlen_q = 0
+    _incr_attn_state_max_seqlen_k = 0
+    _incr_attn_state_state_data = None
+
+    # Cached `torch.arange(paused_request_count, total_request_count)` for the
+    # reduced-op decode bookkeeping path (MCORE_INFER_VEC_UPDATE_REQS).
+    _decode_req_idx_bounds = None
+    _decode_req_idx_arange = None
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -1055,6 +1104,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_tensor_state_allocated:
             return
         self.is_tensor_state_allocated = True
+        self._bump_request_layout_version()
 
         # Validate no tensors allocated prior to this method.
         for key in vars(self).keys():
@@ -2017,6 +2067,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not requests:
             return
 
+        self._bump_request_layout_version()
+
         num_new_requests = len(requests)
         if self.total_request_count + num_new_requests > self.max_requests:
             raise RequestOverflowError(requests[-1].request_id)
@@ -2154,6 +2206,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Adds dummy requests to reflect the number of prefill and decode requests in the graph config.
         These are using during cuda graph captures.
         """
+        self._bump_request_layout_version()
         prefill_tokens = graph_dimensions.token_count - (
             graph_dimensions.decode_req_count * (self.num_speculative_tokens + 1)
         )
@@ -2225,6 +2278,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Called AFTER the EP sync so graph_dimensions reflects the agreed-upon graph.
         """
+        self._bump_request_layout_version()
         N_decode = graph_dimensions.decode_req_count
         N_prefill = graph_dimensions.prefill_req_count
         N = N_decode + N_prefill
@@ -2307,6 +2361,20 @@ class DynamicInferenceContext(BaseInferenceContext):
                 completion, or `None` when no event was requested or no
                 transfer was performed.
         """
+        _verify_snapshot = None
+        if _INCR_ATTN_STATE and not is_expert_parallel_dummy_cuda_graph_step:
+            advanced, fast_bookkeeping_done_event = self._incremental_attention_state_update(
+                construct_graph_dimensions,
+                transfer_bookkeeping_to_gpu=transfer_bookkeeping_to_gpu,
+                record_bookkeeping_done_event=record_bookkeeping_done_event,
+            )
+            if advanced:
+                if not _INCR_ATTN_STATE_VERIFY:
+                    return fast_bookkeeping_done_event
+                # Verify mode: keep what the fast path produced, redo everything
+                # from scratch below, then assert the two agree exactly.
+                _verify_snapshot = self._incr_attn_state_snapshot()
+
         # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
         # overlap with the CPU work below.  These are non-blocking GPU kernels.
         self._execute_pending_mamba_ops()
@@ -2560,9 +2628,260 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Preserve the existing behavior for callers that do not publish explicitly.
+        bookkeeping_done_event = None
         if transfer_bookkeeping_to_gpu:
-            return self.transfer_bookkeeping_to_gpu(record_done_event=record_bookkeeping_done_event)
-        return None
+            bookkeeping_done_event = self.transfer_bookkeeping_to_gpu(
+                record_done_event=record_bookkeeping_done_event
+            )
+
+        if _INCR_ATTN_STATE:
+            self._incr_attn_state_store(real_bs, padded_bs, max_seqlen_q, max_seqlen_k)
+            if _verify_snapshot is not None:
+                self._incr_attn_state_verify(_verify_snapshot)
+
+        return bookkeeping_done_event
+
+    def _bump_request_layout_version(self) -> None:
+        """Invalidate the incremental attention-state cache.
+
+        Called from every path that changes *which* request occupies a slot, a
+        request's sampling metadata, or a request's KV block table — i.e. the
+        inputs that `initialize_attention_state` would otherwise recompute
+        identically on every decode step. Advancing a request's KV length is
+        deliberately *not* such a path: that is the one thing the incremental
+        update recomputes.
+        """
+        self._request_layout_version += 1
+
+    def _incr_attn_state_cache_key(self):
+        """Cheap scalar signature of the batch layout, or None if uncacheable.
+
+        `_request_layout_version` is the primary guard. The remaining entries
+        are independent structural sentinels so that a missed version bump
+        still has to coincide with an unchanged request count, token count and
+        KV block-allocator occupancy to go unnoticed.
+        """
+        if self.is_hybrid_model or self.num_prefill_requests != 0:
+            return None
+        return (
+            self._request_layout_version,
+            self.total_request_count,
+            self.paused_request_count,
+            self.active_token_count,
+            self.kv_block_allocator.pool_avail,
+            self.chunked_prefill_request_id,
+            self.num_speculative_tokens,
+        )
+
+    def _incr_attn_state_store(
+        self, real_bs: int, padded_bs: int, max_seqlen_q: int, max_seqlen_k: int
+    ) -> None:
+        """Record that the state just built by the full path is incrementable."""
+        if (
+            self.is_creating_cuda_graphs
+            or not self._using_cuda_graph_this_step
+            or self.is_hybrid_model
+            or self.num_prefill_requests != 0
+        ):
+            self._incr_attn_state_key = None
+            return
+        self._incr_attn_state_real_bs = real_bs
+        self._incr_attn_state_padded_bs = padded_bs
+        self._incr_attn_state_max_seqlen_q = max_seqlen_q
+        self._incr_attn_state_max_seqlen_k = max_seqlen_k
+        self._incr_attn_state_state_data = self.active_attn_metadata["mha_metadata"].state_data
+        self._incr_attn_state_key = self._incr_attn_state_cache_key()
+
+    def _incremental_attention_state_update(
+        self,
+        construct_graph_dimensions: Optional[InferenceBatchDimensions],
+        *,
+        transfer_bookkeeping_to_gpu: bool = True,
+        record_bookkeeping_done_event: bool = False,
+    ) -> Tuple[bool, Optional[torch.cuda.Event]]:
+        """Advance the cached attention state by one decode step.
+
+        In steady-state decode the request set, sampling metadata, KV block
+        table, CUDA-graph selection, padded dimensions and every
+        query-length-derived buffer are identical to the previous step; only
+        the KV sequence lengths advance by `num_speculative_tokens + 1` per
+        request. Recompute exactly those and reuse the rest.
+
+        The publish arguments mirror :meth:`initialize_attention_state`, so this path
+        serves deferred-publish callers (async scheduling) too. Without them the fast
+        path had to decline those callers, which meant it never ran at all under async
+        scheduling -- and async is the default in the tuned config, so the whole
+        optimization was silently inactive there.
+
+        Returns:
+            Tuple[bool, Optional[torch.cuda.Event]]: whether the state was advanced
+                (False means the caller must run the full path), and the bookkeeping
+                H2D completion event when one was both requested and recorded.
+        """
+        if construct_graph_dimensions is not None:
+            self._incr_attn_state_key = None
+            if _INCR_DIAG:
+                _incr_diag("decline:graph_capture")
+            return False, None
+        key = self._incr_attn_state_cache_key()
+        if key is None or key != self._incr_attn_state_key:
+            if _INCR_DIAG:
+                if key is None:
+                    # Uncacheable batch: hybrid model or a prefill request present.
+                    _incr_diag("decline:key_none")
+                elif self._incr_attn_state_key is None:
+                    # Previous step declined to store, so there is nothing to advance.
+                    _incr_diag("decline:no_stored_key")
+                else:
+                    # Both keys exist but differ: name the first differing field, which
+                    # is what distinguishes "layout really changed" from "one sentinel
+                    # (e.g. KV block availability) churns every step".
+                    fields = (
+                        "layout_version",
+                        "total_reqs",
+                        "paused_reqs",
+                        "active_tokens",
+                        "kv_blocks_avail",
+                        "chunked_prefill_id",
+                        "spec_tokens",
+                    )
+                    diff = next(
+                        (
+                            f
+                            for f, a, b in zip(fields, key, self._incr_attn_state_key)
+                            if a != b
+                        ),
+                        "unknown",
+                    )
+                    _incr_diag(f"decline:key_differs:{diff}")
+            return False, None
+
+        real_bs = self._incr_attn_state_real_bs
+        padded_bs = self._incr_attn_state_padded_bs
+
+        self._execute_pending_mamba_ops()
+        self.is_creating_cuda_graphs = False
+        self._using_cuda_graph_this_step = True
+        self.active_attn_metadata = self.graph_attn_metadata  # type: ignore[assignment]
+
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        query_lengths_view = self.request_query_lengths[active_slice]
+        request_kv_length_offsets_view = self.request_kv_length_offsets[active_slice]
+
+        # Character-identical to the corresponding statements in the full path,
+        # so the buffers stay bit-identical to a fresh computation.
+        self._cpu_mha_kv_seq_lengths[:real_bs] = (
+            request_kv_length_offsets_view[:real_bs] + query_lengths_view[:real_bs]
+        )
+        self._cpu_mha_cu_kv_seq_lengths[0] = 0
+        if real_bs > 0:
+            self._cpu_mha_cu_kv_seq_lengths[1 : real_bs + 1] = torch.cumsum(
+                self._cpu_mha_kv_seq_lengths[:real_bs], dim=0
+            )
+        if real_bs < padded_bs:
+            self._cpu_mha_cu_kv_seq_lengths[real_bs + 1 : padded_bs + 1] = (
+                self._cpu_mha_cu_kv_seq_lengths[real_bs]
+            )
+
+        # Token padding slots hold step-invariant sentinels, but re-stamp them
+        # whenever padding exists at all, since the token buffers are shared.
+        if self.active_token_count != self.padded_active_token_count:
+            self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
+                self.kv_block_allocator.dummy_block_idx
+            )
+            self.token_to_local_position_within_kv_block[
+                self.active_token_count : self.padded_active_token_count
+            ] = 0
+            self.token_to_position_in_request[
+                self.active_token_count : self.padded_active_token_count
+            ] = 0
+
+        # `reset_attention_state()` clears the max-seqlen scalars every step, so
+        # rebind state_data even though the slices behind it are unchanged.
+        self.active_attn_metadata["mha_metadata"].restore_state_data(
+            self._incr_attn_state_state_data,
+            self._incr_attn_state_max_seqlen_q,
+            self._incr_attn_state_max_seqlen_k,
+        )
+
+        if self.moe_enable_routing_replay:
+            self.moe_routing_metadata.enable_static_buffer_recording()
+
+        if self._nccl_ep_dispatcher:
+            NCCLAllGatherDispatcher._use_allgather_v = False
+
+        self._execute_pending_mamba_ops()
+        # Graph-capture and EP dummy steps are declined above, so this step always
+        # produces real output; clear the flag the publish step reads, which may
+        # still be set from an earlier capture step.
+        self._bookkeeping_no_real_work = False
+        if _INCR_DIAG:
+            _incr_diag("advanced")
+        # Same conditional publish as the tail of the full path: deferred-publish
+        # callers bind the GPU views here and push the values later.
+        bookkeeping_done_event = None
+        if transfer_bookkeeping_to_gpu:
+            bookkeeping_done_event = self.transfer_bookkeeping_to_gpu(
+                record_done_event=record_bookkeeping_done_event
+            )
+        return True, bookkeeping_done_event
+
+    def _incr_attn_state_snapshot(self) -> Dict:
+        """Clone everything the incremental path produced (debug verify only)."""
+        torch.cuda.synchronize()
+        n = self.padded_active_request_count
+        mha = self.active_attn_metadata["mha_metadata"]
+        snapshot = {
+            "mha_query_lengths": self._cpu_mha_query_lengths[:n].clone(),
+            "mha_cu_query_seq_lengths": self._cpu_mha_cu_query_seq_lengths[: n + 1].clone(),
+            "mha_kv_seq_lengths": self._cpu_mha_kv_seq_lengths[:n].clone(),
+            "mha_cu_kv_seq_lengths": self._cpu_mha_cu_kv_seq_lengths[: n + 1].clone(),
+            "mha_block_table": self._cpu_mha_block_table[:n].clone(),
+            "active_request_last_token_idxs": self.active_request_last_token_idxs[:n].clone(),
+            "active_logit_idxs": self.active_logit_idxs.clone(),
+            "gpu_bookkeeping_buf": self.gpu_view._buf.clone(),
+            "padded_active_token_count": self.padded_active_token_count,
+            "padded_active_request_count": self.padded_active_request_count,
+            "padded_batch_dimensions": self.padded_batch_dimensions,
+            "using_cuda_graph_this_step": self._using_cuda_graph_this_step,
+            "max_seqlen_q": mha._max_seqlen_q,
+            "max_seqlen_k": mha._max_seqlen_k,
+        }
+        for label, tensor in self.active_request_metadata.items():
+            snapshot[f"active_request_metadata/{label}"] = tensor[:n].clone()
+        # state_data holds views into the GPU bookkeeping buffer; compare the
+        # bindings (address, shape, dtype) rather than the contents, which the
+        # `gpu_bookkeeping_buf` entry above already covers.
+        for label, value in mha.state_data.items():
+            if isinstance(value, torch.Tensor):
+                value = (value.data_ptr(), tuple(value.shape), str(value.dtype))
+            snapshot[f"state_data/{label}"] = value
+        return snapshot
+
+    def _incr_attn_state_verify(self, snapshot: Dict) -> None:
+        """Assert the freshly recomputed state matches the incremental one."""
+        fresh = self._incr_attn_state_snapshot()
+        mismatches = []
+        for key, want in snapshot.items():
+            got = fresh[key]
+            if isinstance(want, torch.Tensor):
+                if not torch.equal(want, got):
+                    bad = (want != got).nonzero().flatten()[:8].tolist()
+                    mismatches.append(f"{key}: {bad} incr={want.flatten()[:8].tolist()}")
+            elif want != got:
+                mismatches.append(f"{key}: incr={want} full={got}")
+        self._incr_attn_state_verify_steps = getattr(self, "_incr_attn_state_verify_steps", 0) + 1
+        if mismatches:
+            raise AssertionError(
+                "MCORE_INFER_INCR_ATTN_STATE verification failed at step "
+                f"{self._incr_attn_state_verify_steps}: " + "; ".join(mismatches)
+            )
+        if self._incr_attn_state_verify_steps % 10 == 0:
+            logging.info(
+                "[INCR_ATTN_STATE verify] %d incremental steps bit-identical to full "
+                "recomputation",
+                self._incr_attn_state_verify_steps,
+            )
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
@@ -2735,6 +3054,8 @@ class DynamicInferenceContext(BaseInferenceContext):
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
 
+        self._bump_request_layout_version()
+
         # Reset request indexes.
         self.request_ids.fill_(-1)
         self.request_query_lengths.fill_(0)
@@ -2778,6 +3099,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         # There is no prefix-cache state to preserve when caching is disabled.
         preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
+
+        self._bump_request_layout_version()
 
         # Reset request/token counts.
         self.total_request_count = 0
@@ -3165,6 +3488,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not self.is_tensor_state_allocated:
             raise TensorStateDeallocatedError(req.request_id)
 
+        self._bump_request_layout_version()
+
         # Prefill chunk length.
         if prefill_chunk_length is None:
             prefill_chunk_length = req.remaining_prompt_length
@@ -3403,6 +3728,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Move all the relevent booking tensors with src idxs to dst idxs
         """
+        self._bump_request_layout_version()
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
         self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
             src_idxs
@@ -3432,6 +3758,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
         """
+        self._bump_request_layout_version()
         tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
         tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_in_prefill_status_tensor, src_idxs, dst_idxs)
@@ -3489,6 +3816,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             request_indexes (torch.Tensor): Request indexes. (*Note*, NOT request
                 ids.)
         """
+        self._bump_request_layout_version()
         kv_blocks_assigned = self.request_to_kv_block_ids[request_indexes]
         non_zero_values_in_kv_memory = kv_blocks_assigned[kv_blocks_assigned != -1]
         self.kv_block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
@@ -3629,6 +3957,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Resume requests by assigning blocks and updating bookkeeping tensors.
         if resume_request_count > 0:
+            self._bump_request_layout_version()
             resume_start = self.paused_request_count
             resume_end = self.paused_request_count + resume_request_count
 
@@ -3858,6 +4187,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if block_ids is not None:
             row_idx = torch.nonzero(rows_requiring_new_block, as_tuple=True)[0]
             col_idx = self.request_kv_block_counts[row_idx]
+            self._bump_request_layout_version()
             self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
             self.request_kv_block_counts[row_idx] += 1
             self.request_last_kv_block_id[row_idx] = block_ids
@@ -3962,6 +4292,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             Tuple[Tensor, Tensor]: Request IDs that finished and source row indices
                 for surviving requests in their resolved destination order.
         """
+        # The layout-version bump is deferred until a request is known to have
+        # finished (below). When the mask is all ones -- the steady-state decode
+        # case -- nothing here touches the layout: no rows move (``survivor_idxs``
+        # equals ``dst_idxs``), no KV blocks are released, the stale slice is empty
+        # and ``total_request_count`` is unchanged. Bumping unconditionally
+        # invalidated the incremental attention-state cache on *every* step, which
+        # made that whole optimization inert under async scheduling (measured: the
+        # fast path advanced on 0.1% of calls, 97.5% declining on this version).
         if active_requests_mask.is_cuda:
             active_requests_mask = active_requests_mask.cpu()
 
@@ -3996,6 +4334,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_attention_state()
 
         if finished_idxs.numel() > 0:
+            # Every layout change in this method is downstream of a finished request:
+            # the row compaction below, the KV block release, and the request-count
+            # change all require at least one zero in the mask.
+            self._bump_request_layout_version()
             self.release_memory_blocks_from_request_indexes(finished_idxs)
 
         if active_request_count == 0:
@@ -4102,7 +4444,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask[-1] = 1
 
         active_request_count = (active_requests_mask == 1).sum().item()
-        finished_request_count = (active_requests_mask == 0).sum().item()
+        if _VEC_UPDATE_REQS:
+            # The mask is 0/1 by construction (a `&` of two byte comparisons in
+            # text_generation_controller), so the complement is exact and saves a
+            # second full comparison + reduction over the request dimension.
+            finished_request_count = active_requests_mask.numel() - active_request_count
+        else:
+            finished_request_count = (active_requests_mask == 0).sum().item()
         assert (
             active_request_count + finished_request_count + self.paused_request_count
             == self.total_request_count
@@ -4193,7 +4541,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             ]
             active_requests_requiring_new_block = (
                 num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
-            ).byte()
+            )
+            if not _VEC_UPDATE_REQS:
+                # The bool tensor supports every downstream use (nonzero, `== 0`,
+                # scalar assignment, sum), so the byte cast is a pure copy.
+                active_requests_requiring_new_block = active_requests_requiring_new_block.byte()
 
             # Find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
             if (
@@ -4210,9 +4562,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                     # Force-pause excess requests in a decode-only batch
                     active_requests_requiring_new_block[max_allowed_active:] = 1
 
-            active_requests_requiring_new_block_count = (
-                (active_requests_requiring_new_block == 1).sum().item()
-            )
+            if _VEC_UPDATE_REQS:
+                active_requests_requiring_new_block_count = int(
+                    active_requests_requiring_new_block.sum()
+                )
+            else:
+                active_requests_requiring_new_block_count = (
+                    (active_requests_requiring_new_block == 1).sum().item()
+                )
 
             if active_requests_requiring_new_block_count > 0:
                 newly_paused_request_ids = self.request_ids[
@@ -4360,6 +4717,123 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_generated_tokens
         )
 
+        if _VEC_UPDATE_REQS and self.num_speculative_tokens == 0:
+            if _VEC_UPDATE_REQS_VERIFY:
+                self._verify_decode_token_bookkeeping(active_request_count, next_tokens)
+            else:
+                self._write_decode_token_bookkeeping_fast(active_request_count, next_tokens)
+        else:
+            self._write_token_bookkeeping_reference(
+                active_request_count,
+                num_generated_tokens,
+                next_tokens,
+                prev_last_block_ids,
+                new_speculative_tokens,
+            )
+
+        return {
+            "newly_paused_request_ids": newly_paused_request_ids,
+            "evict_request_ids": evict_request_ids,
+        }
+
+    def _write_decode_token_bookkeeping_fast(
+        self, active_request_count: int, next_tokens: Tensor
+    ) -> None:
+        """Reduced-op form of `_write_token_bookkeeping_reference` for plain decode.
+
+        Only valid when `num_speculative_tokens == 0`, i.e. exactly one generated
+        token per active request. Under that condition the reference path spends
+        most of its host time on operations that are provably identity:
+        `repeat_interleave(1)`, adding `torch.arange(1).repeat(n)` (a zero
+        vector), and building the `raw_positions` / `crosses_boundary` tensors
+        whose only consumer is a branch that a zero speculative-token count makes
+        unreachable. This writes the same values with those operations removed.
+        """
+        paused = self.paused_request_count
+        total = self.total_request_count
+        active_slice = slice(paused, total)
+        num_tokens = active_request_count
+
+        block_offsets = self.request_last_kv_block_offset
+        block_offsets[active_slice] = (
+            block_offsets[active_slice] + 1
+        ) % self.block_size_tokens
+
+        self.active_token_count = num_tokens
+        self.token_to_input_ids[:num_tokens] = next_tokens[active_slice]
+
+        pos_ids = self.token_to_pos_ids
+        pos_ids[:num_tokens] = self.request_kv_length_offsets[active_slice]
+
+        if self._decode_req_idx_bounds != (paused, total):
+            self._decode_req_idx_bounds = (paused, total)
+            self._decode_req_idx_arange = torch.arange(paused, total, device='cpu')
+        self.token_to_request_idx[:num_tokens] = self._decode_req_idx_arange
+
+        self.token_to_position_in_request[:num_tokens] = pos_ids[:num_tokens]
+        self.token_to_local_position_within_kv_block[:num_tokens] = (
+            pos_ids[:num_tokens] % self.block_size_tokens
+        )
+        self.token_to_block_idx[:num_tokens] = self.request_last_kv_block_id[active_slice]
+
+    def _verify_decode_token_bookkeeping(
+        self, active_request_count: int, next_tokens: Tensor
+    ) -> None:
+        """Run the fast path, then the reference path, and assert they agree."""
+        paused = self.paused_request_count
+        total = self.total_request_count
+        pre_block_offsets = self.request_last_kv_block_offset[paused:total].clone()
+
+        self._write_decode_token_bookkeeping_fast(active_request_count, next_tokens)
+        num_tokens = self.active_token_count
+        fast = {
+            "request_last_kv_block_offset": self.request_last_kv_block_offset[
+                paused:total
+            ].clone(),
+            "active_token_count": self.active_token_count,
+            "token_to_input_ids": self.token_to_input_ids[:num_tokens].clone(),
+            "token_to_pos_ids": self.token_to_pos_ids[:num_tokens].clone(),
+            "token_to_request_idx": self.token_to_request_idx[:num_tokens].clone(),
+            "token_to_position_in_request": self.token_to_position_in_request[
+                :num_tokens
+            ].clone(),
+            "token_to_local_position_within_kv_block": (
+                self.token_to_local_position_within_kv_block[:num_tokens].clone()
+            ),
+            "token_to_block_idx": self.token_to_block_idx[:num_tokens].clone(),
+        }
+
+        self.request_last_kv_block_offset[paused:total] = pre_block_offsets
+        self._write_token_bookkeeping_reference(active_request_count, 1, next_tokens, None)
+
+        mismatches = []
+        for name, fast_value in fast.items():
+            if name == "active_token_count":
+                if fast_value != self.active_token_count:
+                    mismatches.append(f"{name}: {fast_value} != {self.active_token_count}")
+                continue
+            if name == "request_last_kv_block_offset":
+                reference = self.request_last_kv_block_offset[paused:total]
+            else:
+                reference = getattr(self, name)[:num_tokens]
+            if not torch.equal(fast_value, reference):
+                bad = int((fast_value != reference).sum())
+                mismatches.append(f"{name}: {bad} of {reference.numel()} elements differ")
+        if mismatches:
+            raise AssertionError(
+                "MCORE_INFER_VEC_UPDATE_REQS verification failed at step "
+                f"{self.step_count}: " + "; ".join(mismatches)
+            )
+
+    def _write_token_bookkeeping_reference(
+        self,
+        active_request_count: int,
+        num_generated_tokens: int,
+        next_tokens: Tensor,
+        prev_last_block_ids: Optional[Tensor],
+        new_speculative_tokens: Optional[Tensor] = None,
+    ) -> None:
+        """Per-token bookkeeping for the next forward pass (general path)."""
         # Clone needed: old_offsets is reused later to compute raw_positions
         # for block-boundary detection. The write-back on the next line overwrites the
         # underlying tensor, so without clone the boundary-crossing logic would see the
@@ -4485,11 +4959,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Convert back to 1d tensor
             self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
-
-        return {
-            "newly_paused_request_ids": newly_paused_request_ids,
-            "evict_request_ids": evict_request_ids,
-        }
 
     def _processed_log_probs(
         self,
