@@ -269,9 +269,14 @@ class FsdpParameterGroup:
         # TODO: Retrieve the all-gather stream directly from self.model_weight after
         # https://github.com/NVIDIA/Megatron-LM/pull/6441 merges.
         allgather_stream = context.allgather_stream
-        allgather_stream.wait_stream(context.current_stream())
+        current_stream = context.current_stream()
+        allgather_stream.wait_stream(current_stream)
         with torch.cuda.stream(allgather_stream):
             self.model_weight = self.main_weight.cast(self.model_weight.dtype)
+        # CUDA graph capture requires every forked stream to rejoin the capture
+        # stream before capture ends. Keep the eager path asynchronous.
+        if torch.cuda.is_current_stream_capturing():
+            current_stream.wait_stream(allgather_stream)
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
