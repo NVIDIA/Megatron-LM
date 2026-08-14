@@ -196,7 +196,7 @@ def weighted_silu_mul_bounded(
     y: torch.Tensor,
     weights_flat: torch.Tensor,
     bound_elems: torch.Tensor,
-    num_programs: int = 1184,
+    num_programs: Optional[int] = None,
     xblock: int = 1024,
 ) -> torch.Tensor:
     """SwiGLU with routing weights applied at the activation (training parity).
@@ -204,9 +204,19 @@ def weighted_silu_mul_bounded(
     y: [rows, 2*half_n] bf16 (gate | up); weights_flat: [rows] fp32 routing
     probabilities; bound_elems: device scalar = live_rows * half_n.
     Returns [rows, half_n] bf16; rows beyond the live bound are untouched.
+
+    num_programs defaults to SMs * 8 waves (Inductor's persistent-grid sizing;
+    1184 on the B200 this was captured from). Grid size cannot affect bits:
+    the kernel is elementwise with each program owning a disjoint strided
+    index range, so it is an occupancy knob only.
     """
     rows, two_half_n = y.shape
     half_n = two_half_n // 2
+    if num_programs is None:
+        # Lazy import: permute.py imports this module at its top level.
+        from megatron.core.inference.moe.permute import _get_num_sms
+
+        num_programs = _get_num_sms(y.device) * 8
     out = torch.empty(rows, half_n, dtype=y.dtype, device=y.device)
     _weighted_silu_mul_bounded_kernel[(num_programs,)](
         y, weights_flat, out, bound_elems, rows * half_n, HALF_N=half_n, XBLOCK=xblock
