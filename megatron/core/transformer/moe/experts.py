@@ -23,7 +23,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, ensure_mxfp8_scale_dtype
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -1088,9 +1088,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 s_list.append(mxfp8.scale)
 
             stacked_data = torch.stack(q_list, dim=0).contiguous()
-            stacked_scale = torch.stack(s_list, dim=0).contiguous()
+            stacked_scale = ensure_mxfp8_scale_dtype(
+                torch.stack(s_list, dim=0).contiguous()
+            )
 
-            setattr(self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale))
+            setattr(
+                self,
+                buf_name,
+                MXFP8Tensor(data=stacked_data, scale=stacked_scale, backend="triton"),
+            )
 
             # Redirect per-expert weight .data to views into the stacked buffer,
             # mirroring _build_concatenated_weights. This frees the original
@@ -1100,9 +1106,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 if isinstance(w, MXFP8Tensor):
                     w.data = stacked_data[i]
                     w.scale = stacked_scale[i]
+                    w.backend = "triton"
                 elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
                     w.data.data = stacked_data[i]
                     w.data.scale = stacked_scale[i]
+                    w.data.backend = "triton"
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):

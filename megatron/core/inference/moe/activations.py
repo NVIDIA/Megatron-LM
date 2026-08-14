@@ -226,7 +226,11 @@ def _squared_relu_quantize_kernel(
                 # Load and apply squared ReLU
                 x = tl.load(input_ptr + row * K + offs, mask=mask, other=0.0).to(tl.float32)
                 relu = tl.maximum(x, 0.0)
-                activated = relu * relu
+                # Match the unfused training/inference contract exactly:
+                # squared ReLU materializes a BF16 activation before the next
+                # MXFP8 quantization. Keeping the product in FP32 here changes
+                # quantization bins and compounds across MoE layers.
+                activated = (relu * relu).to(tl.bfloat16).to(tl.float32)
 
                 # Per-group-of-32 quantization
                 x_grouped = tl.reshape(activated, [BLOCK_GROUPS, 32])

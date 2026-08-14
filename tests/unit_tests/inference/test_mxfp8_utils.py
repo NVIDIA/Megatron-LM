@@ -260,9 +260,28 @@ class TestMxfp8Quantize:
 
 class TestMXFP8Tensor:
 
+    def test_restore_uint8_scale_dtype_after_resharding(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import (
+            ensure_mxfp8_scale_dtype,
+        )
+
+        scale_bytes = torch.arange(16, dtype=torch.uint8)
+        scale = ensure_mxfp8_scale_dtype(scale_bytes)
+
+        assert scale.dtype == torch.float8_e8m0fnu
+        torch.testing.assert_close(scale.view(torch.uint8), scale_bytes)
+
+    def test_reject_invalid_scale_dtype(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import (
+            ensure_mxfp8_scale_dtype,
+        )
+
+        with pytest.raises(TypeError, match="MXFP8 scales must use"):
+            ensure_mxfp8_scale_dtype(torch.ones(16, dtype=torch.bfloat16))
+
     @pytest.mark.parametrize("M,K", [(16, 128), (64, 256), (128, 2688)])
     def test_from_bf16_triton(self, M, K):
-        """from_bf16 with triton backend produces correct data and scales."""
+        """The Triton backend produces correct data and scales."""
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
         torch.manual_seed(42)
@@ -440,7 +459,7 @@ class TestSquaredReluAndQuantizeMxfp8:
         perm_map = _make_permutation_map(M, num_padding=0)
 
         # PyTorch reference: squared ReLU in fp32, then downcast to bf16, then quantize
-        activated_ref = torch.relu(x.float()).pow(2)
+        activated_ref = torch.relu(x.float()).pow(2).to(torch.bfloat16)
         _, ref_data = ref_to_mxfp(activated_ref)
 
         # Fused kernel
@@ -460,7 +479,7 @@ class TestSquaredReluAndQuantizeMxfp8:
         perm_map = _make_permutation_map(M, num_padding=0)
 
         # PyTorch reference
-        activated_ref = torch.relu(x.float()).pow(2)
+        activated_ref = torch.relu(x.float()).pow(2).to(torch.bfloat16)
         ref_scales_2d, _ = ref_to_mxfp(activated_ref)
         ref_swizzled = ref_swizzle(ref_scales_2d)
 
@@ -485,7 +504,7 @@ class TestSquaredReluAndQuantizeMxfp8:
 
         # PyTorch reference (only real rows)
         real_rows = M - num_padding
-        activated_ref = torch.relu(x[:real_rows].float()).pow(2)
+        activated_ref = torch.relu(x[:real_rows].float()).pow(2).to(torch.bfloat16)
         _, ref_data = ref_to_mxfp(activated_ref)
 
         # Fused kernel
@@ -633,6 +652,17 @@ class TestPermuteAndQuantizeMxfp8:
         assert isinstance(result, MXFP8Tensor)
         assert result.backend == "triton"
         assert result.data.dtype == torch.float8_e4m3fn
+
+    def test_fixed_buffer_rows_match_swizzled_scale_padding(self):
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+        hidden, probs, routing_map = self._make_inputs(72, 2688, 6, 128)
+        result, _, _, _ = permute_and_quantize_mxfp8(
+            hidden, probs, routing_map, 0, 64, _vt(72), alignment=128
+        )
+
+        assert result.data.shape[0] == 8704
+        assert result.scale_2d().shape[0] == result.data.shape[0]
 
     @pytest.mark.parametrize("alignment", [128])
     def test_offsets_aligned(self, alignment):

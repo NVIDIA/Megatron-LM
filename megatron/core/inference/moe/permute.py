@@ -674,7 +674,11 @@ def permute_and_quantize_mxfp8(
         tokens_per_expert, alignment=alignment
     )
     # Output sized at max to keep allocations fixed across steps (CUDA graph compatible).
-    output_size = max_tokens * min(topk, num_local_experts) + alignment * num_local_experts
+    unaligned_output_size = (
+        max_tokens * min(topk, num_local_experts) + alignment * num_local_experts
+    )
+    # Keep data rows consistent with the swizzled scale layout's row padding.
+    output_size = _ceil_div(unaligned_output_size, alignment) * alignment
 
     scale_cols = K // 32
     n_row_blocks = _ceil_div(output_size, 128)
