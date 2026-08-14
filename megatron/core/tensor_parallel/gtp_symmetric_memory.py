@@ -31,7 +31,7 @@ import torch
 import torch.distributed as dist
 
 import megatron.core.nccl_allocator as nccl_allocator
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import is_torch_min_version, log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,12 @@ def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPoo
     """
     if group is None or group.size() <= 1:
         return None
+    if not is_torch_min_version("2.9.0a0"):
+        raise RuntimeError(
+            "[GTP] --gtp-remat-nccl-ub/--egtp-remat-nccl-ub require PyTorch >= 2.9: older "
+            "versions cannot create a symmetric memory pool (create_nccl_mem_pool silently "
+            "falls back to a non-symmetric one, so the reduce-scatter would not be symmetric)."
+        )
     pool = get_gtp_symm_pool(group)
     if group.group_name in _registered:
         return pool

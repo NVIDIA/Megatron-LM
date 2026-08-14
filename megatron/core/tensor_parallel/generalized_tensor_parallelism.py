@@ -2155,7 +2155,11 @@ class GTPShardedParam(torch.nn.Parameter):
                 for buf in wgrads:
                     _wgrad_pool_put(buf)
             for buf in rs_inputs:
-                symmetric_wgrad_pool.free(buf)  # tag-gated: symm LIFO parents only
+                # Dual release, mirroring _release_comm_scratch: each free is tag-gated
+                # and takes only its own pool's buffers.
+                if poolable:
+                    _wgrad_pool_put(buf)
+                symmetric_wgrad_pool.free(buf)
             ret = result if batched else result[0]
 
         # Wait for last reduce scatter if it was async

@@ -96,6 +96,13 @@ def _restore_gtp_config():
 # ---------------------------------------------------------------------------
 
 
+class TestRegisterVersionGuard:
+    def test_register_rejects_old_torch(self, monkeypatch):
+        monkeypatch.setattr(gtp_symm, "is_torch_min_version", lambda v: False)
+        with pytest.raises(RuntimeError, match="PyTorch >= 2.9"):
+            gtp_symm.register_gtp_symm_pool(_StubGroup(size=2))
+
+
 class TestRegisteredLifoPool:
     def test_alloc_returns_tagged_view(self):
         pool = RegisteredLifoPool()
