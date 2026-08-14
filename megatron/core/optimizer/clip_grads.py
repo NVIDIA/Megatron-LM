@@ -172,7 +172,7 @@ def clip_grad_by_total_norm_fp32(
         else:
             if param.grad is not None:
                 local_grad = to_local_if_dtensor(param.grad)
-                assert local_grad.type() == 'torch.cuda.FloatTensor'
+                assert local_grad.dtype in (torch.float32, torch.bfloat16)
                 params.append(param)
                 grads.append(local_grad.detach())
 

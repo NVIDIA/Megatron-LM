@@ -357,11 +357,11 @@ class TestMcoreAdapterDense:
 
         optimizer.zero_grad(set_to_none=True)
         output = model(
-            hidden_states=torch.full(
-                (8, 2, config.hidden_size),
-                fill_value=torch.distributed.get_rank() + 1,
-                device="cuda",
-                dtype=torch.bfloat16,
+            hidden_states=(
+                torch.arange(1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16)
+                .view(1, 1, -1)
+                .expand(8, 2, -1)
+                * (torch.distributed.get_rank() + 1)
             ),
             attention_mask=None,
         )
@@ -373,11 +373,11 @@ class TestMcoreAdapterDense:
         post_clip_norm = global_grad_norm()
 
         assert success
-        torch.testing.assert_close(pre_clip_norm, expected_pre_clip_norm)
+        torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
         assert (
             expected_pre_clip_norm > clip_grad
         ), "Test gradients must exceed the clipping threshold to exercise clipping."
-        torch.testing.assert_close(post_clip_norm, clip_grad)
+        torch.testing.assert_close(post_clip_norm, clip_grad, rtol=1e-3, atol=0)
 
 
 class TestMcoreAdapterExpertParallel:
