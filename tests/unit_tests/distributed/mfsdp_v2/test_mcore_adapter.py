@@ -258,8 +258,8 @@ class TestMcoreAdapterDense:
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
 
 
-    def test_fused_sgd_rejects_mismatched_grads(self):
-        """FusedSGD cannot consume V2's BF16 gradients for FP32 weights."""
+    def test_fused_sgd_casts_mismatched_grads(self):
+        """FusedSGD steps after MCore casts V2's BF16 gradients to FP32."""
         config = TransformerConfig(
             num_layers=1,
             hidden_size=16,
@@ -308,10 +308,8 @@ class TestMcoreAdapterDense:
         )
         output.float().square().mean().backward()
 
-        with pytest.raises(
-            RuntimeError, match="Unsupported combination of weight and gradient types"
-        ):
-            optimizer.step()
+        success, _, _ = optimizer.step()
+        assert success
 
 
 class TestMcoreAdapterExpertParallel:
