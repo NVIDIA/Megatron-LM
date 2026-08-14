@@ -19,19 +19,19 @@ re-exported here for backwards compatibility with older standalone callers.
 import json
 from functools import partial
 
-# NOTE: ``get_model`` below does a ``from model import model_provider`` for the
-# ``examples/multimodal/model.py`` file, whose siblings use bare imports like
-# ``from config import ...``. The *caller* of this module (typically
-# ``tools/run_dynamic_text_generation_server.py``) is expected to have already
-# added the repo root and ``examples/multimodal/`` to ``sys.path`` before
-# invoking ``get_model``. ``megatron/core`` does not mutate ``sys.path`` here.
-
 from megatron.core.transformer.module import MegatronModule
 from megatron.inference.utils import add_inference_args
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import print_rank_0
 from megatron.training.checkpointing import load_args_from_checkpoint, load_checkpoint
+
+# NOTE: ``get_model`` below does a ``from model import model_provider`` for the
+# ``examples/multimodal/model.py`` file, whose siblings use bare imports like
+# ``from config import ...``. The *caller* of this module (typically
+# ``tools/run_dynamic_text_generation_server.py``) is expected to have already
+# added the repo root and ``examples/multimodal/`` to ``sys.path`` before
+# invoking ``get_model``. ``megatron/core`` does not mutate ``sys.path`` here.
 
 
 def add_vlm_inference_args(parser):

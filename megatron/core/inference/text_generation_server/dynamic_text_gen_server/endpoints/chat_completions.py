@@ -8,8 +8,8 @@ import logging
 import socket
 import time
 import traceback
-import urllib.parse
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import warnings
