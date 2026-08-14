@@ -615,8 +615,43 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 skip_backward_callback=skip_backward_cb,
             )
         super().__init__(config=config, module=module)
+        if config.init_model_with_meta_device:
+            self._reset_parameters_for_meta_device_init()
         if fine_grained:
             self._setup_1f1b_overlap_interface()
+
+    def _reset_parameters_for_meta_device_init(self) -> None:
+        """Reset model parameters that were initialized on the meta device.
+
+        Meta-device init leaves parameters without values; ``fully_shard`` then
+        materializes them as empty tensors. Reset each leaf module's weights on
+        the full (unsharded) parameters, copy the aligned values back into the
+        sharded optimizer/compute buffers, and return to the sharded resting state.
+        """
+        root = self.module
+        fsdp_modules = [m for m in root.modules() if isinstance(m, FsdpModule)]
+
+        # Unshard every FSDP unit so reset_parameters() writes the full weight.
+        for m in fsdp_modules:
+            m._unshard_parameter_groups()
+        context = root.context
+        context.current_stream().wait_stream(context.allgather_stream)
+
+        # Reset the original (non-FsdpModule) leaf modules.
+        for m in root.modules():
+            if isinstance(m, FsdpModule):
+                continue
+            if hasattr(m, "reset_parameters"):
+                m.reset_parameters()
+            elif hasattr(m, "_reset_parameters"):
+                m._reset_parameters()
+
+        # Copy the reset full weights back into the sharded buffers, aligned
+        # across DP/EDP ranks, then return to the sharded resting state.
+        for m in fsdp_modules:
+            for group in m._parameter_groups:
+                group.sync_model_weight_from_unsharded_weight()
+            m._reshard_parameter_groups()
 
     def _setup_1f1b_overlap_interface(self) -> None:
         """Expose the parameter lifecycle callbacks used by combined 1F1B.
