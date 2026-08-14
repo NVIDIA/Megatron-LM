@@ -137,18 +137,22 @@ def collect_mxfp8_param_metadata(
     return metadata
 
 
+@torch.inference_mode(False)
+@torch.no_grad()
 def quantize_params_to_mxfp8(
     model: torch.nn.Module,
     persistent_buffers: Optional[Dict[str, MXFP8Tensor]] = None,
     _prefix: str = "",
     backend: str = "flashinfer",
 ) -> Dict[str, MXFP8Tensor]:
-    """Quantize model parameters to MXFP8Tensor format.
+    """Quantize model parameters to mutable MXFP8Tensor storage.
 
     Handles both TEMXFP8Tensor (fp8_param=True) and BF16/FP16 nn.Parameter
     inputs.  When *persistent_buffers* is provided, new quantized values are
     ``copy_()``'d into the existing MXFP8Tensor objects so that CUDA-graph
-    device-pointer captures remain valid.
+    device-pointer captures remain valid.  Persistent buffers are deliberately
+    created outside inference mode so later refits can update them regardless
+    of the caller's execution mode.
 
     Args:
         model: The model whose parameters should be quantized.

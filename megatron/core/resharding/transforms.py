@@ -12,7 +12,11 @@ Reshard transforms for custom send/recv/writeback during weight transfer.
 import torch
 
 from megatron.core.fp8_utils import dequantize_fp8_tensor, is_mxfp8tensor
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.mxfp8_tensor import (
+    MXFP8Tensor,
+    ensure_mxfp8_scale_dtype,
+    validate_mxfp8_tensor,
+)
 
 
 class ReshardTransform:
@@ -165,6 +169,8 @@ class MXFP8ReshardTransform(ReshardTransform):
         self.persistent_buffers = persistent_buffers
         self.buffer_key_prefix = buffer_key_prefix
         self.convert_on_send = convert_on_send
+        for name, buffer in persistent_buffers.items():
+            validate_mxfp8_tensor(buffer, tensor_name=f"persistent refit buffer {name!r}")
         # Accumulation buffers for 1D-scale params that arrive in partial slices.
         # The 1D swizzled FlashInfer scale can't be updated partially; we collect
         # all BF16 slices here and quantize the full weight once it's assembled.
@@ -235,7 +241,8 @@ class MXFP8ReshardTransform(ReshardTransform):
             # (1D scale is rejected at prepare_recv time, so only 2D reaches here.)
             buf.data[dst_slice].copy_(recv_buffers[0])
             scale_slice = _scale_slice_from_data_slice(dst_slice)
-            buf.scale[scale_slice].copy_(recv_buffers[1])
+            recv_scale = ensure_mxfp8_scale_dtype(recv_buffers[1])
+            buf.scale[scale_slice].view(torch.uint8).copy_(recv_scale.view(torch.uint8))
         elif buf.scale.ndim == 1:
             # 1D swizzled scale (FlashInfer format) encodes scale values across the
             # full weight tensor; partial updates would corrupt the swizzle layout.
@@ -261,7 +268,7 @@ class MXFP8ReshardTransform(ReshardTransform):
                     )
                 mxfp8 = MXFP8Tensor.from_bf16(accum)
                 buf.data.copy_(mxfp8.data)
-                buf.scale.copy_(mxfp8.scale)
+                buf.scale.view(torch.uint8).copy_(mxfp8.scale.view(torch.uint8))
                 del self._pending_1d[buf_key]
             else:
                 self._pending_1d[buf_key][1] = written
@@ -271,4 +278,6 @@ class MXFP8ReshardTransform(ReshardTransform):
             mxfp8 = MXFP8Tensor.from_bf16(recv_buffers[0])
             buf.data[dst_slice].copy_(mxfp8.data)
             scale_slice = _scale_slice_from_data_slice(dst_slice)
-            buf.scale[scale_slice].copy_(mxfp8.scale)
+            buf.scale[scale_slice].view(torch.uint8).copy_(mxfp8.scale.view(torch.uint8))
+
+        validate_mxfp8_tensor(buf, tensor_name=f"refitted parameter {param_name!r}")

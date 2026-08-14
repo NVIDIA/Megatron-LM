@@ -122,6 +122,41 @@ class TestMXFP8ReshardTransform:
             overlap = torch.randn(M // 2 + 1, K, dtype=torch.bfloat16, device="cuda")
             t.finalize_recv("decoder.weight", (slice(M // 2 - 1, M), slice(None)), [overlap])
 
+    def test_repeated_finalize_updates_persistent_buffer_outside_inference_mode(self, monkeypatch):
+        from megatron.core.inference.quantization import utils as quantization_utils
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+
+        M, K = 64, 128
+        monkeypatch.setattr(quantization_utils, "_should_quantize_param", lambda _param: True)
+        with torch.inference_mode():
+            model = torch.nn.Linear(K, M, bias=False).to(dtype=torch.bfloat16, device="cuda")
+            buffers = quantization_utils.quantize_params_to_mxfp8(model, backend="triton")
+        buf = buffers["weight"]
+        assert not torch.is_inference(buf.data)
+        assert not torch.is_inference(buf.scale)
+
+        transform = MXFP8ReshardTransform(
+            convertible_params={"decoder.weight"},
+            persistent_buffers=buffers,
+            buffer_key_prefix="decoder.",
+        )
+        data_ptr = buf.data.data_ptr()
+        scale_ptr = buf.scale.data_ptr()
+
+        for _ in range(2):
+            assert torch.is_grad_enabled()
+            assert not torch.is_inference_mode_enabled()
+            new_data = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+            transform.finalize_recv("decoder.weight", (slice(None), slice(None)), [new_data])
+            expected = MXFP8Tensor.from_bf16(new_data)
+            assert torch.equal(buf.data, expected.data)
+            assert torch.equal(buf.scale.view(torch.uint8), expected.scale.view(torch.uint8))
+            assert buf.data.data_ptr() == data_ptr
+            assert buf.scale.data_ptr() == scale_ptr
+            assert buf.backend == "triton"
+            assert buf.scale.dtype == torch.float8_e8m0fnu
+
 
 # ===========================================================================
 # quantize_params_to_mxfp8
