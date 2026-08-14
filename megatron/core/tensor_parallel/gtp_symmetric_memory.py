@@ -101,22 +101,6 @@ def is_gtp_symm_pool_registered(group: dist.ProcessGroup | None) -> bool:
     return group is not None and group.size() > 1 and group.group_name in _registered
 
 
-def deregister_gtp_symm_pools() -> None:
-    """Deregister every GTP-owned pool (a window left registered at process-group
-    destruction makes NCCL abort). Call on all ranks before teardown; no-op if nothing
-    was registered. Also drops the recycled send buffers living in these pools."""
-    # Drop the recycled send buffers first: they alias the pools torn down below.
-    symmetric_wgrad_pool.clear()
-    # Quiesce the device before deregistering windows: an in-flight kernel or
-    # collective still reading pool memory would otherwise fault asynchronously.
-    if torch.cuda.is_available() and torch.cuda.is_initialized():
-        torch.cuda.synchronize()
-    for name in sorted(_registered):
-        nccl_allocator.deregister_mem_pool(_pools[name], _registered[name])
-    _registered.clear()
-    _pools.clear()
-
-
 # ---------------------------------------------------------------------------
 # RS send-buffer LIFO: recycled window-registered scratch for wgrad reduce-scatters
 # ---------------------------------------------------------------------------
@@ -186,7 +170,7 @@ class RegisteredLifoPool:
         group = getattr(buf, "_gtp_symm_group", None)
         if group is None:
             return
-        self._free[(buf.numel(), buf.dtype, group.group_name)].append(buf.reshape(-1))
+        self._free[(buf.numel(), buf.dtype, group.group_name)].append(buf.view(-1))
 
     def clear(self) -> None:
         """Drop every cached buffer. Called at teardown, before the pools they alias go away."""
@@ -194,5 +178,24 @@ class RegisteredLifoPool:
 
 
 # The process-wide send-buffer cache, used by generalized_tensor_parallelism. Lives here
-# so deregister_gtp_symm_pools can drop its buffers at teardown.
+# so deregister_and_clear_gtp_symm_pools can drop its buffers at teardown.
 symmetric_wgrad_pool = RegisteredLifoPool()
+
+
+def deregister_and_clear_gtp_symm_pools() -> None:
+    """Deregister every GTP-owned pool (a window left registered at process-group
+    destruction makes NCCL abort) and drop the recycled send buffers living in them.
+    Call on all ranks before teardown; no-op if nothing was registered."""
+    # Wait for all GPU work to finish first: a kernel or collective still reading
+    # pool memory would fault once the windows go away.
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        torch.cuda.synchronize()
+    # Deregister while the recycled send buffers are still alive. Their memory keeps
+    # the pool non-empty, so deregister_mem_pool (which skips empty pools) always runs.
+    for name in sorted(_registered):
+        nccl_allocator.deregister_mem_pool(_pools[name], _registered[name])
+    # Only now drop the buffers and the pools; the windows are gone, so the memory
+    # is safe to release.
+    symmetric_wgrad_pool.clear()
+    _registered.clear()
+    _pools.clear()

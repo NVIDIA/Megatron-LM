@@ -2138,11 +2138,11 @@ def pretrain(
         rl_utils.rl_inference_interface_shutdown()
 
     if getattr(args, 'gtp_nccl_ub', False) or getattr(args, 'egtp_nccl_ub', False):
-        from megatron.core.tensor_parallel.gtp_api import deregister_gtp_symm_pools
+        from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
 
         # Deregister the GTP symmetric-memory pools: windows left registered when the
         # process groups are destroyed make NCCL abort.
-        deregister_gtp_symm_pools()
+        deregister_and_clear_gtp_symm_pools()
 
     ft_integration.shutdown()
     one_logger_utils.finish()
@@ -5046,11 +5046,11 @@ def train(
         # causing "NCCL WARN Deregister: Could not find handle" and a crash.
         torch.distributed.barrier()
         if getattr(args, 'gtp_nccl_ub', False) or getattr(args, 'egtp_nccl_ub', False):
-            from megatron.core.tensor_parallel.gtp_api import deregister_gtp_symm_pools
+            from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
 
             # Deregister the GTP symmetric-memory pools: windows left registered when the
             # process groups are destroyed make NCCL abort.
-            deregister_gtp_symm_pools()
+            deregister_and_clear_gtp_symm_pools()
 
         for model_module in model:
             if isinstance(model_module, DDP):

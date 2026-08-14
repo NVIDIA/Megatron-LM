@@ -319,19 +319,20 @@ def _use_symmetric_wgrad_buffer(weight) -> bool:
     A registered pool takes precedence over fp32-accum on its group: the group keeps the
     plain (symmetric) reduce-scatter, and fp32-accum applies only to unregistered groups.
     """
-    return getattr(weight, "gtp_smr", False) and is_gtp_symm_pool_registered(weight.group)
+    return weight.gtp_smr and is_gtp_symm_pool_registered(weight.group)
 
 
-def _use_fp32_accum_rs(group) -> bool:
-    """True when this group's wgrad reduction runs as the fp32-accum all-to-all.
+def _use_fp32_accum_rs(weight) -> bool:
+    """True when this weight's wgrad reduction runs as the fp32-accum all-to-all.
 
-    Size <= 2 gains nothing (one addition) and still costs the scratch, so it bypasses. A
-    registered symmetric pool takes precedence (see _use_symmetric_wgrad_buffer).
+    Size <= 2 gains nothing (one addition) and still costs the scratch, so it bypasses.
+    The exact complement of _use_symmetric_wgrad_buffer: a symmetric send buffer takes
+    precedence, so a weight never routes to both.
     """
     return (
         GTP_CONFIG.reduce_scatter_with_fp32_accumulation
-        and group.size() > 2
-        and not is_gtp_symm_pool_registered(group)
+        and weight.group.size() > 2
+        and not _use_symmetric_wgrad_buffer(weight)
     )
 
 
@@ -2047,7 +2048,7 @@ class GTPShardedParam(torch.nn.Parameter):
 
         with rs_ctx:
             # self.group is per chain, so each axis decides on its own.
-            if _use_fp32_accum_rs(self.group):
+            if _use_fp32_accum_rs(self):
                 nvtx_range_push(f"{nvtx_label}.gtp_rs_fp32accum")
                 outputs, sum_handles = [], []
                 if len(wgrads) > 1:

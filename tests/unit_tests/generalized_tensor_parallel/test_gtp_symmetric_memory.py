@@ -43,7 +43,7 @@ import megatron.core.tensor_parallel.gtp_symmetric_memory as gtp_symm
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG, GTPShardedParam
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
     RegisteredLifoPool,
-    deregister_gtp_symm_pools,
+    deregister_and_clear_gtp_symm_pools,
     gtp_symm_pool_ctx,
     is_gtp_symm_pool_registered,
     register_gtp_symm_pool,
@@ -310,7 +310,7 @@ def _worker_wgrad_split(rank, world_size, port):
         GTP_CONFIG.reduce_scatter_with_fp32_accumulation = True
         t = wa.get_wgrad_tensor()
         assert wa._wgrad_symm_slot is not None
-        assert not gtp_module._use_fp32_accum_rs(group)
+        assert not gtp_module._use_fp32_accum_rs(wa)
         symmetric_wgrad_pool.free(wa._wgrad_symm_slot)
         wa._wgrad_symm_slot = None
     finally:
@@ -318,7 +318,7 @@ def _worker_wgrad_split(rank, world_size, port):
         gtp_symm.is_gtp_symm_pool_registered = saved_symm_pred
         GTP_CONFIG.reduce_scatter_with_fp32_accumulation = False
         # Drop the LIFO buffers and the (unregistered) pools created via gtp_symm_pool_ctx.
-        deregister_gtp_symm_pools()
+        deregister_and_clear_gtp_symm_pools()
 
 
 class TestWgradSendBufferSplit:
@@ -363,7 +363,7 @@ def _worker_symm_backward_numerics(rank, world_size, port):
     finally:
         gtp_module.is_gtp_symm_pool_registered = saved_pred
         gtp_symm.is_gtp_symm_pool_registered = saved_symm_pred
-        deregister_gtp_symm_pools()
+        deregister_and_clear_gtp_symm_pools()
 
     # Same inputs, same weights, same collective — the send buffer's provenance must
     # not change the reduced gradient.
@@ -407,7 +407,7 @@ def _worker_real_pool_registration(rank, world_size, port):
         torch.cuda.synchronize()
     finally:
         # Mandatory: leftover windows abort the ProcessGroupNCCL destructor at teardown.
-        deregister_gtp_symm_pools()
+        deregister_and_clear_gtp_symm_pools()
     assert not is_gtp_symm_pool_registered(group)
 
 
