@@ -116,8 +116,8 @@ class HybridStack(MegatronModule):
             raise ValueError("Exactly one of layer_type_list or layer_config_list must be provided")
         if layer_type_list is not None:
             if any(
-                not isinstance(layer_type, str) or len(layer_type) != 1
-                for layer_type in layer_type_list
+                not isinstance(layer_symbol, str) or len(layer_symbol) != 1
+                for layer_symbol in layer_type_list
             ):
                 raise ValueError("Each entry in layer_type_list must be a single layer symbol")
             layer_config_list = validate_segment_layers(''.join(layer_type_list), config)

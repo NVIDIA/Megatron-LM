@@ -1,24 +1,32 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import functools
+import operator
 from unittest.mock import patch
 
 import pytest
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    LAYER_CONFIG_BY_PATTERN_CHAR,
+    LAYER_SYMBOL_TO_CONFIG_CLASS,
     ParsedHybridPattern,
+    Symbols,
     get_hybrid_layer_counts,
     get_hybrid_total_layer_count,
     get_hybrid_total_pipeline_segment_count,
+    get_layer_maps_from_layer_type_list,
     parse_hybrid_pattern,
     pattern_from_ratios,
     select_pipeline_segment,
     validate_segment_layers,
 )
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 
@@ -28,7 +36,7 @@ def _make_transformer_config() -> TransformerConfig:
 
 def _assert_layer_config_types(layer_config_list, pattern: str) -> None:
     assert [type(config) for config in layer_config_list] == [
-        LAYER_CONFIG_BY_PATTERN_CHAR[pattern_char] for pattern_char in pattern
+        LAYER_SYMBOL_TO_CONFIG_CLASS[layer_symbol] for layer_symbol in pattern
     ]
 
 
@@ -54,22 +62,22 @@ class TestPatternFromRatios:
 
     def test_attention_only(self):
         result = pattern_from_ratios(10, attention_ratio=0.3)
-        assert result.count("*") == 3
-        assert result.count("M") == 7
+        assert result.count(Symbols.ATTENTION) == 3
+        assert result.count(Symbols.MAMBA) == 7
         assert len(result) == 10
 
     def test_attention_and_mlp(self):
         result = pattern_from_ratios(10, attention_ratio=0.3, mlp_ratio=0.3)
-        assert result.count("*") == 3
-        assert result.count("-") == 3
-        assert result.count("M") == 4
+        assert result.count(Symbols.ATTENTION) == 3
+        assert result.count(Symbols.MLP) == 3
+        assert result.count(Symbols.MAMBA) == 4
         assert len(result) == 10
 
     def test_attention_evenly_spaced(self):
         result = pattern_from_ratios(10, attention_ratio=0.5)
-        assert result.count("*") == 5
-        assert result.count("M") == 5
-        attn_positions = [i for i, ch in enumerate(result) if ch == "*"]
+        assert result.count(Symbols.ATTENTION) == 5
+        assert result.count(Symbols.MAMBA) == 5
+        attn_positions = [i for i, ch in enumerate(result) if ch == Symbols.ATTENTION]
         gaps = [attn_positions[i + 1] - attn_positions[i] for i in range(len(attn_positions) - 1)]
         assert all(
             g in (1, 2, 3) for g in gaps
@@ -77,8 +85,8 @@ class TestPatternFromRatios:
 
     def test_mlp_does_not_replace_attention(self):
         result = pattern_from_ratios(10, attention_ratio=0.3, mlp_ratio=0.3)
-        attn_positions = [i for i, c in enumerate(result) if c == "*"]
-        mlp_positions = [i for i, c in enumerate(result) if c == "-"]
+        attn_positions = [i for i, c in enumerate(result) if c == Symbols.ATTENTION]
+        mlp_positions = [i for i, c in enumerate(result) if c == Symbols.MLP]
         assert not set(attn_positions) & set(mlp_positions)
 
     def test_single_layer(self):
@@ -117,11 +125,22 @@ class TestValidateSegmentLayers:
         for pattern in ["M*-M*-M*-", "MMMMMMMMM", "MM*-", "MEME"]:
             layer_config_list = validate_segment_layers(pattern, self.config)
             for layer_config in layer_config_list:
-                assert type(layer_config) in LAYER_CONFIG_BY_PATTERN_CHAR.values()
+                assert type(layer_config) in LAYER_SYMBOL_TO_CONFIG_CLASS.values()
 
-    @pytest.mark.parametrize(("pattern_char", "config_class"), LAYER_CONFIG_BY_PATTERN_CHAR.items())
-    def test_all_pattern_characters_map_to_layer_configs(self, pattern_char, config_class):
-        layer_config_list = validate_segment_layers(pattern_char, self.config)
+    @pytest.mark.parametrize(
+        ("layer_symbol", "config_class"),
+        [
+            (Symbols.MAMBA, MambaLayerConfig),
+            (Symbols.GDN, GDNLayerConfig),
+            (Symbols.ATTENTION, AttentionLayerConfig),
+            (Symbols.DS_ATTENTION, DSALayerConfig),
+            (Symbols.MLA, MLALayerConfig),
+            (Symbols.MLP, MLPLayerConfig),
+            (Symbols.MOE, MoELayerConfig),
+        ],
+    )
+    def test_all_symbols_map_to_layer_configs(self, layer_symbol, config_class):
+        layer_config_list = validate_segment_layers(layer_symbol, self.config)
 
         assert len(layer_config_list) == 1
         assert type(layer_config_list[0]) is config_class
@@ -129,7 +148,12 @@ class TestValidateSegmentLayers:
         assert layer_config_list[0] is not self.config
         _assert_config_contents_equal(layer_config_list[0], self.config)
         assert layer_config_list[0].hidden_size == self.config.hidden_size
-        _assert_layer_config_types(layer_config_list, pattern_char)
+        _assert_layer_config_types(layer_config_list, layer_symbol)
+
+    def test_config_mapping_covers_all_layer_symbols(self):
+        assert set(LAYER_SYMBOL_TO_CONFIG_CLASS) == Symbols.VALID_LAYERS
+        assert Symbols.PIPE not in LAYER_SYMBOL_TO_CONFIG_CLASS
+        assert Symbols.MTP_SEPARATOR not in LAYER_SYMBOL_TO_CONFIG_CLASS
 
     def test_repeated_layers_receive_independent_config_copies(self):
         self.config.test_mutable_value = {"items": []}
@@ -864,3 +888,102 @@ class TestSelectPipelineSegmentLegacyFallback:
             assert offset == len(all_layers)
             all_layers.extend(layers)
         _assert_layer_config_types(all_layers, "M*M*M*")
+
+
+@pytest.mark.internal
+class TestGetLayerMapsFromLayerTypeList:
+    """Tests for get_layer_maps_from_layer_type_list."""
+
+    def test_standard_layer_types(self):
+        """Standard symbols each produce a single-entry map at local index 0."""
+        maps = get_layer_maps_from_layer_type_list(
+            [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE]
+        )
+        # We always get all symbols, not only those contained in the pattern.
+        assert len(maps) == len(Symbols.VALID_LAYERS)
+        attention_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
+        )(maps)
+        assert attention_map == {0: 0}
+        assert mamba_map == {1: 0}
+        assert mlp_map == {2: 0}
+        assert moe_map == {3: 0}
+
+    def test_dsa(self):
+        """DSA layers have their own local cache indices."""
+        maps = get_layer_maps_from_layer_type_list(
+            [Symbols.DS_ATTENTION, Symbols.MAMBA, Symbols.DS_ATTENTION, Symbols.MAMBA]
+        )
+        attention_map, dsa_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
+        )(maps)
+        assert attention_map == {}
+        assert dsa_map == {0: 0, 2: 1}
+        assert mamba_map == {1: 0, 3: 1}
+        assert mlp_map == {}
+        assert moe_map == {}
+
+    def test_mixed_attention_and_dsa(self):
+        """Attention and DSA layers maintain separate local indices."""
+        maps = get_layer_maps_from_layer_type_list(
+            [Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MAMBA, Symbols.MLP]
+        )
+        attention_map, dsa_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
+        )(maps)
+        assert attention_map == {0: 0}
+        assert dsa_map == {1: 0}
+        assert mamba_map == {2: 0}
+        assert mlp_map == {3: 0}
+        assert moe_map == {}
+
+    def test_all_mamba(self):
+        """All-Mamba patterns leave the other maps empty."""
+        maps = get_layer_maps_from_layer_type_list([Symbols.MAMBA] * 3)
+        attention_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
+        )(maps)
+        assert attention_map == {}
+        assert mamba_map == {0: 0, 1: 1, 2: 2}
+        assert mlp_map == {}
+        assert moe_map == {}
+
+    def test_mla(self):
+        """MLA layers have their own local cache indices."""
+        maps = get_layer_maps_from_layer_type_list(
+            [Symbols.MLA, Symbols.MAMBA, Symbols.MLA, Symbols.MAMBA]
+        )
+        attention_map, dsa_map, mamba_map, mla_map, mlp_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION,
+            Symbols.DS_ATTENTION,
+            Symbols.MAMBA,
+            Symbols.MLA,
+            Symbols.MLP,
+            Symbols.MOE,
+        )(maps)
+        assert attention_map == {}
+        assert dsa_map == {}
+        assert mla_map == {0: 0, 2: 1}
+        assert mamba_map == {1: 0, 3: 1}
+        assert mlp_map == {}
+        assert moe_map == {}
+
+    def test_mixed_dsa_and_mla(self):
+        """DSA and MLA layers maintain separate local indices."""
+        maps = get_layer_maps_from_layer_type_list(
+            [Symbols.DS_ATTENTION, Symbols.MLA, Symbols.MAMBA, Symbols.MLP]
+        )
+        attention_map, dsa_map, mamba_map, mla_map, mlp_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION,
+            Symbols.DS_ATTENTION,
+            Symbols.MAMBA,
+            Symbols.MLA,
+            Symbols.MLP,
+            Symbols.MOE,
+        )(maps)
+        assert attention_map == {}
+        assert dsa_map == {0: 0}
+        assert mla_map == {1: 0}
+        assert mamba_map == {2: 0}
+        assert mlp_map == {3: 0}
+        assert moe_map == {}

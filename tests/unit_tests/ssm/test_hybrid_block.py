@@ -10,7 +10,8 @@ import megatron.core.transformer.utils as transformer_utils
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    LAYER_CONFIG_BY_PATTERN_CHAR,
+    LAYER_SYMBOL_TO_CONFIG_CLASS,
+    Symbols,
     validate_segment_layers,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -36,8 +37,11 @@ from tests.unit_tests.test_utilities import Utils
 @pytest.mark.parametrize(
     ("layer_pattern", "expected_spec_names"),
     [
-        ("MG*-E", ["mamba_layer", "gdn_layer", "attention_layer", "mlp_layer", "moe_layer"]),
-        ("D+", ["dsa_layer", "mla_layer"]),
+        (
+            Symbols.MAMBA + Symbols.GDN + Symbols.ATTENTION + Symbols.MLP + Symbols.MOE,
+            ["mamba_layer", "gdn_layer", "attention_layer", "mlp_layer", "moe_layer"],
+        ),
+        (Symbols.DS_ATTENTION + Symbols.MLA, ["dsa_layer", "mla_layer"]),
     ],
 )
 def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, expected_spec_names):
@@ -79,7 +83,7 @@ def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, e
 
     assert not hasattr(block, "layer_type_list")
     assert [type(layer_config) for layer_config in layer_config_list] == [
-        LAYER_CONFIG_BY_PATTERN_CHAR[pattern_char] for pattern_char in layer_pattern
+        LAYER_SYMBOL_TO_CONFIG_CLASS[layer_symbol] for layer_symbol in layer_pattern
     ]
     assert [module_spec for module_spec, _ in build_calls] == expected_specs
     assert all(
@@ -116,7 +120,7 @@ def test_legacy_layer_config_mutations_are_synchronized(monkeypatch):
         config,
         submodules,
         False,
-        list("M+-"),
+        [Symbols.MAMBA, Symbols.MLA, Symbols.MLP],
         post_layer_norm=False,
         post_process=False,
         pg_collection=SimpleNamespace(pp=None, tp=None),
@@ -125,7 +129,8 @@ def test_legacy_layer_config_mutations_are_synchronized(monkeypatch):
 
     assert not hasattr(block, "layer_type_list")
     assert [type(layer_config) for layer_config in layer_config_list] == [
-        LAYER_CONFIG_BY_PATTERN_CHAR[pattern_char] for pattern_char in "M+-"
+        LAYER_SYMBOL_TO_CONFIG_CLASS[layer_symbol]
+        for layer_symbol in (Symbols.MAMBA, Symbols.MLA, Symbols.MLP)
     ]
     assert len({id(layer_config) for layer_config in layer_config_list}) == len(layer_config_list)
     assert all(layer_config is not config for layer_config in layer_config_list)
@@ -150,7 +155,9 @@ def test_legacy_layer_config_mutations_are_synchronized(monkeypatch):
         num_layers=2, hidden_size=64, num_attention_heads=4
     )
     independent_root_config.tp_comm_overlap = True
-    independent_layer_configs = list(validate_segment_layers("+-", independent_root_config))
+    independent_layer_configs = list(
+        validate_segment_layers(Symbols.MLA + Symbols.MLP, independent_root_config)
+    )
     HybridStack(
         config=independent_root_config,
         submodules=submodules,
@@ -176,8 +183,10 @@ def test_hybrid_stack_requires_exactly_one_layer_list(
 ):
     """HybridStack requires exactly one legacy symbol list or per-layer config list."""
     config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
-    layer_type_list = ["M"] if provide_layer_type_list else None
-    layer_config_list = validate_segment_layers("M", config) if provide_layer_config_list else None
+    layer_type_list = [Symbols.MAMBA] if provide_layer_type_list else None
+    layer_config_list = (
+        validate_segment_layers(Symbols.MAMBA, config) if provide_layer_config_list else None
+    )
 
     with pytest.raises(
         ValueError, match="Exactly one of layer_type_list or layer_config_list must be provided"
@@ -202,7 +211,7 @@ def test_hybrid_stack_rejects_multi_character_layer_type():
         HybridStack(
             config=config,
             submodules=hybrid_stack_spec.submodules,
-            layer_type_list=["M*"],
+            layer_type_list=[Symbols.MAMBA + Symbols.ATTENTION],
             pre_process=False,
             post_layer_norm=False,
             post_process=False,
@@ -345,7 +354,7 @@ class TestHybridBlock:
 
     def test_gpu_forward(self):
         """Test GPU forward pass."""
-        layer_pattern = "M*-"
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
         block = self.get_hybrid_block(layer_pattern)
         block.cuda()
         micro_batch_size = 2
@@ -383,7 +392,16 @@ class TestHybridBlock:
         ],
         ids=["full_block", "full_uniform", "selective"],
     )
-    @pytest.mark.parametrize("layer_pattern", ["MMMMM", "*****", "-----", "*-M*-", "M*-"])
+    @pytest.mark.parametrize(
+        "layer_pattern",
+        [
+            Symbols.MAMBA * 5,
+            Symbols.ATTENTION * 5,
+            Symbols.MLP * 5,
+            Symbols.ATTENTION + Symbols.MLP + Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP,
+            Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP,
+        ],
+    )
     def test_recompute(self, recompute_kwargs: dict, layer_pattern: str):
         seed = 123
         sequence_length, micro_batch_size = 32, 2
@@ -448,7 +466,7 @@ class TestHybridBlock:
         Make sure that the layer types specified with layer_pattern
         were honored.
         """
-        layer_pattern = "M*-"
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
         block = self.get_hybrid_block(layer_pattern)
         layers = block.layers
         # Note that this matches the order specified by layer_pattern above
@@ -465,8 +483,8 @@ class TestHybridBlock:
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_pattern_char = 'X'
-        assert invalid_pattern_char not in LAYER_CONFIG_BY_PATTERN_CHAR  # sanity check.
-        layer_pattern = "M*-" + invalid_pattern_char
+        assert invalid_pattern_char not in Symbols.VALID_LAYERS  # sanity check.
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_pattern_char
         # validate_segment_layers() in hybrid_layer_allocation.py throws a ValueError.
         with pytest.raises(ValueError):
             block = self.get_hybrid_block(layer_pattern)
@@ -476,7 +494,7 @@ class TestHybridBlock:
         Make sure that G creates a TransformerLayer wrapping GatedDeltaNet,
         while * creates a TransformerLayer wrapping SelfAttention.
         """
-        layer_pattern = "G*M"
+        layer_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
         block = self.get_hybrid_block(layer_pattern)
         layers = block.layers
         assert isinstance(layers[0], TransformerLayer)
@@ -487,7 +505,7 @@ class TestHybridBlock:
 
     def test_gdn_gpu_forward(self):
         """Test GPU forward pass with GDN, attention, and Mamba layers."""
-        layer_pattern = "G*M"
+        layer_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
         transformer_config = TransformerConfig(
             hidden_size=256,
             num_layers=len(layer_pattern),
@@ -521,7 +539,7 @@ class TestHybridBlock:
 
     def test_dsa_layer_types(self):
         """D symbol creates a TransformerLayer with absorbed MLA and DSA core attention."""
-        layer_pattern = "MDM"
+        layer_pattern = Symbols.MAMBA + Symbols.DS_ATTENTION + Symbols.MAMBA
         block = self.get_dsa_hybrid_block(layer_pattern)
         layers = block.layers
         assert isinstance(layers[0], MambaLayer)
@@ -532,14 +550,14 @@ class TestHybridBlock:
 
     def test_mixed_attention_and_dsa_layer_types(self):
         """* and D in the same block fail."""
-        layer_pattern = "M*DM"
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.DS_ATTENTION + Symbols.MAMBA
         with pytest.raises(ValueError):
             block = self.get_dsa_hybrid_block(layer_pattern)
 
     def test_mla_layer_types(self):
         """+ symbol creates a TransformerLayer with MLASelfAttention but
         standard (non-DSA) core attention."""
-        layer_pattern = "M+M"
+        layer_pattern = Symbols.MAMBA + Symbols.MLA + Symbols.MAMBA
         block = self.get_mla_hybrid_block(layer_pattern)
         layers = block.layers
         assert isinstance(layers[0], MambaLayer)
@@ -550,6 +568,6 @@ class TestHybridBlock:
 
     def test_mixed_attention_and_mla_layer_types(self):
         """* and + in the same block fail (same reason as * and D)."""
-        layer_pattern = "M*+M"
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLA + Symbols.MAMBA
         with pytest.raises(ValueError):
             block = self.get_mla_hybrid_block(layer_pattern)

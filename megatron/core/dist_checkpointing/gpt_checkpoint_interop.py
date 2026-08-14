@@ -56,7 +56,11 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensor,
     ShardedTensorFactory,
 )
-from megatron.core.models.hybrid.hybrid_layer_allocation import PIPE_SEPARATOR, parse_hybrid_pattern
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    Symbols,
+    get_layer_maps_from_layer_type_list,
+    parse_hybrid_pattern,
+)
 
 # Hybrid layer symbols that have a GPT-side source of weights ('*', '-', 'E')
 # or that are explicitly initialized from scratch ('M'). Attention layers map
@@ -64,8 +68,8 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import PIPE_SEPARATOR, 
 # GPT ``mlp`` sub-modules (both models keep MoE tensors under ``mlp.*``).
 # GDN ('G') and DS-attention ('D') use different weight layouts than GPT
 # attention and are rejected rather than silently mistranslated.
-_GPT_SOURCED_PATTERN_CHARACTERS = ('*', '-', 'E')
-_FRESH_INIT_PATTERN_CHARACTERS = ('M',)
+_GPT_SOURCED_SYMBOLS = (Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)
+_FRESH_INIT_SYMBOLS = (Symbols.MAMBA,)
 
 _DECODER_LAYER_KEY_RE = re.compile(r'decoder\.layers\.(\d+)\.')
 
@@ -115,12 +119,13 @@ def gpt_compatible_layer_maps(hybrid_layer_pattern: str) -> GPTCompatLayerMaps:
             f"('/{parsed.mtp_pattern}'), which have no source weights in a GPT "
             f"checkpoint. Remove the MTP part of the pattern to load a GPT checkpoint."
         )
-    main_pattern = (parsed.main_pattern or '').replace(PIPE_SEPARATOR, '')
+    main_pattern = (parsed.main_pattern or '').replace(Symbols.PIPE, '')
     if not main_pattern:
         raise ValueError("Hybrid layer pattern is empty; set --hybrid-layer-pattern.")
 
-    translatable = set(_GPT_SOURCED_PATTERN_CHARACTERS) | set(_FRESH_INIT_PATTERN_CHARACTERS)
-    unknown = sorted(set(main_pattern) - translatable)
+    layer_type_list = list(main_pattern)
+    translatable = set(_GPT_SOURCED_SYMBOLS) | set(_FRESH_INIT_SYMBOLS)
+    unknown = sorted(set(layer_type_list) - translatable)
     if unknown:
         raise ValueError(
             f"Hybrid layer pattern {hybrid_layer_pattern!r} contains layer types "
@@ -129,20 +134,9 @@ def gpt_compatible_layer_maps(hybrid_layer_pattern: str) -> GPTCompatLayerMaps:
             f"initialization)."
         )
 
-    attention_map = {}
-    dense_map = {}
-    moe_map = {}
-    fresh_init = set()
-    for global_layer_idx, pattern_char in enumerate(main_pattern):
-        if pattern_char == '*':
-            attention_map[global_layer_idx] = len(attention_map)
-        elif pattern_char == '-':
-            dense_map[global_layer_idx] = len(dense_map)
-        elif pattern_char == 'E':
-            moe_map[global_layer_idx] = len(moe_map)
-        elif pattern_char == 'M':
-            fresh_init.add(global_layer_idx)
-
+    layer_maps = get_layer_maps_from_layer_type_list(layer_type_list)
+    dense_map = layer_maps[Symbols.MLP]
+    moe_map = layer_maps[Symbols.MOE]
     if dense_map and moe_map:
         raise ValueError(
             f"Hybrid layer pattern {hybrid_layer_pattern!r} mixes dense ('-') and "
@@ -150,6 +144,7 @@ def gpt_compatible_layer_maps(hybrid_layer_pattern: str) -> GPTCompatLayerMaps:
             f"layer, so the pattern must use only one of '-' or 'E'."
         )
     mlp_map = moe_map if moe_map else dense_map
+    attention_map = layer_maps[Symbols.ATTENTION]
 
     if len(attention_map) != len(mlp_map) or not attention_map:
         raise ValueError(
@@ -162,7 +157,7 @@ def gpt_compatible_layer_maps(hybrid_layer_pattern: str) -> GPTCompatLayerMaps:
     return GPTCompatLayerMaps(
         attention_to_gpt=dict(attention_map),
         mlp_to_gpt=dict(mlp_map),
-        fresh_init=frozenset(fresh_init),
+        fresh_init=frozenset(layer_maps[Symbols.MAMBA]),
         num_gpt_layers=len(attention_map),
     )
 

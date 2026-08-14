@@ -742,13 +742,12 @@ def validate_args(args, defaults={}):
         )
 
     from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        MTP_SEPARATOR,
-        PIPE_SEPARATOR,
+        Symbols,
         get_hybrid_total_layer_count,
         get_hybrid_total_pipeline_segment_count,
         parse_hybrid_pattern,
     )
-    sep = MTP_SEPARATOR
+    sep = Symbols.MTP_SEPARATOR
 
     # Backward compat: convert legacy mtp_hybrid_override_pattern to unified format
     if (
@@ -778,7 +777,7 @@ def validate_args(args, defaults={}):
         # first/last pipeline num layers are incompatible with pipe-separated patterns
         # (the pipe separators already define the pipeline layout explicitly), but are
         # allowed for pipe-free patterns where they control uneven PP splitting.
-        has_pipes = PIPE_SEPARATOR in args.hybrid_layer_pattern.split(sep)[0]
+        has_pipes = Symbols.PIPE in args.hybrid_layer_pattern.split(sep)[0]
         if has_pipes:
             assert args.decoder_first_pipeline_num_layers is None, (
                 'If --hybrid-layer-pattern contains pipe separators, '
@@ -888,8 +887,8 @@ def validate_args(args, defaults={}):
 
     # Infer use of MLA from unified pattern
     if args.hybrid_layer_pattern and (
-            '+' in args.hybrid_layer_pattern
-            or 'D' in args.hybrid_layer_pattern
+            Symbols.MLA in args.hybrid_layer_pattern
+            or Symbols.DS_ATTENTION in args.hybrid_layer_pattern
     ):
         args.multi_latent_attention = True
 
