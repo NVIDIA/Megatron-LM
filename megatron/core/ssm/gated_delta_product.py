@@ -640,8 +640,14 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         """Switch the (l, b, proj_dim) input projection to the batch-first layout the
         causal conv and the kernels expect, and split it into the z, VKQ, and ba groups.
         """
-        zVKQba = rearrange(zVKQba, "l b d -> b l d").contiguous()
+        return self._split_projection(rearrange(zVKQba, "l b d -> b l d").contiguous())
 
+    def _split_projection(self, zVKQba):
+        """Split the (b, l, proj_dim) input projection into the z, VKQ, and ba groups.
+
+        The decode paths already receive the projection batch-first, so they split
+        without the transpose.
+        """
         return torch.split(
             zVKQba,
             [
@@ -653,13 +659,19 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             dim=-1,
         )
 
-    def _prepare_qkv(self, x, conv_state=None, seq_idx=None):
+    def _prepare_qkv(
+        self, x, conv_state=None, seq_idx=None, is_decode=False, conv_state_indices=None
+    ):
         """Run the causal conv on the VKQ slice and split/reshape it into query, key,
         and value.
 
         x: (b, l, d). Keep the transposes to the conv layout inside this function so that
         the checkpointed subgraph takes the (b, l, d) slice as input and hands back a
         gradient that is already contiguous in (b, l, d) for the split backward's concat.
+
+        Decode passes ``is_decode`` to step the cached conv state one token at a time
+        with ``causal_conv1d_update`` (l == 1), selecting per-request cache rows with
+        ``conv_state_indices``.
         """
         # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor in channels-last memory,
         # which is also what it requires when ``seq_idx`` is set. ``x`` is a view into
@@ -667,23 +679,37 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # stride(1) == 1 and no copy is needed on either path.
         x = rearrange(x, "b l d -> b d l")
 
-        if conv_state is not None:
-            # Static-batching prefill: seed the conv state from the prompt's tail.
-            # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-            # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-            conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
-        if causal_conv1d_fn is None:
-            seqlen = x.size(2)
-            x = self.act(self.cp.conv1d(x)[..., :seqlen])
-        else:
-            # causal_conv1d uses seq_idx to reset the convolution boundaries
-            x = causal_conv1d_fn(
-                x=x,
-                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                bias=self.cp.get_conv1d_bias(),
-                activation=self.activation,
-                seq_idx=seq_idx,
+        if is_decode:
+            # Indexed conv update: reads/writes the per-request conv state rows selected
+            # by ``conv_state_indices``, in place. ``self.activation`` must be the
+            # activation *string* so the kernel enables SiLU (a bool would disable it).
+            # ``causal_conv1d_update`` accepts (b, d) or (b, d, l); here l == 1.
+            x = causal_conv1d_update(
+                x,
+                conv_state,
+                rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=conv_state_indices,
             )
+        else:
+            if conv_state is not None:
+                # Static-batching prefill: seed the conv state from the prompt's tail.
+                # If we just take x[:, :, -self.d_conv :], it errors if seqlen < d_conv.
+                # Instead F.pad pads with zeros if seqlen < d_conv, and truncates otherwise.
+                conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # state (B D W)
+            if causal_conv1d_fn is None:
+                seqlen = x.size(2)
+                x = self.act(self.cp.conv1d(x)[..., :seqlen])
+            else:
+                # causal_conv1d uses seq_idx to reset the convolution boundaries
+                x = causal_conv1d_fn(
+                    x=x,
+                    weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                    bias=self.cp.get_conv1d_bias(),
+                    activation=self.activation,
+                    seq_idx=seq_idx,
+                )
 
         x = rearrange(x, "b d l ->  b l d")
 
@@ -715,10 +741,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             ).contiguous()
             query = rearrange(query, "b l (g n) -> b l g n", n=self.d_state).contiguous()
 
-        if not self.config.gdp_cutedsl_kernel:
+        if not is_decode and not self.config.gdp_cutedsl_kernel:
             # The CuTeDSL path applies the L2 norm inside chunk_gated_delta_product
             # (use_qk_l2norm_in_kernel); apply it here for the FLA path so that it falls
-            # inside the QKV recompute boundary.
+            # inside the QKV recompute boundary. Decode defers it to the fused recurrent
+            # kernel, which normalizes after the householder zeros are interleaved in.
             query = l2_norm(query)
             key = l2_norm(key)
 
@@ -837,56 +864,18 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         assert (
             intermediate_conv_state is None and intermediate_ssm_state is None
         ), "GDP decode does not support speculative decoding yet"
-        zVKQba = zVKQba.squeeze(1)  # [n, proj_dim]
         M = self.num_householder
 
-        z, VKQ, ba = torch.split(
-            zVKQba,
-            [
-                self.cp.d_inner_local_tpcp,
-                self.cp.d_inner_local_tpcp * M
-                + (M + 1) * self.cp.ngroups_local_tpcp * self.d_state,
-                self.cp.nheads_local_tpcp * (M + 1),
-            ],
-            dim=-1,
+        # Keep the length-1 sequence dimension so the shared helpers apply: with l == 1
+        # their (b, l, ...) reshapes collapse to exactly the layouts the fla recurrent
+        # kernel wants here, i.e. "b (l m) h p" is "n m h p" and "b l g n" is "n 1 g n".
+        z, VKQ, ba = self._split_projection(zVKQba)
+
+        query, key, value = self._prepare_qkv(
+            VKQ, conv_state=conv_state, is_decode=True, conv_state_indices=batch_indices
         )
 
-        # Indexed conv update: reads/writes the per-request conv state rows
-        # selected by ``batch_indices``, in place. ``self.activation`` must be the
-        # activation *string* so the kernel enables SiLU (a bool would disable it).
-        VKQ = causal_conv1d_update(
-            VKQ,
-            conv_state,
-            rearrange(self.conv1d.weight, "d 1 w -> d w"),
-            self.conv1d.bias,
-            self.activation,
-            conv_state_indices=batch_indices,
-        )
-
-        value, key, query = torch.split(
-            VKQ,
-            [
-                self.cp.d_inner_local_tpcp * M,
-                self.cp.ngroups_local_tpcp * self.d_state * M,
-                self.cp.ngroups_local_tpcp * self.d_state,
-            ],
-            dim=-1,
-        )
-        b, a = torch.split(ba, [self.cp.nheads_local_tpcp * M, self.cp.nheads_local_tpcp], dim=-1)
-
-        # Reshape to the fla layout with batch=n requests, seq length 1, and the
-        # householder copies folded into the sequence dimension (static path, l=1).
-        value = rearrange(value, "n (m h p) -> n m h p", m=M, p=self.headdim).contiguous()
-        key = rearrange(key, "n (m g s) -> n m g s", m=M, s=self.d_state).contiguous()
-        query = rearrange(query, "n (g s) -> n 1 g s", s=self.d_state).contiguous()
-        beta = rearrange(b.sigmoid(), "n (m h) -> n m h", m=M).contiguous()
-        g = -self.cp.get_A_log().float().exp() * F.softplus(a.float() + self.cp.get_dt_bias())
-        g = rearrange(g, "n h -> n 1 h").contiguous()
-
-        if self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp > 1:
-            rep = self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp
-            query = query.repeat_interleave(rep, dim=2)
-            key = key.repeat_interleave(rep, dim=2)
+        beta, g = self._compute_gating(ba)
 
         # Interleave the (length-1) query / decay with householder zeros so the
         # recurrent kernel sees an (1 * M)-length sequence (matches static decode).
@@ -930,8 +919,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         y = rearrange(core_attn_out, "n t h p -> n t (h p)").contiguous()  # [n, 1, d_inner]
         if self.rmsnorm:
-            z = rearrange(z, "n d -> n 1 d").contiguous()
-            y = self.norm(y, z)
+            # z kept its length-1 sequence dimension through the split.
+            y = self.norm(y, z.contiguous())
         return y
 
     def ssm_prefill(
