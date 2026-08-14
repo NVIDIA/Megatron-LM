@@ -435,6 +435,7 @@ class TestRLUtils:
             world_size=1,
             cuda_graph_impl="none",
             rl_offload_optimizer_during_inference=False,
+            langrl_env_config=None,
             rl_prompts_per_eval=1,
             rl_default_temperature=1.0,
             rl_default_top_p=1.0,
