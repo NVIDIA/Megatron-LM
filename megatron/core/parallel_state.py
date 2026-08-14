@@ -481,9 +481,7 @@ class RankGenerator(object):
         rank_offset: int = 0,
         gtp_remat: int = 1,
     ) -> None:
-        assert (
-            ep == 1 or cp == 1
-        ), "Both EP and CP > 1 in not allow in one rank generator. \
+        assert ep == 1 or cp == 1, "Both EP and CP > 1 in not allow in one rank generator. \
             CP is only included in default RankGenerator, and EP only in expert RankGenerator."
 
         self.tp = tp
@@ -960,9 +958,7 @@ def initialize_model_parallel(
     # when both axes are non-trivial; otherwise the wiring falls back to the single
     # non-trivial axis group (identical semantics).
     global _TP_GTP_WEIGHT_REMAT_GROUP
-    assert (
-        _TP_GTP_WEIGHT_REMAT_GROUP is None
-    ), "tp x gtp_remat group is already initialized"
+    assert _TP_GTP_WEIGHT_REMAT_GROUP is None, "tp x gtp_remat group is already initialized"
     if gtp_remat_size > 1 and tensor_model_parallel_size > 1:
         for tg_ranks in decoder_rank_generator.get_ranks('tp-gtp_remat'):
             group = create_group(
@@ -1771,9 +1767,7 @@ def get_tp_gtp_weight_remat_group(check_initialized=True):
     non-trivial axis group (same semantics) or the two-stage exchange.
     """
     if check_initialized:
-        assert (
-            _TP_GTP_WEIGHT_REMAT_GROUP is not None
-        ), "tp x gtp_remat group is not initialized"
+        assert _TP_GTP_WEIGHT_REMAT_GROUP is not None, "tp x gtp_remat group is not initialized"
     return _TP_GTP_WEIGHT_REMAT_GROUP
 
 

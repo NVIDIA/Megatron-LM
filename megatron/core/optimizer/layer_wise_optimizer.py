@@ -722,9 +722,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         expert_pgs = (
             expert_gtp,
             expert_tp,
-            _fused_group(
-                expert_gtp, expert_tp, getattr(pg_collection, 'expt_tp_gtp_remat', None)
-            ),
+            _fused_group(expert_gtp, expert_tp, getattr(pg_collection, 'expt_tp_gtp_remat', None)),
         )
 
         for opt in optimizers:
