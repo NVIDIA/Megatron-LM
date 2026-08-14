@@ -477,6 +477,7 @@ class TestDistributedOptimizer:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True) as ckpt_dir:
             mock_args = parse_args(ignore_unknown_args=True)
             mock_args.use_distributed_optimizer = True
+            mock_args.save_tokenizer_assets = False
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 # Initialize model and optimizer A
                 if is_moe:
@@ -552,6 +553,7 @@ class TestDistributedOptimizer:
             tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True
         ) as ckpt_dir:
             mock_args = parse_args(ignore_unknown_args=True)
+            mock_args.save_tokenizer_assets = False
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 init_basic_mock_args(mock_args, tp=src_tp_pp[0], pp=src_tp_pp[1])
                 init_checkpointing_mock_args(mock_args, ckpt_dir, False)

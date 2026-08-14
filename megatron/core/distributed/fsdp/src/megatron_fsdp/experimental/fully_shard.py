@@ -27,11 +27,13 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .module import FsdpContext, FsdpModule
 from .placement import MeshAxis, Placements
 
-_FSDP_CONTEXT = ContextVar[FsdpContext | None]("megatron_fsdp_context", default=None)
+_FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
 
 
 @contextmanager
-def fully_shard_context(device: torch.device | None = None) -> Iterator[FsdpContext]:
+def fully_shard_context(
+    device: torch.device | None = None, *, use_symmetric_memory: bool = False
+) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
     Independent roots are ordered by their root-level ``fully_shard`` calls.
@@ -40,6 +42,8 @@ def fully_shard_context(device: torch.device | None = None) -> Iterator[FsdpCont
     Args:
         device: CUDA device on which to create communication streams. Defaults to
             the current CUDA device.
+        use_symmetric_memory: Allocate communication staging buffers from PyTorch's
+            NCCL symmetric-memory pool.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -48,7 +52,7 @@ def fully_shard_context(device: torch.device | None = None) -> Iterator[FsdpCont
     if device.type != "cuda":
         raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
 
-    context = FsdpContext(device=device)
+    context = FsdpContext(device=device, use_symmetric_memory=use_symmetric_memory)
     token = _FSDP_CONTEXT.set(context)
     try:
         yield context
@@ -65,7 +69,6 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
-    use_symm_mem: bool = False,
     grad_divisor: int = 1,
 ) -> None:
     """Apply FSDP to a module in place.
@@ -79,8 +82,6 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
-        use_symm_mem: Allocate all-gather and reduce-scatter staging buffers from
-            PyTorch's NCCL symmetric-memory pool.
         grad_divisor: Additional divisor applied to the reduced gradient, on top of the
             averaging the mesh already performs. Defaults to 1, which is correct whenever
             each mesh rank contributes exactly one term to the gradient.
@@ -117,8 +118,8 @@ def fully_shard(
             mesh=mesh,
             placements=placements,
             mixed_precision_policy=mixed_precision_policy,
-            use_symm_mem=use_symm_mem,
             grad_divisor=grad_divisor,
+            use_symmetric_memory=context.use_symmetric_memory,
         )
     except Exception:
         module.__class__ = original_cls
