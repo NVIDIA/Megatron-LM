@@ -2137,7 +2137,7 @@ def pretrain(
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
 
-    if getattr(args, 'gtp_nccl_ub', False) or getattr(args, 'egtp_nccl_ub', False):
+    if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'egtp_remat_nccl_ub', False):
         from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
 
         # Deregister the GTP symmetric-memory pools: windows left registered when the
@@ -2720,7 +2720,11 @@ def setup_model_and_optimizer(
     # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
     # also covers the config-container builder path, which does not call get_model.
     if is_gtp_remat_active(args):
-        from megatron.core.tensor_parallel.gtp_api import configure_gtp_remat_from_recipe
+        from megatron.core.process_groups_config import resolve_gtp_remat_group
+        from megatron.core.tensor_parallel.gtp_api import (
+            configure_gtp_remat_from_recipe,
+            register_gtp_symm_pool,
+        )
 
         configure_gtp_remat_from_recipe(
             fp4=getattr(args, 'fp4', None) is not None,
@@ -2730,10 +2734,14 @@ def setup_model_and_optimizer(
             reduce_scatter_with_fp32_accumulation=getattr(
                 args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
             ),
-            gtp_nccl_ub=getattr(args, 'gtp_nccl_ub', False),
-            egtp_nccl_ub=getattr(args, 'egtp_nccl_ub', False),
-            pg_collection=pg_collection,
+            gtp_remat_nccl_ub=getattr(args, 'gtp_remat_nccl_ub', False),
+            egtp_remat_nccl_ub=getattr(args, 'egtp_remat_nccl_ub', False),
         )
+
+        if getattr(args, 'gtp_remat_nccl_ub', False):
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
+        if getattr(args, 'egtp_remat_nccl_ub', False):
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
@@ -5045,7 +5053,7 @@ def train(
         # ncclCommDeregister on handles created by ncclCommWindowRegister,
         # causing "NCCL WARN Deregister: Could not find handle" and a crash.
         torch.distributed.barrier()
-        if getattr(args, 'gtp_nccl_ub', False) or getattr(args, 'egtp_nccl_ub', False):
+        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'egtp_remat_nccl_ub', False):
             from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
 
             # Deregister the GTP symmetric-memory pools: windows left registered when the

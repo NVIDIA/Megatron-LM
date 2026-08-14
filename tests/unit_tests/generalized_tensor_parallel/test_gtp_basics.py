@@ -71,6 +71,7 @@ class _FakeGroup:
     def __init__(self, size=1, rank=0):
         self._size = size
         self._rank = rank
+        self.group_name = f"fake_group_{id(self)}"
 
     def size(self):
         return self._size
@@ -1449,7 +1450,6 @@ class TestGTPGraphWgradRing:
             weight.group = group
             weight.chain_id = GTPChain.GRAPHED.value
             weight.pad_length = 2
-            weight.gtp_smr = False
             weight.main_grad = torch.empty_like(weight)
         for previous, current in zip(weights, weights[1:]):
             previous.next_w = current
@@ -1502,7 +1502,6 @@ class TestGTPGraphWgradRing:
                 self.group = group
                 self.chain_id = GTPChain.GRAPHED.value
                 self.pad_length = 2
-                self.gtp_smr = False
                 self.expert_idx = 0
                 self.device = torch.device("cuda")
                 self.main_grad = torch.empty(3, 4, device=self.device)

@@ -1089,7 +1089,7 @@ class ColumnParallelLinear(torch.nn.Module):
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
-            wrap_module_params_gtp(self, ["weight"], gtp_remat_group, is_expert=self.is_expert)
+            wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
             self.gtp_remat_size = gtp_remat_group.size()
 
         if bias:
@@ -1453,7 +1453,7 @@ class RowParallelLinear(torch.nn.Module):
         if gtp_remat_group is not None and gtp_remat_group.size() > 1:
             from megatron.core.tensor_parallel.gtp_api import wrap_module_params_gtp
 
-            wrap_module_params_gtp(self, ["weight"], gtp_remat_group, is_expert=self.is_expert)
+            wrap_module_params_gtp(self, ["weight"], gtp_remat_group)
             self.gtp_remat_size = gtp_remat_group.size()
 
         if bias:

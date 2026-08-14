@@ -5,8 +5,6 @@
 Test groups
 -----------
 - TestRegisteredLifoPool    - LIFO recycling, keying, tagging, capture guard (single process)
-- TestSymmFlagStamping      - gtp_smr from is_expert x config flags
-- TestConfigureRecipeSymm   - symm kwargs land in GTP_CONFIG, pools registered, fp32-accum warning
 - TestWgradSendBufferSplit  - get_wgrad_tensor / _prepare_wgrad_reduce_scatter_inputs routing:
                               symm scratch is a logical view of a registered padded LIFO
                               parent sent whole (zero-copy, padded or not) with ownership
@@ -75,8 +73,8 @@ class _StubGroup:
 
 
 _CONFIG_FIELDS = (
-    "gtp_nccl_ub",
-    "egtp_nccl_ub",
+    "gtp_remat_nccl_ub",
+    "egtp_remat_nccl_ub",
     "reduce_scatter_with_fp32_accumulation",
     "pad_for_alignment",
     "check_param_states",
@@ -154,58 +152,6 @@ class TestRegisteredLifoPool:
 
 
 # ---------------------------------------------------------------------------
-# gtp_smr stamping (single process)
-# ---------------------------------------------------------------------------
-
-
-class TestSymmFlagStamping:
-    @pytest.mark.parametrize(
-        "gtp_flag,egtp_flag,is_expert,expect",
-        [
-            (True, False, False, True),  # dense param, dense flag on
-            (True, False, True, False),  # expert param must NOT take the dense flag
-            (False, True, True, True),  # expert param, expert flag on
-            (False, True, False, False),  # dense param must NOT take the expert flag
-            (False, False, False, False),
-        ],
-    )
-    def test_stamping_follows_is_expert(self, gtp_flag, egtp_flag, is_expert, expect):
-        GTP_CONFIG.gtp_nccl_ub = gtp_flag
-        GTP_CONFIG.egtp_nccl_ub = egtp_flag
-        p = GTPShardedParam(torch.randn(4, 4, device="cuda", dtype=torch.bfloat16))
-        gtp_module._gtp_attach_attrs(p, _StubGroup(), is_expert=is_expert)
-        assert p.gtp_smr is expect
-
-
-# ---------------------------------------------------------------------------
-# configure_gtp_remat_from_recipe: symm kwargs + fp32-accum warning
-# ---------------------------------------------------------------------------
-
-
-class TestConfigureRecipeSymm:
-    def test_symm_kwargs_land_in_config_and_register(self, monkeypatch, caplog):
-        registered = []
-        monkeypatch.setattr(
-            gtp_module, "register_gtp_symm_pool", lambda group: registered.append(group)
-        )
-        with caplog.at_level(logging.WARNING, logger=gtp_module.logger.name):
-            gtp_module.configure_gtp_remat_from_recipe(
-                gtp_nccl_ub=True, egtp_nccl_ub=False, reduce_scatter_with_fp32_accumulation=True
-            )
-        assert GTP_CONFIG.gtp_nccl_ub is True
-        assert GTP_CONFIG.egtp_nccl_ub is False
-        assert len(registered) == 1  # dense group only
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            assert any("take precedence" in r.message for r in caplog.records)
-
-    def test_no_warning_without_fp32_accum(self, monkeypatch, caplog):
-        monkeypatch.setattr(gtp_module, "register_gtp_symm_pool", lambda group: None)
-        with caplog.at_level(logging.WARNING, logger=gtp_module.logger.name):
-            gtp_module.configure_gtp_remat_from_recipe(gtp_nccl_ub=True, egtp_nccl_ub=True)
-        assert not any("take precedence" in r.message for r in caplog.records)
-
-
-# ---------------------------------------------------------------------------
 # get_wgrad_tensor / _prepare_wgrad_reduce_scatter_inputs routing (world 4)
 # ---------------------------------------------------------------------------
 
@@ -230,12 +176,6 @@ def _worker_wgrad_split(rank, world_size, port):
     gtp_module.is_gtp_symm_pool_registered = lambda g: g is group
     gtp_symm.is_gtp_symm_pool_registered = lambda g: g is group
     try:
-        # Not symm-stamped -> plain scratch even with the pool "registered".
-        t = wa.get_wgrad_tensor()
-        assert getattr(wa, "_wgrad_symm_slot", None) is None
-        wa.gtp_smr = True
-        wp.gtp_smr = True
-
         # Unpadded symm weight: the GEMM scratch is a view of a registered LIFO parent.
         assert group.group_name not in gtp_symm._pools
         t = wa.get_wgrad_tensor()
@@ -355,7 +295,6 @@ def _worker_symm_backward_numerics(rank, world_size, port):
             pred = (lambda g: g is group) if symm else saved_pred
             gtp_module.is_gtp_symm_pool_registered = pred
             gtp_symm.is_gtp_symm_pool_registered = pred if symm else saved_symm_pred
-            w.gtp_smr = symm
             x = inp.clone().requires_grad_(True)
             out = layer(x, is_first_microbatch=True)
             out.backward(gout)

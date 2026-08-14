@@ -172,7 +172,6 @@ def allocate_graph_wgrad_rings(
                 param._unsharded_shape_padded,
                 param.main_grad.dtype,
                 param.expert_idx,
-                param.gtp_smr,
             )
             params_by_key[key].append(param)
 
@@ -187,7 +186,7 @@ def allocate_graph_wgrad_rings(
         slot_count = min(ring_size, len(matching_params))
         slots = []
         exemplar = matching_params[0]
-        symm = exemplar.gtp_smr and is_gtp_symm_pool_registered(exemplar.group)
+        symm = is_gtp_symm_pool_registered(exemplar.group)
         for slot_index in range(slot_count):
             with gtp_symm_pool_ctx(exemplar.group) if symm else nullcontext():
                 tensor = torch.empty(
