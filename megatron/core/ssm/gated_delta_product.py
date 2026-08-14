@@ -634,12 +634,14 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         zVKQba = self.cp.pre_conv_ssm(zVKQba, packed_seq_params=packed_seq_params)
 
+        return self._preprocess(zVKQba)
+
+    def _preprocess(self, zVKQba):
+        """Switch the (l, b, proj_dim) input projection to the batch-first layout the
+        causal conv and the kernels expect, and split it into the z, VKQ, and ba groups.
+        """
         zVKQba = rearrange(zVKQba, "l b d -> b l d").contiguous()
 
-        return self._split_projection(zVKQba)
-
-    def _split_projection(self, zVKQba):
-        """Split the (b, l, proj_dim) input projection into the z, VKQ, and ba groups."""
         return torch.split(
             zVKQba,
             [
@@ -952,10 +954,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         cu_seqlens = metadata.cu_seqlens
         batch_indices = metadata.batch_indices_prefill
 
-        # l b d -> b l d
-        zVKQba = rearrange(zVKQba, "l b d -> b l d").contiguous()
-
-        z, VKQ, ba = self._split_projection(zVKQba)
+        z, VKQ, ba = self._preprocess(zVKQba)
 
         # Capture per-request final conv states (before the conv consumes the
         # inputs) and write them into the prefill requests' cache rows. Done here
