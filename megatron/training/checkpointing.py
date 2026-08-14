@@ -1044,7 +1044,9 @@ def save_checkpoint(
                 save_retain_interval = getattr(
                     args, 'save_retain_interval', None
                 )  # For backwards compatibility of tests.
-                if save_retain_interval is not None:
+                most_recent_k = getattr(args, 'most_recent_k', -1)
+                keep_most_recent = most_recent_k is not None and most_recent_k > 0
+                if save_retain_interval is not None and not keep_most_recent:
                     if maybe_msc.os.path.exists(tracker_filename):
                         with maybe_msc.open(tracker_filename, 'r') as f:
                             prev_iteration = int(f.read().strip())
@@ -1062,51 +1064,18 @@ def save_checkpoint(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
                     )
 
-                if save_retain_interval is not None:
+                if keep_most_recent:
+                    for iteration_to_delete in _get_checkpoint_iterations_to_delete(
+                        save_dir, most_recent_k, save_retain_interval
+                    ):
+                        _schedule_checkpoint_deletion(args, save_dir, iteration_to_delete)
+                elif save_retain_interval is not None:
                     if (
                         prev_iteration > 0
                         and prev_iteration != iteration
                         and prev_iteration % save_retain_interval != 0
                     ):
-                        checkpoint_name = get_checkpoint_name(
-                            args.save, iteration=prev_iteration, return_base_dir=True
-                        )
-                        # Don't delete if `checkpoint_name` is a symbolic link.
-                        if os.path.islink(
-                            checkpoint_name
-                        ):  # TODO: Make this work with MSC remote paths?
-                            print_rank_0(
-                                f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
-                                f'at {args.save} since it is a symbolic link'
-                            )
-                        else:
-                            # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
-                            # Use multiprocessing to delete checkpoint in background
-                            if args.async_save:
-                                # Clean up any finished deletion processes before starting a new one
-                                finalize_deletion_processes(blocking=False)
-                                ctx = multiprocessing.get_context('fork')
-                                delete_process = ctx.Process(
-                                    target=_async_delete_checkpoint_impl,
-                                    args=(
-                                        args.save,
-                                        prev_iteration,
-                                        args.log_progress,
-                                        True,
-                                        args.async_ckpt_cpu_priority,
-                                        args.async_ckpt_io_priority,
-                                    ),
-                                    daemon=True,
-                                )
-                                delete_process.start()
-                                # Track the process so we can join it later to prevent zombies
-                                _deletion_processes.append(delete_process)
-                            else:
-                                th = threading.Thread(
-                                    target=_async_delete_checkpoint_impl,
-                                    args=(args.save, prev_iteration, args.log_progress),
-                                )
-                                th.start()
+                        _schedule_checkpoint_deletion(args, save_dir, prev_iteration)
 
         if args.async_save:
             assert async_save_request is not None
@@ -1254,6 +1223,67 @@ def _async_delete_checkpoint_impl(
         )
         # Any exception encountered in checkpoint deletion can be ignored and is not fatal.
         pass
+
+
+def _get_checkpoint_iterations_to_delete(
+    save_path, most_recent_k, save_retain_interval=None
+):
+    """Return checkpoint iterations older than the retention window."""
+    checkpoint_iterations = []
+    for checkpoint_path in Path(save_path).glob('iter_*'):
+        match = re.fullmatch(r'iter_(\d+)', checkpoint_path.name)
+        if match is not None and checkpoint_path.is_dir():
+            checkpoint_iterations.append(int(match.group(1)))
+
+    checkpoint_iterations.sort()
+    iterations_to_delete = checkpoint_iterations[:-most_recent_k]
+    if save_retain_interval is not None:
+        iterations_to_delete = [
+            iteration
+            for iteration in iterations_to_delete
+            if iteration % save_retain_interval != 0
+        ]
+    return iterations_to_delete
+
+
+def _schedule_checkpoint_deletion(args, save_path, iteration_to_delete):
+    """Delete a checkpoint in the background after its replacement is durable."""
+    checkpoint_name = get_checkpoint_name(
+        save_path, iteration=iteration_to_delete, return_base_dir=True
+    )
+    # Don't delete if `checkpoint_name` is a symbolic link.
+    if os.path.islink(checkpoint_name):  # TODO: Make this work with MSC remote paths?
+        print_rank_0(
+            f'  skipping deleting checkpoint from iteration {iteration_to_delete:7d} '
+            f'at {save_path} since it is a symbolic link'
+        )
+        return
+
+    # Use multiprocessing for async saves so checkpoint finalization is not blocked by deletion.
+    if args.async_save:
+        # Clean up any finished deletion processes before starting a new one.
+        finalize_deletion_processes(blocking=False)
+        ctx = multiprocessing.get_context('fork')
+        delete_process = ctx.Process(
+            target=_async_delete_checkpoint_impl,
+            args=(
+                save_path,
+                iteration_to_delete,
+                args.log_progress,
+                True,
+                args.async_ckpt_cpu_priority,
+                args.async_ckpt_io_priority,
+            ),
+            daemon=True,
+        )
+        delete_process.start()
+        # Track the process so we can join it later to prevent zombies.
+        _deletion_processes.append(delete_process)
+    else:
+        threading.Thread(
+            target=_async_delete_checkpoint_impl,
+            args=(save_path, iteration_to_delete, args.log_progress),
+        ).start()
 
 
 def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=False):

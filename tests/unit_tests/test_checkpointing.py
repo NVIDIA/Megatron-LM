@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
+import time
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
@@ -22,6 +23,7 @@ from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
+    _get_checkpoint_iterations_to_delete,
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
     load_args_from_checkpoint,
@@ -352,6 +354,88 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
             expected_ckpt_path = ckpt_dir / ".metadata"
 
         assert os.path.exists(expected_ckpt_path)
+
+
+def test_save_checkpoint_keeps_most_recent_k(init_model_parallel, create_args, tmp_path_dist_ckpt):
+    """Checkpoint retention keeps only the requested number of recent saves."""
+    args = create_args
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = True
+    args.use_dist_ckpt = False
+    args.save_retain_interval = None
+    args.most_recent_k = 2
+
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = MockModel(config)
+    optimizer = MockState({"optimizer": "optimizer_state"})
+    opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+
+    with TempNamedDir(
+        tmp_path_dist_ckpt / "test_save_checkpoint_keeps_most_recent_k", sync=True
+    ) as save_dir:
+        args.save = save_dir
+        set_args(args)
+
+        for iteration in range(1, 4):
+            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, 0)
+
+        def saved_iterations():
+            return sorted(int(path.name.removeprefix("iter_")) for path in save_dir.glob("iter_*"))
+
+        deadline = time.monotonic() + 5
+        while saved_iterations() != [2, 3] and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        assert saved_iterations() == [2, 3]
+
+
+def test_most_recent_k_uses_effective_save_directory(
+    init_model_parallel, create_args, tmp_path_dist_ckpt
+):
+    """Retention never schedules deletion outside the directory used for the current save."""
+    args = create_args
+    args.ckpt_format = "torch_dcp"
+    args.use_distributed_optimizer = False
+    args.use_dist_ckpt = True
+    args.save_retain_interval = None
+    args.most_recent_k = 2
+    args.non_persistent_ckpt_type = "global"
+
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = MockModel(config)
+    optimizer = MockState({"optimizer": "optimizer_state"})
+    opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+
+    with TempNamedDir(
+        tmp_path_dist_ckpt / "test_most_recent_k_uses_effective_save_directory", sync=True
+    ) as root_dir:
+        args.save = root_dir / "persistent"
+        args.save.mkdir(exist_ok=True)
+        for iteration in range(1, 4):
+            (args.save / f"iter_{iteration:07d}").mkdir(exist_ok=True)
+        args.non_persistent_global_ckpt_dir = root_dir / "non_persistent"
+        set_args(args)
+
+        with mock.patch("megatron.training.checkpointing._schedule_checkpoint_deletion") as delete:
+            save_checkpoint(4, [model], optimizer, opt_param_scheduler, 0, non_persistent_ckpt=True)
+
+        delete.assert_not_called()
+        assert sorted(path.name for path in args.save.glob("iter_*")) == [
+            "iter_0000001",
+            "iter_0000002",
+            "iter_0000003",
+        ]
+
+
+def test_most_recent_k_preserves_periodic_checkpoints(tmp_path):
+    """Periodic retention checkpoints do not count toward the recent-checkpoint limit."""
+    for iteration in range(1, 6):
+        (tmp_path / f"iter_{iteration:07d}").mkdir()
+    (tmp_path / "iter_invalid").mkdir()
+
+    assert _get_checkpoint_iterations_to_delete(
+        tmp_path, most_recent_k=2, save_retain_interval=2
+    ) == [1, 3]
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])

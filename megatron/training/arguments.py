@@ -1315,6 +1315,10 @@ def validate_args(args, defaults={}):
             assert args.save_retain_interval % args.save_interval == 0
         if args.save_params_interval is not None:
             assert not args.overlap_param_gather
+    if args.most_recent_k is not None:
+        assert args.most_recent_k == -1 or args.most_recent_k > 0, (
+            '--most-recent-k must be -1 or a positive integer'
+        )
     if args.log_memory_interval is not None:
         assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.
@@ -2869,7 +2873,10 @@ def _add_learning_rate_args(parser):
 def _add_checkpointing_args(parser):
     from megatron.training.config import CheckpointConfig
 
-    ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_tokenizer_assets", "save_optim", "save_rng", "load_optim", "load_rng"])
+    ckpt_factory = ArgumentGroupFactory(
+        CheckpointConfig,
+        exclude=["save_tokenizer_assets", "save_optim", "save_rng", "load_optim", "load_rng"],
+    )
     group = ckpt_factory.build_group(parser, "checkpointing")
 
     group.add_argument('--no-save-optim', action='store_true', default=None,
