@@ -13,6 +13,7 @@ from functools import partial
 from typing import Dict, List, Optional, Tuple
 from unittest import mock
 
+import msgpack
 import pytest
 import torch
 from tqdm import tqdm
@@ -757,8 +758,13 @@ def test_streaming_partials_are_sent():
     engine._partial_emit_lengths = {}
     request = types.SimpleNamespace(
         generated_tokens=[11, 12, 13],
-        generated_log_probs=None,
-        sampling_params=types.SimpleNamespace(streaming=True, return_log_probs=False),
+        generated_log_probs=[-0.1, -0.2, -0.3],
+        generated_top_n_logprobs=[{"eleven": -0.01}, {"twelve": -0.02}, {"thirteen": -0.03}],
+        prompt_log_probs=[-0.4],
+        prompt_top_n_logprobs=[{"prompt": -0.04}],
+        sampling_params=types.SimpleNamespace(
+            streaming=True, return_log_probs=True, skip_prompt_log_probs=False
+        ),
     )
     engine.requests = {7: types.SimpleNamespace(record=[request])}
     engine.socket_for_receiving_requests = mock.Mock()
@@ -767,6 +773,13 @@ def test_streaming_partials_are_sent():
 
     engine.socket_for_receiving_requests.send.assert_called_once()
     assert engine._partial_emit_lengths == {7: 3}
+    payload = msgpack.unpackb(
+        engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
+    )
+    partial = payload[1][0]
+    assert partial["new_top_n_logprobs"] == request.generated_top_n_logprobs
+    assert partial["prompt_log_probs"] == request.prompt_log_probs
+    assert partial["prompt_top_n_logprobs"] == request.prompt_top_n_logprobs
 
 
 def test_streaming_partials_buffer_until_token_interval():

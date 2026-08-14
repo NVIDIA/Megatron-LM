@@ -13,7 +13,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
-from ..openai_streaming import openai_stream
+from ..openai_streaming import StreamingChatParser, openai_stream
 
 logger = logging.getLogger(__name__)
 
@@ -642,6 +642,40 @@ try:
             streams = [
                 client.add_request_streaming(prompt_tokens, sampling_params) for _ in range(n)
             ]
+            chat_parsers = None
+            if parsers:
+                marker_prefixes = (
+                    tuple(
+                        marker
+                        for parser_name in parsers
+                        for marker in getattr(PARSER_MAPPING[parser_name], "streaming_markers", ())
+                    )
+                    if tools_requested
+                    else ()
+                )
+
+                def parse_streaming_text(text):
+                    parsed_text, metadata = apply_parsers(
+                        text,
+                        tools,
+                        parsers,
+                        tools_requested,
+                        chat_template_kwargs=chat_template_kwargs,
+                    )
+                    metadata["tool_calls"] = _maybe_filter_parallel_tool_calls(
+                        metadata.get("tool_calls", []), parallel_tool_calls
+                    )
+                    return parsed_text, metadata
+
+                is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
+                chat_parsers = [
+                    StreamingChatParser(
+                        parse_streaming_text,
+                        marker_prefixes=marker_prefixes,
+                        named_tool_choice=is_named_tool_choice,
+                    )
+                    for _ in range(n)
+                ]
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
             response = Response(
                 openai_stream(
@@ -651,6 +685,7 @@ try:
                     chat=True,
                     return_log_probs=return_log_probs,
                     include_usage=include_usage,
+                    chat_parsers=chat_parsers,
                 ),
                 content_type="text/event-stream",
             )

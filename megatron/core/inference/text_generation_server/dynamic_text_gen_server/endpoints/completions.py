@@ -157,6 +157,8 @@ try:
                     chat=False,
                     return_log_probs=return_log_probs,
                     include_usage=include_usage,
+                    echo_prompts=prompts_as_strings if echo else None,
+                    prompt_token_ids=prompts_as_tokens if echo else None,
                 ),
                 content_type="text/event-stream",
             )
