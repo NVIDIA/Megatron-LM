@@ -111,6 +111,13 @@ class DBuffer:
         """Device of the local buffer."""
         return self.local_buffer.device
 
+    @property
+    def is_symmetric_memory(self) -> bool:
+        """Whether the local buffer is allocated from symmetric memory."""
+        return hasattr(symm_mem, "is_symm_mem_tensor") and symm_mem.is_symm_mem_tensor(
+            self.local_buffer
+        )
+
     def reallocate_storage(self) -> None:
         """Restore the local buffer's backing storage to its logical size."""
         self._resize_storage(self.local_buffer.numel())
@@ -360,10 +367,7 @@ class DBuffer:
         out = self._create_or_validate_out(out, placements=placements)
         # Symmetric-memory registration is scoped to the collective's process
         # group, so rendezvous the output on the same mesh axis as the all-gather.
-        is_symm_mem = hasattr(symm_mem, "is_symm_mem_tensor") and symm_mem.is_symm_mem_tensor(
-            out.local_buffer
-        )
-        if is_symm_mem:
+        if out.is_symmetric_memory:
             out.rendezvous(mesh_axis)
         dist.all_gather_into_tensor(
             output_tensor=out.local_buffer,
@@ -406,10 +410,7 @@ class DBuffer:
         reduce_op = partial_placement.reduce_op
         # Symmetric-memory MFSDP requires this detector, but ordinary DBuffer
         # reductions remain supported on older PyTorch versions that lack it.
-        is_symm_mem = hasattr(symm_mem, "is_symm_mem_tensor") and symm_mem.is_symm_mem_tensor(
-            self.local_buffer
-        )
-        if is_symm_mem:
+        if self.is_symmetric_memory:
             self.rendezvous(axis)
             # NCCL symmetric-memory reduce-scatter selects its symmetric kernel
             # for SUM. Preserve the placement's AVG semantics by scaling the
@@ -422,7 +423,7 @@ class DBuffer:
             op=reduce_op,
             group=self.mesh.get_group(axis),
         )
-        if is_symm_mem and partial_placement.reduce_op == dist.ReduceOp.AVG:
+        if self.is_symmetric_memory and partial_placement.reduce_op == dist.ReduceOp.AVG:
             out.local_buffer.div_(self.mesh.size(axis))
         return out
 

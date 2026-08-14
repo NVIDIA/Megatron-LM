@@ -230,8 +230,8 @@ class FsdpParameterGroup:
             )
         self.fsdp_parameters = tuple(fsdp_parameters)
 
-        self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
+        self._switch_to_sharded_parameters()
 
     def _get_context(self) -> "FsdpContext":
         """Return the finalized runtime context that owns this parameter group."""
