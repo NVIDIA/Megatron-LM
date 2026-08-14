@@ -41,7 +41,7 @@ Below we describe the different conceptual components and how they divide respon
 
 Pure on-policy RL runs rollout generation and training sequentially: each training step has to wait for fresh rollouts from the current policy. This significantly underutilizes hardware.
 
-Off-policy generation overlaps the two, whether that's in the time dimension (by switching resources between training and inference), in the space dimension (by dividing resources between training and inferences), or both.
+Off-policy generation overlaps the two, whether that's in the time dimension (by switching resources between training and inference), in the space dimension (by dividing resources between training and inference), or both.
 Note that whether we are overlapping in the time dimension (like Python's asyncio) or the space dimension (like Python's threading), the core behavior is almost the same.
 While training is busy with step *N*, the inference engine keeps generating rollouts that will be consumed by steps *N+1*, *N+2*, … The rollouts come from slightly older policy weights, so they are *stale* by some amount. We call this the **collection lag**:
 
@@ -65,7 +65,7 @@ Useful values:
 ### Autotuning
 
 If you omit `--rl-generation-lag`, the system sets it automatically, and prints what it picked at startup.
-Alternatively, if you provide your own `--rl-generation-lag`, the same log line will inform you whether *your* `--rl-generation-lag` oversubscribes the inference engine —
+Alternatively, if you provide your own `--rl-generation-lag`, a startup warning will inform you whether *your* `--rl-generation-lag` oversubscribes the inference engine —
 i.e. whether you're asking for more in-flight work than the engine can actually serve.
 This is why it is important to allow `L` to turn negative. Negative values of `L` occur when there are so few inference resources that even fully-synchronous RL will oversubscribe the engine.
 Given such information, users can utilize the formula below to appropriately scale their inference resources:
@@ -74,7 +74,7 @@ Given such information, users can utilize the formula below to appropriately sca
 max_effective_lag = DP * engine.max_requests / (G * P) - 1
 ```
 
-where `DP` is the inference data-parallel size, `G` is `--grpo-group-size`, `P` is `--grpo-prompts-per-step`, and `engine.max_requests` is the per-rank request capacity of the inference engine (set via `--inference-max-requests` or derived from KV-cache memory).
+where `DP` is the inference data-parallel size, `G` is `--grpo-group-size`, `P` is `--grpo-prompts-per-step`, and `engine.max_requests` is the per-rank request capacity of the inference engine (derived from KV-cache memory, or overridden via `--inference-dynamic-batching-max-requests`).
 
 ### Submission and consumption granularity
 
@@ -101,11 +101,11 @@ Rules of thumb:
 Under the hood, the lag controls how many submission units ("tasks") are in flight simultaneously:
 
 ```
-tasks              = round((L + 1) * P * G / unit)   # in-flight units of generation work
-rollouts_in_flight = tasks * unit                    # total concurrent inference requests
+tasks              = max(1, round((L + 1) * P * G / unit))   # in-flight units of generation work
+rollouts_in_flight = tasks * unit                             # total concurrent inference requests
 ```
 
-where `unit` is the number of rollouts per submission unit (`P * G` for `B`, `G` for `G`, `1` for `R`). You generally don't need to think about this — pick an `L` (or let autotune pick one) and check the startup log to confirm the resulting task count is what you expected.
+where `unit` is the number of rollouts per submission unit (`P * G` for `B`, `G` for `G`, `1` for `R`). You generally don't need to think about this — pick an `L` (or let autotune pick one), or set `--rl-max-inflight-requests` to cap the total in-flight rollout requests directly (`(L + 1) * P * G`; mutually exclusive with `--rl-generation-lag`) — then check the gate capacity in the startup log to confirm the resulting task count is what you expected.
 
 ## Examples
 See `examples/rl` for demonstrations of:

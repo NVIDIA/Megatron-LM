@@ -39,10 +39,6 @@ from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
 from megatron.rl.inference import ReturnsRaw
-from megatron.rl.rollout_granularity import (
-    get_rl_parallel_generation_tasks,
-    resolve_rl_generation_lag,
-)
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -228,59 +224,6 @@ class TestRLUtils:
         assert args.rl_consumption_granularity == "B"
         assert args.rl_generation_lag == 0
         assert not hasattr(args, "rl_parallel_generation_tasks")
-        assert get_rl_parallel_generation_tasks(args) == 1
-
-    @pytest.mark.parametrize(
-        "submission_granularity, generation_lag, expected_parallel_generation_tasks",
-        [
-            pytest.param("B", 0, 1, id="batch"),
-            pytest.param("B", 2, 3, id="batch_with_lag"),
-            pytest.param("B", -1, 1, id="batch_min_lag_clamped"),
-            pytest.param("G", 0, 8, id="group"),
-            pytest.param("G", 2, 24, id="group_with_lag"),
-            pytest.param("G", 0.25, 10, id="group_fractional_lag"),
-            pytest.param("G", -1, 1, id="group_min_lag_clamped"),
-            pytest.param("R", 0, 32, id="rollout"),
-            pytest.param("R", 2, 96, id="rollout_with_lag"),
-            pytest.param("R", -0.5, 16, id="rollout_fractional_negative_lag"),
-        ],
-    )
-    def test_get_rl_parallel_generation_tasks(
-        self, submission_granularity, generation_lag, expected_parallel_generation_tasks
-    ):
-        args = SimpleNamespace(
-            rl_submission_granularity=submission_granularity,
-            rl_generation_lag=generation_lag,
-            grpo_prompts_per_step=8,
-            grpo_group_size=4,
-        )
-
-        assert get_rl_parallel_generation_tasks(args) == expected_parallel_generation_tasks
-
-    @pytest.mark.parametrize(
-        "generation_lag, dp_size, max_requests, expected_lag, expected_tasks",
-        [
-            # 2 * 64 request slots / G=4 -> 32 groups in flight / P=8 -> lag 3.
-            pytest.param(None, 2, 64, 3.0, 32, id="autotune_fills_engine"),
-            # 1 * 4 slots / G=4 -> 1 group / P=8 -> negative lag, tasks clamped to 1.
-            pytest.param(None, 1, 4, -0.875, 1, id="autotune_negative_capacity"),
-            pytest.param(1.0, 2, 64, 1.0, 16, id="explicit_lag_untouched"),
-        ],
-    )
-    def test_resolve_rl_generation_lag(
-        self, generation_lag, dp_size, max_requests, expected_lag, expected_tasks
-    ):
-        args = SimpleNamespace(
-            rl_generation_lag=generation_lag,
-            rl_submission_granularity="G",
-            grpo_prompts_per_step=8,
-            grpo_group_size=4,
-        )
-
-        resolve_rl_generation_lag(args, dp_size=dp_size, max_requests=max_requests)
-
-        assert args.rl_generation_lag == expected_lag
-        assert get_rl_parallel_generation_tasks(args) == expected_tasks
 
     @pytest.mark.parametrize(
         "rl_partial_rollouts, submission_granularity",
@@ -313,6 +256,7 @@ class TestRLUtils:
                 captured["agent"] = agent
                 captured["request"] = request
                 captured["parallel_generation_tasks"] = parallel_generation_tasks
+                self.gate = SimpleNamespace(capacity=parallel_generation_tasks)
 
             def run(self):
                 return rollout_generator
@@ -354,6 +298,25 @@ class TestRLUtils:
                 id="lag_requires_partial_rollouts",
             ),
             pytest.param({"rl_generation_lag": -2}, "must be >= -1", id="lag_below_minimum"),
+            pytest.param(
+                {
+                    "rl_generation_lag": 1,
+                    "rl_max_inflight_requests": 64,
+                    "rl_partial_rollouts": True,
+                },
+                "mutually exclusive",
+                id="lag_and_max_inflight_exclusive",
+            ),
+            pytest.param(
+                {"rl_max_inflight_requests": 128},
+                "requires --rl-partial-rollouts",
+                id="max_inflight_above_batch_requires_partial_rollouts",
+            ),
+            pytest.param(
+                {"rl_max_inflight_requests": 0, "rl_partial_rollouts": True},
+                "must be >= 1",
+                id="max_inflight_below_minimum",
+            ),
             pytest.param(
                 {"rl_submission_granularity": "R"},
                 "Rollout submission granularity requires streaming grouped rollouts",
