@@ -28,7 +28,7 @@ from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Partial, Placements, Replicate
+from .placement import Partial, Placements, Replicate, changed_mesh_axis
 
 if TYPE_CHECKING:
     from .module import FsdpContext, FsdpModule
@@ -266,6 +266,8 @@ class FsdpParameterGroup:
     def sync_model_weight_from_main_weight(self) -> None:
         """Sync optimizer weights to the model-weight representation."""
         context = self._get_context()
+        # TODO: Retrieve the all-gather stream directly from self.model_weight after
+        # https://github.com/NVIDIA/Megatron-LM/pull/6441 merges.
         allgather_stream = context.allgather_stream
         allgather_stream.wait_stream(context.current_stream())
         with torch.cuda.stream(allgather_stream):
@@ -375,17 +377,33 @@ class FsdpParameterGroup:
         has_sharded_grads = self._has_sharded_grads()
 
         # A non-accumulation main_grad means the previous step finalized it; this
-        # only happens on the first microbatch. Start with fresh accumulation storage
-        # rather than trying to redistribute a Flat optimizer shard back to Partial.
+        # only happens on the first microbatch. Restore it to the DP-outer-Partial
+        # accumulation placement. HSDP's finalize keeps the buffer size (Replicate
+        # on DP-outer), so relabel it in place; ZeRO-1's finalize reduce-scattered
+        # DP-outer to a smaller optimizer-sharded buffer, so allocate a fresh one
+        # (zeroed only when we accumulate into it, i.e. sharded grads are still set).
         if self.main_grad.placements != self._main_grad_placements:
-            self.main_grad = DBuffer(
-                mesh=self.mesh,
-                placements=self._main_grad_placements,
-                tensor_shapes=self.main_weight.layout.tensor_shapes,
-                dtype=self.main_grad.dtype,
-                device=self.main_weight.device,
-            )
-            has_sharded_grads = False
+            reset_axis = changed_mesh_axis(self.main_grad.placements, self._main_grad_placements)
+            assert reset_axis is not None  # The placements differ, so an axis changed.
+            if isinstance(self.main_grad.placements[reset_axis], Replicate):
+                # HSDP: Replicate -> Partial changes only metadata and reuses the tensor.
+                self.main_grad = self.main_grad.redistribute(self._main_grad_placements)
+            else:
+                # ZeRO-1: main_grad was reduce-scattered to the optimizer shard, too small
+                # to hold the accumulation, so re-allocate. This runs inside the
+                # reduce_scatter stream context (see FsdpModule._reduce_gradient_groups),
+                # so the buffer is allocated on that stream and stays race-safe. Zero it
+                # only when we accumulate (set_to_none=False); with set_to_none=True the
+                # reduction below overwrites it via out=.
+                self.main_grad = DBuffer(
+                    mesh=self.mesh,
+                    placements=self._main_grad_placements,
+                    tensor_shapes=self.main_weight.layout.tensor_shapes,
+                    dtype=self.main_grad.dtype,
+                    device=self.main_weight.device,
+                )
+                if has_sharded_grads:
+                    self.main_grad.local_buffer.zero_()
 
         can_reduce_into_main_grad = (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
