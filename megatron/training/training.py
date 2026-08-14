@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
 
@@ -2988,6 +2988,7 @@ def dummy_train_step(data_iterator):
                 is_hybrid_cp=is_hybrid_cp,
                 cp_group=get_context_parallel_group(),
                 hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+                cp_partition_mode=args.cp_partition_mode,
             )
 
 

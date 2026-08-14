@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Utility functions used throughout Megatron core"""
 
@@ -2448,6 +2448,73 @@ def get_batch_on_this_tp_rank(
 ########################
 
 
+def _get_batch_on_this_cp_rank_contiguous(
+    batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
+):
+    """Partition an unpacked SBHD batch into contiguous CP rank intervals.
+
+    Each CP rank receives one contiguous ``seq_length / cp_size`` interval.
+    Sequence tensors are batch-first at this point in the training pipeline,
+    so their sequence dimension is 1. Attention masks use dimension 2 for
+    their query sequence. CP metadata and ``None`` entries are left unchanged.
+
+    Args:
+        batch (dict[str, torch.Tensor]): Batch dict containing tensors with
+            sequence dimensions compatible with the conventions above.
+        cp_group (torch.distributed.ProcessGroup): The context-parallel
+            process group.
+
+    Returns:
+        dict[str, torch.Tensor]: The batch with sequence tensors narrowed to
+        this CP rank's contiguous interval.
+
+    Raises:
+        ValueError: If packed/THD metadata is present or a sequence dimension
+        is not evenly divisible by the CP size.
+    """
+    cp_size = torch.distributed.get_world_size(cp_group)
+    cp_rank = torch.distributed.get_rank(cp_group)
+
+    if cp_size <= 1:
+        return batch
+
+    if batch.get("cu_seqlens") is not None or batch.get("cu_seqlens_padded") is not None:
+        raise ValueError(
+            "Contiguous CP batch partitioning currently supports unpacked SBHD inputs only; "
+            "packed/THD batches require per-sequence partition metadata."
+        )
+
+    metadata_keys = {
+        'cu_seqlens',
+        'cu_seqlens_padded',
+        'max_seqlen',
+        'local_cp_size',
+        'hybrid_cp_group',
+    }
+    sequence_tensors = []
+    for key, val in batch.items():
+        if key in metadata_keys or val is None:
+            continue
+        seq_dim = 2 if key == 'attention_mask' else 1
+        if val.dim() <= seq_dim:
+            raise ValueError(
+                f"Batch tensor {key!r} with shape {tuple(val.shape)} has no sequence "
+                f"dimension {seq_dim} required for contiguous CP partitioning."
+            )
+        seq_length = val.shape[seq_dim]
+        if seq_length % cp_size != 0:
+            raise ValueError(
+                f"Batch tensor {key!r} sequence length ({seq_length}) must be divisible by "
+                f"the context-parallel size ({cp_size}) for contiguous partitioning."
+            )
+        sequence_tensors.append((key, val, seq_dim, seq_length // cp_size))
+
+    for key, val, seq_dim, local_seq_length in sequence_tensors:
+        batch[key] = val.narrow(seq_dim, cp_rank * local_seq_length, local_seq_length).contiguous()
+
+    return batch
+
+
 def _get_batch_on_this_cp_rank_per_document_balancing(
     batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
 ):
@@ -2660,11 +2727,14 @@ def get_batch_on_this_cp_rank(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
     use_per_sequence_balancing: bool = False,
+    cp_partition_mode: str = "zigzag",
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
     Routes to the appropriate CP partitioning strategy based on the batch
     contents and parallelism mode:
+      - **Contiguous SBHD**: When ``cp_partition_mode`` is ``"contiguous"``,
+        delegates to ``_get_batch_on_this_cp_rank_contiguous``.
       - **Per-sequence zigzag**: When ``cu_seqlens`` is None, or when
         ``use_per_sequence_balancing`` is True, delegates to
         ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
@@ -2688,11 +2758,35 @@ def get_batch_on_this_cp_rank(
             even when ``cu_seqlens`` is present (e.g., for inter-document
             masking where document lengths are not divisible by
             ``2 * cp_size``).
+        cp_partition_mode (str): Rank-local CP sequence layout. ``"zigzag"``
+            preserves the existing load-balanced behavior; ``"contiguous"``
+            selects one contiguous interval per rank for unpacked SBHD data.
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
         to this CP rank.
     """
+
+    if cp_partition_mode not in ("zigzag", "contiguous"):
+        raise ValueError(f"Unsupported cp_partition_mode: {cp_partition_mode}")
+
+    # TODO: Refactor CP batch partitioning into independent stages for effective
+    # CP-group selection, input geometry/granularity, and rank-local layout. This
+    # will let contiguous layout support packed/THD and hybrid CP without adding
+    # more feature-specific branches to this dispatcher.
+    if cp_partition_mode == "contiguous":
+        assert (
+            not is_hybrid_cp
+        ), "Contiguous CP batch partitioning does not support hybrid context parallelism yet."
+        assert not use_per_sequence_balancing, (
+            "Contiguous CP batch partitioning does not support the "
+            "use_per_sequence_balancing path yet."
+        )
+        assert batch.get("cu_seqlens") is None and batch.get("cu_seqlens_padded") is None, (
+            "Contiguous CP batch partitioning currently supports unpacked SBHD inputs only; "
+            "packed/THD support is future work."
+        )
+        return _get_batch_on_this_cp_rank_contiguous(batch, cp_group=cp_group)
 
     if use_per_sequence_balancing or batch.get("cu_seqlens") is None:
         batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
