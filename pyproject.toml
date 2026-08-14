@@ -98,7 +98,6 @@ dev = [
     "multi-storage-client~=0.50",
     "opentelemetry-api>=1.33.1,<2",
     "nemo-lens",
-    "flash-linear-attention==0.5.1",
     "megatron-energon[av_decode]~=7.0",
     "av",
     "flashinfer-python>=0.5.0,<0.7.0",
@@ -134,6 +133,7 @@ te = [
 ssm = [
     "mamba-ssm",
     "causal-conv1d~=1.5",
+    "flash-linear-attention==0.5.1",
 ]
 
 [dependency-groups]
