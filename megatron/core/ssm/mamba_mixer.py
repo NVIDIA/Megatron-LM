@@ -466,8 +466,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             D_has_hdim=self.D_has_hdim,
         )
         self.tp_group = pg_collection.tp
+        self._supports_split_input_output = True
 
-    def forward(
+    def input_proj_ssm(
         self,
         hidden_states,
         inference_context=None,
@@ -518,9 +519,37 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             assert ssm_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)
 
-        out, out_bias = self.out_proj(y)
+        return y
 
-        return out, out_bias
+    def output_proj(self, y):
+        """Apply the Mamba output projection to an SSM output tensor."""
+        return self.out_proj(y)
+
+    def forward(
+        self,
+        hidden_states,
+        inference_context=None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Run the input projection/SSM phase followed by the output projection."""
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        y = self.input_proj_ssm(
+            hidden_states,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+        )
+        if (
+            InferenceMode.is_active()
+            and inference_context is not None
+            and (
+                inference_context.is_dynamic_batching()
+                or inference_context.seqlen_offset > 0
+            )
+        ):
+            return y
+        return self.output_proj(y)
 
     # ==================================================================
     # Static / eager inference

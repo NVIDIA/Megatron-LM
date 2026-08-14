@@ -32,10 +32,14 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.cuda_graphs import (
+    ArgMetadata,
+    CudagraphBufferMetadata,
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _copy_cudagraph_buffer_metadata,
     create_cudagraphs,
+    mark_cuda_graph_prebound_input,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -63,6 +67,26 @@ from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, _ = check_fp8_support()
+
+
+def test_cudagraph_buffer_metadata_copy_preserves_nonleaf_buffer_reference():
+    """Metadata copies must not deepcopy live graph-buffer tensors."""
+    source = torch.ones(1, requires_grad=True)
+    nonleaf_buffer = source * 2
+    metadata = CudagraphBufferMetadata(
+        is_cudagraph_input=True,
+        capture_reuse_count=2,
+        fwd_cudagraph_buffer=nonleaf_buffer,
+        bwd_cudagraph_buffer=nonleaf_buffer,
+    )
+
+    copied = _copy_cudagraph_buffer_metadata(metadata)
+
+    assert copied is not metadata
+    assert copied.fwd_cudagraph_buffer is nonleaf_buffer
+    assert copied.bwd_cudagraph_buffer is nonleaf_buffer
+    copied.capture_reuse_count -= 1
+    assert metadata.capture_reuse_count == 2
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
@@ -474,7 +498,9 @@ class TestPackedSeqCudagraphs:
     )
 
     def setup_method(self, method):
-        self.original_nvte_env = {name: os.environ.get(name) for name in self.NVTE_ENV_VARS}
+        self.original_nvte_env = {
+            name: os.environ.get(name) for name in self.NVTE_ENV_VARS
+        }
         os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
 
     def teardown_method(self, method):
@@ -552,7 +578,9 @@ class TestPackedSeqCudagraphs:
         )
 
         eager_out = block(
-            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+            hidden_states=hidden_states,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
         )
         hidden_states_metadata = hidden_states.cg_buffer_metadata
         assert hidden_states_metadata.is_cudagraph_input
@@ -584,7 +612,8 @@ class TestPackedSeqCudagraphs:
         padded_cu_seqlens_metadata = packed_seq_params.cu_seqlens_q_padded.cg_buffer_metadata
         assert packed_seq_params.cu_seqlens_kv.cg_buffer_metadata is actual_cu_seqlens_metadata
         assert (
-            packed_seq_params.cu_seqlens_kv_padded.cg_buffer_metadata is padded_cu_seqlens_metadata
+            packed_seq_params.cu_seqlens_kv_padded.cg_buffer_metadata
+            is padded_cu_seqlens_metadata
         )
         assert actual_cu_seqlens_metadata.is_cudagraph_input
         assert padded_cu_seqlens_metadata.is_cudagraph_input
@@ -607,7 +636,8 @@ class TestPackedSeqCudagraphs:
             tensor
             for runner in runners
             for tensor in runner.fwd_graph_input_surface[: runner.num_dgrads]
-            if tensor.dtype == torch.int32 and tensor.shape == packed_seq_params.cu_seqlens_q.shape
+            if tensor.dtype == torch.int32
+            and tensor.shape == packed_seq_params.cu_seqlens_q.shape
         ]
         assert len(cu_seqlens_buffers) == 4 * len(runners)
         buffers_by_ptr = {}
@@ -618,7 +648,9 @@ class TestPackedSeqCudagraphs:
             assert sum(not tensor.can_skip_replay_copy for tensor in shared_buffers) == 1
 
         graphed_out = block(
-            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+            hidden_states=hidden_states,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
         )
         assert torch.equal(graphed_out, eager_out), (
             "CUDA graph replay output is not bitwise equal to eager output: "
@@ -1795,6 +1827,50 @@ class TestInlineCaptureManager:
         assert (
             runner.num_warmup_steps == 0
         ), f"Expected 0 warmup steps (manager override), got {runner.num_warmup_steps}"
+
+    @torch.inference_mode()
+    def test_prebound_input_uses_exact_capture_allocation(self):
+        config = self._make_config()
+        module = _SimpleModule(config).cuda().eval()
+        manager = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            num_warmup_steps=0,
+            need_backward=False,
+        )
+
+        static_input = mark_cuda_graph_prebound_input(
+            torch.randn(4, config.hidden_size, device="cuda")
+        )
+        module.my_op(static_input, cache_key="prebound")
+
+        runner = manager.cudagraph_runners[0]
+        captured_input = runner.fwd_graph_input_surface[0]
+        assert captured_input.data_ptr() == static_input.data_ptr()
+        assert captured_input.cg_buffer_metadata.input_use_count == 1
+
+        # The exact prebound allocation skips the replay copy without losing its metadata.
+        module.my_op(static_input, cache_key="prebound")
+
+        wrong_allocation = mark_cuda_graph_prebound_input(torch.empty_like(static_input))
+        with pytest.raises(AssertionError, match="prebound input requires"):
+            module.my_op(wrong_allocation, cache_key="prebound")
+
+    def test_prebound_input_preserves_requires_grad(self):
+        static_input = mark_cuda_graph_prebound_input(
+            torch.randn(4, 32, device="cuda", requires_grad=True)
+        )
+        static_input.cg_buffer_metadata = CudagraphBufferMetadata(
+            is_cudagraph_input=True,
+            input_use_count=1,
+        )
+        metadata = ArgMetadata(static_input)
+
+        assert metadata.prebound_cudagraph_input.requires_grad
+        assert metadata.prebound_cudagraph_input.data_ptr() == static_input.data_ptr()
+        assert metadata.prebound_cudagraph_input.cg_buffer_metadata.input_use_count == 1
 
 
 class TestSkipFp8WeightUpdateTensor:

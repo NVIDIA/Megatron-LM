@@ -282,6 +282,7 @@ class _GDNBase(MegatronModule):
             tp_group=self.pg_collection.tp,
             name=(name + ".out_proj") if name is not None else None,
         )
+        self._supports_split_input_output = not self.recompute_norm_out
 
         self.reset_parameters()
 

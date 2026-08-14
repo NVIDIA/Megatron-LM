@@ -146,7 +146,7 @@ class GatedDeltaNet2(_GDNBase):
 
         return g, {"b": b.contiguous(), "w": w.contiguous()}
 
-    def forward(
+    def input_proj_attn(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -156,12 +156,12 @@ class GatedDeltaNet2(_GDNBase):
         *,
         inference_params: BaseInferenceContext | None = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         """
-        Perform a forward pass through the GDN2 module.
+        Run GDN2 through its normalized recurrence output, before output projection.
 
         Return:
-            (tuple[torch.Tensor, torch.Tensor]) GDN2 output and bias.
+            torch.Tensor: Normalized recurrence output.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -322,15 +322,39 @@ class GatedDeltaNet2(_GDNBase):
                 core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
             )
 
-        # Output projection
+        return norm_out
+
+    def output_proj(self, norm_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply GDN2's output projection to the normalized recurrence output."""
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
-
         if self.recompute_norm_out:
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
         return out, out_bias
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        inference_context: BaseInferenceContext | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
+        sequence_len_offset: int | None = None,
+        *,
+        inference_params: BaseInferenceContext | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the GDN2 recurrence followed by its output projection."""
+        norm_out = self.input_proj_attn(
+            hidden_states,
+            attention_mask,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
+            **kwargs,
+        )
+        return self.output_proj(norm_out)
 
 
 ####################

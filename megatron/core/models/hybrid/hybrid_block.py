@@ -22,11 +22,12 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, annotate_first_last_layer
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
@@ -50,6 +51,22 @@ class HybridStackSubmodules:
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
+
+
+@dataclass(frozen=True)
+class _HybridExecutionStep:
+    """One precomputed single-layer or shortcut-pair execution step."""
+
+    layer_index: int
+    shortcut_block: Optional[ShortcutMoEBlock] = None
+
+
+def _install_standalone_cudagraph_manager(layer, config):
+    """Restore the regular graph manager for a layer not consumed by a shortcut pair."""
+    if getattr(layer, '_shortcut_graph_output_proj', False) and not hasattr(
+        layer, 'cudagraph_manager'
+    ):
+        layer.cudagraph_manager = CudaGraphManager(config)
 
 
 class HybridStack(MegatronModule):
@@ -76,6 +93,8 @@ class HybridStack(MegatronModule):
             process groups to use.
         is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
     """
+
+    _supports_moe_shortcut = True
 
     def __init__(
         self,
@@ -187,6 +206,7 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
@@ -225,6 +245,74 @@ class HybridStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+
+        if self.config.moe_shortcut_connection:
+            # Each compute/MoE pair resolves to eager-serial, eager-overlap, or graph-overlap.
+            # All modes share the composite computation modules; only graph-overlap registers
+            # CUDA-graph managers for them.
+            execution_plan = []
+            shortcut_route_input_managers = nn.ModuleList()
+            shortcut_output_shared_managers = nn.ModuleList()
+            i = 0
+            while i < len(self.layers):
+                next_is_moe = (
+                    i + 1 < len(self.layers)
+                    and self.layer_type_list[i + 1] == LayerSymbols.MOE
+                )
+                if not next_is_moe:
+                    # Mamba/attention constructors defer their regular graph manager whenever
+                    # shortcut mode is globally enabled. Restore it when this particular layer
+                    # is not the immediate predecessor of an MoE shortcut pair.
+                    _install_standalone_cudagraph_manager(self.layers[i], self.config)
+                    execution_plan.append(_HybridExecutionStep(layer_index=i))
+                    i += 1
+                    continue
+
+                paired_type = self.layer_type_list[i]
+                if paired_type not in (
+                    LayerSymbols.MAMBA,
+                    LayerSymbols.GDN,
+                    LayerSymbols.ATTENTION,
+                ):
+                    raise ValueError(
+                        "Shortcut MoE must be preceded by a Mamba, GDN, or attention layer"
+                    )
+                paired_layer = self.layers[i]
+                if not getattr(paired_layer, '_supports_split_input_output', False):
+                    raise ValueError(
+                        f"{paired_type.name} does not support split input/output execution"
+                    )
+                moe_layer = self.layers[i + 1]
+                enable_cudagraph = (
+                    getattr(paired_layer, '_shortcut_graph_output_proj', False)
+                    and getattr(moe_layer, '_shortcut_graph_shared_experts', False)
+                )
+                shortcut_block = ShortcutMoEBlock(
+                    paired_layer,
+                    moe_layer,
+                    is_mamba=paired_type == LayerSymbols.MAMBA,
+                    is_mtp_layer=self.is_mtp_layer,
+                    enable_cudagraph=enable_cudagraph,
+                    overlap_a2a=self.config.moe_shortcut_parallel,
+                )
+                if shortcut_block.route_input_cudagraph_manager is not None:
+                    shortcut_route_input_managers.append(
+                        shortcut_block.route_input_cudagraph_manager
+                    )
+                if shortcut_block.cudagraph_manager is not None:
+                    shortcut_output_shared_managers.append(shortcut_block.cudagraph_manager)
+                execution_plan.append(
+                    _HybridExecutionStep(layer_index=i, shortcut_block=shortcut_block)
+                )
+                i += 2
+
+            # Keep the plan and composite modules alive without registering duplicate paths to
+            # paired/MoE parameters in HybridStack.state_dict().
+            object.__setattr__(self, '_shortcut_execution_plan', tuple(execution_plan))
+            # Managers contain no model parameters, so registering only them propagates train/eval
+            # and first-microbatch state without adding duplicate layer paths to the state dict.
+            self.shortcut_route_input_managers = shortcut_route_input_managers
+            self.shortcut_output_shared_managers = shortcut_output_shared_managers
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`
@@ -366,7 +454,7 @@ class HybridStack(MegatronModule):
                     padding_mask=padding_mask,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                 )
-            else:
+            elif not self.config.moe_shortcut_connection:
                 for layer in self.layers:
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
@@ -390,12 +478,58 @@ class HybridStack(MegatronModule):
                                 inference_context=inference_context,
                                 packed_seq_params=packed_seq_params,
                             )
-
                     # The attention layer (currently a simplified transformer layer)
                     # outputs a tuple of (hidden_states, context). Context is intended
                     # for cross-attention, and is not needed in our model.
                     if isinstance(hidden_states, tuple):
                         hidden_states = hidden_states[0]
+            else:
+                # moe_shortcut_connection=True: process (non-MOE, MOE) layer pairs.
+                # Shortcut pairs run through ShortcutMoEBlock. Layers that are not
+                # followed by an MoE layer run normally.
+                def run_layer(layer, hidden_states):
+                    inner_quant_context = get_inner_quant_context(
+                        self.config, layer.layer_number - 1
+                    )
+                    with inner_quant_context:
+                        if isinstance(layer, TransformerLayer):
+                            hidden_states, _ = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                rotary_pos_emb=rotary_pos_emb,
+                                sequence_len_offset=sequence_len_offset,
+                                packed_seq_params=packed_seq_params,
+                                padding_mask=padding_mask,
+                            )
+                        else:  # MambaLayer, Expert, or MLP
+                            hidden_states = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                packed_seq_params=packed_seq_params,
+                            )
+                    # The attention layer outputs a tuple of (hidden_states, context).
+                    # Context is intended for cross-attention and is not needed here.
+                    if isinstance(hidden_states, tuple):
+                        hidden_states = hidden_states[0]
+                    return hidden_states
+
+                for step in self._shortcut_execution_plan:
+                    if step.shortcut_block is not None:
+                        hidden_states = step.shortcut_block.forward(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                            rotary_pos_emb=rotary_pos_emb,
+                            sequence_len_offset=sequence_len_offset,
+                            packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
+                            quant_context_factory=get_inner_quant_context,
+                            quant_config=self.config,
+                        )
+                    else:
+                        hidden_states = run_layer(self.layers[step.layer_index], hidden_states)
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
