@@ -21,6 +21,7 @@ from weakref import ReferenceType, ref
 
 import torch
 import torch.distributed as dist
+import torch.distributed.tensor as dist_tensor
 import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed import DeviceMesh
@@ -85,6 +86,13 @@ class FsdpParameterGroup:
     _unsharded_model_weight: DBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
+    # Cached sharded-gradient DTensors keyed by the main_grad DBuffer identity.
+    # Rebuilding DTensors every backward costs O(params) ``_FromTorchTensor``
+    # calls on the host; when main_grad storage is reused we rebind the cached
+    # DTensor's local storage in place instead. Invalidation: cleared whenever
+    # main_grad is replaced (redistribute) or changes dtype.
+    _grad_dtensor_cache: list[dist_tensor.DTensor | None]
+    _grad_dtensor_cache_main_grad_id: int | None
 
     def __init__(
         self,
@@ -129,6 +137,8 @@ class FsdpParameterGroup:
         self._owning_module = ref(owning_module)
         self.mesh = mesh
         self.grad_divisor = grad_divisor
+        self._grad_dtensor_cache = []
+        self._grad_dtensor_cache_main_grad_id = None
         first_parameter = next(iter(parameter_to_fqns))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
@@ -415,8 +425,44 @@ class FsdpParameterGroup:
             self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
 
         # Make each sharded parameter's .grad consistent with the final main_grad.
+        # Reuse cached DTensors where possible: rebinding storage in place avoids
+        # O(params) ``DTensor.from_local`` (``_FromTorchTensor``) host cost per
+        # backward. The cache is keyed on the main_grad DBuffer identity so a
+        # fresh buffer (redistribute replacement, dtype change) rebuilds it.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.sharded.grad = self.main_grad.get_dtensor(index)
+            fsdp_parameter.sharded.grad = self._get_sharded_grad_dtensor(index)
+
+    def _get_sharded_grad_dtensor(self, index: int) -> dist_tensor.DTensor:
+        """Return the sharded-gradient DTensor for parameter ``index``, cached.
+
+        The first call for a given ``main_grad`` storage builds DTensors via
+        ``get_dtensor``; later calls with the same storage rebind the cached
+        DTensor's local tensor in place, skipping ``DTensor.from_local``.
+        """
+        main_grad = self.main_grad
+        assert main_grad is not None
+        cache_id = self._grad_dtensor_cache_main_grad_id
+        if cache_id != id(main_grad):
+            self._grad_dtensor_cache = [None] * len(self.fsdp_parameters)
+            self._grad_dtensor_cache_main_grad_id = id(main_grad)
+
+        cached = self._grad_dtensor_cache[index]
+        if cached is not None:
+            new_local = main_grad.get_local_tensor(index)
+            old_local = cached._local_tensor
+            if (
+                old_local is not None
+                and old_local.data_ptr() == new_local.data_ptr()
+                and old_local.shape == new_local.shape
+                and old_local.dtype == new_local.dtype
+            ):
+                return cached
+            object.__setattr__(cached._local_tensor, "data", new_local)
+            return cached
+
+        dtensor = main_grad.get_dtensor(index)
+        self._grad_dtensor_cache[index] = dtensor
+        return dtensor
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
