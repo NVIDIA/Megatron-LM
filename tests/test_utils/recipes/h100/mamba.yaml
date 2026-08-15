@@ -102,3 +102,10 @@ products:
         platforms: [dgx_h100]
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
+
+  - test_case: [hybrid_ling_v3_tiny_tp1_pp1_ep8_cp2_dgx_h100_1N8G]
+    products:
+      # Enable after the official H100 functional run produces golden values.
+      - environment: [dev]
+        scope: [mr-broken, mr-github-broken]
+        platforms: [dgx_h100]
