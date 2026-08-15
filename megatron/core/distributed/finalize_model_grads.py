@@ -249,6 +249,11 @@ def _allreduce_embedding_grad(
 
         grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
+        preserve_mfsdp_v2_dtensor_grad = (
+            ddp_config.use_megatron_fsdp
+            and ddp_config.megatron_fsdp_version == 2
+            and isinstance(orig_grad, DTensor)
+        )
         if ddp_config.use_megatron_fsdp:
             orig_grad = orig_grad._local_tensor if orig_grad is not None else None
         grad = _unshard_if_dtensor(orig_grad)
@@ -256,7 +261,11 @@ def _allreduce_embedding_grad(
         if grad is None and skip_if_none:
             return
         torch.distributed.all_reduce(grad, group=embd_group)
-        setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+        # MFSDP v2 keeps the DTensor wrapper attached to the parameter. ``grad``
+        # aliases its local shard, so the in-place all-reduce has already updated
+        # it; assigning that local tensor back would violate the global DTensor shape.
+        if not preserve_mfsdp_v2_dtensor_grad:
+            setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
 def _allreduce_position_embedding_grads(

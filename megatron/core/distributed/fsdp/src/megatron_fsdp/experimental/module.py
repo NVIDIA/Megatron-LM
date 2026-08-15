@@ -568,9 +568,21 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 
 
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
-    grouped: dict[tuple[torch.dtype, bool, bool], dict[str, nn.Parameter]] = {}
+    grouped: dict[tuple[torch.dtype, bool, bool, int | None], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (parameter.dtype, parameter.requires_grad, _is_fp8_parameter(parameter))
+        # Pipeline-tied embedding/output gradients are reduced between the
+        # first and last stages by matching data-parallel shards. Keep each
+        # physical shared parameter in its own DBuffer so unrelated root
+        # parameters cannot shift its local shard boundary on one endpoint.
+        shared_parameter_id = (
+            id(parameter) if getattr(parameter, "shared_embedding", False) else None
+        )
+        key = (
+            parameter.dtype,
+            parameter.requires_grad,
+            _is_fp8_parameter(parameter),
+            shared_parameter_id,
+        )
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 
