@@ -207,6 +207,63 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             and CudaGraphModule.moe_router in self.config.cuda_graph_modules
         )
 
+    def _can_group_te_cuda_graph_with(self, next_layer: MegatronModule) -> bool:
+        """Whether this attention layer and the following MoE prefix can share one TE graph.
+
+        HybridStack represents attention and MoE as separate layers, unlike the GPT path where
+        both scopes live in one TransformerLayer callable. Group only the matching mHC pair and
+        only when HybridStack executes its normal per-layer loop. Full/MHC-selective recompute
+        use different layer scheduling and retain the existing per-layer graphs.
+        """
+        if not isinstance(next_layer, HyperConnectionHybridLayer):
+            return False
+        if self.config.recompute_granularity == 'full' or (
+            self.config.recompute_granularity == 'selective'
+            and 'mhc' in (self.config.recompute_modules or [])
+        ):
+            return False
+        if not isinstance(self.inner_layer, TransformerLayer):
+            return False
+        is_attention_only = not (
+            isinstance(self.inner_layer.self_attention, IdentityOp)
+            and isinstance(self.inner_layer.cross_attention, IdentityOp)
+        ) and isinstance(self.inner_layer.mlp, IdentityOp)
+        return is_attention_only and next_layer._inner_is_partial_moe_capture()
+
+    def _set_te_cuda_graph_group_tail(self, next_layer: MegatronModule) -> None:
+        """Attach a non-registered capture-only tail while preserving checkpoint keys."""
+        assert self._can_group_te_cuda_graph_with(next_layer)
+        # Bypass nn.Module.__setattr__: next_layer remains registered exactly once in
+        # HybridStack.layers, so this capture-only reference cannot alter state_dict keys.
+        object.__setattr__(self, '_te_cuda_graph_group_tail', next_layer)
+
+    def _get_te_cuda_graph_group_tail(self) -> Optional['HyperConnectionHybridLayer']:
+        """Return the capture-only MoE tail, if discovery grouped this layer."""
+        return getattr(self, '_te_cuda_graph_group_tail', None)
+
+    def parameters(self, recurse: bool = True):
+        """Expose grouped-prefix parameters to TE without registering the group tail.
+
+        Transformer Engine derives a graphed callable's autograd input surface from
+        ``callable.parameters()``. The grouped MoE tail stays registered only in
+        ``HybridStack.layers`` for checkpoint compatibility, so include just its graph-covered
+        prefix parameters here. Parent model traversal and ``state_dict`` continue to use the
+        unchanged module hierarchy.
+        """
+        seen = set()
+        for param in super().parameters(recurse=recurse):
+            seen.add(id(param))
+            yield param
+
+        group_tail = self._get_te_cuda_graph_group_tail()
+        if not recurse or group_tail is None:
+            return
+        for submodule in group_tail._get_submodules_under_cudagraphs():
+            for param in submodule.parameters():
+                if id(param) not in seen:
+                    seen.add(id(param))
+                    yield param
+
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """Capture the graph-safe portion of the wrapper forward.
 
@@ -221,6 +278,14 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         CUDA-graph output).
         """
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
+
+        group_tail = self._get_te_cuda_graph_group_tail()
+        if group_tail is not None:
+            hidden_states, context = self.forward(*args, **kwargs)
+            assert context is None, "Grouped hybrid CUDA graphs do not support cross-attention."
+            tail_kwargs = dict(kwargs)
+            tail_kwargs.pop("hidden_states", None)
+            return group_tail._te_cuda_graph_capture(hidden_states, **tail_kwargs)
 
         if self._inner_is_partial_moe_capture():
             hidden_states = args[0] if args else kwargs["hidden_states"]
@@ -256,38 +321,46 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         """
         self._decompose_packed_seq_params_to_kwargs(kwargs)
 
+        group_tail = self._get_te_cuda_graph_group_tail()
+        if group_tail is not None:
+            out = list(super()._te_cuda_graph_replay(*args, **kwargs))
+            return group_tail._resume_partial_moe_cuda_graph(out)
+
         if self._inner_is_partial_moe_capture():
             out = list(super()._te_cuda_graph_replay(*args, **kwargs))
-            residual = out.pop()  # n-stream [s, b, n*C] — graph output (see capture)
-            h_res = out.pop()
-            h_post = out.pop()
-            # Resume the inner MoE experts eagerly to the raw delta (mlp_output_with_bias),
-            # then let the n-stream BDA own the residual — identical to the eager forward
-            # (`_call_inner_transformer_layer_without_local_bda` fast path →
-            # fused_h_res_h_post_bda), just with the router/preprocess prefix graphed.
-            # Mirror the eager fast path's BDA args (it feeds the inner layer's
-            # `hidden_dropout` / `bias_dropout_fusion`) so replay == eager bit-for-bit.
-            mlp_output_with_bias = self.inner_layer.resume_moe_experts_after_partial_cudagraph(out)
-            hidden_states = self.hyper_connection.fused_h_res_h_post_bda(
-                h_res,
-                residual,
-                h_post,
-                mlp_output_with_bias,
-                dropout_prob=self.inner_layer.hidden_dropout,
-                training=self.training,
-                fused=self.inner_layer.config.bias_dropout_fusion,
-                manager=None,
-            )
-            if (
-                self.config.fp32_residual_connection
-                and self.config.params_dtype is not None
-                and hidden_states.dtype != self.config.params_dtype
-            ):
-                hidden_states = hidden_states.to(self.config.params_dtype)
-            return hidden_states, None
+            return self._resume_partial_moe_cuda_graph(out)
 
         cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
         return cuda_graph_output[0], None
+
+    def _resume_partial_moe_cuda_graph(self, out: List[Tensor]) -> Tuple[Tensor, Optional[Tensor]]:
+        """Run the eager expert/BDA tail from captured router/preprocess outputs."""
+        assert self._inner_is_partial_moe_capture()
+        residual = out.pop()  # n-stream [s, b, n*C] — graph output (see capture)
+        h_res = out.pop()
+        h_post = out.pop()
+        # Resume the inner MoE experts eagerly to the raw delta (mlp_output_with_bias),
+        # then let the n-stream BDA own the residual — identical to the eager forward
+        # (`_call_inner_transformer_layer_without_local_bda` fast path →
+        # fused_h_res_h_post_bda), just with the router/preprocess prefix graphed.
+        mlp_output_with_bias = self.inner_layer.resume_moe_experts_after_partial_cudagraph(out)
+        hidden_states = self.hyper_connection.fused_h_res_h_post_bda(
+            h_res,
+            residual,
+            h_post,
+            mlp_output_with_bias,
+            dropout_prob=self.inner_layer.hidden_dropout,
+            training=self.training,
+            fused=self.inner_layer.config.bias_dropout_fusion,
+            manager=None,
+        )
+        if (
+            self.config.fp32_residual_connection
+            and self.config.params_dtype is not None
+            and hidden_states.dtype != self.config.params_dtype
+        ):
+            hidden_states = hidden_states.to(self.config.params_dtype)
+        return hidden_states, None
 
     def _get_submodules_under_cudagraphs(self):
         """Submodules whose params are driven by the wrapper graph's manual hooks.
@@ -298,8 +371,17 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         keep their normal forward hooks.
         """
         if self._inner_is_partial_moe_capture():
-            return [self.hyper_connection] + self.inner_layer._get_submodules_under_cudagraphs()
-        return super()._get_submodules_under_cudagraphs()
+            submodules = [
+                self.hyper_connection,
+                *self.inner_layer._get_submodules_under_cudagraphs(),
+            ]
+        else:
+            submodules = super()._get_submodules_under_cudagraphs()
+
+        group_tail = self._get_te_cuda_graph_group_tail()
+        if group_tail is not None:
+            submodules += group_tail._get_submodules_under_cudagraphs()
+        return submodules
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """Delegate Mamba inference state shape requests to the wrapped layer."""
@@ -946,7 +1028,12 @@ class HybridStack(MegatronModule):
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                 )
             else:
+                grouped_tail_to_skip = None
                 for l_no, layer in enumerate(self.layers):
+                    if layer is grouped_tail_to_skip:
+                        grouped_tail_to_skip = None
+                        continue
+
                     # Layers have 1-indexed layer numbers attribute.
                     inner_quant_context = get_inner_quant_context(
                         self.config, layer.layer_number - 1
@@ -983,6 +1070,11 @@ class HybridStack(MegatronModule):
                                 inference_context=inference_context,
                                 packed_seq_params=packed_seq_params,
                             )
+
+                    if isinstance(layer, HyperConnectionHybridLayer) and getattr(
+                        layer, 'cuda_graphs', None
+                    ):
+                        grouped_tail_to_skip = layer._get_te_cuda_graph_group_tail()
 
                     # The attention layer (currently a simplified transformer layer)
                     # outputs a tuple of (hidden_states, context). Context is intended
