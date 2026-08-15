@@ -666,6 +666,9 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
     ) -> None:
+        # Keep the subclass constructor aligned with FsdpParameterGroup. The
+        # shared module factory passes these keywords without knowing whether
+        # a group owns BF16 or MXFP8 weights.
         if use_symmetric_memory:
             raise ValueError("MFSDP v2 fp8 model weights do not support symmetric memory yet.")
         if te_cast_master_weights_to_fp8() is None:
@@ -695,9 +698,9 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         use_symmetric_memory: bool,
     ) -> None:
         del main_weight_dtype, main_weight_placements, allgather_stream, use_symmetric_memory
-        # The regular model-weight storage is replaced by row-wise and
-        # column-wise uint8 payload DBuffers. The module keeps its own MXFP8Tensor
-        # parameter objects and they are rebound to gathered payloads for compute.
+        # The bf16 model-weight storage is replaced by the two uint8 payload
+        # DBuffers; the unsharded parameters are the module's own MXFP8Tensor
+        # objects whose raw payloads are rebound from the gathered buffers.
         self.model_weight = None
         self._unsharded_model_weight = None
         device = self.main_weight.device
