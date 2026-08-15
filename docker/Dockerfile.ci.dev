@@ -6,6 +6,7 @@ FROM ${FROM_IMAGE_NAME} AS main
 ENV PIP_CONSTRAINT=""
 ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
+ARG TARGETARCH
 ARG YQ_VERSION=4.44.1
 # TE 2.18's NCCL EP build requires NCCL 2.30.7+; the 26.06 base uses CUDA 13.3.
 ARG NCCL_VERSION=2.30.7-1+cuda13.3
@@ -30,8 +31,19 @@ RUN bash -ex <<"EOF"
     esac 
     wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/local/bin/yq
     chmod a+x /usr/local/bin/yq
-    curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | \
-        env UV_UNMANAGED_INSTALL=/usr/local/bin sh
+    case "${TARGETARCH}" in \
+      "amd64") UV_ARCH=x86_64; UV_SHA256=cfaab1b5166a6439ff66f020333d3a12bbdf622deee3b510718283e8f06c9de7 ;; \
+      "arm64") UV_ARCH=aarch64; UV_SHA256=2872fdf4785666575d129ba90590c44e6508e22584735f3e7e8a30d773dfc3db ;; \
+      *) echo "Unsupported TARGETARCH for uv: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac
+    UV_ARCHIVE="uv-${UV_ARCH}-unknown-linux-gnu.tar.gz"
+    curl -fLSs -o "/tmp/${UV_ARCHIVE}" \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ARCHIVE}"
+    echo "${UV_SHA256}  /tmp/${UV_ARCHIVE}" | sha256sum -c -
+    tar -xzf "/tmp/${UV_ARCHIVE}" -C /tmp
+    install -m 0755 "/tmp/uv-${UV_ARCH}-unknown-linux-gnu/uv" /usr/local/bin/uv
+    install -m 0755 "/tmp/uv-${UV_ARCH}-unknown-linux-gnu/uvx" /usr/local/bin/uvx
+    rm -rf "/tmp/${UV_ARCHIVE}" "/tmp/uv-${UV_ARCH}-unknown-linux-gnu"
 EOF
 
 RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_nccl.sh \
