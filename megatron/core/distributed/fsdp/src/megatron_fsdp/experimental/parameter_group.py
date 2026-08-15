@@ -17,7 +17,6 @@
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
 from weakref import ReferenceType, ref
 
 import torch
@@ -29,9 +28,6 @@ from torch.distributed import DeviceMesh
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
 from .placement import Partial, Placements, Replicate, changed_mesh_axis
-
-if TYPE_CHECKING:
-    from .module import FsdpContext, FsdpModule
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -233,15 +229,6 @@ class FsdpParameterGroup:
         self._unsharded_model_weight.release_storage()
         self._switch_to_sharded_parameters()
 
-    def _get_context(self) -> "FsdpContext":
-        """Return the finalized runtime context that owns this parameter group."""
-        owning_module = self._owning_module()
-        if owning_module is None:
-            raise RuntimeError("FSDP parameter group outlived its owning module.")
-        context = cast("FsdpModule", owning_module).context
-        context.ensure_finalized()
-        return context
-
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:
             return nullcontext()
@@ -264,12 +251,10 @@ class FsdpParameterGroup:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
     def sync_model_weight_from_main_weight(self) -> None:
-        """Sync optimizer weights to the model-weight representation."""
-        context = self._get_context()
-        # TODO: Retrieve the all-gather stream directly from self.model_weight after
-        # https://github.com/NVIDIA/Megatron-LM/pull/6441 merges.
-        allgather_stream = context.allgather_stream
-        current_stream = context.current_stream()
+        """Refresh compute weights from optimizer weights."""
+        allgather_stream = self.model_weight.allocation_stream
+        assert allgather_stream is not None
+        current_stream = torch.cuda.current_stream(self.model_weight.device)
         allgather_stream.wait_stream(current_stream)
         with torch.cuda.stream(allgather_stream):
             self.model_weight = self.main_weight.cast(self.model_weight.dtype)
