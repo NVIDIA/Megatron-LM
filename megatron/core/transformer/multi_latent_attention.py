@@ -125,6 +125,7 @@ class MLASelfAttentionSubmodules:
     linear_kv_up_proj: Union[ModuleSpec, type] = None
     linear_qkv_down_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
+    linear_gate: Union[ModuleSpec, type] = None
 
 
 class MultiLatentAttention(Attention):
@@ -224,6 +225,26 @@ class MultiLatentAttention(Attention):
             pg_collection=self.pg_collection,
             **core_attn_extra_kwargs,
         )
+
+        if self.config.attention_output_gate:
+            if submodules.linear_gate is None:
+                raise ValueError("MLA output gating requires a linear_gate module spec.")
+            self.linear_gate = build_module(
+                submodules.linear_gate,
+                self.config.hidden_size,
+                self.config.num_attention_heads,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='mla_gate',
+                tp_group=self.pg_collection.tp,
+                name=(name + ".linear_gate") if name is not None else None,
+            )
+        else:
+            self.linear_gate = None
 
         # Output.
         self.linear_proj = submodules.linear_proj(
@@ -332,6 +353,8 @@ class MultiLatentAttention(Attention):
         ), "cache_mla_latents conflicts with training."
 
         # hidden_states: [sq, b, h]
+
+        gate_input = hidden_states
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
         if inference_context and not inference_context.is_static_batching():
@@ -484,6 +507,9 @@ class MultiLatentAttention(Attention):
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
 
+        if self.linear_gate is not None:
+            core_attn_out = self._project_and_apply_mla_output_gate(core_attn_out, gate_input)
+
         # =================
         # Output. [sq, b, h]
         # =================
@@ -494,6 +520,25 @@ class MultiLatentAttention(Attention):
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias
+
+    def _project_and_apply_mla_output_gate(
+        self, core_attn_out: torch.Tensor, gate_input: torch.Tensor
+    ) -> torch.Tensor:
+        """Project the gate after core attention, then apply it to the MLA output."""
+        gate, _ = apply_module(self.linear_gate)(gate_input)
+        return self._apply_mla_output_gate(core_attn_out, gate)
+
+    @staticmethod
+    def _apply_mla_output_gate(core_attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Apply one native-dtype sigmoid gate per local MLA attention head."""
+        output_shape = core_attn_out.shape
+        core_attn_out = core_attn_out.view(*output_shape[:2], gate.size(-1), -1)
+        # Preserve the Tiny/native BF16 autograd contract.  Casting to FP32 before
+        # sigmoid can produce the same BF16 forward values while changing the
+        # gate-input and gate-weight VJP.
+        gate = torch.sigmoid(gate)
+        core_attn_out = core_attn_out * gate.unsqueeze(-1)
+        return core_attn_out.reshape(output_shape)
 
 
 class MLASelfAttention(MultiLatentAttention):
@@ -1102,10 +1147,12 @@ class MLASelfAttention(MultiLatentAttention):
         """Execute weight gradient computation"""
         self._backward_kv_proj()
         self._backward_q_proj()
+        if self.linear_gate is not None:
+            self.linear_gate.backward_dw()
         # For the 'dsa' experimental variant core_attention is DSAttention, whose
         # indexer linears defer their wgrads under delay_wgrad_compute and need an
         # explicit flush. For standard MLA the core is TEDotProductAttention, which
-        # owns no linears and defines no backward_dw — hence the guard.
+        # owns no linears and defines no backward_dw hence the guard.
         core_attention_backward_dw = getattr(self.core_attention, "backward_dw", None)
         if core_attention_backward_dw is not None:
             core_attention_backward_dw()

@@ -690,6 +690,159 @@ class TestContextParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
 
 
+class TestMLAOutputGate:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="yarn",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+            attention_output_gate=True,
+        )
+        self.parallel_attention = MLASelfAttention(
+            self.transformer_config,
+            get_mla_self_attn_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_constructor_builds_head_wise_gate(self):
+        gate = self.parallel_attention.linear_gate
+        assert gate is not None
+        assert gate.weight.shape == (
+            self.transformer_config.num_attention_heads,
+            self.transformer_config.hidden_size,
+        )
+        assert gate.bias is None or gate.bias.numel() == 0
+
+    def test_gate_is_applied_per_head(self):
+        core_attn_out = torch.arange(24, dtype=torch.bfloat16).view(2, 1, 12)
+        gate = torch.tensor([[[-2.0, -1.0, 0.0, 1.0]], [[2.0, 3.0, 4.0, 5.0]]]).bfloat16()
+
+        output = self.parallel_attention._apply_mla_output_gate(core_attn_out, gate)
+        expected = core_attn_out.view(2, 1, 4, 3) * torch.sigmoid(gate).unsqueeze(-1)
+
+        torch.testing.assert_close(output, expected.reshape_as(output), atol=0, rtol=0)
+
+    def test_gate_preserves_native_dtype_vjp(self):
+        if not torch.cuda.is_available():
+            pytest.skip("native BF16 VJP check requires CUDA")
+
+        generator = torch.Generator(device="cuda").manual_seed(20260814)
+        gate_input = torch.randn(
+            (8, 1, 4), generator=generator, device="cuda", dtype=torch.bfloat16
+        )
+        core_output = torch.randn(
+            (8, 1, 32), generator=generator, device="cuda", dtype=torch.bfloat16
+        )
+        output_gradient = torch.randn(
+            core_output.shape, generator=generator, device="cuda", dtype=torch.bfloat16
+        )
+
+        actual_gate = gate_input.detach().clone().requires_grad_(True)
+        actual_core = core_output.detach().clone().requires_grad_(True)
+        actual_output = self.parallel_attention._apply_mla_output_gate(actual_core, actual_gate)
+        actual_gradients = torch.autograd.grad(
+            actual_output, (actual_gate, actual_core), output_gradient
+        )
+
+        reference_gate = gate_input.detach().clone().requires_grad_(True)
+        reference_core = core_output.detach().clone().requires_grad_(True)
+        reference_output = (
+            reference_core.view(8, 1, 4, 8) * torch.sigmoid(reference_gate).unsqueeze(-1)
+        ).reshape_as(reference_core)
+        reference_gradients = torch.autograd.grad(
+            reference_output, (reference_gate, reference_core), output_gradient
+        )
+
+        torch.testing.assert_close(actual_output, reference_output, atol=0, rtol=0)
+        for actual, reference in zip(actual_gradients, reference_gradients):
+            torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+    def test_missing_gate_spec_raises(self):
+        submodules = get_mla_self_attn_submodules()
+        submodules.linear_gate = None
+        with pytest.raises(ValueError, match="linear_gate module spec"):
+            MLASelfAttention(
+                self.transformer_config,
+                submodules,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+    def test_fused_down_projection_is_rejected(self):
+        with pytest.raises(ValueError, match="does not support fused down projections"):
+            MLATransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                q_lora_rank=32,
+                kv_lora_rank=32,
+                qk_head_dim=128,
+                v_head_dim=128,
+                qk_pos_emb_head_dim=64,
+                rope_type=self.transformer_config.rope_type,
+                rotary_base=10000,
+                original_max_position_embeddings=32,
+                attention_output_gate=True,
+                mla_down_proj_fusion=True,
+            )
+
+    def test_gpu_forward_thd(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("MLA requires TransformerEngine >= 1.10.0")
+
+        attention = self.parallel_attention.cuda().bfloat16()
+        call_order = []
+        core_attention_hook = attention.core_attention.register_forward_pre_hook(
+            lambda *_: call_order.append("core_attention")
+        )
+        gate_projection_hook = attention.linear_gate.register_forward_pre_hook(
+            lambda *_: call_order.append("linear_gate")
+        )
+        sequence_length = 32
+        hidden_states = torch.ones(
+            (sequence_length, 1, self.transformer_config.hidden_size),
+            device='cuda',
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        packed_seq_params = make_test_packed_seq_params(sequence_length=sequence_length)
+
+        try:
+            with mock.patch.dict(
+                os.environ, {"NVTE_FUSED_ATTN": "1", "NVTE_FLASH_ATTN": "0"}, clear=False
+            ):
+                output, bias = attention(
+                    hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+                )
+                output.sum().backward()
+        finally:
+            core_attention_hook.remove()
+            gate_projection_hook.remove()
+
+        assert call_order == ["core_attention", "linear_gate"]
+        assert output.shape == hidden_states.shape
+        assert bias.shape == (self.transformer_config.hidden_size,)
+        assert hidden_states.grad is not None
+        assert attention.linear_gate.weight.grad is not None
+
+
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestParallelMLAAttentionPrecision:
 
@@ -1387,19 +1540,23 @@ class TestMLAClipQK:
     ],
 )
 @pytest.mark.parametrize(
-    ("tp", "sp", "cp"),
+    ("tp", "sp", "cp", "output_gate"),
     [
-        (4, False, 1),  # TP w/o SP
-        (4, True, 1),  # TP w/ SP
-        (1, False, 4),  # CP
-        (2, False, 2),  # CP + TP w/o SP
-        (2, True, 2),  # CP + TP w/ SP
+        (4, False, 1, False),  # TP w/o SP
+        (4, True, 1, False),  # TP w/ SP
+        (1, False, 4, False),  # CP
+        (2, False, 2, False),  # CP + TP w/o SP
+        (2, True, 2, False),  # CP + TP w/ SP
+        (4, True, 1, True),  # Gated MLA with TP + SP
+        (1, False, 2, True),  # Gated MLA with CP
     ],
 )
 @pytest.mark.skipif(not is_te_min_version("1.10.0"), reason="Requires TransformerEngine >= 1.10.0")
 def test_parallel_multi_latent_attention_correctness(
-    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp
+    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp, output_gate
 ):
+    if output_gate and (rope_type != "yarn" or apply_rope_fusion):
+        pytest.skip("Gated MLA parallel coverage uses one representative YARN configuration.")
     if cp > 1 and not is_te_min_version("2.5.0", check_equality=True):
         pytest.skip("MLA CP requires TransformerEngine >= 2.5.0")
     if rope_type == "yarn" and apply_rope_fusion and not is_torch_min_version("2.5.0"):
@@ -1473,6 +1630,7 @@ def test_parallel_multi_latent_attention_correctness(
         bf16=True,
         rope_type=rope_type,
         apply_rope_fusion=apply_rope_fusion,
+        attention_output_gate=output_gate,
         hidden_dropout=0.0,
         attention_dropout=0.0,
     )
