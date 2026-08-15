@@ -55,3 +55,39 @@ def transfer_block_count(peer_meta: Any, src_block_ids: List[int]) -> int:
 
     records = transfer_peer_records(peer_meta, src_block_ids)
     return len(records[0][1]) if records else 0
+
+
+def drop_transfer_prefix_blocks(
+    peer_meta: Any, src_block_ids: List[int], prefix_count: int
+) -> Tuple[Any, List[int]]:
+    """Return transfer metadata with a sequence prefix removed.
+
+    Used when the decode engine reuses cached prefix blocks and only pulls the uncached suffix.
+    """
+
+    if prefix_count == 0:
+        return peer_meta, list(src_block_ids)
+    if prefix_count < 0:
+        raise ValueError("transfer prefix count must be non-negative")
+
+    def trim_metadata(value: Any) -> Any:
+        if isinstance(value, list):
+            return [trim_metadata(entry) for entry in value]
+        if not isinstance(value, dict):
+            return value
+
+        trimmed = dict(value)
+        if "block_ids" in trimmed:
+            block_ids = list(trimmed["block_ids"])
+            if prefix_count > len(block_ids):
+                raise ValueError(
+                    f"cannot remove {prefix_count} blocks from a {len(block_ids)}-block peer"
+                )
+            trimmed["block_ids"] = block_ids[prefix_count:]
+        for key in ("pp_metas", "tp_metas"):
+            if key in trimmed:
+                trimmed[key] = trim_metadata(trimmed[key])
+        return trimmed
+
+    trimmed_src_blocks = list(src_block_ids[prefix_count:])
+    return trim_metadata(peer_meta), trimmed_src_blocks
