@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy
 import torch
@@ -3163,3 +3163,28 @@ def deprecate_inference_params(inference_context, inference_params):
         )
         return inference_params
     return inference_context
+
+
+#: Attribute a parameter-sharding backend sets on each parameter it publishes asynchronously.
+#: See :func:`ensure_params_ready`.
+PARAM_READY_CALLBACK_ATTR = "_ensure_param_ready_callback"
+
+
+def ensure_params_ready(params: Iterable[Any]) -> None:
+    """Make ``params`` readable now, finishing any outstanding backend publication.
+
+    A parameter-sharding backend (DDP with ``overlap_param_gather``, FSDP, ...) publishes values
+    asynchronously, so only the owning module's forward pre-hook makes ``param.data`` valid. Any
+    consumer reading it earlier -- ahead of that module, or from another stream -- calls this
+    first. Backends mark their params with :data:`PARAM_READY_CALLBACK_ATTR`; unmarked params
+    no-op, so neither side needs to know about the other.
+
+    Callbacks are shared per communication bucket, so each fires once, not once per parameter.
+    """
+    fired = set()
+    for param in params:
+        callback = getattr(param, PARAM_READY_CALLBACK_ATTR, None)
+        if callback is None or id(callback) in fired:
+            continue
+        fired.add(id(callback))
+        callback()
