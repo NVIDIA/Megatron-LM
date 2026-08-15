@@ -45,27 +45,26 @@ def collect_train_test_metrics(
         if golden_value_key
         in [
             "iteration-time",
+            "grad-norm",
             "mem-allocated-bytes",
             "mem-max-allocated-bytes",
             "lm loss",
             "num-zeros",
             "mtp_1 loss",
-            "mtp_2 loss",
-            "total loss",
+            "z_loss",
         ]
     }
 
     if output_path is not None:
-        serialized_summaries = json.dumps(
-            {
-                golden_value_key: golden_values.model_dump()
-                for golden_value_key, golden_values in summaries.items()
-            },
-            indent=4,
-            allow_nan=False,
-        )
         with open(output_path, "w") as fh:
-            fh.write(serialized_summaries)
+            json.dump(
+                {
+                    golden_value_key: golden_values.model_dump()
+                    for golden_value_key, golden_values in summaries.items()
+                },
+                fh,
+                indent=4,
+            )
 
 
 if __name__ == "__main__":

@@ -13,15 +13,15 @@ logger = logging.getLogger(__name__)
 
 CHECK_THRESHOLDS = {
     "iteration-time": [common.ApproximateTest(atol=0, rtol=0.05)],
+    "grad-norm": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
     "mem-allocated-bytes": [common.ApproximateTest(atol=0, rtol=0.05)],
     "mem-max-allocated-bytes": [common.ApproximateTest(atol=0, rtol=0.05)],
     "lm loss": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
     "mtp_1 loss": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
-    "mtp_2 loss": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
+    "z_loss": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
     "num-zeros": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.20)],
     "generated_tokens": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
     "logprobs": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
-    "total loss": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
 }
 
 
