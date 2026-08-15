@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 import torch
 import torch.distributed.checkpoint
+from torch.distributed.checkpoint import FileSystemReader
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -25,6 +26,7 @@ from megatron.training.checkpointing import (
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
     load_checkpoint,
+    preprocess_fsdp_dtensor_state_dict,
     read_metadata,
     save_checkpoint,
 )
@@ -45,6 +47,32 @@ class MockModel(MegatronModule):
 
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
+        return self.state_dict()
+
+
+class MockDeltaRule(torch.nn.Module):
+    """Minimal delta-rule module exposing production checkpoint metadata."""
+
+    def __init__(self, split_names, split_sections):
+        super().__init__()
+        self.qk_dim = 4
+        self.v_dim = 6
+        self.tp_size = 1
+        self.in_proj_dim = sum(split_sections)
+        self.in_proj_split_names = split_names
+        self.in_proj_split_sections = split_sections
+        self.in_proj = torch.nn.Linear(4, self.in_proj_dim, bias=False)
+        self.conv1d = torch.nn.Conv1d(4, 2 * self.qk_dim + self.v_dim, 1, bias=True)
+
+
+class MockDeltaRuleModel(MegatronModule):
+    """Minimal Megatron model used to exercise the real FSDP checkpoint path."""
+
+    def __init__(self, config, split_names, split_sections):
+        super().__init__(config=config)
+        self.delta_rule = MockDeltaRule(split_names, split_sections)
+
+    def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         return self.state_dict()
 
 
@@ -72,6 +100,113 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+def test_fsdp_dtensor_preprocessing_calls_delta_rule_handler():
+    args = SimpleNamespace(swiglu=False, num_experts=None)
+    model = mock.sentinel.model
+    model_state = {"weight": mock.sentinel.model_weight}
+    optimizer_state = {"state": {}}
+    split_model_state = {"weight.query": mock.sentinel.query_weight}
+    split_optimizer_state = {"state": {"weight.query": {}}}
+
+    with (
+        mock.patch("megatron.training.checkpointing.handle_fp8_extra_state_case"),
+        mock.patch(
+            "megatron.training.checkpointing.handle_gdn_in_state_dict",
+            return_value=(split_model_state, split_optimizer_state),
+        ) as handle_gdn,
+        mock.patch("megatron.training.checkpointing.preprocess_state_dict_for_uneven_dtensor"),
+    ):
+        state_dict = preprocess_fsdp_dtensor_state_dict(
+            args, {"model": model_state, "optimizer": optimizer_state}, model
+        )
+
+    handle_gdn.assert_called_once_with(model, model_state, optimizer_state)
+    assert state_dict["model"] is split_model_state
+    assert state_dict["optimizer"] is split_optimizer_state
+
+
+def _local_checkpoint_tensor(value):
+    if hasattr(value, "to_local"):
+        value = value.to_local()
+    return value.detach().clone()
+
+
+@pytest.mark.parametrize(
+    ("split_names", "split_sections"),
+    [
+        (("query", "key", "value", "z", "f", "b", "w"), (4, 4, 6, 6, 4, 4, 6)),
+        (("query", "key", "value", "g", "gate"), (4, 4, 6, 4, 6)),
+    ],
+)
+def test_fsdp_dtensor_delta_rule_save_load_roundtrip(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, split_names, split_sections
+):
+    """Real Megatron-FSDP save/load preserves variant-specific fused projections."""
+
+    args = create_ckpt_load_args
+    args.ckpt_format = "fsdp_dtensor"
+    args.use_megatron_fsdp = True
+    args.use_distributed_optimizer = True
+    args.use_dist_ckpt = True
+    args.swiglu = False
+    args.num_experts = None
+    args.save_tokenizer_assets = False
+
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True, use_megatron_fsdp=True
+    )
+
+    def build_model(seed):
+        torch.manual_seed(seed)
+        return FullyShardedDataParallel(
+            config=config,
+            ddp_config=ddp_config,
+            module=MockDeltaRuleModel(config, split_names, split_sections),
+        )
+
+    source_model = build_model(123)
+    source_optimizer = MockState({"state": {}})
+    source_scheduler = MockState({"scheduler": "source"})
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_delta_rule_fsdp_roundtrip", sync=True) as ckpt_dir:
+        args.save = ckpt_dir
+        args.load = ckpt_dir
+        set_args(args)
+        save_checkpoint(7, [source_model], source_optimizer, source_scheduler, 0)
+
+        checkpoint_dir = ckpt_dir / "iter_0000007"
+        metadata_keys = FileSystemReader(checkpoint_dir).read_metadata().state_dict_metadata
+        metadata_prefix = "model.module.delta_rule"
+        for name in split_names:
+            assert f"{metadata_prefix}.in_proj.weight.{name}" in metadata_keys
+        for parameter in ("weight", "bias"):
+            for name in ("query", "key", "value"):
+                assert f"{metadata_prefix}.conv1d.{parameter}.{name}" in metadata_keys
+        assert f"{metadata_prefix}.in_proj.weight" not in metadata_keys
+        assert f"{metadata_prefix}.conv1d.weight" not in metadata_keys
+        assert f"{metadata_prefix}.conv1d.bias" not in metadata_keys
+
+        source_state = {
+            key: _local_checkpoint_tensor(value) for key, value in source_model.state_dict().items()
+        }
+        target_model = build_model(456)
+        target_optimizer = MockState({"state": {}})
+        target_scheduler = MockState({"scheduler": "target"})
+
+        loaded_iteration, _ = load_checkpoint(
+            [target_model], target_optimizer, target_scheduler, strict=True
+        )
+
+        assert loaded_iteration == 7
+        target_state = {
+            key: _local_checkpoint_tensor(value) for key, value in target_model.state_dict().items()
+        }
+        assert source_state.keys() == target_state.keys()
+        for key in source_state:
+            torch.testing.assert_close(target_state[key], source_state[key], rtol=0, atol=0)
 
 
 def create_checkpoint(load_path, ckpt_format):
