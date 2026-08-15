@@ -2309,7 +2309,10 @@ def wrap_model_chunks_with_ddp(
         or (DP is FullyShardedDataParallel and ddp_config.megatron_fsdp_version == 2)
     ) and len(model_chunks) > 1
     fsdp_context_cm = (
-        fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub)
+        fully_shard_context(
+            use_trace_replay=config.overlap_moe_expert_parallel_comm,
+            use_symmetric_memory=ddp_config.nccl_ub,
+        )
         if wrap_v2_shared_context
         else nullcontext()
     )

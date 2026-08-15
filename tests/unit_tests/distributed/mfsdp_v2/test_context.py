@@ -13,6 +13,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_runner import EventKind
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
@@ -74,6 +75,12 @@ class NestedSiblingModel(nn.Module):
 
 def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+
+
+def _record_unshard_and_prefetch(runner, module, orientation):
+    """Record an unshard on the runner and return the suggested prefetch."""
+    runner.record_unshard(module, orientation)
+    return runner.suggest_prefetch(module, orientation)
 
 
 def test_child_then_parent_share_one_context(distributed_setup):
@@ -271,6 +278,9 @@ def test_reuse_existing_requires_compatible_context(distributed_setup):
                 device=device, reuse_existing=True, use_symmetric_memory=True
             ):
                 pass
+        with pytest.raises(RuntimeError, match="does not support nesting"):
+            with fully_shard_context(device=device, reuse_existing=True, use_trace_replay=True):
+                pass
 
 
 def test_fully_shard_rejects_child_from_another_context(distributed_setup):
@@ -327,3 +337,327 @@ def test_post_backward_release_processes_nested_fsdp_modules_once(distributed_se
         ("root", "reduce"),
         ("root", "reshard"),
     ]
+
+
+def test_prefetch_traces_and_replays_actual_consume_order(distributed_setup):
+    """The runner should trace batch 1 and replay the actual consume order.
+
+    The fine-grained schedule can consume modules in an order that differs
+    from forward_order/backward_order (e.g. F L0 -> B L2 -> F L1). The first
+    batch traces that order and returns no prefetch; later batches replay it
+    and prefetch the actual next consumer.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=3).to(device)
+
+    with fully_shard_context(device=device, use_trace_replay=True):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+    assert runner.is_tracing
+
+    # Batch 1 (trace): consume in schedule order F L0, B L2, F L1. No
+    # prefetch during tracing.
+    assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") is None
+    assert _record_unshard_and_prefetch(runner, layers[2], "colwise") is None
+    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") is None
+    assert runner.is_tracing
+
+    # Batch boundary compiles the trace into the replay cycle.
+    runner.complete_trace()
+    assert not runner.is_tracing
+
+    # Batch 2 (replay): consume in the same order; each call returns the
+    # traced next consumer (with wrap-around at the batch boundary).
+    assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (layers[2], "colwise")
+    assert _record_unshard_and_prefetch(runner, layers[2], "colwise") == (layers[1], "rowwise")
+    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (layers[0], "rowwise")
+
+    # Divergence re-traces from the mismatching occurrence: the reshard
+    # round of L0 is reset, then L0 is consumed with the wrong orientation.
+    runner.record_reshard(layers[0])
+    assert _record_unshard_and_prefetch(runner, layers[0], "colwise") is None
+    assert runner.is_tracing
+
+
+def test_eager_pre_forward_feeds_context_runner(distributed_setup):
+    """In trace-replay mode, the eager pre_forward feeds the context runner.
+
+    The runner is shared across the full FsdpContext, so a consume driven by
+    the eager forward hooks is traced identically to a fine-grained consume:
+    batch 1 records (demand-only), and after the batch boundary batch 2
+    replays the traced order.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+
+    with fully_shard_context(device=device, use_trace_replay=True):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    ctx = model.context
+    assert ctx.runner.use_trace_replay
+    assert ctx.runner.is_tracing
+
+    # Batch 1: eager forward consumes are recorded; without an optimizer
+    # boundary the runner stays tracing.
+    with torch.no_grad():
+        model(torch.ones(2, 4, device=device))
+    assert ctx.runner.is_tracing
+    assert len(ctx.runner._trace) >= 2  # root + child layers
+
+    # The batch boundary compiles the trace; subsequent forwards replay it.
+    ctx.runner.complete_trace()
+    assert not ctx.runner.is_tracing
+    with torch.no_grad():
+        model(torch.ones(2, 4, device=device))
+    assert not ctx.runner.is_tracing
+
+
+def test_default_mode_uses_static_order_prefetch(distributed_setup):
+    """Default mode keeps static-order prefetch and skips the runner.
+
+    With use_trace_replay=False (the default), pre_forward/pre_backward
+    prefetch via forward_order/backward_order exactly as before the runner,
+    and the runner's trace stays untouched.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements())
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    ctx = model.context
+    assert not ctx.runner.use_trace_replay
+    assert ctx.runner.is_tracing
+
+    # A full forward does not feed the runner in default mode.
+    with torch.no_grad():
+        model(torch.ones(2, 4, device=device))
+    assert ctx.runner.is_tracing
+    assert not ctx.runner._trace
+
+
+def test_runner_wrap_around_chunk_cycle_prefetches_first_module(distributed_setup):
+    """Replay must prefetch across the cycle wrap: 0 -> 1 -> 2 -> 0.
+
+    A VPP schedule walks the chunk cycle repeatedly. The traced successor of
+    the last occurrence wraps to the first module, so consuming module 2
+    must prefetch module 0 (not None).
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=3).to(device)
+
+    with fully_shard_context(device=device, use_trace_replay=True):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+
+    # Batch 1 traces the chunk cycle 0 -> 1 -> 2, each unshard followed by
+    # its reshard round.
+    for layer in layers:
+        assert _record_unshard_and_prefetch(runner, layer, "rowwise") is None
+        runner.record_reshard(layer)
+    runner.complete_trace()
+
+    # Batch 2 replays two full cycles, prefetching the successor at every
+    # step including the 2 -> 0 wrap.
+    for _ in range(2):
+        for i, layer in enumerate(layers):
+            next_layer = layers[(i + 1) % len(layers)]
+            assert _record_unshard_and_prefetch(runner, layer, "rowwise") == (
+                next_layer,
+                "rowwise",
+            )
+            runner.record_reshard(layer)
+
+
+def test_runner_wrap_within_batch_multiple_cycles(distributed_setup):
+    """A single global batch can contain several full chunk cycles."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=3).to(device)
+
+    with fully_shard_context(device=device, use_trace_replay=True):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+    for _ in range(2):
+        for layer in layers:
+            assert _record_unshard_and_prefetch(runner, layer, "rowwise") is None
+            runner.record_reshard(layer)
+    runner.complete_trace()
+    assert len(runner._trace) == 6 * 2
+
+    expected_cycle = [layers[0], layers[1], layers[2], layers[0], layers[1], layers[2]]
+    for i, layer in enumerate(expected_cycle):
+        expected_next = expected_cycle[(i + 1) % len(expected_cycle)]
+        assert _record_unshard_and_prefetch(runner, layer, "rowwise") == (
+            expected_next,
+            "rowwise",
+        )
+        runner.record_reshard(layer)
+
+
+def test_runner_divergence_retraces_and_recovers(distributed_setup):
+    """A divergent schedule should re-trace and recover at the next boundary."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=3).to(device)
+
+    with fully_shard_context(device=device, use_trace_replay=True):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+    for layer in layers:
+        _record_unshard_and_prefetch(runner, layer, "rowwise")
+    runner.complete_trace()
+
+    _record_unshard_and_prefetch(runner, layers[0], "rowwise")
+    assert _record_unshard_and_prefetch(runner, layers[2], "rowwise") is None
+    assert runner.is_tracing
+
+    _record_unshard_and_prefetch(runner, layers[0], "rowwise")
+    _record_unshard_and_prefetch(runner, layers[1], "rowwise")
+    runner.complete_trace()
+    assert not runner.is_tracing
+    assert _record_unshard_and_prefetch(runner, layers[2], "rowwise") == (
+        layers[0],
+        "rowwise",
+    )
+    assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (
+        layers[1],
+        "rowwise",
+    )
+    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (
+        layers[2],
+        "rowwise",
+    )
+
+
+def test_runner_tolerates_transient_mismatch_without_crashing(distributed_setup):
+    """A transient orientation mismatch should fall back to re-tracing."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=3).to(device)
+
+    with fully_shard_context(device=device, use_trace_replay=True):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+    for layer in layers:
+        _record_unshard_and_prefetch(runner, layer, "rowwise")
+    runner.complete_trace()
+
+    assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (
+        layers[1],
+        "rowwise",
+    )
+    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (
+        layers[2],
+        "rowwise",
+    )
+    assert _record_unshard_and_prefetch(runner, layers[2], "colwise") is None
+    assert runner.is_tracing
+
+    _record_unshard_and_prefetch(runner, layers[0], "rowwise")
+    _record_unshard_and_prefetch(runner, layers[1], "rowwise")
+    runner.complete_trace()
+    assert not runner.is_tracing
+    assert _record_unshard_and_prefetch(runner, layers[2], "colwise") == (
+        layers[0],
+        "rowwise",
+    )
+
+
+def test_unshard_records_one_consume_per_module_per_pass(distributed_setup):
+    """Repeated fine-grained hooks should record one consume per module round."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=3).to(device)
+
+    with fully_shard_context(device=device, use_trace_replay=True):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+    for layer in layers:
+        runner.record_unshard(layer, "rowwise")
+        runner.record_unshard(layer, "rowwise")
+        runner.record_reshard(layer)
+    runner.complete_trace()
+    assert len(runner._trace) == 2 * len(layers)
+    assert [event.kind for event in runner._trace] == [
+        EventKind.UNSHARD,
+        EventKind.RESHARD,
+    ] * len(layers)
+
+    assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (
+        layers[1],
+        "rowwise",
+    )
+    runner.record_reshard(layers[0])
+    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (
+        layers[2],
+        "rowwise",
+    )
+
+
+def test_complete_trace_clears_dedup_so_replay_records(distributed_setup):
+    """The batch boundary should clear fine-grained consume deduplication."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+
+    with fully_shard_context(device=device, use_trace_replay=True):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    layers = model.layers
+    runner = model.context.runner
+    runner.record_unshard(layers[0], "rowwise")
+    runner.record_reshard(layers[0])
+    runner.record_unshard(layers[1], "rowwise")
+    runner.complete_trace()
+    assert not runner._consumed_this_round
+    assert runner._complete_trace_calls == 1
+
+    # Multiple VPP chunk adapters share one runner and can report the same
+    # optimizer boundary. With no execution between calls, it is a no-op.
+    runner.complete_trace()
+    assert runner._complete_trace_calls == 1
+
+    assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (
+        layers[1],
+        "rowwise",
+    )
+    runner.record_reshard(layers[0])
+    assert _record_unshard_and_prefetch(runner, layers[1], "rowwise") == (
+        layers[0],
+        "rowwise",
+    )

@@ -577,10 +577,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         fine_grained = config.overlap_moe_expert_parallel_comm
         skip_backward_cb = fine_grained and ddp_config.delay_wgrad_compute
         # Join an ambient multi-chunk construction scope when VPP wrapping
-        # opens one; otherwise this adapter owns and finalizes its context.
+        # opens one; otherwise this adapter owns and finalizes its context. The
+        # combined schedule uses trace-replay because VPP occurrence order does
+        # not follow the static construction order.
         with fully_shard_context(
             device=device,
             reuse_existing=True,
+            use_trace_replay=fine_grained,
             use_symmetric_memory=ddp_config.nccl_ub,
         ):
             if expert_dp_mesh is not None:
@@ -657,7 +660,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         for m in fsdp_modules:
             for group in m._parameter_groups:
                 group.sync_model_weight_from_unsharded_weight()
-            m._reshard_parameter_groups()
+            m._reshard_parameter_groups(record_execution=False)
 
     def _setup_1f1b_overlap_interface(self) -> None:
         """Expose the parameter lifecycle callbacks used by combined 1F1B.
@@ -678,9 +681,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         def unshard_parameters(module: torch.nn.Module) -> None:
             """All-gather full parameter storage for compute (idempotent)."""
             module = _require_fsdp_module(module)
-            module._unshard_parameter_groups()
-            if module._unshard_event is not None:
-                module.context.current_stream().wait_event(module._unshard_event)
+            module._unshard_and_prefetch("rowwise")
 
         def reshard_parameters(module: torch.nn.Module) -> None:
             """Release all-gathered storage and install DTensor parameters."""
@@ -850,6 +851,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 gradient reduction is complete when backward returns."""
+
+    def complete_fsdp_trace(self) -> None:
+        """Mark a global-batch boundary for the shared execution runner."""
+        self.module.context.runner.complete_trace()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
