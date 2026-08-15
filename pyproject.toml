@@ -113,7 +113,6 @@ dev = [
     "orjson",
     "fast-hadamard-transform",
     "zstandard",
-    "nvidia-cutlass-dsl[cu13]~=4.5.0",
 ]
 
 ### 'lts' extra is deprecated                                                   ###
