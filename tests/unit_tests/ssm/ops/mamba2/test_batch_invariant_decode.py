@@ -8,11 +8,11 @@ import torch
 try:
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
-    from megatron.core.ssm.ops.batch_invariant_decode import (
+    from megatron.core.ssm.ops.mamba2.batch_invariant_decode import (
         BatchInvariantDecodeBuffers,
         batch_invariant_decode_buffered_scan,
     )
-    from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_combined_varlen
+    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
     HAVE_BATCH_INVARIANT_DECODE = True
 except ImportError:

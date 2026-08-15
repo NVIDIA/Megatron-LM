@@ -8,6 +8,7 @@ import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -28,6 +29,7 @@ from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
+    CheckpointWithoutOutput,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
@@ -36,6 +38,7 @@ from megatron.core.transformer.cuda_graphs import (
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
     create_cudagraphs,
+    delete_cuda_graphs,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -1643,6 +1646,25 @@ class _SimpleModule(MegatronModule):
         return self.linear(x)
 
 
+class _CheckpointDependencyModule(MegatronModule):
+    """A visible projection consuming the output of a checkpointed child module."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.checkpointed = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.projection = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+
+    def forward(self, x):
+        return self.my_op(x)
+
+    def my_op(self, x):
+        checkpoint = CheckpointWithoutOutput()
+        hidden = checkpoint.checkpoint(self.checkpointed, x)
+        output = self.projection(hidden)
+        checkpoint.discard_output_and_register_recompute(output)
+        return output
+
+
 class _SimpleNonModule:
     """non-nn.Module base_module for testing the function_name= form of `CudaGraphManager`."""
 
@@ -1659,6 +1681,94 @@ def _make_simple_module(config):
 
 def _make_simple_non_module(config):
     return _SimpleNonModule(config)
+
+
+class TestCheckpointParameterDiscovery:
+    """Local-CG discovery and DDP readiness for a checkpointed nested module."""
+
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        if _CudagraphGlobalRecord.cudagraph_created:
+            delete_cuda_graphs()
+        else:
+            _CudagraphGlobalRecord.cudagraph_record = []
+            _CudagraphGlobalRecord.cudagraph_inference_record = []
+            CudaGraphManager.global_mempool = None
+        torch.cuda.set_stream(torch.cuda.default_stream())
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_nested_checkpoint_parameter_gradients_and_ddp_readiness(self):
+        if not torch.distributed.is_initialized() or torch.distributed.get_world_size() < 2:
+            pytest.skip("test requires at least two data-parallel ranks")
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            cuda_graph_warmup_steps=0,
+            recompute_granularity="selective",
+            recompute_modules=["layernorm"],
+        )
+        torch.manual_seed(123)
+        reference = _CheckpointDependencyModule(config).cuda()
+        module = _CheckpointDependencyModule(config).cuda()
+        module.load_state_dict(reference.state_dict())
+
+        manager = CudaGraphManager(
+            config, base_module=module, function_name="my_op", need_backward=True
+        )
+        ddp_model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=1_000_000),
+            module,
+        )
+
+        # Distinct inputs make the expected DDP result the average of different local gradients.
+        torch.manual_seed(1000 + ddp_model.dp_group.rank())
+        test_input = torch.randn(4, config.hidden_size, device="cuda", requires_grad=True)
+        reference_output = reference.my_op(test_input.detach().clone().requires_grad_(True))
+        reference_output_value = reference_output.detach().clone()
+        reference_output.sum().backward()
+        reference_wgrads = {
+            name: param.grad.detach().clone() for name, param in reference.named_parameters()
+        }
+        for grad in reference_wgrads.values():
+            torch.distributed.all_reduce(grad, group=ddp_model.dp_group)
+            grad.div_(ddp_model.dp_group.size())
+        del reference_output
+
+        ddp_model.zero_grad_buffer()
+        record_input = test_input.detach().clone().requires_grad_(True)
+        ddp_model(record_input).sum().backward()
+        ddp_model.finish_grad_sync()
+        ddp_model.zero_grad_buffer()
+        create_cudagraphs()
+
+        runner = manager.cudagraph_runners[0]
+        assert any(param is module.checkpointed.weight for param in runner.params_to_backprop)
+
+        # The first replay uses DDP's recorded ready counts; the second verifies per-step reset.
+        for _ in range(2):
+            ddp_model.zero_grad_buffer()
+            replay_output = ddp_model(test_input.detach().clone().requires_grad_(True))
+            replay_output.sum().backward()
+            ddp_model.finish_grad_sync()
+            torch.cuda.synchronize()
+
+            torch.testing.assert_close(replay_output, reference_output_value)
+            for name, param in module.named_parameters():
+                assert param.grad is None
+                torch.testing.assert_close(param.main_grad, reference_wgrads[name])
 
 
 class TestInlineCaptureManager:
