@@ -99,6 +99,23 @@ class ExperimentalNotEnabledError(Exception):
     """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
 
 
+class UnavailableError(ImportError):
+    """Raised at import time by a module whose optional backend is not installed.
+
+    Some modules cannot be made importable without their backend: they build
+    classes at module scope using decorators from it (the CuteDSL SSD kernels
+    use ``@cute.jit`` / ``@cute.kernel``), so the usual ``try/except ImportError``
+    + ``HAVE_X`` flag pattern does not apply -- the module body itself cannot run.
+
+    Raising this instead of a bare ``ImportError`` marks the failure as expected
+    rather than broken. CI's import checker (FW-CI-templates ``check_imports.py``)
+    walks every module in ``megatron.core`` and imports each one directly, which
+    bypasses any guard a caller might have; it classifies a failure as gracefully
+    handled -- rather than a hard failure -- when ``UnavailableError`` appears in
+    the traceback.
+    """
+
+
 def experimental_fn(introduced_with_version: str):
     """A decorator that marks a function as experimental.
     Experimental functions may change quickly and do not guarantee backwards

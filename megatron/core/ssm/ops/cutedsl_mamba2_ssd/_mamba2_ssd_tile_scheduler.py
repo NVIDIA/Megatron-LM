@@ -30,17 +30,26 @@
 
 from typing import Tuple
 
-import cutlass.cute as cute
-from cutlass._mlir import ir
-from cutlass.cutlass_dsl import (
-    Int32,
-    Integer,
-    dsl_user_op,
-    extract_mlir_values,
-    min,
-    new_from_mlir_values,
-)
-from cutlass.utils import WorkTileInfo
+from megatron.core.utils import UnavailableError
+
+# Optional backend; see UnavailableError. This module builds dsl_user_op-decorated
+# helpers at module scope, so it cannot be imported without nvidia-cutlass-dsl.
+try:
+    import cutlass.cute as cute
+    from cutlass._mlir import ir
+    from cutlass.cutlass_dsl import (
+        Int32,
+        Integer,
+        dsl_user_op,
+        extract_mlir_values,
+        min,
+        new_from_mlir_values,
+    )
+    from cutlass.utils import WorkTileInfo
+except ImportError as e:
+    raise UnavailableError(
+        "The CuteDSL SSD backend requires nvidia-cutlass-dsl, which is not installed"
+    ) from e
 
 
 class Mamba2SSDTileSchedulerParams:

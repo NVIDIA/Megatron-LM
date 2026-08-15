@@ -30,14 +30,24 @@
 
 from typing import Optional, Type
 
-import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
-import cutlass.pipeline as pipeline
-import cutlass.utils as utils
-import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from megatron.core.utils import UnavailableError
+
+# Optional backend: the kernel classes below are built at module scope with
+# @cute.jit / @cute.kernel decorators, so this module cannot be imported at all
+# without nvidia-cutlass-dsl. See UnavailableError.
+try:
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    import cutlass.pipeline as pipeline
+    import cutlass.utils as utils
+    import cutlass.utils.blackwell_helpers as sm100_utils
+    from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
+    from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+except ImportError as e:
+    raise UnavailableError(
+        "The CuteDSL SSD backend requires nvidia-cutlass-dsl, which is not installed"
+    ) from e
 
 from ._mamba2_ssd_tile_scheduler import Mamba2SSDTileScheduler, Mamba2SSDTileSchedulerParams
 

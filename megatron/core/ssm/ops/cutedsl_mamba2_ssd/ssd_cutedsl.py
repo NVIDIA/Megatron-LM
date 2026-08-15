@@ -1,14 +1,24 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import logging
 
-import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
 import torch
-from cutlass.cute.runtime import from_dlpack
 
 from megatron.core.inference.contexts.attention_context.mamba_ssd_metadata import MambaSSDMetadata
-from megatron.core.utils import round_up_to_nearest_multiple
+from megatron.core.utils import UnavailableError, round_up_to_nearest_multiple
+
+# nvidia-cutlass-dsl is an optional dependency, and this module cannot be made
+# importable without it (see UnavailableError). Raising it rather than a bare
+# ImportError keeps CI's import checker from treating an uninstalled optional
+# backend as a broken module.
+try:
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+except ImportError as e:
+    raise UnavailableError(
+        "The CuteDSL SSD backend requires nvidia-cutlass-dsl, which is not installed"
+    ) from e
 
 from ._bc_repack import repack_bc_chunk_major
 from ._fused_cumsum import fused_softplus_cumsum
