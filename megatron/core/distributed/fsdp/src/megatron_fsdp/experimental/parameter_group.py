@@ -387,6 +387,9 @@ class FsdpParameterGroup:
         # DP-outer to a smaller optimizer-sharded buffer, so allocate a fresh one
         # (zeroed only when we accumulate into it, i.e. sharded grads are still set).
         if self.main_grad.placements != self._main_grad_placements:
+            assert self.main_grad.allocation_stream == (
+                torch.cuda.current_stream(self.main_grad.device)
+            )
             reset_axis = changed_mesh_axis(self.main_grad.placements, self._main_grad_placements)
             assert reset_axis is not None  # The placements differ, so an axis changed.
             if isinstance(self.main_grad.placements[reset_axis], Replicate):
@@ -431,6 +434,9 @@ class FsdpParameterGroup:
         if is_last_microbatch:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
             # reduce-scatter for HFSDP) before binding the sharded parameter grads.
+            assert self.main_grad.allocation_stream == (
+                torch.cuda.current_stream(self.main_grad.device)
+            )
             self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
 
         # Make each sharded parameter's .grad consistent with the final main_grad.

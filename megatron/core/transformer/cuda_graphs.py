@@ -864,6 +864,8 @@ class _CudagraphReplayNode(torch.autograd.Function):
         runner.bwd_graph_replay_complete_event.record(torch.cuda.current_stream())
         for param in runner.params_to_backprop:
             param._cudagraph_wgrad_ready_event = runner.bwd_graph_replay_complete_event
+            if hasattr(param, 'grad_added_to_main_grad'):
+                param.grad_added_to_main_grad = True
         runner.status = _GraphStatus.FWD_READY
 
         # Update FP8 scale factors if needed
@@ -880,8 +882,6 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 with torch.cuda.stream(gtp_rs_stream):
                     for param in params:
                         param.grad = None
-                        if hasattr(param, 'grad_added_to_main_grad'):
-                            param.grad_added_to_main_grad = True
                         hook = getattr(param, '_grad_accum_hook', None)
                         if hook is not None:
                             hook()
@@ -933,6 +933,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fp4_runtime_enabled = None
         self.deallocate_pipeline_outputs = False
         self.num_warmup_steps = 0
+        self.needs_recompute_param_discovery = False
         self.use_stream = False
         self.gtp_remat = False
         self.fwd_side_streams = []
@@ -964,6 +965,9 @@ class _CudaGraphRunner(torch.nn.Module):
             self.backward_retain_grad = self.base_module.config.cuda_graph_retain_backward_graph
             self.deallocate_pipeline_outputs = self.base_module.config.deallocate_pipeline_outputs
             self.num_warmup_steps = self.base_module.config.cuda_graph_warmup_steps
+            self.needs_recompute_param_discovery = (
+                self.grad_enabled and self.base_module.config.recompute_granularity is not None
+            )
             self.fp8_enabled = self.base_module.config.fp8 is not None
             self.fp4_enabled = self.base_module.config.fp4 is not None
             self.fp8_runtime_enabled = None
@@ -1280,7 +1284,12 @@ class _CudaGraphRunner(torch.nn.Module):
         with ctx:
             # warmup again as case graph capture mode may execute a different codepath
             _set_warmup_start()
-            for _ in range(self.num_warmup_steps):
+
+            # Recompute parameter discovery needs one warmup output: graph warmup bypasses
+            # CheckpointWithoutOutput, making parameters hidden by its nested backward reachable
+            # from that output's autograd graph. Force this pass even when configured warmup is 0.
+            num_warmup_steps = max(self.num_warmup_steps, int(self.needs_recompute_param_discovery))
+            for _ in range(num_warmup_steps):
                 with self.get_quantization_context():
 
                     def clone_ten(ten):
@@ -1389,7 +1398,10 @@ class _CudaGraphRunner(torch.nn.Module):
             # Preserve only forward buffers whose lifetime crosses into backward capture.
             self._weakref_forward_buffers(preserve_forward_to_backward_lifetimes=True)
 
-            self.params_to_backprop = self.get_connected_params(fwd_graph_outputs)
+            if self.needs_recompute_param_discovery:
+                self.params_to_backprop = self.get_connected_params(warmup_outputs)
+            else:
+                self.params_to_backprop = self.get_connected_params(fwd_graph_outputs)
             self.num_dgrads = len(self.fwd_graph_input_surface)
             self.fwd_graph_input_surface = self.fwd_graph_input_surface + self.params_to_backprop
 
@@ -1467,8 +1479,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 1 for i in self.fwd_graph_input_surface[: self.num_dgrads] if i.requires_grad
             )
             for param, wgrad in zip(self.params_to_backprop, grad_inputs[n_act_grads:]):
-                if wgrad is not None and not getattr(param, 'grad_added_to_main_grad', False):
+                grad_already_accumulated = getattr(param, 'grad_added_to_main_grad', False)
+                if wgrad is not None and not grad_already_accumulated:
                     param.main_grad.add_(wgrad)
+                if param.grad is not None and not grad_already_accumulated:
+                    # A nested backward can accumulate directly into param.grad instead of
+                    # returning that contribution through the outer autograd.grad call.
+                    param.main_grad.add_(param.grad)
+                param.grad_added_to_main_grad = True
 
             # GTP cross-graph RS overlap, two phases:
             #   Phase 1 — drain AG, fence runner_stream past ag_stream's tail,

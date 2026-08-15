@@ -416,6 +416,102 @@ class TestRLUtils:
         lang_module.train.assert_called_once()
 
     @pytest.mark.parametrize(
+        "do_train, skip_train, expect_train_branch",
+        [
+            pytest.param(True, False, True, id="training"),
+            pytest.param(True, True, True, id="inference_only"),
+            pytest.param(False, False, False, id="eval_only"),
+        ],
+    )
+    def test_evaluate_and_print_results_rl_wandb_step_handling(
+        self, monkeypatch, do_train, skip_train, expect_train_branch
+    ):
+        """Only eval-only mode (--skip-train --train-iters 0, do_train=False) takes the decoupled
+        eval_only/* wandb path. --skip-train alone still runs the RL loop with monotonically
+        advancing iteration, so its evals log against the global step (see PR #6043)."""
+        args = SimpleNamespace(
+            do_train=do_train,
+            skip_train=skip_train,
+            world_size=1,
+            cuda_graph_impl="none",
+            rl_offload_optimizer_during_inference=False,
+            langrl_env_config=None,
+            rl_prompts_per_eval=1,
+            rl_default_temperature=1.0,
+            rl_default_top_p=1.0,
+            rl_default_top_k=0,
+            seq_length=SEQ,
+        )
+        response = SimpleNamespace(env_id="env", metrics=lambda: {"reward": [1.0, 0.5]}, results=[])
+        agent = SimpleNamespace(run_evaluation=lambda request: [response])
+        wandb_writer = MagicMock()
+
+        monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(
+            rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
+        )
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
+        )
+        monkeypatch.setattr(rl_utils, "get_agent", lambda *_args: agent)
+        monkeypatch.setattr(
+            rl_utils, "get_asyncio_loop", lambda: SimpleNamespace(run_until_complete=lambda r: r)
+        )
+        monkeypatch.setattr(
+            rl_utils, "EvaluationRequest", lambda **kwargs: SimpleNamespace(**kwargs)
+        )
+        monkeypatch.setattr(rl_utils, "get_wandb_writer", lambda: wandb_writer)
+        monkeypatch.setattr(rl_utils, "lang_rl_log_dir", None)
+        monkeypatch.setattr(rl_utils.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(
+            rl_utils.dist, "gather_object", lambda obj, lst, dst=0: lst.__setitem__(0, obj)
+        )
+
+        rl_utils.evaluate_and_print_results_rl(
+            data_iterator=None,
+            model=[MagicMock()],
+            optimizer=MagicMock(),
+            iteration=7,
+            write_to_tensorboard=False,
+        )
+
+        if expect_train_branch:
+            wandb_writer.log.assert_called_once_with({"env_eval_mean_reward": 0.75}, step=7)
+            wandb_writer.define_metric.assert_not_called()
+        else:
+            wandb_writer.define_metric.assert_called_once_with(
+                "eval_only/*", step_metric="eval_checkpoint_iter"
+            )
+            wandb_writer.log.assert_called_once_with(
+                {"eval_checkpoint_iter": 7, "eval_only/env_eval_mean_reward": 0.75}
+            )
+
+    @pytest.mark.parametrize("template_dtype", [torch.float32, torch.bfloat16])
+    def test_align_unpacked_inference_logprobs_rides_in_float32(self, template_dtype):
+        """Under bf16 training old_logprobs arrives bf16 while wire inference
+        logprobs are float32; the alignment must not silently downcast them
+        into the template's dtype (the IS-correction ratio is
+        precision-sensitive), and the aligned result rides in float32 like
+        pack_inference_logprobs' packed twin."""
+        old_logprobs = torch.full((2, 6), -1.0, dtype=template_dtype)
+        # Two generated tokens at positions 3,4: the logprob of the token at
+        # position p lives at index p-1, so the filled slots are 2,3.
+        gen_masks = torch.zeros((2, 7), dtype=torch.bool)
+        gen_masks[:, 3:5] = True
+        inference_logprobs = [torch.tensor([-0.5, -0.25], dtype=torch.float32) for _ in range(2)]
+        aligned = rl_utils.align_unpacked_inference_logprobs(
+            inference_logprobs=inference_logprobs,
+            old_logprobs_for_data=old_logprobs,
+            generation_masks=gen_masks,
+            group_stats=SimpleNamespace(),
+        )
+        assert aligned.dtype == torch.float32
+        assert aligned[0, 2].item() == pytest.approx(-0.5)
+        assert aligned[0, 3].item() == pytest.approx(-0.25)
+        # Slots without inference logprobs keep the template's values.
+        assert aligned[0, 0].item() == pytest.approx(-1.0)
+
+    @pytest.mark.parametrize(
         "share_config",
         [pytest.param(True, id="shared-config"), pytest.param(False, id="distinct-config")],
     )
@@ -1366,6 +1462,45 @@ class TestRLUtils:
         assert metrics["max_num_evictions"] == 1
         # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
         assert metrics["mean_completion_gap"] == 2.5
+
+        # Case where every episode has failed: the wave still reports the
+        # failure counters (the one signal it carries) and skips the tables.
+        writer = MagicMock()
+        metrics = rl_utils.prep_wandb_metrics(
+            writer,
+            traj_lens=[],
+            turn_lens=[],
+            rewards=[],
+            num_turns=[],
+            advantages=[],
+            policy_epoch=[],
+            kv_cache_epoch=[],
+            completed_epochs=[],
+            num_evictions=[],
+            current_iteration=6,
+        )
+        assert metrics == {'failed_rollouts/count': 0, 'failed_rollouts/ratio': 0.0}
+        writer.Table.assert_not_called()
+
+        # All-placeholder wave: rewards exist (placeholders carry 0.0) but every
+        # rollout is a zero-turn pad, so the masked stats have nothing to reduce
+        # over; the guard must still report the failure counters.
+        writer = MagicMock()
+        metrics = rl_utils.prep_wandb_metrics(
+            writer,
+            traj_lens=[[0, 0]],
+            turn_lens=[[]],
+            rewards=[[0.0, 0.0]],
+            num_turns=[[0, 0]],
+            advantages=[0.0, 0.0],
+            policy_epoch=[[[0], [0]]],
+            kv_cache_epoch=[[[0], [0]]],
+            completed_epochs=[[]],
+            num_evictions=[[0, 0]],
+            current_iteration=6,
+        )
+        assert metrics == {'failed_rollouts/count': 2, 'failed_rollouts/ratio': 1.0}
+        writer.Table.assert_not_called()
 
     def test_compute_group_stats_excludes_placeholders_from_metric_fields(self):
         def real_rollout(tokens, problem_id):

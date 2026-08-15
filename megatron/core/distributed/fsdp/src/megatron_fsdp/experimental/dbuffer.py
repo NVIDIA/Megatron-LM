@@ -67,6 +67,10 @@ class DBuffer:
     layout: GlobalLayout
     offset: int
     local_buffer: torch.Tensor
+    # Record the allocation stream so DBuffer users can check that uses are joined back to it
+    # before deleting the buffer. See https://github.com/NVIDIA/Megatron-LM/pull/6187 and
+    # https://docs.pytorch.org/docs/2.13/generated/torch.Tensor.record_stream.html.
+    allocation_stream: torch.cuda.Stream | None
 
     def __init__(
         self,
@@ -100,6 +104,11 @@ class DBuffer:
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
         self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
+        self.allocation_stream = (
+            torch.cuda.current_stream(self.local_buffer.device)
+            if self.local_buffer.is_cuda
+            else None
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -162,6 +171,8 @@ class DBuffer:
         mesh: DeviceMesh,
         placements: Iterable[Placement],
         tensor_shapes: Iterable[Shape],
+        *,
+        allocation_stream: torch.cuda.Stream | None,
     ) -> "DBuffer":
         """Create a DBuffer from an existing local buffer.
 
@@ -172,6 +183,7 @@ class DBuffer:
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
             tensor_shapes: Global shapes for each logical tensor in this buffer.
+            allocation_stream: CUDA stream that allocated ``local_buffer``, or ``None`` for CPU.
 
         Returns:
             A DBuffer that reuses ``local_buffer`` without allocating storage.
@@ -202,6 +214,7 @@ class DBuffer:
         buffer.layout = layout
         buffer.offset = offset
         buffer.local_buffer = local_buffer
+        buffer.allocation_stream = allocation_stream
         return buffer
 
     @classmethod
@@ -347,7 +360,11 @@ class DBuffer:
                     "Replicate -> Partial redistribute does not support an out buffer."
                 )
             return DBuffer.from_local(
-                self.local_buffer, self.mesh, new_placements, self.layout.tensor_shapes
+                self.local_buffer,
+                self.mesh,
+                new_placements,
+                self.layout.tensor_shapes,
+                allocation_stream=self.allocation_stream,
             )
         raise NotImplementedError(
             "Unsupported DBuffer placement transition on axis "
@@ -458,7 +475,13 @@ class DBuffer:
             raise RuntimeError("scatter() destination is not contained in the source local buffer.")
         local_slice = self.local_buffer.narrow(0, local_buffer_offset, destination_numel)
         if out is None:
-            return DBuffer.from_local(local_slice, self.mesh, placements, self.layout.tensor_shapes)
+            return DBuffer.from_local(
+                local_slice,
+                self.mesh,
+                placements,
+                self.layout.tensor_shapes,
+                allocation_stream=self.allocation_stream,
+            )
 
         out.local_buffer.copy_(local_slice)
         return out

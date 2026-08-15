@@ -49,14 +49,22 @@ jobs:
       issues: write
       pull-requests: write
     env:
-      GITHUB_TOKEN: ${{ secrets.PAT }}
       REPO: ${{ github.repository }}
       DISABLE_EXTERNAL_CONTRIBUTOR: ${{ vars.DISABLE_EXTERNAL_CONTRIBUTOR }}
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          permission-contents: read
+
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          token: ${{ env.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
 
       - name: Get PR info
         id: get-pr-info
@@ -71,9 +79,38 @@ jobs:
           github_token: ${{ secrets.NVIDIA_MANAGEMENT_ORG_PAT }}
           sso_users_filename: ${{ vars.SSO_USERS_FILENAME }}
 
+      - name: Generate NVIDIA-NeMo membership token
+        id: nvidia-nemo-members-token
+        if: |
+          startsWith(github.ref, 'refs/heads/pull-request/')
+          && github.event_name == 'push'
+          && vars.DISABLE_EXTERNAL_CONTRIBUTOR == 'true' && steps.check-sso.outputs.is_member != 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          owner: NVIDIA-NeMo
+          permission-members: read
+
+      - name: Generate NVIDIA membership token
+        id: nvidia-members-token
+        if: |
+          startsWith(github.ref, 'refs/heads/pull-request/')
+          && github.event_name == 'push'
+          && vars.DISABLE_EXTERNAL_CONTRIBUTOR == 'true' && steps.check-sso.outputs.is_member != 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          owner: NVIDIA
+          permission-members: read
+
       - name: Set maintainer status
         id: check-membership
         env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          NVIDIA_MEMBERS_TOKEN: ${{ steps.nvidia-members-token.outputs.token }}
+          NVIDIA_NEMO_MEMBERS_TOKEN: ${{ steps.nvidia-nemo-members-token.outputs.token }}
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
@@ -104,7 +141,7 @@ jobs:
             API_URL="https://api.github.com/orgs/NVIDIA-NeMo/members/$PR_AUTHOR"
             ORG_NVIDIA_NEMO_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
               -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Authorization: Bearer $NVIDIA_NEMO_MEMBERS_TOKEN" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               $API_URL)
 
@@ -112,7 +149,7 @@ jobs:
             API_URL="https://api.github.com/orgs/NVIDIA/members/$PR_AUTHOR"
             ORG_NVIDIA_MEMBERSHIP_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -L \
               -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Authorization: Bearer $NVIDIA_MEMBERS_TOKEN" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
               $API_URL)
 
@@ -177,11 +214,19 @@ jobs:
           fi
           echo "sha=${SHA}" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          permission-pull-requests: read
+
       - name: Configure
         id: configure
         shell: bash -x -e -u -o pipefail {0}
         env:
-          GH_TOKEN: ${{ secrets.PAT }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           EVENT_NAME: ${{ github.event_name }}
@@ -214,7 +259,7 @@ jobs:
             SCOPE=L0; N_REPEAT=5; LIGHTWEIGHT=false
           fi
 
-          if [ "$HAS_MBRIDGE" == "true" || $IS_MERGE_GROUP == "true" ]; then
+          if [ "$HAS_MBRIDGE" == "true" ] || [ "$IS_MERGE_GROUP" == "true" ]; then
             MBRIDGE_SUITE="L1"
           else
             MBRIDGE_SUITE="unit-only"
@@ -458,6 +503,8 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
       && vars.ENABLE_CICD_MBRIDGE_TESTING == 'true'
+      && github.event_name == 'push'
+      && startsWith(github.ref, 'refs/heads/pull-request/')
       && needs.configure.outputs.run_mbridge == 'true'
       && needs.pre-flight.outputs.docs_only == 'false'
       && (
@@ -467,55 +514,19 @@ jobs:
         || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
+    timeout-minutes: 300
     steps:
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push'
-        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
-
-      - name: Checkout MBridge and create testing branch
+      - name: Checkout Megatron-LM
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: main
-          repository: NVIDIA-NeMo/Megatron-Bridge
-          path: megatron-bridge
-          token: ${{ secrets.PAT }}
 
-      - name: Create testing branch
+      - name: Trigger and wait for MBridge tests
         env:
-          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
-        run: |
-          cd megatron-bridge
-          git fetch origin main
-          git checkout -b ${{ env.MBRIDGE_BRANCH_NAME }} origin/main
-          git push origin ${{ env.MBRIDGE_BRANCH_NAME }} --force
-
-      - name: Trigger MBridge tests
-        uses: convictional/trigger-workflow-and-wait@f69fa9eedd3c62a599220f4d5745230e237904be # v1.6.5
-        env:
-          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
-        with:
-          owner: NVIDIA-NeMo
-          repo: Megatron-Bridge
-          workflow_file_name: cicd-main.yml
-          github_token: ${{ secrets.PAT }}
-          ref: ${{ env.MBRIDGE_BRANCH_NAME }}
-          wait_interval: 60
-          propagate_failure: true
-          client_payload: |
-            {
-              "mcore_ref": "${{ needs.configure.outputs.sha }}",
-              "test_suite": "${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}",
-              "triggered_by": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            }
-
-      - name: Delete testing branch
-        if: always()
-        env:
-          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
-        run: |
-          cd megatron-bridge
-          git push origin --delete ${{ env.MBRIDGE_BRANCH_NAME }}
+          BOT_ID: ${{ vars.COMMUNITY_BOT_ID }}
+          BOT_KEY: ${{ secrets.COMMUNITY_BOT_KEY }}
+          MBRIDGE_MCORE_REF: ${{ needs.configure.outputs.sha }}
+          MBRIDGE_TEST_SUITE: ${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}
+          MBRIDGE_POLL_TIMEOUT_SECONDS: "12600"
+        run: python3 -u .github/scripts/trigger_workflow_and_wait.py
 
   cicd-mbridge-testing-notify:
     runs-on: ubuntu-latest
@@ -701,6 +712,8 @@ jobs:
 
       - name: Build and push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        env:
+          BUILDX_NO_DEFAULT_OCI_ARTIFACT: "true"
         with:
           file: ${{ steps.base-image.outputs.dockerfile }}
           push: true
@@ -715,8 +728,6 @@ jobs:
           tags: |
             ${{ matrix.registry }}/megatron-lm:${{ steps.cache_keys.outputs.key }}-${{ matrix.cloud }}
             ${{ matrix.registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-${{ matrix.cloud }}
-          secrets: |
-            GH_TOKEN=${{ secrets.PAT }}
 
   cicd-parse-unit-tests:
     runs-on: ubuntu-latest
@@ -797,7 +808,6 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
-          PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           sha: ${{ needs.configure.outputs.sha }}
 
@@ -885,7 +895,6 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
-          PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           platform: dgx_gb200
           sha: ${{ needs.configure.outputs.sha }}
@@ -1042,7 +1051,6 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
-          PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
@@ -1143,7 +1151,6 @@ jobs:
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "false"
-          PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           scope: ${{ needs.configure.outputs.scope }}
           n_repeat: ${{ needs.configure.outputs.n_repeat }}
@@ -1283,10 +1290,18 @@ jobs:
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          permission-statuses: write
+
       - name: Generate fake coverage report
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
-          github-token: ${{ secrets.PAT }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
@@ -1370,10 +1385,18 @@ jobs:
           PR_NUMBER=$(echo "${{ github.event.merge_group.head_ref }}" | sed -n 's/.*\/pr-\([0-9]*\)-.*/\1/p')
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
 
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          permission-issues: write
+
       - name: Comment on PR with action run URL
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
-          github-token: ${{ secrets.PAT }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const prNumber = ${{ steps.get-pr-number.outputs.pr_number }};
             const runUrl = `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;

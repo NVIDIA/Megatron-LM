@@ -40,6 +40,7 @@ class SamplingParams:
     return_prompt_tokens: bool = False
     streaming: bool = False  # Emit incremental ENGINE_REPLY_PARTIAL frames.
     streaming_interval: int = 1  # Minimum unsent tokens per ENGINE_REPLY_PARTIAL.
+    do_kv_handoff: bool = False  # Pin KV blocks and expose metadata for peer transfer.
 
     def __post_init__(self):
         """Validate parameters and maintain backward compatibility.
