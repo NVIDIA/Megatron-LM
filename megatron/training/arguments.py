@@ -5082,7 +5082,7 @@ def _add_experimental_args(parser):
         type=str,
         default=None,
         help='Specify a hybrid layer pattern using M (mamba), G (gdn), K (kda), '
-        '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
+        '* (attention), D (dsa), + (mla), - (mlp), E (moe). Use | to define pipeline '
         'stage boundaries for flexible virtual pipeline parallel (fVPP). '
         'Use / to separate MTP patterns. '
         'Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '

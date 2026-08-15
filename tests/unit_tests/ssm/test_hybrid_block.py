@@ -399,7 +399,7 @@ class TestHybridBlock:
         assert output.shape == (sequence_length, micro_batch_size, transformer_config.hidden_size)
 
     def test_invalid_layer_types_cause_failure(self):
-        invalid_symbol = '+'
+        invalid_symbol = 'X'
         assert invalid_symbol not in Symbols.VALID_LAYERS  # sanity check.
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP + invalid_symbol
         # validate_segment_layers() in hybrid_layer_allocation.py throws a ValueError.
