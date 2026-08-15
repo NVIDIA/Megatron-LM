@@ -444,21 +444,21 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         conv_state, ssm_state = None, None
         if inference_context is not None:
+            # Only decode is actually incompatible: it runs
+            # fused_recurrent_gated_delta_rule, which needs the batched layout, while
+            # _prepare_qkv and _compute_gating emit the CuTeDSL varlen layout whenever
+            # gdp_cutedsl_kernel is set. Checked once here, ahead of the static/dynamic
+            # split, so a run fails at the entry rather than part way through
+            # generation: both batching modes prefill and then decode the same request.
+            assert (
+                not self.config.gdp_cutedsl_kernel
+            ), "gdp_cutedsl_kernel is only supported for training, not inference."
             if inference_context.is_dynamic_batching():
                 ok, reason = check_fla_sequence_packing_support()
                 assert ok, reason
                 assert (
                     self.cp.cp_size == 1
                 ), "Context parallel is not supported for GDP dynamic inference"
-                # Checked here rather than in ssm_decode so a run fails at the entry
-                # instead of part way through generation: the mixin prefills and then
-                # decodes the same request, and only the decode step is affected.
-                assert not self.config.gdp_cutedsl_kernel, (
-                    "Decode runs fused_recurrent_gated_delta_rule, which needs the "
-                    "batched layout, but _prepare_qkv and _compute_gating emit the "
-                    "CuTeDSL varlen layout whenever gdp_cutedsl_kernel is set; it is "
-                    "only supported for training and prefill."
-                )
                 return self.ssm_dynamic_inference(hidden_states, inference_context)
             assert (
                 inference_context.is_static_batching()
@@ -811,10 +811,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         """Single-token static-batching decode step (updates state in place)."""
         assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
         assert self.cp.cp_size == 1, "Context parallel not supported for GDP inference decode"
-        assert not self.config.gdp_cutedsl_kernel, (
-            "Decode uses the FLA fused_recurrent_gated_delta_rule and the batched tensor "
-            "layout; gdp_cutedsl_kernel is only supported for training and prefill."
-        )
 
         # (1, b, d_model) -> (1, b, proj_dim)
         zVKQba, _ = self.in_proj(hidden_states)
