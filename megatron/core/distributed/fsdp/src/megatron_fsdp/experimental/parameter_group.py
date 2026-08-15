@@ -274,9 +274,8 @@ class FsdpParameterGroup:
         with torch.cuda.stream(allgather_stream):
             self.model_weight = self.main_weight.cast(self.model_weight.dtype)
         # CUDA graph capture requires every forked stream to rejoin the capture
-        # stream before capture ends. Keep the eager path asynchronous.
-        if torch.cuda.is_current_stream_capturing():
-            current_stream.wait_stream(allgather_stream)
+        # stream before capture ends.
+        current_stream.wait_stream(allgather_stream)
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
