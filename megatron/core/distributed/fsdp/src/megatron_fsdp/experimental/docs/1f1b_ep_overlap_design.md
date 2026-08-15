@@ -187,9 +187,7 @@ def _fine_grained_pre_forward(hook_module, args, kwargs):
     target = _find_fsdp_target(hook_module)
     if target is None:
         return
-    target._unshard_parameter_groups()
-    if target._unshard_event is not None:
-        target.context.current_stream().wait_event(target._unshard_event)
+    target._unshard_and_prefetch("rowwise")
 ```
 
 ### 2.2 Pre-backward hooks on sub-modules
@@ -205,9 +203,7 @@ def _fine_grained_pre_backward_hook(submodule: nn.Module, grad_output) -> None:
         return
     if target.phase is FsdpModule.Phase.RESTING:
         target.phase = FsdpModule.Phase.BACKWARD
-    target._unshard_parameter_groups()
-    if target._unshard_event is not None:
-        target.context.current_stream().wait_event(target._unshard_event)
+    target._unshard_and_prefetch("colwise")
 ```
 
 ### 2.3 Wiring from `fully_shard()`
@@ -223,6 +219,27 @@ def fully_shard(module, mesh, placements, *, fine_grained=False, ...):
 The adapter passes `fine_grained=config.overlap_moe_expert_parallel_comm` for
 every unit it shards (transformer layers, MoE sub-modules on the expert-DP
 mesh, and the root).
+
+### 2.4 Two prefetch execution modes
+
+All eager and fine-grained hooks call the same `_unshard_and_prefetch()`
+path. `FsdpExecutionRunner` selects one of two modes:
+
+- **Static lookahead** (`use_trace_replay=False`, the default): prefetch the
+  next module in `forward_order` or `backward_order`. This is the low-overhead
+  path used by conventional schedules and retains the fine-grained prefetch.
+- **VPP trace-replay** (`use_trace_replay=True`): the first global batch
+  records actual unshard/reshard occurrences without speculative prefetch.
+  Later batches replay that cycle, prefetching the real next VPP consumer and
+  retaining storage across an immediate compatible reuse. A divergence safely
+  falls back to tracing again.
+
+MFSDP v2 enables trace-replay for the combined 1F1B overlap schedule. The
+optimizer calls `complete_fsdp_trace()` after each step to mark the global
+batch boundary. Both paths share the same parameter lifecycle; only successor
+selection and the optional reshard skip differ. VPP chunk adapters share one
+runner, so duplicate boundary notifications without intervening execution are
+idempotent.
 
 ---
 
@@ -277,6 +294,9 @@ path, where the schedule drives reduction explicitly).
 | `fine_grained` | `bool` | `False` | Register hooks on every sub-module for EP overlap. |
 | `skip_backward_callback` | `bool` | `False` | Skip per-param `post_accumulate_grad_hook` for `delay_wgrad_compute`. |
 
+`fully_shard_context(..., use_trace_replay=False)` selects static lookahead;
+setting it to `True` enables the VPP execution runner described in §2.4.
+
 ### New methods on `FullyShardedDataParallelV2` (adapter)
 
 The schedule-facing surface is assembled in `_setup_1f1b_overlap_interface`,
@@ -291,6 +311,7 @@ which binds closures that operate on a passed `FsdpModule`:
 | `post_forward_release_module` | `(module) -> None` | Release forward-pass params (reshard only). |
 | `post_backward_release_module` | `(module) -> None` | Release backward-pass params (reshard + reduce). |
 | `no_sync()` | `() -> contextmanager` | Suppress gradient finalization for non-final microbatches. |
+| `complete_fsdp_trace()` | `() -> None` | Mark the global-batch boundary and compile/reset trace replay. |
 | `_setup_1f1b_overlap_interface()` | `() -> None` | Bind the schedule-facing callbacks above. |
 
 ### Changes to `find_megatron_fsdp()` (`megatron_fsdp/utils.py`)
@@ -302,18 +323,14 @@ and bare `FsdpModule` instances, alongside v1 `MegatronFSDP`.
 
 ## 5. Activation Recomputation Guard
 
-Activation recomputation runs forward hooks inside backward. If the forward
-hook prefetched the next module in forward order, that module's backward may
-already be complete, so no later backward hook would reshard it. MFSDP v2
-detects recomputation via the module phase and the active autograd GraphTask:
+Activation recomputation runs forward hooks inside backward. In static mode,
+the execution runner detects recomputation from the module phase and active
+autograd GraphTask and suppresses forward-order successor prefetch:
 
 ```python
-is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
-...
-if not is_recomputing:
-    next_module = context.forward_order.next_item(self)
-    if next_module is not None:
-        next_module._unshard_parameter_groups()
+if module._phase is module.Phase.BACKWARD or torch._C._current_graph_task_id() != -1:
+    return None
+next_module = context.forward_order.next_item(module)
 ```
 
 Recomputed forwards still unshard the current module (its parameters are
@@ -325,8 +342,9 @@ needed for the recomputed GEMMs) but never prefetch a successor.
 
 | File | Change |
 |---|---|
-| `experimental/module.py` | Public lifecycle APIs, fine-grained hooks, `skip_backward_callback`, recompute guard, phase transitions |
-| `experimental/fully_shard.py` | Hook registration and reusable construction contexts for VPP chunks |
+| `experimental/execution_runner.py` | Static lookahead and VPP trace-replay successor planning |
+| `experimental/module.py` | Fine-grained hooks, shared unshard/prefetch path, recompute guard, phase transitions |
+| `experimental/fully_shard.py` | Hook registration, execution-mode selection, and reusable construction contexts for VPP chunks |
 | `mcore_fsdp_adapter.py` | Wire `fine_grained` / `skip_backward_callback`, add `no_sync()`, `_setup_1f1b_overlap_interface()`, per-domain meshes |
 | `megatron_fsdp/utils.py` | Extend `find_megatron_fsdp()` |
 | `optimizer/fully_sharded_optimizer.py` | PP/VPP model-chunk support |
@@ -349,7 +367,9 @@ The schedule supports interleaved pipelining
 (`combined_1f1b_schedule_for_interleaved_pipelining`), with the MFSDP v2
 optimizer handling multiple model chunks. The wrapping paths open one ambient
 `fully_shard_context`; each chunk adapter joins it with `reuse_existing=True`,
-so all chunks share communication streams and cross-root prefetch orders.
+so all chunks share communication streams and one execution runner. The first
+batch records the interleaved occurrence order; subsequent batches prefetch
+that learned VPP cycle rather than assuming construction order.
 
 ### 7.3 `fsdp_double_buffer` incompatibility
 

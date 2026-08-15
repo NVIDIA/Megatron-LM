@@ -63,6 +63,7 @@ def fully_shard_context(
     device: torch.device | None = None,
     *,
     reuse_existing: bool = False,
+    use_trace_replay: bool = False,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
 ) -> Iterator[FsdpContext]:
@@ -80,6 +81,8 @@ def fully_shard_context(
             the current CUDA device.
         reuse_existing: Join a compatible already-active context instead of
             creating a new one. Defaults to False, preserving nesting rejection.
+        use_trace_replay: Trace the first batch's actual execution order and replay
+            it for prefetch. Defaults to static forward/backward-order lookahead.
         use_symmetric_memory: Allocate communication staging buffers from PyTorch's
             NCCL symmetric-memory pool.
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
@@ -94,6 +97,7 @@ def fully_shard_context(
         if (
             reuse_existing
             and existing.device == requested_device
+            and existing.runner.use_trace_replay == use_trace_replay
             and existing.use_symmetric_memory == use_symmetric_memory
         ):
             yield existing
@@ -107,6 +111,7 @@ def fully_shard_context(
         device=requested_device,
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
+        use_trace_replay=use_trace_replay,
     )
     token = _FSDP_CONTEXT.set(context)
     try:
