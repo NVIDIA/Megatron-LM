@@ -7,6 +7,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from megatron.core.inference.contexts.attention_context.mamba_ssd_metadata import MambaSSDMetadata
 from megatron.core.utils import round_up_to_nearest_multiple
 
 from ._bc_repack import repack_bc_chunk_major
@@ -275,7 +276,7 @@ class SSDTiling:
     Everything else the launcher needs is arithmetic on these.
 
     Attributes:
-        seq_chunk_start: Per active sequence, its first chunk in workspace order.
+        seq_chunk_start_acc: Per active sequence, its first chunk in workspace order.
         seq_chunk_count: Per active sequence, how many chunks it owns.
         seq_chunk_base: Per active sequence, its first chunk as a GLOBAL index.
         active_seq_idx: Batch slots that carry tokens.
@@ -295,7 +296,7 @@ class SSDTiling:
     """
 
     __slots__ = (
-        "seq_chunk_start",
+        "seq_chunk_start_acc",
         "seq_chunk_count",
         "seq_chunk_base",
         "active_seq_idx",
@@ -310,7 +311,7 @@ class SSDTiling:
         "active_is_prefix",
     )
 
-    def __init__(self, metadata):
+    def __init__(self, ssd_metadata: MambaSSDMetadata):
         """Read the per-step tiling off the batch metadata.
 
         Args:
@@ -320,19 +321,19 @@ class SSDTiling:
                 ``mamba_chunk_size``, ``cu_seqlens`` and
                 ``real_prefill_token_count`` works (tests pass a stand-in).
         """
-        self.seq_chunk_start = metadata.ssd_seq_chunk_start
-        self.seq_chunk_count = metadata.ssd_seq_chunk_count
-        self.seq_chunk_base = metadata.ssd_seq_chunk_base
-        self.active_seq_idx = metadata.ssd_active_seq_idx
-        self.empty_seq_idx = metadata.ssd_empty_seq_idx
-        self.chunk_token_base = metadata.ssd_chunk_token_base
-        self.chunk_valid_start = metadata.ssd_chunk_valid_start
-        self.chunk_valid_end = metadata.ssd_chunk_valid_end
-        self.chunk_size = metadata.mamba_chunk_size
-        self.num_slots = metadata.cu_seqlens.shape[0] - 1
-        self.num_real_tokens = metadata.real_prefill_token_count
-        self.starts_aligned = metadata.ssd_starts_aligned
-        self.active_is_prefix = metadata.ssd_active_is_prefix
+        self.seq_chunk_start_acc = ssd_metadata.ssd_seq_chunk_start_acc
+        self.seq_chunk_count = ssd_metadata.ssd_seq_chunk_count
+        self.seq_chunk_base = ssd_metadata.ssd_seq_chunk_base
+        self.active_seq_idx = ssd_metadata.ssd_active_seq_idx
+        self.empty_seq_idx = ssd_metadata.ssd_empty_seq_idx
+        self.chunk_token_base = ssd_metadata.ssd_chunk_token_base
+        self.chunk_valid_start = ssd_metadata.ssd_chunk_valid_start
+        self.chunk_valid_end = ssd_metadata.ssd_chunk_valid_end
+        self.chunk_size = ssd_metadata.mamba_chunk_size
+        self.num_slots = ssd_metadata.cu_seqlens.shape[0] - 1
+        self.num_real_tokens = ssd_metadata.real_prefill_token_count
+        self.starts_aligned = ssd_metadata.ssd_starts_aligned
+        self.active_is_prefix = ssd_metadata.ssd_active_is_prefix
 
 
 def cutedsl_unsupported_reason(
@@ -628,7 +629,7 @@ def mamba_chunk_scan_combined_varlen_cutedsl_thd(
     # cs/nc/xs descriptors are cached in the metadata (stable tensors).
     # Built per launch: the tiling arrays are views into the engine's per-step
     # buffers, so a descriptor must not outlive the step that produced them.
-    cs_t = _to_cute(tiling.seq_chunk_start, [0])
+    cs_t = _to_cute(tiling.seq_chunk_start_acc, [0])
     nc_t = _to_cute(tiling.seq_chunk_count, [0])
     xs_t = _to_cute(tiling.seq_chunk_base, [0])
 

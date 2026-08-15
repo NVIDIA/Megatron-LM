@@ -327,7 +327,7 @@ class SSDKernel:
         initial_states: cute.Tensor,
         intermediate_out: cute.Tensor,
         emit_slot: cute.Tensor,
-        seq_chunk_start: cute.Tensor,
+        seq_chunk_start_acc: cute.Tensor,
         seq_n_chunks: cute.Tensor,
         seq_x_chunk_start: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
@@ -595,7 +595,7 @@ class SSDKernel:
             self.d_linear_smem_layout,
             self.epi_tile,
             tile_sched_params,
-            seq_chunk_start,
+            seq_chunk_start_acc,
             seq_n_chunks,
             seq_x_chunk_start,
         ).launch(
@@ -648,7 +648,7 @@ class SSDKernel:
         d_linear_smem_layout: Optional[cute.Layout],
         epi_tile: cute.Tile,
         tile_sched_params: Mamba2SSDTileSchedulerParams,
-        seq_chunk_start: cute.Tensor,
+        seq_chunk_start_acc: cute.Tensor,
         seq_n_chunks: cute.Tensor,
         seq_x_chunk_start: cute.Tensor,
     ):
@@ -849,7 +849,7 @@ class SSDKernel:
                 # global range [chunk_base, chunk_base + C) in the chunk-major
                 # (B=1) packed tensors. C shadows the static chunk count.
                 C = cute.arch.make_warp_uniform(cutlass.Int32(seq_n_chunks[b_idx]))
-                chunk_base = cute.arch.make_warp_uniform(cutlass.Int32(seq_chunk_start[b_idx]))
+                chunk_base = cute.arch.make_warp_uniform(cutlass.Int32(seq_chunk_start_acc[b_idx]))
                 # X is read from the caller's token-packed stream, whose chunk
                 # grid is GLOBAL and L-aligned; the dense workspace tensors
                 # (delta/cumsum/B/C) and the Y output use their own, possibly
@@ -991,7 +991,7 @@ class SSDKernel:
             while work_tile.is_valid_tile:
                 b_idx, eh_idx, g_idx = work_tile.tile_idx
                 C = cute.arch.make_warp_uniform(cutlass.Int32(seq_n_chunks[b_idx]))
-                chunk_base = cute.arch.make_warp_uniform(cutlass.Int32(seq_chunk_start[b_idx]))
+                chunk_base = cute.arch.make_warp_uniform(cutlass.Int32(seq_chunk_start_acc[b_idx]))
 
                 # Slice global tensor to current tile idx (chunk-major: b=0)
                 # ((ATOM_V, REST_V), C)
@@ -1588,7 +1588,7 @@ class SSDKernel:
                 b_idx, eh_idx, g_idx = work_tile.tile_idx
                 C = cute.arch.make_warp_uniform(cutlass.Int32(seq_n_chunks[b_idx]))
                 # Global chunk base for this sequence (for prefix-caching emit lookup).
-                chunk_base = cute.arch.make_warp_uniform(cutlass.Int32(seq_chunk_start[b_idx]))
+                chunk_base = cute.arch.make_warp_uniform(cutlass.Int32(seq_chunk_start_acc[b_idx]))
 
                 # Slice global tensor to current tile idx
                 # fstate is per-(seq, head): b_idx IS the sequence index.
@@ -2095,7 +2095,7 @@ class SSDKernel:
             while work_tile.is_valid_tile:
                 b_idx, eh_idx, g_idx = work_tile.tile_idx
                 C = cute.arch.make_warp_uniform(cutlass.Int32(seq_n_chunks[b_idx]))
-                chunk_base = cute.arch.make_warp_uniform(cutlass.Int32(seq_chunk_start[b_idx]))
+                chunk_base = cute.arch.make_warp_uniform(cutlass.Int32(seq_chunk_start_acc[b_idx]))
 
                 # Slice global tensor to current tile idx (chunk-major: b=0)
                 # ((ATOM_V, REST_V), EPI_M, EPI_N, C)

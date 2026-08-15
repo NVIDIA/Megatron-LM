@@ -19,9 +19,9 @@ from megatron.core.utils import round_up_to_nearest_multiple
 #   capacity: which bound sizes the array ("requests" or "chunks"),
 #   count_key: the per-step length, as published in the compute_cpu_metadata dict.
 _SSD_ARRAYS = {
-    "seq_chunk_start": ("requests", "ssd_num_active_seqs"),
-    "seq_chunk_count": ("requests", "ssd_num_active_seqs"),
     "seq_chunk_base": ("requests", "ssd_num_active_seqs"),
+    "seq_chunk_count": ("requests", "ssd_num_active_seqs"),
+    "seq_chunk_start_acc": ("requests", "ssd_num_active_seqs"),
     "active_seq_idx": ("requests", "ssd_num_active_seqs"),
     "empty_seq_idx": ("requests", "ssd_num_empty_seqs"),
     "chunk_token_base": ("chunks", "ssd_num_chunks"),
@@ -64,7 +64,7 @@ def compute_ssd_tiling(
     Returns:
         The tiling, as host lists.
     """
-    active, chunk_base, chunk_count, chunk_start = [], [], [], []
+    active, chunk_base, chunk_count, chunk_start_acc = [], [], [], []
     token_base, valid_start, valid_end = [], [], []
     acc = 0
     for i in range(padded_prefill_count):
@@ -77,7 +77,7 @@ def compute_ssd_tiling(
         count = -(-(end - base * chunk_size) // chunk_size)
         chunk_base.append(base)
         chunk_count.append(count)
-        chunk_start.append(acc)
+        chunk_start_acc.append(acc)
         acc += count
 
         for c in range(count):
@@ -90,9 +90,9 @@ def compute_ssd_tiling(
 
     return SSDTilingLists(
         arrays={
-            "seq_chunk_start": chunk_start,
-            "seq_chunk_count": chunk_count,
             "seq_chunk_base": chunk_base,
+            "seq_chunk_count": chunk_count,
+            "seq_chunk_start_acc": chunk_start_acc,
             "active_seq_idx": active,
             "empty_seq_idx": empty,
             "chunk_token_base": token_base,
