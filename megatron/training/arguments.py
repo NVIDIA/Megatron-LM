@@ -1718,6 +1718,11 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
         if getattr(args, 'use_layer_sharding_muon', False):
+            assert args.optimizer == 'muon', (
+                f"--use-layer-sharding-muon is only supported with --optimizer muon "
+                f"(got --optimizer {args.optimizer}). Other Muon variants such as "
+                "adaptive_muon do not implement layer sharding."
+            )
             assert args.use_layer_wise_distributed_optimizer, (
                 "--use-layer-sharding-muon requires the layer-wise distributed "
                 "optimizer path (--optimizer muon with --use-distributed-optimizer)."
