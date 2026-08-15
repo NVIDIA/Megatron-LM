@@ -16,26 +16,24 @@
 
 Tests cover:
   1. Per-TransformerLayer gated_linear_unit check in handle_swiglu_in_state_dict
-  2. GDN fused projection splitting in handle_gdn_in_state_dict
+  2. GDN-family fused projection splitting in handle_gdn_in_state_dict
   3. Helper functions: get_expert_index_from_key, flatten_state_dict, etc.
 
 Note: handle_swiglu_in_state_dict and handle_gdn_in_state_dict require
 HAVE_MEGATRON_FSDP=True and a real distributed environment with DTensors.
 We test their internal helper logic (is_swiglu_key, _key_in_glu_layer,
-_match_gdn_key) by extracting the logic into standalone testable units.
+projection metadata validation) directly and cover real DTensor splitting in the
+distributed M-FSDP test suite.
 For the checkpoint_inspector.py conversion functions, we test the
 non-distributed components: SWiGLU key detection, SWiGLU regex splitting,
 MTP key renaming, and --swiglu-modules prefix filtering.
 """
 
 import re
-from types import SimpleNamespace
 
 import pytest
 import torch
 
-from megatron.core.dist_checkpointing.core import CheckpointingException
-from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_model_parallel,
@@ -45,78 +43,11 @@ from megatron.core.tensor_parallel.layers import (
     copy_tensor_model_parallel_attributes,
     set_tensor_model_parallel_attributes,
 )
-from megatron.core.transformer import fsdp_dtensor_checkpoint
 from megatron.core.transformer.fsdp_dtensor_checkpoint import (
-    MLA_UNFUSED_DOWN_PROJS,
-    _intersect_slice,
-    _shift_slice,
-    _strip_wrapper_prefixes,
-    absorbed_input_layernorm_key,
     flatten_state_dict,
     get_expert_index_from_key,
-    get_mla_fused_down_proj_splits,
-    get_mtp_inner_layer_paths,
-    get_unexpected_model_keys,
-    handle_mla_down_proj_in_state_dict,
-    handle_mtp_in_state_dict,
-    match_mla_fused_down_proj_key,
-    rename_mtp_inner_layer_keys,
-    validate_fsdp_dtensor_model_load,
+    handle_gdn_in_state_dict,
 )
-
-
-# ============================================================================
-# Test the slice/path helpers shared by the SwiGLU, GDN and MLA handlers
-# ============================================================================
-class TestSharedSliceHelpers:
-    """These three are used by every fused-parameter handler, so pin their semantics."""
-
-    def test_intersect_overlapping(self):
-        assert _intersect_slice(slice(0, 10), slice(4, 20)) == slice(4, 10)
-
-    def test_intersect_contained(self):
-        assert _intersect_slice(slice(0, 10), slice(2, 5)) == slice(2, 5)
-
-    @pytest.mark.parametrize(
-        "s1,s2",
-        [
-            (slice(0, 4), slice(4, 8)),  # touching but not overlapping
-            (slice(0, 4), slice(6, 8)),  # disjoint
-            (slice(6, 8), slice(0, 4)),  # disjoint, reversed
-        ],
-    )
-    def test_intersect_without_overlap_is_empty(self, s1, s2):
-        """An FSDP shard that holds none of a section must yield a zero-length slice, not a
-        negative-length one, otherwise the section's reshape silently takes the wrong data."""
-        result = _intersect_slice(s1, s2)
-        assert result.stop - result.start == 0
-        assert list(range(10))[result] == []
-
-    def test_shift_slice(self):
-        assert _shift_slice(slice(6, 10), -4) == slice(2, 6)
-
-    def test_shift_rebases_onto_local_storage(self):
-        """The handlers shift by -fsdp_slice.start to index into this rank's local shard."""
-        fsdp_slice = slice(8, 16)
-        section = _intersect_slice(fsdp_slice, slice(12, 20))
-        assert _shift_slice(section, -fsdp_slice.start) == slice(4, 8)
-
-    @pytest.mark.parametrize(
-        "path,expected",
-        [
-            ("module.decoder.layers.0.weight", "decoder.layers.0.weight"),
-            ("model.module.decoder.layers.0.weight", "decoder.layers.0.weight"),
-            ("module.module.decoder.weight", "decoder.weight"),
-            ("decoder.layers.0.weight", "decoder.layers.0.weight"),
-            ("", ""),
-        ],
-    )
-    def test_strip_wrapper_prefixes(self, path, expected):
-        assert _strip_wrapper_prefixes(path) == expected
-
-    def test_strip_keeps_inner_module_segments(self):
-        """Only leading wrapper segments go; 'module' deeper in the path is a real submodule."""
-        assert _strip_wrapper_prefixes("module.decoder.module.weight") == "decoder.module.weight"
 
 
 # ============================================================================
@@ -483,6 +414,89 @@ class TestKeyInGluLayer:
 # ============================================================================
 # Test GDN key matching logic
 # ============================================================================
+class _FakeGDNMetadata(torch.nn.Module):
+    def __init__(self, names, sections):
+        super().__init__()
+        self.qk_dim = 4
+        self.v_dim = 6
+        self.tp_size = 1
+        self.in_proj_dim = sum(sections)
+        self.in_proj_split_names = names
+        self.in_proj_split_sections = sections
+
+
+class TestGDNProjectionMetadata:
+    @staticmethod
+    def _preprocess(module):
+        return handle_gdn_in_state_dict(module, {}, None)
+
+    @pytest.mark.parametrize(
+        ("names", "sections"),
+        [
+            (("query", "key", "value", "z", "beta", "alpha"), (4, 4, 6, 6, 1, 1)),
+            (("query", "key", "value", "g", "gate"), (4, 4, 6, 4, 6)),
+            (("query", "key", "value", "z", "f", "b", "w"), (4, 4, 6, 6, 4, 4, 6)),
+        ],
+    )
+    def test_accepts_variant_specific_metadata(self, names, sections):
+        model_state, optimizer_state = self._preprocess(_FakeGDNMetadata(names, sections))
+
+        assert model_state == {}
+        assert optimizer_state is None
+
+    def test_rejects_incomplete_metadata(self):
+        module = _FakeGDNMetadata(("query",), (4,))
+        del module.in_proj_split_sections
+
+        with pytest.raises(ValueError, match="must define both"):
+            self._preprocess(module)
+
+    def test_rejects_duplicate_names(self):
+        module = _FakeGDNMetadata(("query", "query"), (4, 4))
+
+        with pytest.raises(ValueError, match="duplicate"):
+            self._preprocess(module)
+
+    @pytest.mark.parametrize(
+        ("names", "sections", "error"),
+        [
+            (("query", "key"), (4,), "sizes for 2 names"),
+            (("query", ""), (4, 4), "invalid in_proj split names"),
+            (("query", "key"), (4, 0), "invalid in_proj split sizes"),
+            (("query", "key"), (4, True), "invalid in_proj split sizes"),
+        ],
+    )
+    def test_rejects_invalid_metadata(self, names, sections, error):
+        module = _FakeGDNMetadata(names, sections)
+
+        with pytest.raises(ValueError, match=error):
+            self._preprocess(module)
+
+    def test_rejects_incorrect_total_size(self):
+        module = _FakeGDNMetadata(("query", "key"), (4, 4))
+        module.in_proj_dim += 1
+
+        with pytest.raises(ValueError, match="expected"):
+            self._preprocess(module)
+
+    @pytest.mark.parametrize("tp_size", [0, True])
+    def test_rejects_invalid_tp_size(self, tp_size):
+        module = _FakeGDNMetadata(("query", "key"), (4, 4))
+        module.tp_size = tp_size
+
+        with pytest.raises(ValueError, match="invalid tp_size"):
+            self._preprocess(module)
+
+    def test_rejects_dimensions_not_divisible_by_tp(self):
+        module = _FakeGDNMetadata(("query", "key"), (2, 2))
+        module.tp_size = 2
+        module.in_proj_dim = 8
+        module.qk_dim = 5
+
+        with pytest.raises(ValueError, match="qk_dim/v_dim must be divisible"):
+            self._preprocess(module)
+
+
 class TestGDNKeyMatching:
     """Test the _match_gdn_key logic from handle_gdn_in_state_dict.
 
@@ -728,633 +742,6 @@ class TestVLMSWiGLUScenario:
         # Vision encoder keys: all 4 should be skipped
         assert len(should_skip) == 4
         assert all("vision_encoder" in k for k in should_skip)
-
-
-# ============================================================================
-# Fixtures for the fused-MLA / MTP handlers
-#
-# These build real nn.Modules so that named_modules() behaves exactly as it does
-# in production; only the leaf parameters are placeholders.
-# ============================================================================
-Q_LORA_RANK = 24
-KV_LORA_RANK = 16
-QK_POS_EMB_HEAD_DIM = 8
-MLA_SPLIT_SIZES = [Q_LORA_RANK, KV_LORA_RANK + QK_POS_EMB_HEAD_DIM]
-
-
-def _mla_config():
-    return SimpleNamespace(
-        q_lora_rank=Q_LORA_RANK, kv_lora_rank=KV_LORA_RANK, qk_pos_emb_head_dim=QK_POS_EMB_HEAD_DIM
-    )
-
-
-class _FusedMLAAttention(torch.nn.Module):
-    """Stands in for FusedMLASelfAttention: one fused down-proj plus a config."""
-
-    def __init__(self, absorb_layernorm=False):
-        super().__init__()
-        self.config = _mla_config()
-        self.linear_qkv_down_proj = torch.nn.Module()
-        self.linear_qkv_down_proj.weight = torch.nn.Parameter(torch.zeros(sum(MLA_SPLIT_SIZES), 4))
-        if absorb_layernorm:
-            self.linear_qkv_down_proj.layer_norm_weight = torch.nn.Parameter(torch.zeros(4))
-
-
-class _UnfusedMLAAttention(torch.nn.Module):
-    """Stands in for MLASelfAttention: separate q/kv down-projections."""
-
-    def __init__(self):
-        super().__init__()
-        self.config = _mla_config()
-        self.linear_q_down_proj = torch.nn.Module()
-        self.linear_kv_down_proj = torch.nn.Module()
-
-
-class _Layer(torch.nn.Module):
-    def __init__(self, attention):
-        super().__init__()
-        self.self_attention = attention
-        self.input_layernorm = torch.nn.Module()
-
-
-class _MTPLayer(torch.nn.Module):
-    """Stands in for MultiTokenPredictionLayer."""
-
-    def __init__(self, mtp_layer_pattern=None):
-        super().__init__()
-        self.mtp_layer_pattern = mtp_layer_pattern
-        self.mtp_model_layer = torch.nn.Module()
-
-
-class _Decoder(torch.nn.Module):
-    def __init__(self, layers):
-        super().__init__()
-        self.layers = torch.nn.ModuleList(layers)
-
-
-class _Model(torch.nn.Module):
-    """Wrapper mirroring the ``module.`` indirection the handlers expect."""
-
-    def __init__(self, decoder_layers=(), mtp_layers=()):
-        super().__init__()
-        inner = torch.nn.Module()
-        inner.decoder = _Decoder(list(decoder_layers))
-        if mtp_layers:
-            inner.mtp = _Decoder(list(mtp_layers))
-        self.module = inner
-
-    def get_parameter(self, name):
-        # The handlers only need an object carrying Megatron-FSDP shard metadata; the
-        # split itself is exercised separately.
-        return SimpleNamespace(name=name)
-
-
-def _fused_model(num_layers=1, absorb_layernorm=False, with_mtp=False):
-    layers = [_Layer(_FusedMLAAttention(absorb_layernorm)) for _ in range(num_layers)]
-    mtp = [_MTPLayer()] if with_mtp else []
-    return _Model(decoder_layers=layers, mtp_layers=mtp)
-
-
-# ============================================================================
-# Test get_mla_fused_down_proj_splits
-# ============================================================================
-class TestGetMLAFusedDownProjSplits:
-    """The fused down-proj split sizes must match FusedMLASelfAttention.sharded_state_dict."""
-
-    def test_fused_model_reports_q_and_kv_sizes(self):
-        splits = get_mla_fused_down_proj_splits(_fused_model())
-        assert splits == {"decoder.layers.0.self_attention": MLA_SPLIT_SIZES}
-
-    def test_kv_section_includes_pos_emb_head_dim(self):
-        """kv is kv_lora_rank + qk_pos_emb_head_dim, not kv_lora_rank alone."""
-        splits = get_mla_fused_down_proj_splits(_fused_model())
-        _, kv = splits["decoder.layers.0.self_attention"]
-        assert kv == KV_LORA_RANK + QK_POS_EMB_HEAD_DIM
-
-    def test_split_sizes_sum_to_fused_width(self):
-        model = _fused_model()
-        splits = get_mla_fused_down_proj_splits(model)
-        fused_weight = model.module.decoder.layers[0].self_attention.linear_qkv_down_proj.weight
-        assert sum(splits["decoder.layers.0.self_attention"]) == fused_weight.shape[0]
-
-    def test_unfused_model_reports_nothing(self):
-        model = _Model(decoder_layers=[_Layer(_UnfusedMLAAttention())])
-        assert get_mla_fused_down_proj_splits(model) == {}
-
-    def test_multiple_layers(self):
-        splits = get_mla_fused_down_proj_splits(_fused_model(num_layers=3))
-        assert set(splits) == {
-            "decoder.layers.0.self_attention",
-            "decoder.layers.1.self_attention",
-            "decoder.layers.2.self_attention",
-        }
-
-    def test_mtp_attention_included(self):
-        """The MTP layer's attention is fused too and must be rewritten alongside the decoder."""
-        model = _Model(decoder_layers=[_Layer(_FusedMLAAttention())], mtp_layers=[_MTPLayer()])
-        model.module.mtp.layers[0].mtp_model_layer = _Layer(_FusedMLAAttention())
-        splits = get_mla_fused_down_proj_splits(model)
-        assert "mtp.layers.0.mtp_model_layer.self_attention" in splits
-
-
-# ============================================================================
-# Test match_mla_fused_down_proj_key
-# ============================================================================
-class TestMatchMLAFusedDownProjKey:
-
-    SPLITS = {"decoder.layers.0.self_attention": MLA_SPLIT_SIZES}
-
-    def test_weight_key_matched(self):
-        key = "decoder.layers.0.self_attention.linear_qkv_down_proj.weight"
-        wrapper, path, sizes, leaf = match_mla_fused_down_proj_key(key, self.SPLITS)
-        assert wrapper == ""
-        assert path == "decoder.layers.0.self_attention"
-        assert sizes == MLA_SPLIT_SIZES
-        assert leaf == "weight"
-
-    def test_wrapper_prefix_preserved(self):
-        key = "module.decoder.layers.0.self_attention.linear_qkv_down_proj.weight"
-        wrapper, path, _, leaf = match_mla_fused_down_proj_key(key, self.SPLITS)
-        assert wrapper == "module."
-        assert path == "decoder.layers.0.self_attention"
-        assert leaf == "weight"
-
-    def test_nested_wrapper_prefix_preserved(self):
-        key = "model.module.decoder.layers.0.self_attention.linear_qkv_down_proj.weight"
-        wrapper, _, _, _ = match_mla_fused_down_proj_key(key, self.SPLITS)
-        assert wrapper == "model.module."
-
-    def test_layer_norm_leaf_matched(self):
-        key = "decoder.layers.0.self_attention.linear_qkv_down_proj.layer_norm_weight"
-        _, _, _, leaf = match_mla_fused_down_proj_key(key, self.SPLITS)
-        assert leaf == "layer_norm_weight"
-
-    def test_extra_state_leaf_matched(self):
-        key = "decoder.layers.0.self_attention.linear_qkv_down_proj._extra_state"
-        _, _, _, leaf = match_mla_fused_down_proj_key(key, self.SPLITS)
-        assert leaf == "_extra_state"
-
-    def test_already_unfused_key_not_matched(self):
-        """An unfused checkpoint-style key must not be rewritten a second time."""
-        key = "decoder.layers.0.self_attention.linear_q_down_proj.weight"
-        assert match_mla_fused_down_proj_key(key, self.SPLITS) is None
-
-    def test_unrelated_key_not_matched(self):
-        key = "decoder.layers.0.mlp.linear_fc1.weight"
-        assert match_mla_fused_down_proj_key(key, self.SPLITS) is None
-
-    def test_other_layer_not_matched(self):
-        key = "decoder.layers.1.self_attention.linear_qkv_down_proj.weight"
-        assert match_mla_fused_down_proj_key(key, self.SPLITS) is None
-
-    def test_empty_splits_match_nothing(self):
-        key = "decoder.layers.0.self_attention.linear_qkv_down_proj.weight"
-        assert match_mla_fused_down_proj_key(key, {}) is None
-
-
-# ============================================================================
-# Test absorbed_input_layernorm_key
-# ============================================================================
-class TestAbsorbedInputLayernormKey:
-    """With fuse_input_layernorm the layernorm moves up one level, per the layer spec's
-    sharded_state_dict_keys_map: self_attention.linear_qkv_down_proj.layer_norm_ ->
-    input_layernorm."""
-
-    def test_weight(self):
-        assert (
-            absorbed_input_layernorm_key("", "decoder.layers.0.self_attention", "layer_norm_weight")
-            == "decoder.layers.0.input_layernorm.weight"
-        )
-
-    def test_bias(self):
-        assert (
-            absorbed_input_layernorm_key("", "decoder.layers.3.self_attention", "layer_norm_bias")
-            == "decoder.layers.3.input_layernorm.bias"
-        )
-
-    def test_wrapper_preserved(self):
-        assert (
-            absorbed_input_layernorm_key(
-                "module.", "decoder.layers.0.self_attention", "layer_norm_weight"
-            )
-            == "module.decoder.layers.0.input_layernorm.weight"
-        )
-
-    def test_top_level_attention_rejected(self):
-        with pytest.raises(AssertionError):
-            absorbed_input_layernorm_key("", "self_attention", "layer_norm_weight")
-
-
-# ============================================================================
-# Test handle_mla_down_proj_in_state_dict
-#
-# split_fused_fsdp_param needs real Megatron-FSDP DTensors, so it is replaced with a
-# recorder; everything around it (key rewriting, split sizes, optimizer state) is real.
-# ============================================================================
-@pytest.fixture
-def recorded_splits(monkeypatch):
-    calls = []
-
-    def fake_split(data, dist_param, split_sizes, is_expert_param=False, split_dim=0):
-        calls.append({"data": data, "split_sizes": list(split_sizes)})
-        return [f"{data}::q", f"{data}::kv"]
-
-    monkeypatch.setattr(fsdp_dtensor_checkpoint, "split_fused_fsdp_param", fake_split)
-    return calls
-
-
-class TestHandleMLADownProjInStateDict:
-
-    WEIGHT_KEY = "decoder.layers.0.self_attention.linear_qkv_down_proj.weight"
-    Q_KEY = "decoder.layers.0.self_attention.linear_q_down_proj.weight"
-    KV_KEY = "decoder.layers.0.self_attention.linear_kv_down_proj.weight"
-
-    def test_fused_weight_becomes_q_and_kv(self, recorded_splits):
-        model_sd, _ = handle_mla_down_proj_in_state_dict(
-            _fused_model(), {self.WEIGHT_KEY: "W"}, None
-        )
-        assert set(model_sd) == {self.Q_KEY, self.KV_KEY}
-        assert model_sd[self.Q_KEY] == "W::q"
-        assert model_sd[self.KV_KEY] == "W::kv"
-
-    def test_unfused_projection_names_match_mcore(self):
-        assert MLA_UNFUSED_DOWN_PROJS == ("linear_q_down_proj", "linear_kv_down_proj")
-
-    def test_config_split_sizes_are_forwarded(self, recorded_splits):
-        handle_mla_down_proj_in_state_dict(_fused_model(), {self.WEIGHT_KEY: "W"}, None)
-        assert recorded_splits[0]["split_sizes"] == MLA_SPLIT_SIZES
-
-    def test_absorbed_layernorm_is_moved_not_split(self, recorded_splits):
-        ln_key = "decoder.layers.0.self_attention.linear_qkv_down_proj.layer_norm_weight"
-        model_sd, _ = handle_mla_down_proj_in_state_dict(
-            _fused_model(absorb_layernorm=True), {ln_key: "LN"}, None
-        )
-        assert model_sd == {"decoder.layers.0.input_layernorm.weight": "LN"}
-        assert recorded_splits == []
-
-    def test_extra_state_left_alone(self, recorded_splits):
-        key = "decoder.layers.0.self_attention.linear_qkv_down_proj._extra_state"
-        model_sd, _ = handle_mla_down_proj_in_state_dict(_fused_model(), {key: "X"}, None)
-        assert model_sd == {key: "X"}
-
-    def test_unrelated_keys_untouched(self, recorded_splits):
-        other = "decoder.layers.0.mlp.linear_fc1.weight"
-        model_sd, _ = handle_mla_down_proj_in_state_dict(
-            _fused_model(), {self.WEIGHT_KEY: "W", other: "M"}, None
-        )
-        assert model_sd[other] == "M"
-
-    def test_unfused_model_is_noop(self, recorded_splits):
-        model = _Model(decoder_layers=[_Layer(_UnfusedMLAAttention())])
-        original = {self.Q_KEY: "Q", self.KV_KEY: "KV"}
-        model_sd, opt_sd = handle_mla_down_proj_in_state_dict(model, original, None)
-        assert model_sd == original
-        assert opt_sd is None
-        assert recorded_splits == []
-
-    def test_input_state_dict_not_mutated(self, recorded_splits):
-        original = {self.WEIGHT_KEY: "W"}
-        handle_mla_down_proj_in_state_dict(_fused_model(), original, None)
-        assert original == {self.WEIGHT_KEY: "W"}
-
-    def test_all_layers_rewritten(self, recorded_splits):
-        model_sd, _ = handle_mla_down_proj_in_state_dict(
-            _fused_model(num_layers=3),
-            {
-                f"decoder.layers.{i}.self_attention.linear_qkv_down_proj.weight": f"W{i}"
-                for i in range(3)
-            },
-            None,
-        )
-        assert len(model_sd) == 6
-        assert all("linear_qkv_down_proj" not in k for k in model_sd)
-
-    def test_optimizer_state_split(self, recorded_splits):
-        opt_key = f"module.{self.WEIGHT_KEY}"
-        optimizer_state_dict = {"state": {opt_key: {"exp_avg": "A", "exp_avg_sq": "B", "step": 7}}}
-        _, opt_sd = handle_mla_down_proj_in_state_dict(_fused_model(), {}, optimizer_state_dict)
-        state = opt_sd["state"]
-        assert set(state) == {f"module.{self.Q_KEY}", f"module.{self.KV_KEY}"}
-        assert state[f"module.{self.Q_KEY}"]["exp_avg"] == "A::q"
-        assert state[f"module.{self.KV_KEY}"]["exp_avg"] == "A::kv"
-        assert state[f"module.{self.Q_KEY}"]["exp_avg_sq"] == "B::q"
-        # Non-tensor entries are carried over to both halves.
-        assert state[f"module.{self.Q_KEY}"]["step"] == 7
-
-    def test_optimizer_layernorm_moved_not_split(self, recorded_splits):
-        """Regression: the absorbed layernorm has no q/kv halves to split into."""
-        ln_key = "module.decoder.layers.0.self_attention.linear_qkv_down_proj.layer_norm_weight"
-        _, opt_sd = handle_mla_down_proj_in_state_dict(
-            _fused_model(absorb_layernorm=True), {}, {"state": {ln_key: {"exp_avg": "A"}}}
-        )
-        assert set(opt_sd["state"]) == {"module.decoder.layers.0.input_layernorm.weight"}
-        assert recorded_splits == []
-
-    def test_optimizer_unrelated_state_preserved(self, recorded_splits):
-        other = "module.decoder.layers.0.mlp.linear_fc1.weight"
-        _, opt_sd = handle_mla_down_proj_in_state_dict(
-            _fused_model(), {}, {"state": {other: {"exp_avg": "A"}}}
-        )
-        assert opt_sd["state"][other] == {"exp_avg": "A"}
-
-    def test_empty_optimizer_state_tolerated(self, recorded_splits):
-        _, opt_sd = handle_mla_down_proj_in_state_dict(_fused_model(), {}, {"state": {}})
-        assert opt_sd["state"] == {}
-
-
-# ============================================================================
-# Test get_mtp_inner_layer_paths
-# ============================================================================
-class TestGetMTPInnerLayerPaths:
-
-    def test_gpt_mtp_layer_included(self):
-        model = _Model(mtp_layers=[_MTPLayer(mtp_layer_pattern=None)])
-        assert get_mtp_inner_layer_paths(model) == ["mtp.layers.0"]
-
-    def test_mamba_mtp_layer_excluded(self):
-        """Mamba MTP keeps mtp_model_layer as its native checkpoint name."""
-        model = _Model(mtp_layers=[_MTPLayer(mtp_layer_pattern="M-M-")])
-        assert get_mtp_inner_layer_paths(model) == []
-
-    def test_model_without_mtp(self):
-        model = _Model(decoder_layers=[_Layer(_UnfusedMLAAttention())])
-        assert get_mtp_inner_layer_paths(model) == []
-
-    def test_multiple_mtp_layers(self):
-        model = _Model(mtp_layers=[_MTPLayer(), _MTPLayer()])
-        assert get_mtp_inner_layer_paths(model) == ["mtp.layers.0", "mtp.layers.1"]
-
-
-# ============================================================================
-# Test rename_mtp_inner_layer_keys
-# ============================================================================
-class TestRenameMTPInnerLayerKeys:
-    """The model uses mtp_model_layer; checkpoints use transformer_layer."""
-
-    PATHS = ["mtp.layers.0"]
-
-    def test_key_renamed(self):
-        sd = {"mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight": 1}
-        out = rename_mtp_inner_layer_keys(sd, self.PATHS)
-        assert out == {"mtp.layers.0.transformer_layer.mlp.linear_fc1.weight": 1}
-
-    def test_wrapper_prefix_preserved(self):
-        sd = {"module.mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight": 1}
-        out = rename_mtp_inner_layer_keys(sd, self.PATHS)
-        assert list(out) == ["module.mtp.layers.0.transformer_layer.mlp.linear_fc1.weight"]
-
-    def test_expert_key_renamed(self):
-        """The MTP layer's expert weights were the bulk of the silently dropped keys."""
-        sd = {"mtp.layers.0.mtp_model_layer.mlp.experts.linear_fc1.weight3": 1}
-        out = rename_mtp_inner_layer_keys(sd, self.PATHS)
-        assert list(out) == ["mtp.layers.0.transformer_layer.mlp.experts.linear_fc1.weight3"]
-
-    def test_decoder_key_untouched(self):
-        sd = {"decoder.layers.0.mlp.linear_fc1.weight": 1}
-        assert rename_mtp_inner_layer_keys(sd, self.PATHS) == sd
-
-    def test_mtp_key_outside_inner_layer_untouched(self):
-        sd = {"mtp.layers.0.enorm.weight": 1}
-        assert rename_mtp_inner_layer_keys(sd, self.PATHS) == sd
-
-    def test_only_inner_layer_occurrence_renamed(self):
-        sd = {"mtp.layers.0.mtp_model_layer.sub.mtp_model_layer.weight": 1}
-        out = rename_mtp_inner_layer_keys(sd, self.PATHS)
-        assert list(out) == ["mtp.layers.0.transformer_layer.sub.mtp_model_layer.weight"]
-
-    def test_unlisted_mtp_layer_untouched(self):
-        sd = {"mtp.layers.1.mtp_model_layer.mlp.linear_fc1.weight": 1}
-        assert rename_mtp_inner_layer_keys(sd, self.PATHS) == sd
-
-    def test_input_not_mutated(self):
-        sd = {"mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight": 1}
-        rename_mtp_inner_layer_keys(sd, self.PATHS)
-        assert list(sd) == ["mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight"]
-
-
-# ============================================================================
-# Test handle_mtp_in_state_dict
-# ============================================================================
-class TestHandleMTPInStateDict:
-
-    MODEL_KEY = "mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight"
-    RENAMED_KEY = "mtp.layers.0.transformer_layer.mlp.linear_fc1.weight"
-
-    def test_model_state_renamed(self):
-        model_sd, _ = handle_mtp_in_state_dict(
-            _Model(mtp_layers=[_MTPLayer()]), {self.MODEL_KEY: 1}, None
-        )
-        assert model_sd == {self.RENAMED_KEY: 1}
-
-    def test_optimizer_state_renamed(self):
-        opt_key = f"module.{self.MODEL_KEY}"
-        _, opt_sd = handle_mtp_in_state_dict(
-            _Model(mtp_layers=[_MTPLayer()]), {}, {"state": {opt_key: {"exp_avg": "A"}}}
-        )
-        assert list(opt_sd["state"]) == [f"module.{self.RENAMED_KEY}"]
-
-    def test_noop_without_mtp(self):
-        model = _Model(decoder_layers=[_Layer(_UnfusedMLAAttention())])
-        sd = {"decoder.layers.0.mlp.linear_fc1.weight": 1}
-        model_sd, opt_sd = handle_mtp_in_state_dict(model, sd, None)
-        assert model_sd == sd
-        assert opt_sd is None
-
-    def test_noop_for_mamba_mtp(self):
-        model = _Model(mtp_layers=[_MTPLayer(mtp_layer_pattern="M-M-")])
-        sd = {self.MODEL_KEY: 1}
-        model_sd, _ = handle_mtp_in_state_dict(model, sd, None)
-        assert model_sd == sd
-
-    def test_empty_optimizer_state_tolerated(self):
-        _, opt_sd = handle_mtp_in_state_dict(_Model(mtp_layers=[_MTPLayer()]), {}, {"state": {}})
-        assert opt_sd["state"] == {}
-
-
-# ============================================================================
-# Test get_unexpected_model_keys
-# ============================================================================
-class TestGetUnexpectedModelKeys:
-    """ "Unexpected" follows StrictHandling: requested by this rank, absent from the
-    checkpoint. This is the direction that silently zeroed weights."""
-
-    def test_missing_model_key_reported(self):
-        metadata = {"model": {"decoder.layers.0.mlp.linear_fc1.weight": object()}}
-        load = {
-            "model": {
-                "decoder.layers.0.mlp.linear_fc1.weight": 1,
-                "decoder.layers.0.self_attention.linear_qkv_down_proj.weight": 1,
-            }
-        }
-        assert get_unexpected_model_keys(metadata, load) == {
-            "model.decoder.layers.0.self_attention.linear_qkv_down_proj.weight"
-        }
-
-    def test_nothing_missing(self):
-        metadata = {"model": {"a.weight": object(), "b.weight": object()}}
-        load = {"model": {"a.weight": 1, "b.weight": 1}}
-        assert get_unexpected_model_keys(metadata, load) == set()
-
-    def test_expert_parallel_extras_not_reported(self):
-        """Regression: under EP the checkpoint holds every expert but each rank owns a
-        slice. Reporting checkpoint-side extras would fail every EP run."""
-        metadata = {
-            "model": {
-                f"decoder.layers.0.mlp.experts.linear_fc1.weight{i}": object() for i in range(8)
-            }
-        }
-        load = {
-            "model": {f"decoder.layers.0.mlp.experts.linear_fc1.weight{i}": 1 for i in range(2)}
-        }
-        assert get_unexpected_model_keys(metadata, load) == set()
-
-    def test_optimizer_section_ignored(self):
-        """Optimizer state is legitimately absent when it is not being restored."""
-        metadata = {"model": {"a.weight": object()}}
-        load = {"model": {"a.weight": 1}, "optimizer": {"state": {"a.weight": {"exp_avg": 1}}}}
-        assert get_unexpected_model_keys(metadata, load) == set()
-
-    def test_rng_section_ignored(self):
-        metadata = {"model": {"a.weight": object()}}
-        load = {"model": {"a.weight": 1}, "rng_state": [1, 2, 3]}
-        assert get_unexpected_model_keys(metadata, load) == set()
-
-    def test_extra_state_ignored(self):
-        """TE _extra_state is dropped from both sides before save and load."""
-        metadata = {"model": {"a.weight": object()}}
-        load = {"model": {"a.weight": 1, "a._extra_state": 1}}
-        assert get_unexpected_model_keys(metadata, load) == set()
-
-    def test_virtual_pipeline_model_sections_covered(self):
-        metadata = {"model0": {"a.weight": object()}, "model1": {}}
-        load = {"model0": {"a.weight": 1}, "model1": {"b.weight": 1}}
-        assert get_unexpected_model_keys(metadata, load) == {"model1.b.weight"}
-
-    def test_non_model_top_level_key_ignored(self):
-        metadata = {"model": {}}
-        load = {"model": {}, "checkpoint_version": 3.0}
-        assert get_unexpected_model_keys(metadata, load) == set()
-
-
-# ============================================================================
-# Test validate_fsdp_dtensor_model_load
-# ============================================================================
-class TestValidateFsdpDtensorModelLoad:
-
-    MISSING_KEY = "decoder.layers.0.self_attention.linear_qkv_down_proj.weight"
-
-    def _mismatched(self):
-        return {"model": {}}, {"model": {self.MISSING_KEY: 1}}
-
-    def _matched(self):
-        return {"model": {"a.weight": object()}}, {"model": {"a.weight": 1}}
-
-    def test_raise_unexpected_raises(self):
-        metadata, load = self._mismatched()
-        with pytest.raises(CheckpointingException) as excinfo:
-            validate_fsdp_dtensor_model_load(
-                metadata, load, "/ckpt", strict=StrictHandling.RAISE_UNEXPECTED
-            )
-        assert self.MISSING_KEY in str(excinfo.value)
-        assert "/ckpt" in str(excinfo.value)
-
-    def test_error_explains_the_cause(self):
-        """The message should point at sharded_state_dict(), which is the actual trap."""
-        metadata, load = self._mismatched()
-        with pytest.raises(CheckpointingException, match="sharded_state_dict"):
-            validate_fsdp_dtensor_model_load(metadata, load, "/ckpt")
-
-    def test_raises_by_default(self):
-        metadata, load = self._mismatched()
-        with pytest.raises(CheckpointingException):
-            validate_fsdp_dtensor_model_load(metadata, load, "/ckpt")
-
-    def test_no_raise_when_complete(self):
-        metadata, load = self._matched()
-        assert validate_fsdp_dtensor_model_load(metadata, load, "/ckpt") == set()
-
-    def test_raise_all_behaves_like_raise_unexpected(self):
-        metadata, load = self._mismatched()
-        with pytest.raises(CheckpointingException):
-            validate_fsdp_dtensor_model_load(
-                metadata, load, "/ckpt", strict=StrictHandling.RAISE_ALL
-            )
-
-    @pytest.mark.parametrize("strict", [StrictHandling.LOG_UNEXPECTED, StrictHandling.LOG_ALL])
-    def test_log_variants_do_not_raise(self, strict, caplog):
-        metadata, load = self._mismatched()
-        with caplog.at_level("WARNING"):
-            result = validate_fsdp_dtensor_model_load(metadata, load, "/ckpt", strict=strict)
-        assert result == {f"model.{self.MISSING_KEY}"}
-        assert self.MISSING_KEY in caplog.text
-
-    def test_ignore_all_disables_the_check(self):
-        metadata, load = self._mismatched()
-        assert (
-            validate_fsdp_dtensor_model_load(
-                metadata, load, "/ckpt", strict=StrictHandling.IGNORE_ALL
-            )
-            == set()
-        )
-
-    def test_assume_ok_unexpected_raises(self):
-        """ASSUME_OK_UNEXPECTED defers to the underlying strategy, which never raises on a
-        partial DCP load, so for fsdp_dtensor it has to raise here instead. This is the
-        default value of --dist-ckpt-strictness, so the check must be on out of the box."""
-        metadata, load = self._mismatched()
-        with pytest.raises(CheckpointingException):
-            validate_fsdp_dtensor_model_load(
-                metadata, load, "/ckpt", strict=StrictHandling.ASSUME_OK_UNEXPECTED
-            )
-
-    def test_assume_ok_unexpected_quiet_when_complete(self):
-        metadata, load = self._matched()
-        assert (
-            validate_fsdp_dtensor_model_load(
-                metadata, load, "/ckpt", strict=StrictHandling.ASSUME_OK_UNEXPECTED
-            )
-            == set()
-        )
-
-    @pytest.mark.parametrize(
-        "strict", [StrictHandling.RETURN_UNEXPECTED, StrictHandling.RETURN_ALL]
-    )
-    def test_return_variants_report_without_raising(self, strict):
-        metadata, load = self._mismatched()
-        assert validate_fsdp_dtensor_model_load(metadata, load, "/ckpt", strict=strict) == {
-            f"model.{self.MISSING_KEY}"
-        }
-
-    def test_string_strict_flag_accepted(self):
-        metadata, load = self._mismatched()
-        with pytest.raises(CheckpointingException):
-            validate_fsdp_dtensor_model_load(metadata, load, "/ckpt", strict="raise_unexpected")
-
-    def test_invalid_strict_flag_rejected(self):
-        metadata, load = self._matched()
-        with pytest.raises(ValueError):
-            validate_fsdp_dtensor_model_load(metadata, load, "/ckpt", strict="nonsense")
-
-    def test_expert_parallel_load_does_not_raise(self):
-        """Regression: the validator must stay quiet on a healthy expert-parallel load."""
-        metadata = {
-            "model": {
-                f"decoder.layers.0.mlp.experts.linear_fc1.weight{i}": object() for i in range(8)
-            }
-        }
-        load = {
-            "model": {f"decoder.layers.0.mlp.experts.linear_fc1.weight{i}": 1 for i in range(2)}
-        }
-        assert validate_fsdp_dtensor_model_load(metadata, load, "/ckpt") == set()
-
-    def test_message_truncated(self):
-        metadata = {"model": {}}
-        load = {"model": {f"decoder.layers.{i}.weight": 1 for i in range(50)}}
-        with pytest.raises(CheckpointingException) as excinfo:
-            validate_fsdp_dtensor_model_load(metadata, load, "/ckpt", max_reported=5)
-        message = str(excinfo.value)
-        assert "and 45 more" in message
-        assert message.count("\n  model.decoder.layers.") == 5
 
 
 # ============================================================================

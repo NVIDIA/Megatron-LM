@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 import torch
 import torch.distributed.checkpoint
+from torch.distributed.checkpoint import FileSystemReader
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -24,9 +25,8 @@ from megatron.training.checkpointing import (
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
-    load_args_from_checkpoint,
     load_checkpoint,
-    maybe_save_dataloader_state,
+    preprocess_fsdp_dtensor_state_dict,
     read_metadata,
     save_checkpoint,
 )
@@ -47,6 +47,32 @@ class MockModel(MegatronModule):
 
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
+        return self.state_dict()
+
+
+class MockDeltaRule(torch.nn.Module):
+    """Minimal delta-rule module exposing production checkpoint metadata."""
+
+    def __init__(self, split_names, split_sections):
+        super().__init__()
+        self.qk_dim = 4
+        self.v_dim = 6
+        self.tp_size = 1
+        self.in_proj_dim = sum(split_sections)
+        self.in_proj_split_names = split_names
+        self.in_proj_split_sections = split_sections
+        self.in_proj = torch.nn.Linear(4, self.in_proj_dim, bias=False)
+        self.conv1d = torch.nn.Conv1d(4, 2 * self.qk_dim + self.v_dim, 1, bias=True)
+
+
+class MockDeltaRuleModel(MegatronModule):
+    """Minimal Megatron model used to exercise the real FSDP checkpoint path."""
+
+    def __init__(self, config, split_names, split_sections):
+        super().__init__(config=config)
+        self.delta_rule = MockDeltaRule(split_names, split_sections)
+
+    def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         return self.state_dict()
 
 
@@ -76,128 +102,111 @@ class MockState:
         return self.state_dict()
 
 
-def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
-    """Dataloader checkpoints use the supplied module groups and canonical model-parallel path."""
-    groups = {
-        "tp": SimpleNamespace(rank=0, size=2),
-        "pp": SimpleNamespace(rank=0, size=2),
-        "dp": SimpleNamespace(rank=3, size=4),
-    }
-    barriers = []
-    saved = []
-    iterator = SimpleNamespace(
-        iterable=SimpleNamespace(save_state=lambda: {"global_sequence_id": 16})
-    )
+def test_fsdp_dtensor_preprocessing_calls_delta_rule_handler():
+    args = SimpleNamespace(swiglu=False, num_experts=None)
+    model = mock.sentinel.model
+    model_state = {"weight": mock.sentinel.model_weight}
+    optimizer_state = {"state": {}}
+    split_model_state = {"weight.query": mock.sentinel.query_weight}
+    split_optimizer_state = {"state": {"weight.query": {}}}
 
     with (
+        mock.patch("megatron.training.checkpointing.handle_fp8_extra_state_case"),
         mock.patch(
-            "megatron.training.checkpointing.get_pg_rank", side_effect=lambda group: group.rank
-        ),
-        mock.patch(
-            "megatron.training.checkpointing.get_pg_size", side_effect=lambda group: group.size
-        ),
-        mock.patch(
-            "megatron.training.checkpointing.torch.distributed.barrier",
-            side_effect=lambda group: barriers.append(group),
-        ),
-        mock.patch(
-            "megatron.training.checkpointing.torch.save",
-            side_effect=lambda state, path: saved.append((state, path)),
-        ),
+            "megatron.training.checkpointing.handle_gdn_in_state_dict",
+            return_value=(split_model_state, split_optimizer_state),
+        ) as handle_gdn,
+        mock.patch("megatron.training.checkpointing.preprocess_state_dict_for_uneven_dtensor"),
     ):
-        maybe_save_dataloader_state(
-            iterator,
-            2,
-            tmp_path,
-            tp_group=groups["tp"],
-            pp_group=groups["pp"],
-            dp_group=groups["dp"],
+        state_dict = preprocess_fsdp_dtensor_state_dict(
+            args, {"model": model_state, "optimizer": optimizer_state}, model
         )
 
-    assert barriers == [groups["dp"], groups["dp"]]
-    assert saved[0][0] == {"dataloader_state_dict": {"global_sequence_id": 16}}
-    assert saved[0][1] == str(
-        tmp_path / "iter_0000002" / "mp_rank_00_000" / "train_dataloader_dprank003.pt"
-    )
+    handle_gdn.assert_called_once_with(model, model_state, optimizer_state)
+    assert state_dict["model"] is split_model_state
+    assert state_dict["optimizer"] is split_optimizer_state
 
 
-def test_maybe_save_dataloader_state_skips_empty_state_after_barriers(tmp_path):
-    """Ranks without dataloader state participate in barriers but do not write a file."""
-    group = SimpleNamespace(rank=0, size=1)
-    iterator = SimpleNamespace(iterable=SimpleNamespace(save_state=lambda: None))
-    barriers = []
-
-    with (
-        mock.patch(
-            "megatron.training.checkpointing.get_pg_rank",
-            side_effect=lambda process_group: process_group.rank,
-        ),
-        mock.patch(
-            "megatron.training.checkpointing.get_pg_size",
-            side_effect=lambda process_group: process_group.size,
-        ),
-        mock.patch(
-            "megatron.training.checkpointing.torch.distributed.barrier",
-            side_effect=lambda group: barriers.append(group),
-        ),
-        mock.patch("megatron.training.checkpointing.torch.save") as save,
-    ):
-        maybe_save_dataloader_state(
-            iterator, 2, tmp_path, tp_group=group, pp_group=group, dp_group=group
-        )
-
-    assert barriers == [group, group]
-    save.assert_not_called()
-
-
-class MockOptParamScheduler(MockState):
-    def __init__(self, state_dict):
-        super().__init__(state_dict)
-        self.num_steps = state_dict.get("num_steps", 0)
-        self.step_calls = []
-
-    def load_state_dict(self, state_dict):
-        super().load_state_dict(state_dict)
-        self.num_steps = state_dict.get("num_steps", self.num_steps)
-
-    def step(self, increment=1):
-        self.step_calls.append(increment)
-
-
-class MockOptimizer(MockState):
-    def state_dict(self, is_loading=False):
-        state_dict = super().state_dict(is_loading=is_loading).copy()
-        state_dict["param_groups"] = [param_group.copy() for param_group in self.param_groups]
-        return state_dict
-
-    def load_state_dict(self, state_dict):
-        super().load_state_dict(state_dict)
-        self.param_groups = [param_group.copy() for param_group in state_dict["param_groups"]]
+def _local_checkpoint_tensor(value):
+    if hasattr(value, "to_local"):
+        value = value.to_local()
+    return value.detach().clone()
 
 
 @pytest.mark.parametrize(
-    ("checkpoint_args", "configured_num_householder", "expected_num_householder"),
-    [(SimpleNamespace(gdp_num_householder=5), 3, 5), (SimpleNamespace(), 5, 3)],
+    ("split_names", "split_sections"),
+    [
+        (("query", "key", "value", "z", "f", "b", "w"), (4, 4, 6, 6, 4, 4, 6)),
+        (("query", "key", "value", "g", "gate"), (4, 4, 6, 4, 6)),
+    ],
 )
-def test_load_args_restores_gdp_num_householder_from_checkpoint(
-    checkpoint_args, configured_num_householder, expected_num_householder
+def test_fsdp_dtensor_delta_rule_save_load_roundtrip(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, split_names, split_sections
 ):
-    args = SimpleNamespace(
-        load="checkpoint",
-        iteration=0,
-        gdp_num_householder=configured_num_householder,
-        use_tokenizer_model_from_checkpoint_args=False,
-        use_mp_args_from_checkpoint_args=False,
+    """Real Megatron-FSDP save/load preserves variant-specific fused projections."""
+
+    args = create_ckpt_load_args
+    args.ckpt_format = "fsdp_dtensor"
+    args.use_megatron_fsdp = True
+    args.use_distributed_optimizer = True
+    args.use_dist_ckpt = True
+    args.swiglu = False
+    args.num_experts = None
+    args.save_tokenizer_assets = False
+
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True, use_megatron_fsdp=True
     )
-    state_dict = {"args": checkpoint_args, "iteration": 12}
 
-    with mock.patch(
-        "megatron.training.checkpointing._load_base_checkpoint",
-        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
-    ):
-        restored_args, _ = load_args_from_checkpoint(args)
+    def build_model(seed):
+        torch.manual_seed(seed)
+        return FullyShardedDataParallel(
+            config=config,
+            ddp_config=ddp_config,
+            module=MockDeltaRuleModel(config, split_names, split_sections),
+        )
 
-    assert restored_args.gdp_num_householder == expected_num_householder
+    source_model = build_model(123)
+    source_optimizer = MockState({"state": {}})
+    source_scheduler = MockState({"scheduler": "source"})
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_delta_rule_fsdp_roundtrip", sync=True) as ckpt_dir:
+        args.save = ckpt_dir
+        args.load = ckpt_dir
+        set_args(args)
+        save_checkpoint(7, [source_model], source_optimizer, source_scheduler, 0)
+
+        checkpoint_dir = ckpt_dir / "iter_0000007"
+        metadata_keys = FileSystemReader(checkpoint_dir).read_metadata().state_dict_metadata
+        metadata_prefix = "model.module.delta_rule"
+        for name in split_names:
+            assert f"{metadata_prefix}.in_proj.weight.{name}" in metadata_keys
+        for parameter in ("weight", "bias"):
+            for name in ("query", "key", "value"):
+                assert f"{metadata_prefix}.conv1d.{parameter}.{name}" in metadata_keys
+        assert f"{metadata_prefix}.in_proj.weight" not in metadata_keys
+        assert f"{metadata_prefix}.conv1d.weight" not in metadata_keys
+        assert f"{metadata_prefix}.conv1d.bias" not in metadata_keys
+
+        source_state = {
+            key: _local_checkpoint_tensor(value) for key, value in source_model.state_dict().items()
+        }
+        target_model = build_model(456)
+        target_optimizer = MockState({"state": {}})
+        target_scheduler = MockState({"scheduler": "target"})
+
+        loaded_iteration, _ = load_checkpoint(
+            [target_model], target_optimizer, target_scheduler, strict=True
+        )
+
+        assert loaded_iteration == 7
+        target_state = {
+            key: _local_checkpoint_tensor(value) for key, value in target_model.state_dict().items()
+        }
+        assert source_state.keys() == target_state.keys()
+        for key in source_state:
+            torch.testing.assert_close(target_state[key], source_state[key], rtol=0, atol=0)
 
 
 def create_checkpoint(load_path, ckpt_format):
@@ -242,12 +251,92 @@ def create_args():
     args.auto_detect_ckpt_format = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
     args.ckpt_step = None
-    args.override_opt_param_scheduler = False
     args.swiglu = True
     args.num_experts = 1
     args.verify_integrity = False
 
     yield args
+
+
+def test_async_save_rejects_reusable_chunked_optimizer_buffers(create_args):
+    """Checkpoint entry must preserve the CLI guard when startup validation was bypassed."""
+
+    create_args.async_save = True
+    create_args.ckpt_format = 'torch_dist'
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        pytest.raises(RuntimeError, match="does not support --async-save"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_rejects_mutated_format_with_chunked_optimizer_offload(create_args):
+    """Checkpoint entry revalidates the format after resume-time argument restoration."""
+
+    create_args.ckpt_format = 'torch'
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        pytest.raises(RuntimeError, match="requires --ckpt-format torch_dist"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_treats_zero_offload_fraction_as_disabled(create_args):
+    """A zero fraction must not impose async-save or distributed-format restrictions."""
+
+    create_args.async_save = True
+    create_args.ckpt_format = 'torch'
+    optimizer = SimpleNamespace(
+        config=SimpleNamespace(
+            chunked_optimizer_state_offload=True, optimizer_state_offload_fraction=0.0
+        )
+    )
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing.is_empty_async_queue",
+            side_effect=RuntimeError("continued past optimizer offload guard"),
+        ),
+        pytest.raises(RuntimeError, match="continued past optimizer offload guard"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_skips_offload_guards_without_optimizer_state(create_args):
+    """Model-only saves do not expose reusable optimizer buffers to the async writer."""
+
+    create_args.async_save = True
+    create_args.ckpt_format = 'torch_dist'
+    create_args.no_save_optim = True
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing.is_empty_async_queue",
+            side_effect=RuntimeError("continued past optimizer offload guard"),
+        ),
+        pytest.raises(RuntimeError, match="continued past optimizer offload guard"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_allows_legacy_format_without_optimizer_state(create_args):
+    """A model-only save is not forced through optimizer-specific distributed hooks."""
+
+    create_args.ckpt_format = 'torch'
+    create_args.no_save_optim = True
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing.on_save_checkpoint_start",
+            side_effect=RuntimeError("continued past optimizer offload guard"),
+        ),
+        pytest.raises(RuntimeError, match="continued past optimizer offload guard"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
 
 
 @pytest.fixture
@@ -360,7 +449,6 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
 
     with TempNamedDir(tmp_path_dist_ckpt / "test_save_checkpoint", sync=True) as save_dir:
         args.save = save_dir
-        args.save_tokenizer_assets = False
         set_args(args)
 
         save_checkpoint(
@@ -397,7 +485,6 @@ def test_load_checkpoint(
     with TempNamedDir(tmp_path_dist_ckpt / "test_load_checkpoint", sync=True) as ckpt_dir:
         args.load = ckpt_dir
         args.save = ckpt_dir
-        args.save_tokenizer_assets = False
         set_args(args)
 
         # Create and save a checkpoint first.
@@ -433,79 +520,6 @@ def test_load_checkpoint(
         assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
 
 
-@pytest.mark.parametrize("ckpt_format", ["torch"])
-def test_load_checkpoint_override_opt_param_scheduler(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
-):
-    """Test override_opt_param_scheduler behavior during checkpoint load."""
-    args = create_ckpt_load_args
-    args.ckpt_format = ckpt_format
-    args.use_distributed_optimizer = False
-    args.use_dist_ckpt = ckpt_format != "torch"
-    args.override_opt_param_scheduler = True
-    args.lr = 1.0
-    args.min_lr = 0.1
-    args.decoupled_lr = 0.5
-    args.decoupled_min_lr = 0.05
-    args.consumed_train_samples = 42
-
-    with TempNamedDir(
-        tmp_path_dist_ckpt / "test_load_checkpoint_override_opt_param_scheduler", sync=True
-    ) as ckpt_dir:
-        args.load = ckpt_dir
-        args.save = ckpt_dir
-        args.save_tokenizer_assets = False
-        set_args(args)
-
-        # Create and save a checkpoint first.
-        iteration = 123
-        config = TransformerConfig(num_layers=1, kv_channels=1)
-        model = MockModel(config)
-
-        optimizer = MockOptimizer({"optimizer": "optimizer_state"})
-        optimizer.param_groups = [
-            {"is_decoupled_lr": False, "max_lr": -1.0, "min_lr": -1.0},
-            {"is_decoupled_lr": True, "max_lr": -1.0, "min_lr": -1.0},
-        ]
-        opt_param_scheduler = MockOptParamScheduler(
-            {"opt_param_scheduler": "scheduler_state", "num_steps": 3}
-        )
-        num_floating_point_operations_so_far = 456
-
-        save_checkpoint(
-            iteration, [model], optimizer, opt_param_scheduler, num_floating_point_operations_so_far
-        )
-
-        # Create new model, optimizer, and scheduler instances to load into.
-        new_model = MockModel(config)
-        new_optimizer = MockOptimizer({"optimizer": "dummy1"})
-        new_optimizer.param_groups = [
-            {"is_decoupled_lr": False, "max_lr": -2.0, "min_lr": -2.0},
-            {"is_decoupled_lr": True, "max_lr": -2.0, "min_lr": -2.0},
-        ]
-        new_opt_param_scheduler = MockOptParamScheduler(
-            {"opt_param_scheduler": "dummy2", "num_steps": 0}
-        )
-
-        # Load checkpoint and verify runtime overrides are restored.
-        loaded_iter, loaded_flops = load_checkpoint(
-            [new_model], new_optimizer, new_opt_param_scheduler, strict=True
-        )
-        assert loaded_iter == iteration
-        assert loaded_flops == num_floating_point_operations_so_far
-        assert new_optimizer.param_groups[0]["max_lr"] == args.lr
-        assert new_optimizer.param_groups[0]["min_lr"] == args.min_lr
-        assert new_optimizer.param_groups[1]["max_lr"] == args.decoupled_lr
-        assert new_optimizer.param_groups[1]["min_lr"] == args.decoupled_min_lr
-        assert new_opt_param_scheduler.num_steps == args.consumed_train_samples
-        assert new_opt_param_scheduler.step_calls[-1] == 0
-
-        # Ensure loading without optimizer/scheduler remains safe.
-        loaded_iter_none, loaded_flops_none = load_checkpoint([new_model], None, None, strict=True)
-        assert loaded_iter_none == iteration
-        assert loaded_flops_none == num_floating_point_operations_so_far
-
-
 def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args):
     """Test distributed checkpoint versioning."""
     args = create_ckpt_load_args
@@ -518,7 +532,6 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
     ) as ckpt_dir:
         args.load = ckpt_dir
         args.save = ckpt_dir
-        args.save_tokenizer_assets = False
         set_args(args)
 
         # Create and save a checkpoint first.
