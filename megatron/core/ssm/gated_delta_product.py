@@ -914,11 +914,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             # Scatter updated states back into the cache (skips -1 padding slots).
             tensor_masked_update(ssm_state, batch_indices, last_recurrent_state)
 
-        y = rearrange(core_attn_out, "n t h p -> n t (h p)").contiguous()  # [n, 1, d_inner]
-        if self.rmsnorm:
-            # z kept its length-1 sequence dimension through the split.
-            y = self.norm(y, z.contiguous())
-        return y
+        # ``_postprocess`` returns the sequence-first layout, so transpose back to the
+        # batch-first [n, seq_len, d_inner] this method contracts to return; the
+        # transpose is free at l == 1. post_conv_ssm inside it is a no-op here: decode
+        # only runs at cp_size == 1.
+        return self._postprocess(core_attn_out, z).transpose(0, 1)
 
     def ssm_prefill(
         self,
