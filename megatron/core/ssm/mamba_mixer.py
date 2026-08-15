@@ -108,7 +108,7 @@ def _ssd_tiling_from(metadata):
 
 
 try:
-    from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_combined_varlen
+    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
     HAVE_SSM_OPS_VARLEN = True
 except ImportError:

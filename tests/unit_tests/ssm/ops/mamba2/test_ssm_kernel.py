@@ -245,7 +245,9 @@ class TestCuteDSLAccuracy:
             cutedsl_unsupported_reason,
             mamba_chunk_scan_combined_varlen_cutedsl_thd,
         )
-        from megatron.core.ssm.ops.ssd_combined import _mamba_chunk_scan_combined_varlen_triton
+        from megatron.core.ssm.ops.mamba2.ssd_combined import (
+            _mamba_chunk_scan_combined_varlen_triton,
+        )
 
         torch.manual_seed(42)
         device = torch.device("cuda")
@@ -451,7 +453,9 @@ class TestCuteDSLRawStates:
             cutedsl_unsupported_reason,
             mamba_chunk_scan_combined_varlen_cutedsl_thd,
         )
-        from megatron.core.ssm.ops.ssd_combined import _mamba_chunk_scan_combined_varlen_triton
+        from megatron.core.ssm.ops.mamba2.ssd_combined import (
+            _mamba_chunk_scan_combined_varlen_triton,
+        )
 
         torch.manual_seed(42)
         device = torch.device("cuda")

@@ -7,7 +7,7 @@ import torch
 import triton
 from packaging import version
 
-from .ssd_backend import cutedsl_ssd_available
+from ..ssd_backend import cutedsl_ssd_available
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
@@ -267,7 +267,7 @@ def mamba_chunk_scan_combined_varlen(
     # backend selection; callers holding no per-step metadata (op-level tests,
     # benchmarks) simply get Triton. The availability check is a backstop.
     if ssd_tiling is not None and cutedsl_ssd_available():
-        from .cutedsl_mamba2_ssd import (
+        from ..cutedsl_mamba2_ssd import (
             cutedsl_unsupported_reason,
             mamba_chunk_scan_combined_varlen_cutedsl_thd,
         )
