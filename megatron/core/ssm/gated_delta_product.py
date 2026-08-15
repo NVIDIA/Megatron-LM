@@ -450,10 +450,14 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 assert (
                     self.cp.cp_size == 1
                 ), "Context parallel is not supported for GDP dynamic inference"
+                # Checked here rather than in ssm_decode so a run fails at the entry
+                # instead of part way through generation: the mixin prefills and then
+                # decodes the same request, and only the decode step is affected.
                 assert not self.config.gdp_cutedsl_kernel, (
-                    "Dynamic inference uses the FLA kernels directly in ssm_prefill/"
-                    "ssm_decode, which expect the batched layout; gdp_cutedsl_kernel is "
-                    "only supported for training and static-batching prefill."
+                    "Decode runs fused_recurrent_gated_delta_rule, which needs the "
+                    "batched layout, but _prepare_qkv and _compute_gating emit the "
+                    "CuTeDSL varlen layout whenever gdp_cutedsl_kernel is set; it is "
+                    "only supported for training and prefill."
                 )
                 return self.ssm_dynamic_inference(hidden_states, inference_context)
             assert (
