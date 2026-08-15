@@ -542,7 +542,6 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
         fully_shard(model, mesh=mesh, placements=placements)
 
     (parameter_group,) = model.parameter_groups
-    (fsdp_parameter,) = parameter_group.fsdp_parameters
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, foreach=False)
     fully_shard_optimizer(optimizer)
 
@@ -551,7 +550,6 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     optimizer.step()
     assert parameter_group.model_weight.placements == (Flat(),)
     torch.cuda.synchronize(device)
-    torch.cuda.empty_cache()
     allocated_before_forward = torch.cuda.memory_allocated(device)
     torch.cuda.reset_peak_memory_stats(device)
 
@@ -561,9 +559,9 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     torch.cuda.synchronize(device)
     assert parameter_group.model_weight.placements == (Replicate(),)
 
-    state = optimizer.state[fsdp_parameter.sharded]
-    actual_optimizer_size = (
+    actual_optimizer_size = sum(
         state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes
+        for state in optimizer.state.values()
     )
 
     # Theoretical sharded Adam size.
