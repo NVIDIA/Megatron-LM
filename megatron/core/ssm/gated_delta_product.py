@@ -682,17 +682,12 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         with ``causal_conv1d_update`` (l == 1), selecting per-request cache rows with
         ``conv_state_indices``.
         """
-        # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor in channels-last memory,
-        # which is also what it requires when ``seq_idx`` is set. ``x`` is a view into
-        # the channels-last ``zVKQba``, so the transpose alone already gives
-        # stride(1) == 1 and no copy is needed on either path.
-        x = rearrange(x, "b l d -> b d l")
-
         if is_decode:
             # Indexed conv update: reads/writes the per-request conv state rows selected
-            # by ``conv_state_indices``, in place. ``self.activation`` must be the
-            # activation *string* so the kernel enables SiLU (a bool would disable it).
-            # ``causal_conv1d_update`` accepts (b, d) or (b, d, l); here l == 1.
+            # by ``conv_state_indices``, in place. Unlike ``causal_conv1d_fn`` below, the
+            # Triton ``causal_conv1d_update`` takes ``x`` as (batch, seq_len, dim) -- a
+            # 2-D (batch, dim) input is unsqueezed at dim 1 -- so decode keeps the
+            # (b, l, d) layout rather than transposing to [B, D, L]. Here l == 1.
             x = causal_conv1d_update(
                 x,
                 conv_state,
@@ -702,6 +697,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 conv_state_indices=conv_state_indices,
             )
         else:
+            # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor in channels-last memory,
+            # which is also what it requires when ``seq_idx`` is set. ``x`` is a view into
+            # the channels-last ``zVKQba``, so the transpose alone already gives
+            # stride(1) == 1 and no copy is needed on either path.
+            x = rearrange(x, "b l d -> b d l")
             if conv_state is not None:
                 # Static-batching prefill: seed the conv state from the prompt's tail.
                 # If we just take x[:, :, -self.d_conv :], it errors if seqlen < d_conv.
@@ -719,8 +719,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                     activation=self.activation,
                     seq_idx=seq_idx,
                 )
-
-        x = rearrange(x, "b d l ->  b l d")
+            x = rearrange(x, "b d l ->  b l d")
 
         value, key, query = torch.split(
             x,
