@@ -152,6 +152,7 @@ RUN if ! getent group "${RUNTIME_GID}" >/dev/null; then \
         /home/nemo-runtime \
         /home/gitlab-runner/data/gpt3_data \
         /opt/megatron-lm \
+        /tmp/regent-cache \
         /tmp/regent-cache/pip \
         /tmp/regent-cache/uv \
         /tmp/regent-cache/xdg \
@@ -168,6 +169,10 @@ USER ${RUNTIME_UID}:${RUNTIME_GID}
 # the dependency-build checkout in /workspace. Runtime callers select this UID
 # and set HOME/cache variables explicitly; the published image remains root by
 # default. Prove that the non-root contract works before restoring that default.
+# The cache root is probed for directory creation, not just file writes: a
+# caller pointing XDG_CACHE_HOME or HF_HOME below it materializes new
+# subdirectories, which a root-owned parent rejects even when every pre-created
+# leaf is writable.
 RUN export HOME=/home/nemo-runtime \
         PIP_CACHE_DIR=/tmp/regent-cache/pip \
         XDG_CACHE_HOME=/tmp/regent-cache/xdg \
@@ -186,7 +191,9 @@ RUN export HOME=/home/nemo-runtime \
     touch /workspace/data/cache/.nonroot-write-probe && \
     rm /workspace/data/cache/.nonroot-write-probe && \
     touch /opt/megatron-lm/.nonroot-write-probe && \
-    rm /opt/megatron-lm/.nonroot-write-probe
+    rm /opt/megatron-lm/.nonroot-write-probe && \
+    mkdir /tmp/regent-cache/.nonroot-mkdir-probe && \
+    rmdir /tmp/regent-cache/.nonroot-mkdir-probe
 
 USER root
 
