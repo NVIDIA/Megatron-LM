@@ -23,13 +23,13 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.ops.batch_invariant_decode import MambaBatchInvariantDecode
-from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
-from megatron.core.ssm.ops.intermediate_extraction import (
+from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.common.intermediate_extraction import (
     scatter_intermediate_conv,
     scatter_intermediate_ssm,
 )
-from megatron.core.ssm.ops.mamba_ssm import selective_state_update
+from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
+from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -80,7 +80,7 @@ except ImportError:
     HAVE_MAMBA_SSM = False
 
 try:
-    from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_combined_varlen
+    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
     HAVE_SSM_OPS_VARLEN = True
 except ImportError:
@@ -837,7 +837,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         conv_bias = self.cp.get_conv1d_bias().to(conv_state_dtype)
 
         xBC_pre_conv = xBC if intermediate_conv_out is not None else None
-        from megatron.core.ssm.ops.causal_conv1d_varlen import causal_conv1d_varlen_fn
+        from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
         xBC_out = causal_conv1d_varlen_fn(
             x=xBC.squeeze(0).contiguous(),

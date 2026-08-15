@@ -334,6 +334,7 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
 
     with TempNamedDir(tmp_path_dist_ckpt / "test_save_checkpoint", sync=True) as save_dir:
         args.save = save_dir
+        args.save_tokenizer_assets = False
         set_args(args)
 
         save_checkpoint(
@@ -370,6 +371,7 @@ def test_load_checkpoint(
     with TempNamedDir(tmp_path_dist_ckpt / "test_load_checkpoint", sync=True) as ckpt_dir:
         args.load = ckpt_dir
         args.save = ckpt_dir
+        args.save_tokenizer_assets = False
         set_args(args)
 
         # Create and save a checkpoint first.
@@ -417,6 +419,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
     ) as ckpt_dir:
         args.load = ckpt_dir
         args.save = ckpt_dir
+        args.save_tokenizer_assets = False
         set_args(args)
 
         # Create and save a checkpoint first.
