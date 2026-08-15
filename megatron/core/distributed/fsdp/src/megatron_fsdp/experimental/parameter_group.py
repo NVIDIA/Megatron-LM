@@ -93,6 +93,7 @@ class FsdpParameterGroup:
         mesh: DeviceMesh,
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
+        allgather_stream: torch.cuda.Stream,
         reduce_scatter_stream: torch.cuda.Stream,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
@@ -105,6 +106,7 @@ class FsdpParameterGroup:
             mesh: Device mesh used for all DBuffer storage in this version.
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
+            allgather_stream: Stream on which to allocate the model-weight buffer.
             reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
             use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
@@ -163,10 +165,15 @@ class FsdpParameterGroup:
         else:
             self._symm_mem_pool = None
 
-        # Match the optimizer post-step and checkpoint-load state: compute weights
-        # begin as a cast of the optimizer weights and are restored to their
-        # configured placements by the first pre-forward unshard.
-        self.model_weight = self.main_weight.cast(self.dtype)
+        current_stream = torch.cuda.current_stream(allgather_stream.device)
+        allgather_stream.wait_stream(current_stream)
+        with torch.cuda.stream(allgather_stream):
+            # Match the optimizer post-step and checkpoint-load state: compute weights
+            # begin as a cast of the optimizer weights and are restored to their
+            # configured placements by the first pre-forward unshard.
+            self.model_weight = self.main_weight.cast(self.dtype)
+        current_stream.wait_stream(allgather_stream)
+
         with self._symmetric_memory_context():
             self._unsharded_model_weight = DBuffer(
                 mesh=self.mesh,

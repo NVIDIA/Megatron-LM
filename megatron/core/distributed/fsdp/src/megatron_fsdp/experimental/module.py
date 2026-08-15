@@ -182,6 +182,7 @@ class FsdpModule:
                 mesh=mesh,
                 placements=placements,
                 mixed_precision_policy=mixed_precision_policy,
+                allgather_stream=context.allgather_stream,
                 reduce_scatter_stream=context.reduce_scatter_stream,
                 grad_divisor=grad_divisor,
                 use_symmetric_memory=use_symmetric_memory,
