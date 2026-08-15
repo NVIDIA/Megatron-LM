@@ -477,7 +477,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             # ``hidden_states`` is [seq_len, batch, dim]; THD requires batch=1.
             assert batch_size == 1, "Packed sequences require batch=1 (THD/varlen format)."
 
-        y = self._gdp_training(
+        y = self._gdp_chunk_forward(
             hidden_states,
             conv_state=conv_state,
             ssm_state=ssm_state,
@@ -503,14 +503,16 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             packed_seq_params
         )
 
-    def _gdp_training(self, hidden_states, conv_state=None, ssm_state=None, packed_seq_params=None):
-        """Training forward: input projection, causal conv, QKV preparation, and the
-        chunked gated delta product kernel, with optional in_proj/QKV recompute and
-        fine-grained activation offloading of the causal conv input.
+    def _gdp_chunk_forward(
+        self, hidden_states, conv_state=None, ssm_state=None, packed_seq_params=None
+    ):
+        """Chunked-kernel forward, shared by training and static-batching prefill: input
+        projection, causal conv, QKV preparation, and the chunked gated delta product
+        kernel, with optional in_proj/QKV recompute and fine-grained activation
+        offloading of the causal conv input.
 
-        Static-batching prefill runs the same computation and passes conv_state and
-        ssm_state so the trailing conv window and the final recurrent state are cached
-        for the decode steps.
+        Prefill passes conv_state and ssm_state so the trailing conv window and the final
+        recurrent state are cached for the decode steps.
         """
         if self.recompute_in_proj:
             # Checkpoint the input projection and its preprocessing, discard the z, VKQ,
@@ -685,8 +687,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             x = causal_conv1d_update(
                 x,
                 conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
+                rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                self.cp.get_conv1d_bias(),
                 self.activation,
                 conv_state_indices=conv_state_indices,
             )
@@ -801,9 +803,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
     # ``_static_decode`` implements legacy static-batching decode. It is
     # deliberately kept separate from the dynamic inference hooks below so that
     # static-batching bookkeeping does not pollute the interface defined by
-    # ``SSMDynamicInferenceMixin``. Static-batching prefill shares the training
-    # body in ``forward``, which seeds the conv/SSM state when the caches are
-    # present. Mirrors ``MambaMixer._static_decode``.
+    # ``SSMDynamicInferenceMixin``. Static-batching prefill instead shares
+    # ``_gdp_chunk_forward`` with training, seeding the conv/SSM state when the
+    # caches are present. Mirrors ``MambaMixer._static_decode``.
     # ==================================================================
     def _static_decode(
         self, hidden_states: torch.Tensor, conv_state: torch.Tensor, ssm_state: torch.Tensor
