@@ -326,12 +326,13 @@ needed for the recomputed GEMMs) but never prefetch a successor.
 | File | Change |
 |---|---|
 | `experimental/module.py` | Public lifecycle APIs, fine-grained hooks, `skip_backward_callback`, recompute guard, phase transitions |
-| `experimental/fully_shard.py` | `fine_grained` / `skip_backward_callback` params, hook registration |
+| `experimental/fully_shard.py` | Hook registration and reusable construction contexts for VPP chunks |
 | `mcore_fsdp_adapter.py` | Wire `fine_grained` / `skip_backward_callback`, add `no_sync()`, `_setup_1f1b_overlap_interface()`, per-domain meshes |
 | `megatron_fsdp/utils.py` | Extend `find_megatron_fsdp()` |
 | `optimizer/fully_sharded_optimizer.py` | PP/VPP model-chunk support |
 | `distributed/finalize_model_grads.py` | Gradient finalization for the overlap path |
-| `pipeline_parallel/combined_1f1b.py` | No changes (schedule contract already exists) |
+| `pipeline_parallel/combined_1f1b.py` | Select forward/backward FSDP callbacks from their respective VPP chunks |
+| `training.py`, `training/models/dist_utils.py` | Construct all MFSDP v2 VPP chunks in one shared context |
 
 ---
 
@@ -346,9 +347,9 @@ prefetch a successor and never reshard the current module mid-recompute.
 
 The schedule supports interleaved pipelining
 (`combined_1f1b_schedule_for_interleaved_pipelining`), with the MFSDP v2
-optimizer handling multiple model chunks. Cross-chunk stream/context sharing
-is provided by the follow-up "Share one FsdpContext across VPP model chunks"
-change (PR #123).
+optimizer handling multiple model chunks. The wrapping paths open one ambient
+`fully_shard_context`; each chunk adapter joins it with `reuse_existing=True`,
+so all chunks share communication streams and cross-root prefetch orders.
 
 ### 7.3 `fsdp_double_buffer` incompatibility
 

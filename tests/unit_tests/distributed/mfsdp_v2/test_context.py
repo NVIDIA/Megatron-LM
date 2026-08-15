@@ -237,6 +237,42 @@ def test_fully_shard_context_rejects_nesting(distributed_setup):
     assert model[1].context is outer_context
 
 
+def test_vpp_chunks_share_one_context_via_reuse(distributed_setup):
+    """Per-chunk adapter scopes should join one outer VPP construction context."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    chunks = [MultiChildModel(dim=4, num_children=2).to(device) for _ in range(2)]
+
+    with fully_shard_context(device=device) as outer:
+        for chunk in chunks:
+            with fully_shard_context(device=device, reuse_existing=True) as reused:
+                assert reused is outer
+                fully_shard(chunk, mesh=mesh, placements=_flat_placements())
+
+    for chunk in chunks:
+        assert chunk.context is outer
+        assert chunk.is_root()
+    assert list(outer.forward_order) == chunks
+    assert list(outer.backward_order) == list(reversed(chunks))
+    assert chunks[0].context.allgather_stream is chunks[1].context.allgather_stream
+    assert chunks[0].context.reduce_scatter_stream is chunks[1].context.reduce_scatter_stream
+
+
+def test_reuse_existing_requires_compatible_context(distributed_setup):
+    """A reuse request must match the ambient context's device and memory mode."""
+    device = distributed_setup.device
+
+    with fully_shard_context(device=device):
+        with pytest.raises(RuntimeError, match="does not support nesting"):
+            with fully_shard_context(device=torch.device("cpu"), reuse_existing=True):
+                pass
+        with pytest.raises(RuntimeError, match="does not support nesting"):
+            with fully_shard_context(
+                device=device, reuse_existing=True, use_symmetric_memory=True
+            ):
+                pass
+
+
 def test_fully_shard_rejects_child_from_another_context(distributed_setup):
     """A parent cannot join a context different from an FSDP child context."""
     device = distributed_setup.device

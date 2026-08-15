@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from contextlib import nullcontext
 from typing import Any, Callable
 
 import torch
@@ -11,6 +12,7 @@ from megatron.core.distributed import (
     DistributedDataParallelConfig,
     FullyShardedDataParallel,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
 from megatron.core.full_cuda_graph import get_shared_capture_stream
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
@@ -30,7 +32,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_model_config, get_pg_rank
-
 
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
@@ -351,56 +352,66 @@ def _ddp_wrap(
         if not use_torch_fsdp2:
             dp_init_kwargs["pg_collection"] = pg_collection
 
+        # The factory resolves to MFSDP v2 from ddp_config. Under VPP, open one
+        # ambient context so every per-chunk adapter joins the same streams and
+        # cross-root prefetch orders.
+        wrap_v2_shared_context = (
+            DP is FullyShardedDataParallel
+            and ddp_config.megatron_fsdp_version == 2
+            and len(model) > 1
+        )
+        fsdp_context_cm = (
+            fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub)
+            if wrap_v2_shared_context
+            else nullcontext()
+        )
+
         wrapped_model = []
-        for model_chunk_idx, model_chunk in enumerate(model):
-            chunk_kwargs = dict(dp_init_kwargs)
-            disable_bucketing = (
-                (model_chunk_idx > 0)
-                or overlap_param_gather_with_optimizer_step
-            )
-
-            # Pre-compute parameter layouts for the distributed optimizer.
-            # Only pass to DDP; FSDP variants don't accept full_param_layout.
-            if ddp_config.use_distributed_optimizer and DP is DistributedDataParallel:
-                all_params = [
-                    p for p in model_chunk.parameters() if p.requires_grad
-                ]
-                pp_rank = pg_collection.pp.rank()
-                effective_bucket_size = (
-                    None
-                    if disable_bucketing or pp_rank > 0
-                    else ddp_config.bucket_size
-                )
-                # Size the layout by the group the optimizer actually shards over, which is
-                # the intra-instance group when there are several optimizer instances. Using
-                # the full dp_cp would report more shards than the reduce-scatter uses and
-                # leave the trailing shard of every bucket owned by no rank.
-                intra_dp_cp_group = getattr(pg_collection, "intra_dp_cp", None)
-                intra_expt_dp_group = getattr(pg_collection, "intra_expt_dp", None)
-                chunk_kwargs["full_param_layout"] = compute_full_param_layout(
-                    all_params,
-                    effective_bucket_size,
-                    (
-                        intra_dp_cp_group
-                        if intra_dp_cp_group is not None
-                        else pg_collection.dp_cp
-                    ).size(),
-                    ddp_config,
-                    expert_data_parallel_world_size=(
-                        intra_expt_dp_group
-                        if intra_expt_dp_group is not None
-                        else pg_collection.expt_dp
-                    ).size(),
+        with fsdp_context_cm:
+            for model_chunk_idx, model_chunk in enumerate(model):
+                chunk_kwargs = dict(dp_init_kwargs)
+                disable_bucketing = (
+                    (model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step
                 )
 
-            wrapped_chunk = DP(
-                config=get_model_config(model_chunk),
-                ddp_config=ddp_config,
-                module=model_chunk,
-                disable_bucketing=disable_bucketing,
-                **chunk_kwargs,
-            )
-            wrapped_model.append(wrapped_chunk)
+                # Pre-compute parameter layouts for the distributed optimizer.
+                # Only pass to DDP; FSDP variants don't accept full_param_layout.
+                if ddp_config.use_distributed_optimizer and DP is DistributedDataParallel:
+                    all_params = [p for p in model_chunk.parameters() if p.requires_grad]
+                    pp_rank = pg_collection.pp.rank()
+                    effective_bucket_size = (
+                        None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
+                    )
+                    # Size the layout by the group the optimizer actually shards over, which is
+                    # the intra-instance group when there are several optimizer instances. Using
+                    # the full dp_cp would report more shards than the reduce-scatter uses and
+                    # leave the trailing shard of every bucket owned by no rank.
+                    intra_dp_cp_group = getattr(pg_collection, "intra_dp_cp", None)
+                    intra_expt_dp_group = getattr(pg_collection, "intra_expt_dp", None)
+                    chunk_kwargs["full_param_layout"] = compute_full_param_layout(
+                        all_params,
+                        effective_bucket_size,
+                        (
+                            intra_dp_cp_group
+                            if intra_dp_cp_group is not None
+                            else pg_collection.dp_cp
+                        ).size(),
+                        ddp_config,
+                        expert_data_parallel_world_size=(
+                            intra_expt_dp_group
+                            if intra_expt_dp_group is not None
+                            else pg_collection.expt_dp
+                        ).size(),
+                    )
+
+                wrapped_chunk = DP(
+                    config=get_model_config(model_chunk),
+                    ddp_config=ddp_config,
+                    module=model_chunk,
+                    disable_bucketing=disable_bucketing,
+                    **chunk_kwargs,
+                )
+                wrapped_model.append(wrapped_chunk)
         model = wrapped_model
 
     # Ensure initialization-stream work completes before touching params on the default stream.
