@@ -91,7 +91,7 @@ class FsdpParameterGroup:
     requires_grad: bool
     main_weight: DBuffer
     model_weight: DBuffer | None
-    main_grad: DBuffer | None
+    _main_grad: DBuffer | None
     _unsharded_model_weight: DBuffer | None
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
@@ -192,30 +192,16 @@ class FsdpParameterGroup:
             use_symmetric_memory,
         )
 
-        self.main_grad = None
+        self._main_grad = None
+        self._main_grad_dtype = None
         self._grad_dtensor_cache = []
         self._grad_dtensor_cache_main_grad_id = None
         if self.requires_grad:
-            grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
-            # Keep main_grad persistent for the initial implementation. For micro-batch
-            # size 1, this allocation could be delayed until post_backward and then
-            # eagerly deallocated right after optimizer.step(), avoiding main_grad
-            # storage during forward. That requires a separate lifetime contract with
-            # the optimizer, so this version keeps the simpler persistent buffer.
-            with torch.cuda.stream(reduce_scatter_stream):
-                self.main_grad = DBuffer(
-                    mesh=self.mesh,
-                    placements=main_grad_placements,
-                    tensor_shapes=self.main_weight.layout.tensor_shapes,
-                    dtype=grad_dtype,
-                    device=self.main_weight.device,
-                )
-            assert self.main_grad.layout == self.main_weight.layout, (
-                "main_grad is built from main_weight tensor shapes on the same mesh, "
-                "and DBuffer layouts are deterministic from those shapes and mesh size."
-            )
+            # main_grad itself is materialized lazily by the property below; only its
+            # dtype and placement metadata are recorded here. See that property for why.
+            self._main_grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
         fsdp_parameters: list[FsdpParameter] = []
-        main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
+        main_grad_dtype = self._main_grad_dtype
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
             unsharded_tensor = (
                 self._unsharded_model_weight.get_local_tensor(index)
@@ -313,8 +299,12 @@ class FsdpParameterGroup:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.sharded)
 
     def _switch_to_unsharded_parameters(self) -> None:
-        for fsdp_parameter in self.fsdp_parameters:
-            self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            self._set_module_parameter(fsdp_parameter.fqns, self._get_unsharded_parameter(index))
+
+    def _get_unsharded_parameter(self, index: int) -> torch.Tensor:
+        """Return the parameter object installed on the module for tensor ``index``."""
+        return self.fsdp_parameters[index].unsharded
 
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
@@ -414,6 +404,47 @@ class FsdpParameterGroup:
         if self._unsharded_model_weight is not None:
             self._unsharded_model_weight.release_storage()
 
+    @property
+    def main_grad(self) -> DBuffer | None:
+        """Sharded gradient buffer, materialized on first access.
+
+        Allocation is deferred to the first backward so that the buffer is created on
+        ``reduce_scatter_stream`` -- the same stream that later frees it when
+        ``reduce_partial_gradients`` rebinds it. Allocating during ``fully_shard()``
+        would bind the block to the caller's stream, typically the default stream. The
+        caching allocator binds a block to its allocation stream, so that buffer would
+        become reusable by default-stream allocations the moment it is dropped here,
+        while the reduce-scatter is still reading it as its input.
+        ``FsdpModule._reshard_parameter_groups`` keeps the same
+        allocate-and-release-on-one-stream invariant for unsharded parameter storage.
+
+        Returns ``None`` for parameter groups that do not require gradients.
+        """
+        if self._main_grad is not None:
+            return self._main_grad
+        if not self.requires_grad:
+            return None
+
+        owning_module = self._owning_module()
+        if owning_module is None:
+            raise RuntimeError("FSDP parameter group outlived its owning module.")
+        assert (
+            torch.cuda.current_stream(self.main_weight.device)
+            == owning_module.context.reduce_scatter_stream
+        ), "main_grad must be allocated on the reduce-scatter stream."
+        self._main_grad = DBuffer(
+            mesh=self.mesh,
+            placements=self._main_grad_placements,
+            tensor_shapes=self.main_weight.layout.tensor_shapes,
+            dtype=self._main_grad_dtype,
+            device=self.main_weight.device,
+        )
+        assert self._main_grad.layout == self.main_weight.layout, (
+            "main_grad is built from main_weight tensor shapes on the same mesh, "
+            "and DBuffer layouts are deterministic from those shapes and mesh size."
+        )
+        return self._main_grad
+
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer.
 
@@ -424,17 +455,21 @@ class FsdpParameterGroup:
         keeps the allocate-on-reduce-scatter-stream + release invariant that
         avoids allocator/symm-mem serialization.
         """
-        assert self.main_grad is not None
+        assert self.requires_grad
 
+        # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
+        # Preserve AVG semantics by reducing SUM and scaling the output below.
+        partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
         grads: list[torch.Tensor] = []
-        for fsdp_parameter in self.fsdp_parameters:
-            if fsdp_parameter.unsharded.grad is None:
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            grad = self._get_unsharded_parameter(index).grad
+            if grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            grads.append(fsdp_parameter.unsharded.grad)
+            grads.append(grad)
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
-                placements=[Partial("avg")] * self.mesh.ndim,
+                placements=[Partial(partial_op)] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
@@ -447,13 +482,13 @@ class FsdpParameterGroup:
             partial_grad.get_local_tensor(index) for index in range(len(self.fsdp_parameters))
         ]
         sources = [
-            self.fsdp_parameters[index].unsharded.grad
+            self._get_unsharded_parameter(index).grad
             for index in range(len(self.fsdp_parameters))
         ]
         if destinations:
             torch._foreach_copy_(destinations, sources)
-        for fsdp_parameter in self.fsdp_parameters:
-            fsdp_parameter.unsharded.grad = None
+        for index in range(len(self.fsdp_parameters)):
+            self._get_unsharded_parameter(index).grad = None
 
     def _has_sharded_grads(self) -> bool:
         has_any_grad = False
@@ -501,7 +536,7 @@ class FsdpParameterGroup:
             assert reset_axis is not None  # the placements differ, so an axis changed
             if isinstance(self.main_grad.placements[reset_axis], Replicate):
                 # HSDP: Replicate -> Partial changes only metadata and reuses the tensor.
-                self.main_grad = self.main_grad.redistribute(self._main_grad_placements)
+                self._main_grad = self.main_grad.redistribute(self._main_grad_placements)
             else:
                 # HFSDP: main_grad was reduce-scattered to the optimizer shard, too small
                 # to hold the accumulation, so re-allocate. This runs inside the
@@ -509,7 +544,7 @@ class FsdpParameterGroup:
                 # so the buffer is allocated on that stream and stays race-safe. Zero it
                 # only when we accumulate (set_to_none=False); with set_to_none=True the
                 # reduction below overwrites it via out=.
-                self.main_grad = DBuffer(
+                self._main_grad = DBuffer(
                     mesh=self.mesh,
                     placements=self._main_grad_placements,
                     tensor_shapes=self.main_weight.layout.tensor_shapes,
@@ -518,6 +553,19 @@ class FsdpParameterGroup:
                 )
                 if has_sharded_grads:
                     self.main_grad.local_buffer.zero_()
+
+        reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
+        if reduce_axis is None:
+            raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
+        partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
+        # Start from the caller's extra divisor (1 unless this group sees more than one
+        # contribution per mesh rank, as expert parallelism does), then add back the axis
+        # size when the collective reduced with SUM instead of averaging.
+        grad_divisor = self.grad_divisor
+        if partial_reduce_op == dist.ReduceOp.SUM:
+            grad_divisor *= self.mesh.size(reduce_axis)
+        if self._symm_mem_pool is not None:
+            partial_grad.rendezvous(reduce_axis)
 
         if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
@@ -529,8 +577,8 @@ class FsdpParameterGroup:
 
         # Scale this backward's contribution before accumulating it so repeated
         # backwards do not repeatedly scale the running total.
-        if self.grad_divisor != 1:
-            reduced_grad.local_buffer.div_(self.grad_divisor)
+        if grad_divisor != 1:
+            reduced_grad.local_buffer.div_(grad_divisor)
 
         if reduced_grad is not self.main_grad:
             if has_sharded_grads:
@@ -544,7 +592,7 @@ class FsdpParameterGroup:
             assert self.main_grad.allocation_stream == (
                 torch.cuda.current_stream(self.main_grad.device)
             )
-            self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
+            self._main_grad = self.main_grad.redistribute(self.main_weight.placements)
 
         # Make each sharded parameter's .grad consistent with the final main_grad.
         # Reuse cached DTensors where possible: rebinding storage in place avoids
