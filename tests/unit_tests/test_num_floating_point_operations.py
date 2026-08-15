@@ -99,6 +99,24 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     return args
 
 
+def _make_ling_hybrid_args(pattern):
+    """Minimal direct-KDA/MLA dimensions for hybrid FLOPs tests."""
+    args = _make_hybrid_args()
+    args.hybrid_layer_pattern = pattern
+    args.linear_key_head_dim = 32
+    args.linear_value_head_dim = 32
+    args.linear_num_key_heads = 8
+    args.linear_num_value_heads = 8
+    args.linear_conv_kernel_dim = 4
+    args.q_lora_rank = 128
+    args.qk_head_dim = 48
+    args.qk_pos_emb_head_dim = 16
+    args.kv_lora_rank = 256
+    args.v_head_dim = 64
+    args.attention_output_gate = True
+    return args
+
+
 class TestBSHDBackwardCompat:
     """For unpacked BSHD, the new optional arg must not change the result."""
 
@@ -378,6 +396,55 @@ class TestHybridMatchesStandard:
             args.v_head_dim = 64
 
         self._assert_match(configure)
+
+
+class TestLingHybridAttentionFlops:
+    """KDA and MLA layers must contribute to Ling-V3 Tiny MFU accounting."""
+
+    def test_kda_direct_projection_formula(self):
+        args = _make_ling_hybrid_args("K")
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        qk_dim = args.linear_key_head_dim * args.linear_num_key_heads
+        v_dim = args.linear_value_head_dim * args.linear_num_value_heads
+        in_proj_dim = 3 * qk_dim + 2 * v_dim
+        kda_forward = (
+            2
+            * total_tokens
+            * (
+                args.hidden_size * (in_proj_dim + args.linear_num_key_heads)
+                + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                + args.hidden_size * v_dim
+            )
+        )
+        kda_forward += (
+            8
+            * total_tokens
+            * args.linear_num_key_heads
+            * args.linear_key_head_dim
+            * args.linear_value_head_dim
+        )
+        logits_forward = 2 * total_tokens * args.hidden_size * args.padded_vocab_size
+
+        assert num_floating_point_operations(args, batch_size) == 3 * (kda_forward + logits_forward)
+
+    def test_mla_uses_ragged_attention_work(self):
+        args = _make_ling_hybrid_args("+")
+        batch_size = 2
+        bshd_sum = batch_size * args.seq_length**2
+        flops_full = num_floating_point_operations(
+            args, batch_size, seqlen_squared_sum_in_batch=bshd_sum
+        )
+        flops_half = num_floating_point_operations(
+            args, batch_size, seqlen_squared_sum_in_batch=bshd_sum // 2
+        )
+        expected_delta = (
+            3
+            * (bshd_sum // 2)
+            * args.num_attention_heads
+            * (args.qk_head_dim + args.qk_pos_emb_head_dim + args.v_head_dim)
+        )
+        assert flops_full - flops_half == expected_delta
 
 
 class TestPaddingRemoval:

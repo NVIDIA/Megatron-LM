@@ -606,6 +606,7 @@ def num_floating_point_operations(
         qk_head_dim,
         qk_pos_emb_head_dim,
         v_head_dim,
+        attention_output_gate=False,
     ):
         """Calculate FLOPs for a Multi-Latent Attention (MLA) layer.
 
@@ -615,9 +616,8 @@ def num_floating_point_operations(
         ``attn_layer_flops`` above assumes dense MHA/GQA QKV projections and
         badly overcounts MLA, whose Q/KV go through low-rank ``lora`` ranks.
 
-        Returns a forward-equivalent value (FMA factor 2 baked in, NO fwd+bwd
-        factor): the caller (``hybrid_flops``) applies the global ``* 3`` for
-        forward + wgrad + dgrad, exactly as for the other layer types.
+        Returns a forward-equivalent value (FMA factor 2 baked in, no
+        forward/backward factor): hybrid_flops applies the global factor 3.
         """
         fma = 2
         if q_lora_rank is None:
@@ -632,6 +632,7 @@ def num_floating_point_operations(
             + kv_lora_rank * (hidden_size + num_heads * (qk_head_dim + v_head_dim) + 1)
             + hidden_size * qk_pos_emb_head_dim
             + (num_heads * v_head_dim) * hidden_size
+            + (hidden_size * num_heads if attention_output_gate else 0)
         )
         # Core attention (L^2) part: QK^T and (softmax(QK^T))V. /2 (causal) cancels *2 (FMA).
         core = fma * (
@@ -685,11 +686,43 @@ def num_floating_point_operations(
             )
         )
 
+    def kda_layer_flops(
+        total_tokens,
+        hidden_size,
+        qk_head_dim=128,
+        v_head_dim=128,
+        num_qk_heads=16,
+        num_v_heads=16,
+        conv_kernel_dim=4,
+    ):
+        """Calculate FLOPs for a direct-projection Kimi Delta Attention layer."""
+        if num_qk_heads != num_v_heads or qk_head_dim != v_head_dim:
+            raise ValueError(
+                "KDA FLOPs require the equal K/V head layout enforced by KimiDeltaAttention."
+            )
+        qk_dim = qk_head_dim * num_qk_heads
+        v_dim = v_head_dim * num_v_heads
+        in_proj_dim = 3 * qk_dim + 2 * v_dim
+        non_core_flops = (
+            2
+            * total_tokens
+            * (
+                hidden_size * (in_proj_dim + num_qk_heads)
+                + conv_kernel_dim * (2 * qk_dim + v_dim)
+                + hidden_size * v_dim
+            )
+        )
+        state_update_flops = num_v_heads * (qk_head_dim**2 + 3 * qk_head_dim * v_head_dim)
+        core_flops = 2 * total_tokens * state_update_flops
+        return non_core_flops + core_flops
+
     def hybrid_flops(
         total_tokens,
         seqlen_squared_sum,
         hidden_size,
         num_attn_layers,
+        num_mla_layers,
+        num_kda_layers,
         num_mamba_layers,
         num_mlp_layers,
         num_moe_layers,
@@ -713,6 +746,11 @@ def num_floating_point_operations(
         gdn_num_qk_heads=16,
         gdn_num_v_heads=32,
         gdn_conv_kernel_dim=4,
+        kda_qk_head_dim=128,
+        kda_v_head_dim=128,
+        kda_num_qk_heads=16,
+        kda_num_v_heads=16,
+        kda_conv_kernel_dim=4,
         vocab_size=256000,
         mtp_num_layers=0,
         multi_latent_attention=False,
@@ -721,6 +759,7 @@ def num_floating_point_operations(
         qk_head_dim=0,
         qk_pos_emb_head_dim=0,
         v_head_dim=0,
+        attention_output_gate=False,
         experimental_attention_variant=None,
         dsv4_n_layers_r0=0,
         dsv4_n_layers_r4=0,
@@ -737,10 +776,8 @@ def num_floating_point_operations(
         # Self-attention (already summed over all attention layers, fwd-equivalent
         # with the FMA factor baked in; the global ``* 3`` below adds fwd+bwd).
         if experimental_attention_variant == "dsv4_hybrid":
-            # DSv4 attention (Window/CSA/HCA) is MLA-based but runs SPARSE
-            # attention, not full O(L^2) MLA. Use the shared helper -- the single
-            # source of truth also used by ``transformer_flops`` -- so both code
-            # paths agree. Window/CSA/HCA layer counts come from the pattern.
+            # DSv4 uses sparse MLA attention. Keep the shared helper as the
+            # single source of truth for both HybridModel and GPTModel.
             dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
                 hidden_size=hidden_size,
                 num_attention_heads=num_attn_heads,
@@ -760,30 +797,60 @@ def num_floating_point_operations(
             attn_flops_total = 2 * (
                 dsv4_token_term * total_tokens + dsv4_core_term * seqlen_squared_sum
             )
-        elif multi_latent_attention:
-            attn_flops_total = num_attn_layers * mla_attn_layer_flops(
-                total_tokens,
-                seqlen_squared_sum,
-                hidden_size,
-                num_attn_heads,
-                q_lora_rank,
-                kv_lora_rank,
-                qk_head_dim,
-                qk_pos_emb_head_dim,
-                v_head_dim,
-            )
         else:
-            attn_flops_total = num_attn_layers * attn_layer_flops(
+            if multi_latent_attention:
+                plain_attn_layer_flops = mla_attn_layer_flops(
+                    total_tokens,
+                    seqlen_squared_sum,
+                    hidden_size,
+                    num_attn_heads,
+                    q_lora_rank,
+                    kv_lora_rank,
+                    qk_head_dim,
+                    qk_pos_emb_head_dim,
+                    v_head_dim,
+                    attention_output_gate,
+                )
+            else:
+                plain_attn_layer_flops = attn_layer_flops(
+                    total_tokens,
+                    seqlen_squared_sum,
+                    hidden_size,
+                    num_attn_heads,
+                    gqa,
+                    gqa_groups,
+                    kv_channels,
+                )
+            attn_flops_total = num_attn_layers * plain_attn_layer_flops
+            if num_mla_layers:
+                attn_flops_total += num_mla_layers * mla_attn_layer_flops(
+                    total_tokens,
+                    seqlen_squared_sum,
+                    hidden_size,
+                    num_attn_heads,
+                    q_lora_rank,
+                    kv_lora_rank,
+                    qk_head_dim,
+                    qk_pos_emb_head_dim,
+                    v_head_dim,
+                    attention_output_gate,
+                )
+
+        kda_flops_total = 0
+        if num_kda_layers:
+            kda_flops_total = num_kda_layers * kda_layer_flops(
                 total_tokens,
-                seqlen_squared_sum,
                 hidden_size,
-                num_attn_heads,
-                gqa,
-                gqa_groups,
-                kv_channels,
+                kda_qk_head_dim,
+                kda_v_head_dim,
+                kda_num_qk_heads,
+                kda_num_v_heads,
+                kda_conv_kernel_dim,
             )
+
         flops_fwd = (
             attn_flops_total
+            + kda_flops_total
             + num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size, mlp_expansion, swiglu)
             + num_mamba_layers
             * mamba_layer_flops(
@@ -817,9 +884,7 @@ def num_floating_point_operations(
             +
             # MTP norms (eh_norm + final_norm) and eh projection (2 * h^2).
             2 * mtp_num_layers * (3 * hidden_size + 2 * hidden_size * hidden_size) * total_tokens
-            + (
-                2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
-            )  # logits computation
+            + 2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
         )
         return flops_fwd * 3
 
@@ -1169,34 +1234,34 @@ def num_floating_point_operations(
 
     # Main entrypoint for FLOPs calculation.
     if is_hybrid_model(args):
-        # Calculate the number of each type of layer.
-        from operator import itemgetter
-
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             Symbols,
             get_hybrid_layer_counts,
         )
 
         layer_counts = get_hybrid_layer_counts(args.hybrid_layer_pattern)
-        num_mamba_layers, num_gdn_layers, num_mlp_layers, num_moe_layers = itemgetter(
-            Symbols.MAMBA, Symbols.GDN, Symbols.MLP, Symbols.MOE
-        )(layer_counts)
-        # Attention layers = plain ATTENTION ('*') PLUS every MLA variant
-        # (DS_ATTENTION 'D', CSA 'C', HCA 'H', WINDOW 'W'). Previously only '*'
-        # was counted, so a DSv4 pattern (all C/H/W, zero '*') yielded
-        # num_attn_layers=0 and dropped ALL attention FLOPs from the estimate,
-        # roughly halving the reported throughput vs. the gpt_model.
-        num_attn_layers = layer_counts[Symbols.ATTENTION] + sum(
-            layer_counts[s] for s in Symbols.MLA_ATTENTION
-        )
+        num_mamba_layers = layer_counts[Symbols.MAMBA]
+        num_gdn_layers = layer_counts[Symbols.GDN]
+        num_kda_layers = layer_counts[Symbols.KDA]
+        num_mlp_layers = layer_counts[Symbols.MLP]
+        num_moe_layers = layer_counts[Symbols.MOE]
 
-        # DSv4 sparse-attention layer counts by compression ratio, derived from the
-        # pattern symbols: WINDOW -> r0, CSA -> r4, HCA -> r128 (mirrors the
-        # ``csa_compress_ratios`` 0/4/128 buckets used by ``transformer_flops``).
+        # Ling uses + for dense MLA. DSv4 D/C/H/W layers are MLA variants too,
+        # but their sparse attention FLOPs are handled by the DSv4 branch.
+        dsv4_mla_symbols = Symbols.MLA_ATTENTION - {Symbols.MLA}
+        dsv4_mla_layers = sum(layer_counts[symbol] for symbol in dsv4_mla_symbols)
+        num_mla_layers = layer_counts[Symbols.MLA]
+        if args.experimental_attention_variant == "dsv4_hybrid":
+            num_attn_layers = layer_counts[Symbols.ATTENTION] + dsv4_mla_layers
+        else:
+            num_attn_layers = layer_counts[Symbols.ATTENTION]
+            num_mla_layers += dsv4_mla_layers
+
         dsv4_n_layers_r0 = layer_counts[Symbols.WINDOW]
         dsv4_n_layers_r4 = layer_counts[Symbols.CSA]
         dsv4_n_layers_r128 = layer_counts[Symbols.HCA]
         if args.experimental_attention_variant == "dsv4_hybrid":
+            assert num_mla_layers == 0, "dsv4_hybrid does not support dense + MLA layers"
             assert num_attn_layers == (dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128), (
                 "dsv4_hybrid expects all attention layers to be Window/CSA/HCA; "
                 f"got {num_attn_layers} attention layers but only "
@@ -1206,12 +1271,14 @@ def num_floating_point_operations(
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
             mtp_num_layers = 0
-        # Compute hybrid model FLOPs.
+
         return hybrid_flops(
             total_tokens=total_real_tokens_in_batch,
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
             num_attn_layers=num_attn_layers,
+            num_mla_layers=num_mla_layers,
+            num_kda_layers=num_kda_layers,
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
             num_moe_layers=num_moe_layers,
@@ -1243,6 +1310,11 @@ def num_floating_point_operations(
             gdn_num_qk_heads=args.linear_num_key_heads or 16,
             gdn_num_v_heads=args.linear_num_value_heads or 32,
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
+            kda_qk_head_dim=args.linear_key_head_dim or 128,
+            kda_v_head_dim=args.linear_value_head_dim or 128,
+            kda_num_qk_heads=args.linear_num_key_heads or 16,
+            kda_num_v_heads=args.linear_num_value_heads or 16,
+            kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
             multi_latent_attention=args.multi_latent_attention,
@@ -1251,6 +1323,7 @@ def num_floating_point_operations(
             qk_head_dim=args.qk_head_dim,
             qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
             v_head_dim=args.v_head_dim,
+            attention_output_gate=getattr(args, "attention_output_gate", False),
             experimental_attention_variant=args.experimental_attention_variant,
             dsv4_n_layers_r0=dsv4_n_layers_r0,
             dsv4_n_layers_r4=dsv4_n_layers_r4,
