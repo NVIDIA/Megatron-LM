@@ -7,6 +7,7 @@ import torch
 
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
+from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
@@ -27,6 +28,7 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_routing_with_score_function,
     z_loss_func,
 )
+from megatron.core.transformer.moe.router_diagnostics import build_router_diagnostics
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -798,9 +800,14 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
 
-        # Apply each aux loss type and attach aux loss autograd function to probs
-        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
-            # Calculate scores and routing_map for aux loss
+        # Reuse the unbiased aux-loss routing calculation for due router diagnostics.
+        observe_router_diagnostics = is_observing_tensor("router_diagnostics")
+        aux_loss_enabled = self.is_aux_loss_enabled()
+        if (
+            self.training
+            and torch.is_grad_enabled()
+            and (aux_loss_enabled or observe_router_diagnostics)
+        ):
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
                 logits,
                 self.topk,
@@ -808,26 +815,44 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 padding_mask=padding_mask,
             )
-            probs = self._apply_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                with_padding_mask=padding_mask is not None,
-            )
-            probs = self._apply_seq_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                seq_length,
-                bsz,
-                with_padding_mask=padding_mask is not None,
-            )
-            probs = self._apply_global_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                with_padding_mask=padding_mask is not None,
-            )
+            if observe_router_diagnostics:
+                diagnostics = build_router_diagnostics(
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    routing_map,
+                    self.expert_bias,
+                    seq_length,
+                    bsz,
+                    padding_mask=padding_mask,
+                )
+                observe_tensor(
+                    self,
+                    "router_diagnostics",
+                    "router_diagnostics",
+                    diagnostics,
+                    tp_shard_dim=0 if self.config.sequence_parallel else None,
+                )
+            if aux_loss_enabled:
+                probs = self._apply_aux_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    with_padding_mask=padding_mask is not None,
+                )
+                probs = self._apply_seq_aux_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    seq_length,
+                    bsz,
+                    with_padding_mask=padding_mask is not None,
+                )
+                probs = self._apply_global_aux_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    with_padding_mask=padding_mask is not None,
+                )
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
@@ -855,6 +880,34 @@ class TopKRouter(Router):
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
+        tp_shard_dim = 0 if self.config.sequence_parallel else None
+        observe_tensor(
+            self,
+            "router_logits",
+            "router_logits",
+            logits,
+            tp_shard_dim=tp_shard_dim,
+        )
+        # Materialize the full decision distribution only when a due metric requests it.
+        if torch.is_grad_enabled() and is_observing_tensor("router_scores"):
+            with torch.no_grad():
+                if self.score_function == "softmax":
+                    scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+                elif self.score_function == "sigmoid":
+                    scores = torch.sigmoid(logits.float())
+                    scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+                elif self.score_function == "sqrtsoftplus":
+                    scores = torch.nn.functional.softplus(logits.float()).sqrt()
+                    scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+                else:
+                    raise ValueError(f"Invalid score_function: {self.score_function}")
+            observe_tensor(
+                self,
+                "router_scores",
+                "router_scores",
+                scores,
+                tp_shard_dim=tp_shard_dim,
+            )
 
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark

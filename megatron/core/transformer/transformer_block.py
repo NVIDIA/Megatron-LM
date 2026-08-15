@@ -21,6 +21,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
+from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
@@ -645,6 +646,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states = checkpointed_result
             else:
                 for l_no, layer in enumerate(self.layers):
+                    residual_accumulator = hidden_states
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
                         if self.config.fp8:
@@ -676,6 +678,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                         )
+                    observe_layer_residuals(layer, residual_accumulator, hidden_states)
 
                     if (
                         torch.is_grad_enabled()

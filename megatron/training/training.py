@@ -20,6 +20,7 @@ import math
 import os
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -191,6 +192,8 @@ from .utils import (
     to_empty_if_meta_device,
     update_use_dist_ckpt,
 )
+
+_TensorMetricObserverCallback = Callable[..., None]
 
 # Optional dependencies. Each is guarded so the module imports cleanly when the
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
@@ -1100,8 +1103,11 @@ def pretrain(
     store=None,
     inprocess_call_wrapper: Optional[Any] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
-    pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
+    pg_collection: Optional[
+        ProcessGroupCollection | MultiModuleProcessGroupCollection
+    ] = None,
     skip_model_parallel_init=False,
+    tensor_metric_observer: _TensorMetricObserverCallback | None = None,
 ):
     """Main training program.
 
@@ -1144,6 +1150,11 @@ def pretrain(
             torch.distributed.init_process_group
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
+        tensor_metric_observer: Optional callback invoked immediately before each optimizer step.
+            Observers exposing ``observe_forward_backward`` also receive a context around the
+            forward-backward execution. The callback runs on every rank and owns tensor selection,
+            metric execution, and sinks. It overrides any observer selected by
+            ``cfg_container.logger.tensor_metrics``.
     """
     # Capture timestamp right at top of pretrain, before initialize_megatron
     global _STARTUP_TIMESTAMPS
@@ -1181,6 +1192,11 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
+
+    if tensor_metric_observer is None and cfg_container.logger.tensor_metrics:
+        from .tensor_metrics.observer import build_tensor_metric_observer
+
+        tensor_metric_observer = build_tensor_metric_observer(cfg_container.logger.tensor_metrics)
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
@@ -1510,6 +1526,7 @@ def pretrain(
                 inference_model,
                 p2p_communicator=p2p_communicator,
                 pg_collection=pg_collection,
+                tensor_metric_observer=tensor_metric_observer,
             )
 
         print_datetime('after training is done')
@@ -2445,13 +2462,31 @@ def dummy_train_step(data_iterator):
             )
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
+def train_step(
+    forward_step_func,
+    data_iterator,
+    model,
+    optimizer,
+    opt_param_scheduler,
+    config,
+    forward_backward_func,
+    iteration=None,
+    pg_collection: Optional[
+        ProcessGroupCollection | MultiModuleProcessGroupCollection
+    ] = None,
+    p2p_communicator: Optional[P2PCommunicator] = None,
+    tensor_metric_observer: _TensorMetricObserverCallback | None = None,
+):
     """Single training step.
 
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior. Reductions source per-rank groups from the model.
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
+    tensor_metric_observer: optional callback invoked after backward and immediately before the
+        optimizer step. The callback sees finalized but not necessarily unscaled gradients.
+        Observers exposing ``observe_forward_backward`` also receive a context around the
+        forward-backward execution for short-lived tensors.
     """
     args = get_args()
     timers = get_timers()
@@ -2517,7 +2552,20 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
         grad_context, forward_only = _forward_backward_grad_context(args)
-        with grad_context:
+        tensor_metric_context = nullcontext()
+        observe_forward_backward = getattr(
+            tensor_metric_observer, "observe_forward_backward", None
+        )
+        if observe_forward_backward is not None:
+            metric_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+            if metric_pg_collection is None:
+                metric_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+            tensor_metric_context = observe_forward_backward(
+                model=model,
+                iteration=iteration,
+                pg_collection=metric_pg_collection,
+            )
+        with grad_context, tensor_metric_context:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
@@ -2581,6 +2629,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
+
+    if tensor_metric_observer is not None:
+        metric_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+        if metric_pg_collection is None:
+            metric_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tensor_metric_observer(
+            model=model,
+            optimizer=optimizer,
+            iteration=iteration,
+            pg_collection=metric_pg_collection,
+        )
 
     # Update parameters.
 
@@ -2738,6 +2797,7 @@ def training_log(
     if args.timing_log_level >= 1:
         timers_to_log.extend([
             'forward-backward',
+            'tensor-metrics',
             'layernorm-grads-all-reduce',
             'embedding-grads-all-reduce',
             'all-grads-sync',
@@ -3464,7 +3524,10 @@ def train(
     non_loss_data_func,
     inference_model=None,
     p2p_communicator: Optional[P2PCommunicator] = None,
-    pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
+    pg_collection: Optional[
+        ProcessGroupCollection | MultiModuleProcessGroupCollection
+    ] = None,
+    tensor_metric_observer: _TensorMetricObserverCallback | None = None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -3472,6 +3535,7 @@ def train(
         preserves the default behavior.
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior.
+    tensor_metric_observer: optional callback forwarded to each training step.
     """
     args = get_args()
     timers = get_timers()
@@ -3968,9 +4032,17 @@ def train(
                 num_zeros_in_grad,
                 max_attention_logit,
             ) = train_step(
-                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
+                forward_step_func,
+                train_data_iterator,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                config,
+                forward_backward_func,
+                iteration=iteration,
                 pg_collection=pg_collection,
                 p2p_communicator=p2p_communicator,
+                tensor_metric_observer=tensor_metric_observer,
             )
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:

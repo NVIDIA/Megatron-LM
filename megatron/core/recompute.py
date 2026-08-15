@@ -9,6 +9,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -75,6 +76,7 @@ def checkpointed_forward(
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
                 layer = self.layers[index]
+                residual_accumulator = hidden_states
 
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
@@ -118,6 +120,7 @@ def checkpointed_forward(
                 # Some layer paths may still return a tuple (defensive).
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+                observe_layer_residuals(layer, residual_accumulator, hidden_states)
             return hidden_states, context
 
         return custom_forward
