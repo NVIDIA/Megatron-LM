@@ -612,6 +612,15 @@ def _fine_grained_pre_forward_hook(submodule: nn.Module, args, kwargs) -> None:
     if target._unshard_event is not None:
         target.context.current_stream().wait_event(target._unshard_event)
 
+    # Fine-grained schedules bypass FsdpModule.pre_forward(), so issue the same
+    # one-module lookahead here. This queues the next all-gather before the current
+    # module's post-forward storage-release barrier reaches the all-gather stream.
+    is_recomputing = target.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
+    if not is_recomputing:
+        next_module = target.context.forward_order.next_item(target)
+        if next_module is not None:
+            next_module._unshard_parameter_groups()
+
 
 def _register_fine_grained_backward_hooks(fsdp_module: FsdpModule) -> None:
     """Register pre-backward hooks on every sub-module of *fsdp_module*.
