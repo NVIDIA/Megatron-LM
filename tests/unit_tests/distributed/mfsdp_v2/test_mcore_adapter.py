@@ -257,7 +257,6 @@ class TestMcoreAdapterDense:
         assert torch.isfinite(reference_losses).all()
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
 
-
     def test_fused_sgd_casts_mismatched_grads(self):
         """FusedSGD steps after MCore casts V2's BF16 gradients to FP32."""
         config = TransformerConfig(
