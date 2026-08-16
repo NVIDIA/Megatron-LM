@@ -224,6 +224,9 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
             b_virtual_microbatch_id, b_model_chunk_id
         )
 
+    # Forward and backward may target different virtual-pipeline chunks. Each
+    # chunk owns its adapter callbacks, while all MFSDP v2 chunks share the
+    # ambient FsdpContext created during wrapping.
     forward_fsdp_wrapper = (
         find_megatron_fsdp(model[f_model_chunk_id]) if f_model_chunk_id is not None else None
     )
@@ -393,13 +396,10 @@ def combined_forward_backward_step(
         # each layer's all-gathered parameters explicitly after its compute.
         # Only needed for optim_grads_params strategy (where params are sharded).
         forward_fsdp_wrapper = find_megatron_fsdp(f_model)
-        forward_ddp_config = getattr(forward_fsdp_wrapper, "ddp_config", None)
         if (
             forward_fsdp_wrapper is not None
-            and (
-                forward_ddp_config is None
-                or forward_ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
-            )
+            and forward_fsdp_wrapper.ddp_config.data_parallel_sharding_strategy
+            == "optim_grads_params"
         ):
             for i in range(f_schedule_plan.num_layers()):
                 layer_plan = f_schedule_plan.get_layer(i)

@@ -1,5 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+"""End-to-end parity of M-FSDP v2 against a distributed-optimizer reference.
+
+Trains the same small GPT/Hybrid model under M-FSDP v2 and under a plain
+distributed optimizer and compares per-step losses and parameter snapshots,
+across activation recompute, EP 1F1B overlap, and PP2/VPP2 interleaving.
+"""
+
 import pytest
 import torch
 from torch.distributed.tensor import DTensor
@@ -185,6 +192,7 @@ class TestMegatronFSDPE2E:
                     "model_parallel_config": {"expert_model_parallel_size": 2},
                     "model_config": {
                         "data_parallel_sharding_strategy": "optim_grads_params",
+                        "clip_grad": 0.0,
                         "recompute_granularity": "full",
                         "recompute_method": "uniform",
                         "recompute_num_layers": 1,
@@ -202,6 +210,7 @@ class TestMegatronFSDPE2E:
                     "model_config": {
                         "bf16": True,
                         "data_parallel_sharding_strategy": "optim_grads_params",
+                        "clip_grad": 0.0,
                         "megatron_fsdp_main_grads_dtype": torch.float32,
                         "moe_grouped_gemm": True,
                         "moe_token_dispatcher_type": "alltoall",
@@ -225,6 +234,7 @@ class TestMegatronFSDPE2E:
                     "model_config": {
                         "bf16": True,
                         "data_parallel_sharding_strategy": "optim_grads_params",
+                        "clip_grad": 0.0,
                         "megatron_fsdp_main_grads_dtype": torch.float32,
                         "moe_grouped_gemm": True,
                         "moe_token_dispatcher_type": "alltoall",

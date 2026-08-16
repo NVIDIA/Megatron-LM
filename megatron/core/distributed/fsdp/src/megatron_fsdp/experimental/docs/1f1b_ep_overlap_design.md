@@ -1,9 +1,9 @@
-# 1F1B EP Overlap — M-FSDP v2 Integration Design
+# 1F1B EP Overlap — MFSDP v2 Integration Design
 
-This document describes the FSDP-side contract required by the 1F1B EP-overlap
-schedule (`combined_1f1b`) and how the experimental Megatron FSDP
-(`megatron_fsdp.experimental`) must fulfil it.  The v1 implementation
-(`megatron_fsdp`) is used as a reference for the contract.
+This document describes how the experimental Megatron FSDP v2
+(`megatron_fsdp.experimental`) integrates with the 1F1B EP-overlap schedule
+(`combined_1f1b`). The v1 implementation (`megatron_fsdp`) defines the
+schedule-facing contract; this PR implements the same contract for v2.
 
 ---
 
@@ -11,7 +11,7 @@ schedule (`combined_1f1b`) and how the experimental Megatron FSDP
 
 ### Normal FSDP flow
 
-Hooks fire on `TransformerLayer`:
+FSDP hooks fire on `TransformerLayer`:
 
 ```
 TransformerLayer.forward()
@@ -23,9 +23,6 @@ backward()
   → compute grads
   → post_backward hook: reshard_parameters() + reduce_grad()
 ```
-
-FSDP hooks are registered on the `TransformerLayer` and `register_multi_grad_hook`
-captures its output tensors.
 
 ### EP overlap flow
 
@@ -42,234 +39,143 @@ combined_forward_backward_step()
 
 Because the schedule invokes sub-modules (`attn`, `mlp`, `moe_dispatch`,
 `moe_combine`) directly, FSDP hooks registered on `TransformerLayer` are
-**never triggered**.  FSDP must expose manual management APIs that the schedule
+**never triggered**. FSDP must expose manual management APIs that the schedule
 calls explicitly at the right moments.
 
 ### Key flags
 
 | Flag | What it does |
 |---|---|
-| `--overlap-moe-expert-parallel-comm` | Enables the combined 1F1B schedule. |
+| `--overlap-moe-expert-parallel-comm` | Enables the combined 1F1B schedule and fine-grained FSDP hooks. |
 | `--delay-wgrad-compute` | TE layers postpone weight gradient computation until `backward_dw()`. FSDP must defer `reduce_grad()` until after `backward_dw()`. |
 
 ### Why `delay_wgrad_compute` matters for FSDP
 
-When `delay_wgrad_compute=True`, the normal per-param `post_accumulate_grad_hook`
-fires **before** `backward_dw()` writes weight gradients.  This corrupts `.grad`
-if gradient reduction happens at the wrong time.  FSDP must skip the autograd
-backward callback and let the schedule's explicit `post_backward_release_module()`
-call handle reduction **after** `backward_dw()` completes.
+With `delay_wgrad_compute=True`, the per-param `post_accumulate_grad_hook`
+fires when activation gradients are ready, **before** `backward_dw()` writes
+weight gradients. Reducing at that point would reduce only partial gradients.
+FSDP v2 therefore skips the autograd final-callback path for this schedule and
+lets the schedule's explicit `post_backward_release_module()` call handle
+reduction **after** `backward_dw()` completes.
 
 ---
 
 ## 1. Schedule Integration Contract
 
-The schedule in `combined_1f1b.py` has five injection points where it calls into
-FSDP.  The experimental API must satisfy all five.
+The schedule in `combined_1f1b.py` has five injection points where it calls
+into FSDP. MFSDP v2 satisfies all five.
 
 ### 1.1 Discovery — `find_megatron_fsdp(model)`
 
-**File:** `megatron/core/pipeline_parallel/combined_1f1b.py:68`
+**File:** `megatron_fsdp/utils.py`
 
-```python
-fsdp_wrapper = find_megatron_fsdp(model)
-```
-
-**Contract:** Return the FSDP root object (v1 `MegatronFSDP` instance) or `None`.
-Currently only finds v1 instances (walks `model` looking for `MegatronFSDP`).
-
-**Experimental API requirement:** Extend `find_megatron_fsdp()` (in
-`megatron_fsdp/utils.py`) to detect `FsdpModule` instances:
-
-```python
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-if isinstance(model, FsdpModule):
-    return model
-if hasattr(model, 'module') and isinstance(model.module, FsdpModule):
-    return model.module
-return None
-```
-
-When using the `FullyShardedDataParallelV2` adapter, the schedule passes the
-raw model tree (not the adapter), so the root `FsdpModule` is directly
-discoverable via `isinstance(model, FsdpModule)`.
+`find_megatron_fsdp()` walks the model wrapper chain and returns the first
+FSDP object it finds: a v1 `MegatronFSDP` wrapper, a `FullyShardedDataParallelV2`
+adapter wrapping an `FsdpModule` (`hasattr(m, "ddp_config")`), or a bare
+`FsdpModule`. When the schedule receives the raw model tree, the root
+`FsdpModule` is directly discoverable.
 
 ### 1.2 Pre-schedule setup — `_replace_param_with_raw_if_needed()`
 
-**File:** `combined_1f1b.py:74`
+**File:** `combined_1f1b.py` → `FullyShardedDataParallelV2._replace_param_with_raw_if_needed()`
+
+The schedule calls this once before running. In v1 it swaps optimizer-facing
+DTensor parameters back to raw `nn.Parameter`s. MFSDP v2 always stores raw
+tensors backed by `DBuffer` on the module, so **no parameter swap is needed**;
+the adapter finalizes the root `FsdpContext` instead, ensuring a child FSDP
+unit cannot mistake itself for the root when it executes first:
 
 ```python
-if fsdp_wrapper is not None:
-    fsdp_wrapper._replace_param_with_raw_if_needed()
-```
-
-**Contract:** Swap distributed (optimizer-managed) DTensor parameters back to
-raw `nn.Parameter` tensors so the schedule can access sub-module parameters
-directly.  v1 requires this because it stores optimizer-facing DTensor params
-separate from module params.
-
-**Experimental API requirement:** The experimental API always stores raw tensors
-backed by `DBuffer` on the module, so no parameter swap is needed. Use this
-schedule-entry callback to initialize the root context before any child FSDP
-unit is called directly. Otherwise a child on a middle pipeline stage can run
-first and incorrectly initialize itself as the root:
-
-```python
-# On FsdpModule (module.py)
-def _replace_param_with_raw_if_needed(self) -> None:
-    self.context.ensure_finalized()
+# In FullyShardedDataParallelV2._setup_1f1b_overlap_interface (mcore_fsdp_adapter.py)
+def _replace_param_with_raw_if_needed() -> None:
+    self.module.context.ensure_finalized()
 ```
 
 ### 1.3 Root backward-phase setup — `pre_backward()`
 
-**File:** `combined_1f1b.py:349`
+**File:** `combined_1f1b.py` → `FsdpModule.pre_backward()`
 
-```python
-if fsdp_wrapper is not None and b_model is not None:
-    fsdp_wrapper.pre_backward()
-```
+Called once per overlapped run before backward. MFSDP v2:
 
-**Contract:** Called once before each overlapped forward+backward run. In v1,
-sets training state to `PRE_BACKWARD` on all sub-modules (so forward
-reconstruction during activation recompute doesn't reshard), marks AG buckets
-as releasable, and tracks params requiring gradient handling.  Does **not**
-auto-enqueue the post-backward final callback — the schedule calls it manually.
-
-**Experimental API requirement:** `FsdpModule` already has a private `pre_backward()`
-(method in `module.py`).  Make it public and accept the v1-compatible signature:
-
-```python
-# On FsdpModule (module.py)
-def pre_backward(self) -> None:
-    """Prepare all FSDP parameter groups for backward compute.
-
-    - Unshards parameters (all-gather).
-    - If root: registers post_backward_final_callback.
-    - Resets post_backward_issued flags.
-    """
-```
-
-Called by the schedule as `fsdp_wrapper.pre_backward()`.
+- transitions this module to `Phase.BACKWARD`,
+- if root: registers the post-backward final callback (waits the
+  reduce-scatter stream after autograd) and forks the reduce-scatter stream
+  off the current stream once so later allocations stay legal under
+  CUDA-graph capture,
+- unshards parameters (all-gather) and waits for them,
+- prefetches the next module in `backward_order` (static-order prefetch).
 
 ### 1.4 Per-layer parameter release — `set_fsdp_reshard_hooks()`
 
-**File:** `combined_1f1b.py:405-408`
+**File:** `combined_1f1b.py` → adapter callbacks
 
-```python
-layer_plan.set_fsdp_reshard_hooks(
-    forward_fsdp_wrapper.post_forward_release_module,
-    forward_fsdp_wrapper.post_backward_release_module,
-)
-```
+The schedule attaches two callables per `TransformerLayerSchedulePlan`:
 
-**Contract:** The schedule attaches two callables to each `TransformerLayerSchedulePlan`:
+- **`post_forward_release_module(module)`** — called after the last forward
+  node of a layer; reshard only (no gradient reduction).
+- **`post_backward_release_module(module)`** — called after the last backward
+  node; runs the module's `post_backward()` (reshard + gradient reduction).
 
-- **`post_forward_release_module(module)`** — called after the last forward node
-  of a layer.  Releases all-gathered parameter storage (reshard to DTensor).
-- **`post_backward_release_module(module)`** — called after the last backward node
-  (`pre_dispatch_computation`).  Reshards parameters **and** reduces gradients
-  (copy `.grad` → reduce-scatter → install DTensor `.grad`).
-
-**Experimental API requirement:** Expose two `partial`-wrapped callables on the
-root `FsdpModule`:
-
-```python
-def _post_forward_release(module: FsdpModule) -> None:
-    """Release all-gathered parameters after forward compute."""
-    module.reshard_parameters()
-
-def _post_backward_release(module: FsdpModule) -> None:
-    """Release parameters and reduce gradients after backward compute."""
-    module.reshard_parameters()
-    module.reduce_grad()
-```
-
-Attach as instance attributes:
-```python
-root_module.post_forward_release_module = partial(_post_forward_release)
-root_module.post_backward_release_module = partial(_post_backward_release)
-```
+The `FullyShardedDataParallelV2` adapter binds both through a single
+`release_module(module, *, reduce_grad)` helper (in
+`_setup_1f1b_overlap_interface`) that validates the argument is an
+`FsdpModule`, then calls `module._reshard_parameter_groups()` (forward) or
+`module.post_backward()` (backward). No release helpers live on
+`FsdpModule` itself.
 
 ### 1.5 Root backward finalization — `post_backward()`
 
-**File:** `combined_1f1b.py:510`
+**File:** `combined_1f1b.py` → `FsdpModule.post_backward()`
 
-```python
-if fsdp_wrapper is not None and b_model is not None:
-    fsdp_wrapper.post_backward()
-```
+Called once after each overlapped run completes. `post_backward()` is a
+**no-op unless this module is in the BACKWARD phase** (idempotent — the
+schedule may call it on a module already released). MFSDP v2:
 
-**Contract:** Called once after each overlapped run completes. Handles any
-modules whose per-module post-backward was skipped, drains pending async
-reduce-grad events, resets root state (`backward_phase`, `backward_done_modules`),
-and transitions the bucket allocator from trace → optimized plan.
+- walks the module subtree (excluding itself) and finalizes (reduce +
+  reshard) any submodule `FsdpModule` that is **still in the BACKWARD
+  phase** — i.e. the 1F1B schedule skipped its per-module release,
+- then reduces and reshards this module itself and returns it to `RESTING`.
 
-**Experimental API requirement:** `FsdpModule` already has a private `post_backward()`
-(method in `module.py`).  Make it public:
-
-```python
-# On FsdpModule (module.py)
-def post_backward(self) -> None:
-    """Finalise the backward pass.
-
-    - Handles any parameter groups with pending gradients.
-    - Drains async reduce-scatter events.
-    - Resets root phase state.
-    - Transitions allocator trace → optimized (first microbatch only).
-    """
-```
+The v2 adapter binds `self.post_backward = self.module.post_backward` (no
+arguments).
 
 ### 1.6 Gradient sync suppression — `no_sync_func()`
 
-**File:** `combined_1f1b.py:97`
+**File:** `combined_1f1b.py` → `FullyShardedDataParallelV2.no_sync()`
+
+A context manager that suppresses gradient finalization for non-final
+microbatches so gradients accumulate across inner microbatches:
 
 ```python
-with no_sync_func():
-    for i in range(num_microbatches - 1):
-        combined_forward_backward_step(...)
-```
-
-**Contract:** A context manager that suppresses gradient finalization for
-non-final microbatches (so gradients accumulate across inner microbatches).
-
-**Experimental API requirement:** The experimental API already has
-`FsdpContext.is_last_microbatch` controlled by the `microbatch()` context
-manager.  Add a `no_sync()` method to `FullyShardedDataParallelV2` that
-toggles this flag on all root `FsdpContext` instances:
-
-```python
-# On FullyShardedDataParallelV2 (mcore_fsdp_adapter.py)
 @contextmanager
 def no_sync(self):
-    roots = [m for m in self.module.modules()
-             if isinstance(m, FsdpModule) and m.is_root()]
-    for root in roots:
-        root.context.is_last_microbatch = False
+    self.module.context.ensure_finalized()
+    context = self.module.context
+    previous_state = context.is_last_microbatch
+    context.is_last_microbatch = False
     try:
         yield
     finally:
-        for root in roots:
-            root.context.is_last_microbatch = True
+        context.is_last_microbatch = previous_state
 ```
 
-This automatically wires into `config.no_sync_func` via the existing training
-loop contract.
+This wires into `config.no_sync_func` via the existing training-loop contract.
 
 ---
 
 ## 2. Fine-Grained Hook Registration
 
-When `overlap_moe_expert_parallel_comm=True`, hooks must be registered on
-**every sub-module** of each FSDP unit, not just on the FSDP unit itself.
+With `overlap_moe_expert_parallel_comm=True`, hooks are registered on **every
+sub-module** of each FSDP unit, not just on the FSDP unit itself. This is
+controlled by the `fine_grained` parameter of `fully_shard()` (wired from the
+adapter as `fine_grained = config.overlap_moe_expert_parallel_comm`).
 
 ### 2.1 Pre-forward hooks on sub-modules
 
-Register a pre-forward hook on every sub-module of each `FsdpModule`.  When the
-schedule calls `f_layer.attn.forward()`, the hook fires → resolves the parent
-`FsdpModule` → calls `unshard_parameters()`.
+When the schedule calls `f_layer.attn.forward()`, a pre-forward hook on the
+sub-module fires, resolves the parent `FsdpModule`, and unshards it:
 
 ```python
-# In fully_shard.py or module.py
 def _register_fine_grained_forward_hooks(module: FsdpModule) -> None:
     for submodule in module.modules():
         if _find_fsdp_target(submodule) is not module:
@@ -281,33 +187,26 @@ def _fine_grained_pre_forward(hook_module, args, kwargs):
     target = _find_fsdp_target(hook_module)
     if target is None:
         return
-    target.unshard_parameters()
+    target._unshard_and_prefetch("rowwise")
 ```
 
 ### 2.2 Pre-backward hooks on sub-modules
 
-Register via `register_multi_grad_hook` on each sub-module's output tensors.
-When backward reaches a sub-module, the hook fires → `unshard_parameters()`.
+A `register_full_backward_pre_hook` on each sub-module marks the parent
+`FsdpModule` BACKWARD and unshards it before that sub-module's own backward
+runs, so its weight-gradient computation sees full parameters:
 
 ```python
-def _register_fine_grained_backward_hooks(module: FsdpModule) -> None:
-    for submodule in module.modules():
-        if _find_fsdp_target(submodule) is not module:
-            continue
-        _create_custom_backward_hook(submodule,
-            lambda m, g: _fine_grained_pre_backward(m))
-
-def _fine_grained_pre_backward(hook_module):
-    target = _find_fsdp_target(hook_module)
-    if target is None or target._fsdp_pre_backward_done:
+def _fine_grained_pre_backward_hook(submodule: nn.Module, grad_output) -> None:
+    target = _find_fsdp_target(submodule)
+    if target is None:
         return
-    target._fsdp_pre_backward_done = True
-    target.unshard_parameters()
+    if target.phase is FsdpModule.Phase.RESTING:
+        target.phase = FsdpModule.Phase.BACKWARD
+    target._unshard_and_prefetch("colwise")
 ```
 
 ### 2.3 Wiring from `fully_shard()`
-
-Add a `fine_grained: bool = False` parameter:
 
 ```python
 def fully_shard(module, mesh, placements, *, fine_grained=False, ...):
@@ -317,16 +216,30 @@ def fully_shard(module, mesh, placements, *, fine_grained=False, ...):
         _register_fine_grained_backward_hooks(module)
 ```
 
-### 2.4 Wiring from the adapter
+The adapter passes `fine_grained=config.overlap_moe_expert_parallel_comm` for
+every unit it shards (transformer layers, MoE sub-modules on the expert-DP
+mesh, and the root).
 
-```python
-# In FullyShardedDataParallelV2.__init__()
-fully_shard(
-    submodule, mesh=mesh, placements=placements,
-    mixed_precision_policy=self.mp_policy,
-    fine_grained=config.overlap_moe_expert_parallel_comm,
-)
-```
+### 2.4 Two prefetch execution modes
+
+All eager and fine-grained hooks call the same `_unshard_and_prefetch()`
+path. `FsdpExecutionRunner` selects one of two modes:
+
+- **Static lookahead** (`use_trace_replay=False`, the default): prefetch the
+  next module in `forward_order` or `backward_order`. This is the low-overhead
+  path used by conventional schedules and retains the fine-grained prefetch.
+- **VPP trace-replay** (`use_trace_replay=True`): the first global batch
+  records actual unshard/reshard occurrences without speculative prefetch.
+  Later batches replay that cycle, prefetching the real next VPP consumer and
+  retaining storage across an immediate compatible reuse. A divergence safely
+  falls back to tracing again.
+
+MFSDP v2 enables trace-replay for the combined 1F1B overlap schedule. The
+optimizer calls `complete_fsdp_trace()` after each step to mark the global
+batch boundary. Both paths share the same parameter lifecycle; only successor
+selection and the optional reshard skip differ. VPP chunk adapters share one
+runner, so duplicate boundary notifications without intervening execution are
+idempotent.
 
 ---
 
@@ -334,60 +247,45 @@ fully_shard(
 
 ### Problem
 
-The normal backward path uses per-param `post_accumulate_grad_hook` (registered
-in `FsdpModule._register_hooks()`) to detect when all parameter gradients are
-ready, then calls `post_backward()` which does `reshard_parameters()` +
-`reduce_grad()`.  With `delay_wgrad_compute=True`, this hook fires during
-`backward()` (activation gradients only), but weight gradients are written
-later in `backward_dw()`.  This causes `reduce_grad()` to reduce only partial
-gradients.
+The normal backward path uses per-param `post_accumulate_grad_hook`
+(registered in `FsdpModule._register_hooks()`) to detect when all parameter
+gradients are ready, then calls `post_backward()` which reshards and reduces.
+With `delay_wgrad_compute=True`, this hook fires during `backward()`
+(activation gradients only), but weight gradients are written later in
+`backward_dw()`, so reduction would see partial gradients.
 
 ### Solution
 
-When `skip_backward_callback=True`, do **not** register per-param
-`post_accumulate_grad_hook`.  Instead, rely entirely on the schedule's explicit
-`post_backward_release_module()` call which fires at the correct time (after
-`backward_dw()`).
+When `skip_backward_callback=True`, `_register_hooks()` does **not** register
+per-param `post_accumulate_grad_hook`; reduction relies entirely on the
+schedule's explicit `post_backward_release_module()` call, which fires after
+`backward_dw()`:
 
 ```python
-# In module.py, FsdpModule._register_hooks()
-def _register_hooks(self, skip_backward_callback: bool = False) -> None:
-    ...
-    if not skip_backward_callback:
-        for param in parameters:
-            param.register_post_accumulate_grad_hook(...)
+# In FsdpModule._register_hooks()
+if skip_backward_callback:
+    return
+for group in self._parameter_groups:
+    if not group.requires_grad:
+        continue
+    for fsdp_parameter in group.fsdp_parameters:
+        fsdp_parameter.unsharded.register_post_accumulate_grad_hook(self._make_grad_hook())
 ```
 
-Wired from the adapter:
-
-```python
-fully_shard(
-    submodule, ...,
-    skip_backward_callback=config.delay_wgrad_compute,
-)
-```
+The adapter wires it as `skip_backward_cb = fine_grained and
+ddp_config.delay_wgrad_compute` (the flag only matters on the fine-grained
+path, where the schedule drives reduction explicitly).
 
 ---
 
-## 4. Public API Surface — Summary
+## 4. Public API Surface
 
 ### New public methods on `FsdpModule`
 
 | Method | Signature | Description |
 |---|---|---|
-| `unshard_parameters()` | `() -> None` | All-gather full parameters for compute. Idempotent. |
-| `reshard_parameters()` | `() -> None` | Release all-gathered storage, install DTensor params. |
-| `reduce_grad()` | `() -> None` | Pack gradients → reduce-scatter → install DTensor `.grad`. |
 | `pre_backward()` | `() -> None` | Root backward-phase setup (unshard for backward). |
-| `post_backward()` | `() -> None` | Finalise backward (drain pending reductions, reset state). |
-| `_replace_param_with_raw_if_needed()` | `() -> None` | Initialize the root context; no parameter swap is needed. |
-
-### New public attributes on root `FsdpModule`
-
-| Attribute | Type | Description |
-|---|---|---|
-| `post_forward_release_module` | `Callable[[FsdpModule], None]` | Release forward-pass params (reshard only). |
-| `post_backward_release_module` | `Callable[[FsdpModule], None]` | Release backward-pass params (reshard + reduce). |
+| `post_backward()` | `() -> None` | Finalize backward: no-op unless BACKWARD phase; reduce+reshard this module, and any submodule `FsdpModule` still in the BACKWARD phase. |
 
 ### New parameters on `fully_shard()`
 
@@ -396,51 +294,101 @@ fully_shard(
 | `fine_grained` | `bool` | `False` | Register hooks on every sub-module for EP overlap. |
 | `skip_backward_callback` | `bool` | `False` | Skip per-param `post_accumulate_grad_hook` for `delay_wgrad_compute`. |
 
-### New method on `FullyShardedDataParallelV2`
+`fully_shard_context(..., use_trace_replay=False)` selects static lookahead;
+setting it to `True` enables the VPP execution runner described in §2.4.
 
-| Method | Signature | Description |
+### New methods on `FullyShardedDataParallelV2` (adapter)
+
+The schedule-facing surface is assembled in `_setup_1f1b_overlap_interface`,
+which binds closures that operate on a passed `FsdpModule`:
+
+| Attribute | Signature | Description |
 |---|---|---|
+| `unshard_parameters` | `(module) -> None` | All-gather full parameter storage for compute. Idempotent. |
+| `reshard_parameters` | `(module) -> None` | Release all-gathered storage, install DTensor params. |
+| `reduce_grad` | `(module) -> None` | Pack gradients → reduce-scatter → install DTensor `.grad`. |
+| `_replace_param_with_raw_if_needed` | `() -> None` | Finalize the root context; no parameter swap is needed. |
+| `post_forward_release_module` | `(module) -> None` | Release forward-pass params (reshard only). |
+| `post_backward_release_module` | `(module) -> None` | Release backward-pass params (reshard + reduce). |
 | `no_sync()` | `() -> contextmanager` | Suppress gradient finalization for non-final microbatches. |
+| `complete_fsdp_trace()` | `() -> None` | Mark the global-batch boundary and compile/reset trace replay. |
+| `_setup_1f1b_overlap_interface()` | `() -> None` | Bind the schedule-facing callbacks above. |
 
 ### Changes to `find_megatron_fsdp()` (`megatron_fsdp/utils.py`)
 
-Extend to detect `FsdpModule` instances (currently only finds v1 `MegatronFSDP`).
+Now also detects `FullyShardedDataParallelV2` adapters (via `ddp_config`)
+and bare `FsdpModule` instances, alongside v1 `MegatronFSDP`.
 
 ---
 
-## 5. Edge Cases
+## 5. Activation Recomputation Guard
 
-### 5.1 Activation recomputation with overlap
+Activation recomputation runs forward hooks inside backward. In static mode,
+the execution runner detects recomputation from the module phase and active
+autograd GraphTask and suppresses forward-order successor prefetch:
 
-The module phase and active autograd `GraphTask` identify recomputed forwards.
-They still unshard the current module, but skip forward-order prefetch and do
-not reshard parameters that the ongoing backward still needs.
+```python
+if module._phase is module.Phase.BACKWARD or torch._C._current_graph_task_id() != -1:
+    return None
+next_module = context.forward_order.next_item(module)
+```
 
-### 5.2 Interleaved pipeline parallelism + EP overlap
+Recomputed forwards still unshard the current module (its parameters are
+needed for the recomputed GEMMs) but never prefetch a successor.
 
-All virtual-pipeline model chunks on a rank share one `FsdpContext`.
-Fine-grained hooks record occurrence-based unshard and reshard events in the
-shared execution runner, which learns the interleaved schedule order; see
-[execution-runner trace optimization](execution_runner_trace_optimization.md).
+---
 
-### 5.3 `fsdp_double_buffer` incompatibility
+## 6. Files Touched
+
+| File | Change |
+|---|---|
+| `experimental/execution_runner.py` | Static lookahead and VPP trace-replay successor planning |
+| `experimental/module.py` | Fine-grained hooks, shared unshard/prefetch path, recompute guard, phase transitions |
+| `experimental/fully_shard.py` | Hook registration, execution-mode selection, and reusable construction contexts for VPP chunks |
+| `mcore_fsdp_adapter.py` | Wire `fine_grained` / `skip_backward_callback`, add `no_sync()`, `_setup_1f1b_overlap_interface()`, per-domain meshes |
+| `megatron_fsdp/utils.py` | Extend `find_megatron_fsdp()` |
+| `optimizer/fully_sharded_optimizer.py` | PP/VPP model-chunk support |
+| `distributed/finalize_model_grads.py` | Gradient finalization for the overlap path |
+| `pipeline_parallel/combined_1f1b.py` | Select forward/backward FSDP callbacks from their respective VPP chunks |
+| `training.py`, `training/models/dist_utils.py` | Construct all MFSDP v2 VPP chunks in one shared context |
+
+---
+
+## 7. Edge Cases
+
+### 7.1 Activation recomputation with overlap
+
+Handled by the phase/GraphTask detection in §5: recomputed forwards never
+prefetch a successor and never reshard the current module mid-recompute.
+
+### 7.2 Interleaved pipeline parallelism + EP overlap
+
+The schedule supports interleaved pipelining
+(`combined_1f1b_schedule_for_interleaved_pipelining`), with the MFSDP v2
+optimizer handling multiple model chunks. The wrapping paths open one ambient
+`fully_shard_context`; each chunk adapter joins it with `reuse_existing=True`,
+so all chunks share communication streams and one execution runner. The first
+batch records the interleaved occurrence order; subsequent batches prefetch
+that learned VPP cycle rather than assuming construction order.
+
+### 7.3 `fsdp_double_buffer` incompatibility
 
 Double buffering is incompatible with per-sub-module parameter management.
 The experimental API does not implement double buffering, so no additional
-validation needed.
+validation is needed.
 
 ---
 
-## 6. Reference — v1 Contract
+## 8. Reference — v1 Contract
 
-For context, here is the exact v1 API contract that the schedule calls:
+For context, the v1 API contract that the schedule calls:
 
 | Call Site (combined_1f1b.py) | v1 Attribute/Method | Type |
 |---|---|---|
-| Line 68 | `find_megatron_fsdp(model)` | Discovers `MegatronFSDP` instance |
-| Line 74 | `fsdp_wrapper._replace_param_with_raw_if_needed()` | Method (root-context initialization for experimental) |
-| Line 97 | `no_sync_func()` → `model.no_sync()` | Context manager on adapter |
-| Line 349 | `fsdp_wrapper.pre_backward()` | `partial(_root_pre_backward, module=None, skip_backward_hook=True)` |
-| Line 405-407 | `forward_fsdp_wrapper.post_forward_release_module` | `partial(_post_forward, input=None, output=None)` |
-| Line 405-407 | `forward_fsdp_wrapper.post_backward_release_module` | `_post_backward_release_module` |
-| Line 510 | `fsdp_wrapper.post_backward()` | `_root_post_backward` |
+| Discovery | `find_megatron_fsdp(model)` | Discovers `MegatronFSDP` instance |
+| Pre-schedule | `fsdp_wrapper._replace_param_with_raw_if_needed()` | Method (root-context init for v2) |
+| Microbatch loop | `no_sync_func()` → `model.no_sync()` | Context manager on adapter |
+| Pre-run | `fsdp_wrapper.pre_backward()` | `partial(_root_pre_backward, module=None, skip_backward_hook=True)` |
+| Layer plan | `forward_fsdp_wrapper.post_forward_release_module` | `partial(_post_forward, input=None, output=None)` |
+| Layer plan | `forward_fsdp_wrapper.post_backward_release_module` | `_post_backward_release_module` |
+| Post-run | `fsdp_wrapper.post_backward()` | `_root_post_backward` |

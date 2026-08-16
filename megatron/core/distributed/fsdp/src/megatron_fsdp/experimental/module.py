@@ -15,21 +15,20 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 import enum
-import weakref
-from collections.abc import Callable
-from functools import partial
-from typing import cast
+from typing import Literal, cast
 from weakref import ref
 
 import torch
 from torch import nn
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Shard
+from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy, fp8_need_transpose_data, is_float8tensor
 from .execution_runner import FsdpExecutionRunner
 from .indexed_order import IndexedOrder
 from .parameter_group import Fp8ParameterGroup, FsdpParameterGroup, get_containing_parameter_group
-from .placement import MeshAxis, Placements
+from .placement import Flat
 
 
 def _is_in_backward() -> bool:
@@ -45,28 +44,28 @@ def _is_fp8_parameter(parameter: nn.Parameter) -> bool:
 class FsdpContext:
     """Runtime stream and prefetch state shared by FSDP roots constructed together."""
 
+    device: torch.device
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
-    device: torch.device
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
     use_symmetric_memory: bool
+    unify_communication_stream: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
-    # Execution-order tracer and prefetch planner (see execution_runner.py).
-    # Owns the prefetch mode: default static-order prefetch, or trace-and-
-    # replay for complex schedules (VPP + combined 1F1B).
+    # Selects static-order lookahead or traced VPP occurrence-order replay.
     runner: FsdpExecutionRunner
 
     def __init__(
         self,
         device: torch.device,
         use_symmetric_memory: bool = False,
+        unify_communication_stream: bool = False,
         *,
         use_trace_replay: bool = False,
     ) -> None:
@@ -76,21 +75,28 @@ class FsdpContext:
             device: Device on which this context schedules communication.
             use_symmetric_memory: Whether modules constructed in this context allocate
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
-            use_trace_replay: Enable trace-and-replay prefetch for complex
-                schedules such as VPP + combined 1F1B. Defaults to False.
+            unify_communication_stream: Whether all-gathers and reduce-scatters share one
+                communication stream to reduce peak transient memory.
+            use_trace_replay: Trace the actual execution order during the first batch
+                and replay it for later prefetches. Defaults to static-order lookahead.
         """
         self.device = device
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
+        self.unify_communication_stream = unify_communication_stream
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self.runner = FsdpExecutionRunner(context=self, use_trace_replay=use_trace_replay)
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
-        with torch.cuda.device(device):
-            self.allgather_stream = torch.cuda.Stream()
-            self.reduce_scatter_stream = torch.cuda.Stream()
+        self.allgather_stream = torch.cuda.Stream(device)
+        if unify_communication_stream:
+            # A unified stream lets an all-gather reuse the storage released by a
+            # preceding reduce-scatter.
+            self.reduce_scatter_stream = self.allgather_stream
+        else:
+            self.reduce_scatter_stream = torch.cuda.Stream(device)
 
     def register_module(self, module: "FsdpModule") -> None:
         """Register a module constructed in this context."""
@@ -181,7 +187,9 @@ class FsdpModule:
         self,
         context: FsdpContext,
         mesh: DeviceMesh,
-        placements: Placements,
+        model_weight_placements: tuple[Placement, ...],
+        main_grad_placements: tuple[Placement, ...],
+        main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
@@ -195,32 +203,8 @@ class FsdpModule:
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
         owned_parameters = _collect_owned_parameters(self)
-        assert tuple(placements.dp_axes) == tuple(
-            range(mesh.ndim)
-        ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
-
-        if any(parameter.is_meta for parameter in owned_parameters.values()):
-            # Collect nested FsdpModules to skip — they were already materialized
-            # when their own fully_shard() processed them bottom-up.
-            ignored_modules: set = set()
-            for _, child in self.named_modules():
-                if child is not self and isinstance(child, FsdpModule):
-                    for sub in child.modules():
-                        ignored_modules.add(sub)
-            _materialize_meta_params(self, mesh, ignored_modules)
-            # Parameters were replaced by m._apply() — re-read.
-            owned_parameters = _collect_owned_parameters(self)
-
-        meta_parameter_names = [
-            name for name, parameter in owned_parameters.items() if parameter.is_meta
-        ]
-        if meta_parameter_names:
-            raise RuntimeError(
-                "FSDP parameter materialization left parameters on the meta device: "
-                + ", ".join(repr(name) for name in meta_parameter_names)
-            )
 
         for name, parameter in owned_parameters.items():
             if is_float8tensor(parameter) and not fp8_need_transpose_data(parameter):
@@ -229,53 +213,41 @@ class FsdpModule:
                     f"a {type(parameter).__name__} without transpose data."
                 )
 
-        parameter_groups = [
-            (
-                Fp8ParameterGroup
-                if all(_is_fp8_parameter(p) for p in group_parameters.values())
-                else FsdpParameterGroup
-            )(
-                owning_module=self,
-                parameters=group_parameters,
-                mesh=mesh,
-                placements=placements,
-                mixed_precision_policy=mixed_precision_policy,
-                reduce_scatter_stream=context.reduce_scatter_stream,
-                grad_divisor=grad_divisor,
-                use_symmetric_memory=use_symmetric_memory,
+        parameter_groups = []
+        for group_parameters in _group_parameters(owned_parameters):
+            group_dtype = next(iter(group_parameters.values())).dtype
+            is_fp8_group = all(_is_fp8_parameter(p) for p in group_parameters.values())
+            parameter_group_type = Fp8ParameterGroup if is_fp8_group else FsdpParameterGroup
+            parameter_groups.append(
+                parameter_group_type(
+                    owning_module=self,
+                    parameters=group_parameters,
+                    mesh=mesh,
+                    model_weight_placements=_specialize_placements(
+                        model_weight_placements, group_dtype, is_fp8_group
+                    ),
+                    main_grad_placements=_specialize_placements(
+                        main_grad_placements, group_dtype, is_fp8_group
+                    ),
+                    main_weight_placements=_specialize_placements(
+                        main_weight_placements, group_dtype, is_fp8_group
+                    ),
+                    mixed_precision_policy=mixed_precision_policy,
+                    allgather_stream=context.allgather_stream,
+                    reduce_scatter_stream=context.reduce_scatter_stream,
+                    grad_divisor=grad_divisor,
+                    use_symmetric_memory=use_symmetric_memory,
+                )
             )
-            for group_parameters in _group_parameters(owned_parameters)
-        ]
         self._parameter_groups = tuple(parameter_groups)
         self._num_ready_grad_parameters = 0
         self._num_trainable_parameters = sum(
             len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
-        self._post_backward_issued = False
         self._register_hooks(
             fine_grained=fine_grained, skip_backward_callback=skip_backward_callback
         )
-        # Public callables for 1F1B EP overlap schedule integration.
-        self.post_forward_release_module = partial(self._post_forward_release)
-        self.post_backward_release_module = self._post_backward_release
         context.register_module(self)
-
-    def _post_forward_release(self, hook_module=None) -> None:
-        """Release forward-pass parameters (reshard only, no gradient reduction).
-
-        Matching the v1 contract: takes an optional hook_module argument
-        (ignored — this FsdpModule manages its own parameters)."""
-        self.reshard_parameters()
-
-    def _post_backward_release(self, hook_module=None) -> None:
-        """Release backward-pass parameters (reshard + reduce gradients).
-
-        Matching the v1 contract: takes an optional hook_module argument
-        (ignored — this FsdpModule manages its own parameters)."""
-        modules = cast(nn.Module, self).modules()
-        for module in reversed(list(modules)):
-            if isinstance(module, FsdpModule):
-                module._issue_post_backward()
 
     @property
     def context(self) -> FsdpContext:
@@ -316,6 +288,7 @@ class FsdpModule:
         self, fine_grained: bool = False, skip_backward_callback: bool = False
     ) -> None:
         module = cast(nn.Module, self)
+        module.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
         if fine_grained:
             _register_fine_grained_forward_hooks(self)
             _register_fine_grained_backward_hooks(self)
@@ -346,16 +319,9 @@ class FsdpModule:
         # based: once every owned Parameter has accumulated its grad, this
         # FsdpModule can reduce and reshard. Module full-backward hooks can fire
         # before that when module inputs do not require grad.
-        for group in self._parameter_groups:
-            if not group.requires_grad:
-                continue
-            for fsdp_parameter in group.fsdp_parameters:
-                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(self._make_grad_hook())
-
-    def _make_grad_hook(self) -> Callable[[nn.Parameter], None]:
         module_ref = ref(self)
 
-        def grad_hook(_parameter: nn.Parameter) -> None:
+        def grad_hook(_: nn.Parameter) -> None:
             module = module_ref()
             if module is None:
                 return
@@ -363,7 +329,31 @@ class FsdpModule:
             if module._num_ready_grad_parameters == module._num_trainable_parameters:
                 module.post_backward()
 
-        return grad_hook
+        for group in self._parameter_groups:
+            if not group.requires_grad:
+                continue
+            for fsdp_parameter in group.fsdp_parameters:
+                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(grad_hook)
+
+    @staticmethod
+    def _pre_load_state_dict(
+        _module: nn.Module,
+        _state_dict: dict[str, object],
+        _prefix: str,
+        local_metadata: dict[str, object],
+        _strict: bool,
+        _missing_keys: list[str],
+        _unexpected_keys: list[str],
+        _error_msgs: list[str],
+    ) -> None:
+        """Reject state-dict loads that replace parameters managed by FSDP."""
+        # PyTorch propagates load_state_dict(assign=True) to pre-hooks through
+        # this internal metadata key before replacing parameters and buffers.
+        if local_metadata.get("assign_to_params_buffers", False):
+            raise RuntimeError(
+                "load_state_dict(assign=True) is not supported after fully_shard(). "
+                "Load before fully_shard() or use an in-place load path with assign=False."
+            )
 
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute and prefetch the next FsdpModule.
@@ -375,9 +365,6 @@ class FsdpModule:
         # This is the first MFSDP hook to run, so finalize the context here once
         # before any module begins communication.
         context.ensure_finalized()
-        # A reentrant checkpoint recomputes before the child module's backward-pre
-        # hook runs. The active autograd GraphTask identifies that recomputation.
-        is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
         if self.phase is not FsdpModule.Phase.BACKWARD:
             self.phase = FsdpModule.Phase.FORWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
@@ -388,24 +375,7 @@ class FsdpModule:
         if self.is_root():
             allgather_stream.wait_stream(current_stream)
 
-        self._unshard_parameter_groups()
-        assert self._unshard_event is not None
-        # Compute waits only for this FsdpModule's all-gather (the prefetch below is
-        # issued afterwards, so it is free to run concurrently with this FsdpModule).
-        torch.cuda.nvtx.range_push(self._nvtx_label("wait_ag"))
-        current_stream.wait_event(self._unshard_event)
-        torch.cuda.nvtx.range_pop()
-
-        # Activation recomputation runs forward hooks inside backward. The
-        # runner decides the prefetch target: static-order successor in
-        # default mode, traced next consumer in trace-replay mode.
-        torch.cuda.nvtx.range_push(self._nvtx_label("prefetch"))
-        context.runner.record_unshard(self, "rowwise")
-        prefetch = context.runner.suggest_prefetch(self, "rowwise")
-        if prefetch is not None:
-            next_module, next_orientation = prefetch
-            next_module._unshard_parameter_groups(next_orientation)
-        torch.cuda.nvtx.range_pop()
+        self._unshard_and_prefetch("rowwise")
 
     def _unshard_parameter_groups(self, orientation: str = "rowwise") -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
@@ -424,36 +394,25 @@ class FsdpModule:
             return
 
         allgather_stream = self.context.allgather_stream
-        torch.cuda.nvtx.range_push(self._nvtx_label("allgather"))
         with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
                 group.unshard_parameters(orientation)
             self._unshard_event = allgather_stream.record_event()
-        torch.cuda.nvtx.range_pop()
 
-    def unshard_parameters(self, orientation: str = "rowwise") -> None:
-        """Public API: all-gather full parameter storage for compute.
+    def _unshard_and_prefetch(self, orientation: str) -> None:
+        """Materialize this module and prefetch its execution-order successor.
 
-        Idempotent — if parameters are already unsharded, this is a no-op.
-        Called by the 1F1B EP overlap schedule via fine-grained sub-module
-        hooks before each individual sub-module compute. Issues the next
-        module's all-gather as a prefetch so it overlaps with this module's
-        compute, mirroring the eager ``pre_forward`` path.
-
-        Args:
-            orientation: Payload orientation to gather for MXFP8 groups
-                (``"rowwise"`` on forward, ``"colwise"`` on backward).
+        The context runner owns the mode switch: default mode uses the static
+        forward/backward order, while trace-replay mode follows the observed VPP
+        occurrence order. Fine-grained hooks and eager module hooks share this path.
         """
-        # This module is now consuming compute; all-gather its parameters and
-        # wait, then let the runner decide the prefetch target. Trace-replay
-        # mode owns all prefetch decisions (the recompute check is
-        # default-mode logic inside the runner); the runner also dedups the
-        # fine-grained per-sub-module hooks of a pass.
         self._unshard_parameter_groups(orientation)
         if self._unshard_event is not None:
             self.context.current_stream().wait_event(self._unshard_event)
-        self.context.runner.record_unshard(self, orientation)
-        prefetch = self.context.runner.suggest_prefetch(self, orientation)
+
+        runner = self.context.runner
+        runner.record_unshard(self, orientation)
+        prefetch = runner.suggest_prefetch(self, orientation)
         if prefetch is not None:
             next_module, next_orientation = prefetch
             next_module._unshard_parameter_groups(next_orientation)
@@ -470,17 +429,21 @@ class FsdpModule:
             self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
-    def _reshard_parameter_groups(self) -> None:
+    def _reshard_parameter_groups(self, *, record_execution: bool = True) -> None:
         """Reshard parameter groups and release unsharded storage after compute.
 
         This method clears ``_unshard_event`` after queuing the release, so
-        future users enqueue a fresh all-gather. In trace-replay mode the
-        runner may decide the storage can stay resident (immediate same-
-        orientation re-consume), skipping the release entirely.
+        future users enqueue a fresh all-gather. Trace-replay mode may retain
+        storage for an immediate same-module, same-orientation reuse.
+
+        Args:
+            record_execution: Record the reshard in the execution runner. Internal
+                initialization cleanup passes False because it is not a training event.
         """
-        self.context.runner.record_reshard(self)
-        if self.context.runner.suggest_skip_reshard(self):
-            return
+        if record_execution:
+            self.context.runner.record_reshard(self)
+            if self.context.runner.suggest_skip_reshard(self):
+                return
         for group in self._parameter_groups:
             group.reshard_parameters()
 
@@ -493,31 +456,20 @@ class FsdpModule:
                 group.release_unsharded_storage()
             self._unshard_event = None
 
-    def reshard_parameters(self) -> None:
-        """Public API: release all-gathered storage and install DTensor parameters.
-
-        Called by the 1F1B EP overlap schedule's per-layer release hooks
-        after compute completes on a sub-module.
-        """
-        self._reshard_parameter_groups()
-
     def pre_backward(self, register_final_callback: bool = True) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order.
 
         Args:
             register_final_callback: Whether to finalize through the autograd engine.
-                Manual backward schedules finalize explicitly in ``post_backward()``.
+                Manual backward schedules (the 1F1B EP overlap schedule) finalize
+                explicitly in ``post_backward()``, so they pass False to avoid
+                installing an autograd callback outside the backward pass.
         """
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
-            # The orders are prefetch-only; reset the idempotency flag by
-            # traversing this root's own subtree instead.
-            for module in self.modules():
-                if isinstance(module, FsdpModule):
-                    module._post_backward_issued = False
             if register_final_callback:
                 context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
@@ -529,61 +481,31 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
-        self._unshard_parameter_groups("colwise")
-        assert self._unshard_event is not None
-        current_stream.wait_event(self._unshard_event)
+        self._unshard_and_prefetch("colwise")
 
-        context.runner.record_unshard(self, "colwise")
-        prefetch = context.runner.suggest_prefetch(self, "colwise")
-        if prefetch is not None:
-            next_module, next_orientation = prefetch
-            next_module._unshard_parameter_groups(next_orientation)
-
-    def post_backward(self, finalize_context: bool = False) -> None:
+    def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state.
 
-        Args:
-            finalize_context: Whether to finalize the root context synchronously.
+        No-op unless this module is in the BACKWARD phase (idempotent). Any
+        submodule FsdpModule still in the BACKWARD phase (e.g. the 1F1B schedule
+        skipped its per-module release) is finalized first.
         """
-        if finalize_context:
-            assert self.is_root()
-            for module in reversed(list(self.modules())):
-                if isinstance(module, FsdpModule):
-                    module._issue_post_backward()
-        else:
-            self._issue_post_backward()
-        torch.cuda.nvtx.range_pop()
-
-    def _issue_post_backward(self) -> None:
-        """Reshard and reduce this module's gradients at most once per backward."""
-        if self._post_backward_issued:
+        if self.phase is not FsdpModule.Phase.BACKWARD:
             return
+        # The 1F1B schedule may skip a per-module release; finalize any submodule
+        # still in the BACKWARD phase (excluding this module itself).
+        for module in reversed(list(cast(nn.Module, self).modules())):
+            if module is self:
+                continue
+            if isinstance(module, FsdpModule) and module.phase is FsdpModule.Phase.BACKWARD:
+                module.post_backward()
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
-        self._phase = FsdpModule.Phase.RESTING
+        self.phase = FsdpModule.Phase.RESTING
+        # 1F1B cooldown can run consecutive backward passes without an intervening
+        # pre_forward(), so reset the hook counter as soon as this pass is finalized.
         self._num_ready_grad_parameters = 0
-        self._post_backward_issued = True
-
-    def reduce_grad(self) -> None:
-        """Public API: pack gradients and launch their reduce-scatters.
-
-        Called by the 1F1B EP overlap schedule's per-layer release hooks
-        after backward compute completes.  Only operates on parameter groups
-        that require gradients.
-        """
-        self._reduce_gradient_groups()
-
-    def _replace_param_with_raw_if_needed(self) -> None:
-        """Initialize the root context before a fine-grained schedule runs.
-
-        Provided for compatibility with the 1F1B EP overlap schedule, which
-        calls this method to swap optimizer-facing DTensor parameters back to
-        raw nn.Parameters before accessing sub-modules directly.  The
-        experimental API stores raw tensors backed by DBuffer at all times,
-        so no swap is needed, but finalizing the context here ensures a child
-        FSDP unit cannot mistake itself for the root when it executes first.
-        """
-        self.context.ensure_finalized()
+        torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
         """Pack gradients and immediately launch their reduce-scatters."""
@@ -591,7 +513,6 @@ class FsdpModule:
         reduce_scatter_stream = context.reduce_scatter_stream
         current_stream = context.current_stream()
 
-        torch.cuda.nvtx.range_push(self._nvtx_label("reduce_grad"))
         for group in self._parameter_groups:
             if not group.requires_grad:
                 continue
@@ -605,14 +526,13 @@ class FsdpModule:
             reduce_scatter_stream.wait_stream(current_stream)
             with torch.cuda.stream(reduce_scatter_stream):
                 group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
-        torch.cuda.nvtx.range_pop()
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
         """Parameter groups owned by this FsdpModule."""
         return self._parameter_groups
 
-    def _nvtx_label(self, phase: str) -> str:
+    def _nvtx_label(self, phase: Literal["forward", "backward"]) -> str:
         name = self.name if self.name else "<root>"
         return f"MFSDP {name} {phase}"
 
@@ -662,67 +582,41 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 
 
 def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
-    grouped: dict[tuple[torch.dtype, bool, bool], dict[str, nn.Parameter]] = {}
+    grouped: dict[tuple[torch.dtype, bool, bool, int | None], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (parameter.dtype, parameter.requires_grad, _is_fp8_parameter(parameter))
+        # Pipeline-tied embedding/output gradients are reduced between the
+        # first and last stages by matching data-parallel shards. Keep each
+        # physical shared parameter in its own DBuffer so unrelated root
+        # parameters cannot shift its local shard boundary on one endpoint.
+        shared_parameter_id = (
+            id(parameter) if getattr(parameter, "shared_embedding", False) else None
+        )
+        key = (
+            parameter.dtype,
+            parameter.requires_grad,
+            _is_fp8_parameter(parameter),
+            shared_parameter_id,
+        )
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 
-def _materialize_meta_params(
-    module: nn.Module, mesh: DeviceMesh, ignored_modules: set | None = None
-) -> None:
-    """Materialize meta parameters to real tensors and initialize weights.
+def _specialize_placements(
+    placements: tuple[Placement, ...], dtype: torch.dtype, is_fp8_group: bool = False
+) -> tuple[Placement, ...]:
+    """Specialize public placements for one homogeneous parameter group.
 
-    Replaces every meta ``nn.Parameter`` with a real tensor on the current
-    CUDA device, calls ``m.reset_parameters()`` to re-initialize, and
-    broadcasts weights from DP rank 0.
-
-    Args:
-        module: Root module whose meta parameters should be materialized.
-        mesh: Data-parallel device mesh used for the weight broadcast.
-        ignored_modules: Set of module instances to skip (nested FsdpModules
-            already materialized by their own ``fully_shard()`` call).
+    Today every parameter group maps Torch's user-facing ``Shard(0)`` to the
+    DBuffer-specific ``Flat`` format. This dtype-homogeneous group boundary is
+    where MXFP8 groups will instead select ``BlockAtomic``.
     """
-    ignored_modules = ignored_modules or set()
-    device = torch.cuda.current_device()
-    device = device if isinstance(device, torch.device) else torch.device("cuda", device)
-
-    from torch.distributed.tensor import DTensor
-
-    for name, m in reversed(list(module.named_modules())):
-        if m in ignored_modules:
-            continue
-        if m is not module and isinstance(m, FsdpModule):
-            continue
-        if not any(p.is_meta for p in m.parameters(recurse=False)):
-            m._apply(lambda t: t if t.is_meta else t.to(device), recurse=False)
-            continue
-
-        m._apply(lambda t: (torch.empty_like(t, device=device) if t.is_meta else t), recurse=False)
-        if hasattr(m, "reset_parameters"):
-            m.reset_parameters()
-        elif hasattr(m, "_reset_parameters"):
-            m._reset_parameters()
-        else:
-            raise ValueError(f"Module {name!r} contains meta parameters but cannot reset them")
-
-        m._apply(lambda t: t if t.is_meta else t.to(device), recurse=False)
-        for p in m.parameters(recurse=False):
-            if p.is_meta:
-                raise RuntimeError(
-                    f"Module {name!r} contains meta parameters after materialization"
-                )
-
-    if mesh.size() > 1:
-        for param in module.parameters():
-            if param.is_meta or isinstance(param, DTensor):
-                continue
-            for mesh_dim in range(mesh.ndim):
-                group = mesh.get_group(mesh_dim=mesh_dim)
-                if torch.distributed.get_world_size(group) == 1:
-                    continue
-                src_rank = torch.distributed.get_global_rank(group, 0)
-                torch.distributed.broadcast(param.data, src=src_rank, group=group)
+    if not is_fp8_group and dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise NotImplementedError(f"Unsupported dtype: {dtype}.")
+    for placement in placements:
+        if type(placement) is Shard and placement.dim != 0:
+            raise NotImplementedError(
+                "MFSDP currently supports only dim-0 Shard placements, " f"got {placement!r}."
+            )
+    return tuple(Flat() if type(placement) is Shard else placement for placement in placements)
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +639,7 @@ def _register_fine_grained_forward_hooks(fsdp_module: FsdpModule) -> None:
 
     When the 1F1B EP overlap schedule calls individual sub-modules directly
     (e.g., ``layer.attn.forward()``), the hook resolves the parent FsdpModule
-    and calls ``unshard_parameters()``.
+    and unshards its parameters.
     """
     for submodule in fsdp_module.modules():
         if submodule is fsdp_module:
@@ -753,7 +647,7 @@ def _register_fine_grained_forward_hooks(fsdp_module: FsdpModule) -> None:
         target = _find_fsdp_target(submodule)
         if target is not None and target is not fsdp_module:
             continue
-        object.__setattr__(submodule, _FSDP_PARENT_MODULE_REF_ATTR, weakref.ref(fsdp_module))
+        object.__setattr__(submodule, _FSDP_PARENT_MODULE_REF_ATTR, ref(fsdp_module))
         submodule.register_forward_pre_hook(
             _fine_grained_pre_forward_hook, prepend=True, with_kwargs=True
         )
@@ -764,15 +658,16 @@ def _fine_grained_pre_forward_hook(submodule: nn.Module, args, kwargs) -> None:
     target = _find_fsdp_target(submodule)
     if target is None:
         return
-    target.unshard_parameters("rowwise")
+    target._unshard_and_prefetch("rowwise")
 
 
 def _register_fine_grained_backward_hooks(fsdp_module: FsdpModule) -> None:
     """Register pre-backward hooks on every sub-module of *fsdp_module*.
 
-    Uses ``register_multi_grad_hook`` on sub-module output tensors.  When
-    autograd reaches a sub-module during backward, the hook calls
-    ``unshard_parameters()`` on the parent FsdpModule.
+    Uses ``register_full_backward_pre_hook`` on each sub-module.  When
+    autograd reaches a sub-module during backward, the hook unshards the
+    parent FsdpModule's parameters before that sub-module's own backward
+    computes its gradients.
     """
     for submodule in fsdp_module.modules():
         if submodule is fsdp_module:
@@ -780,42 +675,19 @@ def _register_fine_grained_backward_hooks(fsdp_module: FsdpModule) -> None:
         target = _find_fsdp_target(submodule)
         if target is not None and target is not fsdp_module:
             continue
-        _create_fine_grained_backward_hook(submodule)
+        submodule.register_full_backward_pre_hook(_fine_grained_pre_backward_hook)
 
 
-def _create_fine_grained_backward_hook(submodule: nn.Module) -> None:
-    """Wrap *submodule* so a pre-backward hook fires via register_multi_grad_hook."""
+def _fine_grained_pre_backward_hook(submodule: nn.Module, grad_output) -> None:
+    """Pre-backward hook for fine-grained sub-modules.
 
-    def _forward_hook(_module, inputs, output):
-        output_list = []
-        if isinstance(output, torch.Tensor):
-            output_list = [output]
-        elif isinstance(output, (tuple, list)):
-            output_list = [t for t in output if isinstance(t, torch.Tensor)]
-
-        def _multi_grad_hook(grads):
-            target = _find_fsdp_target(submodule)
-            if target is None:
-                return
-            target.unshard_parameters("colwise")
-
-        torch.autograd.graph.register_multi_grad_hook(output_list, _multi_grad_hook, mode="any")
-        return output
-
-    submodule.register_forward_hook(_forward_hook)
-
-
-def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
-    if isinstance(axis, int):
-        axis_index = axis
-        if axis_index < 0:
-            axis_index += mesh.ndim
-        if axis_index < 0 or axis_index >= mesh.ndim:
-            raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
-        return axis_index
-
-    dim_names = mesh.mesh_dim_names
-    if dim_names is None or axis not in dim_names:
-        raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
-    return dim_names.index(axis)
-
+    Marks the parent ``FsdpModule`` BACKWARD and unshards it before the
+    sub-module's backward runs, so its weight-gradient computation sees full
+    parameters.
+    """
+    target = _find_fsdp_target(submodule)
+    if target is None:
+        return
+    if target.phase is FsdpModule.Phase.RESTING:
+        target.phase = FsdpModule.Phase.BACKWARD
+    target._unshard_and_prefetch("colwise")
