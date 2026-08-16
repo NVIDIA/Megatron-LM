@@ -608,6 +608,56 @@ def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
     assert len(list(model.parameters())) == 1
 
 
+@pytest.mark.parametrize("main_params_dtype", [torch.bfloat16, torch.float32])
+def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
+    """FSDP should retain only its sharded weights and gradients at rest."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    dim = 4096
+    dtype = torch.bfloat16
+    model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
+    placements = _flat_placements()
+    policy = MixedPrecisionPolicy(main_params_dtype=main_params_dtype)
+    allocated_before = torch.cuda.memory_allocated(device)
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+
+    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+    persistent_allocated = torch.cuda.memory_allocated(device) - allocated_before
+    if main_params_dtype == dtype:
+        # Model and main weights alias, leaving only one BF16 weight buffer and one
+        # BF16 main-gradient buffer per child.
+        assert all(
+            group.model_weight is group.main_weight
+            for layer in model.layers
+            for group in layer.parameter_groups
+        )
+        expected_per_child_nbytes = 2 * child_weight_nbytes
+    else:
+        # FP32 main weights require a distinct buffer in addition to the BF16 model
+        # weight and BF16 main-gradient buffers.
+        main_weight_nbytes = dim * dim * torch.empty((), dtype=main_params_dtype).element_size()
+        expected_per_child_nbytes = 2 * child_weight_nbytes + main_weight_nbytes
+
+    # All persistent buffers are sharded over the data-parallel group. Small bookkeeping
+    # allocations stay below 1 MiB.
+    expected_persistent_nbytes = len(model.layers) * expected_per_child_nbytes // world_size
+    assert (
+        expected_persistent_nbytes <= persistent_allocated < expected_persistent_nbytes + 1024**2
+    ), (
+        "FSDP persistent memory does not match its sharded weight and gradient storage: "
+        f"rank={rank}, persistent_allocated={_mb(persistent_allocated)}, "
+        f"expected={_mb(expected_persistent_nbytes)}"
+    )
+
+
 def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
     """A training step should stay below five full-size child buffers."""
     rank = distributed_setup.rank
@@ -676,8 +726,8 @@ def test_deleted_model_releases_fsdp_storage(distributed_setup):
     assert torch.cuda.memory_allocated(device) - allocated_before < 1024**2
 
 
-def test_root_forward_returns_to_resting_memory(distributed_setup):
-    """Root forward should release child all-gather storage before returning."""
+def test_fully_shard_returns_to_resting_memory(distributed_setup):
+    """Fully-sharded temporary storage should be released after forward and backward."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -696,56 +746,32 @@ def test_root_forward_returns_to_resting_memory(distributed_setup):
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     x = torch.randn(2, dim, device=device, dtype=dtype)
-    resting_allocated = torch.cuda.memory_allocated(device)
+
+    def clear_cublas_workspaces_and_get_allocated_memory() -> int:
+        # PyTorch retains a cuBLAS workspace for each handle/stream pair. Clear those
+        # library caches so this measurement isolates FSDP-managed storage.
+        torch._C._cuda_clearCublasWorkspaces()
+        return torch.cuda.memory_allocated(device)
+
+    resting_allocated = clear_cublas_workspaces_and_get_allocated_memory()
+
+    def assert_returns_to_resting_memory(phase: str) -> None:
+        extra_allocated = clear_cublas_workspaces_and_get_allocated_memory() - resting_allocated
+        # The live output, activations, and root-owned bias gradient are small; unsharded
+        # parameter storage must be released.
+        assert extra_allocated < 1024**2, (
+            f"Fully-sharded storage did not return to resting memory after {phase}: "
+            f"rank={rank}, extra_allocated={_mb(extra_allocated)}, "
+            "max_extra_allocated=1.00 MB"
+        )
 
     output = model(x)
-    del output
-    allocated_after_forward = torch.cuda.memory_allocated(device)
-    extra_allocated = allocated_after_forward - resting_allocated
-    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+    assert_returns_to_resting_memory("forward")
 
-    assert extra_allocated < child_weight_nbytes, (
-        "Root forward did not return to resting memory after draining child releases: "
-        f"rank={rank}, extra_allocated={_mb(extra_allocated)}, "
-        f"one_child_weight={_mb(child_weight_nbytes)}"
-    )
-
-
-def test_root_backward_returns_to_resting_memory(distributed_setup):
-    """Root backward should release child all-gather storage before returning."""
-    rank = distributed_setup.rank
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    dim = 4096
-    dtype = torch.bfloat16
-    model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
-    placements = _flat_placements()
-    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device):
-        for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-
-    x = torch.randn(2, dim, device=device, dtype=dtype, requires_grad=True)
-    output = model(x)
     loss = output.float().square().mean()
-    allocated_before_backward = torch.cuda.memory_allocated(device)
-
     loss.backward()
     del loss, output
-    allocated_after_backward = torch.cuda.memory_allocated(device)
-    extra_allocated = allocated_after_backward - allocated_before_backward
-    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-
-    assert extra_allocated < child_weight_nbytes, (
-        "Root backward did not return to resting memory after draining child releases: "
-        f"rank={rank}, extra_allocated={_mb(extra_allocated)}, "
-        f"one_child_weight={_mb(child_weight_nbytes)}"
-    )
+    assert_returns_to_resting_memory("backward")
 
 
 @pytest.mark.parametrize(
