@@ -256,7 +256,17 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
     def _copy_main_params_to_model_params(self) -> None:
         """Refresh MFSDP V2 compute weights after updating optimizer weights."""
-        sync_model_weights_from_main_weights(self.get_parameters())
+        # Walk the model hierarchy instead of the base optimizer's parameter
+        # list. Empty local DTensor shards are intentionally omitted from TE
+        # FusedAdam, so optimizer parameters can expose FSDP groups in a
+        # rank-dependent order. Weight refresh launches collectives and must
+        # visit every trainable FSDP group in the same order on every rank.
+        sync_model_weights_from_main_weights(
+            parameter
+            for model_chunk in self.model_chunks
+            for parameter in model_chunk.parameters()
+            if parameter.requires_grad
+        )
 
     def _copy_model_params_to_main_params(self, state_dict=None) -> None:
         """No-op: model loads already write into MFSDP v2's main weights."""

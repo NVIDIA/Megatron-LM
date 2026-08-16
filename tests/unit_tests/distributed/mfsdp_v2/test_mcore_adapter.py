@@ -294,6 +294,74 @@ class TestMcoreAdapterDense:
         # The optimizer must refresh every chunk's compute weights once per step.
         assert all(count == len(steps) for count in sync_counts.values())
 
+    def test_weight_sync_uses_model_order_when_optimizer_params_are_filtered(self, monkeypatch):
+        """Weight refresh must include FSDP groups omitted from local optimizer shards."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=_build_block(config),
+            pg_collection=self.pg_collection,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="adam",
+                lr=1.0e-3,
+                weight_decay=0.0,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                use_distributed_optimizer=False,
+                clip_grad=0.0,
+            ),
+            [model],
+            use_gloo_process_groups=False,
+        )
+        assert isinstance(optimizer, FullyShardedOptimizer)
+
+        parameter_groups = [
+            parameter_group
+            for module in model.modules()
+            if isinstance(module, FsdpModule)
+            for parameter_group in module.parameter_groups
+        ]
+        assert len(parameter_groups) >= 2
+        omitted_parameter_ids = {
+            id(fsdp_parameter.sharded)
+            for fsdp_parameter in parameter_groups[0].fsdp_parameters
+        }
+        for optimizer_param_group in optimizer.optimizer.param_groups:
+            optimizer_param_group["params"] = [
+                parameter
+                for parameter in optimizer_param_group["params"]
+                if id(parameter) not in omitted_parameter_ids
+            ]
+
+        sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
+        for parameter_group in parameter_groups:
+
+            def count_sync(parameter_group=parameter_group):
+                sync_counts[parameter_group] += 1
+
+            monkeypatch.setattr(parameter_group, "sync_model_weight_from_main_weight", count_sync)
+
+        optimizer._copy_main_params_to_model_params()
+
+        assert all(count == 1 for count in sync_counts.values())
+
     def test_fused_sgd_casts_mismatched_grads(self):
         """FusedSGD steps after MCore casts V2's BF16 gradients to FP32."""
         config = TransformerConfig(
