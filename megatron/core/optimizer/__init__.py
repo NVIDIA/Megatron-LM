@@ -1249,9 +1249,9 @@ def get_megatron_optimizer(
 
     for model_chunk in model_chunks:
         for param in model_chunk.parameters():
-            getter = getattr(param, 'get_high_precision_init_val', None)
-            clearer = getattr(param, 'clear_high_precision_init_val', None)
-            if getter is not None and clearer is not None and getter() is not None:
-                clearer()
+            getter_fn = getattr(param, 'get_high_precision_init_val', None)
+            clearer_fn = getattr(param, 'clear_high_precision_init_val', None)
+            if getter_fn is not None and clearer_fn is not None and getter_fn() is not None:
+                clearer_fn()
 
     return ChainedOptimizer(optimizers)
