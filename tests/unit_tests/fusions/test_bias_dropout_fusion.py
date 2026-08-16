@@ -54,6 +54,51 @@ def test_bias_dropout_add(dtype, training):
         assert torch.allclose(out_fused, x_fused, **tols)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("training", [True, False])
+def test_scaled_bias_dropout_add(dtype, training):
+    torch.manual_seed(42)
+    device = "cuda"
+    branch_scale = 0.25
+    B, H = 16, 64
+
+    x = torch.randn(B, H, dtype=dtype, device=device)
+    residual = torch.randn(B, H, dtype=dtype, device=device)
+    bias = torch.randn(H, dtype=dtype, device=device)
+    residual_scale = torch.tensor(0.99, dtype=dtype, device=device)
+
+    x_ref = x.clone().detach().requires_grad_(training)
+    residual_ref = residual.clone().detach().requires_grad_(training)
+    residual_scale_ref = residual_scale.clone().detach().requires_grad_(training)
+    out_ref = get_bias_dropout_add(
+        training=training,
+        fused=False,
+        branch_scale=branch_scale,
+        residual_scale=residual_scale_ref,
+    )((x_ref, bias), residual_ref, prob=0.0)
+
+    x_fused = x.clone().detach().requires_grad_(training)
+    residual_fused = residual.clone().detach().requires_grad_(training)
+    residual_scale_fused = residual_scale.clone().detach().requires_grad_(training)
+    out_fused = get_bias_dropout_add(
+        training=training,
+        fused=True,
+        branch_scale=branch_scale,
+        residual_scale=residual_scale_fused,
+    )((x_fused, bias), residual_fused, prob=0.0)
+
+    tols = dict(rtol=1e-6, atol=1e-6) if dtype is torch.float32 else dict(rtol=2e-2, atol=1e-2)
+    assert torch.allclose(out_fused, out_ref, **tols)
+
+    if training:
+        grad = torch.randn_like(out_ref)
+        out_ref.backward(grad)
+        out_fused.backward(grad)
+        assert torch.allclose(x_ref.grad, x_fused.grad, **tols)
+        assert torch.allclose(residual_ref.grad, residual_fused.grad, **tols)
+        assert torch.allclose(residual_scale_ref.grad, residual_scale_fused.grad, **tols)
+
+
 # ============================================================================
 # Tests for fp32 residual connection fix
 # ============================================================================
