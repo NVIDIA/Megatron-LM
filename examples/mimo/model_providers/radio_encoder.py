@@ -83,6 +83,15 @@ def _make_dense_non_hybrid(config: TransformerConfig) -> None:
     config.use_fused_weighted_squared_relu = False
 
 
+def _disable_gtp(config: TransformerConfig) -> None:
+    """Keep this module replicated across any language GTP axes."""
+    config.tensor_parallel_num_weight_shards = config.tensor_model_parallel_size
+    config.gtp_weight_remat_size = 1
+    expert_tp = config.expert_tensor_parallel_size or config.tensor_model_parallel_size
+    config.expert_tensor_parallel_num_weight_shards = expert_tp
+    config.expert_gtp_weight_remat_size = 1
+
+
 def radio_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) -> TransformerConfig:
     """RADIO vision config: stock from-args base + RADIO-specific overrides."""
     config = deepcopy(_base_config(args))
@@ -114,6 +123,7 @@ def radio_vision_config(args: argparse.Namespace, tp_size: int, pp_size: int) ->
     config.bf16 = bf16
     config.tensor_model_parallel_size = tp_size
     config.pipeline_model_parallel_size = pp_size
+    _disable_gtp(config)
     config.sequence_parallel = False
     return config
 
