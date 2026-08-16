@@ -87,6 +87,9 @@ class TransformerConfig(ModelParallelConfig):
     This prevents MTP loss gradients from flowing back to the main model,
     only training the MTP heads themselves."""
 
+    mtp_hsm: bool = False
+    """Enable uniform per-token Hidden State Mixing for MTP layers."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.

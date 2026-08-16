@@ -19,12 +19,18 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_tensor_and_context_parallel_group,
+    get_tensor_model_parallel_group,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    _hsm_mix,
     _mtp_logits_are_vocab_sharded,
     process_mtp_loss,
     roll_tensor,
@@ -81,6 +87,260 @@ class TestMultiTokenPredictionLayer:
             config=config, spec=transformer_layer_spec, use_transformer_engine=use_te
         )
         return config, mtp_block_spec
+
+    def test_hsm_mix_preserves_dtype_and_gradients(self, monkeypatch):
+        """HSM selects per-element history entries without changing dtype or gradients."""
+        first = torch.full((2, 1, 3), 1.0, dtype=torch.bfloat16, requires_grad=True)
+        second = torch.full((2, 1, 3), 2.0, dtype=torch.bfloat16, requires_grad=True)
+        selection = torch.tensor([[[[0]], [[1]]]], dtype=torch.long)
+
+        monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: selection)
+        mixed = _hsm_mix([first, second])
+
+        assert mixed.dtype == torch.bfloat16
+        torch.testing.assert_close(
+            mixed, torch.tensor([[[1, 1, 1]], [[2, 2, 2]]], dtype=torch.bfloat16)
+        )
+        mixed.sum().backward()
+        torch.testing.assert_close(
+            first.grad, torch.tensor([[[1, 1, 1]], [[0, 0, 0]]], dtype=torch.bfloat16)
+        )
+        torch.testing.assert_close(
+            second.grad, torch.tensor([[[0, 0, 0]], [[1, 1, 1]]], dtype=torch.bfloat16)
+        )
+
+    def test_hsm_mix_uses_newest_state_for_zero_roll_sentinel(self, monkeypatch):
+        """A sampled zero produced by an invalid roll selects the newest hidden state."""
+        first = torch.tensor([1.0, 0.0, 3.0]).view(3, 1, 1).requires_grad_()
+        newest = torch.tensor([11.0, 12.0, 13.0]).view(3, 1, 1).requires_grad_()
+        selection = torch.zeros((1, 3, 1, 1), dtype=torch.long)
+        monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: selection)
+
+        mixed = _hsm_mix([first, newest])
+
+        torch.testing.assert_close(mixed, torch.tensor([1.0, 12.0, 3.0]).view(3, 1, 1))
+        mixed.sum().backward()
+        torch.testing.assert_close(first.grad, torch.tensor([1.0, 0.0, 1.0]).view(3, 1, 1))
+        torch.testing.assert_close(newest.grad, torch.tensor([0.0, 1.0, 0.0]).view(3, 1, 1))
+
+    def test_hsm_rng_matches_across_replicated_tensor_parallel_ranks(self):
+        """Replicated tokens select the same HSM history on every TP rank."""
+        tp = 2
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        tp_group = get_tensor_model_parallel_group()
+
+        history = [
+            torch.full((32, 2, 4), value, dtype=torch.float32, device="cuda")
+            for value in (1.0, 2.0, 3.0)
+        ]
+        mixed = _hsm_mix(history)
+        gathered = [torch.empty_like(mixed) for _ in range(tp)]
+        torch.distributed.all_gather(gathered, mixed, group=tp_group)
+
+        for peer_mixed in gathered[1:]:
+            torch.testing.assert_close(peer_mixed, gathered[0])
+        assert torch.unique(gathered[0][..., 0]).numel() > 1
+
+    def test_hsm_rng_differs_across_sequence_parallel_owners(self):
+        """Disjoint TP+CP token shards receive different tracked RNG slices."""
+        tp = 2
+        cp = 2
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
+            pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        tp_group = get_tensor_model_parallel_group()
+        cp_group = get_context_parallel_group()
+        tp_cp_group = get_tensor_and_context_parallel_group()
+
+        history = [
+            torch.full((64, 2, 4), value, dtype=torch.float32, device="cuda")
+            for value in range(1, 8)
+        ]
+        mixed = _hsm_mix(
+            history,
+            sequence_parallel=True,
+            tp_group=tp_group,
+            cp_group=cp_group,
+        )
+        selections = mixed[..., 0].to(torch.long)
+        gathered = [torch.empty_like(selections) for _ in range(tp * cp)]
+        torch.distributed.all_gather(gathered, selections, group=tp_cp_group)
+
+        assert len({tuple(mask.cpu().flatten().tolist()) for mask in gathered}) == tp * cp
+        assert all(torch.unique(mask).numel() > 1 for mask in gathered)
+
+    def test_hsm_rng_replays_during_activation_checkpointing(self):
+        """MCore checkpoint recomputation reuses the original HSM selection."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        tp_group = get_tensor_model_parallel_group()
+        history = [
+            torch.full(
+                (32, 2, 4), value, dtype=torch.float32, device="cuda", requires_grad=True
+            )
+            for value in (1.0, 2.0, 3.0)
+        ]
+        selections = []
+
+        def mix_with_recording(*states):
+            mixed = _hsm_mix(
+                list(states),
+                sequence_parallel=True,
+                tp_group=tp_group,
+            )
+            selections.append(mixed.detach().clone())
+            return mixed
+
+        mixed = tensor_parallel_checkpoint(mix_with_recording, False, *history)
+        mixed.sum().backward()
+
+        assert len(selections) == 2
+        torch.testing.assert_close(selections[1], selections[0])
+        assert all(state.grad is not None for state in history)
+
+    def test_mtp_hsm_defaults_off(self):
+        """HSM is opt-in and requires multiple MTP depths to affect the forward pass."""
+        config = TransformerConfig(num_layers=2, hidden_size=4, num_attention_heads=1)
+        assert config.mtp_hsm is False
+
+        config.mtp_hsm = True
+        config.mtp_num_layers = 1
+
+        class _IncrementLayer:
+            def __call__(self, hidden_states, input_ids, position_ids, padding_mask, **kwargs):
+                return hidden_states + 1, input_ids, position_ids, padding_mask
+
+        block = types.SimpleNamespace(
+            config=config,
+            training=True,
+            vp_stage=None,
+            mtp_use_repeated_layer=False,
+            layers=[_IncrementLayer()],
+        )
+        hidden_states = torch.zeros(2, 1, config.hidden_size)
+        output = MultiTokenPredictionBlock.forward(
+            block,
+            input_ids=torch.zeros(1, 2, dtype=torch.long),
+            position_ids=torch.zeros(1, 2, dtype=torch.long),
+            hidden_states=hidden_states,
+            attention_mask=torch.ones(1, 1, 2, 2, dtype=torch.bool),
+        )
+        torch.testing.assert_close(output[2:], torch.ones_like(hidden_states))
+
+    @pytest.mark.parametrize(
+        ("training", "expected_second_input"), [
+            (True, [1.0, 2.0]),
+            (False, [2.0, 2.0]),
+        ]
+    )
+    def test_hsm_runs_only_during_training(self, monkeypatch, training, expected_second_input):
+        """The block applies HSM in training and leaves evaluation deterministic."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=4,
+            num_attention_heads=1,
+            mtp_num_layers=2,
+            mtp_hsm=True,
+        )
+        seen_inputs = []
+
+        class _IncrementLayer:
+            def __call__(self, hidden_states, input_ids, position_ids, padding_mask, **kwargs):
+                seen_inputs.append(hidden_states.clone())
+                return hidden_states + 1, input_ids, position_ids, padding_mask
+
+        block = types.SimpleNamespace(
+            config=config,
+            training=training,
+            vp_stage=None,
+            mtp_use_repeated_layer=False,
+            cp_group=None,
+            layers=[_IncrementLayer(), _IncrementLayer()],
+        )
+        monkeypatch.setattr(
+            torch,
+            "randint",
+            lambda high, size, device=None: torch.zeros(size, dtype=torch.long, device=device),
+        )
+
+        hidden_states = torch.ones(2, 1, config.hidden_size)
+        MultiTokenPredictionBlock.forward(
+            block,
+            input_ids=torch.zeros(1, 2, dtype=torch.long),
+            position_ids=torch.zeros(1, 2, dtype=torch.long),
+            hidden_states=hidden_states,
+            attention_mask=torch.ones(1, 1, 2, 2, dtype=torch.bool),
+        )
+
+        torch.testing.assert_close(seen_inputs[0], hidden_states)
+        torch.testing.assert_close(
+            seen_inputs[1],
+            torch.tensor(expected_second_input).view(2, 1, 1).expand_as(hidden_states),
+        )
+
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_hsm_aligns_history_with_target_tokens(self, monkeypatch, packed):
+        """Each reuse of an older HSM state advances it by one target token."""
+        config = TransformerConfig(
+            num_layers=3,
+            hidden_size=1,
+            num_attention_heads=1,
+            mtp_num_layers=3,
+            mtp_hsm=True,
+        )
+        seen_inputs = []
+
+        class _IncrementLayer:
+            def __call__(self, hidden_states, input_ids, position_ids, padding_mask, **kwargs):
+                seen_inputs.append(hidden_states.clone())
+                return hidden_states + 10, input_ids, position_ids, padding_mask
+
+        block = types.SimpleNamespace(
+            config=config,
+            training=True,
+            vp_stage=None,
+            mtp_use_repeated_layer=False,
+            cp_group=None,
+            layers=[_IncrementLayer(), _IncrementLayer(), _IncrementLayer()],
+        )
+        monkeypatch.setattr(
+            torch,
+            "randint",
+            lambda high, size, device=None: torch.zeros(size, dtype=torch.long, device=device),
+        )
+
+        packed_seq_params = None
+        if packed:
+            cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=3,
+                max_seqlen_kv=3,
+                qkv_format='thd',
+            )
+
+        hidden_states = torch.arange(5, dtype=torch.float32).view(5, 1, 1)
+        MultiTokenPredictionBlock.forward(
+            block,
+            input_ids=torch.zeros(1, 5, dtype=torch.long),
+            position_ids=torch.zeros(1, 5, dtype=torch.long),
+            hidden_states=hidden_states,
+            attention_mask=torch.ones(1, 1, 5, 5, dtype=torch.bool),
+            packed_seq_params=packed_seq_params,
+        )
+
+        expected_once = [1, 2, 12, 4, 14] if packed else [1, 2, 3, 4, 14]
+        expected_twice = [2, 12, 22, 14, 24] if packed else [2, 3, 4, 14, 24]
+        torch.testing.assert_close(seen_inputs[0], hidden_states)
+        torch.testing.assert_close(
+            seen_inputs[1], torch.tensor(expected_once, dtype=torch.float32).view(5, 1, 1)
+        )
+        torch.testing.assert_close(
+            seen_inputs[2], torch.tensor(expected_twice, dtype=torch.float32).view(5, 1, 1)
+        )
 
     def test_mtp_detach_heads_config(self):
         """Test that mtp_detach_heads config defaults to False."""

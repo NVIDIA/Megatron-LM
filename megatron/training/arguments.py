@@ -859,6 +859,11 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
+    if getattr(args, 'mtp_hsm', False) and not (
+        args.mtp_num_layers and args.mtp_num_layers >= 2
+    ):
+        args.mtp_hsm = False
+
     # Validate MTP args for hybrid vs non-hybrid models
     if args.hybrid_layer_pattern is not None:
         # Mamba/hybrid model MTP validation
