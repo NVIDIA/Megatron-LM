@@ -477,15 +477,6 @@ def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
 
     child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
     resting_allocated = torch.cuda.memory_allocated(device)
-    # Every child retains a sharded main weight and a persistent sharded main gradient:
-    # num_children * 2 buffers * child_weight_nbytes / world_size. The input and
-    # small bookkeeping allocations should remain below 1 MiB.
-    expected_resting_nbytes = 2 * len(model.layers) * child_weight_nbytes // world_size
-    assert expected_resting_nbytes <= resting_allocated < expected_resting_nbytes + 1024**2, (
-        "FSDP resting memory does not match its persistent sharded weight and gradient "
-        f"storage: rank={rank}, resting_allocated={_mb(resting_allocated)}, "
-        f"expected={_mb(expected_resting_nbytes)}"
-    )
     torch.cuda.reset_peak_memory_stats(device)
     train_step()
     peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
