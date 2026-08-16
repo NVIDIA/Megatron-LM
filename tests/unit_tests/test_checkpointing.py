@@ -452,6 +452,7 @@ def test_load_checkpoint_override_opt_param_scheduler(
     ) as ckpt_dir:
         args.load = ckpt_dir
         args.save = ckpt_dir
+        args.save_tokenizer_assets = False
         set_args(args)
 
         # Create and save a checkpoint first.
