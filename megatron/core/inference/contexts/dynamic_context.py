@@ -35,6 +35,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_maps_from_layer_type_list,
 )
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -417,12 +418,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
+        self.gdp_num_householder = 0
         if self.is_hybrid_model:
             self.mamba_conv_states_shape = mamba_inference_state_config.conv_states_shape
             self.mamba_ssm_states_shape = mamba_inference_state_config.ssm_states_shape
             self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
             self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
+            self.gdp_num_householder = mamba_inference_state_config.gdp_num_householder
 
             if self.batch_invariant_mode:
                 assert not self.enable_prefix_caching, (
@@ -901,17 +904,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and prefix_caching_mamba_gb is not None
                 and prefix_caching_mamba_gb > 0
             ):
+                assert self.mamba_slot_allocator is not None
                 prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
-                # Mirror the split done in _allocate_mamba_cache so this preview
-                # matches what is actually allocated: the "scratch" buffers
-                # (intermediate_ssm_out/intermediate_conv_out) are reserved from the
-                # budget first, then the rest sizes the "durable" cache
-                # (ssm_states/conv_states). mamba_bytes_per_req is the shared
-                # per-slot footprint of both.
+                # The allocator contains the PP-synchronized durable capacity.
+                # Scratch remains stage-local because it is temporary forward
+                # storage and does not participate in prefix-cache matching.
                 scratch_slots = self.max_mamba_intermediate_states_per_step
                 scratch_bytes = scratch_slots * mamba_bytes_per_req
-                durable_slots = (prefix_cache_bytes - scratch_bytes) // mamba_bytes_per_req
-                durable_slots = max(durable_slots, 0)
+                durable_slots = self.mamba_slot_allocator.max_slots
                 log_lines += [
                     f"  Mamba prefix cache:",
                     f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
@@ -971,23 +971,31 @@ class DynamicInferenceContext(BaseInferenceContext):
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
                 decode_indices_dtype=self._mamba_decode_indices_dtype,
+                gdp_num_householder=self.gdp_num_householder,
             )
             # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
             # fields ride along with the single coalesced H2D in
             # transfer_bookkeeping_to_gpu().
-            self.mamba_metadata.bind_cpu_buffers(
-                {
-                    "batch_indices_decode": self._cpu_mamba_batch_indices_decode,
-                    "batch_indices_prefill": self._cpu_mamba_batch_indices_prefill,
-                    "seq_idx": self._cpu_mamba_seq_idx,
-                    "cu_seqlens": self._cpu_mamba_cu_seqlens,
-                    "cu_chunk_seqlens": self._cpu_mamba_cu_chunk_seqlens,
-                    "last_chunk_indices": self._cpu_mamba_last_chunk_indices,
-                    "seq_idx_for_varlen": self._cpu_mamba_seq_idx_for_varlen,
-                    "conv_seq_idx": self._cpu_mamba_conv_seq_idx,
-                    "conv_seq_start": self._cpu_mamba_conv_seq_start,
-                }
-            )
+            _mamba_cpu_bufs = {
+                "batch_indices_decode": self._cpu_mamba_batch_indices_decode,
+                "batch_indices_prefill": self._cpu_mamba_batch_indices_prefill,
+                "seq_idx": self._cpu_mamba_seq_idx,
+                "cu_seqlens": self._cpu_mamba_cu_seqlens,
+                "cu_chunk_seqlens": self._cpu_mamba_cu_chunk_seqlens,
+                "last_chunk_indices": self._cpu_mamba_last_chunk_indices,
+                "seq_idx_for_varlen": self._cpu_mamba_seq_idx_for_varlen,
+                "conv_seq_idx": self._cpu_mamba_conv_seq_idx,
+                "conv_seq_start": self._cpu_mamba_conv_seq_start,
+            }
+            if self.gdp_num_householder > 0:
+                _mamba_cpu_bufs.update(
+                    {
+                        "gdp_chunk_indices": self._cpu_gdp_chunk_indices,
+                        "gdp_chunk_indices_dp": self._cpu_gdp_chunk_indices_dp,
+                        "gdp_chunk_offsets": self._cpu_gdp_chunk_offsets,
+                    }
+                )
+            self.mamba_metadata.bind_cpu_buffers(_mamba_cpu_bufs)
             self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
             self.mamba_conv_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
@@ -1220,6 +1228,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             + _mamba_conv_seq_idx_bytes
             + _mamba_conv_seq_start_bytes
         )
+        # GDP chunk descriptor section, only present for GDP models. All int32,
+        # so no alignment padding is needed after the Mamba section.
+        #   gdp_chunk_indices     int32 (max_gdp_chunks, 2)
+        #   gdp_chunk_indices_dp  int32 (max_gdp_chunks_dp, 2)
+        #   gdp_chunk_offsets     int32 (max_requests + 1,)
+        if self.gdp_num_householder > 0:
+            self._max_gdp_chunks, self._max_gdp_chunks_dp = max_gdp_chunk_counts(
+                self.max_tokens, self.max_requests, self.gdp_num_householder
+            )
+            _gdp_chunk_indices_bytes = self._max_gdp_chunks * 2 * 4
+            _gdp_chunk_indices_dp_bytes = self._max_gdp_chunks_dp * 2 * 4
+            _gdp_chunk_offsets_bytes = (self.max_requests + 1) * 4
+        else:
+            self._max_gdp_chunks = 0
+            self._max_gdp_chunks_dp = 0
+            _gdp_chunk_indices_bytes = 0
+            _gdp_chunk_indices_dp_bytes = 0
+            _gdp_chunk_offsets_bytes = 0
+        _total_bytes += (
+            _gdp_chunk_indices_bytes + _gdp_chunk_indices_dp_bytes + _gdp_chunk_offsets_bytes
+        )
         self._cpu_bookkeeping_buf = torch.empty(
             _total_bytes, dtype=torch.uint8, device='cpu', pin_memory=True
         )
@@ -1387,6 +1416,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             ].view(torch.int32)
             _off += _mamba_conv_seq_start_bytes
 
+        if self.gdp_num_householder > 0:
+            self._cpu_gdp_chunk_indices = (
+                self._cpu_bookkeeping_buf[_off : _off + _gdp_chunk_indices_bytes]
+                .view(torch.int32)
+                .view(self._max_gdp_chunks, 2)
+            )
+            _off += _gdp_chunk_indices_bytes
+            self._cpu_gdp_chunk_indices_dp = (
+                self._cpu_bookkeeping_buf[_off : _off + _gdp_chunk_indices_dp_bytes]
+                .view(torch.int32)
+                .view(self._max_gdp_chunks_dp, 2)
+            )
+            _off += _gdp_chunk_indices_dp_bytes
+            self._cpu_gdp_chunk_offsets = self._cpu_bookkeeping_buf[
+                _off : _off + _gdp_chunk_offsets_bytes
+            ].view(torch.int32)
+            _off += _gdp_chunk_offsets_bytes
+
         assert _off == _total_bytes, f"layout bug: wrote {_off} of {_total_bytes} bytes"
 
         # GPU view: the single interface for GPU code to read context state.
@@ -1397,6 +1444,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_kv_blocks=self.max_kv_block_count,
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
+            max_gdp_chunks=self._max_gdp_chunks,
+            max_gdp_chunks_dp=self._max_gdp_chunks_dp,
+            # Same presence predicate as the CPU-side GDP section above; the two
+            # layouts must byte-match, so they gate on the same flag.
+            has_gdp=self.gdp_num_householder > 0,
             mamba_decode_indices_dtype=(
                 self._mamba_decode_indices_dtype if self.is_hybrid_model else torch.int64
             ),
@@ -1826,7 +1878,33 @@ class DynamicInferenceContext(BaseInferenceContext):
         scratch_slots = self.max_mamba_intermediate_states_per_step
         scratch_bytes = scratch_slots * per_slot_bytes
         max_slots = (total_bytes - scratch_bytes) // per_slot_bytes  # durable slots
+        local_max_slots = max_slots
+
+        # Prefix-cache state is replicated across pipeline stages. Use the
+        # smallest stage-local capacity so identical cache operations produce
+        # identical block-to-slot mappings on every stage. A recurrent prefix
+        # is executable only when all stages retain its state, so additional
+        # slots on an individual stage would not increase usable cache capacity.
+        if get_pg_size(self.pipeline_parallel_group) > 1:
+            max_slots_tensor = torch.tensor(
+                max_slots, dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(
+                max_slots_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.pipeline_parallel_group,
+            )
+            max_slots = int(max_slots_tensor.item())
+
         if max_slots < 1:
+            if local_max_slots >= 1:
+                raise ValueError(
+                    f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
+                    f"has room for {local_max_slots} durable slots on this pipeline stage, but "
+                    f"another stage has room for fewer than one. Cache capacity is mirrored to "
+                    f"the minimum across stages; increase prefix_caching_mamba_gb, reduce "
+                    f"max_tokens, or rebalance the Mamba layers."
+                )
             raise ValueError(
                 f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
                 f"is too small. The CUDA-graph extraction scratch reserves "
@@ -2474,6 +2552,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._cpu_mha_block_table[:real_bs] = request_to_kv_block_ids_view[:real_bs]
         if real_bs < padded_bs:
             self._cpu_mha_block_table[real_bs:padded_bs] = self.kv_block_allocator.dummy_block_idx
+        # Real rows must avoid having a -1 sentinel in their trailing columns,
+        # because the kernel treats the -1 sentinel as a real value.
+        # We cannot avoid writing -1 into `request_to_kv_block_ids`; other logic needs it.
+        # The only option is to overwrite the -1 with a dummy block index via `masked_fill`.
+        if real_bs > 0:
+            _real_rows = self._cpu_mha_block_table[:real_bs]
+            # masked_fill_ over the pinned int32 view: no index_put/nonzero
+            # temporaries on the per-step CPU path.
+            _real_rows.masked_fill_(_real_rows < 0, self.kv_block_allocator.dummy_block_idx)
 
         # Max sequence lengths (Python scalars; consumed as kernel launch args).
         if not self.using_cuda_graph_this_step() and real_bs > 0:
@@ -3065,10 +3152,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         Check if the request can be added to the context.
         """
         # Note that for hybrid models checking the total request count is sufficient
-        # because we allocate a single set of Mamba state tensors for each request
+        # because we allocate a single set of Mamba state tensors for each request.
         request_can_be_added = (
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
+        # A handoff is the exception: it keeps its live recurrent-state slot after
+        # its request row is removed, so both capacities must be checked independently.
+        if self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning:
+            request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
 
         matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
             self._compute_prefix_match(req, req.remaining_prompt_length)

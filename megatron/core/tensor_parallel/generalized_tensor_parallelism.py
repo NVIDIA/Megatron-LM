@@ -42,7 +42,7 @@ from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     register_capture_comm,
     register_capture_wgrad_ring_slot,
 )
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import ensure_params_ready, log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,10 @@ except (ImportError, ModuleNotFoundError):
     MXFP8Quantizer = MagicMock()
     nvtx_range_pop = nvtx_range_push = round_up_to_nearest_multiple = MagicMock()
     HAVE_TE = False
+
+# TE's name says fp8, but the flag it returns is set for BF16 activation recompute too (the
+# FP8-gated helper is `is_fp8_activation_recompute_enabled`). Alias it so call sites read right.
+in_activation_recompute_phase = in_fp8_activation_recompute_phase
 
 
 class GTPChain(str, Enum):
@@ -1285,10 +1289,20 @@ class GTPShardedParam(torch.nn.Parameter):
 
         weights = self._weights
 
+        # 0. Wait for DDP's asynchronous parameter all-gather (and its post-gather quantize), if
+        #    any, to finish on the shards we are about to read. GTP prefetches ahead of the module
+        #    that owns the target weight, so that module's DDP pre-hook may not have run yet and
+        #    the shard can still hold last iteration's values.
+        #
+        #    Forward only: backward re-reads what forward published, and recompute runs inside
+        #    backward where a dispatch could gather into the grad-aliased buffer.
+        if fwd and not in_activation_recompute_phase():
+            ensure_params_ready(weights)
+
         # 1. Transition state for async gathers. Skip during recompute-forward: it gathers
         #    rowwise (_ag_ticket_fwd) while a bwd-chain prefetch may hold an in-flight columnwise
         #    AG state (_ag_ticket_bwd) on the same weight — clobbering breaks the dgrad consume.
-        if GTP_CONFIG.check_param_states and not in_fp8_activation_recompute_phase():
+        if GTP_CONFIG.check_param_states and not in_activation_recompute_phase():
             new_state = GTPWeightState.ASYNC_WAIT if async_op else GTPWeightState.DATA_READY_SYNC
             for w in weights:
                 w._set_state(new_state)
@@ -1595,7 +1609,7 @@ class GTPShardedParam(torch.nn.Parameter):
         # During an activation-recompute forward (runs in backward), route consume +
         # prefetch through the recompute-forward chain on its own _recompute_* slot
         # (see __init__) instead of the fwd/bwd chains; lazy-built below.
-        in_recompute = in_fp8_activation_recompute_phase()
+        in_recompute = in_activation_recompute_phase()
         use_recompute_chain = in_recompute and GTP_CONFIG.weight_prefetch
 
         # Reaching a forward gather proves the previous backward finished, so the chains it
@@ -1751,15 +1765,19 @@ class GTPShardedParam(torch.nn.Parameter):
     def _handle_megatron_grad_accum(param):
         """Handle megatron DDP and gradient-accumulation fusion.
 
-        Do NOT set param.grad before calling the hook — the hook checks param.grad and would
-        accumulate it into main_grad if zero_out_wgrad is True, corrupting it with a dummy.
-
         Returns a cached dummy wgrad; sync callers use it as the graph-safe grad, async drains
-        discard it.
+        discard it. It is zeroed when DDP will accumulate it — see below.
         """
         if hasattr(param, "grad_added_to_main_grad"):
             param.grad_added_to_main_grad = True
-        dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
+        # This dummy becomes param.grad, and DDP accumulates it when zero_out_wgrad is set
+        # (DistributedDataParallel._make_backward_post_hook in distributed_data_parallel.py).
+        # get_dummy_wgrad returns a SHARED reused buffer, so it must be zeroed in that case
+        # or it injects whatever it last held into the gradient. Same pairing as layers.py.
+        if getattr(param, "zero_out_wgrad", False):
+            dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype, zero=True)
+        else:
+            dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
         if getattr(param, "_grad_accum_hook", None) is not None:
             param._grad_accum_hook()
 

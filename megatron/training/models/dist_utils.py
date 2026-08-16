@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import contextlib
 import logging
+from contextlib import nullcontext
 from typing import Any, Callable
 
 import torch
@@ -352,18 +352,9 @@ def _ddp_wrap(
         if not use_torch_fsdp2:
             dp_init_kwargs["pg_collection"] = pg_collection
 
-        # MFSDP v2 chunks must share one FsdpContext so cross-chunk prefetch
-        # orders and communication streams coordinate under VPP and the
-        # combined-1F1B overlap schedule. The adapter joins an ambient
-        # fully_shard_context when present (reuse_existing=True); DP is the
-        # FullyShardedDataParallel factory, which resolves to V2 from
-        # ddp_config.megatron_fsdp_version.
-        #
-        # Enable trace-replay on the ambient context when the combined-1F1B
-        # EP-overlap schedule is active: the adapter requests
-        # use_trace_replay=fine_grained but a reuse_existing join yields THIS
-        # context as-is, so its flags win. Without this the runner is
-        # silently disabled for every VPP + overlap run.
+        # The factory resolves to MFSDP v2 from ddp_config. Under VPP, open one
+        # ambient context so every per-chunk adapter joins the same streams and
+        # cross-root prefetch orders.
         wrap_v2_shared_context = (
             DP is FullyShardedDataParallel
             and ddp_config.megatron_fsdp_version == 2
@@ -371,10 +362,11 @@ def _ddp_wrap(
         )
         fsdp_context_cm = (
             fully_shard_context(
-                use_trace_replay=get_model_config(model[0]).overlap_moe_expert_parallel_comm
+                use_trace_replay=get_model_config(model[0]).overlap_moe_expert_parallel_comm,
+                use_symmetric_memory=ddp_config.nccl_ub,
             )
             if wrap_v2_shared_context
-            else contextlib.nullcontext()
+            else nullcontext()
         )
 
         wrapped_model = []
@@ -382,21 +374,16 @@ def _ddp_wrap(
             for model_chunk_idx, model_chunk in enumerate(model):
                 chunk_kwargs = dict(dp_init_kwargs)
                 disable_bucketing = (
-                    (model_chunk_idx > 0)
-                    or overlap_param_gather_with_optimizer_step
+                    (model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step
                 )
 
                 # Pre-compute parameter layouts for the distributed optimizer.
                 # Only pass to DDP; FSDP variants don't accept full_param_layout.
                 if ddp_config.use_distributed_optimizer and DP is DistributedDataParallel:
-                    all_params = [
-                        p for p in model_chunk.parameters() if p.requires_grad
-                    ]
+                    all_params = [p for p in model_chunk.parameters() if p.requires_grad]
                     pp_rank = pg_collection.pp.rank()
                     effective_bucket_size = (
-                        None
-                        if disable_bucketing or pp_rank > 0
-                        else ddp_config.bucket_size
+                        None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
                     )
                     # Size the layout by the group the optimizer actually shards over, which is
                     # the intra-instance group when there are several optimizer instances. Using

@@ -58,6 +58,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             if self.ddp_config != model_chunk.ddp_config:
                 raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
         self.is_stub_optimizer = optimizer is None
+        self._casted_grads = []
 
     @staticmethod
     def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
@@ -77,14 +78,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             raise ValueError("MFSDP v2 does not support optimizer-step parameter-gather overlap.")
         if config.optimizer_cpu_offload:
             raise ValueError("MFSDP v2 does not currently support optimizer CPU offload.")
-        if config.use_precision_aware_optimizer:
-            raise ValueError("MFSDP v2 does not currently support precision-aware optimizer.")
         if config.use_layer_wise_distributed_optimizer:
             raise ValueError(
                 "MFSDP v2 does not currently support layer-wise distributed optimizer."
             )
-        if config.optimizer_cuda_graph:
-            raise ValueError("MFSDP v2 does not currently support optimizer CUDA graphs.")
 
     def state_dict(self):
         """Return optimizer state.
@@ -130,7 +127,33 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         return result
 
     def _copy_model_grads_to_main_grads(self) -> None:
-        """No-op: MFSDP v2 reduces directly into optimizer-visible sharded grads."""
+        """Install optimizer-compatible gradients for non-precision-aware optimizers."""
+        if self.config.use_precision_aware_optimizer:
+            return
+
+        assert not self._casted_grads
+        for parameter in self.get_parameters():
+            if parameter.grad is None:
+                continue
+            if parameter.grad.dtype == parameter.data.dtype:
+                continue
+
+            original_grad = parameter.grad
+            parameter.grad = None
+            parameter.grad_dtype = parameter.data.dtype
+            parameter.grad = original_grad.to(dtype=parameter.data.dtype)
+            self._casted_grads.append((parameter, original_grad))
+
+    @torch.no_grad()
+    def step_with_ready_grads(self) -> bool:
+        """Step the optimizer and restore MFSDP gradient dtypes."""
+        success = super().step_with_ready_grads()
+        for parameter, original_grad in self._casted_grads:
+            parameter.grad = None
+            parameter.grad_dtype = original_grad.dtype
+            parameter.grad = original_grad
+        self._casted_grads.clear()
+        return success
 
     def _copy_main_params_to_model_params(self) -> None:
         """Refresh MFSDP V2 compute weights after updating optimizer weights."""
