@@ -54,7 +54,6 @@ With `default` span groups, Megatron emits a handful of coarse spans per iterati
 | Checkpointing | `megatron/training/checkpointing.py` | `megatron.save_checkpoint.*`, `megatron.load_checkpoint.*` |
 | Model init | `megatron/training/training.py` | `megatron.model_init` |
 | Evaluation | `megatron/training/training.py` | `megatron.evaluate`, `megatron.evaluate.step` |
-| Inference server | `megatron/core/inference/text_generation_server/` | `text_completion {model}` (GenAI semconv) |
 
 Each span is tagged with a **span group** that controls whether it's emitted at runtime. See [Span Groups](span-groups.md).
 
