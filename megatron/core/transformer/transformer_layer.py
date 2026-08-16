@@ -17,6 +17,16 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
+
+try:
+    from megatron.core.inference.fused_add_rmsnorm import (
+        can_use_fused_add_rmsnorm as _can_use_fused_add_rmsnorm,
+    )
+    from megatron.core.inference.fused_add_rmsnorm import fused_add_rmsnorm as _fused_add_rmsnorm
+except Exception:  # keep the layer importable if the inference helper is unavailable
+    _can_use_fused_add_rmsnorm = None
+    _fused_add_rmsnorm = None
+
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
@@ -613,6 +623,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        # Cleared each forward; set only when the self_attn_bda + pre_mlp_layernorm
+        # fused-add-norm path runs, so _forward_pre_mlp_layernorm can consume it.
+        self._fused_pre_mlp_normed = None
+
         # Optional Input Layer norm
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
         if self.recompute_input_layernorm:
@@ -680,10 +694,36 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # self attention module.
             hidden_states = attention_output_with_bias[0]
         else:
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                    attention_output_with_bias, residual, self.hidden_dropout
+            attn_out = attention_output_with_bias[0]
+            if (
+                _fused_add_rmsnorm is not None
+                and not self.training
+                and self.config.normalization == "RMSNorm"
+                and attention_output_with_bias[1] is None
+                and isinstance(self.cross_attention, IdentityOp)
+                and isinstance(self.pre_cross_attn_layernorm, IdentityOp)
+                and not self.recompute_pre_mlp_layernorm
+                and not getattr(self, "offload_attn_norm", False)
+                and not getattr(self, "offload_mlp_norm", False)
+                and _can_use_fused_add_rmsnorm(self.pre_mlp_layernorm, attn_out, residual)
+            ):
+                # Fuse the residual-add (self_attn_bda) with the standalone
+                # pre-MLP RMSNorm: one kernel yields both the updated residual
+                # and the normalized MLP input, removing a launch + graph node
+                # per layer. Decode-gated; falls back below otherwise.
+                pre_mlp_normed, hidden_states = _fused_add_rmsnorm(
+                    attn_out,
+                    residual,
+                    self.pre_mlp_layernorm.weight,
+                    self.config.layernorm_epsilon,
+                    self.config.layernorm_zero_centered_gamma,
                 )
+                self._fused_pre_mlp_normed = pre_mlp_normed
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.self_attn_bda(
+                        self.training, self.config.bias_dropout_fusion
+                    )(attention_output_with_bias, residual, self.hidden_dropout)
         nvtx_range_pop(suffix="self_attn_bda")
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
@@ -747,6 +787,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
+        # If the fused self_attn_bda + pre_mlp_layernorm path ran, the normed
+        # activation is already computed; consume it and skip the norm call.
+        stashed = getattr(self, "_fused_pre_mlp_normed", None)
+        if stashed is not None:
+            self._fused_pre_mlp_normed = None
+            return stashed
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
