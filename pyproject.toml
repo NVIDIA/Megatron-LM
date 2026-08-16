@@ -96,7 +96,7 @@ dev = [
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "multi-storage-client~=0.50",
-    "opentelemetry-api~=1.33.1",
+    "opentelemetry-api>=1.33.1,<2",
     "nemo-lens @ git+https://github.com/NVIDIA-NeMo/Lens.git@b85578fc2b736a1804705e537001b5f45e9c715d",
     "flash-linear-attention==0.5.1",
     "megatron-energon[av_decode]~=7.0",
