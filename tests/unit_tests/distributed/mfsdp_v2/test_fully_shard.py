@@ -556,7 +556,6 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     # Restore replicated model weight.
     with torch.no_grad():
         output = model(x)
-    torch.cuda.synchronize(device)
     assert parameter_group.model_weight.placements == (Replicate(),)
 
     actual_optimizer_size = sum(
