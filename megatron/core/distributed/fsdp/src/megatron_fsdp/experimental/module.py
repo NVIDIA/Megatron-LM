@@ -67,7 +67,9 @@ class FsdpContext:
         self._is_finalized = False
         with torch.cuda.device(device):
             self.allgather_stream = torch.cuda.Stream()
-            self.reduce_scatter_stream = torch.cuda.Stream()
+            # A unified stream lets an all-gather reuse the storage released by a
+            # preceding reduce-scatter.
+            self.reduce_scatter_stream = self.allgather_stream
 
     def register_module(self, module: "FsdpModule") -> None:
         """Register a module constructed in this context."""
@@ -386,8 +388,10 @@ class FsdpModule:
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
-        self._reduce_gradient_groups()
+        # Releasing the current full weight before allocating the packed gradient
+        # lets the communication stream reuse its storage for a later all-gather.
         self._reshard_parameter_groups()
+        self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
