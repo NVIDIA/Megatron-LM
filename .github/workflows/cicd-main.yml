@@ -625,7 +625,7 @@ jobs:
               "test_to_run": "L1",
               "test_script_pattern": "L1_Functional_Tests_Megatron_4",
               "test_platform": "h100",
-              "megatron_lm_commit": "${{ needs.configure.outputs.sha }}"
+              "megatron_lm_commit": "${{ github.sha }}"
             }
 
       - name: Delete testing branch
