@@ -150,7 +150,7 @@ def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
 
-def _zero0_placements() -> Placements:
+def _no_shard_placements() -> Placements:
     return Placements(
         dp_axes=[0],
         parameter=[Replicate()],
@@ -198,8 +198,8 @@ _GEMM_OP_NAME_SUBSTRING = "aten::mm"
 
 @pytest.mark.parametrize(
     "placements_factory",
-    [_zero0_placements, _zero1_placements, _zero2_placements, _flat_placements],
-    ids=["zero0", "zero1", "zero2", "zero3"],
+    [_no_shard_placements, _zero1_placements, _zero2_placements, _flat_placements],
+    ids=["no_shard", "zero1", "zero2", "zero3"],
 )
 @pytest.mark.parametrize("num_microbatches", [1, 3])
 def test_fully_shard_sgd_losses_match_baseline(
@@ -545,11 +545,11 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, foreach=False)
     fully_shard_optimizer(optimizer)
 
-    # Initialize sharded Adam states.
+    # Adam lazily initializes its states on the first step with gradients, so create
+    # them before recording the memory baseline and measuring their sharded size.
     model(x).sum().backward()
     optimizer.step()
     assert parameter_group.model_weight.placements == (Flat(),)
-    torch.cuda.synchronize(device)
     allocated_before_forward = torch.cuda.memory_allocated(device)
     torch.cuda.reset_peak_memory_stats(device)
 
