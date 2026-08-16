@@ -106,7 +106,7 @@ class FsdpParameterGroup:
             mesh: Device mesh used for all DBuffer storage in this version.
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
-            allgather_stream: Stream on which to allocate the model-weight buffer.
+            allgather_stream: Stream on which to allocate the main- and model-weight buffers.
             reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
             use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
@@ -152,11 +152,18 @@ class FsdpParameterGroup:
 
         tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
-        self.main_weight = DBuffer.distribute_tensors(
-            (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
-            mesh=self.mesh,
-            placements=main_weight_placements,
-        )
+        current_stream = torch.cuda.current_stream(allgather_stream.device)
+        allgather_stream.wait_stream(current_stream)
+        with torch.cuda.stream(allgather_stream):
+            self.main_weight = DBuffer.distribute_tensors(
+                (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
+                mesh=self.mesh,
+                placements=main_weight_placements,
+            )
+            # Match the optimizer post-step and checkpoint-load state: compute weights
+            # begin as a cast of the optimizer weights and are restored to their
+            # configured placements by the first pre-forward unshard.
+            self.model_weight = self.main_weight.cast(self.dtype)
 
         if use_symmetric_memory:
             # PyTorch caches this in C++ and returns early when the backend is already NCCL.
@@ -164,15 +171,6 @@ class FsdpParameterGroup:
             self._symm_mem_pool = symm_mem.get_mem_pool(self.main_weight.device)
         else:
             self._symm_mem_pool = None
-
-        current_stream = torch.cuda.current_stream(allgather_stream.device)
-        allgather_stream.wait_stream(current_stream)
-        with torch.cuda.stream(allgather_stream):
-            # Match the optimizer post-step and checkpoint-load state: compute weights
-            # begin as a cast of the optimizer weights and are restored to their
-            # configured placements by the first pre-forward unshard.
-            self.model_weight = self.main_weight.cast(self.dtype)
-        current_stream.wait_stream(allgather_stream)
 
         with self._symmetric_memory_context():
             self._unsharded_model_weight = DBuffer(
