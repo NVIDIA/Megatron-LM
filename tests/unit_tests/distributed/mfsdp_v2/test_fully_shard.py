@@ -447,6 +447,53 @@ def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
     assert len(list(model.parameters())) == 1
 
 
+def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
+    """A training step should stay below five full-size child buffers."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    dim = 4096
+    dtype = torch.bfloat16
+    model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
+    placements = _flat_placements()
+    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
+    x = torch.randn(2, dim, device=device, dtype=dtype)
+
+    def train_step() -> None:
+        optimizer.zero_grad(set_to_none=True)
+        model(x).float().sum().backward()
+        optimizer.step()
+
+    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+    resting_allocated = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    train_step()
+    peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
+
+    # Backward keeps the current child and one prefetched child unsharded. The current
+    # child also has a full wgrad until it is copied into a full reduce-scatter input,
+    # for a four-full-child-buffer peak. Allow one additional buffer for cuBLAS
+    # workspace, allocator granularity, and small temporaries.
+    bound_nbytes = (4 + 1) * child_weight_nbytes
+
+    assert peak_delta < bound_nbytes, (
+        "FSDP training-step peak memory exceeded the full-size-buffer bound: "
+        f"rank={rank}, peak_delta={_mb(peak_delta)}, "
+        f"five_full_child_buffers={_mb(bound_nbytes)}"
+    )
+
+
 def test_deleted_model_releases_fsdp_storage(distributed_setup):
     """Deleting an FSDP model should release its persistent storage."""
     world_size = distributed_setup.world_size
