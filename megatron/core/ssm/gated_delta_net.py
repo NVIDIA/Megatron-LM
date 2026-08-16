@@ -47,7 +47,6 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
-    from fla.ops.cp import build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
@@ -57,6 +56,11 @@ except ImportError:
     chunk_gated_delta_rule = None
 
     HAVE_FLA = False
+
+try:
+    from fla.ops.cp import build_cp_context
+except ImportError:
+    build_cp_context = None
 
 
 logger = logging.getLogger(__name__)
@@ -416,6 +420,11 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens_kv = None
 
         if cp_size_chunkwise > 1:
+            if build_cp_context is None:
+                raise ImportError(
+                    "FLA chunkwise context parallelism requires fla.ops.cp.build_cp_context. "
+                    "Install an FLA build that provides the CP extension, or use CP=1/headwise CP."
+                )
             if cu_seqlens_q is None:
                 # Non-packed input: the only sources of cu_seqlens are the static
                 # global sequence length and batch size. Cache both the cu_seqlens

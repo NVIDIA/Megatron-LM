@@ -13,6 +13,7 @@
 #               support pipeline parallelism)
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
+#   MTP_NUM_LAYERS: number of MTP prediction depths (default: 1)
 #   FORCE_LOAD_BALANCING: set to 1 to enable --moe-router-force-load-balancing
 #                         (perf / mock-data only; OFF for real finetuning)
 #   LAUNCHER: torchrun (default) or python
@@ -48,6 +49,7 @@ VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
 # Batch sizes
 MBS=${MBS:-2}
 GBS=${GBS:-16}
+MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-1}
 
 # Parallelism
 TP=${TP:-1}
@@ -260,13 +262,18 @@ TRAINING_ARGS=(
     --enable-experimental
     --manual-gc
     --manual-gc-interval 50
-    --mtp-num-layers 1
-    --mtp-loss-scaling-factor 0.1
     --sft
     --use-flash-attn
     # --attention-backend flash
     --calculate-per-token-loss
 )
+
+if [ "$MTP_NUM_LAYERS" -gt 0 ]; then
+    TRAINING_ARGS+=(
+        --mtp-num-layers "$MTP_NUM_LAYERS"
+        --mtp-loss-scaling-factor 0.1
+    )
+fi
 
 PROFILE_ARGS=()
 NSYS_CMD=()
@@ -336,8 +343,7 @@ fi
 
 # --- Qwen3.5 Decoder Architecture (variant-specific dims set above) ---
 # These must match examples/multimodal_dev/models/qwen35_vl/configuration.py
-GPT_MODEL_ARGS=(
-    --num-layers "$NUM_LAYERS"
+LANGUAGE_MODEL_ARGS=(
     --hidden-size "$HIDDEN_SIZE"
     --ffn-hidden-size "$FFN_HIDDEN_SIZE"
     --num-attention-heads "$NUM_ATTN_HEADS"
@@ -373,7 +379,7 @@ GPT_MODEL_ARGS=(
 # 0.8B, 2B, 4B use tied embeddings; all other variants untie them.
 case "$MODEL_VARIANT" in
     0.8b|2b|4b) ;;
-    *)           GPT_MODEL_ARGS+=( --untie-embeddings-and-output-weights ) ;;
+    *)           LANGUAGE_MODEL_ARGS+=( --untie-embeddings-and-output-weights ) ;;
 esac
 
 # --- MoE args (MoE variants only) ---
@@ -415,6 +421,34 @@ if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
         MOE_ARGS+=( --moe-router-force-load-balancing )
     fi
 fi
+
+# HybridModel expresses each historical GPT block as two independently ordered
+# layers: attention (GatedDeltaNet 'G' or full attention '*') followed by an
+# MLP ('-' for dense or 'E' for MoE). Qwen3.5 uses three GDN blocks followed by
+# one full-attention block, matching --linear-attention-freq 4 in the former
+# GPT path. Its MTP layer replicates the last block, as the GPT path derived the
+# MTP spec from the final decoder layer. A NUM_LAYERS that is not a multiple of
+# 4 leaves trailing GDN blocks, which is also what --linear-attention-freq 4
+# produced, so proxy runs with any depth stay supported.
+if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
+    MLP_LAYER_SYMBOL="E"
+else
+    MLP_LAYER_SYMBOL="-"
+fi
+ATTN_LAYER_SYMBOL="G"
+HYBRID_LAYER_PATTERN=""
+for ((layer_idx = 1; layer_idx <= NUM_LAYERS; layer_idx++)); do
+    if [ $((layer_idx % 4)) -eq 0 ]; then
+        ATTN_LAYER_SYMBOL="*"
+    else
+        ATTN_LAYER_SYMBOL="G"
+    fi
+    HYBRID_LAYER_PATTERN+="${ATTN_LAYER_SYMBOL}${MLP_LAYER_SYMBOL}"
+done
+for ((mtp_depth = 0; mtp_depth < MTP_NUM_LAYERS; mtp_depth++)); do
+    HYBRID_LAYER_PATTERN+="/${ATTN_LAYER_SYMBOL}${MLP_LAYER_SYMBOL}"
+done
+HYBRID_MODEL_ARGS=( --hybrid-layer-pattern "$HYBRID_LAYER_PATTERN" )
 
 # --- Recompute ---
 if [ "$RECOMPUTE" -eq 1 ]; then
@@ -476,6 +510,7 @@ echo "================================================================"
 echo "Qwen3.5-VL Multimodal Training (multimodal_dev)"
 echo "  Variant:       $MODEL_VARIANT"
 echo "  Vision layers: $VISION_NUM_LAYERS"
+echo "  Hybrid pattern: $HYBRID_LAYER_PATTERN"
 echo "  GPUs per node: $GPUS_PER_NODE"
 echo "  Num nodes:     $NUM_NODES"
 echo "  TP=$TP  EP=$EP  PP=$PP  CP=$CP"
@@ -510,7 +545,8 @@ cmd=( "${NSYS_CMD[@]}" "${LAUNCH_CMD[@]}" \
     "${EVAL_AND_LOGGING_ARGS[@]}" \
     "${TOKENIZER_ARGS[@]}" \
     "${MULTIMODAL_ARGS[@]}" \
-    "${GPT_MODEL_ARGS[@]}" \
+    "${LANGUAGE_MODEL_ARGS[@]}" \
+    "${HYBRID_MODEL_ARGS[@]}" \
     "${MOE_ARGS[@]}" \
     "${RECOMPUTE_ARGS[@]}" \
     "${FSDP_ARGS[@]}" \
