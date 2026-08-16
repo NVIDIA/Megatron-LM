@@ -525,7 +525,7 @@ def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setu
 
 
 def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distributed_setup):
-    """Allocated memory should match sharded optimizer data plus the replicated model weight."""
+    """First-step peak memory should match the expected ZeRO-1 training allocations."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
@@ -540,23 +540,17 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     placements = _zero1_placements()
     with fully_shard_context(device=device):
         fully_shard(model, mesh=mesh, placements=placements)
-
-    (parameter_group,) = model.parameter_groups
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, foreach=False)
     fully_shard_optimizer(optimizer)
+    (parameter_group,) = model.parameter_groups
 
-    # Adam lazily initializes its states on the first step with gradients, so create
-    # them before recording the memory baseline and measuring their sharded size.
-    model(x).sum().backward()
-    optimizer.step()
-    assert parameter_group.model_weight.placements == (Flat(),)
-    allocated_before_forward = torch.cuda.memory_allocated(device)
+    allocated_before_training = torch.cuda.memory_allocated(device)
     torch.cuda.reset_peak_memory_stats(device)
 
-    # Restore replicated model weight.
-    with torch.no_grad():
-        output = model(x)
-    assert parameter_group.model_weight.placements == (Replicate(),)
+    loss = model(x).sum()
+    loss.backward()
+    optimizer.step()
+    assert parameter_group.model_weight.placements == (Flat(),)
 
     actual_optimizer_size = sum(
         state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes
@@ -568,12 +562,57 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     fp32_size = torch.empty((), dtype=torch.float32).element_size()
     bf16_size = torch.empty((), dtype=dtype).element_size()
     theoretical_optimizer_size = 2 * shard_numel * fp32_size
-    # Flat and replicated weights coexist during all-gather.
-    theoretical_forward_growth = dim * dim * bf16_size
+
+    # ElementwiseModel itself is the only layer in this test model.
+    num_layers = 1
+    full_bf16_weight_size = dim * dim * bf16_size
+    sharded_bf16_weight_size = full_bf16_weight_size // world_size
+    sharded_fp32_weight_size = shard_numel * fp32_size
+    activation_size = num_tokens * dim * bf16_size
+    # Backward peak growth:
+    # - Unsharded model weight: dim * dim * bf16_size.
+    backward_model_weight_size = full_bf16_weight_size
+    # - Full parameter gradient: dim * dim * bf16_size.
+    backward_parameter_gradient_size = full_bf16_weight_size
+    # - Unreduced partial-gradient buffer: dim * dim * bf16_size.
+    backward_partial_gradient_size = full_bf16_weight_size
+    # - Earlier-layer activations: (num_layers - 1) * num_tokens * dim * bf16_size.
+    #   This one-layer model has no stacked activation at its backward peak.
+    backward_stacked_activation_size = (num_layers - 1) * activation_size
+    # - Released baseline model-weight shard: -(dim * dim * bf16_size / world_size).
+    released_sharded_model_weight_size = sharded_bf16_weight_size
+    theoretical_backward_growth = (
+        backward_model_weight_size
+        + backward_parameter_gradient_size
+        + backward_partial_gradient_size
+        + backward_stacked_activation_size
+        - released_sharded_model_weight_size
+    )
+
+    # First-Adam-step peak growth:
+    # - Model weight grows from sharded to full BF16: full - sharded BF16 weight.
+    optimizer_model_weight_growth = full_bf16_weight_size - sharded_bf16_weight_size
+    # - BF16 main gradient shrinks from full to sharded: -(full - sharded BF16 weight).
+    optimizer_main_gradient_reduction = full_bf16_weight_size - sharded_bf16_weight_size
+    # - Casted gradient: shard_numel * fp32_size.
+    optimizer_casted_gradient_size = sharded_fp32_weight_size
+    # - Optimizer states exp_avg and exp_avg_sq: 2 * shard_numel * fp32_size.
+    optimizer_state_size = 2 * sharded_fp32_weight_size
+    # - Two FP32 buffers that briefly coexist while Adam computes the
+    #   bias-corrected denominator: 2 * shard_numel * fp32_size.
+    optimizer_temporary_size = 2 * sharded_fp32_weight_size
+    theoretical_optimizer_growth = (
+        optimizer_model_weight_growth
+        - optimizer_main_gradient_reduction
+        + optimizer_casted_gradient_size
+        + optimizer_state_size
+        + optimizer_temporary_size
+    )
+    theoretical_training_growth = max(theoretical_backward_growth, theoretical_optimizer_growth)
 
     assert actual_optimizer_size == theoretical_optimizer_size
-    actual_forward_growth = torch.cuda.max_memory_allocated(device) - allocated_before_forward
-    assert abs(actual_forward_growth - theoretical_forward_growth) < 1024**2
+    actual_training_growth = torch.cuda.max_memory_allocated(device) - allocated_before_training
+    assert abs(actual_training_growth - theoretical_training_growth) < 1024**2
 
 
 def test_deleted_model_releases_fsdp_storage(distributed_setup):
@@ -1148,21 +1187,22 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
 
 
-@pytest.mark.parametrize(
-    "strategy,placements_factory",
-    [
-        pytest.param("zero1", _zero1_placements, id="zero1"),
-        pytest.param("zero2", _zero2_placements, id="zero2"),
-        pytest.param("zero3", _flat_placements, id="zero3"),
-    ],
-)
-def test_fully_shard_reduces_peak_training_memory(distributed_setup, strategy, placements_factory):
-    """Per-layer FSDP should reduce peak CUDA memory for each sharding strategy."""
+def test_fully_shard_reduces_peak_training_memory(distributed_setup):
+    """Peak training memory should decrease as more model state is sharded."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
+    # Ignoring common allocations, let W be the full BF16 model size, R be the
+    # world size, and T be one layer's temporary gradient buffers plus live
+    # activations. W covers all 16 layers, while T covers only the current layer's
+    # gradient buffers and small activations, so T < W in this test.
+    # 1. ZeRO-1 peak = max(W + T, 4W / R).
+    # 2. ZeRO-2 peak = max(W / R + T, 4W / R).
+    # Here 4W / R is the sharded main grad, two Adam states, and foreach temporary.
+    # At R = 2, the optimizer term dominates both, so their peaks may be equal;
+    # R >= 4 ensures that the ZeRO-1 peak is strictly greater than the ZeRO-2 peak.
+    if world_size < 4:
+        pytest.skip("This test requires at least 4 ranks for strict peak-memory ordering.")
     mesh = init_device_mesh(device.type, (world_size,))
     dim = 1024
     layers = 16
@@ -1182,43 +1222,55 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup, strategy, p
     x = torch.randn(batch, dim, device=device, dtype=dtype)
     torch.cuda.reset_peak_memory_stats(device)
     train_steps(baseline, baseline_optimizer, x)
-    torch.cuda.synchronize(device)
     baseline_peak = torch.cuda.max_memory_allocated(device)
 
     del baseline_optimizer
     del baseline
     del x
-    torch.cuda.empty_cache()
 
-    torch.manual_seed(4321)
-    model = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(device)
-    with fully_shard_context(device=device):
-        for layer in model:
-            fully_shard(
-                layer,
-                mesh=mesh,
-                placements=placements_factory(),
-                mixed_precision_policy=MixedPrecisionPolicy(
-                    main_params_dtype=dtype, main_grads_dtype=dtype
-                ),
-            )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
-    torch.cuda.empty_cache()
+    sharded_peaks: dict[str, int] = {}
+    for strategy, placements_factory in (
+        ("zero1", _zero1_placements),
+        ("zero2", _zero2_placements),
+        ("zero3", _flat_placements),
+    ):
+        torch.manual_seed(4321)
+        model = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(device)
+        with fully_shard_context(device=device):
+            for layer in model:
+                fully_shard(
+                    layer,
+                    mesh=mesh,
+                    placements=placements_factory(),
+                    mixed_precision_policy=MixedPrecisionPolicy(
+                        main_params_dtype=dtype, main_grads_dtype=dtype
+                    ),
+                )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
 
-    x = torch.randn(batch, dim, device=device, dtype=dtype)
-    torch.cuda.reset_peak_memory_stats(device)
-    train_steps(model, optimizer, x)
-    torch.cuda.synchronize(device)
-    sharded_peak = torch.cuda.max_memory_allocated(device)
+        x = torch.randn(batch, dim, device=device, dtype=dtype)
+        torch.cuda.reset_peak_memory_stats(device)
+        train_steps(model, optimizer, x)
+        sharded_peaks[strategy] = torch.cuda.max_memory_allocated(device)
+
+        del optimizer
+        del model
+        del x
+
+    zero1_peak = sharded_peaks["zero1"]
+    zero2_peak = sharded_peaks["zero2"]
+    zero3_peak = sharded_peaks["zero3"]
     logger.info(
-        "FSDP peak memory: rank=%s, strategy=%s, baseline=%s, sharded=%s",
+        "Peak training memory: rank=%s, no_shard=%s, zero1=%s, zero2=%s, zero3=%s",
         rank,
-        strategy,
         _mb(baseline_peak),
-        _mb(sharded_peak),
+        _mb(zero1_peak),
+        _mb(zero2_peak),
+        _mb(zero3_peak),
     )
 
-    assert sharded_peak < baseline_peak, (
-        f"Expected {strategy} to reduce peak training memory on rank {rank}: "
-        f"baseline={_mb(baseline_peak)}, sharded={_mb(sharded_peak)}"
+    assert zero3_peak < zero2_peak < zero1_peak < baseline_peak, (
+        f"Expected peak training memory to decrease with increased sharding on rank {rank}: "
+        f"no_shard={_mb(baseline_peak)}, zero1={_mb(zero1_peak)}, "
+        f"zero2={_mb(zero2_peak)}, zero3={_mb(zero3_peak)}"
     )

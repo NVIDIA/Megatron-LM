@@ -153,7 +153,10 @@ class FsdpParameterGroup:
         tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         current_stream = torch.cuda.current_stream(allgather_stream.device)
+        # Wait for the input parameters produced on the main stream to be ready.
         allgather_stream.wait_stream(current_stream)
+        # Allocate main_weight and model_weight on the all-gather stream so both
+        # buffers record it as their allocation stream.
         with torch.cuda.stream(allgather_stream):
             self.main_weight = DBuffer.distribute_tensors(
                 (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
