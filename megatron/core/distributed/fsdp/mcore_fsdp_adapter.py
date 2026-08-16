@@ -58,7 +58,9 @@ try:
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         Flat,
+        Partial,
         Placements,
+        Replicate,
         fully_shard,
         fully_shard_context,
     )
@@ -526,8 +528,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 wrapping path. MFSDP v2 manages parameter groups independently and ignores it.
             device: Device whose type is used to construct the data-parallel mesh.
                 Defaults to CUDA.
-            pg_collection: Explicit process groups. The ``dp_cp`` group defines the
-                data-parallel mesh.
+            pg_collection: Explicit process groups. ``dp_cp`` defines the full
+                data-parallel domain. Hybrid sharding additionally uses ``intra_dp_cp``
+                for DP-inner and ``inter_dist_opt`` for DP-outer.
 
         Raises:
             ImportError: If the Megatron FSDP implementation is unavailable.
@@ -563,17 +566,48 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             self.mp_policy,
         )
 
-        dp_group = pg_collection.dp_cp
         device_type = device.type if device is not None else "cuda"
-        dp_mesh = DeviceMesh.from_group(dp_group, device_type=device_type, mesh_dim_names=("dp",))
+        enable_hsdp = ddp_config.num_distributed_optimizer_instances > 1
+        if enable_hsdp:
+            self.mesh = _build_hybrid_dp_mesh(
+                full_dp_group=pg_collection.dp_cp,
+                outer_dp_group=pg_collection.inter_dist_opt,
+                inner_dp_group=pg_collection.intra_dp_cp,
+                device_type=device_type,
+                mesh_dim_names=("dp_outer", "dp_inner"),
+            )
+            outer_optimizer_placement = (
+                Flat() if ddp_config.outer_dp_sharding_strategy == "optim" else Replicate()
+            )
+            placements = Placements(
+                dp_axes=[0, 1],
+                parameter=[Replicate(), Flat()],
+                gradient=[Partial(dist.ReduceOp.AVG), Flat()],
+                optimizer=[outer_optimizer_placement, Flat()],
+            )
+        else:
+            self.mesh = DeviceMesh.from_group(
+                pg_collection.dp_cp, device_type=device_type, mesh_dim_names=("dp",)
+            )
+            placements = Placements(
+                dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
+            )
+        dp_mesh = self.mesh
+
+        # Hybrid sharding applies only to dense parameters. Expert parameters
+        # retain ordinary one-dimensional FSDP over their full EDP domain.
+        expert_placements = Placements(
+            dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
+        )
         expert_dp_mesh = None
-        if config.expert_model_parallel_size > 1:
+        has_moe = any(isinstance(submodule, MoELayer) for submodule in module.modules())
+        if has_moe and (enable_hsdp or config.expert_model_parallel_size > 1):
+            if pg_collection.expt_dp is None:
+                raise ValueError("MFSDP v2 MoE models require an explicit expt_dp group.")
             expert_dp_mesh = DeviceMesh.from_group(
                 pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expert_dp",)
             )
-        placements = Placements(
-            dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
-        )
+        self.moe_mesh = expert_dp_mesh
         fine_grained = config.overlap_moe_expert_parallel_comm
         skip_backward_cb = fine_grained and ddp_config.delay_wgrad_compute
         # Join an ambient multi-chunk construction scope when VPP wrapping
@@ -595,7 +629,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,
-                            placements=placements,
+                            placements=expert_placements,
                             mixed_precision_policy=self.mp_policy,
                             fine_grained=fine_grained,
                             skip_backward_callback=skip_backward_cb,
@@ -784,8 +818,42 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError(
                 "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."
             )
-        if ddp_config.outer_dp_sharding_strategy != "no_shard":
-            raise ValueError("MFSDP v2 does not currently support outer DP sharding.")
+        enable_hsdp = ddp_config.num_distributed_optimizer_instances > 1
+        if ddp_config.outer_dp_sharding_strategy == "optim" and not enable_hsdp:
+            raise ValueError(
+                "MFSDP v2 outer_dp_sharding_strategy='optim' requires "
+                "num_distributed_optimizer_instances > 1."
+            )
+        if enable_hsdp:
+            required_groups = ("intra_dp_cp", "inter_dist_opt")
+            for group_name in required_groups:
+                if getattr(pg_collection, group_name, None) is None:
+                    raise ValueError(
+                        f"MFSDP v2 hybrid sharding requires an explicit {group_name} group."
+                    )
+            outer_size = pg_collection.inter_dist_opt.size()
+            inner_size = pg_collection.intra_dp_cp.size()
+            if outer_size != ddp_config.num_distributed_optimizer_instances:
+                raise ValueError(
+                    "MFSDP v2 DP-outer group size must match "
+                    "num_distributed_optimizer_instances: "
+                    f"got {outer_size} and {ddp_config.num_distributed_optimizer_instances}."
+                )
+            if pg_collection.dp_cp.size() != outer_size * inner_size:
+                raise ValueError(
+                    "MFSDP v2 full DP group must factor as DP-outer x DP-inner: "
+                    f"got full={pg_collection.dp_cp.size()}, outer={outer_size}, "
+                    f"inner={inner_size}."
+                )
+
+            has_expert_parameters = any(
+                isinstance(submodule, MoELayer) for submodule in module.modules()
+            )
+            if has_expert_parameters:
+                if getattr(pg_collection, "expt_dp", None) is None:
+                    raise ValueError(
+                        "MFSDP v2 hybrid MoE sharding requires an explicit expt_dp group."
+                    )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss:
@@ -890,6 +958,58 @@ def FullyShardedDataParallel(
     )
     return fsdp_class(
         config, ddp_config, module, fsdp_unit_modules, disable_bucketing, device, pg_collection
+    )
+
+
+def _build_hybrid_dp_mesh(
+    full_dp_group, outer_dp_group, inner_dp_group, device_type: str, mesh_dim_names: Tuple[str, str]
+) -> DeviceMesh:
+    """Build a 2-D DP mesh from MCore's full, outer, and inner process groups.
+
+    MCore orders each full DP group's ranks as contiguous distributed-optimizer
+    instances. Reshaping that ordered rank list as ``(outer, inner)`` therefore
+    makes rows match ``inner_dp_group`` and columns match ``outer_dp_group``.
+    Validate both memberships before handing the existing groups to DeviceMesh;
+    this catches a rank-order mismatch before any collective is launched.
+    """
+    outer_size = outer_dp_group.size()
+    inner_size = inner_dp_group.size()
+    full_ranks = dist.get_process_group_ranks(full_dp_group)
+    expected_size = outer_size * inner_size
+    if len(full_ranks) != expected_size:
+        raise ValueError(
+            "Hybrid DP mesh requires full DP size == outer DP size * inner DP size: "
+            f"got full={len(full_ranks)}, outer={outer_size}, inner={inner_size}."
+        )
+
+    mesh = torch.tensor(full_ranks, dtype=torch.int64).reshape(outer_size, inner_size)
+    rank = dist.get_rank()
+    coordinates = (mesh == rank).nonzero(as_tuple=False)
+    if coordinates.shape != (1, 2):
+        raise ValueError(
+            f"Current rank {rank} must occur exactly once in hybrid DP mesh {mesh.tolist()}."
+        )
+    outer_coordinate, inner_coordinate = coordinates[0].tolist()
+    mesh_inner_ranks = mesh[outer_coordinate, :].tolist()
+    mesh_outer_ranks = mesh[:, inner_coordinate].tolist()
+    actual_inner_ranks = dist.get_process_group_ranks(inner_dp_group)
+    actual_outer_ranks = dist.get_process_group_ranks(outer_dp_group)
+    if sorted(mesh_inner_ranks) != sorted(actual_inner_ranks):
+        raise ValueError(
+            "Hybrid DP mesh row does not match the current rank's DP-inner group: "
+            f"mesh={mesh_inner_ranks}, group={actual_inner_ranks}."
+        )
+    if sorted(mesh_outer_ranks) != sorted(actual_outer_ranks):
+        raise ValueError(
+            "Hybrid DP mesh column does not match the current rank's DP-outer group: "
+            f"mesh={mesh_outer_ranks}, group={actual_outer_ranks}."
+        )
+
+    return DeviceMesh.from_group(
+        [outer_dp_group, inner_dp_group],
+        device_type=device_type,
+        mesh=mesh.tolist(),
+        mesh_dim_names=mesh_dim_names,
     )
 
 

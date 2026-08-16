@@ -12,6 +12,7 @@ import torch
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import Flat, Partial, Replicate
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -503,3 +504,214 @@ class TestMcoreAdapterExpertParallel:
         assert torch.isfinite(reference_losses).all()
         assert losses[-1] < losses[0]
         torch.testing.assert_close(losses, reference_losses)
+
+
+class TestMcoreAdapterHybrid:
+    """Exercise the adapter's DP-outer x DP-inner HFSDP mapping."""
+
+    def setup_method(self):
+        world_size = Utils.world_size
+        if world_size < 4 or world_size % 2:
+            pytest.skip("MFSDP v2 hybrid adapter tests require an even number of >=4 ranks.")
+        # EP spans the whole dense DP domain, so expert DP remains exactly one
+        # while dense DP can still factor into DP-outer x DP-inner.
+        self.expert_model_parallel_size = world_size
+        Utils.initialize_model_parallel(
+            1,
+            1,
+            expert_model_parallel_size=self.expert_model_parallel_size,
+            num_distributed_optimizer_instances=2,
+            expert_num_distributed_optimizer_instances=1,
+        )
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(1234)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def test_hfsdp_mesh_placements_and_multiple_steps(self):
+        """HFSDP should use inner sharding, outer optimizer sharding, and train repeatedly."""
+        world_size = torch.distributed.get_world_size()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+            device="cuda", dtype=config.params_dtype
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                outer_dp_sharding_strategy="optim",
+                num_distributed_optimizer_instances=2,
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.bfloat16,
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert tuple(model.mesh.mesh.shape) == (2, world_size // 2)
+        assert sorted(torch.distributed.get_process_group_ranks(model.mesh.get_group(0))) == sorted(
+            torch.distributed.get_process_group_ranks(self.pg_collection.inter_dist_opt)
+        )
+        assert sorted(torch.distributed.get_process_group_ranks(model.mesh.get_group(1))) == sorted(
+            torch.distributed.get_process_group_ranks(self.pg_collection.intra_dp_cp)
+        )
+
+        parameter_group = model.module.parameter_groups[0]
+        assert isinstance(parameter_group.model_weight.placements[0], Replicate)
+        assert isinstance(parameter_group.model_weight.placements[1], Flat)
+        assert isinstance(parameter_group._main_grad_placements[0], Partial)
+        assert isinstance(parameter_group._main_grad_placements[1], Flat)
+        assert all(
+            isinstance(placement, Flat) for placement in parameter_group.main_weight.placements
+        )
+
+        optimizer_config = OptimizerConfig(
+            optimizer="adam",
+            lr=1.0e-3,
+            weight_decay=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_distributed_optimizer=False,
+            clip_grad=0.0,
+        )
+        optimizer = get_megatron_optimizer(
+            optimizer_config,
+            [model],
+            use_gloo_process_groups=False,
+            pg_collection=self.pg_collection,
+        )
+        optimizer.reload_model_params()
+
+        inputs = [
+            torch.randn(4, config.hidden_size, device="cuda", dtype=config.params_dtype)
+            for _ in range(3)
+        ]
+        losses = []
+        for batch in inputs:
+            model.zero_grad_buffer()
+            optimizer.zero_grad(set_to_none=True)
+            loss = model(batch).float().square().mean()
+            loss.backward()
+            success, _, _ = optimizer.step()
+            assert success
+            losses.append(loss.detach())
+
+        assert torch.isfinite(torch.stack(losses)).all()
+
+    def test_hfsdp_meta_init_stages_optimizer_sharding(self):
+        """Meta initialization should materialize both HFSDP axes one at a time."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            init_model_with_meta_device=True,
+        )
+        model = torch.nn.Sequential(
+            torch.nn.Linear(
+                config.hidden_size, config.hidden_size, device="meta", dtype=config.params_dtype
+            ),
+            torch.nn.GELU(),
+            torch.nn.Linear(
+                config.hidden_size, config.hidden_size, device="meta", dtype=config.params_dtype
+            ),
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                outer_dp_sharding_strategy="optim",
+                num_distributed_optimizer_instances=2,
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.bfloat16,
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        output = model(torch.randn(2, config.hidden_size, device="cuda", dtype=config.params_dtype))
+        assert torch.isfinite(output).all()
+
+    def test_expert_parameters_keep_plain_fsdp_at_edp_one(self):
+        """Dense HFSDP must not add a dense outer axis to expert parameters."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_moe_experts=self.expert_model_parallel_size,
+            expert_model_parallel_size=self.expert_model_parallel_size,
+            moe_layer_freq=[0, 1],
+            moe_token_dispatcher_type="alltoall",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            moe_ffn_hidden_size=128,
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+            params_dtype=torch.float32,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            gradient_accumulation_fusion=False,
+            attention_backend=AttnBackend.unfused,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=8,
+            hybrid_layer_pattern="*E",
+            pg_collection=self.pg_collection,
+        ).cuda()
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                outer_dp_sharding_strategy="optim",
+                num_distributed_optimizer_instances=2,
+                megatron_fsdp_main_params_dtype=torch.float32,
+                megatron_fsdp_main_grads_dtype=torch.bfloat16,
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert self.pg_collection.expt_dp.size() == 1
+        assert self.pg_collection.intra_expt_dp.size() == 1
+        assert tuple(model.moe_mesh.mesh.shape) == (1,)
+
+        expert_module = model.module.decoder.layers[1].mlp.experts
+        assert isinstance(expert_module, FsdpModule)
+        assert expert_module.parameter_groups
+        for parameter_group in expert_module.parameter_groups:
+            assert parameter_group.mesh.ndim == 1
+            assert isinstance(parameter_group.model_weight.placements[0], Flat)
+            assert isinstance(parameter_group._main_grad_placements[0], Flat)
+            assert isinstance(parameter_group.main_weight.placements[0], Flat)
+
+        dense_groups = [
+            parameter_group
+            for fsdp_module in model.module.modules()
+            if isinstance(fsdp_module, FsdpModule) and fsdp_module is not expert_module
+            for parameter_group in fsdp_module.parameter_groups
+        ]
+        assert any(parameter_group.mesh.ndim == 2 for parameter_group in dense_groups)
