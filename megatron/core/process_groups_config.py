@@ -161,7 +161,7 @@ class ProcessGroupCollection:
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
-    # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    # _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
