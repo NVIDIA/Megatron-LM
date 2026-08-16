@@ -157,7 +157,8 @@ def _make_config(
         add_bias_linear=False,
         bf16=True,
         params_dtype=torch.bfloat16,
-        layernorm_epsilon=1e-6,
+        layernorm_epsilon=1e-5,
+        attention_latent_norm_epsilon=1e-6,
         normalization="RMSNorm",
         qk_layernorm=True,
         layernorm_zero_centered_gamma=False,
@@ -754,12 +755,12 @@ class NativeDSv4HybridAttention(nn.Module):
             self._rope_yarn_kwargs = dict()
 
         self.linear_q_down_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
-        self.q_layernorm = nn.RMSNorm(config.q_lora_rank, eps=config.layernorm_epsilon)
+        self.q_layernorm = nn.RMSNorm(config.q_lora_rank, eps=config.attention_latent_norm_epsilon)
         self.linear_q_up_proj = nn.Linear(
             config.q_lora_rank, config.num_attention_heads * config.v_head_dim, bias=False
         )
         self.linear_kv_proj = nn.Linear(config.hidden_size, config.v_head_dim, bias=False)
-        self.kv_layernorm = nn.RMSNorm(config.v_head_dim, eps=config.layernorm_epsilon)
+        self.kv_layernorm = nn.RMSNorm(config.v_head_dim, eps=config.attention_latent_norm_epsilon)
         self.core_attention = NativeCompressedSparseAttention(config, compress_ratio)
         group_in = (config.num_attention_heads * config.v_head_dim) // config.o_groups
         self.linear_o_group_proj = nn.Parameter(
@@ -985,6 +986,22 @@ class TestDSv4HybridNativeParity:
     def teardown_method(self):
         gc.collect()
         torch.cuda.empty_cache()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize(("backend", "use_fused_kernels"), _DSA_BACKENDS)
+    def test_attention_latent_norm_epsilon_matches_native_reference(
+        self, backend: str, use_fused_kernels: bool
+    ):
+        """Exercise distinct global and attention latent norm epsilons on DSv4."""
+        self.test_attention_matches_native_reference(
+            variant="flash",
+            compress_ratio=4,
+            seqlen=512,
+            backend=backend,
+            use_fused_kernels=use_fused_kernels,
+            calculate_per_token_loss=True,
+            dsa_indexer_use_sparse_loss=True,
+        )
 
     @pytest.mark.parametrize(("backend", "use_fused_kernels"), _DSA_BACKENDS)
     @pytest.mark.parametrize("variant", ["flash", "pro"])
