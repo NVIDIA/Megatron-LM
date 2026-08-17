@@ -38,6 +38,7 @@ from .param_layout import (
 )
 
 logger = logging.getLogger(__name__)
+LAYERWISE_LAYOUT_FALLBACK_MAX_PADDING_OVERHEAD = 1.0
 
 
 def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
@@ -74,6 +75,11 @@ def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: boo
     if not hasattr(param, 'is_managed_by_layer_wise_optimizer'):
         return default_for_untagged
     return param.is_managed_by_layer_wise_optimizer
+
+
+def _bucket_uses_layer_wise_fallback(bucket) -> bool:
+    """Whether a bucket belongs to a LayerWise fallback buffer."""
+    return getattr(bucket, 'layerwise_fallback', False)
 
 
 def _param_sort_key(numel: int, identity: tuple) -> tuple:
@@ -129,6 +135,12 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         dp_size = data_parallel_world_size
         bucket_divisor = bucket_end_divisor(dp_size, ddp_config.pad_buckets_for_high_nccl_busbw)
         return math.lcm(64, bucket_divisor // dp_size)
+
+    @staticmethod
+    def _layout_padding_overhead(layout: 'PerBufferParamLayout', total_param_numel: int) -> float:
+        """Return padded-buffer overhead relative to raw parameter numel."""
+        total_buffer_numel = layout.bucket_indices[-1][1] if layout.bucket_indices else 0
+        return (total_buffer_numel - total_param_numel) / max(total_param_numel, 1)
 
     @staticmethod
     def _compute_per_buffer_param_layout(
@@ -373,14 +385,38 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 layouts[buffer_key] = per_buffer_layout
                 continue
             if buffer_key.is_managed_by_layer_wise_optimizer:
-                compute_per_buffer_layout = (
-                    LayerWiseDistributedOptimizer._compute_per_buffer_param_layout
+                layout = LayerWiseDistributedOptimizer._compute_per_buffer_param_layout(
+                    group_params, bucket_size, dp_world_size, ddp_config, param_indices
                 )
+                total_param_numel = sum(p.data.nelement() for p in group_params)
+                layerwise_overhead = LayerWiseDistributedOptimizer._layout_padding_overhead(
+                    layout, total_param_numel
+                )
+                if layerwise_overhead > LAYERWISE_LAYOUT_FALLBACK_MAX_PADDING_OVERHEAD:
+                    fallback_layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                        group_params, bucket_size, dp_world_size, ddp_config, param_indices
+                    )
+                    fallback_layout.layerwise_fallback = True
+                    fallback_overhead = LayerWiseDistributedOptimizer._layout_padding_overhead(
+                        fallback_layout, total_param_numel
+                    )
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        "Layerwise param layout fallback: "
+                        f"{len(group_params)} params, dp_size={dp_world_size}, "
+                        f"layerwise_overhead={layerwise_overhead * 100:.1f}% exceeds "
+                        f"{LAYERWISE_LAYOUT_FALLBACK_MAX_PADDING_OVERHEAD * 100:.1f}%, "
+                        f"fallback_overhead={fallback_overhead * 100:.1f}%. "
+                        "This buffer will use all-reduce gradients and legacy "
+                        "LayerWise parameter all-gather; other buffers keep reduce-scatter.",
+                    )
+                    layout = fallback_layout
             else:
-                compute_per_buffer_layout = DistributedOptimizer._compute_per_buffer_param_layout
-            layouts[buffer_key] = compute_per_buffer_layout(
-                group_params, bucket_size, dp_world_size, ddp_config, param_indices
-            )
+                layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                    group_params, bucket_size, dp_world_size, ddp_config, param_indices
+                )
+            layouts[buffer_key] = layout
         return FullParamLayout(layouts=layouts)
 
     def __init__(
@@ -425,15 +461,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # per-rank lists are all-gathered (dp_cp / expt_dp size > 1 here); non-gathered fp8 params
         # (e.g. expt_dp == 1 experts, which are absent from these lists) still need the copy-back.
         self.use_fp8_param_sync = False
-        if self.decouple_ddp_layout:
-            for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
-                if not params_list:
-                    continue
-                for per_rank in params_list:
-                    for p in per_rank:
-                        if is_float8tensor(p):
-                            self.use_fp8_param_sync = True
-                            p._layer_wise_fp8_gathered = True
+        params_lists_to_gather = (
+            (self.dp_cp_params_list, self.expt_dp_params_list)
+            if self.decouple_ddp_layout
+            else (self.dp_cp_fallback_params_list, self.expt_dp_fallback_params_list)
+        )
+        for params_list in params_lists_to_gather:
+            if not params_list:
+                continue
+            for per_rank in params_list:
+                for param in per_rank:
+                    if is_float8tensor(param):
+                        self.use_fp8_param_sync = True
+                        param._layer_wise_fp8_gathered = True
 
         # When a full_param_layout is available (and we are not decoupling),
         # ddp_config.use_distributed_optimizer is True and model params are views into the
@@ -534,6 +574,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if dp_cp_size == 1:
             self.dp_cp_params_list = None
             self.expt_dp_params_list = None
+            self.dp_cp_fallback_params_list = None
+            self.expt_dp_fallback_params_list = None
             return
 
         expt_dp_size = get_pg_size(self.pg_collection.expt_dp)
@@ -550,15 +592,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
         self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
+        self.dp_cp_fallback_params_list = [[] for _ in range(dp_cp_size)]
+        self.expt_dp_fallback_params_list = [[] for _ in range(expt_dp_size)]
 
         # Map each param to its shard index.
         param_to_shard: Dict[torch.nn.Parameter, int] = {}
+        fallback_params = set()
         for full_layout in full_param_layouts:
             for buffer_key, layout in full_layout.layouts.items():
                 # Non-LayerWise buffers (e.g. Adam-managed embeddings, biases,
                 # layernorms with a DistOpt byte-level layout) are managed by a
                 # separate DistributedOptimizer; LayerWise does not own them.
                 if not buffer_key.is_managed_by_layer_wise_optimizer:
+                    continue
+                if layout.layerwise_fallback:
+                    fallback_params.update(layout.param_index_map.keys())
                     continue
                 dp_size = expt_dp_size if buffer_key.is_expert_parallel else dp_cp_size
                 for param, (
@@ -585,6 +633,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for optimizer in optimizers:
             param_groups += optimizer.param_groups
         param_groups_this_rank = [[] for _ in param_groups]
+        fallback_param_entries = []
 
         for group_index, group in enumerate(param_groups):
             is_expert = group.get("is_expert_parallel", False)
@@ -592,6 +641,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             params_list = self.expt_dp_params_list if is_expert else self.dp_cp_params_list
 
             for param in group["params"]:
+                if param in fallback_params:
+                    fallback_param_entries.append((param, group_index, is_expert))
+                    continue
                 assert param in param_to_shard, (
                     f"Optimizer param (shape={tuple(param.shape)}, numel={param.numel()}) "
                     f"not found in any param layout. Ensure all optimizer params are "
@@ -602,6 +654,32 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 if shard_id == local_rank:
                     param_groups_this_rank[group_index].append(param)
 
+        # Fallback params use the legacy whole-parameter ping-pong assignment:
+        # their gradients are all-reduced (not reduce-scattered), so any rank can
+        # own and update a whole tensor without matching a contiguous buffer shard.
+        dp_cp_loop = list(range(dp_cp_size)) + list(range(dp_cp_size))[::-1]
+        expt_dp_loop = list(range(expt_dp_size)) + list(range(expt_dp_size))[::-1]
+        dp_cp_idx, expt_dp_idx = 0, 0
+        fallback_param_entries.sort(key=lambda x: x[0].numel())
+        for param, group_index, is_expert in fallback_param_entries:
+            if is_expert:
+                shard_id = expt_dp_loop[expt_dp_idx]
+                expt_dp_idx = (expt_dp_idx + 1) % len(expt_dp_loop)
+                local_rank = expt_dp_rank
+                params_list = self.expt_dp_params_list
+                fallback_params_list = self.expt_dp_fallback_params_list
+            else:
+                shard_id = dp_cp_loop[dp_cp_idx]
+                dp_cp_idx = (dp_cp_idx + 1) % len(dp_cp_loop)
+                local_rank = dp_cp_rank
+                params_list = self.dp_cp_params_list
+                fallback_params_list = self.dp_cp_fallback_params_list
+
+            params_list[shard_id].append(param)
+            fallback_params_list[shard_id].append(param)
+            if shard_id == local_rank:
+                param_groups_this_rank[group_index].append(param)
+
         # Now we modify the group to only handle local params.
         for group, local_params in zip(param_groups, param_groups_this_rank):
             group["params"] = local_params
@@ -609,6 +687,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Simplify when expt_dp group size is 1 or expert parallel is off.
         if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
             self.expt_dp_params_list = None
+        if not any(self.dp_cp_fallback_params_list):
+            self.dp_cp_fallback_params_list = None
+        if not any(self.expt_dp_fallback_params_list):
+            self.expt_dp_fallback_params_list = None
 
     def _build_param_sort_keys(self, model_chunks):
         """Build ``{param: (chunk_idx, buffer_idx, global_start_index)}`` — a rank-independent key
@@ -655,6 +737,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         expt_dp_loop = list(range(expt_dp_size)) + list(range(expt_dp_size))[::-1]
         self.dp_cp_params_list = [[] for _ in range(dp_cp_size)]
         self.expt_dp_params_list = [[] for _ in range(expt_dp_size)]
+        self.dp_cp_fallback_params_list = None
+        self.expt_dp_fallback_params_list = None
         # Get all param groups.
         param_groups = []
         for optimizer in optimizers:
@@ -759,6 +843,112 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     bucket.set_layerwise_params_list(bucket_params_list)
 
     @torch.no_grad()
+    def _allgather_params_list(self, params_list, group) -> None:
+        """All-gather whole parameters from per-rank parameter ownership lists."""
+        if not params_list:
+            return
+
+        def _allgather_helper_fp8(owned_params_list):
+            rank = get_pg_rank(group)
+            dp_size = get_pg_size(group)
+            device = next(
+                (params[0].device for params in owned_params_list if len(params) > 0), None
+            )
+            if device is None:
+                return
+
+            owned = owned_params_list[rank]
+            src = (
+                _flatten_dense_tensors([_stage_param_to_bf16(param) for param in owned])
+                if len(owned) > 0
+                else torch.empty(0, device=device, dtype=torch.bfloat16)
+            )
+            flat_sizes = [sum(param.numel() for param in params) for params in owned_params_list]
+            if max(flat_sizes) == 0:
+                return
+
+            gather_list = [
+                (
+                    src
+                    if rank_idx == rank
+                    else torch.empty(flat_sizes[rank_idx], device=device, dtype=torch.bfloat16)
+                )
+                for rank_idx in range(dp_size)
+            ]
+            torch.distributed.all_gather(gather_list, src, group=group)
+
+            for rank_idx, params in enumerate(owned_params_list):
+                if len(params) == 0:
+                    continue
+                templates = [
+                    torch.empty(param.shape, device="meta", dtype=torch.bfloat16)
+                    for param in params
+                ]
+                updated_params = _unflatten_dense_tensors(gather_list[rank_idx], templates)
+                for updated_bf16, model_param in zip(updated_params, params):
+                    copy_back_gathered_bf16_into_fp8_param(model_param, updated_bf16)
+
+            fp8_params = [
+                param for params in owned_params_list for param in params if is_float8tensor(param)
+            ]
+            if fp8_params:
+                post_all_gather_processing(fp8_params)
+
+        def _allgather_helper(owned_params_list):
+            rank = get_pg_rank(group)
+            dp_size = get_pg_size(group)
+            nonempty_params = next((params for params in owned_params_list if params), None)
+            if nonempty_params is None:
+                return
+
+            device = nonempty_params[0].device
+            dtype = nonempty_params[0].dtype
+            local_params = owned_params_list[rank]
+            src = (
+                _flatten_dense_tensors(local_params)
+                if len(local_params) > 0
+                else torch.empty(0, device=device, dtype=dtype)
+            )
+            flat_sizes = [sum(param.numel() for param in params) for params in owned_params_list]
+            if max(flat_sizes) == 0:
+                return
+
+            gather_list = [
+                (
+                    src
+                    if rank_idx == rank
+                    else torch.empty(flat_sizes[rank_idx], device=device, dtype=dtype)
+                )
+                for rank_idx in range(dp_size)
+            ]
+            torch.distributed.all_gather(gather_list, src, group=group)
+
+            for rank_idx, params in enumerate(owned_params_list):
+                if len(params) == 0 or rank_idx == rank:
+                    continue
+                updated_params = _unflatten_dense_tensors(gather_list[rank_idx], params)
+                for updated_param, model_param in zip(updated_params, params):
+                    model_param.data.copy_(updated_param)
+
+        staged = [
+            [param for param in owned if is_float8tensor(param) or param.dtype != torch.float32]
+            for owned in params_list
+        ]
+        native = [
+            [
+                param
+                for param in owned
+                if not is_float8tensor(param) and param.dtype == torch.float32
+            ]
+            for owned in params_list
+        ]
+        if any(owned for owned in staged):
+            staged_helper = _allgather_helper_fp8 if self.use_fp8_param_sync else _allgather_helper
+            staged_helper(staged)
+        if any(owned for owned in native):
+            _allgather_helper(native)
+
+    @torch.no_grad()
     def allgather_params(self) -> None:
         """All-gather updated params from all ranks.
 
@@ -777,127 +967,24 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
           columnwise/transpose (blockwise/Float8; mxfp8 noop since copy-back already forced it).
         """
 
-        # FP8-aware variant: stage bf16, uneven all-gather bf16, requantize per rank.
-        def _allgather_helper_fp8(params_list, group):
-            # TODO(perf, blockwise-only): blockwise could gather the owner's fp8 rowwise data
-            # (~2x less comm) instead of bf16; mxfp8 must stay on bf16. See the matching TODO in
-            # ``_ParamAndGradBucketGroup.start_param_sync`` for the full rationale.
-            rank = get_pg_rank(group)
-            dp_size = get_pg_size(group)
-            # Device from any non-empty owned list (rank 0 may own zero params in the layout).
-            device = next((params[0].device for params in params_list if len(params) > 0), None)
-            if device is None:
-                # No rank owns any param in this buffer -> nothing to gather.
-                return
-
-            # Stage fp32 master->bf16 (high-precision source), not lossy dequant(fp8).
-            owned = params_list[rank]
-            src = (
-                _flatten_dense_tensors([_stage_param_to_bf16(p) for p in owned])
-                if len(owned) > 0
-                else torch.empty(0, device=device, dtype=torch.bfloat16)
-            )
-            flat_sizes = [sum(p.numel() for p in params) for params in params_list]
-            if max(flat_sizes) == 0:
-                return
-
-            gather_list = []
-            for i in range(dp_size):
-                if i == rank:
-                    gather_list.append(src)
-                else:
-                    gather_list.append(
-                        torch.empty(flat_sizes[i], device=device, dtype=torch.bfloat16)
-                    )
-
-            torch.distributed.all_gather(gather_list, src, group=group)
-
-            # Requantize the gathered bf16 into EVERY rank's params (owned included) so all ranks
-            # hold Q(bf16(master)), matching OFF/Adam. Unflatten by param shape (logical numel).
-            for idx, params in enumerate(params_list):
-                if len(params) == 0:
-                    continue
-                templates = [
-                    torch.empty(p.shape, device="meta", dtype=torch.bfloat16) for p in params
-                ]
-                updated_params = _unflatten_dense_tensors(gather_list[idx], templates)
-                for updated_bf16, model_p in zip(updated_params, params):
-                    copy_back_gathered_bf16_into_fp8_param(model_p, updated_bf16)
-
-            # Rebuild fp8 columnwise/transpose after the gather (mirrors the overlap / DistOpt
-            # paths; blockwise/Float8 build it, mxfp8 is a noop). Else it'd be deferred to forward.
-            fp8_params = [p for params in params_list for p in params if is_float8tensor(p)]
-            if fp8_params:
-                post_all_gather_processing(fp8_params)
-
-        # helper function to flatten local params, all-gather,
-        # unflatten and copy to model params
-        def _allgather_helper(params_list, group):
-            device = params_list[0][0].device
-            dtype = params_list[0][0].dtype
-            rank = get_pg_rank(group)
-            dp_size = get_pg_size(group)
-            # Flatten this rank's params.
-            src = (
-                _flatten_dense_tensors(params_list[rank])
-                if len(params_list[rank]) > 0
-                else torch.empty(0, device=device, dtype=dtype)
-            )
-            flat_sizes = [sum(p.numel() for p in params) for params in params_list]
-            if max(flat_sizes) == 0:
-                return
-
-            # Allocate per-rank receive buffers with actual sizes (no padding).
-            # PyTorch's NCCL backend handles uneven sizes in all_gather via
-            # grouped send/recv internally. Reuse src for local rank's slot.
-            gather_list = []
-            for i in range(dp_size):
-                if i == rank:
-                    gather_list.append(src)
-                else:
-                    gather_list.append(torch.empty(flat_sizes[i], device=device, dtype=dtype))
-
-            torch.distributed.all_gather(gather_list, src, group=group)
-
-            # Unflatten and copy gathered params for each rank.
-            for idx, params in enumerate(params_list):
-                if len(params) == 0 or idx == rank:
-                    continue
-                updated_params = _unflatten_dense_tensors(gather_list[idx], params)
-                for updated_p, model_p in zip(updated_params, params):
-                    model_p.data.copy_(updated_p)
-
         if self.pg_collection is None:
             return
-
-        def _dispatch(params_list, group):
-            # Split each rank's owned params by transport dtype. fp8 and bf16 params ride the
-            # bf16 transport (the fp8 helper stages master->bf16 / requantizes, a no-op in
-            # precision for bf16); native fp32 params (e.g. weights marked keep_in_fp32 such as
-            # the DeepSeek-V4 CSA ``ape``) must be gathered in fp32 -- routing them through the
-            # bf16-staged path would silently downcast them, and mixing fp32 with bf16 in one
-            # flatten is invalid. For a pure-bf16 model (no fp32 Muon params) the native group is
-            # empty and this collapses to the original single-helper dispatch.
-            staged = [
-                [p for p in owned if is_float8tensor(p) or p.dtype != torch.float32]
-                for owned in params_list
-            ]
-            native = [
-                [p for p in owned if not is_float8tensor(p) and p.dtype == torch.float32]
-                for owned in params_list
-            ]
-            if any(owned for owned in staged):
-                staged_helper = (
-                    _allgather_helper_fp8 if self.use_fp8_param_sync else _allgather_helper
-                )
-                staged_helper(staged, group)
-            if any(owned for owned in native):
-                _allgather_helper(native, group)
-
         if self.dp_cp_params_list:
-            _dispatch(self.dp_cp_params_list, self.pg_collection.dp_cp)
+            self._allgather_params_list(self.dp_cp_params_list, self.pg_collection.dp_cp)
         if self.expt_dp_params_list:
-            _dispatch(self.expt_dp_params_list, self.pg_collection.expt_dp)
+            self._allgather_params_list(self.expt_dp_params_list, self.pg_collection.expt_dp)
+
+    @torch.no_grad()
+    def allgather_fallback_params(self) -> None:
+        """All-gather only LayerWise fallback params after local whole-param updates."""
+        if self.pg_collection is None:
+            return
+        if self.dp_cp_fallback_params_list:
+            self._allgather_params_list(self.dp_cp_fallback_params_list, self.pg_collection.dp_cp)
+        if self.expt_dp_fallback_params_list:
+            self._allgather_params_list(
+                self.expt_dp_fallback_params_list, self.pg_collection.expt_dp
+            )
 
     @torch.no_grad()
     def broadcast_params(self):
@@ -989,6 +1076,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 if bucket_group.buckets and _bucket_is_managed_by_layer_wise_optimizer(
                     bucket_group.buckets[0]
                 ):
+                    if _bucket_uses_layer_wise_fallback(bucket_group.buckets[0]):
+                        continue
                     model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
 
     @torch.no_grad()
@@ -1016,6 +1105,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 self.start_param_sync_for_bucket_group_subset()
             else:
                 self.allgather_params()
+
+        if self.use_buffer_param_sync:
+            self.allgather_fallback_params()
 
         return success
 
