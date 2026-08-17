@@ -543,6 +543,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         # cannot reliably run NCCL P2P on a separate stream, so this flag lets
         # tests (the only synchronous-use case) fall back to the default stream.
         self.use_owner_comm_stream: bool = use_owner_comm_stream
+        self._owner_comm_needed: bool | None = None
         self._shard_plans: dict[int, ShardPlan] = {}
         self._owners: dict[int, int] = {}
         self._owner_comm_stream_cache: dict[torch.device, torch.cuda.Stream] = {}
@@ -1011,6 +1012,20 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
            owner gather; boundary params wait for their gather then NS+scatter).
         """
         loss = None if closure is None else closure()
+
+        if self._world_size() > 1:
+            if self._owner_comm_needed is None:
+                has_boundary = False
+                for group in self.param_groups:
+                    plans = self._init_shard_plans(group["params"])
+                    if any(p is not None and p.is_boundary() for p in plans):
+                        has_boundary = True
+                        break
+                flag = torch.tensor(int(has_boundary), device=self._device(), dtype=torch.int)
+                dist.all_reduce(flag, op=dist.ReduceOp.SUM, group=self._dp_group())
+                self._owner_comm_needed = flag.item() > 0
+                if self._owner_comm_needed:
+                    self._init_collective_groups()
 
         fsdp_parameter_groups: set[FsdpParameterGroup] = set()
         for group in self.param_groups:
