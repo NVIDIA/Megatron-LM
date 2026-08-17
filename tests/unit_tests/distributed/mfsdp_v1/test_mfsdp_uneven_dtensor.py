@@ -3,19 +3,27 @@
 Unit tests for Megatron-FSDP uneven_dtensor functions.
 
 Run with torchrun:
+    torchrun --nproc_per_node=2 pytest test_mfsdp_uneven_dtensor.py -v
     torchrun --nproc_per_node=4 pytest test_mfsdp_uneven_dtensor.py -v
     torchrun --nproc_per_node=8 pytest test_mfsdp_uneven_dtensor.py -v
 """
 
+import shutil
+
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as dist_checkpointing
 from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.placement_types import _StridedShard
 
+from megatron.core.dist_checkpointing.core import CheckpointingException
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    gather_and_compute_chunk_metadata,
+    preprocess_state_dict_for_uneven_dtensor,
     split_dtensor,
     uneven_dtensor_to_full_tensor,
+    validate_state_dict_for_uneven_dtensor,
 )
 
 # ---------- Helper: broadcast-based global tensor creation ----------
@@ -54,6 +62,184 @@ def make_global_arange(shape, dtype=torch.float32, device=torch.device("cpu")):
 
 
 # ---------- Tests ----------
+
+
+@pytest.mark.distributed
+def test_chunk_metadata_preflight_accepts_uneven_shards(distributed_setup):
+    """Valid uneven shards should produce deterministic offsets and sizes."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(world_size)))
+    shard_sizes = [shard_rank + 1 for shard_rank in range(world_size)]
+    global_rows = sum(shard_sizes)
+    local_rows = shard_sizes[rank]
+    local = torch.zeros((local_rows, 3), device=distributed_setup.device)
+    dtensor = DTensor.from_local(
+        local, mesh, (Shard(0),), run_check=False, shape=(global_rows, 3), stride=(3, 1)
+    )
+
+    chunk_metadata = gather_and_compute_chunk_metadata(dtensor)
+
+    assert chunk_metadata.offsets == (sum(shard_sizes[:rank]), 0)
+    assert chunk_metadata.sizes == (local_rows, 3)
+
+
+@pytest.mark.distributed
+def test_chunk_metadata_preflight_rejects_global_shape_mismatch(distributed_setup):
+    """Ranks must fail together when they declare different logical shapes."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Contract mismatch test requires at least two ranks")
+
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(world_size)))
+    declared_rows = world_size if rank == 0 else world_size + 1
+    local = torch.zeros((1, 3), device=distributed_setup.device)
+    dtensor = DTensor.from_local(
+        local, mesh, (Shard(0),), run_check=False, shape=(declared_rows, 3), stride=(3, 1)
+    )
+
+    with pytest.raises(CheckpointingException, match="metadata contract mismatch"):
+        gather_and_compute_chunk_metadata(dtensor)
+
+    # A successful collective after the exception proves that every rank exited the
+    # preflight symmetrically and the communicator remains usable.
+    dist.barrier()
+
+
+@pytest.mark.distributed
+def test_chunk_metadata_preflight_rejects_placement_mismatch(distributed_setup):
+    """Ranks must not branch into different shape collectives for different placements."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Contract mismatch test requires at least two ranks")
+
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(world_size)))
+    placement = Shard(0) if rank == 0 else Replicate()
+    local = torch.zeros((1, 3), device=distributed_setup.device)
+    dtensor = DTensor.from_local(
+        local, mesh, (placement,), run_check=False, shape=(world_size, 3), stride=(3, 1)
+    )
+
+    with pytest.raises(CheckpointingException, match="metadata contract mismatch"):
+        gather_and_compute_chunk_metadata(dtensor)
+
+    dist.barrier()
+
+
+@pytest.mark.distributed
+def test_state_dict_preflight_rejects_key_manifest_mismatch(distributed_setup):
+    """Different state-dict key sets must fail before per-key metadata diverges."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Manifest mismatch test requires at least two ranks")
+
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(world_size)))
+    local = torch.zeros((1, 3), device=distributed_setup.device)
+    dtensor = DTensor.from_local(
+        local, mesh, (Shard(0),), run_check=False, shape=(world_size, 3), stride=(3, 1)
+    )
+    state_dict = {"left" if rank == 0 else "right": dtensor}
+
+    with pytest.raises(CheckpointingException, match="metadata contract mismatch"):
+        preprocess_state_dict_for_uneven_dtensor(state_dict)
+
+    dist.barrier()
+
+
+@pytest.mark.distributed
+def test_state_dict_preflight_rejects_missing_dtensor_manifest(distributed_setup):
+    """A missing DTensor key must fail before per-key collectives diverge."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Manifest mismatch test requires at least two ranks")
+
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(world_size)))
+    local = torch.zeros((1, 3), device=distributed_setup.device)
+    dtensor = DTensor.from_local(
+        local, mesh, (Shard(0),), run_check=False, shape=(world_size, 3), stride=(3, 1)
+    )
+    state_dict = {"common": dtensor}
+    if rank == 0:
+        state_dict["rank_zero_only"] = dtensor
+
+    with pytest.raises(CheckpointingException, match="metadata contract mismatch"):
+        validate_state_dict_for_uneven_dtensor(state_dict)
+
+    dist.barrier()
+
+
+@pytest.mark.distributed
+def test_chunk_metadata_preflight_rejects_invalid_shard_composition(distributed_setup):
+    """Local shard lengths must compose the logical shape, including uneven layouts."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Shard composition test requires at least two ranks")
+
+    world_size = distributed_setup.world_size
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(world_size)))
+    local = torch.zeros((2, 3), device=distributed_setup.device)
+    dtensor = DTensor.from_local(
+        local, mesh, (Shard(0),), run_check=False, shape=(world_size, 3), stride=(3, 1)
+    )
+
+    with pytest.raises(CheckpointingException, match="do not compose"):
+        gather_and_compute_chunk_metadata(dtensor)
+
+    dist.barrier()
+
+
+@pytest.mark.distributed
+def test_uneven_dtensor_checkpoint_round_trip(distributed_setup, tmp_path_dist_ckpt):
+    """Save and load a real uneven DTensor checkpoint through PyTorch DCP."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    mesh = DeviceMesh(distributed_setup.device.type, list(range(world_size)))
+    shard_sizes = [shard_rank + 1 for shard_rank in range(world_size)]
+    global_rows = sum(shard_sizes)
+    global_tensor = make_global_arange(
+        (global_rows, 4), dtype=torch.float32, device=distributed_setup.device
+    )
+    local_start = sum(shard_sizes[:rank])
+    local_end = local_start + shard_sizes[rank]
+    source_local = global_tensor[local_start:local_end].clone()
+    source_dtensor = DTensor.from_local(
+        source_local,
+        mesh,
+        (Shard(0),),
+        run_check=False,
+        shape=global_tensor.shape,
+        stride=global_tensor.stride(),
+    )
+    source_state_dict = preprocess_state_dict_for_uneven_dtensor({"weight": source_dtensor})
+
+    checkpoint_dir = tmp_path_dist_ckpt / "uneven_dtensor_preflight_round_trip"
+    if rank == 0:
+        shutil.rmtree(checkpoint_dir, ignore_errors=True)
+        checkpoint_dir.mkdir(parents=True)
+    dist.barrier()
+
+    dist_checkpointing.save(source_state_dict, checkpoint_id=str(checkpoint_dir))
+    dist.barrier()
+
+    target_local = torch.full_like(source_local, -1)
+    target_dtensor = DTensor.from_local(
+        target_local,
+        mesh,
+        (Shard(0),),
+        run_check=False,
+        shape=global_tensor.shape,
+        stride=global_tensor.stride(),
+    )
+    target_state_dict = preprocess_state_dict_for_uneven_dtensor({"weight": target_dtensor})
+    dist_checkpointing.load(target_state_dict, checkpoint_id=str(checkpoint_dir))
+
+    assert torch.equal(target_dtensor.to_local(), source_local)
+    assert torch.equal(uneven_dtensor_to_full_tensor(target_dtensor), global_tensor)
+    dist.barrier()
+
 
 # ---------------------------------------------------------------------------
 # uneven_dtensor_to_full_tensor tests
