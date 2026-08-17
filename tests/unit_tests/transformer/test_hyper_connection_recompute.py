@@ -59,6 +59,22 @@ class TestHyperConnectionCheckpoint:
 
         torch.testing.assert_close(mixed, expected, atol=0.0, rtol=0.0)
 
+    def test_forward_supports_empty_sequence(self):
+        """Forward and backward should support an empty sequence."""
+        module = self._create_hyper_connection_module(hidden_size=4, num_residual_streams=2)
+        hidden_states = torch.empty(0, 1, 8, device='cuda', requires_grad=True)
+
+        aggregated, h_res, h_post, residual = module(hidden_states)
+
+        assert aggregated.shape == (0, 1, 4)
+        assert h_res.shape == (0, 1, 2, 2)
+        assert h_post.shape == (0, 1, 2)
+        assert residual.shape == (0, 1, 8)
+
+        (aggregated.sum() + h_res.sum() + h_post.sum() + residual.sum()).backward()
+        assert hidden_states.grad is not None
+        assert module.mapping_proj.weight.grad is not None
+
     def test_forward_normal_vs_checkpoint_correctness(self):
         """
         Test that _forward_with_checkpoint produces the same outputs as _forward_normal.
