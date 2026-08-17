@@ -55,3 +55,26 @@ def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
             num_attention_heads=4,
             gdp_num_householder=num_householder,
         )
+
+
+@pytest.mark.parametrize("num_chunk_states", [0, 2, 64])
+def test_gdp_chunk_state_recompute_accepts_supported_values(num_chunk_states: int):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        gdp_num_chunk_states_to_recompute=num_chunk_states,
+    )
+
+    assert config.gdp_num_chunk_states_to_recompute == num_chunk_states
+
+
+@pytest.mark.parametrize("num_chunk_states", [-1, 65])
+def test_gdp_chunk_state_recompute_rejects_unsupported_values(num_chunk_states: int):
+    with pytest.raises(ValueError, match="must be in \\[0, 64\\]"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            gdp_num_chunk_states_to_recompute=num_chunk_states,
+        )

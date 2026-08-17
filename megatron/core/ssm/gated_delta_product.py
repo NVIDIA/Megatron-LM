@@ -4,6 +4,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import inspect
 import logging
 import math
 from dataclasses import dataclass, replace
@@ -77,10 +78,34 @@ try:
 
     HAVE_FLA = True
 except ImportError:
+    chunk_gated_delta_product = None
+    fused_recurrent_gated_delta_rule = None
     HAVE_FLA = False
+
+try:
+    from gdp_attn import chunk_gated_delta_product as cutedsl_chunk_gated_delta_product
+
+    HAVE_CUTEDSL_GDP = True
+except ImportError:
+    cutedsl_chunk_gated_delta_product = None
+    HAVE_CUTEDSL_GDP = False
 
 
 logger = logging.getLogger(__name__)
+
+
+def _kernel_accepts_kwarg(kernel, name: str) -> bool:
+    """Return True if `kernel` explicitly declares a keyword argument called `name`."""
+    try:
+        parameters = inspect.signature(kernel).parameters
+    except (TypeError, ValueError):
+        # Builtins / C extensions without introspectable signatures.
+        return False
+    parameter = parameters.get(name)
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 class ExtendedRMSNorm(RMSNormGated):
@@ -176,7 +201,10 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 "MambaSSM is not installed. Please install it with `pip install mamba-ssm`."
             )
 
-        if not HAVE_FLA:
+        if config.gdp_cutedsl_kernel:
+            if not HAVE_CUTEDSL_GDP:
+                raise ImportError("gdp_attn (CuTeDSL GatedDeltaProduct) is not installed")
+        elif not HAVE_FLA:
             raise ImportError("FLA is not installed")
 
         super().__init__(config)
@@ -191,6 +219,22 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         assert ok, reason
 
         self.num_householder = config.gdp_num_householder
+
+        # Select the chunked kernel once. The recurrent FLA kernel remains the decode
+        # implementation, which is why the CuTeDSL path is rejected for decode below.
+        self.gdp_kernel = (
+            cutedsl_chunk_gated_delta_product
+            if config.gdp_cutedsl_kernel
+            else chunk_gated_delta_product
+        )
+
+        # Newer CuTeDSL kernel builds accept num_chunk_states_to_recompute; probe the
+        # signature once so older builds that predate the argument still work.
+        self.gdp_kernel_extra_kwargs = {}
+        if _kernel_accepts_kwarg(self.gdp_kernel, "num_chunk_states_to_recompute"):
+            self.gdp_kernel_extra_kwargs["num_chunk_states_to_recompute"] = (
+                config.gdp_num_chunk_states_to_recompute
+            )
 
         self.config = config
         self.d_model = d_model
@@ -384,11 +428,22 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         packed_seq_params=None,
     ):
         """Run the gated delta product mixer on hidden states."""
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         seq_len, batch_size, dim = hidden_states.shape
+
+        if self.config.gdp_cutedsl_kernel and packed_seq_params is not None:
+            raise NotImplementedError(
+                "--gdp-cutedsl-kernel currently supports unpacked sequences only."
+            )
 
         conv_state, ssm_state = None, None
         if inference_context is not None:
             if inference_context.is_dynamic_batching():
+                if self.config.gdp_cutedsl_kernel:
+                    raise NotImplementedError(
+                        "--gdp-cutedsl-kernel does not support dynamic inference."
+                    )
                 ok, reason = check_fla_sequence_packing_support()
                 assert ok, reason
                 assert (
@@ -403,6 +458,10 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 "GDP does not currently support packed sequences during inference. "
                 "Packing is only wired through the training/prefill (chunk) path."
             )
+            if self.config.gdp_cutedsl_kernel and inference_context.seqlen_offset > 0:
+                raise NotImplementedError(
+                    "--gdp-cutedsl-kernel supports static prefill but not decode."
+                )
             conv_state, ssm_state = self._get_states_from_cache(inference_context, batch_size)
             if inference_context.seqlen_offset > 0:
                 # The states are updated in place.
@@ -442,11 +501,17 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             dim=-1,
         )
 
-        # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor.
-        # But the expected memory layout varies depending on whether seq_idx is set.
+        # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor. Its unpacked kernel
+        # supports both channels-first and channels-last memory layouts.
         if seq_idx_packed is None:
-            # Default path: channels-first contiguous, stride(2) == 1.
-            VKQ = rearrange(VKQ, "b l d -> b d l").contiguous()
+            if self.config.gdp_cutedsl_kernel:
+                # Keep the channel-last backing storage, stride(1) == 1. The conv
+                # output then becomes dense [B, L, D] after the transpose below,
+                # avoiding a full VKQ copy and downstream layout materializations.
+                VKQ = rearrange(VKQ, "b l d -> b d l")
+            else:
+                # Preserve the existing FLA path: channels-first, stride(2) == 1.
+                VKQ = rearrange(VKQ, "b l d -> b d l").contiguous()
         else:
             # ``causal_conv1d_fn(seq_idx=...)`` requires channels-last memory but [B, D, L]
             # logical shape. This keeps the channels contiguous in memory.
@@ -486,41 +551,98 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         )
 
         z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
-        value = rearrange(
-            value, "b l (m h p) -> b (l m) h p", m=self.num_householder, p=self.headdim
-        ).contiguous()
-        key = rearrange(
-            key, "b l (m g n) -> b (l m) g n", m=self.num_householder, n=self.d_state
-        ).contiguous()
-        query = rearrange(query, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+        if self.config.gdp_cutedsl_kernel:
+            # CuTeDSL consumes one row per token and keeps the Householder copies in
+            # the feature dimension. Avoid materializing the FLA-only b x (l*m)
+            # layouts and their contiguous copies.
+            value = rearrange(
+                value, "b l (m h p) -> (b l) (m h p)", m=self.num_householder, p=self.headdim
+            )
+            key = rearrange(
+                key,
+                "b l (m g n) -> b l m g n",
+                m=self.num_householder,
+                n=self.d_state,
+            )
+            query = rearrange(query, "b l (g n) -> b l g n", n=self.d_state)
+        else:
+            value = rearrange(
+                value, "b l (m h p) -> b (l m) h p", m=self.num_householder, p=self.headdim
+            ).contiguous()
+            key = rearrange(
+                key, "b l (m g n) -> b (l m) g n", m=self.num_householder, n=self.d_state
+            ).contiguous()
+            query = rearrange(query, "b l (g n) -> b l g n", n=self.d_state).contiguous()
 
-        b, a = b.contiguous(), a.contiguous()
+            # Preserve the existing FLA layout and stride contract exactly.
+            b, a = b.contiguous(), a.contiguous()
+
         beta = b.sigmoid()
-        beta = rearrange(beta, "b l (m h) -> b (l m) h", m=self.num_householder).contiguous()
 
         # If the model is loaded in fp16, without the .float() here, A might be -inf
         g = -self.cp.get_A_log().float().exp() * F.softplus(a.float() + self.cp.get_dt_bias())
 
+        if self.config.gdp_cutedsl_kernel:
+            # Flatten the pointwise outputs directly without requesting separate
+            # contiguous materializations.
+            beta = rearrange(beta, "b l d -> (b l) d")
+            g = rearrange(g, "b l h -> (b l) h")
+        else:
+            beta = rearrange(
+                beta, "b l (m h) -> b (l m) h", m=self.num_householder
+            ).contiguous()
+
         if self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp > 1:
             query = query.repeat_interleave(
-                self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp, dim=2
+                self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp, dim=-2
             )
             key = key.repeat_interleave(
-                self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp, dim=2
+                self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp, dim=-2
             )
 
-        core_attn_out, last_recurrent_state = chunk_gated_delta_product(
-            query,
-            key,
-            value,
+        if self.config.gdp_cutedsl_kernel:
+            # GQA expansion is complete; collapse directly to the flat feature layout
+            # expected by gdp_attn without any explicit contiguous call.
+            key = rearrange(key, "b l m h n -> (b l) (m h n)")
+            query = rearrange(query, "b l h n -> (b l) (h n)")
+
+        kernel_cu_seqlens = cu_seqlens_packed
+        if self.config.gdp_cutedsl_kernel:
+            # Packed input is rejected above. These offsets describe each row of
+            # the rectangular batch as an independent fixed-length sequence.
+            kernel_batch_size, kernel_seq_len = zVKQba.shape[:2]
+            kernel_cu_seqlens = torch.arange(
+                0,
+                (kernel_batch_size + 1) * kernel_seq_len,
+                kernel_seq_len,
+                device=zVKQba.device,
+                dtype=torch.int32,
+            )
+
+        core_attn_out, last_recurrent_state = self.gdp_kernel(
+            q=query,
+            k=key,
+            v=value,
             g=g,
             beta=beta,
+            num_householder=self.num_householder,
             initial_state=None,
             output_final_state=(ssm_state is not None),
-            num_householder=self.num_householder,
             use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens_packed,
+            cu_seqlens=kernel_cu_seqlens,
+            **self.gdp_kernel_extra_kwargs,
         )
+
+        if self.config.gdp_cutedsl_kernel:
+            # Restore gdp_attn's [(b*l), (h*p)] output to the common layout
+            # without requesting another contiguous materialization here.
+            core_attn_out = rearrange(
+                core_attn_out,
+                "(b l) (h p) -> b l h p",
+                b=zVKQba.shape[0],
+                l=zVKQba.shape[1],
+                p=self.headdim,
+            )
 
         if ssm_state is not None:
             ssm_state.copy_(last_recurrent_state)

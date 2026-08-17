@@ -1216,6 +1216,17 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Controls usage of the memory efficient path for Mamba layers."""
 
+    gdp_cutedsl_kernel: bool = False
+    """Use the CuTeDSL GatedDeltaProduct kernel for unpacked training and static prefill."""
+
+    gdp_num_chunk_states_to_recompute: int = 2
+    """Checkpoint-coarsening ratio N in [0, 64] for the CuTeDSL GatedDeltaProduct kernel.
+    N=0 checkpoints every chunk state for the backward pass (dense, no recompute). N>=1
+    stores one checkpoint per group of N+1 chunks (1/(N+1) the checkpoint memory) and the
+    backward recomputes each group's N missing chunk states, trading recompute time for
+    activation memory monotonically in N (sweet spot N=2..3). Only honored by kernel
+    builds that expose the num_chunk_states_to_recompute argument."""
+
     mlp_chunks_for_prefill: int = 1
     """The number of chunks along the sequence dimension to use for MLP computation
     during prefill."""
@@ -1356,6 +1367,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.gdp_num_householder < 1:
             raise ValueError(
                 f"gdp_num_householder must be positive, got {self.gdp_num_householder}."
+            )
+        if not 0 <= self.gdp_num_chunk_states_to_recompute <= 64:
+            raise ValueError(
+                "gdp_num_chunk_states_to_recompute must be in [0, 64], got "
+                f"{self.gdp_num_chunk_states_to_recompute}."
             )
 
         # Apply BF16 matmul precision setting if needed
