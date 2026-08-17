@@ -184,7 +184,7 @@ def loss_func(
     # Note: This information needs to be determined in forward_step where we have access to the batch data
     # The loss_func doesn't have direct access to this information
 
-    return (loss[0], total_tokens.int(), output_dict)
+    return (loss[0].clone(), total_tokens.int(), output_dict)
 
 
 def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
