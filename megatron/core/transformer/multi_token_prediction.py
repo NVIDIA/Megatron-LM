@@ -15,6 +15,8 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fusions.fused_mtp_prefix import mtp_e2e_prefix_objective
+from megatron.core.fusions.fused_mtp_tv import vocab_parallel_tv_distance
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -724,126 +726,6 @@ def _compute_mtp_acceptance_counts(
     return correct, total
 
 
-class _VocabParallelTVDistance(torch.autograd.Function):
-    """Full-vocabulary TV distance with a TP-aware analytical backward.
-
-    The implementation follows Algorithms 1 and 2 in the Bebop paper
-    (https://arxiv.org/abs/2606.12370). It intentionally keeps the target
-    distribution detached and returns gradients for draft logits only.
-
-    This PyTorch implementation establishes the mathematical contract. It does
-    not yet fuse the vocabulary passes into a dedicated GPU kernel.
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        draft_logits: Tensor,
-        target_logits: Tensor,
-        tp_group: Optional[torch.distributed.ProcessGroup],
-        logits_are_vocab_sharded: bool,
-    ) -> Tensor:
-        """Compute the TV distance and save the draft-side backward state."""
-        if draft_logits.shape != target_logits.shape:
-            raise ValueError(
-                "Draft and target logits must have identical shapes, got "
-                f"{tuple(draft_logits.shape)} and {tuple(target_logits.shape)}."
-            )
-        if draft_logits.device != target_logits.device:
-            raise ValueError("Draft and target logits must be on the same device.")
-
-        tp_size = torch.distributed.get_world_size(group=tp_group) if tp_group is not None else 1
-        if logits_are_vocab_sharded and tp_group is None and parallel_state.is_initialized():
-            initialized_tp_size = parallel_state.get_tensor_model_parallel_world_size()
-            if initialized_tp_size > 1:
-                raise ValueError(
-                    "tp_group must be provided for TV distance over vocab-sharded logits "
-                    f"when tensor parallel size is {initialized_tp_size}."
-                )
-
-        draft_logits_fp32 = draft_logits.float()
-        target_logits_fp32 = target_logits.float()
-        maxima = torch.stack(
-            (draft_logits_fp32.max(dim=-1).values, target_logits_fp32.max(dim=-1).values)
-        )
-        if logits_are_vocab_sharded and tp_size > 1:
-            torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX, group=tp_group)
-        draft_max, target_max = maxima.unbind(dim=0)
-
-        draft_exp = torch.exp(draft_logits_fp32 - draft_max.unsqueeze(-1))
-        target_exp = torch.exp(target_logits_fp32 - target_max.unsqueeze(-1))
-        denominators = torch.stack((draft_exp.sum(dim=-1), target_exp.sum(dim=-1)))
-        if logits_are_vocab_sharded and tp_size > 1:
-            torch.distributed.all_reduce(
-                denominators, op=torch.distributed.ReduceOp.SUM, group=tp_group
-            )
-        draft_denominator, target_denominator = denominators.unbind(dim=0)
-
-        draft_prob = draft_exp / draft_denominator.unsqueeze(-1)
-        target_prob = target_exp / target_denominator.unsqueeze(-1)
-        draft_below_target = draft_prob <= target_prob
-        overlap_and_s = torch.stack(
-            (
-                torch.minimum(draft_prob, target_prob).sum(dim=-1),
-                (draft_prob * draft_below_target).sum(dim=-1),
-            )
-        )
-        if logits_are_vocab_sharded and tp_size > 1:
-            torch.distributed.all_reduce(
-                overlap_and_s, op=torch.distributed.ReduceOp.SUM, group=tp_group
-            )
-        overlap, s = overlap_and_s.unbind(dim=0)
-
-        raw_tv_distance = 1.0 - overlap
-        tv_distance = raw_tv_distance.clamp(min=0.0, max=1.0)
-        clamp_gradient_mask = (raw_tv_distance >= 0.0) & (raw_tv_distance <= 1.0)
-        ctx.save_for_backward(
-            draft_logits,
-            draft_max,
-            draft_denominator,
-            s,
-            draft_prob > target_prob,
-            clamp_gradient_mask,
-        )
-        return tv_distance
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor):
-        """Apply the analytical Bebop gradient to the draft logits only."""
-        (draft_logits, draft_max, draft_denominator, s, draft_above_target, clamp_gradient_mask) = (
-            ctx.saved_tensors
-        )
-
-        draft_prob = torch.exp(draft_logits.float() - draft_max.unsqueeze(-1))
-        draft_prob = draft_prob / draft_denominator.unsqueeze(-1)
-        grad_draft = draft_prob * (s.unsqueeze(-1) - 1.0 + draft_above_target.to(draft_prob.dtype))
-        grad_draft *= (grad_output * clamp_gradient_mask).unsqueeze(-1)
-        return grad_draft.to(draft_logits.dtype), None, None, None
-
-
-def vocab_parallel_tv_distance(
-    draft_logits: Tensor,
-    target_logits: Tensor,
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    logits_are_vocab_sharded: bool = True,
-) -> Tensor:
-    """Compute per-position full-vocabulary TV distance between draft and target logits.
-
-    Args:
-        draft_logits: Trainable draft logits with vocabulary in the last dimension.
-        target_logits: Detached target logits with the same local or global vocabulary layout.
-        tp_group: Tensor-parallel group owning vocabulary shards.
-        logits_are_vocab_sharded: Whether the last dimension is sharded across ``tp_group``.
-
-    Returns:
-        A FP32 tensor with the vocabulary dimension removed. Gradients flow only to
-        ``draft_logits``.
-    """
-    return _VocabParallelTVDistance.apply(
-        draft_logits, target_logits.detach(), tp_group, logits_are_vocab_sharded
-    )
-
-
 @dataclass
 class MultiTokenPredictionLayerSubmodules:
     """
@@ -1117,10 +999,11 @@ def _process_mtp_e2e_tv_loss(
         )
         if scale_logits_fn is not None:
             draft_logits = scale_logits_fn(draft_logits)
+        aligned_target_logits = target_logits.permute(2, 0, 1)
         tv_distances.append(
             vocab_parallel_tv_distance(
                 draft_logits,
-                target_logits.permute(2, 0, 1),
+                aligned_target_logits,
                 tp_group=tp_group,
                 logits_are_vocab_sharded=logits_are_vocab_sharded,
             )
@@ -1128,9 +1011,7 @@ def _process_mtp_e2e_tv_loss(
 
     tv_distances_tensor = torch.stack(tv_distances, dim=0)
     per_step_acceptance = 1.0 - tv_distances_tensor
-    prefix_acceptance = torch.cumprod(per_step_acceptance, dim=0)
-    prefix_losses = 1.0 - prefix_acceptance
-    e2e_tv_loss = prefix_losses.mean(dim=0)
+    e2e_tv_loss, prefix_losses = mtp_e2e_prefix_objective(per_step_acceptance)
 
     chain_mask = chain_valid.transpose(0, 1).to(e2e_tv_loss.dtype)
     num_tokens = chain_mask.sum()
