@@ -43,20 +43,22 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     return parser
 
 
-def _parse_and_validate() -> argparse.Namespace:
-    """Parse stock plus MIMO arguments and validate the disjoint module grids."""
-    args = parse_args(extra_args_provider)
-    validate_hetero_grid_args(args, args.world_size)
-    physical_world_size = args.world_size
-    # Run stock validation against the language module's logical topology.
+def _set_stock_parallel_args(args: argparse.Namespace) -> None:
+    # validate_args and the stock training loop consume these fields.
     args.tensor_model_parallel_size = args.llm_tp
     args.pipeline_model_parallel_size = args.llm_pp
     args.context_parallel_size = args.llm_cp
     args.expert_model_parallel_size = args.llm_ep
     args.expert_tensor_parallel_size = args.llm_expt_tp or 1
-    args.world_size = (
-        args.llm_dp * args.llm_tp * args.gtp_weight_remat_size * args.llm_pp * args.llm_cp
-    )
+
+
+def _parse_and_validate() -> argparse.Namespace:
+    """Parse stock plus MIMO arguments and validate the disjoint module grids."""
+    args = parse_args(extra_args_provider)
+    _, llm_size = validate_hetero_grid_args(args, args.world_size)
+    _set_stock_parallel_args(args)
+    physical_world_size = args.world_size
+    args.world_size = llm_size
     try:
         validate_args(args, {"dataloader_type": "external"})
     finally:

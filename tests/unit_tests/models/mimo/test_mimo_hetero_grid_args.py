@@ -71,8 +71,8 @@ def test_gtp_layout_validates_and_maps_weight_shard_axes():
     )
 
     assert validate_hetero_grid_args(args, WORLD_SIZE_8) == (4, 4)
-    assert args.gtp_weight_remat_size == 2
-    assert args.expert_gtp_weight_remat_size == 2
+    assert not hasattr(args, "gtp_weight_remat_size")
+    assert not hasattr(args, "expert_gtp_weight_remat_size")
 
     _, language_grid_spec = build_module_grid_specs(
         args, WORLD_SIZE_8, encoder_module_name="radio_encoder"
