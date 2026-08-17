@@ -617,10 +617,8 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_backward:
             for group in chunk.offload_groups:
                 if group.offload and keep_on_gpu_bytes > 0:
-                    debug_rank(
-                        f"group {group._name} offload {group.offload} \
-                        keep_on_gpu_bytes {keep_on_gpu_bytes}"
-                    )
+                    debug_rank(f"group {group._name} offload {group.offload} \
+                        keep_on_gpu_bytes {keep_on_gpu_bytes}")
                     keep_on_gpu_bytes -= group.total_offload_bytes
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
