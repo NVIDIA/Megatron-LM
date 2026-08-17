@@ -310,7 +310,11 @@ class TransformerConfig(ModelParallelConfig):
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
-    """How THD sequence rows are partitioned across context-parallel ranks."""
+    """How THD sequence rows are partitioned across context-parallel ranks.
+
+    Contiguous partitioning is defined only for THD inputs; BSHD context parallelism uses the
+    standard zigzag layout.
+    """
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
@@ -594,7 +598,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc", "gdn".
+             "shared_experts", "mhc", "gdn", "gdn_norm_out".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -609,7 +613,10 @@ class TransformerConfig(ModelParallelConfig):
     "gdn": recompute the entire GatedDeltaNet module (in_proj, conv1d, gated delta rule,
             gated norm, CP all-to-all and out_proj). Requires
             experimental_attention_variant="gated_delta_net".
-    "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
+    "gdn_norm_out": recompute the GatedDeltaNet gated normalization output via
+            CheckpointWithoutOutput. Requires experimental_attention_variant="gated_delta_net".
+    "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use
+    output-discarding checkpointing,
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
 
@@ -1556,6 +1563,15 @@ class TransformerConfig(ModelParallelConfig):
         if self.cp_partition_mode not in ("zigzag", "contiguous"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
 
+        if self.cp_partition_mode == "contiguous" and (
+            self.context_parallel_size > 1 or self.dynamic_context_parallel
+        ):
+            if self.sequence_packing_scheduler is None:
+                raise ValueError(
+                    "cp_partition_mode='contiguous' with context parallelism requires THD "
+                    "inputs from a sequence_packing_scheduler; BSHD inputs are not supported."
+                )
+
         if self.context_parallel_size > 1:
             if (
                 self.experimental_attention_variant == "dsv4_hybrid"
@@ -2171,6 +2187,7 @@ class TransformerConfig(ModelParallelConfig):
                     "shared_experts",
                     "mhc",
                     "gdn",
+                    "gdn_norm_out",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -2190,12 +2207,27 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if (
+                "gdn_norm_out" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_norm_out in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
+                )
+
+            if (
                 "gdn" in self.recompute_modules
                 and self.experimental_attention_variant != "gated_delta_net"
             ):
                 raise ValueError(
                     "gdn in recompute_modules is only supported with "
                     "experimental_attention_variant='gated_delta_net'."
+                )
+
+            if "gdn" in self.recompute_modules and "gdn_norm_out" in self.recompute_modules:
+                raise ValueError(
+                    "'gdn' and 'gdn_norm_out' in recompute_modules cannot be used together. "
+                    "'gdn' recomputes the full GatedDeltaNet module, including gated norm."
                 )
 
             if "core_attn" in self.recompute_modules:

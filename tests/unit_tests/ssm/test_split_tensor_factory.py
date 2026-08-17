@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from unittest import mock
@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.ssm.gated_delta_net import (
+from megatron.core.ssm.gated_delta_net.common import (
     _split_tensor_factory as gated_delta_split_tensor_factory,
 )
 from megatron.core.ssm.mamba_mixer import _split_tensor_factory as mamba_split_tensor_factory
