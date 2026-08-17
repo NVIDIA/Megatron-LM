@@ -281,8 +281,8 @@ jobs:
           fi
 
           # NeMo RL job gating: PR authors opt in by adding the `Run NeMoRL tests`
-          # label, while merge queue validation runs automatically.
-          if [ "$HAS_NEMO_RL" == "true" ] || [ "$IS_MERGE_GROUP" == "true" ]; then
+          # label. Merge queue validation intentionally skips the downstream run.
+          if [ "$HAS_NEMO_RL" == "true" ] && [ "$IS_MERGE_GROUP" != "true" ]; then
             RUN_NEMO_RL=true
           else
             RUN_NEMO_RL=false
@@ -382,7 +382,7 @@ jobs:
           - **\`dev\`**: uses the latest development container base image (default)
           - **\`cadence\`**: per-test trigger filter (recipe \`cadence:\` field). Recipes default to \`[pr, nightly, mergegroup]\`.
           - **\`run_mbridge\`**: whether to trigger the Megatron-Bridge downstream CI. Off for PR pushes by default; flip on by adding the _Run MBridge tests_ label.
-          - **\`run_nemo_rl\`**: whether to trigger the NeMo RL downstream CI. On for merge queue validation; PR authors can opt in by adding the _Run NeMoRL tests_ label.
+          - **\`run_nemo_rl\`**: whether to trigger the NeMo RL downstream CI. Off for merge queue validation; PR authors can opt in by adding the _Run NeMoRL tests_ label.
           SUMMARY
 
   linting:
@@ -567,20 +567,19 @@ jobs:
       - configure
       - cicd-wait-in-queue
       - cicd-parse-downstream-testing
-    # Skip downstream NeMo RL testing for docs-only changes. PR authors opt in
-    # with the "Run NeMoRL tests" label; non-docs merge_group runs opt in
-    # automatically through configure.outputs.run_nemo_rl.
+    # Skip downstream NeMo RL testing for docs-only and merge queue changes.
+    # PR authors opt in with the "Run NeMoRL tests" label.
     if: |
       needs.pre-flight.result != 'cancelled'
       && needs.configure.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
       && needs.configure.outputs.run_nemo_rl == 'true'
+      && github.event_name != 'merge_group'
       && needs.pre-flight.outputs.docs_only == 'false'
       && (
         success()
         || needs.pre-flight.outputs.force_run_all == 'true'
-        || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
     steps:
