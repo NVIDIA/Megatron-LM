@@ -6,10 +6,10 @@ algorithm.
 
 The central data structure is `ShardPlan`, which describes how a single 2D parameter's full matrix
 is split across the DP group under M-FSDPv2's all-`Flat` layout. Given shard plans,
-`assign_owner_work` balances Newton-Schulz work across owner ranks, and the pack/unpack helpers
-(`pack_owner_work`/`pack_update_shards`) build the flat P2P send/recv buffers.
-`OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full matrix on the owner,
-and `OwnerScatterPlan.unpack` extracts received update shards.
+`assign_owner_work` balances Newton-Schulz work across owner ranks. `ShardPlan.from_flat_layout`
+builds a plan from DBuffer layout metadata, `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` build the
+flat P2P send/recv buffers, `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into
+the full matrix on the owner, and `OwnerScatterPlan.unpack` extracts received update shards.
 """
 
 from __future__ import annotations
@@ -194,6 +194,80 @@ class OwnerGatherPlan:
     own_shards: dict[int, torch.Tensor]
     recv_offsets: dict[tuple[int, int], tuple[int, int, int]]
 
+    @classmethod
+    def pack(
+        cls,
+        plans: Sequence[ShardPlan],
+        owners: dict[int, int],
+        local_shards: Sequence[torch.Tensor],
+        world_size: int,
+        this_rank: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> OwnerGatherPlan:
+        """Pack this rank's pre-NS shards into per-owner P2P send buffers.
+
+        Args:
+            plans: Shard plans in parameter order.
+            owners: Mapping from parameter index to owner rank.
+            local_shards: This rank's local pre-NS shard per parameter.
+            world_size: DP group size.
+            this_rank: This rank's DP index.
+            device: Device for the send buffers (the pre-NS device).
+            dtype: Dtype for the send buffers (the pre-NS dtype).
+        """
+        send_sizes: dict[int, int] = {o: 0 for o in range(world_size) if o != this_rank}
+        recv_sizes: dict[int, int] = {s: 0 for s in range(world_size) if s != this_rank}
+        for param_index, plan in enumerate(plans):
+            owner = owners[param_index]
+            if owner != this_rank:
+                send_sizes[owner] += plan.shard_numel(this_rank)
+            else:
+                for src in range(world_size):
+                    if src == this_rank:
+                        continue
+                    recv_sizes[src] += plan.shard_numel(src)
+
+        send_buffers: dict[int, torch.Tensor] = {}
+        for owner, size in send_sizes.items():
+            send_buffers[owner] = torch.empty(size, dtype=dtype, device=device)
+
+        # Fill each owner's send buffer in param order.
+        cursors: dict[int, int] = {o: 0 for o in send_buffers}
+        own_shards: dict[int, torch.Tensor] = {}
+        for param_index, (plan, shard) in enumerate(zip(plans, local_shards)):
+            owner = owners[param_index]
+            if owner == this_rank:
+                own_shards[param_index] = shard
+                continue
+            numel = plan.shard_numel(this_rank)
+            if numel == 0:
+                continue
+            buf = send_buffers[owner]
+            buf[cursors[owner] : cursors[owner] + numel].copy_(shard.reshape(-1))
+            cursors[owner] += numel
+
+        # Per (owned param, src) recv offset within the recv buffer from src.
+        recv_offsets: dict[tuple[int, int], tuple[int, int, int]] = {}
+        owned_indices = [i for i in range(len(plans)) if owners[i] == this_rank]
+        for src in range(world_size):
+            if src == this_rank:
+                continue
+            offset = 0
+            for param_index in owned_indices:
+                plan = plans[param_index]
+                numel = plan.shard_numel(src)
+                recv_offsets[(param_index, src)] = (offset, numel, plan.rank_row_count(src))
+                offset += numel
+
+        return cls(
+            send_buffers=send_buffers,
+            recv_sizes=recv_sizes,
+            own_shards=own_shards,
+            recv_offsets=recv_offsets,
+        )
+
     def reconstruct_full(
         self,
         param_index: int,
@@ -228,82 +302,6 @@ class OwnerGatherPlan:
         return torch.cat(shards, dim=0)
 
 
-def pack_owner_work(
-    plans: Sequence[ShardPlan],
-    owners: dict[int, int],
-    local_shards: Sequence[torch.Tensor],
-    world_size: int,
-    this_rank: int,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> OwnerGatherPlan:
-    """Pack this rank's pre-NS shards into per-owner P2P send buffers.
-
-    Args:
-        plans: Shard plans in parameter order.
-        owners: Mapping from parameter index to owner rank.
-        local_shards: This rank's local pre-NS shard per parameter.
-        world_size: DP group size.
-        this_rank: This rank's DP index.
-        device: Device for the send buffers (the pre-NS device).
-        dtype: Dtype for the send buffers (the pre-NS dtype).
-
-    Returns:
-        The `OwnerGatherPlan` for this rank.
-    """
-    send_sizes: dict[int, int] = {o: 0 for o in range(world_size) if o != this_rank}
-    recv_sizes: dict[int, int] = {s: 0 for s in range(world_size) if s != this_rank}
-    for param_index, plan in enumerate(plans):
-        owner = owners[param_index]
-        if owner != this_rank:
-            send_sizes[owner] += plan.shard_numel(this_rank)
-        else:
-            for src in range(world_size):
-                if src == this_rank:
-                    continue
-                recv_sizes[src] += plan.shard_numel(src)
-
-    send_buffers: dict[int, torch.Tensor] = {}
-    for owner, size in send_sizes.items():
-        send_buffers[owner] = torch.empty(size, dtype=dtype, device=device)
-
-    # Fill each owner's send buffer in param order.
-    cursors: dict[int, int] = {o: 0 for o in send_buffers}
-    own_shards: dict[int, torch.Tensor] = {}
-    for param_index, (plan, shard) in enumerate(zip(plans, local_shards)):
-        owner = owners[param_index]
-        if owner == this_rank:
-            own_shards[param_index] = shard
-            continue
-        numel = plan.shard_numel(this_rank)
-        if numel == 0:
-            continue
-        buf = send_buffers[owner]
-        buf[cursors[owner] : cursors[owner] + numel].copy_(shard.reshape(-1))
-        cursors[owner] += numel
-
-    # Per (owned param, src) recv offset within the recv buffer from src.
-    recv_offsets: dict[tuple[int, int], tuple[int, int, int]] = {}
-    owned_indices = [i for i in range(len(plans)) if owners[i] == this_rank]
-    for src in range(world_size):
-        if src == this_rank:
-            continue
-        offset = 0
-        for param_index in owned_indices:
-            plan = plans[param_index]
-            numel = plan.shard_numel(src)
-            recv_offsets[(param_index, src)] = (offset, numel, plan.rank_row_count(src))
-            offset += numel
-
-    return OwnerGatherPlan(
-        send_buffers=send_buffers,
-        recv_sizes=recv_sizes,
-        own_shards=own_shards,
-        recv_offsets=recv_offsets,
-    )
-
-
 @dataclasses.dataclass
 class OwnerScatterPlan:
     """Metadata and send buffers for the owner-scatter P2P step of one chunk.
@@ -324,6 +322,79 @@ class OwnerScatterPlan:
     recv_sizes: dict[int, int]
     recv_offsets: dict[tuple[int, int], tuple[int, int, int]]
 
+    @classmethod
+    def pack(
+        cls,
+        full_updates: dict[int, torch.Tensor],
+        plans: Sequence[ShardPlan],
+        owners: dict[int, int],
+        world_size: int,
+        this_rank: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> OwnerScatterPlan:
+        """Pack this owner rank's full updates into per-destination P2P send buffers.
+
+        Args:
+            full_updates: Full update matrix per owned parameter index.
+            plans: Shard plans in parameter order.
+            owners: Mapping from parameter index to owner rank.
+            world_size: DP group size.
+            this_rank: This rank's DP index.
+            device: Device for the send buffers (the update device).
+            dtype: Dtype for the send buffers (the update dtype).
+        """
+        owned_indices = [i for i in range(len(plans)) if owners[i] == this_rank]
+        send_sizes: dict[int, int] = {d: 0 for d in range(world_size) if d != this_rank}
+        recv_sizes: dict[int, int] = {o: 0 for o in range(world_size) if o != this_rank}
+        for param_index in owned_indices:
+            plan = plans[param_index]
+            for dest in range(world_size):
+                if dest == this_rank:
+                    continue
+                send_sizes[dest] += plan.shard_numel(dest)
+        for param_index, plan in enumerate(plans):
+            owner = owners[param_index]
+            if owner == this_rank:
+                continue
+            recv_sizes[owner] += plan.shard_numel(this_rank)
+
+        send_buffers: dict[int, torch.Tensor] = {}
+        for dest, size in send_sizes.items():
+            send_buffers[dest] = torch.empty(size, dtype=dtype, device=device)
+
+        cursors: dict[int, int] = {d: 0 for d in send_buffers}
+        for dest in range(world_size):
+            if dest == this_rank:
+                continue
+            for param_index in owned_indices:
+                plan = plans[param_index]
+                row_start, row_count = plan.rank_rows[dest]
+                numel = row_count * plan.row_size
+                if numel == 0:
+                    continue
+                full = full_updates[param_index]
+                buf = send_buffers[dest]
+                buf[cursors[dest] : cursors[dest] + numel].copy_(
+                    full[row_start : row_start + row_count].reshape(-1)
+                )
+                cursors[dest] += numel
+
+        recv_offsets: dict[tuple[int, int], tuple[int, int, int]] = {}
+        for owner in range(world_size):
+            if owner == this_rank:
+                continue
+            offset = 0
+            for param_index, plan in enumerate(plans):
+                if owners[param_index] != owner:
+                    continue
+                numel = plan.shard_numel(this_rank)
+                recv_offsets[(param_index, owner)] = (offset, numel, plan.rank_row_count(this_rank))
+                offset += numel
+
+        return cls(send_buffers=send_buffers, recv_sizes=recv_sizes, recv_offsets=recv_offsets)
+
     def unpack(self, recv_buffers: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
         """Extract this rank's local update shards from the per-owner recv buffers.
 
@@ -342,80 +413,3 @@ class OwnerScatterPlan:
             row_size = numel // row_count if row_count else 1
             updates[param_index] = buf[offset : offset + numel].view(row_count, row_size)
         return updates
-
-
-def pack_update_shards(
-    full_updates: dict[int, torch.Tensor],
-    plans: Sequence[ShardPlan],
-    owners: dict[int, int],
-    world_size: int,
-    this_rank: int,
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> OwnerScatterPlan:
-    """Pack this owner rank's full updates into per-destination P2P send buffers.
-
-    Args:
-        full_updates: Full update matrix per owned parameter index.
-        plans: Shard plans in parameter order.
-        owners: Mapping from parameter index to owner rank.
-        world_size: DP group size.
-        this_rank: This rank's DP index.
-        device: Device for the send buffers (the update device).
-        dtype: Dtype for the send buffers (the update dtype).
-
-    Returns:
-        The `OwnerScatterPlan` for this rank.
-    """
-    owned_indices = [i for i in range(len(plans)) if owners[i] == this_rank]
-    send_sizes: dict[int, int] = {d: 0 for d in range(world_size) if d != this_rank}
-    recv_sizes: dict[int, int] = {o: 0 for o in range(world_size) if o != this_rank}
-    for param_index in owned_indices:
-        plan = plans[param_index]
-        for dest in range(world_size):
-            if dest == this_rank:
-                continue
-            send_sizes[dest] += plan.shard_numel(dest)
-    for param_index, plan in enumerate(plans):
-        owner = owners[param_index]
-        if owner == this_rank:
-            continue
-        recv_sizes[owner] += plan.shard_numel(this_rank)
-
-    send_buffers: dict[int, torch.Tensor] = {}
-    for dest, size in send_sizes.items():
-        send_buffers[dest] = torch.empty(size, dtype=dtype, device=device)
-
-    cursors: dict[int, int] = {d: 0 for d in send_buffers}
-    for dest in range(world_size):
-        if dest == this_rank:
-            continue
-        for param_index in owned_indices:
-            plan = plans[param_index]
-            row_start, row_count = plan.rank_rows[dest]
-            numel = row_count * plan.row_size
-            if numel == 0:
-                continue
-            full = full_updates[param_index]
-            buf = send_buffers[dest]
-            buf[cursors[dest] : cursors[dest] + numel].copy_(
-                full[row_start : row_start + row_count].reshape(-1)
-            )
-            cursors[dest] += numel
-
-    recv_offsets: dict[tuple[int, int], tuple[int, int, int]] = {}
-    for owner in range(world_size):
-        if owner == this_rank:
-            continue
-        offset = 0
-        for param_index, plan in enumerate(plans):
-            if owners[param_index] != owner:
-                continue
-            numel = plan.shard_numel(this_rank)
-            recv_offsets[(param_index, owner)] = (offset, numel, plan.rank_row_count(this_rank))
-            offset += numel
-
-    return OwnerScatterPlan(
-        send_buffers=send_buffers, recv_sizes=recv_sizes, recv_offsets=recv_offsets
-    )

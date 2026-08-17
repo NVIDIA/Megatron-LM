@@ -12,10 +12,10 @@ communication is simulated in-process by `_simulate_p2p`.
 import torch
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.shard_plan import (
+    OwnerGatherPlan,
+    OwnerScatterPlan,
     ShardPlan,
     assign_owner_work,
-    pack_owner_work,
-    pack_update_shards,
 )
 
 # ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ def test_pack_and_reconstruct_round_trip():
     per_rank_send = []
     per_rank_gather = []
     for r in range(world_size):
-        gather = pack_owner_work(
+        gather = OwnerGatherPlan.pack(
             plans,
             owners,
             per_rank_local[r],
@@ -183,7 +183,7 @@ def test_pack_and_unpack_update_round_trip():
     per_rank_send = []
     per_rank_scatter = []
     for r in range(world_size):
-        scatter = pack_update_shards(
+        scatter = OwnerScatterPlan.pack(
             full_updates_by_rank[r],
             plans,
             owners,
