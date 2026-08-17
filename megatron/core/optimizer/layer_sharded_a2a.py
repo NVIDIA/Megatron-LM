@@ -98,8 +98,8 @@ def layer_sharded_all_to_all_fwd(
     )
 
     # Unpack: for each of my assigned params, concatenate GTP shards from all sources.
-    # recv_buf layout: [from_g0_for_my_params | from_g1_for_my_params | ... | from_g(S-1)_for_my_params]
-    # Each from_gk block contains shards for my params in order.
+    # recv_buf layout: [from_g0 | from_g1 | ... | from_g(S-1)], where each
+    # from_gk block contains that source's shards of my params, in order.
     my_param_indices = [i for i, _ in my_params]
 
     # Prefix offsets of each of my params within one source block. Precomputed:

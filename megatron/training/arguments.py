@@ -2693,6 +2693,12 @@ def _add_regularization_args(parser):
                        'NS FLOPs for near-square matrices). Requires '
                        '--muon-fp32-matmul-prec medium; auto-disabled when Triton/SM '
                        'requirements are unmet.')
+    group.add_argument('--muon-no-concurrent-groups', action='store_false',
+                       dest='muon_concurrent_groups',
+                       help='Serialize param groups on one CUDA stream under '
+                       '--use-layer-sharding-muon instead of overlapping one group\'s '
+                       'Newton-Schulz with another\'s all_to_all. Bitwise-neutral; use '
+                       'when the concurrent transient buffers push peak memory too high.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
