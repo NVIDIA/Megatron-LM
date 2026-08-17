@@ -368,7 +368,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                     "FsdpOrthogonalizedOptimizer parameters must be FSDP-sharded; "
                     f"parameter {param!r} is not owned by an FsdpParameterGroup."
                 )
-            index = group.sharded_parameters.index(param)
+            index = next(i for i, fp in enumerate(group.fsdp_parameters) if fp.sharded is param)
             layout = group.main_weight.layout
             shape = layout.tensor_shapes[index]
             if len(shape) != 2:
