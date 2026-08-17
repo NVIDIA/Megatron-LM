@@ -164,6 +164,7 @@ class GraphableMegatronModule(MegatronModule):
 
     def __init__(self, config: TransformerConfig, vp_stage: Optional[int] = None):
         super().__init__(config)
+        self.vp_stage = vp_stage
 
         assert isinstance(config, TransformerConfig), "config must be a TransformerConfig"
 

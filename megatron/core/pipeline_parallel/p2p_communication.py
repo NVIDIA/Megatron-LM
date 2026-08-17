@@ -232,35 +232,23 @@ class P2PCommunicator:
                 group=self.pp_group,
             )
         else:
-            ops = []
-            if send_prev_shape_tensor is not None:
-                send_prev_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, self.pp_group
-                )
-                ops.append(send_prev_op)
-            if recv_prev_shape_tensor is not None:
-                recv_prev_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, self.pp_group
-                )
-                ops.append(recv_prev_op)
-            if send_next_shape_tensor is not None:
-                send_next_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, self.pp_group
-                )
-                ops.append(send_next_op)
-            if recv_next_shape_tensor is not None:
-                recv_next_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, self.pp_group
-                )
-                ops.append(recv_next_op)
-            if len(ops) > 0:
-                reqs = torch.distributed.batch_isend_irecv(ops)
-                for req in reqs:
-                    req.wait()
+            p2p_func = _batched_p2p_ops if config.batch_p2p_comm else _p2p_ops
+            reqs = p2p_func(
+                tensor_send_prev=send_prev_shape_tensor,
+                tensor_recv_prev=recv_prev_shape_tensor,
+                tensor_send_next=send_next_shape_tensor,
+                tensor_recv_next=recv_next_shape_tensor,
+                group=self.pp_group,
+                prev_pipeline_rank=self.prev_rank,
+                next_pipeline_rank=self.next_rank,
+            )
+            for req in reqs if isinstance(reqs, list) else reqs.values():
+                req.wait()
 
-            # To protect against race condition when using batch_isend_irecv().
-            # should take this out once the bug with batch_isend_irecv is resolved.
-            torch.cuda.synchronize()
+            if config.batch_p2p_comm:
+                # To protect against race condition when using batch_isend_irecv().
+                # should take this out once the bug with batch_isend_irecv is resolved.
+                torch.cuda.synchronize()
 
         recv_prev_shape = [0, 0, 0]
         if recv_prev_shape_tensor is not None:

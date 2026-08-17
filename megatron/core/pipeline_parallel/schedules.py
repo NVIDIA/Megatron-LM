@@ -1158,8 +1158,9 @@ def forward_backward_pipelining_with_interleaving(
 
     def get_microbatch_id_in_model_chunk(iteration_id, forward):
         """Helper method to get the microbatch_id within model chunk given the iteration number."""
-        assert forward
-        microbatch_id_in_model_chunk = microbatch_id_table[iteration_id]
+        microbatch_id_in_model_chunk = microbatch_id_table[
+            iteration_id % total_num_microbatches
+        ]
         return microbatch_id_in_model_chunk
 
     def num_released_microbatches(virtual_microbatch_id, model_chunk_id):
@@ -1367,6 +1368,10 @@ def forward_backward_pipelining_with_interleaving(
         """Helper method to run backward step with model split into chunks"""
         nonlocal output_tensor_grads
         model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=False)
+        microbatch_id = get_microbatch_id_in_model_chunk(
+            virtual_microbatch_id, forward=False
+        )
+        set_current_microbatch(model[model_chunk_id], microbatch_id)
 
         input_tensor, output_tensor, output_tensor_grad = backward_step_helper_preprocess(
             virtual_microbatch_id, model_chunk_id
