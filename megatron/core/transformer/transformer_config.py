@@ -1479,10 +1479,7 @@ class TransformerConfig(ModelParallelConfig):
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
 
-        if (
-            self.gdn_pre_gated_delta_rule_fusion
-            and self.experimental_attention_variant != "gdn"
-        ):
+        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant != "gdn":
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
                 "experimental_attention_variant='gdn' "

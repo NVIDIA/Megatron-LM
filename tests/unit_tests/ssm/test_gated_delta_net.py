@@ -529,9 +529,7 @@ class TestGatedDeltaNet:
             side_effect=fake_fused_streamed_pre_gated_delta_rule,
         ):
             gdn._fused_streamed_pre_gated_delta_rule(
-                qkvzba,
-                cp_size_headwise=cp_size_headwise,
-                cp_group_headwise=gdn.pg_collection.cp,
+                qkvzba, cp_size_headwise=cp_size_headwise, cp_group_headwise=gdn.pg_collection.cp
             )
 
         assert captured["qkvzba"] is qkvzba
