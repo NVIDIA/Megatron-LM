@@ -1218,7 +1218,12 @@ class LLaVAModel(MegatronModule):
                     max_seqlen_kv=max_seqlen,
                 )
 
-            vision_kwargs = {"packed_seq_params": vision_packed_seq_params}
+            # Only pass VLM-specific kwargs when they're non-None. The stock
+            # CLIPViTModel.forward() signature does not accept these kwargs,
+            # so passing them unconditionally breaks CLIP-based test fixtures.
+            vision_kwargs = {}
+            if vision_packed_seq_params is not None:
+                vision_kwargs["packed_seq_params"] = vision_packed_seq_params
             if imgs_sizes is not None:
                 vision_kwargs["imgs_sizes"] = imgs_sizes
             image_embeddings = self.vision_model(
