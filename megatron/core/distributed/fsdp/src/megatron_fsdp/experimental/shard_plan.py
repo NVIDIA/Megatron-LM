@@ -25,9 +25,8 @@ from .layout import non_leading_numel
 class ShardPlan:
     """How a single 2D parameter's full matrix is split across the DP group.
 
-    M-FSDPv2's all-`Flat` layout shards dim-0 rows contiguously in rank order,
-    so rank `r` owns the contiguous global row range
-    `[start, start + count)` where `start`/`count` come from the flat
+    M-FSDPv2's all-`Flat` layout shards dim-0 rows contiguously in rank order, so rank `r` owns the
+    contiguous global row range `[start, start + count)` where `start`/`count` come from the flat
     DBuffer layout. A rank with `count == 0` holds no shard of this parameter.
     """
 
@@ -79,10 +78,10 @@ def compute_shard_plan(
 
     Args:
         full_shape: Global `(rows, cols)` shape of the parameter.
-        tensor_flat_offset: Flat-element offset of this parameter inside the
-            DBuffer's global layout.
-        rank_flat_shard_size: Flat elements each DP rank owns (uniform for the
-            even all-`Flat` layout: `layout.size // world_size`).
+        tensor_flat_offset: Flat-element offset of this parameter inside the DBuffer's global
+            layout.
+        rank_flat_shard_size: Flat elements each DP rank owns (uniform for the even all-`Flat`
+            layout: `layout.size // world_size`).
         world_size: DP group size.
 
     Returns:
@@ -126,10 +125,10 @@ def compute_shard_plan(
 def assign_owner_work(plans: Sequence[ShardPlan], num_ns_steps: int) -> dict[int, int]:
     """Assign one owner rank to each boundary parameter, balanced by NS cost.
 
-    Only ranks that own a non-empty shard of a parameter are eligible owners.
-    Assignment greedily gives each parameter to its eligible rank with the
-    smallest running cost total, where a parameter's cost is the Newton-Schulz
-    compute estimate `numel * (min(rows, cols) * num_steps + 1)`.
+    Only ranks that own a non-empty shard of a parameter are eligible owners. Assignment greedily
+    gives each parameter to its eligible rank with the smallest running cost total, where a
+    parameter's cost is the Newton-Schulz compute estimate `numel * (min(rows, cols) * num_steps +
+    1)`.
 
     Args:
         plans: Shard plans indexed by their position in the input sequence.
@@ -164,21 +163,19 @@ def assign_owner_work(plans: Sequence[ShardPlan], num_ns_steps: int) -> dict[int
 class OwnerGatherPlan:
     """Metadata and send buffers for the owner-gather P2P step of one chunk.
 
-    The owner keeps its own shard locally (no self-send), so it only receives
-    from the other shard-holding ranks and reconstructs each owned matrix by
-    concatenating shards in rank order (own shard at the owner's rank rows).
+    The owner keeps its own shard locally (no self-send), so it only receives from the other
+    shard-holding ranks and reconstructs each owned matrix by concatenating shards in rank order
+    (own shard at the owner's rank rows).
 
     Attributes:
-        send_buffers: Per-destination-owner flat send buffer (this rank's
-            pre-NS shards for that owner's params, in param order). Only owners
+        send_buffers: Per-destination-owner flat send buffer (this rank's pre-NS shards for that
+            owner's params, in param order). Only owners other than this rank appear.
+        recv_sizes: Per-source-rank element count this rank (as an owner) receives. Only sources
             other than this rank appear.
-        recv_sizes: Per-source-rank element count this rank (as an owner)
-            receives. Only sources other than this rank appear.
-        own_shards: This rank's local shard per owned parameter (used directly
-            in reconstruction, not communicated).
-        recv_offsets: Per `(param_index, src_rank)` of `(offset, numel,
-            row_count)` describing where this param's shard lands inside the
-            recv buffer received from `src_rank`.
+        own_shards: This rank's local shard per owned parameter (used directly in reconstruction,
+            not communicated).
+        recv_offsets: Per `(param_index, src_rank)` of `(offset, numel, row_count)` describing where
+            this param's shard lands inside the recv buffer received from `src_rank`.
     """
 
     send_buffers: dict[int, torch.Tensor]
@@ -264,11 +261,11 @@ def pack_owner_work(
 
 
 def reconstruct_full_tensor(
-    param_index: int,
-    plan: ShardPlan,
-    gather_plan: OwnerGatherPlan,
-    recv_buffers: dict[int, torch.Tensor],
-    owner_rank: int,
+        param_index: int,
+        plan: ShardPlan,
+        gather_plan: OwnerGatherPlan,
+        recv_buffers: dict[int, torch.Tensor],
+        owner_rank: int,
 ) -> torch.Tensor:
     """Reconstruct the full 2D tensor for one owned parameter from its per-rank shards.
 
@@ -309,18 +306,16 @@ def reconstruct_full_tensor(
 class OwnerScatterPlan:
     """Metadata and send buffers for the owner-scatter P2P step of one chunk.
 
-    The owner keeps its own update shard (applied directly), so it only sends to
-    the other shard-holding ranks.
+    The owner keeps its own update shard (applied directly), so it only sends to the other
+    shard-holding ranks.
 
     Attributes:
-        send_buffers: Per-destination-rank flat send buffer (this owner's update
-            shards for the params it owns, in param order). Only destinations
+        send_buffers: Per-destination-rank flat send buffer (this owner's update shards for the
+            params it owns, in param order). Only destinations other than this rank appear.
+        recv_sizes: Per-owner-rank element count this rank (as a destination) receives. Only owners
             other than this rank appear.
-        recv_sizes: Per-owner-rank element count this rank (as a destination)
-            receives. Only owners other than this rank appear.
-        recv_offsets: Per `(param_index, owner_rank)` of `(offset, numel,
-            row_count)` describing where this param's update shard lands inside
-            the recv buffer received from `owner_rank`.
+        recv_offsets: Per `(param_index, owner_rank)` of `(offset, numel, row_count)` describing
+            where this param's update shard lands inside the recv buffer received from `owner_rank`.
     """
 
     send_buffers: dict[int, torch.Tensor]
@@ -415,8 +410,8 @@ def unpack_update_shards(
         recv_buffers: Per-owner-rank received buffer (only owners that sent).
 
     Returns:
-        Mapping from parameter index to the local update shard `(row_count, cols)`,
-        for parameters this rank does NOT own.
+        Mapping from parameter index to the local update shard `(row_count, cols)`, for parameters
+        this rank does NOT own.
     """
     updates: dict[int, torch.Tensor] = {}
     for (param_index, owner), (offset, numel, row_count) in scatter_plan.recv_offsets.items():
