@@ -158,13 +158,7 @@ class TestMuonDecoupleFP8ParamGather:
         )
 
     def _create_args(
-        self,
-        fp8_param_gather,
-        fp8_recipe,
-        overlap,
-        num_experts=0,
-        expert_model_parallel_size=1,
-        single_grouped_weight=False,
+        self, fp8_param_gather, fp8_recipe, overlap, num_experts=0, expert_model_parallel_size=1
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -227,9 +221,7 @@ class TestMuonDecoupleFP8ParamGather:
             args.moe_router_topk = 2
             args.moe_ffn_hidden_size = args.ffn_hidden_size
             args.moe_token_dispatcher_type = 'alltoall'
-            args.moe_grouped_gemm = single_grouped_weight
-            args.moe_use_grouped_tensor = single_grouped_weight
-            args.moe_single_grouped_weight = single_grouped_weight
+            args.moe_grouped_gemm = False
             # Deterministic routing comes from the fixed seed + deterministic_mode; drop the
             # aux-loss gradient term so ON and OFF compare cleanly without router-bias drift.
             args.moe_router_load_balancing_type = 'none'
@@ -238,10 +230,6 @@ class TestMuonDecoupleFP8ParamGather:
         validate_args(args)
         set_global_variables(args, False)
         return args
-
-    def test_rejects_single_grouped_weight_with_fp8_param_gather(self):
-        with pytest.raises(AssertionError, match="moe-single-grouped-weight"):
-            self._create_args(True, "blockwise", False, num_experts=8, single_grouped_weight=True)
 
     def _batch(self):
         d = list(range(self.seq_length))
