@@ -89,7 +89,10 @@ class InferenceClient:
         self.aborted_request_ids: set[int] = set()
 
     def add_request(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        block_hashes: Optional[List[int]] = None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -111,27 +114,38 @@ class InferenceClient:
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        self.socket.send_multipart(self._submit_frames(request_id, prompt, sampling_params))
+        self.socket.send_multipart(
+            self._submit_frames(request_id, prompt, sampling_params, block_hashes)
+        )
         assert request_id not in self.completion_futures
         self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 
-    def _submit_frames(self, request_id, prompt, sampling_params):
-        """Frame a submission as [metadata, prompt].
+    def _submit_frames(self, request_id, prompt, sampling_params, block_hashes=None):
+        """Frame a submission as [metadata, prompt] (+ [block_hashes]).
 
         The prompt travels in its own frame so the coordinator can route the
         request without decoding it -- at long prompts that decode dominates the
         coordinator's per-request cost, and it is a single serial loop shared by
         every data parallel rank.
+
+        Block hashes, when the caller computed them, ride in a third frame for the
+        same reason: prefix-affinity routing needs them, and having the client
+        hash the tokens it already holds keeps that work off the coordinator. The
+        frame is omitted entirely when there are none, so a coordinator that does
+        not look for it is unaffected.
         """
-        return [
+        frames = [
             msgpack.packb(
                 [Headers.SUBMIT_REQUEST.value, request_id, sampling_params.serialize()],
                 use_bin_type=True,
             ),
             msgpack.packb(prompt, use_bin_type=True),
         ]
+        if block_hashes:
+            frames.append(msgpack.packb(block_hashes, use_bin_type=True))
+        return frames
 
     def abort_request(self, request_id: int) -> None:
         """Cancel an in-flight request and close its local response stream."""
@@ -148,7 +162,10 @@ class InferenceClient:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
     def add_request_streaming(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        block_hashes: Optional[List[int]] = None,
     ) -> AsyncStream[dict]:
         """Submit a streaming inference request.
 
@@ -175,7 +192,9 @@ class InferenceClient:
         sampling_params.streaming = True
         request_id = self.next_request_id
         self.next_request_id += 1
-        self.socket.send_multipart(self._submit_frames(request_id, prompt, sampling_params))
+        self.socket.send_multipart(
+            self._submit_frames(request_id, prompt, sampling_params, block_hashes)
+        )
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop
         )

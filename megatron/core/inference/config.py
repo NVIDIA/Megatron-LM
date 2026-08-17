@@ -114,6 +114,24 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
 
 
+def routes_on_prefix(policy) -> bool:
+    """Whether `policy` needs per-request block hashes to make a routing decision.
+
+    Frontends call this to decide whether hashing a prompt is worth anything: under
+    LOAD_BALANCED the coordinator discards the hashes, so computing them is pure
+    overhead on the request path. Kept beside the enum so a new prefix-aware policy
+    only has to be added in one place.
+
+    Accepts the enum, its string value, or None (no policy configured).
+    """
+    if policy is None:
+        return False
+    return PrefixCachingCoordinatorPolicy(policy) in (
+        PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
+    )
+
+
 class KVCacheManagementMode(str, Enum):
     """Mode for handling large tensors (KV cache, Mamba states) during suspend/resume."""
 
@@ -326,6 +344,16 @@ class InferenceConfig:
     `PrefixCachingCoordinatorPolicy` for options.
 
     Only applies when enable_prefix_caching is True and using a coordinator.
+    """
+
+    prefix_cache_ttl_seconds: float = 300.0
+    """How long the coordinator assumes an engine still holds a block it routed.
+
+    Only applies under `PrefixCachingEvictionPolicy.LRU`, where the engine keeps
+    released blocks and evicts them under memory pressure -- something the
+    coordinator cannot observe, so it approximates by age. Too long and it claims
+    hits on blocks already evicted, routing for affinity and paying a cold prefill
+    anyway; too short and it forgets blocks the engine still holds.
     """
 
     prefix_caching_routing_alpha: float = 0.5

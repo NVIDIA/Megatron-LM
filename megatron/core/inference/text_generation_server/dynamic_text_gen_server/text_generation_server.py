@@ -19,6 +19,7 @@ except ImportError as e:
     HAS_BACKEND = False
 
 import megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints as endpoints
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.utils import trace_async_exceptions
 
@@ -50,6 +51,8 @@ async def _run_text_gen_server(
     parsers: Optional[List[str]] = None,
     verbose: bool = False,
     hostname: Optional[str] = None,
+    block_size_tokens: Optional[int] = None,
+    prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -85,6 +88,11 @@ async def _run_text_gen_server(
         app.config['tokenizer'] = tokenizer
         app.config['parsers'] = parsers
         app.config['verbose'] = verbose
+        # The frontend hashes the prompt it already holds so the coordinator does
+        # not have to on its single serial loop. The policy decides whether anyone
+        # reads the hashes; the block size is only the granularity.
+        app.config['block_size_tokens'] = block_size_tokens
+        app.config['prefix_caching_coordinator_policy'] = prefix_caching_coordinator_policy
 
         # Applying the chat template is synchronous and O(prompt); on the event loop it
         # stalls every other request this replica owns, including delivery of responses
@@ -135,6 +143,8 @@ def _server_process_worker(
     parsers: Optional[List[str]] = None,
     verbose: bool = False,
     hostname: Optional[str] = None,
+    block_size_tokens: Optional[int] = None,
+    prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -142,7 +152,15 @@ def _server_process_worker(
     try:
         loop.run_until_complete(
             _run_text_gen_server(
-                coordinator_addr, tokenizer, rank, server_port, parsers, verbose, hostname
+                coordinator_addr,
+                tokenizer,
+                rank,
+                server_port,
+                parsers,
+                verbose,
+                hostname,
+                block_size_tokens,
+                prefix_caching_coordinator_policy,
             )
         )
     except KeyboardInterrupt:
@@ -198,6 +216,8 @@ def start_text_gen_server(
     num_replicas: int = 4,
     hostname: Optional[str] = None,
     sock: Optional[socket.socket] = None,
+    block_size_tokens: Optional[int] = None,
+    prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ) -> Optional[str]:
     """Start the text generation server.
 
@@ -245,7 +265,17 @@ def start_text_gen_server(
     for i in range(num_replicas):
         p = mp.Process(
             target=_server_process_worker,
-            args=(coordinator_addr, tokenizer, rank, server_port, parsers, verbose, hostname),
+            args=(
+                coordinator_addr,
+                tokenizer,
+                rank,
+                server_port,
+                parsers,
+                verbose,
+                hostname,
+                block_size_tokens,
+                prefix_caching_coordinator_policy,
+            ),
             daemon=True,
         )
         p.start()

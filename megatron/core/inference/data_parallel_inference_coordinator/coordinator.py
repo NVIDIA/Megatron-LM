@@ -6,6 +6,7 @@ import json
 import logging
 import signal
 import socket
+import time
 from collections import deque
 from multiprocessing import Event
 from multiprocessing.connection import Connection
@@ -13,7 +14,10 @@ from multiprocessing.connection import Connection
 import numpy as np
 import torch
 
-from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.config import (
+    PrefixCachingCoordinatorPolicy,
+    PrefixCachingEvictionPolicy,
+)
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -99,6 +103,10 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         prefix_caching_routing_alpha: float = 0.5,
+        prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
+            PrefixCachingEvictionPolicy.LRU
+        ),
+        prefix_cache_ttl_seconds: float = 300.0,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
     ):
@@ -218,11 +226,28 @@ class DataParallelInferenceCoordinator:
         self._identities_list = list(sorted_identities)  # rank_index → identity
         self._pending_counts = np.zeros(n_ranks, dtype=np.int32)
 
-        # Hash → {rank_idx: timestamp} dict for prefix cache affinity routing.
-        # Each key is a block hash; each value maps rank indices to assignment
-        # timestamps (positive int).  Missing entries are implicitly zero.
-        self._hash_table: dict[int, dict[int, int]] = {}
-        self._hash_assignment_counter = 0
+        # Hash → {rank_idx: [last_touch, refcount]} for prefix cache affinity
+        # routing. This models what each engine holds; it is a prediction, since
+        # the engines are never asked. Entries are retired the way the engine
+        # retires blocks, per prefix_caching_eviction_policy:
+        #   REF_ZERO -- the engine deregisters at refcount 0, so drop the entry
+        #               when the last request holding it completes.
+        #   LRU      -- the engine keeps released blocks and evicts under memory
+        #               pressure, which the coordinator cannot observe, so
+        #               approximate it by age: drop entries untouched for
+        #               prefix_cache_ttl_seconds.
+        # Without either, the table only grows and grows steadily more optimistic,
+        # claiming hits on blocks the engine evicted long ago.
+        self._hash_table: dict[int, dict[int, list]] = {}
+        # (touch_time, hash, rank_idx) in insertion order, so TTL expiry is a
+        # sweep from the front costing only what it actually evicts. An entry
+        # refreshed since it was queued is skipped by comparing timestamps.
+        self._hash_expiry: deque = deque()
+        # request_id → hashes, kept only under REF_ZERO, where completion is what
+        # releases the blocks.
+        self.request_id_to_hashes: dict[int, list] = {}
+        self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
+        self.prefix_cache_ttl_seconds = prefix_cache_ttl_seconds
 
         # Clients that have completed the CONNECT handshake.
         self.known_clients = set()
@@ -371,6 +396,26 @@ class DataParallelInferenceCoordinator:
         if not self.enable_prefix_caching or not request_hashes:
             return self.get_least_loaded_data_parallel_rank()
 
+        if self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.LONGEST_PREFIX:
+            # Cost of sending here: the prefill this rank would still have to
+            # compute, scaled by how contended it is. Multiplicative rather than a
+            # weighted sum because prefill saved on a rank that cannot start it
+            # promptly is not saved.
+            #
+            # 1 + load, so an idle rank is charged for the prefill it would still
+            # have to do rather than scoring zero on any prefix. Reading it as
+            # queue position: this request is the (load + 1)-th on that rank, so
+            # the product approximates when its prefill would finish. Affinity
+            # therefore decides from the first request, including while every rank
+            # is idle.
+            depth = self._prefix_depth_vector(request_hashes)
+            remaining_blocks = np.maximum(0, len(request_hashes) - depth)
+            cost = remaining_blocks.astype(np.float64) * (1.0 + self._pending_counts)
+            # Tiebreak: lowest cost, then least loaded, then lowest rank index.
+            n_ranks = len(self._identities_list)
+            order = np.lexsort((np.arange(n_ranks), self._pending_counts, cost))
+            return self._identities_list[int(order[0])]
+
         match, recency = self._match_vector(request_hashes)
 
         alpha = self.prefix_caching_routing_alpha
@@ -386,17 +431,94 @@ class DataParallelInferenceCoordinator:
         return self._identities_list[best_idx]
 
     def _update_rank_hashes(self, rank_identity, request_hashes):
-        """Record that a rank owns the given hashes.
+        """Record that a rank owns the given hashes, and take a reference to them.
 
         Args:
             rank_identity: ZMQ identity of the target rank.
             request_hashes: List of block hashes assigned to this rank.
         """
         rank_idx = self.identity_to_rank_index[rank_identity]
-        self._hash_assignment_counter += 1
-        ts = self._hash_assignment_counter
+        now = time.monotonic()
         for h in request_hashes:
-            self._hash_table.setdefault(h, {})[rank_idx] = ts
+            entry = self._hash_table.setdefault(h, {}).get(rank_idx)
+            if entry is None:
+                self._hash_table[h][rank_idx] = [now, 1]
+            else:
+                entry[0] = now
+                entry[1] += 1
+            # One timestamp for the whole call keeps the deque sorted.
+            self._hash_expiry.append((now, h, rank_idx))
+
+    def _release_rank_hashes(self, request_id, rank_identity):
+        """Drop the references a finished request held, under REF_ZERO.
+
+        Mirrors the engine deregistering blocks once no request holds them. Blocks
+        shared with a still-running request keep a nonzero count and survive.
+
+        Args:
+            request_id: Server-side request id that just completed.
+            rank_identity: ZMQ identity of the rank that served it.
+        """
+        hashes = self.request_id_to_hashes.pop(request_id, None)
+        if not hashes:
+            return
+        rank_idx = self.identity_to_rank_index.get(rank_identity)
+        if rank_idx is None:  # engine already removed; its column is gone
+            return
+        for h in hashes:
+            row = self._hash_table.get(h)
+            entry = row.get(rank_idx) if row is not None else None
+            if entry is None:
+                continue
+            entry[1] -= 1
+            if entry[1] <= 0:
+                del row[rank_idx]
+                if not row:
+                    del self._hash_table[h]
+
+    def _expire_rank_hashes(self, now):
+        """Drop entries untouched for the TTL, under LRU.
+
+        The deque is insertion-ordered, so expired entries form a prefix of it and
+        the sweep stops at the first live one -- the cost is what it evicts, not
+        the table size. A stale queue entry whose table entry was refreshed since
+        is recognized by its older timestamp and skipped.
+        """
+        ttl = self.prefix_cache_ttl_seconds
+        while self._hash_expiry:
+            ts, h, rank_idx = self._hash_expiry[0]
+            if now - ts <= ttl:
+                break
+            self._hash_expiry.popleft()
+            row = self._hash_table.get(h)
+            entry = row.get(rank_idx) if row is not None else None
+            if entry is not None and entry[0] <= ts:
+                del row[rank_idx]
+                if not row:
+                    del self._hash_table[h]
+
+    def _prefix_depth_vector(self, hashes):
+        """Return per-rank contiguous prefix depth, in blocks.
+
+        Prefix cache reuse requires an unbroken chain from the first block -- each
+        block hash chains the previous one's digest -- so a rank only benefits up
+        to its first miss. Walking forward and dropping ranks as they miss gives
+        each rank its true depth, and the loop exits as soon as no rank is left.
+        """
+        n_ranks = len(self._identities_list)
+        depth = np.zeros(n_ranks, dtype=np.int64)
+        alive = np.ones(n_ranks, dtype=bool)
+        for h in hashes:
+            row = self._hash_table.get(h)
+            if row is None:
+                break
+            present = np.zeros(n_ranks, dtype=bool)
+            present[np.fromiter(row.keys(), dtype=np.intp, count=len(row))] = True
+            alive &= present
+            if not alive.any():
+                break
+            depth += alive
+        return depth
 
     def _match_vector(self, hashes):
         """Return ``(match, recency)`` vectors of shape ``(n_ranks,)``.
@@ -421,7 +543,10 @@ class DataParallelInferenceCoordinator:
             present = np.zeros(n_ranks, dtype=bool)
             present[rank_idxs] = True
             recency = np.zeros(n_ranks, dtype=np.float64)
-            recency[rank_idxs] = np.fromiter(row.values(), dtype=np.float64)
+            # Values are [last_touch, refcount]; recency is the touch time.
+            recency[rank_idxs] = np.fromiter(
+                (e[0] for e in row.values()), dtype=np.float64, count=len(row)
+            )
             if present.any():
                 return present.astype(np.float64) * ((i + 1.0) / n), recency
         return zeros, zeros.copy()
@@ -503,6 +628,10 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         prefix_caching_routing_alpha: float = 0.5,
+        prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
+            PrefixCachingEvictionPolicy.LRU
+        ),
+        prefix_cache_ttl_seconds: float = 300.0,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
     ):
@@ -537,6 +666,8 @@ class DataParallelInferenceCoordinator:
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
+            prefix_caching_eviction_policy=prefix_caching_eviction_policy,
+            prefix_cache_ttl_seconds=prefix_cache_ttl_seconds,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
         )

@@ -24,8 +24,12 @@ Returning a truthy value signals the event loop to stop.
 """
 
 import logging
+import time
 
-from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.config import (
+    PrefixCachingCoordinatorPolicy,
+    PrefixCachingEvictionPolicy,
+)
 from megatron.core.inference.headers import Headers
 
 from .state import CONTROL_TRANSITIONS, CoordinatorState
@@ -76,9 +80,9 @@ def handle_connect(coordinator, sender_identity, metadata, bodies):
 def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     """Route a client request to a data parallel rank.
 
-    ``metadata`` is ``[header, client_request_id, sampling_params]`` and
-    ``bodies[0]`` is the packed prompt, which is forwarded to the engine as-is
-    unless the routing policy needs to hash it.
+    ``metadata`` is ``[header, client_request_id, sampling_params]``, ``bodies[0]``
+    is the packed prompt, which is forwarded to the engine as-is, and ``bodies[1]``
+    -- when present -- carries the prompt's block hashes, computed by the client.
 
     Returns True (stopping the loop) if no engines are reachable.
     """
@@ -89,6 +93,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
 
     _, client_request_id, sampling_params = metadata
     prompt_frame = bodies[0]
+    hash_frame = bodies[1] if len(bodies) > 1 else None
 
     # map client request_id to server request_id
     # necessary because multiple clients might have the same request_id.
@@ -103,18 +108,17 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         [Headers.SUBMIT_REQUEST.value, request_id, sampling_params], use_bin_type=True
     )
 
-    # Only prefix-affinity routing consults the block hashes. When nothing will
-    # look at them, skip hashing *and* the prompt decode it needs -- avoiding
-    # that decode is the reason the prompt travels in its own frame.
+    # Only prefix-affinity routing consults the block hashes. The client computes
+    # them: it already holds the tokens, there are many clients and one of these
+    # loops, and unpacking the prompt here to hash it would undo the frame split
+    # that keeps the coordinator's per-request cost flat in prompt length.
     if (
-        coordinator.enable_prefix_caching
-        and coordinator.block_size_tokens is not None
+        hash_frame is not None
+        and coordinator.enable_prefix_caching
         and coordinator.prefix_caching_coordinator_policy
         != PrefixCachingCoordinatorPolicy.LOAD_BALANCED
     ):
-        request_hashes = coordinator.compute_request_hashes(
-            msgpack.unpackb(prompt_frame, raw=False)
-        )
+        request_hashes = msgpack.unpackb(hash_frame, raw=False)
     else:
         request_hashes = []
 
@@ -123,6 +127,16 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
     ):
         request_hashes = request_hashes[:1]
+
+    if (
+        request_hashes
+        and coordinator.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+    ):
+        # Before the routing decision below, not after: that decision reads the
+        # table, so an entry past its TTL has to be gone first or this request is
+        # placed on evidence the engine no longer holds. Sweeping here also means
+        # expiry needs no timer thread.
+        coordinator._expire_rank_hashes(time.monotonic())
 
     # Account for the fact that some engines may have died.
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
@@ -141,6 +155,9 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
     if request_hashes:
         coordinator._update_rank_hashes(next_identity, request_hashes)
+        if coordinator.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
+            # Completion is what releases these blocks, so remember what to drop.
+            coordinator.request_id_to_hashes[request_id] = request_hashes
     if coordinator.schedule_records is not None:
         coordinator.schedule_records.append(
             {
@@ -227,6 +244,11 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
             if idx is not None:
                 assert coordinator._pending_counts[idx] >= 1
                 coordinator._pending_counts[idx] -= 1
+            if coordinator.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
+                # Under REF_ZERO the engine deregisters blocks once no request
+                # holds them, so mirror that here. Blocks still referenced by
+                # another in-flight request keep a nonzero count and survive.
+                coordinator._release_rank_hashes(fid, assigned_rank)
 
         if needs_detokenize:
             # Detokenizing writes generated_text into the reply, so this one has

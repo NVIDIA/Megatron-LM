@@ -709,6 +709,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     "enable_prefix_caching": self.context.enable_prefix_caching,
                     "prefix_caching_coordinator_policy": self.context.prefix_caching_coordinator_policy,
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
+                    "prefix_caching_eviction_policy": self.context.prefix_caching_eviction_policy,
+                    "prefix_cache_ttl_seconds": self.context.prefix_cache_ttl_seconds,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
                 },

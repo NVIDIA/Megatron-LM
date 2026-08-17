@@ -9,7 +9,13 @@ import uuid
 import warnings
 from functools import partial
 
-from megatron.core.inference.inference_request import unwrap_serialized_tensors
+import torch
+
+from megatron.core.inference.inference_request import (
+    compute_block_hashes_batched,
+    unwrap_serialized_tensors,
+)
+from megatron.core.inference.config import routes_on_prefix
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -457,6 +463,8 @@ try:
         client = current_app.config['client']
         tokenizer = current_app.config['tokenizer']
         parsers = current_app.config['parsers']
+        block_size_tokens = current_app.config.get('block_size_tokens')
+        coordinator_policy = current_app.config.get('prefix_caching_coordinator_policy')
 
         req = await request.get_json()
         tools = req.get("tools", None)
@@ -643,6 +651,19 @@ try:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
+        # Hash here rather than at the coordinator: the tokens are already in hand,
+        # frontends run many-to-one against a single serial coordinator loop, and
+        # hashing there would mean unpacking the prompt frame the split was
+        # introduced to avoid. Skipped unless the coordinator routes on prefix
+        # affinity, since otherwise nobody reads it and the frame is never sent.
+        block_hashes = (
+            compute_block_hashes_batched(
+                torch.tensor(prompt_tokens, dtype=torch.int64), block_size_tokens
+            )
+            if block_size_tokens and routes_on_prefix(coordinator_policy)
+            else None
+        )
+
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
             # Streaming currently supports only Hugging Face fast tokenizers.
@@ -655,7 +676,8 @@ try:
                 return Response(str(error), status=400)
 
             streams = [
-                client.add_request_streaming(prompt_tokens, sampling_params) for _ in range(n)
+                client.add_request_streaming(prompt_tokens, sampling_params, block_hashes)
+                for _ in range(n)
             ]
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
             response = Response(
@@ -672,7 +694,9 @@ try:
             response.timeout = None
             return response
 
-        tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
+        tasks = [
+            client.add_request(prompt_tokens, sampling_params, block_hashes) for _ in range(n)
+        ]
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
