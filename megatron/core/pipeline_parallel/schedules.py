@@ -41,6 +41,11 @@ from .combined_1f1b import (
 )
 from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
+try:
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
+
 # Types
 Shape = Union[List[int], torch.Size]
 
@@ -394,6 +399,7 @@ def forward_step_calc_loss(
     return output_tensor, num_tokens
 
 
+@_otel_trace_fn('microbatch', 'megatron.microbatch.forward')
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -529,6 +535,7 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
+@_otel_trace_fn('microbatch', 'megatron.microbatch.backward')
 def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     """Backward step through passed-in output tensor.
 

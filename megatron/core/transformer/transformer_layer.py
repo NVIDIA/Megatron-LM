@@ -12,6 +12,11 @@ import torch
 import torch.distributed
 from torch import Tensor
 
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+except ImportError:
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -650,18 +655,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
-        attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            attention_bias=attention_bias,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-        )
+        with _otel_managed_span('layer', 'megatron.layer.self_attention'):
+            attention_output_with_bias = self.self_attention(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
         nvtx_range_pop(suffix="self_attention")
 
         if self.recompute_input_layernorm:
@@ -737,14 +743,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(
-            hidden_states,
-            kwargs.get("inference_context", None),
-            padding_mask=kwargs.get("padding_mask", None),
-            packed_seq_params=kwargs.get("packed_seq_params", None),
-        )
-        return output, context
+        with _otel_managed_span(
+            'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
+        ):
+            hidden_states, context = self._forward_attention(*args, **kwargs)
+            with _otel_managed_span('layer', 'megatron.layer.mlp'):
+                output = self._forward_mlp(
+                    hidden_states,
+                    kwargs.get("inference_context", None),
+                    padding_mask=kwargs.get("padding_mask", None),
+                    packed_seq_params=kwargs.get("packed_seq_params", None),
+                )
+            return output, context
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
