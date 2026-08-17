@@ -29,11 +29,13 @@ import pytest
 import torch
 
 from megatron.core.transformer.experimental_attention_variant import csa as csa_module
-from megatron.core.transformer.experimental_attention_variant import csa_fused_compressor as cfc
 from megatron.core.transformer.experimental_attention_variant.csa import (
     Compressor,
     CompressorSubmodules,
     batch_of_row,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    fused_compressor as cfc,
 )
 
 # Run this module on GB200 hardware in CI (marker-driven selection, see
