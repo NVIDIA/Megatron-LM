@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Module."""
+
 from functools import partial
 from typing import Optional, Tuple
 

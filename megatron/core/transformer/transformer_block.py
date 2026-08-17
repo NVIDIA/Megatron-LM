@@ -314,7 +314,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
 
         if get_cpu_offload_context is not None:
-            (self.offload_context, self.group_prefetch_offload_commit_async) = (
+            self.offload_context, self.group_prefetch_offload_commit_async = (
                 get_cpu_offload_context(
                     self.config.cpu_offloading,
                     self.config.cpu_offloading_num_layers,
