@@ -38,6 +38,11 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.transformer.wide_residual_layer import (
+    build_wide_residual_readout,
+    expand_wide_residual_stream,
+    specialize_wide_residual_layer_spec,
+)
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     WrappedTensor,
@@ -361,9 +366,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             else:
                 quantization_context = nullcontext()
 
+            configured_layer_spec = (
+                specialize_wide_residual_layer_spec(layer_spec, layer_config)
+                if layer_config.wide_residual is not None
+                else layer_spec
+            )
+
             with quantization_context:
                 module = build_module(
-                    layer_spec,
+                    configured_layer_spec,
                     config=layer_config,
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,
@@ -380,6 +391,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
+
+        self.residual_stream_readout = (
+            build_wide_residual_readout(self.config) if self.post_process else None
+        )
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
@@ -610,6 +625,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.mhc_num_residual_streams
             )  # [s, b, C] -> [s, b, n*C]
+        elif self.config.wide_residual is not None and self.pre_process:
+            hidden_states = expand_wide_residual_stream(
+                hidden_states, self.config.wide_residual.num_streams
+            )
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -750,6 +769,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             hidden_states = HyperConnectionModule.output_contract(
                 hidden_states, self.mhc_num_residual_streams
             )  # [s, b, n*C] -> [s, b, C]
+        elif self.residual_stream_readout is not None:
+            hidden_states = apply_module(self.residual_stream_readout)(cast(Tensor, hidden_states))
 
         # Final layer norm.
         if self.final_layernorm is not None:
