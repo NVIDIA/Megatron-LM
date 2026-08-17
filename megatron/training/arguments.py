@@ -1132,8 +1132,14 @@ def validate_args(args, defaults={}):
         assert args.optimizer in ('sgd', 'adam'), \
             f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
+        # Expert parameters may be sharded differently from non-expert parameters, in which
+        # case both strategies have to be considered by model-wide checks.
+        sharding_strategies = {args.data_parallel_sharding_strategy}
+        if args.data_parallel_sharding_strategy_experts is not None:
+            sharding_strategies.add(args.data_parallel_sharding_strategy_experts)
+
         if (
-            args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]
+            sharding_strategies & {"optim_grads_params", "optim_grads"}
             and args.gradient_accumulation_fusion
         ):
             warn_rank_0(
@@ -1141,7 +1147,7 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
 
-        if args.data_parallel_sharding_strategy == "optim_grads_params":
+        if "optim_grads_params" in sharding_strategies:
             assert args.check_weight_hash_across_dp_replicas_interval is None, \
                 'check_weight_hash_across_dp_replicas_interval is not supported with optim_grads_params'
 
@@ -1162,7 +1168,7 @@ def validate_args(args, defaults={}):
             # MaxPoolAllocator is a type of FSDP double buffer.
             args.fsdp_double_buffer = True
 
-        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
+        if args.init_model_with_meta_device and sharding_strategies == {"no_shard"}:
             raise ValueError(
                 "Meta device initialization (init_model_with_meta_device=True) is not "
                 "supported or necessary for the 'no_shard' / 0 sharding strategy."
@@ -3138,6 +3144,15 @@ def _add_distributed_args(parser):
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='optim_grads_params',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
+    group.add_argument('--data-parallel-sharding-strategy-experts', type=str, default=None,
+                       choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
+                       help='Sharding strategy of data parallelism for expert (MoE) parameters. '
+                            'When set, --data-parallel-sharding-strategy only applies to '
+                            'non-expert parameters. Expert parameters are sharded over a narrower '
+                            'DP group than non-expert parameters when expert parallelism is '
+                            'enabled, so the two classes can warrant different communication / '
+                            'memory trade-offs. Defaults to None, which applies '
+                            '--data-parallel-sharding-strategy to every parameter.')
     group.add_argument('--outer-dp-sharding-strategy', type=str, default='no_shard',
                        choices=['no_shard', 'optim'],
                        help='Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode. '

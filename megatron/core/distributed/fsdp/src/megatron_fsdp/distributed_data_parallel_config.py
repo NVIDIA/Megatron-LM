@@ -7,6 +7,8 @@ import torch
 
 from .utils import is_torch_min_version
 
+VALID_SHARDING_STRATEGIES = ('no_shard', 'optim', 'optim_grads', 'optim_grads_params')
+
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -43,6 +45,16 @@ class DistributedDataParallelConfig:
     data_parallel_sharding_strategy: str = 'no_shard'
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
       'optim_grads', 'optim_grads_params'."""
+
+    data_parallel_sharding_strategy_experts: Optional[str] = None
+    """Sharding strategy applied to expert (MoE) parameters on DP-Shard. Valid values are
+      'no_shard', 'optim', 'optim_grads', 'optim_grads_params'. When set,
+      `data_parallel_sharding_strategy` only applies to non-expert parameters, which allows
+      trading DP-Shard communication against memory separately for the two parameter classes
+      (e.g. 'optim' on non-experts and 'optim_grads_params' on experts). Expert parameters are
+      already sharded over a narrower DP group than non-expert parameters when expert
+      parallelism is enabled, so the two classes have very different traffic-per-byte.
+      When None, `data_parallel_sharding_strategy` applies to all parameters."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -190,6 +202,17 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        for field_name in [
+            "data_parallel_sharding_strategy",
+            "data_parallel_sharding_strategy_experts",
+        ]:
+            strategy = getattr(self, field_name)
+            if strategy is not None and strategy not in VALID_SHARDING_STRATEGIES:
+                raise ValueError(
+                    f"[Megatron-FSDP] Invalid {field_name}: {strategy}. "
+                    f"Valid values are {VALID_SHARDING_STRATEGIES}."
+                )
+
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
