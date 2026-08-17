@@ -633,9 +633,15 @@ def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = 
     Safe no-op if TE is unavailable.
 
     Args:
-        skip_gemm: leave TE's native general_gemm in place (used by the
-            "te_native" backend, where GEMM batch invariance comes from
-            cuBLASLt workspace starvation rather than kernel substitution).
+        skip_gemm: leave TE's native GEMMs (general_gemm and grouped GEMM) in
+            place (used by the "te_native" backend, where GEMM batch
+            invariance comes from cuBLASLt workspace starvation rather than
+            kernel substitution).
+        skip_rmsnorm: leave TE's native normalization in place (RMSNorm
+            class/module functions and the fused-module apply_normalization
+            entry). Used by "te_native", where the norm's M%32 reduction
+            bit-class is held constant by the 64-multiple alignment
+            discipline instead of kernel substitution.
     """
     global _TE_GENERAL_GEMM_ORIG, _TE_RMSNORM_ORIG_FWD, _MEG_TE_GENERAL_GEMM_ORIG
     import transformer_engine.pytorch as te
@@ -673,7 +679,15 @@ def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = 
             _MEG_TE_GENERAL_GEMM_ORIG = meg_te.general_gemm
             meg_te.general_gemm = _te_general_gemm_patched
 
+        # Patch TE.general_grouped_gemm at every known import site so that
+        # TEGroupedMLP (forward + dgrad + wgrad) goes through DeepGEMM in bf16.
+        # Grouped GEMMs are a GEMM concern: under skip_gemm ("te_native") they
+        # stay native, covered by the same cuBLASLt workspace starvation.
+        _te_patch_general_grouped_gemm()
+
     if skip_rmsnorm:
+        # Everything below patches normalization only (RMSNorm class/module
+        # functions and the fused-module apply_normalization entry).
         return
 
     # Patch RMSNorm.forward once (class may be on te or te.pytorch)
@@ -716,10 +730,6 @@ def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = 
             orig = getattr(te_layernorm_mod, name)
             _TE_RMSNORM_FUNC_ORIGS[name] = orig
             setattr(te_layernorm_mod, name, _make_rmsnorm_patched(orig))
-
-    # Patch TE.general_grouped_gemm at every known import site so that
-    # TEGroupedMLP (forward + dgrad + wgrad) goes through DeepGEMM in bf16.
-    _te_patch_general_grouped_gemm()
 
     # Patch the fused-module normalization entry (`apply_normalization`). TE's
     # fused LayerNormLinear / LayerNormMLP call this instead of RMSNorm.forward,
@@ -1783,9 +1793,11 @@ def enable_batch_invariant_mode(backend: str = "te_native"):
         _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
-    # Also patch Transformer Engine kernels when available (te_native keeps
-    # TE's native GEMMs — invariance comes from the starved workspace — but
-    # still applies the non-GEMM TE patches, e.g. the attention gate).
+    # Also patch Transformer Engine kernels when available. Under te_native
+    # BOTH skips are set, so no TE kernel is substituted at all: GEMMs (dense
+    # and grouped) stay native under the starved workspace, and norms stay
+    # native under the 64-multiple alignment discipline. (The TE attention
+    # version gate is a separate standalone assert, not part of this patch.)
     if backend == "te_native":
         # te_native also keeps TE's NATIVE RMSNorm: its M%32 reduction
         # bit-class is held constant by the 64-multiple alignment discipline
