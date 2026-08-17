@@ -11,6 +11,7 @@ reference using the same Newton-Schulz kernel (bitwise) and against
 
 import contextlib
 import types
+import weakref
 
 import pytest
 import torch
@@ -27,6 +28,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.orthogonalize
     FsdpMuon,
     Muon,
     _require_emerging_optimizers,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    _CONTAINING_PARAMETER_GROUP_ATTR,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.shard_plan import (
     OwnerGatherPlan,
@@ -311,6 +315,23 @@ def test_group_updates_separates_mixed_dtypes():
     assert 3 in chunk_of_1
 
 
+class _MockMesh:
+    """Mock `DeviceMesh` whose `get_group()` returns a fixed `ProcessGroup`."""
+
+    def __init__(self, pg: object) -> None:
+        self._pg = pg
+
+    def get_group(self) -> object:
+        return self._pg
+
+
+class _MockParamGroup:
+    """Mock `FsdpParameterGroup` (supports `weakref`) with a `mesh` attribute."""
+
+    def __init__(self, mesh: _MockMesh) -> None:
+        self.mesh = mesh
+
+
 def test_group_updates_separates_collective_groups():
     """`_group_updates` separates params from different collective groups.
 
@@ -325,8 +346,8 @@ def test_group_updates_separates_collective_groups():
     # whose `mesh.get_group()` returns them.
     pg_a = object()  # mock ProcessGroup A
     pg_b = object()  # mock ProcessGroup B
-    group_a = types.SimpleNamespace(mesh=types.SimpleNamespace(get_group=lambda: pg_a))
-    group_b = types.SimpleNamespace(mesh=types.SimpleNamespace(get_group=lambda: pg_b))
+    group_a = _MockParamGroup(_MockMesh(pg_a))
+    group_b = _MockParamGroup(_MockMesh(pg_b))
     params = [
         nn.Parameter(torch.zeros(2, 2, dtype=torch.float32, device=cpu)),
         nn.Parameter(torch.zeros(2, 2, dtype=torch.float32, device=cpu)),
@@ -335,7 +356,7 @@ def test_group_updates_separates_collective_groups():
     ]
     # 0, 1 -> group_a;  2, 3 -> group_b  (all fp32, same device)
     for p, g in zip(params, [group_a, group_a, group_b, group_b]):
-        p._mfsdp_parameter_group = g
+        setattr(p, _CONTAINING_PARAMETER_GROUP_ATTR, weakref.ref(g))
     shards = [p.detach() for p in params]
     chunks = optimizer._group_updates(params, shards)
 
