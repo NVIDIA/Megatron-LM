@@ -560,9 +560,7 @@ class TestGroupedRollouts:
             submission_granularity=submission_granularity,
             consumption_granularity=consumption_granularity,
         )
-        pipeline = RolloutPipeline(
-            mt, request, parallel_generation_tasks=parallel_generation_tasks
-        )
+        pipeline = RolloutPipeline(mt, request, parallel_generation_tasks=parallel_generation_tasks)
         gen = pipeline.run()
         groups = [await anext(gen) for _ in range(windows * 4)]
 
@@ -679,9 +677,9 @@ class TestGroupedRollouts:
                 mt._distribute_counts(num_groups)
             return
         # The split is identical on every call.
-        assert [
-            [a.num_groups for a in mt.rollout_allocations(num_groups)] for _ in range(3)
-        ] == [expected_layout] * 3
+        assert [[a.num_groups for a in mt.rollout_allocations(num_groups)] for _ in range(3)] == [
+            expected_layout
+        ] * 3
         assert warns == any("weights changed" in message for message in caplog.messages)
         # Config-order distribution: the boot (index 1) and eval (last) slots pinned to 0.
         assert mt._distribute_counts(num_groups) == (

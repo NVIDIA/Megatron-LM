@@ -134,6 +134,7 @@ class WeightedMultiTask(
         """Quantize weights into integer counts summing to `total`, at least one per weighted env.
 
         Raises ValueError when total is smaller than the number of weighted envs.
+        Note that this does not operate on eval-only tasks; those are pre-filtered in `__init__`.
         """
         num_envs = len(self._rollout_weights)
         if total < num_envs:
