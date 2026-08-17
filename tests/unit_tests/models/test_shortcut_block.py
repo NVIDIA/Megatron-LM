@@ -8,12 +8,12 @@ import torch
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.shortcut_block import (
-    AsyncCombineToPersistentBuffer as _AsyncCombineToPersistentBuffer,
-    AsyncDispatchToPersistentGradBuffers as _AsyncDispatchToPersistentGradBuffers,
+    AsyncCombineToPersistentBuffer,
+    AsyncDispatchToPersistentGradBuffers,
     PersistentBuffer,
+    RecordCombineGradReady,
     ShortcutExecutionMode,
     ShortcutMoEBlock,
-    _RecordCombineGradReady,
     group_layers_into_shortcut_blocks,
 )
 from megatron.core.transformer.moe.token_dispatcher import MoEFlexTokenDispatcher
@@ -144,28 +144,6 @@ def test_shortcut_block_registers_pair_and_post_norm():
         "moe_layer",
         "shortcut_post_norm",
     ]
-
-
-def test_persistent_buffer_releases_strong_reference_once(monkeypatch):
-    from megatron.core.transformer import cuda_graphs
-
-    strong_tensor = torch.empty(1)
-    strong_tensor.is_from_global_mempool = True
-    weak_tensor = torch.empty(1)
-    calls = []
-    monkeypatch.setattr(
-        cuda_graphs,
-        "make_weakref",
-        lambda tensor, inplace: calls.append((tensor, inplace)) or weak_tensor,
-    )
-
-    buffer = PersistentBuffer("test")
-    buffer._tensor = strong_tensor
-    buffer.release_strong_reference()
-    buffer.release_strong_reference()
-
-    assert buffer.tensor is weak_tensor
-    assert calls == [(strong_tensor, False)]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -315,7 +293,6 @@ def test_shortcut_block_uses_two_method_level_graph_managers(monkeypatch):
             target.shortcut_post_norm,
         ],
     }
-    assert target.route_input_cudagraph_manager is target.cudagraph_manager_route_input_compute
     assert target.cudagraph_manager is target.cudagraph_manager_output_shared_postprocess
 
 
@@ -405,7 +382,7 @@ def test_async_dispatch_bridge_publishes_both_route_gradients():
     backward_dependency = torch.zeros((), device="cuda", requires_grad=True)
 
     dispatch_stream.wait_stream(torch.cuda.current_stream())
-    dispatched_input, dispatched_probs = _AsyncDispatchToPersistentGradBuffers.apply(
+    dispatched_input, dispatched_probs = AsyncDispatchToPersistentGradBuffers.apply(
         route_input,
         route_probs,
         backward_dependency,
@@ -456,7 +433,7 @@ def test_async_dispatch_bridge_zero_fills_an_unused_private_input():
     backward_dependency = torch.zeros((), device="cuda", requires_grad=True)
 
     dispatch_stream.wait_stream(torch.cuda.current_stream())
-    dispatched_input, dispatched_probs = _AsyncDispatchToPersistentGradBuffers.apply(
+    dispatched_input, dispatched_probs = AsyncDispatchToPersistentGradBuffers.apply(
         route_input,
         route_probs,
         backward_dependency,
@@ -519,7 +496,7 @@ def test_async_dispatch_bridge_orders_paired_backward_after_dispatch_backward():
     )
 
     dispatch_stream.wait_stream(torch.cuda.current_stream())
-    dispatched_input, dispatched_probs = _AsyncDispatchToPersistentGradBuffers.apply(
+    dispatched_input, dispatched_probs = AsyncDispatchToPersistentGradBuffers.apply(
         route_input,
         route_probs,
         backward_dependency,
@@ -557,7 +534,7 @@ def test_async_combine_bridge_preserves_gradient_and_event_order():
         return destination
 
     module = SimpleNamespace(combine=lambda tensor: 2 * tensor)
-    output = _AsyncCombineToPersistentBuffer.apply(
+    output = AsyncCombineToPersistentBuffer.apply(
         source,
         module,
         combine_stream,
@@ -568,7 +545,7 @@ def test_async_combine_bridge_preserves_gradient_and_event_order():
     assert output.data_ptr() == destination.data_ptr()
 
     torch.cuda.current_stream().wait_event(ready_event)
-    output = _RecordCombineGradReady.apply(output, grad_ready_event)
+    output = RecordCombineGradReady.apply(output, grad_ready_event)
     grad = torch.randn_like(output)
     output.backward(grad)
     torch.cuda.synchronize()

@@ -702,7 +702,7 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
-    Without this, the shared experts execute before the router.
+    Without this, the shared experts execute before the router. 
     Only effective when moe-shared-expert-intermediate-size is set.
     """
 

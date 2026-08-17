@@ -29,7 +29,6 @@ class PersistentBuffer:
         self.prebound_graph_input = prebound_graph_input
         self.detach_on_reuse = detach_on_reuse
         self._tensor = None
-        self._has_weak_storage = False
 
     @property
     def tensor(self) -> torch.Tensor:
@@ -78,20 +77,6 @@ class PersistentBuffer:
 
         self._tensor = tensor
         return tensor
-
-    def release_strong_reference(self) -> None:
-        """Replace graph-pinned storage ownership with a raw-pointer tensor wrapper."""
-        if self._tensor is None or self._has_weak_storage:
-            return
-        if not getattr(self._tensor, "is_from_global_mempool", False):
-            return
-
-        from megatron.core.transformer.cuda_graphs import make_weakref
-
-        weak_tensor = make_weakref(self._tensor, inplace=False)
-        if weak_tensor is not self._tensor:
-            self._tensor = weak_tensor
-            self._has_weak_storage = True
 
     def copy_from(self, source: torch.Tensor) -> torch.Tensor:
         """Copy a tensor into the stable allocation without adding an autograd edge."""
@@ -266,12 +251,6 @@ class RecordCombineGradReady(torch.autograd.Function):
         ctx.grad_ready_event.record(torch.cuda.current_stream())
         ctx.grad_ready_event = None
         return grad_output, None
-
-
-_AsyncDispatchToPersistentGradBuffers = AsyncDispatchToPersistentGradBuffers
-_AsyncCombineToPersistentBuffer = AsyncCombineToPersistentBuffer
-_RouteGradFromPersistentBuffers = RouteGradFromPersistentBuffers
-_RecordCombineGradReady = RecordCombineGradReady
 
 
 class ShortcutExecutionMode(Enum):
@@ -569,7 +548,7 @@ class ShortcutMoEBlock(MegatronModule):
             slot.route_input_grad_buffer.acquire_like(route_input)
             slot.route_probs_grad_buffer.acquire_like(route_probs)
             slot.route_ready_event.record(torch.cuda.current_stream())
-            route_grad_dependency = _RouteGradFromPersistentBuffers.apply(
+            route_grad_dependency = RouteGradFromPersistentBuffers.apply(
                 route_input, route_probs, slot
             )
             set_tensor_grad_fn_sequence_sr(route_grad_dependency, 0)
@@ -625,7 +604,7 @@ class ShortcutMoEBlock(MegatronModule):
 
         if self.execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
             torch.cuda.current_stream().wait_event(slot.combine_ready_event)
-            combined_output = _RecordCombineGradReady.apply(
+            combined_output = RecordCombineGradReady.apply(
                 combined_output, slot.combine_grad_ready_event
             )
             set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
@@ -650,28 +629,6 @@ class ShortcutMoEBlock(MegatronModule):
     def cudagraph_manager(self):
         """Return the fused phase's graph manager when capture is enabled."""
         return getattr(self, 'cudagraph_manager_output_shared_postprocess', None)
-
-    @property
-    def route_input_cudagraph_manager(self):
-        """Return the forward-overlap graph manager when enabled."""
-        return getattr(self, 'cudagraph_manager_route_input_compute', None)
-
-    def output_and_shared(
-        self,
-        *compute_state,
-        combined_output=None,
-        inference_context=None,
-        padding_mask=None,
-        persistent_slot: int = 0,
-    ):
-        """Run output projection/shared experts and optionally fused postprocess."""
-        return self.output_shared(
-            *compute_state,
-            combined_output=combined_output,
-            inference_context=inference_context,
-            padding_mask=padding_mask,
-            persistent_slot=persistent_slot,
-        )
 
     def launch_dispatch_async(
         self,
@@ -702,7 +659,7 @@ class ShortcutMoEBlock(MegatronModule):
                     "Persistent async dispatch requires a backward dependency and "
                     "route-gradient-ready event"
                 )
-            dispatched_input, dispatched_probs = _AsyncDispatchToPersistentGradBuffers.apply(
+            dispatched_input, dispatched_probs = AsyncDispatchToPersistentGradBuffers.apply(
                 hidden_states,
                 probs,
                 backward_dependency,
@@ -747,7 +704,7 @@ class ShortcutMoEBlock(MegatronModule):
                 raise ValueError(
                     "Persistent async combine requires forward-ready and gradient-ready events"
                 )
-            combined = _AsyncCombineToPersistentBuffer.apply(
+            combined = AsyncCombineToPersistentBuffer.apply(
                 output,
                 moe_layer,
                 combine_stream,
@@ -896,7 +853,7 @@ class ShortcutMoEBlock(MegatronModule):
             set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
 
         with quant_context_factory(quant_config, layer_number):
-            return self.output_and_shared(
+            return self.output_shared(
                 *paired_state,
                 combined_output=combined_output,
                 inference_context=inference_context,
@@ -942,7 +899,7 @@ class ShortcutMoEBlock(MegatronModule):
             # repeated MTP invocations can otherwise make multiple same-priority HybridEP
             # collectives ready at once, with no cross-rank ordering guarantee.
             self.wait_dispatch_and_launch_combine()
-            projected_hidden, shared_expert_output = self.output_and_shared(
+            projected_hidden, shared_expert_output = self.output_shared(
                 *paired_state,
                 inference_context=inference_context,
                 padding_mask=padding_mask,
@@ -1013,7 +970,7 @@ class ShortcutMoEBlock(MegatronModule):
                 ready_event=output_slot.combine_ready_event,
                 grad_ready_event=output_slot.combine_grad_ready_event,
             )
-            return self.output_and_shared(
+            return self.output_shared(
                 *paired_state,
                 combined_output=combined_output,
                 inference_context=inference_context,

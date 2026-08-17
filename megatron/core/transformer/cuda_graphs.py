@@ -9,7 +9,6 @@ import os
 import time
 from collections import defaultdict
 from contextlib import nullcontext
-from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
 from functools import partial
@@ -132,7 +131,7 @@ def _apply_cudagraph_buffer_metadata(tensor, *, is_output=False):
 
 
 def _tag_cudagraph_buffer_saved_for_backward(tensor):
-    """Tag a CUDA graph input or output observed in a Python ``save_for_backward`` call."""
+    """Tag a CUDA graph input or output observed in a Python 'save_for_backward' call."""
     if not torch.is_tensor(tensor):
         return
 
@@ -349,9 +348,9 @@ def tree_map(func, tree):
             }
             mapped_arg = dataclasses.replace(arg, **changes)
 
-            # ``dataclasses.replace`` reruns ``__post_init__``, which may overwrite a tensor
+            # 'dataclasses.replace' reruns '__post_init__', which may overwrite a tensor
             # field that was explicitly mapped above. In particular, PackedSeqParams rebuilds
-            # ``seq_idx`` from ``cu_seqlens``. CUDA graph input buffers are zero-initialized, so
+            # 'seq_idx' from 'cu_seqlens'. CUDA graph input buffers are zero-initialized, so
             # that rebuild assigns every token the padded sequence count and can make Mamba
             # kernels access out of bounds during graph capture. Preserve the tensor selected by
             # the mapping operation; replay will populate that buffer with the real input value.
@@ -538,7 +537,7 @@ class _CudagraphGlobalRecord:
 
     @classmethod
     def _enable_saved_tensors_observer(cls):
-        """Observe Python ``save_for_backward`` calls while recording and capturing graphs."""
+        """Observe Python 'save_for_backward' calls while recording and capturing graphs."""
         if cls.cudagraph_created or cls._saved_tensors_observer is not None:
             return
 
@@ -550,15 +549,12 @@ class _CudagraphGlobalRecord:
                 _tag_cudagraph_buffer_saved_for_backward(tensor)
             return original_save_for_backward(ctx, *tensors)
 
-        cls._saved_tensors_observer = (
-            original_save_for_backward,
-            observing_save_for_backward,
-        )
+        cls._saved_tensors_observer = (original_save_for_backward, observing_save_for_backward)
         function_ctx.save_for_backward = observing_save_for_backward
 
     @classmethod
     def _disable_saved_tensors_observer(cls):
-        """Restore Python's original ``save_for_backward`` implementation."""
+        """Restore Python's original 'save_for_backward' implementation."""
         if cls._saved_tensors_observer is None:
             return
 
@@ -669,7 +665,6 @@ class _CudagraphGlobalRecord:
                 args, kwargs, out = g[2:]
                 runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
             else:
-                # assert fwd_buffer_reuse_ref_count == 0
                 runner.create_bwd_graph()
 
         # Memory usage.
@@ -1174,9 +1169,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     seen.add(id(buffer))
                     yield buffer
 
-    def _weakref_forward_buffers(
-        self, preserve_forward_to_backward_lifetimes: bool
-    ) -> None:
+    def _weakref_forward_buffers(self, preserve_forward_to_backward_lifetimes: bool) -> None:
         """Release ownership only when CUDA graph topology proves the buffer reclaimable.
 
         `make_weakref` preserves a captured address but releases allocator ownership.
@@ -1186,28 +1179,23 @@ class _CudaGraphRunner(torch.nn.Module):
         """
 
         def is_saved_for_backward(tensor) -> bool:
-            """Return whether capture-time autograd saved this boundary tensor.
+            """Return whether a tensor is needed for the backward pass graph.
 
-            Backward formulas may read the tensor's forward contents even when the tensor is
-            only a CUDA graph input and never becomes a graph output. Preserving allocator
-            ownership guards against the graph pool reusing and overwriting that storage before
-            backward capture records the read.
+            Preserving allocator ownership guards against the graph pool reusing and overwriting
+            that storage before backward capture records the read.
             """
             metadata = getattr(tensor, "cg_buffer_metadata", None)
             return bool(
-                torch.is_tensor(tensor)
-                and metadata is not None
-                and metadata.is_saved_for_backward
+                torch.is_tensor(tensor) and metadata is not None and metadata.is_saved_for_backward
             )
 
         def is_differentiable_cudagraph_output_escape(tensor) -> bool:
             """Return whether a differentiable graph output escapes to eager code.
 
             Outputs that are also inputs to another CUDA graph are protected by graph-to-graph
-            reuse accounting. A differentiable output that is not another graph's input has no
-            such owner, although an eager consumer and its backward may still need its contents.
-            Preserving it guards against premature graph-pool storage reuse across that eager
-            boundary.
+            reuse accounting. However, an output that is not another graph's input has no
+            such owner. Preserving it's ownership guards against premature graph-pool storage
+            reuse across that graph boundary.
             """
             metadata = getattr(tensor, "cg_buffer_metadata", None)
             return bool(
@@ -1265,18 +1253,14 @@ class _CudaGraphRunner(torch.nn.Module):
             saved_fp8_tensors = None
             if self.fp8_enabled:
                 if is_te_min_version("1.13.0"):
-                    saved_fp8_tensors = save_fp8_tensors(
-                        self.participant_modules, self.fp8_recipe
-                    )
+                    saved_fp8_tensors = save_fp8_tensors(self.participant_modules, self.fp8_recipe)
                 else:
                     saved_fp8_tensors = save_fp8_tensors(
                         self.participant_modules, self.fp8_recipe.amax_history_len
                     )
             elif self.fp4_enabled:
                 if is_te_min_version("2.7.0.dev0"):
-                    saved_fp8_tensors = save_fp8_tensors(
-                        self.participant_modules, self.fp4_recipe
-                    )
+                    saved_fp8_tensors = save_fp8_tensors(self.participant_modules, self.fp4_recipe)
                 else:
                     raise ValueError("FP4 requires TE >= 2.7.0.dev0 for NVFP4BlockScaling support.")
 
@@ -1321,7 +1305,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 buf = ten.prebound_cudagraph_input
                 assert buf.data_ptr() == ten.value
                 can_skip_replay_copy = True
-            # The input tensor is reused from another cudagraph's input or output.
+            # the input tensor is resued from another cudagraph's input or output
             elif metadata is not None and metadata.fwd_cudagraph_buffer is not None:
                 shared_buf = metadata.fwd_cudagraph_buffer
                 buf_metadata = shared_buf.cg_buffer_metadata
@@ -1479,8 +1463,8 @@ class _CudaGraphRunner(torch.nn.Module):
         if self.training and torch.is_grad_enabled():
             assert (
                 len(self.fwd_graph_output_surface) > 0
-            ), """Tried graphing a module that returned no tensors in training mode,
-                however the graphed module must output at least one tensor,
+            ), """Tried graphing a module that returned no tensors in training mode, 
+                however the graphed module must output at least one tensor, 
                 so that a corresponding backward node may be registered in the autograd graph."""
 
             # Preserve only forward buffers whose lifetime crosses into backward capture.

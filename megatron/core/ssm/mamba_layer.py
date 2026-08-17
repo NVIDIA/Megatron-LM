@@ -202,6 +202,7 @@ class MambaLayer(GraphableMegatronModule):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
+
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         residual = hidden_states
@@ -210,6 +211,7 @@ class MambaLayer(GraphableMegatronModule):
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.norm)(hidden_states)
+
         mixer_out_with_bias = self.mixer(
             hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
         )

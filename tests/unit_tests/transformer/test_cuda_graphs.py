@@ -498,9 +498,7 @@ class TestPackedSeqCudagraphs:
     )
 
     def setup_method(self, method):
-        self.original_nvte_env = {
-            name: os.environ.get(name) for name in self.NVTE_ENV_VARS
-        }
+        self.original_nvte_env = {name: os.environ.get(name) for name in self.NVTE_ENV_VARS}
         os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
 
     def teardown_method(self, method):
@@ -578,9 +576,7 @@ class TestPackedSeqCudagraphs:
         )
 
         eager_out = block(
-            hidden_states=hidden_states,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
         )
         hidden_states_metadata = hidden_states.cg_buffer_metadata
         assert hidden_states_metadata.is_cudagraph_input
@@ -612,8 +608,7 @@ class TestPackedSeqCudagraphs:
         padded_cu_seqlens_metadata = packed_seq_params.cu_seqlens_q_padded.cg_buffer_metadata
         assert packed_seq_params.cu_seqlens_kv.cg_buffer_metadata is actual_cu_seqlens_metadata
         assert (
-            packed_seq_params.cu_seqlens_kv_padded.cg_buffer_metadata
-            is padded_cu_seqlens_metadata
+            packed_seq_params.cu_seqlens_kv_padded.cg_buffer_metadata is padded_cu_seqlens_metadata
         )
         assert actual_cu_seqlens_metadata.is_cudagraph_input
         assert padded_cu_seqlens_metadata.is_cudagraph_input
@@ -636,8 +631,7 @@ class TestPackedSeqCudagraphs:
             tensor
             for runner in runners
             for tensor in runner.fwd_graph_input_surface[: runner.num_dgrads]
-            if tensor.dtype == torch.int32
-            and tensor.shape == packed_seq_params.cu_seqlens_q.shape
+            if tensor.dtype == torch.int32 and tensor.shape == packed_seq_params.cu_seqlens_q.shape
         ]
         assert len(cu_seqlens_buffers) == 4 * len(runners)
         buffers_by_ptr = {}
@@ -648,9 +642,7 @@ class TestPackedSeqCudagraphs:
             assert sum(not tensor.can_skip_replay_copy for tensor in shared_buffers) == 1
 
         graphed_out = block(
-            hidden_states=hidden_states,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
         )
         assert torch.equal(graphed_out, eager_out), (
             "CUDA graph replay output is not bitwise equal to eager output: "

@@ -329,8 +329,10 @@ class GatedDeltaNet2(_GDNBase):
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
+
         if self.recompute_norm_out:
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
+
         return out, out_bias
 
     def forward(

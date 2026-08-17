@@ -137,7 +137,6 @@ class MoEMetricsTracker:
         force_initialize: bool = False,
         track_names: Optional[Union[str, List[str]]] = None,
         num_layers: Optional[int] = None,
-        num_moe_layers: Optional[int] = None,
         moe_layer_freq: Optional[Union[int, List[int]]] = None,
         mtp_num_layers: Optional[int] = None,
         total_loss_dict: Optional[dict[str, torch.Tensor]] = None,
@@ -162,8 +161,6 @@ class MoEMetricsTracker:
                 whose tensor sizes must match ranks that do have MoE layers.
             track_names: Metric name(s) to report.  ``None`` reports all.
             num_layers: Total transformer layers (required when *force_initialize*).
-            num_moe_layers: Number of MoE aux-loss contributors to average over.
-                When set, this overrides ``moe_layer_freq`` and ``mtp_num_layers``.
             moe_layer_freq: MoE layer frequency or binary pattern list.
             mtp_num_layers: Extra layers from Multi-Token Prediction.
             total_loss_dict: Megatron training-loop accumulator.  Metrics
@@ -190,10 +187,7 @@ class MoEMetricsTracker:
 
         self._sync_metrics(metric_names, pg_collection)
 
-        if num_moe_layers is None:
-            num_moe_layers = self._count_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
-        if num_moe_layers <= 0:
-            raise ValueError("MoE metrics require at least one MoE layer.")
+        num_moe_layers = self._count_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
         scalars = self._aggregate(loss_scale, num_moe_layers, metric_names, percentiles)
 
         # Megatron integration: accumulate loss metrics into total_loss_dict

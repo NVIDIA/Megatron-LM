@@ -689,10 +689,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: Optional[BaseInferenceContext] = None,
     ):
         """Apply attention output projection and the original post-attention operations."""
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
-
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
@@ -779,7 +775,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         context_mask: Optional[Tensor] = None,
         inference_context: Optional[BaseInferenceContext] = None,
         padding_mask: Optional[Tensor] = None,
-        shortcut_hidden: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -796,7 +791,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states,
             inference_context,
             padding_mask=padding_mask,
-            shortcut_hidden=shortcut_hidden,
         )
         return output, context
 
@@ -851,14 +845,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        shortcut_hidden = kwargs.pop("shortcut_hidden", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
             packed_seq_params=kwargs.get("packed_seq_params", None),
-            shortcut_hidden=shortcut_hidden,
         )
         return output, context
 
@@ -921,7 +913,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
         packed_seq_params=None,
-        shortcut_hidden: Tensor | None = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -936,9 +927,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 The MoELayer will internally transform this to [seq_length, bsz] format.
             packed_seq_params: Packed sequence parameters, used to detect flattened
                 batches that need reshaping for MoE sequence load balancing.
-            shortcut_hidden (Tensor, optional): Preceding layer's output for ScMoE routing.
-                Shape [seq_length, batch_size, hidden_size]. When provided, the router and
-                routed experts process this instead of the current layer's representation.
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
@@ -964,15 +952,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
             pre_mlp_layernorm_output, padding_mask, packed_seq_params
         )
-        if shortcut_hidden is not None and moe_unflatten_mbs is not None:
-            shortcut_hidden, _, _ = self._maybe_unflatten_for_moe(
-                shortcut_hidden, None, packed_seq_params
-            )
-
-        # Normalize shortcut for ScMoE routing
-        shortcut_input = None
-        if shortcut_hidden is not None and self.config.moe_shortcut_connection:
-            shortcut_input = apply_module(self.pre_mlp_layernorm)(shortcut_hidden)
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -1006,15 +985,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
                     padding_mask=padding_mask,
-                    shortcut_input=shortcut_input,
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(
-                        apply_module(self.mlp),
-                        padding_mask=padding_mask,
-                        shortcut_input=shortcut_input,
-                    ),
+                    functools.partial(apply_module(self.mlp), padding_mask=padding_mask),
                     False,
                     pre_mlp_layernorm_output,
                 )
@@ -1030,16 +1004,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
             chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
-            if shortcut_input is not None:
-                shortcut_chunks = shortcut_input.chunk(num_chunks, dim=0)
-            else:
-                shortcut_chunks = [None] * len(chunks)
 
             # Compute outputs for each chunk
-            outputs = [
-                apply_module(self.mlp)(chunk, shortcut_input=sc)
-                for chunk, sc in zip(chunks, shortcut_chunks)
-            ]
+            outputs = [apply_module(self.mlp)(chunk) for chunk in chunks]
 
             # Aggregate chunk outputs
             mlp_output = torch.cat([out for out, _ in outputs], dim=0)
@@ -1053,7 +1020,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
             mlp_output_with_bias = apply_module(self.mlp)(
-                pre_mlp_layernorm_output, padding_mask=padding_mask, shortcut_input=shortcut_input
+                pre_mlp_layernorm_output, padding_mask=padding_mask
             )
 
         if moe_unflatten_mbs is not None:
@@ -1708,8 +1675,6 @@ class MoETransformerLayer(TransformerLayer):
                     if self.config.moe_shortcut_parallel:
                         self._shortcut_graph_shared_experts = True
             else:
-                if not hasattr(self, '_router_dtoh_event'):
-                    self._router_dtoh_event = torch.cuda.Event()
                 if not hasattr(self, 'cudagraph_manager_router'):
                     self.cudagraph_manager_router = CudaGraphManager(
                         self.config, self, function_name="_forward_mlp_router"
@@ -1762,11 +1727,11 @@ class MoETransformerLayer(TransformerLayer):
         return obj, leaf_attr_name or attr_name
 
     def _restore_token_dispatcher_attrs(self, attr_outputs):
-        assert self._local_cudagraph_attr_names is not None
         assert len(attr_outputs) == len(self._local_cudagraph_attr_names)
         for attr_name, attr in zip(self._local_cudagraph_attr_names, attr_outputs):
             obj, name = self._resolve_token_dispatcher_attr(attr_name)
             setattr(obj, name, attr)
+
     def _get_token_dispatcher_attrs(self):
         attr_names = []
         token_dispatcher_attr_outputs = []
@@ -1788,7 +1753,17 @@ class MoETransformerLayer(TransformerLayer):
             assert attr_names == self._local_cudagraph_attr_names
         return attr_outputs
 
-    def _forward_mlp_router(self, hidden_states, padding_mask=None, shortcut_hidden=None):
+    def _synchronize_router_host_outputs(self, attr_outputs):
+        """Wait for partial-router graph outputs only when they reside on the host."""
+        if not any(attr.device.type == "cpu" for attr in attr_outputs):
+            return
+
+        if not hasattr(self, '_router_dtoh_event'):
+            self._router_dtoh_event = torch.cuda.Event()
+        self._router_dtoh_event.record()
+        self._router_dtoh_event.synchronize()
+
+    def _forward_mlp_router(self, hidden_states, padding_mask=None):
         """
         Executes the router phase of the MoE block.
 
@@ -1812,16 +1787,8 @@ class MoETransformerLayer(TransformerLayer):
         if self.config.fp32_residual_connection:
             residual = residual.float()
 
-        # Normalize shortcut for ScMoE routing
-        shortcut_input = None
-        if shortcut_hidden is not None and self.config.moe_shortcut_connection:
-            shortcut_input = apply_module(self.pre_mlp_layernorm)(shortcut_hidden)
-
         hidden_states, probs, shared_expert_output = apply_module(self.mlp)(
-            pre_mlp_layernorm_output,
-            intermediate_tensors=(),
-            padding_mask=padding_mask,
-            shortcut_input=shortcut_input,
+            pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
         )
 
         if self.use_partial_cudagraphs:
@@ -1869,12 +1836,7 @@ class MoETransformerLayer(TransformerLayer):
         return self._forward_post_mlp((output, mlp_bias), residual)
 
     def _forward_mlp(
-        self,
-        hidden_states,
-        inference_context=None,
-        padding_mask=None,
-        packed_seq_params=None,
-        shortcut_hidden=None,
+        self, hidden_states, inference_context=None, padding_mask=None, packed_seq_params=None
     ):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
@@ -1893,9 +1855,7 @@ class MoETransformerLayer(TransformerLayer):
         def _forward_mlp_partial_cudagraphs(
             hidden_states, inference_context=None, padding_mask=None
         ):
-            router_outputs = self._forward_mlp_router(
-                hidden_states, padding_mask=padding_mask, shortcut_hidden=shortcut_hidden
-            )
+            router_outputs = self._forward_mlp_router(hidden_states, padding_mask=padding_mask)
             (
                 residual,
                 hidden_states,
@@ -1904,12 +1864,9 @@ class MoETransformerLayer(TransformerLayer):
                 *token_dispatcher_attr_outputs,
             ) = router_outputs
 
-            # After the router graph replays, the captured .copy_() operations that update
-            # the returned dispatcher tensors via `_maybe_dtoh_and_synchronize` are queued on
-            # the current stream but may not have completed. Record an event after the router
-            # graph and wait on it, so we block only until the router's D2H copies complete.
-            self._router_dtoh_event.record()
-            self._router_dtoh_event.synchronize()
+            # CUDA outputs remain ordered by the graph-completion event. Only host outputs need
+            # a CPU-blocking wait before the eager dispatcher can consume them.
+            self._synchronize_router_host_outputs(token_dispatcher_attr_outputs)
 
             expert_output, mlp_bias = self._forward_mlp_expert_compute(
                 hidden_states, probs, token_dispatcher_attr_outputs
@@ -1922,10 +1879,6 @@ class MoETransformerLayer(TransformerLayer):
             hidden_states, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
                 hidden_states, padding_mask, packed_seq_params
             )
-            if shortcut_hidden is not None and moe_unflatten_mbs is not None:
-                shortcut_hidden, _, _ = self._maybe_unflatten_for_moe(
-                    shortcut_hidden, None, packed_seq_params
-                )
 
             if self.moe_layer_recompute:
                 if self.config.fp8 or self.config.fp4:
@@ -1955,10 +1908,7 @@ class MoETransformerLayer(TransformerLayer):
             return result
         else:
             return super()._forward_mlp(
-                hidden_states,
-                padding_mask=padding_mask,
-                packed_seq_params=packed_seq_params,
-                shortcut_hidden=shortcut_hidden,
+                hidden_states, padding_mask=padding_mask, packed_seq_params=packed_seq_params
             )
 
     def shortcut_route_preprocess(self, shortcut_hidden, padding_mask=None):
@@ -1967,7 +1917,7 @@ class MoETransformerLayer(TransformerLayer):
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
         probs, routing_map = self.mlp.route(shortcut_input, padding_mask)
-        permuted_input, probs = self.shortcut_prepare_dispatch(
+        permuted_input, probs = self.mlp.preprocess(
             shortcut_input,
             probs,
             routing_map,
@@ -1976,14 +1926,6 @@ class MoETransformerLayer(TransformerLayer):
         if getattr(self, '_shortcut_graph_shared_experts', False):
             token_dispatcher_attr_outputs = self._get_local_cudagraph_attr_outputs()
         return permuted_input, probs, *token_dispatcher_attr_outputs
-
-    def shortcut_prepare_dispatch(self, shortcut_input, probs, routing_map):
-        """Prepare routed shortcut tokens for dispatch on the current stream."""
-        return self.mlp.preprocess(
-            shortcut_input,
-            probs,
-            routing_map,
-        )
 
     def _shortcut_shared_experts(self, hidden_states):
         pre_mlp_output = self._forward_pre_mlp_layernorm(hidden_states)

@@ -384,9 +384,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params=None,
     ):
-        """Run GDP's input projection and recurrence, before output projection.
-        """
-        inference_context = deprecate_inference_params(inference_context, inference_params)
+        """Run GDP's input projection and recurrence, before output projection."""
         seq_len, batch_size, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None
@@ -550,7 +548,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         packed_seq_params=None,
     ):
         """Run GDP's recurrence followed by its output projection."""
-        inference_context = deprecate_inference_params(inference_context, inference_params)
         y = self.input_proj_ssm(
             hidden_states,
             inference_context=inference_context,

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -454,16 +453,12 @@ class MoELayer(BaseMoELayer):
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
     def preprocess(
-        self,
-        hidden_states: torch.Tensor,
-        probs: torch.Tensor,
-        routing_map: torch.Tensor,
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ):
         """Preprocess token routing for dispatch.
 
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher.
-
         """
         # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
         # expert on its side stream BEFORE fc1_latent_proj so it sees the full
@@ -588,11 +583,6 @@ class MoELayer(BaseMoELayer):
         """Project the output back from latent dimension to hidden dimension after combine
         in latent dimension if needed. Combine expert output with shared_experts if needed.
 
-        Operation order:
-          1. combine_postprocess (un-permute, weight)
-          2. latent projection (if moe_latent_size)
-          3. combine with shared and zero expert outputs
-
         _latent_shared_expert_output is inference-only (latent-MoE + NVLS dispatcher with
         shared-expert overlap). It is populated in preprocess and joined here, after
         fc2_latent_proj, so the dimensions match the full hidden dim."""
@@ -601,7 +591,6 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
 
-        # Combine with shared expert output
         if shared_expert_output is not None:
             output = output + shared_expert_output
         elif (
@@ -613,7 +602,6 @@ class MoELayer(BaseMoELayer):
             torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
             output = output + self._latent_shared_expert_output
             self._latent_shared_expert_output = None
-
         return output
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):
@@ -628,7 +616,6 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
-        shortcut_input: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -668,20 +655,15 @@ class MoELayer(BaseMoELayer):
             padding_mask = padding_mask.transpose(0, 1).bool()
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(
-            hidden_states, intermediate_tensors=None, padding_mask=None, shortcut_input=None
-        ):
-            # ScMoE: route on shortcut, shared expert on current hidden_states
-            routed_input = shortcut_input if shortcut_input is not None else hidden_states
-
+        def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(routed_input, padding_mask)
-                    routed_input, probs = self.preprocess(routed_input, probs, routing_map)
+                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:
-                        return routed_input, probs, shared_expert_output
+                        return hidden_states, probs, shared_expert_output
 
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
@@ -689,13 +671,13 @@ class MoELayer(BaseMoELayer):
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,
                 # like cuda_graph_modules=["moe_router", "moe_preprocess"].
                 # We need to return the intermediate tensors as CUDA graph outputs.
-                return e.get_early_return_outputs(routed_input, shared_expert_output)
+                return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
             if "expert_compute" in self.fwd_execution_map:
                 if intermediate_tensors is not None:
-                    routed_input, probs = intermediate_tensors
+                    hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(routed_input, probs)
+                dispatched_input, probs = self.dispatch(hidden_states, probs)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
                     mlp_bias is None
@@ -726,21 +708,13 @@ class MoELayer(BaseMoELayer):
                     hidden_states,
                     intermediate_tensors,
                     padding_mask,
-                    shortcut_input,
                 )
             else:
                 outputs = tensor_parallel.checkpoint(
-                    custom_forward,
-                    False,
-                    hidden_states,
-                    intermediate_tensors,
-                    padding_mask,
-                    shortcut_input,
+                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
                 )
         else:
-            outputs = custom_forward(
-                hidden_states, intermediate_tensors, padding_mask, shortcut_input
-            )
+            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 
         return outputs
 

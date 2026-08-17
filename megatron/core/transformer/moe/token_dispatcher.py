@@ -97,10 +97,7 @@ class MoETokenDispatcher:
 
     @abstractmethod
     def dispatch_preprocess(
-        self,
-        tokens: torch.Tensor,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
+        self, tokens: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
         """Prepares tokens for dispatch without inter-device communication.
 
@@ -211,7 +208,7 @@ class MoETokenDispatcher:
             hidden_states (torch.Tensor): Combined hidden states from token combination
 
         Returns:
-            The postprocessed output tensor.
+            The final output tensor.
         """
         raise NotImplementedError("combine_postprocess function not implemented.")
 
@@ -271,10 +268,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self.cudagraph_attrs = ['routing_map']
 
     def dispatch_preprocess(
-        self,
-        hidden_states: torch.Tensor,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
+        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
         """Reshapes hidden states and caches the routing map."""
         self.hidden_shape = hidden_states.shape
@@ -627,10 +621,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         return num_tokens_per_local_expert
 
     def dispatch_preprocess(
-        self,
-        hidden_states: torch.Tensor,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
+        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
         """Prepares hidden states and probabilities for dispatch.
 
@@ -641,6 +632,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             hidden_states (torch.Tensor): Input token embeddings.
             routing_map (torch.Tensor): The mapping of tokens to experts.
             probs (torch.Tensor): Routing probabilities.
+
         Returns:
             A tuple of permuted hidden states and probabilities.
         """
@@ -908,7 +900,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
 
-        # Add shared experts output.
+        # Add shared experts output
         if self.shared_experts is not None:
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
@@ -1179,15 +1171,11 @@ class _HybridEPManager(_DispatchManager):
         # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
 
         if self.num_permuted_tokens is None:
-            # capacity_factor=None: tokens_per_expert is the CPU-pinned padded tensor from
-            # dispatch_with_permute (the non_blocking=False sync already occurred).
-            self.num_permuted_tokens = int(tokens_per_expert.sum())
-            # DeepEP exposes its padded int64 GPU counts in the dense-layout handle. The
-            # CPU-pinned result above is used only to resolve the dynamic output size.
-            self.tokens_per_expert = self.handle[10]
+            self.tokens_per_expert = tokens_per_expert.to(torch.int64)
+            # num_permuted_tokens is necessary to allocate the output tensor for combine.
+            self.num_permuted_tokens = self.tokens_per_expert.sum()
         if self.moe_expert_rank_capacity_factor is not None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
-
         return dispatched_hidden
 
     def combine(
@@ -1230,6 +1218,7 @@ class _HybridEPManager(_DispatchManager):
         Get the number of tokens per expert.
         '''
         return self.tokens_per_expert
+
 
 class _DeepepManager(_DispatchManager):
     """
@@ -1924,10 +1913,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
     @jit_fuser
     def dispatch_preprocess(
-        self,
-        hidden_states: torch.Tensor,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
+        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
         """Initializes routing metadata and prepares tensors for fused dispatch.
 
@@ -1969,7 +1955,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         Args:
             hidden_states (torch.Tensor): Preprocessed hidden states to be dispatched
-            probs (torch.Tensor): Routing probabilities to dispatch.
+            probs (torch.Tensor): Routing probabilities (unused in current implementation)
             async_finish (bool): Whether to use asynchronous communication completion
             allocate_on_comm_stream (bool): Whether to allocate buffers on communication stream
 
