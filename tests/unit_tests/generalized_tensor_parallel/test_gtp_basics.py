@@ -29,6 +29,8 @@ Test groups
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` != the required world size (4).
 """
 
+from unittest import mock
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -1522,3 +1524,57 @@ class TestActivationRecomputePhaseFlag:
             f"expected [original fwd=False, recompute fwd=True], got {observed}: "
             "in_activation_recompute_phase no longer tracks BF16 activation recompute"
         )
+
+
+# ---------------------------------------------------------------------------
+# zero_out_wgrad contract for the dummy wgrad handed back to autograd
+# ---------------------------------------------------------------------------
+
+
+class TestGTPDummyWgradZeroOut:
+    """_handle_megatron_grad_accum returns a throwaway wgrad to autograd, and DDP may
+    accumulate it into main_grad.
+
+    DDP's backward-post hook adds param.grad into main_grad whenever zero_out_wgrad is set
+    (language_module sets it for a weight consumed twice: shared embedding/output weights,
+    or MTP). The non-GTP wgrad paths in tensor_parallel/layers.py therefore ask TE for a
+    ZEROED dummy in that case. GTP must do the same: it drives the hook manually, i.e.
+    BEFORE autograd stores the dummy in param.grad, so the hook's trailing
+    ``param.grad = None`` clears nothing and the dummy survives into the next microbatch's
+    hook, where it is accumulated. TE's dummy is one recycled buffer, so an unzeroed one
+    lands in main_grad as NaN/1e38 garbage.
+    """
+
+    def _param(self, zero_out):
+        param = GTPShardedParam(torch.zeros(4, 4, device="cuda"))
+        param.main_grad = torch.zeros(4, 4, device="cuda")
+        param.grad_added_to_main_grad = False
+        param._grad_accum_hook = None
+        if zero_out:
+            param.zero_out_wgrad = True
+        return param
+
+    @pytest.mark.parametrize("zero_out", [True, False])
+    def test_dummy_zeroing_follows_zero_out_wgrad(self, zero_out):
+        param = self._param(zero_out)
+        with mock.patch.object(gtp_module, "get_dummy_wgrad") as dummy:
+            dummy.return_value = torch.zeros(4, 4, device="cuda")
+            GTPShardedParam._handle_megatron_grad_accum(param)
+
+        assert dummy.call_args.kwargs.get("zero", False) is zero_out
+
+    def test_an_unzeroed_dummy_would_poison_main_grad(self):
+        """Guards the consequence, not just the flag: run the DDP accumulation by hand."""
+        param = self._param(zero_out=True)
+        with mock.patch.object(gtp_module, "get_dummy_wgrad") as dummy:
+            # Stand-in for TE's recycled scratch: garbage unless zeroing was requested.
+            dummy.side_effect = lambda shape, dtype, zero=False: (
+                torch.zeros(shape, device="cuda")
+                if zero
+                else torch.full(shape, float("nan"), device="cuda")
+            )
+            grad = GTPShardedParam._handle_megatron_grad_accum(param)
+
+        # What DDP's backward-post hook does when zero_out_wgrad is set.
+        param.main_grad.add_(grad)
+        assert torch.isfinite(param.main_grad).all()
