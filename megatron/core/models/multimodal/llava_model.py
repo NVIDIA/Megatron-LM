@@ -1409,14 +1409,11 @@ class LLaVAModel(MegatronModule):
             "packed_seq_params": packed_seq_params,
         }
         if isinstance(self.language_model, (GPTModel, HybridModel)):
-            # MTP is a training-time feature (multi-token prediction loss). Only
-            # pass loss_mask / mtp_source_loss_mask to the language model when
-            # labels are present (i.e. we're computing loss); at inference we
-            # skip them so we don't collide with LM forward signatures that
-            # don't accept the MTP kwargs.
+            # Only pass loss_mask when labels are present (i.e. we're computing
+            # loss); at inference we skip it so we don't collide with LM
+            # forward signatures that treat loss_mask as required-when-labeled.
             if expanded_labels is not None:
                 language_model_kwargs["loss_mask"] = expanded_loss_mask
-                language_model_kwargs["mtp_source_loss_mask"] = expanded_loss_mask
 
         output = self.language_model(**language_model_kwargs)
 
