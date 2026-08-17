@@ -1552,8 +1552,8 @@ class TestRLUtils:
         # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
         assert metrics["mean_completion_gap"] == 2.5
 
-        # Case where every episode has failed: the wave still reports the
-        # failure counters (the one signal it carries) and skips the tables.
+        # Case where every episode has failed: the wave still reports the failure
+        # counters (now status series + reason table) and skips the rollout tables.
         writer = MagicMock()
         metrics = rl_utils.prep_wandb_metrics(
             writer,
@@ -1568,8 +1568,14 @@ class TestRLUtils:
             num_evictions=[],
             current_iteration=6,
         )
-        assert metrics == {'failed_rollouts/count': 0, 'failed_rollouts/ratio': 0.0}
-        writer.Table.assert_not_called()
+        assert metrics['rollout/count'] == 0
+        assert metrics['failed_rollouts/count'] == 0
+        assert metrics['failed_rollouts/ratio'] == 0.0
+        # Unstamped wave: the known-status series still emit, zeroed.
+        assert metrics['rollout/placeholder_count'] == 0
+        assert metrics['rollout/placeholder_rate'] == 0.0
+        assert 'rollout_table' not in metrics and 'mean_reward' not in metrics
+        assert [c.kwargs['data'] for c in writer.Table.call_args_list] == [[]]
 
         # All-placeholder wave: rewards exist (placeholders carry 0.0) but every
         # rollout is a zero-turn pad, so the masked stats have nothing to reduce
@@ -1587,9 +1593,22 @@ class TestRLUtils:
             completed_epochs=[[]],
             num_evictions=[[0, 0]],
             current_iteration=6,
+            rollout_statuses=[["placeholder", "placeholder"]],
+            failure_reasons=[["http_500", None]],
         )
-        assert metrics == {'failed_rollouts/count': 2, 'failed_rollouts/ratio': 1.0}
-        writer.Table.assert_not_called()
+        assert metrics['rollout/count'] == 2
+        assert metrics['failed_rollouts/count'] == 2
+        assert metrics['failed_rollouts/ratio'] == 1.0
+        assert metrics['rollout/placeholder_count'] == 2
+        assert metrics['rollout/placeholder_rate'] == 1.0
+        assert 'rollout_table' not in metrics and 'mean_reward' not in metrics
+        reason_calls = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["failure_reason", "count", "rate"]
+        ]
+        assert len(reason_calls) == 1
+        assert reason_calls[0].kwargs["data"] == [["http_500", 1, 0.5]]
 
     def test_compute_group_stats_excludes_placeholders_from_metric_fields(self):
         def real_rollout(tokens, problem_id):
