@@ -763,9 +763,11 @@ class TestCompaction:
         save.finalize_fns[0]()
         after_finalize = bank.append(sample_group())
 
-        assert before_finalize.startswith("gen-000007/")
-        assert after_finalize.startswith("gen-000007/")
-        assert {group.uid for group in bank.restore(1)} == {before_finalize, after_finalize}
+        assert before_finalize == "gen-000007/0"
+        assert after_finalize == "gen-000007/1"
+        restored_uids = [group.uid for group in bank.restore(1)]
+        assert len(restored_uids) == 2
+        assert set(restored_uids) == {before_finalize, after_finalize}
 
     def test_marker_after_compaction_is_not_orphaned(self, tmp_path):
         bank = RolloutBank(str(tmp_path))

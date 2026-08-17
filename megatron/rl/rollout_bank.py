@@ -838,6 +838,7 @@ class RolloutBank:
         """
         with self._lock:
             active_collection_iter = self._collection_iter
+            active_sequence = self._seq
             survivors, markers = self._restore_state(iteration)
             survivor_uids = {group.uid for group in survivors}
             retained_markers = {
@@ -854,6 +855,10 @@ class RolloutBank:
             # appends on the collection that was active before compaction.
             if active_collection_iter is not None:
                 self.set_collection(active_collection_iter)
+                # Compaction relocates every survivor into the checkpoint's
+                # physical segment while preserving its uid. Do not reuse a uid
+                # sequence that was already assigned by the active collection.
+                self._seq = max(self._seq, active_sequence)
             self._last_checkpoint_iter = iteration
 
     def recover(self, trained_through: int) -> list["RolloutGroup"]:
