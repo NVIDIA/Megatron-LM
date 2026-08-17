@@ -4,10 +4,12 @@
 Pure CPU tests for the shard-planning and owner-compute packing logic.
 
 These tests exercise `ShardPlan`, `ShardPlan.from_flat_layout`, `assign_owner_work`,
-`pack_owner_work`, `OwnerGatherPlan.reconstruct_full`, `pack_update_shards`, and
+`pack_owner_work`, `OwnerGatherPlan.reconstruct_full`, `pack_result_shards`, and
 `OwnerScatterPlan.unpack` without a process group or any `torch.distributed` dependency. P2P
 communication is simulated in-process by `_simulate_p2p`.
 """
+
+from collections.abc import Callable
 
 import torch
 
@@ -17,6 +19,22 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.shard_plan im
     ShardPlan,
     assign_owner_work,
 )
+
+
+def _ns_cost(num_ns_steps: int) -> Callable[[ShardPlan], int]:
+    """Cost function matching the Newton-Schulz orthogonalization estimate.
+
+    `numel * (min(rows, cols) * num_steps + 1)` – used by the tests to exercise the greedy balancer
+    with a non-trivial cost.
+    """
+
+    def cost_fn(plan: ShardPlan) -> int:
+        rows, cols = plan.full_shape
+        short_dim = min(rows, cols)
+        return plan.full_numel() * (short_dim * num_ns_steps + 1)
+
+    return cost_fn
+
 
 # ---------------------------------------------------------------------------
 # Shard-plan math
@@ -79,8 +97,8 @@ def test_assign_owner_work_balances_by_cost():
     # Two boundary params, all four ranks eligible for each.
     plan0 = ShardPlan(torch.Size((8, 8)), ((0, 4), (0, 4), (0, 4), (0, 4)), 8)  # cost 64*41
     plan1 = ShardPlan(torch.Size((4, 4)), ((0, 2), (0, 2), (0, 2), (0, 2)), 4)  # cost 16*21
-    owners = assign_owner_work([plan0, plan1], num_ns_steps=5)
     # Greedy min running cost: first param -> rank0 (cost 2624), second -> rank1 (cost 336).
+    owners = assign_owner_work([plan0, plan1], _ns_cost(5))
     assert owners == {0: 0, 1: 1}
 
 
@@ -89,7 +107,7 @@ def test_assign_owner_work_only_eligible_ranks_can_own():
     # Only ranks 0 and 2 have shards for both params.
     plan0 = ShardPlan(torch.Size((8, 8)), ((0, 4), (0, 0), (0, 4), (0, 0)), 8)
     plan1 = ShardPlan(torch.Size((8, 8)), ((0, 4), (0, 0), (0, 4), (0, 0)), 8)
-    owners = assign_owner_work([plan0, plan1], num_ns_steps=5)
+    owners = assign_owner_work([plan0, plan1], _ns_cost(5))
     assert all(owners[i] in (0, 2) for i in owners)
     # Two equal-cost params split across the two eligible ranks.
     assert owners[0] != owners[1]
@@ -98,7 +116,7 @@ def test_assign_owner_work_only_eligible_ranks_can_own():
 def test_assign_owner_work_fully_local_owner_is_single_candidate():
     """A fully local parameter is assigned to its single owning rank."""
     plan = ShardPlan(torch.Size((4, 2)), ((0, 4), (0, 0)), 2)
-    owners = assign_owner_work([plan], num_ns_steps=3)
+    owners = assign_owner_work([plan], _ns_cost(3))
     assert owners == {0: 0}
 
 
@@ -124,7 +142,7 @@ def _simulate_p2p(
 
 
 def test_pack_and_reconstruct_round_trip():
-    """Gathered + reconstructed pre-NS matches the concatenation of local shards."""
+    """Gathered + reconstructed shards matches the concatenation of local shards."""
     torch.manual_seed(0)
     world_size = 2
     # Two params, both boundary, shapes (6,3) and (4,2). Owners: param0->rank0, param1->rank1.
@@ -167,8 +185,8 @@ def test_pack_and_reconstruct_round_trip():
     torch.testing.assert_close(full1, full_p1, atol=0, rtol=0)
 
 
-def test_pack_and_unpack_update_round_trip():
-    """Scattered update shards match the owner's full update sliced per rank."""
+def test_pack_and_unpack_result_round_trip():
+    """Scattered result shards match the owner's full result sliced per rank."""
     torch.manual_seed(1)
     world_size = 2
     plan0 = ShardPlan.from_flat_layout(torch.Size((6, 3)), 0, 9, world_size)
@@ -176,15 +194,15 @@ def test_pack_and_unpack_update_round_trip():
     plans = [plan0, plan1]
     owners = {0: 0, 1: 1}
 
-    full_update0 = torch.arange(18, dtype=torch.float32).reshape(6, 3) + 1.0
-    full_update1 = torch.arange(8, dtype=torch.float32).reshape(4, 2) + 2.0
-    full_updates_by_rank = {0: {0: full_update0}, 1: {1: full_update1}}
+    full_result0 = torch.arange(18, dtype=torch.float32).reshape(6, 3) + 1.0
+    full_result1 = torch.arange(8, dtype=torch.float32).reshape(4, 2) + 2.0
+    full_results_by_rank = {0: {0: full_result0}, 1: {1: full_result1}}
 
     per_rank_send = []
     per_rank_scatter = []
     for r in range(world_size):
         scatter = OwnerScatterPlan.pack(
-            full_updates_by_rank[r],
+            full_results_by_rank[r],
             plans,
             owners,
             world_size,
@@ -199,11 +217,11 @@ def test_pack_and_unpack_update_round_trip():
 
     for r in range(world_size):
         received = per_rank_scatter[r].unpack(recv[r])
-        # Rank r receives the update shard for the param it does NOT own.
+        # Rank r receives the result shard for the param it does NOT own.
         other = 1 - r
         plan = plans[other]
         rs, rc = plan.rank_rows[r]
-        expected = full_updates_by_rank[owners[other]][other][rs : rs + rc]
+        expected = full_results_by_rank[owners[other]][other][rs : rs + rc]
         torch.testing.assert_close(received[other], expected, atol=0, rtol=0)
 
 
