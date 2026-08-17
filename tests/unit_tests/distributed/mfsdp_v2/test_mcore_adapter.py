@@ -324,8 +324,7 @@ class TestMcoreAdapterDense:
         ]
         assert len(parameter_groups) >= 2
         omitted_parameter_ids = {
-            id(fsdp_parameter.sharded)
-            for fsdp_parameter in parameter_groups[0].fsdp_parameters
+            id(fsdp_parameter.sharded) for fsdp_parameter in parameter_groups[0].fsdp_parameters
         }
         for optimizer_param_group in optimizer.optimizer.param_groups:
             optimizer_param_group["params"] = [
@@ -333,6 +332,12 @@ class TestMcoreAdapterDense:
                 for parameter in optimizer_param_group["params"]
                 if id(parameter) not in omitted_parameter_ids
             ]
+
+        # Collective traversal must not depend on requires_grad either. A
+        # rank-local filter could otherwise reorder refreshes just like an
+        # omitted empty optimizer shard.
+        for fsdp_parameter in parameter_groups[1].fsdp_parameters:
+            fsdp_parameter.sharded.requires_grad_(False)
 
         sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
         for parameter_group in parameter_groups:
@@ -714,6 +719,34 @@ class TestMcoreAdapterHybrid:
             module=model,
             pg_collection=self.pg_collection,
         )
+
+        parameter_groups = [
+            parameter_group
+            for module in model.modules()
+            if isinstance(module, FsdpModule)
+            for parameter_group in module.parameter_groups
+        ]
+        expected_model_weights = {
+            parameter_group: [
+                parameter_group.model_weight.get_local_tensor(index).clone()
+                for index in range(len(parameter_group.fsdp_parameters))
+            ]
+            for parameter_group in parameter_groups
+        }
+
+        # Meta reset populates main_weight by staging through model_weight. Clear
+        # the compute shards and reconstruct them from main_weight to verify that
+        # the staged outer-axis scatter preserved every logical tensor exactly.
+        for parameter_group in parameter_groups:
+            parameter_group.model_weight.local_buffer.zero_()
+            parameter_group.sync_model_weight_from_main_weight()
+            for index, expected_weight in enumerate(expected_model_weights[parameter_group]):
+                torch.testing.assert_close(
+                    parameter_group.model_weight.get_local_tensor(index),
+                    expected_weight,
+                    rtol=0,
+                    atol=0,
+                )
 
         output = model(torch.randn(2, config.hidden_size, device="cuda", dtype=config.params_dtype))
         assert torch.isfinite(output).all()

@@ -339,9 +339,12 @@ class FsdpParameterGroup:
             torch.distributed.broadcast(unsharded.local_buffer, src=src_rank, group=group)
 
         # Populate the compute shard first, then derive the optimizer shard from
-        # it. For HFSDP this intentionally performs two one-axis transitions:
-        # Replicate,Replicate -> Replicate,Flat -> Flat,Flat. DBuffer rejects a
-        # direct redistribution that changes both mesh axes at once.
+        # it. The unsharded and compute buffers both use self.dtype, so staging
+        # through model_weight is value-preserving even when main_weight uses a
+        # higher-precision dtype. For HFSDP this intentionally performs two
+        # one-axis transitions: Replicate,Replicate -> Replicate,Flat ->
+        # Flat,Flat. DBuffer rejects a direct redistribution that changes both
+        # mesh axes at once.
         unsharded.cast(self.model_weight.dtype).redistribute(
             self.model_weight.placements, out=self.model_weight
         )
