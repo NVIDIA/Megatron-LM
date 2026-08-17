@@ -553,7 +553,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out".
+             "shared_experts", "gdn_norm_out", "mhc".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -563,7 +563,11 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
-    "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
+    "mhc": recompute HyperConnection intermediate activations via
+            CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
+            enable_mhc_connections=True. Cannot be used with "mlp".
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", and "mhc" use
+    output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -1107,6 +1111,35 @@ class TransformerConfig(ModelParallelConfig):
     migrated to cuda_graph_modules in __post_init__. Will be removed in a future release.
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
+
+    ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_mhc_connections: bool = False
+    """Enable mHC residual connections."""
+
+    mhc_num_residual_streams: int = 4
+    """Number of residual streams (n in paper)."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of Gating Factor (alpha in paper)."""
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Number of layers per MHC recompute block.
+
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new CheckpointWithoutOutputManager is created for subsequent layers
+
+    If None, all layers in the transformer block share a single recompute block.
+
+    Must be a positive integer when set."""
 
     ####################
     # miscellaneous
@@ -1850,6 +1883,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "gdn_norm_out",
+                    "mhc",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1919,6 +1953,106 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # Validation for "mhc" in recompute_modules
+        if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
+            if not self.enable_mhc_connections:
+                raise ValueError("'mhc' in recompute_modules requires enable_mhc_connections=True.")
+            if "mlp" in self.recompute_modules:
+                raise ValueError(
+                    "'mhc' and 'mlp' in recompute_modules cannot be used together. "
+                    "They use different checkpoint mechanisms that may conflict."
+                )
+            if self.mhc_recompute_layer_num is not None and (
+                isinstance(self.mhc_recompute_layer_num, bool)
+                or not isinstance(self.mhc_recompute_layer_num, int)
+                or self.mhc_recompute_layer_num < 1
+            ):
+                raise ValueError(
+                    "mhc_recompute_layer_num must be a positive integer when "
+                    "'mhc' is in recompute_modules."
+                )
+            if self.fine_grained_activation_offloading:
+                raise NotImplementedError(
+                    "'mhc' in recompute_modules + fine_grained_activation_offloading is "
+                    "not yet supported. The mHC recompute hook currently fires before "
+                    "the offloading backward chunk is initialized, causing tensor_pop "
+                    "on a None chunk. Disable one of them."
+                )
+
+        if self.enable_mhc_connections and not (
+            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        ):
+            warnings.warn(
+                "HyperConnections are enabled but 'mhc' is not in "
+                "recompute_modules with selective recompute. Consider adding 'mhc' to "
+                "recompute_modules with selective recompute to reduce activation memory."
+            )
+
+        # Validation for hyper_connections with MTP
+        if self.enable_mhc_connections and self.mtp_num_layers is not None:
+            raise ValueError(
+                "enable_mhc_connections is not compatible with Multi-Token Prediction (MTP). "
+                "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
+            )
+
+        if self.enable_mhc_connections and self.recompute_granularity == "full":
+            raise NotImplementedError(
+                "enable_mhc_connections is not yet compatible with full activation recompute. "
+                "Use selective recompute with 'mhc' in recompute_modules, or disable "
+                "activation recompute."
+            )
+
+        if self.enable_mhc_connections and self.inference_fuse_tp_communication:
+            raise NotImplementedError(
+                "enable_mhc_connections is not compatible with inference_fuse_tp_communication. "
+                "The fused inference TP path assumes single-stream residual tensors."
+            )
+
+        # Note: mHC + MoE is deliberately NOT rejected here. HyperConnectionTransformerLayer
+        # raises for a MoE MLP submodule at build time, which is the precise check; a
+        # config-level `num_moe_experts` guard would also block the documented composition
+        # (wrapping MoE as a HybridStack layer via HyperConnectionHybridLayer).
+
+        if self.enable_mhc_connections:
+            # TransformerBlock expands to n-stream at `pre_process` and contracts back at
+            # the stage holding the final layernorm, so every intermediate pipeline stage
+            # exchanges [s, b, n*C] while the p2p buffers are still sized from hidden_size.
+            # Pipeline support lands in the follow-up mHC split, which lifts this guard.
+            if self.pipeline_model_parallel_size > 1:
+                raise NotImplementedError(
+                    "enable_mhc_connections does not support pipeline_model_parallel_size > 1 "
+                    "yet. Inter-stage activations are n-stream ([s, b, n*C]) while pipeline "
+                    "p2p buffers are sized from hidden_size, so the shapes disagree. Use "
+                    "pipeline_model_parallel_size=1 until mHC pipeline support lands."
+                )
+
+            # The residual carried across an mHC layer is the n-stream tensor consumed by
+            # `fused_h_res_h_post_bda` (a bmm against h_res), not the single-stream residual
+            # the base layer casts. Upcasting it alone would mismatch the h_res dtype.
+            if self.fp32_residual_connection:
+                raise NotImplementedError(
+                    "enable_mhc_connections is not compatible with fp32_residual_connection. "
+                    "The mHC residual is the n-stream tensor consumed by the H_res batched "
+                    "matmul, which must share the activation dtype."
+                )
+
+            # SinkhornKnopp.backward's analytic chain rule (grad = grad_M_init * M_init)
+            # is exact only because the per-row max shift is annihilated by the first
+            # row-normalization T_r. With zero iterations that invariance does not hold
+            # and the dropped argmax term makes the gradient silently wrong.
+            if self.mhc_sinkhorn_iterations < 1:
+                raise ValueError(
+                    "mhc_sinkhorn_iterations must be >= 1; the Sinkhorn-Knopp backward "
+                    f"assumes at least one row-normalization pass, got "
+                    f"{self.mhc_sinkhorn_iterations}."
+                )
+
+            if self.mhc_init_gating_factor < 0:
+                raise ValueError(
+                    "mhc_init_gating_factor must be non-negative, got "
+                    f"{self.mhc_init_gating_factor}."
+                )
 
         if self.fine_grained_activation_offloading:
             assert (
