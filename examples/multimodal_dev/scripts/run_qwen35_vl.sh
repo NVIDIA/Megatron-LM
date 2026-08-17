@@ -9,7 +9,9 @@
 #   MODEL_VARIANT: proxy (default), pp_proxy, 0.8b, 2b, 4b, 9b, 27b, 35b_a3b, 122b_a10b, 397b_a17b, 35b_a3b_light
 #   CKPT_LOAD: path to a pre-converted checkpoint to load (enables --load + --finetune)
 #   CKPT_FORMAT: checkpoint format override (e.g. torch_dist); auto-detected when empty
-#   TP, EP, PP: parallelism sizes (PP>1 forces USE_FSDP=0)
+#   TP, EP, PP: parallelism sizes (PP>1 forces USE_FSDP=0 if unset; errors if
+#               USE_FSDP=1 was set explicitly, since FSDP and PP are mutually
+#               exclusive on the standard path)
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
 #   DATASET_PROVIDER: cord_v2 (default) or mock
@@ -523,9 +525,21 @@ if [ -n "$CKPT_LOAD" ]; then
 fi
 
 # --- FSDP ---
+USE_FSDP_WAS_SET=${USE_FSDP+x}
 USE_FSDP=${USE_FSDP:-1}
-# FSDP and PP are mutually exclusive in Megatron's standard path.
+# FSDP and PP are mutually exclusive in Megatron's standard path. Auto-downgrading
+# a user's explicit USE_FSDP=1 would silently drop --ckpt-format fsdp_dtensor,
+# --init-model-with-meta-device, and --use-distributed-optimizer, producing a
+# confusing checkpoint-side error later -- fail loudly instead. The implicit
+# default (USE_FSDP unset) is still auto-downgraded so plain PP smoke runs work.
 if [ "$PP" -gt 1 ] && [ "$USE_FSDP" -eq 1 ]; then
+    if [ -n "$USE_FSDP_WAS_SET" ]; then
+        echo "[run_qwen35_vl] ERROR: USE_FSDP=1 was explicitly requested with PP=${PP} > 1." >&2
+        echo "  FSDP and PP are mutually exclusive on the standard path; forcing USE_FSDP=0" >&2
+        echo "  would silently drop --ckpt-format fsdp_dtensor, --init-model-with-meta-device," >&2
+        echo "  and --use-distributed-optimizer. Set USE_FSDP=0 (or unset it) to run with PP>1." >&2
+        exit 1
+    fi
     echo "[run_qwen35_vl] PP=${PP} > 1 -> forcing USE_FSDP=0"
     USE_FSDP=0
 fi
