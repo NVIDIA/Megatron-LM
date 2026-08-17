@@ -25,9 +25,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.orthogonalized_optimizer import (
     FsdpMuon,
+    Muon,
     OwnerGatherPlan,
     OwnerScatterPlan,
     ShardPlan,
+    _require_emerging_optimizers,
     assign_owner_work,
     compute_shard_plan,
     pack_owner_work,
@@ -46,6 +48,9 @@ except Exception:  # pragma: no cover
         rank: int
         world_size: int
         device: torch.device
+
+
+_require_emerging_optimizers()
 
 
 @pytest.fixture(scope="function")
@@ -404,8 +409,6 @@ def _make_fsdp_model(device: torch.device, mesh, seed: int = 1234) -> TinyModel:
 
 def test_compute_orthogonalization_inputs_matches_reference(distributed_setup):
     """Local pre-NS (weight decay + momentum + Nesterov) matches a plain reference."""
-    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
-
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
@@ -467,8 +470,6 @@ def test_compute_orthogonalization_inputs_matches_reference(distributed_setup):
 
 def test_step_bitwise_matches_single_rank_reference(distributed_setup):
     """The sharded FSDP Muon step must match a single-rank Muon with the same kernel."""
-    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
-
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2 or torch.cuda.device_count() < world_size:
@@ -551,8 +552,6 @@ def test_step_explicit_boundary_param_bitwise_matches_reference(distributed_setu
     owner-gather -> fully-local -> finish restructure and the `pre_ns` argument
     to `_orthogonalize_with_precision` on the boundary path.
     """
-    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
-
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2 or torch.cuda.device_count() < world_size:
@@ -637,8 +636,6 @@ def test_step_reconstruct_full_param_bitwise_matches_reference(distributed_setup
     `orthogonalize`. The result must still match the single-rank reference
     bitwise, guarding the optional full-parameter reconstruction path.
     """
-    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
-
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2 or torch.cuda.device_count() < world_size:
@@ -808,8 +805,6 @@ def test_step_mixed_dtypes_bitwise_matches_reference(distributed_setup):
     call each) with matching P2P buffer metadata, and the result must match a
     single-rank Muon reference.
     """
-    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
-
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2 or torch.cuda.device_count() < world_size:
@@ -989,6 +984,7 @@ def test_import_guard_emerging_optimizers_available():
     from emerging_optimizers.orthogonalized_optimizers import OrthogonalizedOptimizer as RealEO
 
     assert mod.OrthogonalizedOptimizer is RealEO
+
     from emerging_optimizers.orthogonalized_optimizers.muon import Muon as RealMuon
 
     assert mod.Muon is RealMuon
