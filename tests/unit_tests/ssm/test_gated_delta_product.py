@@ -7,6 +7,9 @@ preprocessing: the forward pass is unaffected, and the backward pass rebuilds th
 subgraph from the same saved input. So enabling it must not move the numerics at all.
 Any drift would mean the replay observed a different weight, a different RNG state, or
 a stale storage after the output-discarding checkpoint shared the recomputed one back.
+
+The one exception is `conv1d.weight`, see NONDETERMINISTIC_PARAMS below: its gradient is
+not reproducible run to run, for reasons that have nothing to do with recompute.
 """
 
 import pytest
@@ -96,8 +99,35 @@ def _run(mixer, hidden_states, grads):
     return out.detach().clone(), x.grad.clone(), param_grads
 
 
-def _assert_bitwise_equal(baseline, recomputed):
-    """Compare a (output, input grad, param grads) triple with zero tolerance."""
+# `causal_conv1d_fn` accumulates its weight gradient across blocks with atomicAdd on the
+# channels-last layout the mixer feeds it, so the reduction order -- and with it the
+# last-place rounding -- varies from launch to launch. Two runs of the *same* mixer can
+# therefore disagree on this tensor. It is unrelated to recompute and to FP8: it
+# reproduces with recompute disabled, in plain BF16, and the conv sees the identical
+# layout and dtypes either way. Everything else here must still match bitwise, so scope
+# the tolerance to this one tensor rather than loosening the whole comparison.
+NONDETERMINISTIC_PARAMS = ("conv1d.weight",)
+
+
+def _assert_grad_matches(name, recomputed_grad, base_grad):
+    """Compare one gradient: bitwise, unless the kernel that produced it is unstable."""
+    if name in NONDETERMINISTIC_PARAMS:
+        # Reordering shifts an element by a few ulps of its own value, so the budget is
+        # relative: BF16 carries 8 mantissa bits, so 2**-6 is four ulps. atol only has to
+        # cover elements too close to zero for rtol to mean anything, and is derived from
+        # the tensor's magnitude so it cannot go stale if these tests change shape.
+        atol = float(base_grad.abs().max()) * 2**-11
+        torch.testing.assert_close(
+            recomputed_grad, base_grad, rtol=2**-6, atol=atol, msg=f"{name} gradient drifted"
+        )
+    else:
+        torch.testing.assert_close(
+            recomputed_grad, base_grad, rtol=0, atol=0, msg=f"{name} gradient drifted"
+        )
+
+
+def _assert_replay_matches(baseline, recomputed):
+    """Compare a (output, input grad, param grads) triple; exact but for the conv weight."""
     base_out, base_input_grad, base_param_grads = baseline
     recomp_out, recomp_input_grad, recomp_param_grads = recomputed
 
@@ -107,9 +137,7 @@ def _assert_bitwise_equal(baseline, recomputed):
     )
     assert set(recomp_param_grads) == set(base_param_grads)
     for name, base_grad in base_param_grads.items():
-        torch.testing.assert_close(
-            recomp_param_grads[name], base_grad, rtol=0, atol=0, msg=f"{name} gradient drifted"
-        )
+        _assert_grad_matches(name, recomp_param_grads[name], base_grad)
 
 
 @pytest.mark.skipif(not HAVE_GDP_DEPS, reason="requires mamba-ssm, einops, causal-conv1d and FLA")
@@ -137,7 +165,7 @@ def test_in_proj_recompute_parity(recompute_qkv):
         )
         grads = torch.randn_like(hidden_states)
 
-        _assert_bitwise_equal(
+        _assert_replay_matches(
             _run(baseline, hidden_states, grads), _run(recomputed, hidden_states, grads)
         )
     finally:
@@ -171,7 +199,7 @@ def test_fp8_in_proj_recompute_parity(fp8_recipe):
         )
         grads = torch.randn_like(hidden_states)
 
-        _assert_bitwise_equal(
+        _assert_replay_matches(
             _run(baseline, hidden_states, grads), _run(recomputed, hidden_states, grads)
         )
     finally:
