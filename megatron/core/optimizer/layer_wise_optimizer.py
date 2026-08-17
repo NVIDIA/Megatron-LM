@@ -773,6 +773,26 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 tp_size = get_pg_size(tp_group)
                 if not domain_params or gtp_size * tp_size <= 1:
                     continue
+                # Reject at wiring time what LayerShardedMuon.step() would reject on
+                # its first call (same condition): a TP-sharded param without the GTP
+                # tag is replicated across the GTP group, and the exchange would
+                # concatenate its copies as dim-0 shards. Failing here surfaces the
+                # misconfiguration at optimizer construction instead of after data
+                # loading and the first forward/backward; the step()-level check
+                # remains as the last line of defense for direct-API users.
+                if gtp_size > 1 and tp_size > 1:
+                    for p in domain_params:
+                        pd = getattr(p, 'partition_dim', None)
+                        if pd not in (None, -1) and not getattr(p, 'is_gtp_weight_remat', False):
+                            raise ValueError(
+                                f"LayerShardedMuon wiring: param of shape {tuple(p.shape)} "
+                                f"is TP-sharded (partition_dim={pd}) but not GTP-sharded "
+                                f"(is_gtp_weight_remat absent/False) while gtp_size="
+                                f"{gtp_size} > 1. The GTP exchange would concatenate "
+                                "replicated copies as shards and silently corrupt the "
+                                "update. Tag the param with is_gtp_weight_remat or run "
+                                "it in a domain without a GTP axis."
+                            )
                 assignment.update(
                     LayerWiseDistributedOptimizer._assign_ns_homes(
                         domain_params, gtp_group, tp_group

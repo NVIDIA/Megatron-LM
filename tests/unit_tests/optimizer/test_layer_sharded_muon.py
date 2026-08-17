@@ -1257,3 +1257,56 @@ def test_syrk_matches_gemm_relative_to_update():
             f"SYRK vs GEMM divergence too large for param {i} on rank {r}: "
             f"|diff|/|update| = {rel:.3e}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Guard rails: invalid sharding metadata and mis-built fused groups must fail
+# loudly BEFORE any collective, not corrupt silently.
+# ---------------------------------------------------------------------------
+
+
+def test_tp_sharded_without_gtp_marker_is_rejected():
+    """A TP-sharded param lacking is_gtp_weight_remat is replicated across GTP;
+    the stage-1 exchange would concatenate the copies as shards. step() must
+    raise on every rank (before any collective) instead of corrupting."""
+    _require_four_ranks("Requires exactly 4 ranks (TP=2 x GTP=2)")
+    tp_group, gtp_group = _get_2d_groups()
+    p = torch.nn.Parameter(torch.randn(8, 6))
+    p.partition_dim = 0  # TP-sharded, but NOT tagged is_gtp_weight_remat.
+    opt = LayerShardedMuon([p], lr=0.1, gtp_group=gtp_group, tp_group=tp_group)
+    opt.set_param_ns_homes({id(p): (0, 0)})
+    p.grad = torch.randn_like(p)
+    with pytest.raises(ValueError, match="not GTP-sharded"):
+        opt.step()
+
+
+def test_fused_group_wrong_rank_order_is_rejected(monkeypatch):
+    """The fused exchange requires flat rank g * tp_size + t (TP innermost).
+    A group whose rank order violates that must trip the assert on every rank
+    (before any collective) instead of scattering blocks to wrong coordinates.
+
+    A genuinely mis-ordered world-sized group cannot be constructed here:
+    new_group assigns group ranks in sorted global-rank order, which for the
+    world is exactly the g * T + t convention (tp-innermost enumeration is
+    ascending — the same reason production fused groups satisfy it). So skew
+    the rank query instead; the assert exists to guard future changes to how
+    parallel_state builds these groups."""
+    _require_four_ranks("Requires exactly 4 ranks (TP=2 x GTP=2)")
+    tp_group, gtp_group = _get_2d_groups()
+    world = _world()
+    real_get_rank = dist.get_rank
+
+    def _skewed_get_rank(group=None):
+        rank = real_get_rank(group)
+        # Off-by-one only for the fused (world) group: every rank mismatches
+        # g * T + t simultaneously, so all ranks raise before any collective.
+        return (rank + 1) % 4 if group is world else rank
+
+    monkeypatch.setattr(torch.distributed, "get_rank", _skewed_get_rank)
+    p = _gtp_param(torch.randn(8, 6))
+    p.partition_dim = 0
+    opt = LayerShardedMuon([p], lr=0.1, gtp_group=gtp_group, tp_group=tp_group, fused_group=world)
+    opt.set_param_ns_homes({id(p): (0, 0)})
+    p.grad = torch.randn_like(p)
+    with pytest.raises(AssertionError, match="TP innermost"):
+        opt.step()
