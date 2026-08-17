@@ -19,7 +19,7 @@ from megatron.core.fp8_utils import HAVE_TE
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -1610,3 +1610,62 @@ class TestFsdpHybridModelDoubleBuffer:
             optimizer.step()
 
         torch.cuda.synchronize()
+
+
+class TestMegatronFsdpGradStatsGroup:
+    """Which process group Megatron-FSDP reduces gradient statistics over."""
+
+    NUM_OPTIMIZER_INSTANCES = 2
+
+    @classmethod
+    def _grad_stats_group(cls, outer_dp_sharding_strategy):
+        """Build a Megatron-FSDP optimizer and return its gradient statistics group."""
+        Utils.initialize_model_parallel(
+            num_distributed_optimizer_instances=cls.NUM_OPTIMIZER_INSTANCES
+        )
+        try:
+            fsdp_model = FullyShardedDataParallel(
+                config=TransformerConfig(
+                    num_attention_heads=1, num_layers=1, context_parallel_size=1
+                ),
+                ddp_config=DistributedDataParallelConfig(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    bucket_size=10000,
+                    use_megatron_fsdp=True,
+                    num_distributed_optimizer_instances=cls.NUM_OPTIMIZER_INSTANCES,
+                    outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+                ),
+                module=TestModel(input_dim=13, output_dim=17).cuda(),
+                fsdp_unit_modules=[torch.nn.Linear],
+            )
+            optimizer = get_megatron_optimizer(
+                OptimizerConfig(optimizer="adam", lr=1e-3, use_distributed_optimizer=True),
+                [fsdp_model],
+            )
+            return optimizer.get_grad_stats_parallel_group()
+        finally:
+            Utils.destroy_model_parallel()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    def test_dp_outer_sharding_reduces_over_every_optimizer_instance(self):
+        """
+        Sharding the optimizer state over DP-Outer widens the gradient statistics group.
+
+        Gradient statistics have to be reduced over the process group holding the remainder
+        of the gradient. Optimizer instances hold replicas of it when DP-Outer is unsharded,
+        so a single instance covers the whole gradient, but DP-Outer sharding leaves each
+        instance with a distinct slice and reducing over one instance then under-reports the
+        norm by the square root of the number of instances.
+        """
+        if Utils.world_size % self.NUM_OPTIMIZER_INSTANCES != 0:
+            pytest.skip(f"Requires a world size divisible by {self.NUM_OPTIMIZER_INSTANCES}.")
+
+        assert self._grad_stats_group("optim").size() == Utils.world_size
+        assert (
+            self._grad_stats_group("no_shard").size()
+            == Utils.world_size // self.NUM_OPTIMIZER_INSTANCES
+        )
