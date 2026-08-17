@@ -1359,7 +1359,6 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
     # gradient buffers and small activations, so T < W in this test.
     # 1. ZeRO-1 peak = max(W + T, 4W / R).
     # 2. ZeRO-2 peak = max(W / R + T, 4W / R).
-    # Here 4W / R is the sharded main grad, two Adam states, and foreach temporary.
     # At R = 2, the optimizer term dominates both, so their peaks may be equal;
     # R >= 4 ensures that the ZeRO-1 peak is strictly greater than the ZeRO-2 peak.
     if world_size < 4:
