@@ -180,6 +180,22 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.request_ids == -1)
 
     @pytest.mark.internal
+    def test_kda_inference_fails_early(self):
+        with pytest.raises(NotImplementedError, match="KDA layers"):
+            self._get_dynamic_context(
+                params_dtype=torch.float32,
+                num_layers=1,
+                kv_channels=8,
+                num_attention_heads=2,
+                max_sequence_length=128,
+                buffer_size_gb=0.03,
+                block_size_tokens=64,
+                max_tokens=None,
+                is_hybrid_model=True,
+                layer_type_list=[Symbols.KDA],
+            )
+
+    @pytest.mark.internal
     def test_is_static_batching(self):
 
         dynamic_context = self._get_dynamic_context(

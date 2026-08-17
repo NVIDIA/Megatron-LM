@@ -1,18 +1,19 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 from unittest import mock
 
+import einops
 import pytest
 import torch
 from packaging import version
+from torch.nn import functional as F
 
 import megatron.core.parallel_state as parallel_state
+from megatron.core.datasets.data_schedule_utils import get_cp_slice_for_thd
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.common.embeddings.rope_utils import (
-    get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
-)
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -21,6 +22,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.dot_product_attention_context_parallel import (
+    AttentionFuncionWithContextParallel,
+    to_zz_mask_attn_bias,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import parse_args
@@ -44,10 +49,19 @@ except ImportError:
 
 
 @pytest.mark.parametrize("output_gate", [False, True])
+@pytest.mark.parametrize(
+    ("transformer_impl", "fallback_to_eager_attn"),
+    [("transformer_engine", False), ("transformer_engine", True), ("native", False)],
+)
 class TestParallelAttention:
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self, output_gate):
+    def setup_method(self, output_gate, transformer_impl, fallback_to_eager_attn):
+        if output_gate:
+            if transformer_impl == "native":
+                pytest.skip("Native implementation does not support output gate.")
+            if fallback_to_eager_attn:
+                pytest.skip("No need to test output gate for fallback_to_eager_attn = True.")
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         self.transformer_config = TransformerConfig(
@@ -58,11 +72,17 @@ class TestParallelAttention:
             bf16=True,
             params_dtype=torch.bfloat16,
             attention_output_gate=output_gate,
+            transformer_impl=transformer_impl,
+            fallback_to_eager_attn=fallback_to_eager_attn,
         )
+        if transformer_impl == "transformer_engine":
+            attn_layer_spec = (
+                get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+            )
+        else:
+            attn_layer_spec = get_gpt_layer_local_spec().submodules.self_attention.submodules
         self.parallel_attention = SelfAttention(
-            self.transformer_config,
-            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
-            layer_number=1,
+            self.transformer_config, attn_layer_spec, layer_number=1
         )
 
     def teardown_method(self):
@@ -73,10 +93,19 @@ class TestParallelAttention:
         assert self.parallel_attention.layer_number == 1
 
         num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
+
+        hidden_size = self.transformer_config.hidden_size
+        standard_num_weights = (
+            hidden_size * hidden_size * 4 + hidden_size * 4  # QKVO weight  # QKVO bias
+        )
         if self.transformer_config.attention_output_gate:
-            assert num_weights == 82816
-        else:
-            assert num_weights == 66304
+            standard_num_weights += hidden_size * hidden_size + hidden_size  # Gate weight and bias
+        if self.transformer_config.transformer_impl == "transformer_engine":
+            standard_num_weights += hidden_size * 2  # fused pre layernorm weight and bias
+
+        assert (
+            num_weights == standard_num_weights
+        ), f"{num_weights=} does not match {standard_num_weights=}."
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
@@ -111,6 +140,8 @@ class TestParallelAttention:
     @pytest.mark.parametrize("rotary_interleaved", [True, False])
     @pytest.mark.parametrize("fused_qkv_rope", [True, False])
     def test_fused_rope_gpu_forward(self, rotary_interleaved, fused_qkv_rope):
+        if self.transformer_config.fallback_to_eager_attn:
+            pytest.skip("No need to test fused RoPE for fallback_to_eager_attn = True.")
         self.parallel_attention.config.apply_rope_fusion = True
         if rotary_interleaved and not is_te_min_version("2.3.0"):
             pytest.skip("Only TE >= 2.3.0 supports interleaved fused RoPE.")
@@ -375,6 +406,199 @@ class TestSelfAttention:
     @pytest.fixture(scope='function', autouse=True)
     def setup_method(self, output_gate):
         self.output_gate = output_gate
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def test_clip_qk_disabled_raises_error(self):
+        """Test that clip_qk raises ValueError when qk_clip is not enabled."""
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_clip=False,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+
+        with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
+            attention.clip_qk()
+
+    def test_clip_qk_none_logits_raises_error(self):
+        """Test that clip_qk raises ValueError when current_max_attn_logits is None."""
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+
+        with pytest.raises(ValueError, match="current_max_attn_logits is None"):
+            attention.clip_qk()
+
+    def test_clip_qk_below_threshold_no_update(self):
+        """Test that weights are not updated when max logits are below threshold."""
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+        attention.cuda()
+
+        # Save original weights
+        original_weight = attention.linear_qkv.weight.data.clone()
+
+        # Set current_max_attn_logits below threshold
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [50.0, 60.0, 70.0, 80.0], device='cuda'
+        )
+
+        # Call clip_qk
+        attention.clip_qk()
+
+        # Weights should not be updated
+        assert torch.equal(attention.linear_qkv.weight.data, original_weight)
+        # current_max_attn_logits should be reset
+        assert attention.core_attention.current_max_attn_logits is None
+
+    def test_clip_qk_above_threshold_updates_weights(self):
+        """Test that weights are updated when max logits exceed threshold."""
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+        attention.cuda()
+
+        # Save original weights
+        original_weight = attention.linear_qkv.weight.data.clone()
+
+        # Set current_max_attn_logits above threshold
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [150.0, 160.0, 170.0, 180.0], device='cuda'
+        )
+
+        # Call clip_qk
+        attention.clip_qk()
+
+        # Weights should be updated
+        assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
+        # current_max_attn_logits should be reset
+        assert attention.core_attention.current_max_attn_logits is None
+
+    def test_clip_qk_gqa_configuration(self):
+        """Test clip_qk with GQA (Grouped Query Attention) configuration."""
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=8,
+            num_query_groups=4,  # GQA with 2 heads per group
+            use_cpu_initialization=True,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+        attention.cuda()
+
+        # Save original weights
+        original_weight = attention.linear_qkv.weight.data.clone()
+
+        # Set current_max_attn_logits for all heads (8 heads)
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [150.0, 160.0, 170.0, 180.0, 190.0, 200.0, 210.0, 220.0], device='cuda'
+        )
+
+        # Call clip_qk
+        attention.clip_qk()
+
+        # Weights should be updated
+        assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
+        # current_max_attn_logits should be reset
+        assert attention.core_attention.current_max_attn_logits is None
+
+    def test_clip_qk_mixed_logits(self):
+        """Test clip_qk with mixed logits (some above, some below threshold)."""
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+        attention.cuda()
+
+        # Save original weights
+        original_weight = attention.linear_qkv.weight.data.clone()
+
+        # Set mixed current_max_attn_logits (some above, some below threshold)
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [80.0, 150.0, 90.0, 200.0], device='cuda'
+        )
+
+        # Call clip_qk
+        attention.clip_qk()
+
+        # Weights should be updated since at least one head exceeds threshold
+        assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
+        # current_max_attn_logits should be reset
+        assert attention.core_attention.current_max_attn_logits is None
+
+
+@pytest.mark.parametrize("output_gate", [False, True])
+@pytest.mark.parametrize("transformer_impl", ["transformer_engine", "native"])
+class TestSelfAttention:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self, output_gate, transformer_impl):
+        if transformer_impl == "native":
+            if output_gate:
+                pytest.skip("Native implementation does not support output gate.")
+        self.transformer_impl = transformer_impl
+        self.output_gate = output_gate
         Utils.destroy_model_parallel()
 
     def teardown_method(self):
@@ -389,10 +613,17 @@ class TestSelfAttention:
             attention_output_gate=self.output_gate,
             tensor_model_parallel_size=tensor_model_parallel_size,
             use_cpu_initialization=False,
+            transformer_impl=self.transformer_impl,
         )
+        if self.transformer_impl == "transformer_engine":
+            attn_layer_spec = (
+                get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+            )
+        else:
+            attn_layer_spec = get_gpt_layer_local_spec().submodules.self_attention.submodules
         self.self_attention = SelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            attn_layer_spec,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
             pg_collection=pg_collection,
@@ -473,6 +704,8 @@ def _test_parallel_attention_correctness(
     tmp_path_dist_ckpt,
     atol,
     rtol,
+    cosine_similarity_threshold=None,
+    relative_l2_threshold=0.1,
     tp=1,
     sp=False,
     cp=1,
@@ -480,6 +713,10 @@ def _test_parallel_attention_correctness(
     sequence_length=256,
     micro_batch_size=4,
     sequence_packing=False,
+    cp_partition_mode="zigzag",
+    compare_param_grads=False,
+    input_grad_atol=None,
+    input_grad_rtol=None,
 ):
     # Model initialization function
     def initialize_gpt_model(
@@ -515,7 +752,6 @@ def _test_parallel_attention_correctness(
     with TempNamedDir(tmp_path_dist_ckpt / 'test_parallel_attn', sync=True) as ckpt_dir:
         # Set argument
         mock_args = parse_args(ignore_unknown_args=True)
-        mock_args.save_tokenizer_assets = False
         set_args(mock_args)
 
         # Initialize baseline model
@@ -532,8 +768,24 @@ def _test_parallel_attention_correctness(
         mock_args.no_load_rng = True
         save_checkpoint(10, gpt_model, None, None, 0)
 
+        def get_param_grad(param):
+            grad = param.grad
+            if grad is None:
+                grad = getattr(param, "main_grad", None)
+            if grad is None:
+                return torch.zeros_like(param, dtype=torch.float32)
+            return grad
+
+        def zero_param_grads(module):
+            for param in module.parameters():
+                param.grad = None
+                main_grad = getattr(param, "main_grad", None)
+                if main_grad is not None:
+                    main_grad.zero_()
+
         # Calculate baseline output
         attention = gpt_model[0].decoder.layers[0].self_attention
+        zero_param_grads(attention)
         output_hidden_states_baseline, bias_hidden_states_baseline = attention(
             input_hidden_states, attention_mask=None
         )
@@ -541,6 +793,13 @@ def _test_parallel_attention_correctness(
 
         # Save baseline output
         input_grad_baseline = input_hidden_states.grad.detach()
+        param_grads_baseline = None
+        if compare_param_grads:
+            param_grads_baseline = {
+                name: get_param_grad(param).detach().float().clone()
+                for name, param in attention.named_parameters()
+                if param.requires_grad
+            }
         output_hidden_states_baseline = output_hidden_states_baseline.detach()
         bias_hidden_states_baseline = bias_hidden_states_baseline
         if bias_hidden_states_baseline is not None:
@@ -559,9 +818,11 @@ def _test_parallel_attention_correctness(
         transformer_config.context_parallel_size = cp
         transformer_config.tensor_model_parallel_size = tp
         transformer_config.sequence_parallel = sp
+        transformer_config.cp_partition_mode = cp_partition_mode
         init_basic_mock_args(mock_args, tp, 1, bf16=True)
         mock_args.context_parallel_size = cp
         mock_args.sequence_parallel = sp
+        mock_args.cp_partition_mode = cp_partition_mode
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
             with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
@@ -572,10 +833,31 @@ def _test_parallel_attention_correctness(
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
         def get_tensor_on_this_rank(tensor):
-            if cp > 1:
-                tensor = get_tensor_on_this_cp_rank(tensor, 0, cp_group)
             if sequence_packing:
                 tensor = tensor.transpose(0, 1).contiguous().view(-1, 1, *tensor.shape[2:])
+                if cp > 1:
+                    cu_seqlens_tensor = torch.tensor(
+                        [i * sequence_length for i in range(micro_batch_size + 1)],
+                        device=tensor.device,
+                    )
+                    batch = {"hidden_states": tensor, "cu_seqlens_padded": cu_seqlens_tensor}
+                    get_cp_slice_for_thd(
+                        batch,
+                        cp_group,
+                        keys=("hidden_states",),
+                        cp_partition_mode=cp_partition_mode,
+                    )
+                    tensor = batch["hidden_states"]
+            elif cp > 1:
+                cp_rank = torch.distributed.get_rank(cp_group)
+                if cp_partition_mode == "zigzag":
+                    cp_idx = torch.tensor([cp_rank, 2 * cp - cp_rank - 1], device=tensor.device)
+                elif cp_partition_mode == "contiguous":
+                    cp_idx = torch.tensor([2 * cp_rank, 2 * cp_rank + 1], device=tensor.device)
+                else:
+                    raise ValueError(f"Unsupported test CP partition mode {cp_partition_mode!r}.")
+                tensor = tensor.view(2 * cp, -1, *tensor.shape[1:])
+                tensor = tensor.index_select(0, cp_idx).view(-1, *tensor.shape[2:])
             if tp > 1 and sp:
                 sp_seg = tensor.shape[0] // tp
                 tensor = tensor[tp_rank * sp_seg : (tp_rank + 1) * sp_seg]
@@ -585,15 +867,27 @@ def _test_parallel_attention_correctness(
         if sequence_packing:
             cu_seqlens = [i * sequence_length for i in range(micro_batch_size + 1)]
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+            packed_seq_params.cp_partition_mode = cp_partition_mode
         else:
             packed_seq_params = None
         input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
         input_hidden_states = input_hidden_states.detach().requires_grad_(True)
         parallel_attention = gpt_model[0].decoder.layers[0].self_attention
+        zero_param_grads(parallel_attention)
         output_hidden_states_parallel, bias_hidden_states_parallel = parallel_attention(
             input_hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
         )
         output_hidden_states_parallel.sum().backward()
+        param_grads_parallel = None
+        if compare_param_grads:
+            assert tp == 1, "Parameter gradient parity only supports unsharded parameters."
+            param_grads_parallel = {}
+            for name, param in parallel_attention.named_parameters():
+                if param.requires_grad:
+                    grad = get_param_grad(param)
+                    if cp > 1:
+                        torch.distributed.all_reduce(grad, group=cp_group)
+                    param_grads_parallel[name] = grad.detach().float().clone()
         input_grad_parallel = input_hidden_states.grad.detach()
 
         # Check if the output is close
@@ -630,32 +924,65 @@ def _test_parallel_attention_correctness(
                 ~torch.isinf(bias_hidden_states_parallel)
             ), "bias_hidden_states_parallel contains inf"
 
-        torch.testing.assert_close(
-            output_hidden_states_baseline,
-            output_hidden_states_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in output_hidden_states: {msg}",
+        def assert_close_or_cosine_similarity(
+            baseline, parallel, tensor_name, tensor_atol=atol, tensor_rtol=rtol
+        ):
+            try:
+                torch.testing.assert_close(
+                    baseline,
+                    parallel,
+                    atol=tensor_atol,
+                    rtol=tensor_rtol,
+                    msg=lambda msg: f"Mismatch in {tensor_name}: {msg}",
+                )
+                return
+            except AssertionError as close_error:
+                if cosine_similarity_threshold is None:
+                    raise close_error
+                baseline_flat = baseline.flatten().float()
+                parallel_flat = parallel.flatten().float()
+                cosine_sim = torch.nn.functional.cosine_similarity(
+                    baseline_flat.unsqueeze(0), parallel_flat.unsqueeze(0)
+                ).item()
+                diff_norm = torch.linalg.vector_norm((parallel_flat - baseline_flat).float())
+                baseline_norm = torch.linalg.vector_norm(baseline_flat.float()).clamp_min(1e-12)
+                relative_l2 = (diff_norm / baseline_norm).item()
+                assert cosine_sim >= cosine_similarity_threshold, (
+                    f"Mismatch in {tensor_name}: cosine similarity "
+                    f"{cosine_sim} < {cosine_similarity_threshold}, "
+                    f"while assert_close failed: {close_error}"
+                )
+                assert relative_l2 <= relative_l2_threshold, (
+                    f"Mismatch in {tensor_name}: relative L2 "
+                    f"{relative_l2} > {relative_l2_threshold}, "
+                    f"while assert_close failed: {close_error}"
+                )
+
+        assert_close_or_cosine_similarity(
+            output_hidden_states_baseline, output_hidden_states_parallel, "output_hidden_states"
         )
-        torch.testing.assert_close(
+        assert_close_or_cosine_similarity(
             input_grad_baseline,
             input_grad_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in input_grad: {msg}",
+            "input_grad",
+            tensor_atol=atol if input_grad_atol is None else input_grad_atol,
+            tensor_rtol=rtol if input_grad_rtol is None else input_grad_rtol,
         )
         if has_bias:
-            torch.testing.assert_close(
-                bias_hidden_states_baseline,
-                bias_hidden_states_parallel,
-                atol=atol,
-                rtol=rtol,
-                msg=lambda msg: f"Mismatch in bias_hidden_states: {msg}",
+            assert_close_or_cosine_similarity(
+                bias_hidden_states_baseline, bias_hidden_states_parallel, "bias_hidden_states"
             )
+        if compare_param_grads:
+            assert param_grads_baseline.keys() == param_grads_parallel.keys()
+            for name, grad_baseline in param_grads_baseline.items():
+                assert_close_or_cosine_similarity(
+                    grad_baseline, param_grads_parallel[name], f"param_grad[{name}]"
+                )
 
         Utils.destroy_model_parallel()
 
 
+# TODO(yuzhongw): Add test case for fallback_to_eager_attn
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize("apply_rope_fusion", [False, True])
 @pytest.mark.parametrize(

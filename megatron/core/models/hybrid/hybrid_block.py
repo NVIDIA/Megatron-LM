@@ -55,6 +55,7 @@ class HybridStackSubmodules:
 
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
+    kda_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     mla_layer: Union[ModuleSpec, type] = IdentityOp
@@ -240,6 +241,15 @@ class HybridStack(MegatronModule):
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif layer_type == LayerSymbols.KDA:
+                    layer = build_module(
+                        submodules.kda_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 else:

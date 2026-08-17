@@ -1,6 +1,6 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Gated Delta Net (GDN) family of layers.
+"""Gated Delta Net (GDN) layer exports.
 
 This package replaces the former ``megatron/core/ssm/gated_delta_net.py`` module
 at the same import path; the names below preserve that module's public surface.
@@ -9,6 +9,9 @@ at the same import path; the names below preserve that module's public surface.
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
     GatedDeltaNetSubmodules,
+    _build_head_perm_for_split_sections,
+    _build_thd_cp_a2a_perm,
+    _split_tensor_factory,
     causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
@@ -17,26 +20,25 @@ from megatron.core.ssm.gated_delta_net.common import (
     tensor_a2a_hp2cp,
 )
 from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet, torch_chunk_gated_delta_rule
-from megatron.core.ssm.gated_delta_net.gdn2 import (
-    HAVE_FLA_GDN2,
-    GatedDeltaNet2,
-    chunk_gdn2,
-    torch_chunk_gdn2,
+from megatron.core.ssm.gated_delta_net.kda import (
+    HAVE_FLA_KDA,
+    KimiDeltaAttention,
+    KimiDeltaAttentionSubmodules,
 )
 
 __all__ = [
     "HAVE_FLA",
-    "HAVE_FLA_GDN2",
+    "HAVE_FLA_KDA",
     "GatedDeltaNet",
-    "GatedDeltaNet2",
     "GatedDeltaNetSubmodules",
+    "KimiDeltaAttention",
+    "KimiDeltaAttentionSubmodules",
+    "_split_tensor_factory",
     "causal_conv1d",
     "chunk_gated_delta_rule",
-    "chunk_gdn2",
     "get_parameter_local_cp",
     "l2norm",
     "tensor_a2a_cp2hp",
     "tensor_a2a_hp2cp",
     "torch_chunk_gated_delta_rule",
-    "torch_chunk_gdn2",
 ]
