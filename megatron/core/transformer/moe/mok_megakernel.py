@@ -3,8 +3,7 @@
 
 This module intentionally keeps the integration narrow: MCore owns routing,
 parameters, DDP, and the optimizer, while MoK replaces dispatch, routed/shared
-expert computation, and combine. Checkpoint conversion and fused accumulation
-into ``main_grad`` are deliberately out of scope for the first E2E study.
+expert computation, and combine. Checkpoint conversion remains out of scope.
 """
 
 from __future__ import annotations
@@ -66,6 +65,53 @@ def _new_bf16_parameter(
     param = nn.Parameter(data)
     _copy_parameter_attributes(param, reference, allreduce=allreduce)
     return param
+
+
+def _dummy_weight_gradient(param: nn.Parameter) -> torch.Tensor:
+    """Return TE's shared dummy tensor used to trigger MCore DDP hooks."""
+    from transformer_engine.pytorch.module.base import get_dummy_wgrad
+
+    return get_dummy_wgrad(list(param.shape), param.dtype)
+
+
+def _main_grad_buffer(param: nn.Parameter) -> torch.Tensor:
+    """Return and validate the optimizer-visible FP32 gradient buffer."""
+    main_grad = getattr(param, "main_grad", None)
+    if main_grad is None:
+        raise RuntimeError(
+            "MOK gradient accumulation fusion requires DDP to assign param.main_grad"
+        )
+    if main_grad.shape != param.shape:
+        raise RuntimeError(
+            "MOK weight-gradient shape mismatch: "
+            f"main_grad={tuple(main_grad.shape)}, param={tuple(param.shape)}"
+        )
+    if main_grad.dtype != torch.float32 or not main_grad.is_contiguous():
+        raise RuntimeError("MOK direct accumulation requires contiguous FP32 main_grad")
+    if getattr(param, "zero_out_wgrad", False):
+        raise RuntimeError("MOK does not support zero_out_wgrad parameters")
+    if main_grad.device != param.device:
+        raise RuntimeError("MOK main_grad must be on the parameter device")
+    return main_grad
+
+
+def _finish_weight_gradient(param: nn.Parameter) -> torch.Tensor:
+    """Mark an in-kernel accumulation complete and return a DDP hook-only grad."""
+    param.grad_added_to_main_grad = True
+    return _dummy_weight_gradient(param)
+
+
+@torch.no_grad()
+def _accumulate_weight_gradient(param: nn.Parameter, grad: torch.Tensor) -> torch.Tensor:
+    """Accumulate a materialized wgrad; fallback for non-fused MOK precisions."""
+    main_grad = _main_grad_buffer(param)
+    if main_grad.shape != grad.shape:
+        raise RuntimeError(
+            "MOK weight-gradient shape mismatch: "
+            f"main_grad={tuple(main_grad.shape)}, grad={tuple(grad.shape)}"
+        )
+    main_grad.add_(grad)
+    return _finish_weight_gradient(param)
 
 
 class _MoKAutograd(torch.autograd.Function):
@@ -155,6 +201,17 @@ class _MoKAutograd(torch.autograd.Function):
         backward_gate = gate_q
         backward_up = up_q
         backward_down = down_q[2:] if isinstance(down_q, tuple) else down_q
+        direct_wgrad_accumulation = ctx.module.fuse_wgrad_accumulation
+        main_grads = None
+        if direct_wgrad_accumulation:
+            main_grads = (
+                _main_grad_buffer(ctx.module.shared_gate_weight),
+                _main_grad_buffer(ctx.module.routed_gate_weight),
+                _main_grad_buffer(ctx.module.shared_up_weight),
+                _main_grad_buffer(ctx.module.routed_up_weight),
+                _main_grad_buffer(ctx.module.shared_down_weight),
+                _main_grad_buffer(ctx.module.routed_down_weight),
+            )
         (
             d_x,
             d_router_weights,
@@ -179,7 +236,16 @@ class _MoKAutograd(torch.autograd.Function):
             backward_up,
             backward_down,
             swiglu_limit=ctx.module.swiglu_limit,
+            main_grads=main_grads,
         )
+
+        if ctx.module.fuse_wgrad_accumulation:
+            d_routed_gate = _finish_weight_gradient(ctx.module.routed_gate_weight)
+            d_routed_up = _finish_weight_gradient(ctx.module.routed_up_weight)
+            d_routed_down = _finish_weight_gradient(ctx.module.routed_down_weight)
+            d_shared_gate = _finish_weight_gradient(ctx.module.shared_gate_weight)
+            d_shared_up = _finish_weight_gradient(ctx.module.shared_up_weight)
+            d_shared_down = _finish_weight_gradient(ctx.module.shared_down_weight)
 
         ctx.module = None
         ctx.workspace = None
@@ -235,6 +301,7 @@ class MoKMegakernel(nn.Module):
         self.topk = config.moe_router_topk
         self.swiglu_limit = config.activation_func_clamp_value
         self.use_mxfp8_weights = config.mok_use_mxfp8_weights
+        self.fuse_wgrad_accumulation = config.gradient_accumulation_fusion
         self.mok_config = MoKConfig(
             fwd_num_comm_sms=config.mok_fwd_num_comm_sms,
             bwd_num_comm_sms=config.mok_bwd_num_comm_sms,
