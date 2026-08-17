@@ -260,12 +260,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         # list. Empty local DTensor shards are intentionally omitted from TE
         # FusedAdam, so optimizer parameters can expose FSDP groups in a
         # rank-dependent order. Weight refresh launches collectives and must
-        # visit every trainable FSDP group in the same order on every rank.
+        # visit every FSDP group in the same order on every rank. Deliberately
+        # do not filter on requires_grad: traversal must remain rank-invariant
+        # even when a parameter is locally empty or frozen.
         sync_model_weights_from_main_weights(
-            parameter
-            for model_chunk in self.model_chunks
-            for parameter in model_chunk.parameters()
-            if parameter.requires_grad
+            parameter for model_chunk in self.model_chunks for parameter in model_chunk.parameters()
         )
 
     def _copy_model_params_to_main_params(self, state_dict=None) -> None:
