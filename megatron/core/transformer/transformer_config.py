@@ -2301,7 +2301,11 @@ class TransformerConfig(ModelParallelConfig):
                 # the backward chunk, so tensor_pop hits a None chunk for these modules.
                 # Other offload modules (qkv_linear, core_attn, attn_proj, expert_fc1,
                 # moe_act) live inside self_attention/MLP which are NOT wrapped by mHC
-                # checkpoints, so they are safe to use with mHC recompute.
+                # checkpoints, so they are safe to use with mHC recompute -- except
+                # under the attention-only CUDA Graph split, which narrows the three
+                # attention-scope modules further down in __post_init__ (the split
+                # predicate needs normalized cuda_graph_modules, which are not
+                # available yet here).
                 _MHC_CONFLICTING_OFFLOAD_MODULES = {"attn_norm", "mlp_norm"}
                 conflicting = _MHC_CONFLICTING_OFFLOAD_MODULES & set(self.offload_modules)
                 if conflicting:
@@ -2366,6 +2370,41 @@ class TransformerConfig(ModelParallelConfig):
                 "attention_dropout=0), because other graph scopes cannot represent the "
                 "explicit schedule-owned recompute barrier."
             )
+
+        # is_te_attn_split alone does not check recompute_granularity, so pair it
+        # with use_mhc_recompute to match uses_mhc_recompute_attn_cuda_graph_split
+        # exactly -- rejecting a config whose split is not actually active would be
+        # a false positive.
+        if is_te_attn_split and use_mhc_recompute and self.fine_grained_activation_offloading:
+            # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces the
+            # parent implementation for the split instead of extending it, so it
+            # never plants the two synchronization edges the full-layer capture
+            # plants for captured offload modules: off_interface.backward_record()
+            # on the graph input (graph stream waits on the H2D reload stream) and
+            # off_interface.forward_record() after capture (main stream waits on the
+            # D2H stream). Without them the offload copies race the captured
+            # attention forward/backward and corrupt activations silently, so fail
+            # closed rather than fail late and numerically.
+            #
+            # These are exactly the modules TransformerLayer._set_offload_modules
+            # uses to turn on offload_module_in_cuda_graph under an attn-scope graph,
+            # so this check cannot drift from the mechanism it protects. Supporting
+            # the combination means mirroring both hooks in the split and then
+            # proving the three-way join between mHC recompute, the reload stream and
+            # the graph stream -- the split recomputes at BEFORE_ATTN_BWD, which the
+            # full-layer two-stream ordering never had to account for.
+            attn_scope_offload = {"qkv_linear", "core_attn", "attn_proj"} & set(
+                self.offload_modules or []
+            )
+            if attn_scope_offload:
+                raise ValueError(
+                    f"mHC recompute with attention-only TE CUDA Graphs is incompatible "
+                    f"with offload_modules {sorted(attn_scope_offload)}. The split "
+                    f"capture path omits the offload stream synchronization the "
+                    f"full-layer capture path performs, so the offload copies can race "
+                    f"the captured attention. Remove {sorted(attn_scope_offload)} from "
+                    f"offload_modules, or drop 'attn' from cuda_graph_modules."
+                )
 
         if self.enable_hyper_connections and not use_mhc_recompute:
             warnings.warn(

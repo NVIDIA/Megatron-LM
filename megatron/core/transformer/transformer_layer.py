@@ -1968,8 +1968,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         weight-gradient compute, MoE without EP overlap and an unfused input
         layernorm on exactly that basis, which left the feature reachable by
         almost nothing. Those are left to the guards that already own them --
-        and delayed wgrad in particular is *supported*: the capture-order
-        bookkeeping extends a sample's liveness window across its wgrad entry.
+        attention-scope offloading now has a real mechanism and is rejected by
+        TransformerConfig alongside the other mHC/offload conflicts, and delayed
+        wgrad in particular is *supported*: the capture-order bookkeeping extends
+        a sample's liveness window across its wgrad entry.
 
         What actually protects this path is enforced at runtime and fails loudly:
         ``MHCRecomputeArenaSlot.validate_output`` checks that the producer

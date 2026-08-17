@@ -853,6 +853,53 @@ class TestMHCWithCudaGraph:
         assert layer._uses_mhc_recompute_attn_cuda_graph_split()
         assert layer._is_thd_cuda_graph()
 
+    @pytest.mark.parametrize("offload_module", ["qkv_linear", "core_attn", "attn_proj"])
+    @pytest.mark.parametrize("graph_modules", [["attn"], [CudaGraphModule.attn]])
+    def test_mhc_split_config_rejects_attention_scope_offloading(
+        self, offload_module, graph_modules
+    ):
+        """The split must fail closed when captured attention modules are offloaded.
+
+        The split replaces ``_te_cuda_graph_capture`` instead of extending it, so
+        it never plants the parent's two offload synchronization edges. Both
+        cuda_graph_modules spellings are exercised because the check runs before
+        __post_init__ normalizes the field in bulk; comparing the string form raw
+        would silently disable the guard.
+        """
+        with pytest.raises(ValueError, match="attention-only TE CUDA Graphs is incompatible"):
+            _make_mhc_config(
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=graph_modules,
+                recompute_granularity="selective",
+                recompute_modules=["mhc"],
+                fine_grained_activation_offloading=True,
+                offload_modules=[offload_module],
+            )
+
+    @pytest.mark.parametrize(
+        "extra_config",
+        [
+            # Not the split: offloading captured attention is the parent's job and
+            # the parent does plant the synchronization edges.
+            dict(cuda_graph_impl="none", cuda_graph_modules=[]),
+            # Not the split: mHC recompute is off, so no eager checkpoint feeds the
+            # graph and the parent capture path runs unchanged.
+            dict(recompute_granularity=None, recompute_modules=[]),
+        ],
+    )
+    def test_attention_scope_offloading_allowed_outside_the_split(self, extra_config):
+        """The guard must not leak into configurations the split does not own."""
+        base = dict(
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            recompute_granularity="selective",
+            recompute_modules=["mhc"],
+            fine_grained_activation_offloading=True,
+            offload_modules=["core_attn"],
+        )
+        base.update(extra_config)
+        _make_mhc_config(**base)
+
     def test_te_graph_static_hidden_input_tracks_runtime_microbatch_slot(self):
         """Static-input handles use the same modulo slot selection as TE graphs."""
         layer, _ = self._create_mhc_layer()
