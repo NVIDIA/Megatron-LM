@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
@@ -73,6 +74,7 @@ except ImportError:
     HAVE_EINOPS = False
 
 try:
+    from fla.modules.l2norm import l2_norm
     from fla.ops.gated_delta_product import chunk_gated_delta_product
     from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
@@ -256,6 +258,15 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         self.layer_number = layer_number
         self.pp_layer_offset = pp_layer_offset
         self.cached_batch_size = None
+
+        self.recompute_in_proj = (
+            self.config.recompute_granularity == "selective"
+            and "gdp_in_proj" in self.config.recompute_modules
+        )
+        self.recompute_qkv = (
+            self.config.recompute_granularity == "selective"
+            and "gdp_qkv" in self.config.recompute_modules
+        )
 
         tp_size = self.pg_collection.tp.size()
 
@@ -475,74 +486,47 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             assert batch_size == 1, "Packed sequences require batch=1 (THD/varlen format)."
             cu_seqlens_packed = get_cu_seqlens(packed_seq_params)
 
-        zVKQba, _ = self.in_proj(hidden_states)
+        is_training = inference_context is None
+        in_proj_checkpoint = None
+        if is_training and self.recompute_in_proj:
+            # Capture packed_seq_params rather than passing the non-tensor dataclass
+            # through CheckpointWithoutOutput. Its index tensors are metadata; only
+            # hidden_states must be retained as a differentiable checkpoint input.
+            def in_proj_preprocess(x):
+                return self._in_proj_preprocess(x, packed_seq_params)
 
-        zVKQba = self.cp.pre_conv_ssm(zVKQba, packed_seq_params=packed_seq_params)
+            quantization = self.config.fp8 or self.config.fp4
+            in_proj_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
+            z, VKQ, ba = in_proj_checkpoint.checkpoint(in_proj_preprocess, hidden_states)
+        else:
+            z, VKQ, ba = self._in_proj_preprocess(hidden_states, packed_seq_params)
 
         # Build seq_idx *after* in_proj's SP all-gather and pre_conv_ssm's CP
-        # all-to-all. ``zVKQba.shape[0]`` is now the true pack_length, so the
-        # helper produces a seq_idx matching the conv1d's input length
-        # regardless of SP/CP/TP upstream-slicing. Mirrors mamba_mixer.py
-        # which calls _create_packed_seq_idx after the same gather points.
+        # all-to-all. ``VKQ.shape[1]`` is now the true pack length, so the
+        # helper produces an index matching the conv1d input regardless of
+        # SP/CP/TP upstream slicing.
         seq_idx_packed = None
         if packed_seq_params is not None:
-            seq_idx_packed = build_packed_seq_idx(packed_seq_params, zVKQba.shape[0])
-
-        zVKQba = rearrange(zVKQba, "l b d -> b l d").contiguous()
-
-        z, VKQ, ba = torch.split(
-            zVKQba,
-            [
-                self.cp.d_inner_local_tpcp,
-                self.cp.d_inner_local_tpcp * self.num_householder
-                + (self.num_householder + 1) * self.cp.ngroups_local_tpcp * self.d_state,
-                self.cp.nheads_local_tpcp * (self.num_householder + 1),
-            ],
-            dim=-1,
-        )
-
-        # ``causal_conv1d_fn`` expects a ``[B, D, L]`` tensor. Its unpacked kernel
-        # supports both channels-first and channels-last memory layouts.
-        if seq_idx_packed is None:
-            if self.config.gdp_cutedsl_kernel:
-                # Keep the channel-last backing storage, stride(1) == 1. The conv
-                # output then becomes dense [B, L, D] after the transpose below,
-                # avoiding a full VKQ copy and downstream layout materializations.
-                VKQ = rearrange(VKQ, "b l d -> b d l")
-            else:
-                # Preserve the existing FLA path: channels-first, stride(2) == 1.
-                VKQ = rearrange(VKQ, "b l d -> b d l").contiguous()
-        else:
-            # ``causal_conv1d_fn(seq_idx=...)`` requires channels-last memory but [B, D, L]
-            # logical shape. This keeps the channels contiguous in memory.
-            VKQ = VKQ.contiguous()
-            VKQ = rearrange(VKQ, "b l d -> b d l")
+            seq_idx_packed = build_packed_seq_idx(packed_seq_params, VKQ.shape[1])
 
         if conv_state is not None:
             # Static-batching prefill: seed the conv state from the prompt's tail.
-            # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-            # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-            conv_state.copy_(F.pad(VKQ, (self.d_conv - VKQ.shape[-1], 0)))  # Update state (B D W)
-        # causal_conv1d uses seq_idx_packed to reset the convolution boundaries
-        VKQ = causal_conv1d_fn(
-            x=VKQ,
-            weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-            bias=self.cp.get_conv1d_bias(),
-            activation=self.activation,
-            seq_idx=seq_idx_packed,
-        )
+            VKQ_conv = rearrange(VKQ, "b l d -> b d l")
+            conv_state.copy_(
+                F.pad(VKQ_conv, (self.d_conv - VKQ_conv.shape[-1], 0))
+            )  # Update state (B D W)
 
-        VKQ = rearrange(VKQ, "b d l ->  b l d").contiguous()
+        qkv_checkpoint = None
+        if is_training and self.recompute_qkv:
+            # seq_idx_packed is immutable, small metadata. Capture it so the only
+            # differentiable checkpoint input is the full-width VKQ activation.
+            def prepare_qkv(x):
+                return self._prepare_qkv(x, seq_idx_packed)
 
-        value, key, query = torch.split(
-            VKQ,
-            [
-                self.cp.d_inner_local_tpcp * self.num_householder,
-                self.cp.ngroups_local_tpcp * self.d_state * self.num_householder,
-                self.cp.ngroups_local_tpcp * self.d_state,
-            ],
-            dim=-1,
-        )
+            qkv_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            query, key, value = qkv_checkpoint.checkpoint(prepare_qkv, VKQ)
+        else:
+            query, key, value = self._prepare_qkv(VKQ, seq_idx_packed)
 
         b, a = torch.split(
             ba,
@@ -551,31 +535,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         )
 
         z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
-        if self.config.gdp_cutedsl_kernel:
-            # CuTeDSL consumes one row per token and keeps the Householder copies in
-            # the feature dimension. Avoid materializing the FLA-only b x (l*m)
-            # layouts and their contiguous copies.
-            value = rearrange(
-                value, "b l (m h p) -> (b l) (m h p)", m=self.num_householder, p=self.headdim
-            )
-            key = rearrange(
-                key,
-                "b l (m g n) -> b l m g n",
-                m=self.num_householder,
-                n=self.d_state,
-            )
-            query = rearrange(query, "b l (g n) -> b l g n", n=self.d_state)
-        else:
-            value = rearrange(
-                value, "b l (m h p) -> b (l m) h p", m=self.num_householder, p=self.headdim
-            ).contiguous()
-            key = rearrange(
-                key, "b l (m g n) -> b (l m) g n", m=self.num_householder, n=self.d_state
-            ).contiguous()
-            query = rearrange(query, "b l (g n) -> b l g n", n=self.d_state).contiguous()
-
-            # Preserve the existing FLA layout and stride contract exactly.
-            b, a = b.contiguous(), a.contiguous()
+        b, a = b.contiguous(), a.contiguous()
 
         beta = b.sigmoid()
 
@@ -592,30 +552,16 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 beta, "b l (m h) -> b (l m) h", m=self.num_householder
             ).contiguous()
 
-        if self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp > 1:
-            query = query.repeat_interleave(
-                self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp, dim=-2
-            )
-            key = key.repeat_interleave(
-                self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp, dim=-2
-            )
-
-        if self.config.gdp_cutedsl_kernel:
-            # GQA expansion is complete; collapse directly to the flat feature layout
-            # expected by gdp_attn without any explicit contiguous call.
-            key = rearrange(key, "b l m h n -> (b l) (m h n)")
-            query = rearrange(query, "b l h n -> (b l) (h n)")
-
         kernel_cu_seqlens = cu_seqlens_packed
         if self.config.gdp_cutedsl_kernel:
             # Packed input is rejected above. These offsets describe each row of
             # the rectangular batch as an independent fixed-length sequence.
-            kernel_batch_size, kernel_seq_len = zVKQba.shape[:2]
+            kernel_batch_size, kernel_seq_len = VKQ.shape[:2]
             kernel_cu_seqlens = torch.arange(
                 0,
                 (kernel_batch_size + 1) * kernel_seq_len,
                 kernel_seq_len,
-                device=zVKQba.device,
+                device=VKQ.device,
                 dtype=torch.int32,
             )
 
@@ -628,10 +574,13 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             num_householder=self.num_householder,
             initial_state=None,
             output_final_state=(ssm_state is not None),
-            use_qk_l2norm_in_kernel=True,
+            use_qk_l2norm_in_kernel=self.config.gdp_cutedsl_kernel,
             cu_seqlens=kernel_cu_seqlens,
             **self.gdp_kernel_extra_kwargs,
         )
+
+        if qkv_checkpoint is not None:
+            qkv_checkpoint.discard_output_and_register_recompute(core_attn_out)
 
         if self.config.gdp_cutedsl_kernel:
             # Restore gdp_attn's [(b*l), (h*p)] output to the common layout
@@ -639,8 +588,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             core_attn_out = rearrange(
                 core_attn_out,
                 "(b l) (h p) -> b l h p",
-                b=zVKQba.shape[0],
-                l=zVKQba.shape[1],
+                b=VKQ.shape[0],
+                l=VKQ.shape[1],
                 p=self.headdim,
             )
 
@@ -654,9 +603,93 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             z = self.cp.post_conv_ssm(z, packed_seq_params=packed_seq_params)
             y = self.norm(y, z)
 
+        if in_proj_checkpoint is not None:
+            # out_proj's backward produces y's gradient before the normalization
+            # and GDP-kernel backwards consume z/VKQ, so this is the earliest safe
+            # point to restore all three discarded projection outputs.
+            in_proj_checkpoint.discard_output_and_register_recompute(y)
+
         out, out_bias = self.out_proj(y)
 
         return out, out_bias
+
+    def _in_proj_preprocess(self, hidden_states, packed_seq_params=None):
+        """Project, redistribute over CP, switch to batch-first layout, and split outputs."""
+        zVKQba, _ = self.in_proj(hidden_states)
+        zVKQba = self.cp.pre_conv_ssm(zVKQba, packed_seq_params=packed_seq_params)
+        zVKQba = rearrange(zVKQba, "l b d -> b l d").contiguous()
+        return torch.split(
+            zVKQba,
+            [
+                self.cp.d_inner_local_tpcp,
+                self.cp.d_inner_local_tpcp * self.num_householder
+                + (self.num_householder + 1) * self.cp.ngroups_local_tpcp * self.d_state,
+                self.cp.nheads_local_tpcp * (self.num_householder + 1),
+            ],
+            dim=-1,
+        )
+
+    def _prepare_qkv(self, x, seq_idx_packed=None):
+        """Run the causal convolution and build the selected GDP kernel's Q/K/V layouts."""
+        # The unpacked CuTeDSL kernel accepts the channel-last backing layout;
+        # FLA prefers channels-first. Packed causal-conv requires channel-last.
+        if seq_idx_packed is None and not self.config.gdp_cutedsl_kernel:
+            x = rearrange(x, "b l d -> b d l").contiguous()
+        else:
+            x = x.contiguous() if seq_idx_packed is not None else x
+            x = rearrange(x, "b l d -> b d l")
+
+        x = causal_conv1d_fn(
+            x=x,
+            weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+            bias=self.cp.get_conv1d_bias(),
+            activation=self.activation,
+            seq_idx=seq_idx_packed,
+        )
+        x = rearrange(x, "b d l -> b l d").contiguous()
+
+        value, key, query = torch.split(
+            x,
+            [
+                self.cp.d_inner_local_tpcp * self.num_householder,
+                self.cp.ngroups_local_tpcp * self.d_state * self.num_householder,
+                self.cp.ngroups_local_tpcp * self.d_state,
+            ],
+            dim=-1,
+        )
+
+        if self.config.gdp_cutedsl_kernel:
+            value = rearrange(
+                value, "b l (m h p) -> (b l) (m h p)", m=self.num_householder, p=self.headdim
+            )
+            key = rearrange(
+                key, "b l (m g n) -> b l m g n", m=self.num_householder, n=self.d_state
+            )
+            query = rearrange(query, "b l (g n) -> b l g n", n=self.d_state)
+        else:
+            value = rearrange(
+                value, "b l (m h p) -> b (l m) h p", m=self.num_householder, p=self.headdim
+            ).contiguous()
+            key = rearrange(
+                key, "b l (m g n) -> b (l m) g n", m=self.num_householder, n=self.d_state
+            ).contiguous()
+            query = rearrange(query, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+            query = l2_norm(query)
+            key = l2_norm(key)
+
+        if self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp > 1:
+            query = query.repeat_interleave(
+                self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp, dim=-2
+            )
+            key = key.repeat_interleave(
+                self.cp.nheads_local_tpcp // self.cp.ngroups_local_tpcp, dim=-2
+            )
+
+        if self.config.gdp_cutedsl_kernel:
+            key = rearrange(key, "b l m h n -> (b l) (m h n)")
+            query = rearrange(query, "b l h n -> (b l) (h n)")
+
+        return query, key, value
 
     # ==================================================================
     # Static / eager inference

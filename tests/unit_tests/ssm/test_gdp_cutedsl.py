@@ -93,6 +93,8 @@ def _make_dispatch_mixer(*, cutedsl: bool, projected: torch.Tensor):
     mixer.headdim = headdim
     mixer.rmsnorm = False
     mixer.activation = "silu"
+    mixer.recompute_in_proj = False
+    mixer.recompute_qkv = False
     mixer.in_proj = _IdentityProjection(projected.transpose(0, 1))
     mixer.out_proj = _IdentityOutputProjection()
     mixer.conv1d = SimpleNamespace(weight=torch.empty(conv_dim, 1, 1), bias=None)
@@ -127,6 +129,7 @@ def test_chunk_kernel_dispatch_layouts(monkeypatch, cutedsl):
         return kwargs["x"]
 
     monkeypatch.setattr(gdp_module, "causal_conv1d_fn", fake_causal_conv1d)
+    monkeypatch.setattr(gdp_module, "l2_norm", lambda tensor: tensor)
 
     captured = {}
 
@@ -148,7 +151,7 @@ def test_chunk_kernel_dispatch_layouts(monkeypatch, cutedsl):
 
     assert output.shape == (seq_len, batch_size, d_inner)
     assert output_bias is None
-    assert captured["use_qk_l2norm_in_kernel"] is True
+    assert captured["use_qk_l2norm_in_kernel"] is cutedsl
     assert captured["num_householder"] == num_householder
 
     if cutedsl:
@@ -237,7 +240,12 @@ def test_cutedsl_rejects_static_decode():
         mixer(torch.empty(1, 1, 1), inference_context=context)
 
 
-def _make_real_config(*, cutedsl: bool, chunk_states_to_recompute: int = 2) -> TransformerConfig:
+def _make_real_config(
+    *,
+    cutedsl: bool,
+    chunk_states_to_recompute: int = 2,
+    recompute_modules: list[str] | None = None,
+) -> TransformerConfig:
     # Match the production GDP head/state specialization while keeping the unit-test model small.
     return TransformerConfig(
         num_layers=1,
@@ -256,17 +264,26 @@ def _make_real_config(*, cutedsl: bool, chunk_states_to_recompute: int = 2) -> T
         context_parallel_size=1,
         gdp_cutedsl_kernel=cutedsl,
         gdp_num_chunk_states_to_recompute=chunk_states_to_recompute,
+        recompute_granularity="selective" if recompute_modules else None,
+        recompute_modules=recompute_modules,
     )
 
 
-def _build_real_mixer(*, cutedsl: bool, chunk_states_to_recompute: int = 2):
+def _build_real_mixer(
+    *,
+    cutedsl: bool,
+    chunk_states_to_recompute: int = 2,
+    recompute_modules: list[str] | None = None,
+):
     from megatron.core.extensions.transformer_engine import (
         TELayerNormColumnParallelLinear,
         TERowParallelLinear,
     )
 
     config = _make_real_config(
-        cutedsl=cutedsl, chunk_states_to_recompute=chunk_states_to_recompute
+        cutedsl=cutedsl,
+        chunk_states_to_recompute=chunk_states_to_recompute,
+        recompute_modules=recompute_modules,
     )
     submodules = GatedDeltaProductMixerSubmodules(
         in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
@@ -311,6 +328,12 @@ class TestGDPCuTeDSLParity:
         recompute_two = _build_real_mixer(cutedsl=True, chunk_states_to_recompute=2)
         recompute_two.load_state_dict(no_recompute.state_dict())
         return no_recompute, recompute_two
+
+    def _build_selective_recompute_pair(self, module: str):
+        no_recompute = _build_real_mixer(cutedsl=False)
+        recompute = _build_real_mixer(cutedsl=False, recompute_modules=[module])
+        recompute.load_state_dict(no_recompute.state_dict())
+        return no_recompute, recompute
 
     def test_unpacked_training_forward_backward_parity(self):
         fla_mixer, cutedsl_mixer = self._build_pair()
@@ -369,6 +392,37 @@ class TestGDPCuTeDSLParity:
         for name in ("in_proj.weight", "conv1d.weight", "dt_bias", "A_log", "out_proj.weight"):
             torch.testing.assert_close(
                 recompute_two_parameters[name].grad,
+                no_recompute_parameters[name].grad,
+                rtol=1e-2,
+                atol=1e-2,
+            )
+
+    @pytest.mark.parametrize("module", ["gdp_in_proj", "gdp_qkv"])
+    def test_selective_recompute_forward_backward_parity(self, module):
+        no_recompute, recompute = self._build_selective_recompute_pair(module)
+        no_recompute.train()
+        recompute.train()
+
+        hidden = torch.randn(32, 2, 512, device="cuda", dtype=torch.bfloat16)
+        hidden_no_recompute = hidden.detach().clone().requires_grad_()
+        hidden_recompute = hidden.detach().clone().requires_grad_()
+
+        output_no_recompute, _ = no_recompute(hidden_no_recompute)
+        output_recompute, _ = recompute(hidden_recompute)
+        torch.testing.assert_close(output_recompute, output_no_recompute, rtol=1e-2, atol=1e-2)
+
+        output_grad = torch.randn_like(output_no_recompute)
+        output_no_recompute.backward(output_grad)
+        output_recompute.backward(output_grad)
+        torch.testing.assert_close(
+            hidden_recompute.grad, hidden_no_recompute.grad, rtol=1e-2, atol=1e-2
+        )
+
+        no_recompute_parameters = dict(no_recompute.named_parameters())
+        recompute_parameters = dict(recompute.named_parameters())
+        for name in ("in_proj.weight", "conv1d.weight", "dt_bias", "A_log", "out_proj.weight"):
+            torch.testing.assert_close(
+                recompute_parameters[name].grad,
                 no_recompute_parameters[name].grad,
                 rtol=1e-2,
                 atol=1e-2,
