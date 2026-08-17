@@ -30,6 +30,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from packaging.version import Version
 
 from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS, TensorParallelMuon
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -485,9 +486,16 @@ class TestTPGTPMuonQKVPadding:
     @pytest.mark.parametrize(
         "split_per_head,split_shapes", [(True, [2, 2, 2, 2, 2]), (False, [6, 2, 2])]
     )
-    def test_padding_is_excluded_from_qkv_orthogonalization(self, split_per_head, split_shapes):
+    def test_padding_is_excluded_from_qkv_orthogonalization(
+        self, split_per_head, split_shapes, monkeypatch
+    ):
         if not HAVE_EMERGING_OPTIMIZERS:
             pytest.skip("emerging_optimizers package is not installed")
+        if split_per_head:
+            monkeypatch.setattr(
+                "megatron.core.optimizer.emerging_optimizers.EMERGING_OPTIMIZERS_VERSION",
+                Version("0.3.0"),
+            )
         tp_size = 2
         gtp_remat_size = 2
         world_size = tp_size * gtp_remat_size
