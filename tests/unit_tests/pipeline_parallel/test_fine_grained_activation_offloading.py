@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
+import logging
 import os
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
@@ -8,13 +9,18 @@ from typing import Dict, List, Optional, Tuple
 import pytest
 import torch
 
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import OffloadTensorPool
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    OffloadTensorGroup,
+    OffloadTensorPool,
+    PipelineOffloadManager,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
@@ -79,7 +85,6 @@ def test_chunk_offload_handler_respects_tensor_opt_out_flags():
 def _make_chunk_handler_for_offload_reload():
     handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
     handler.cpu_tensor_pool = OffloadTensorPool(device="cpu", pin_memory=True)
-    handler._cpu_backup_refcount = {}
     return handler
 
 
@@ -91,7 +96,7 @@ def test_chunk_offload_handler_offloads_base_storage_for_covering_views():
     view = base[:, :80]  # non-contiguous last-dim slice covering >50% of the storage
     assert not view.is_contiguous()
 
-    state = handler.offload(view, base_backup_cache={})
+    state = handler.offload(view)
     _, cpu_backup, _, view_meta = state
     # The full flat storage is offloaded, not a gathered copy of the view.
     assert cpu_backup.shape == (base.numel(),)
@@ -109,7 +114,7 @@ def test_chunk_offload_handler_offloads_base_storage_for_covering_views():
     # checkpoint's saved input), which has no ._base; the storage-based
     # resolution must still take the base path.
     detached = base[:, :80].detach()
-    state_d = handler.offload(detached, base_backup_cache={})
+    state_d = handler.offload(detached)
     assert state_d[3] is not None
     reloaded_d = handler.reload(state_d)
     torch.cuda.synchronize()
@@ -124,7 +129,7 @@ def test_chunk_offload_handler_gathers_low_coverage_views():
     base = torch.randn(64, 96, device="cuda")
     view = base[:, :8]  # covers well under BASE_OFFLOAD_MIN_COVERAGE of base
 
-    state = handler.offload(view, base_backup_cache={})
+    state = handler.offload(view)
     _, cpu_backup, _, view_meta = state
     # Low-coverage views fall back to the contiguous gather.
     assert view_meta is None
@@ -136,33 +141,145 @@ def test_chunk_offload_handler_gathers_low_coverage_views():
     assert torch.equal(reloaded, view)
 
 
+def _make_warmup_chunk(groups: List["OffloadTensorGroup"]) -> ChunkOffloadHandler:
+    """Build a warmup chunk handler that already owns ``groups``."""
+    handler = ChunkOffloadHandler(
+        min_offloaded_tensor_size=1,
+        cpu_tensor_pool=OffloadTensorPool(device="cpu", pin_memory=True),
+    )
+    handler.offload_groups = list(groups)
+    handler._max_group_size = len(groups)
+    return handler
+
+
+def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
+    """Drive post_warmup_callback over a single hand-built chunk."""
+    manager = PipelineOffloadManager.__new__(PipelineOffloadManager)
+    manager._is_warmup = True
+    manager._cached_chunks_forward = [chunk]
+    manager._cached_chunks_backward = [chunk]
+    manager._offload_margin = 0
+    manager._pp_rank = 0
+    manager._delta_offload_bytes_across_pp_ranks = 0
+    manager._activation_offload_fraction = 1.0
+    manager.post_warmup_callback()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
-def test_chunk_offload_handler_dedups_views_sharing_a_base():
-    handler = _make_chunk_handler_for_offload_reload()
+def test_post_warmup_callback_warns_on_duplicated_storage_offload(caplog, monkeypatch):
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
 
-    base = torch.randn(64, 96, device="cuda")
-    view_a = base[:, :64]
-    view_b = base[:, 32:]
+    base = torch.randn(1024, 512, device="cuda")
+    storage_bytes = base.numel() * base.element_size()
+    # Two strided views that each cover >50% of the shared storage, so both take
+    # the whole-storage offload path and copy the same bytes to CPU twice.
+    views = (base[:, :400], base[:, 112:])
+    assert all(not view.is_contiguous() for view in views)
 
-    base_backup_cache = {}
-    state_a = handler.offload(view_a, base_backup_cache=base_backup_cache)
-    state_b = handler.offload(view_b, base_backup_cache=base_backup_cache)
-    # The shared base storage is copied to CPU exactly once.
-    assert state_a[1] is state_b[1]
-    assert handler._cpu_backup_refcount[id(state_a[1])] == 2
-    assert handler.cpu_tensor_pool._stats["current_in_use"] == 1
+    # post_warmup_callback disables the last group of each name (offload margin),
+    # so build two same-named groups and assert on the surviving one.
+    groups = []
+    for group_idx in range(2):
+        group = OffloadTensorGroup("core_attn")
+        for tensor_idx, view in enumerate(views):
+            group.push_tensor((group_idx, tensor_idx), view)
+        groups.append(group)
 
-    base_reload_cache = {}
-    reloaded_a = handler.reload(state_a, base_reload_cache=base_reload_cache)
-    reloaded_b = handler.reload(state_b, base_reload_cache=base_reload_cache)
+    chunk = _make_warmup_chunk(groups)
+    for group in groups:
+        chunk.bulk_offload_group(group)
     torch.cuda.synchronize()
-    assert torch.equal(reloaded_a, view_a)
-    assert torch.equal(reloaded_b, view_b)
-    # One shared H2D copy backs both reconstructed views.
-    assert reloaded_a.untyped_storage().data_ptr() == reloaded_b.untyped_storage().data_ptr()
-    # The backup is returned to the pool only by the last reload.
-    assert not handler._cpu_backup_refcount
-    assert handler.cpu_tensor_pool._stats["current_in_use"] == 0
+
+    # The second view of each group is flagged; the first is the legitimate copy.
+    for group in groups:
+        assert group.duplicate_storage_tensor_count == 1
+        assert group.duplicate_storage_bytes == storage_bytes
+
+    monkeypatch.setattr(off_module, "print_offload_summary_table", lambda *args, **kwargs: None)
+    with caplog.at_level(logging.WARNING, logger=off_module.__name__):
+        _run_post_warmup_callback(chunk)
+
+    # The margin rule keeps only the first group offloaded, so exactly one
+    # duplicated copy is reported.
+    if safe_get_rank() == 0:
+        assert "copying the same tensor storage to CPU more than once" in caplog.text
+        assert f"core_attn: 1 tensors, {storage_bytes / (1024 * 1024):.2f} MB" in caplog.text
+        assert "Offloading proceeds with the duplicated copies." in caplog.text
+    # The duplicated offloading is diagnosed, not suppressed.
+    assert groups[0].offload
+    assert groups[0].total_tensor_count == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_bulk_offload_group_flags_disjoint_views_taking_the_whole_storage_path():
+    base = torch.randn(1024, 512, device="cuda")
+    storage_bytes = base.numel() * base.element_size()
+    # Disjoint halves, but each covers exactly BASE_OFFLOAD_MIN_COVERAGE of the
+    # storage, so both are offloaded as the full buffer: the views not sharing a
+    # single element does not make the second copy any less redundant.
+    group = OffloadTensorGroup("core_attn")
+    group.push_tensor((1, 0), base[:, :256])
+    group.push_tensor((1, 1), base[:, 256:])
+
+    chunk = _make_warmup_chunk([group])
+    chunk.bulk_offload_group(group)
+    torch.cuda.synchronize()
+
+    assert all(state[3] is not None for state in group._tensors.values())
+    assert group.total_offload_bytes == 2 * storage_bytes
+    assert group.duplicate_storage_tensor_count == 1
+    assert group.duplicate_storage_bytes == storage_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_bulk_offload_group_does_not_flag_views_copying_their_own_bytes(caplog, monkeypatch):
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
+
+    base = torch.randn(1024, 512, device="cuda")
+    storage_bytes = base.numel() * base.element_size()
+    # Disjoint contiguous slices copy their own bytes, together exactly the
+    # storage once.
+    group = OffloadTensorGroup("core_attn")
+    group.push_tensor((1, 0), base[:512])
+    group.push_tensor((1, 1), base[512:])
+    # Low-coverage strided views are gathered, so they too copy only their own
+    # elements even though the gathered spans interleave in the storage.
+    other_group = OffloadTensorGroup("core_attn")
+    other_group.push_tensor((2, 0), base[:, :8])
+    other_group.push_tensor((2, 1), base[:, 8:16])
+
+    chunk = _make_warmup_chunk([group, other_group])
+    chunk.bulk_offload_group(group)
+    chunk.bulk_offload_group(other_group)
+    torch.cuda.synchronize()
+
+    assert group.total_offload_bytes == storage_bytes
+    for offload_group in (group, other_group):
+        assert all(state[3] is None for state in offload_group._tensors.values())
+        assert offload_group.duplicate_storage_tensor_count == 0
+        assert offload_group.duplicate_storage_bytes == 0
+
+    monkeypatch.setattr(off_module, "print_offload_summary_table", lambda *args, **kwargs: None)
+    with caplog.at_level(logging.WARNING, logger=off_module.__name__):
+        _run_post_warmup_callback(chunk)
+    assert "more than once" not in caplog.text
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_bulk_offload_group_flags_the_same_region_copied_twice():
+    base = torch.randn(1024, 512, device="cuda")
+    half_bytes = base[:512].numel() * base.element_size()
+    # The same activation saved by two autograd nodes is copied twice verbatim.
+    group = OffloadTensorGroup("core_attn")
+    group.push_tensor((1, 0), base[:512])
+    group.push_tensor((1, 1), base[:512])
+
+    chunk = _make_warmup_chunk([group])
+    chunk.bulk_offload_group(group)
+    torch.cuda.synchronize()
+
+    assert group.duplicate_storage_tensor_count == 1
+    assert group.duplicate_storage_bytes == half_bytes
 
 
 def _build_gpt_model(
