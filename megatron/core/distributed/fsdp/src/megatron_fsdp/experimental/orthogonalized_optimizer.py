@@ -872,7 +872,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
     # ========================================
 
     def _orthogonalize_with_precision(
-        self, param: torch.Tensor, pre_ns: torch.Tensor, **kwargs: Any
+        self, param: torch.Tensor | None, pre_ns: torch.Tensor, **kwargs: Any
     ) -> torch.Tensor:
         """Run batched orthogonalization on the given orthogonalization inputs and return the
         result.
@@ -881,6 +881,11 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         `self._inner.fp32_matmul_prec`.
         """
         with eo_utils.fp32_matmul_precision(self._inner.fp32_matmul_prec):
+            # `param` (AKA `p`) is typed as `torch.Tensor` in
+            # `emerging_optimizers.OrthogonalizedOptimizer`. However, we explicitly want to error if
+            # the function tries to use it as a tensor, but we pass `None`. So we remove the `None`
+            # type here to remove the type error for that parameter explicitly.
+            param = cast(torch.Tensor, param)
             return self._inner.orthogonalize(param, pre_ns, **kwargs)
 
     def _apply_update(self, param: DTensor, update_shard: torch.Tensor, lr: float) -> None:
@@ -1157,7 +1162,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             full = self._reconstruct_orthogonalization_input(
                 i, plan, gather_plan, recv_buffers, owner_rank=this_rank
             )
-            full_updates[i] = self._orthogonalize_with_precision(full, **group_kwargs)
+            full_updates[i] = self._orthogonalize_with_precision(None, full, **group_kwargs)
 
         # Phase 4: pack + P2P-send update shards from owners (async on owner stream).
         scatter_plan = self._pack_update_shards(full_updates, b_plans, b_owners, device, dtype)
