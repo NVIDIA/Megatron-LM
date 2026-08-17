@@ -30,8 +30,7 @@ class PendingSSMImport:
     """Exact SSM state being transferred into a reserved live request slot."""
 
     handles: dict[str, Any]
-    live_slot: int | None
-    position: int
+    live_slot: int
 
 
 @dataclass(kw_only=True)

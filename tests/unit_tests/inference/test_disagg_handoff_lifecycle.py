@@ -320,7 +320,7 @@ def test_completed_exact_ssm_handoff_enters_decode_without_waiting_queue(handoff
         cached_prefix_block_count=0,
         handle=None,
         future=handoff_loop.create_future(),
-        ssm=PendingSSMImport(handles={}, live_slot=20, position=0),
+        ssm=PendingSSMImport(handles={}, live_slot=20),
         resume_tokens=[55],
     )
 
@@ -336,7 +336,7 @@ def test_completed_exact_ssm_handoff_enters_decode_without_waiting_queue(handoff
     assert pending.local_blocks == []
     assert pending.continuation_blocks == []
     admit.assert_called_once_with(engine.context, request, [10], [11], [55], ssm_state_idx=20)
-    assert pending.ssm.live_slot is None
+    assert pending.ssm is None
 
 
 def test_setup_pins_handoff_outputs_only_on_prefill():
@@ -482,7 +482,7 @@ def test_releasing_pending_hybrid_import_returns_live_slot(handoff_loop):
     pending = engine._pending_kv_imports[0]
     engine._release_pending_kv_import(pending)
 
-    assert pending.ssm.live_slot is None
+    assert pending.ssm is None
     assert engine.context.mamba_metadata.freed == [20]
     assert engine.context.mamba_metadata.mamba_state_free_slot_count == 1
 

@@ -820,7 +820,7 @@ class InferenceStateHandoffMixin:
         ssm_import = None
         if ssm_meta:
             try:
-                ssm_import = self._reserve_ssm_handoff_import(ssm_meta, local_blocks)
+                ssm_import = self._reserve_ssm_handoff_import()
             except Exception:
                 allocator.release_memory_blocks(owned_blocks_tensor)
                 raise
@@ -944,11 +944,6 @@ class InferenceStateHandoffMixin:
         if self.context.is_hybrid_model:
             if pending.ssm is None:
                 raise RuntimeError("Hybrid decode-only handoff is missing transferred SSM state")
-            final_block_position = len(pending.local_blocks) - 1
-            if pending.ssm.position != final_block_position:
-                raise RuntimeError(
-                    "Hybrid decode-only handoff requires the exact post-prompt SSM state"
-                )
 
     def _finalize_kv_handoff_import(self, pending: PendingKvImport) -> None:
         """Register transferred blocks and admit the decode request.
@@ -1039,8 +1034,7 @@ class InferenceStateHandoffMixin:
                     pending.resume_tokens,
                     ssm_state_idx=(pending.ssm.live_slot if pending.ssm is not None else None),
                 )
-                if pending.ssm is not None:
-                    pending.ssm.live_slot = None
+                pending.ssm = None
                 pending.local_blocks = []
                 pending.continuation_blocks = []
                 if self.use_coordinator and self.is_mp_coordinator:
@@ -1100,9 +1094,9 @@ class InferenceStateHandoffMixin:
             self.context.kv_block_allocator.release_memory_blocks(block_tensor)
         pending.local_blocks = []
         pending.continuation_blocks = []
-        if pending.ssm is not None and pending.ssm.live_slot is not None:
+        if pending.ssm is not None:
             self.context.mamba_metadata.free_slot(pending.ssm.live_slot)
-            pending.ssm.live_slot = None
+            pending.ssm = None
 
     @staticmethod
     def _wait_for_transfer_handles(*handles) -> bool:
@@ -1224,25 +1218,19 @@ class InferenceStateHandoffMixin:
             )
         return ready
 
-    def _reserve_ssm_handoff_import(self, ssm_meta: dict, local_blocks: list) -> PendingSSMImport:
+    def _reserve_ssm_handoff_import(self) -> PendingSSMImport:
         """Reserve the live request slot that receives exact SSM state."""
 
-        positions = [int(pos) for pos in ssm_meta.get("positions", [])]
         if not self._ssm_transfer_agents:
             raise RuntimeError(
                 "Received SSM handoff state but this decode engine has no "
                 "SSM transfer agents. Ensure KV transfer was initialized on a "
                 "hybrid decode engine."
             )
-        if positions != [len(local_blocks) - 1]:
-            raise ValueError(
-                "Hybrid decode-only handoff requires one exact final SSM state; "
-                f"received positions {positions}"
-            )
         live_slot = self.context.mamba_metadata.allocate_slot()
         if live_slot is None:
             raise RuntimeError("Live SSM slot capacity changed during handoff admission")
-        return PendingSSMImport(handles={}, live_slot=int(live_slot), position=positions[0])
+        return PendingSSMImport(handles={}, live_slot=int(live_slot))
 
     def _start_ssm_handoff_import(
         self, request_id: int, ssm_meta: dict, pending: PendingSSMImport
@@ -1251,7 +1239,6 @@ class InferenceStateHandoffMixin:
 
         handles = {}
         pending.handles = handles
-        assert pending.live_slot is not None
         for state_kind, agent in self._ssm_transfer_agents.items():
             handles[state_kind] = agent.begin_pull_blocks(
                 ssm_meta[state_kind], [], [pending.live_slot]
