@@ -215,7 +215,7 @@ class LayerShardedMuon(Muon):
         num_ns_steps: int = 5,
         scale_mode: MuonScaleT = "spectral",
         extra_scale_factor: float = 1.0,
-        gtp_group: "torch.distributed.ProcessGroup",
+        gtp_group: "torch.distributed.ProcessGroup | None",
         tp_group: "torch.distributed.ProcessGroup | None" = None,
         fused_group: "torch.distributed.ProcessGroup | None" = None,
         ns_batch_size: int = 1,
