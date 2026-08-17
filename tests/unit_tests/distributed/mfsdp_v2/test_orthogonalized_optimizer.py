@@ -399,6 +399,57 @@ class BoundaryModel(nn.Module):
         return self.fc(x)
 
 
+class Bias1d(nn.Module):
+    """A single 1D parameter in its own module so it can be Flat-sharded separately.
+
+    Sharding it alone (its own FSDP group) makes it span all DP ranks with equal
+    shards, so it is a boundary parameter that is handled by the non-matrix
+    momentum-SGD fallback (no orthogonalization, no owner-compute P2P).
+    """
+
+    def __init__(self, n: int) -> None:
+        super().__init__()
+        self.bias = nn.Parameter(torch.zeros(n))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.bias
+
+
+class MixedModel(nn.Module):
+    """A 2D linear (matrix path) and a 1D bias (non-matrix path), separately sharded.
+
+    `fc.weight` (4, 8) is a 2D boundary parameter updated by the owner-compute
+    P2P + Newton-Schulz path; `bias` (4,) is a 1D boundary parameter updated by
+    the plain momentum-SGD fallback. They are Flat-sharded in separate FSDP groups
+    (one parameter each) so each spans all DP ranks with equal shards.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc = nn.Linear(8, 4, bias=False)
+        self.relu = nn.ReLU()
+        self.bias_mod = Bias1d(4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.bias_mod(self.relu(self.fc(x)))
+
+
+class NonMatrixModel(nn.Module):
+    """A model whose only parameter is 1D (a bias), exercising the non-matrix path.
+
+    `Bias1d` has a single 1D parameter, Flat-sharded in its own FSDP group so
+    it spans all DP ranks with equal shards (a boundary parameter handled by
+    the plain momentum-SGD fallback, no orthogonalization, no owner-compute P2P).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bias_mod = Bias1d(8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.bias_mod(x)
+
+
 def _make_fsdp_model(device: torch.device, mesh, seed: int = 1234) -> TinyModel:
     torch.manual_seed(seed)
     model = TinyModel().to(device)
@@ -411,7 +462,7 @@ def test_compute_orthogonalization_inputs_matches_reference(distributed_setup):
     """Local pre-NS (weight decay + momentum + Nesterov) matches a plain reference."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
-    if world_size < 2:
+    if world_size < 2 or torch.cuda.device_count() < world_size:
         pytest.skip("Needs >=2 ranks.")
     mesh = init_device_mesh(device.type, (world_size,))
     model = _make_fsdp_model(device, mesh)
@@ -712,6 +763,187 @@ def test_step_reconstruct_full_param_bitwise_matches_reference(distributed_setup
     torch.testing.assert_close(full, baseline.fc.weight, atol=0, rtol=0)
 
 
+def test_step_non_matrix_param_matches_reference(distributed_setup):
+    """A 1D (non-matrix) parameter is updated by the momentum-SGD fallback.
+
+    `NonMatrixModel` has a single 1D `Bias1d` parameter, Flat-sharded in its own
+    FSDP group so it spans all DP ranks with equal shards (a boundary
+    parameter). It is classified `non_matrix` and updated by
+    `_step_non_matrix` (plain momentum-SGD, no orthogonalization, no
+    owner-compute P2P). This also exercises the `if not matrix_indices:
+    continue` edge and the `_owner_comm_needed=False` path (no boundary
+    2D params -> no `new_group`). The wrapper's momentum-SGD uses the Muon
+    EMA (`mom.lerp_(grad, 1-momentum)`, matching the inner
+    `OrthogonalizedOptimizer`), which differs from `torch.optim.SGD`, so the
+    reference replicates `_step_non_matrix` by hand (nesterov disabled) and
+    the result must match bitwise.
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2 or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            "Needs >=2 ranks and >=1 GPU per rank; "
+            "a 1-GPU-multi-rank config cannot run the owner-compute P2P step."
+        )
+    mesh = init_device_mesh(device.type, (world_size,))
+
+    torch.manual_seed(1234)
+    model = NonMatrixModel().to(device)
+    fully_shard(model.bias_mod, mesh=mesh, placements=_flat_placements())
+
+    torch.manual_seed(1234)
+    baseline = NonMatrixModel().to(device)
+    full = _gather_full_1d_param(model.bias_mod.bias, mesh, world_size)
+    with torch.no_grad():
+        baseline.bias_mod.bias.data.copy_(full)
+
+    lr, momentum, weight_decay = 0.05, 0.9, 0.0
+    inner = Muon(
+        model.parameters(),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=False,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+        use_syrk=False,
+    )
+    sharded_opt = FsdpMuon(
+        model.parameters(), inner_optimizer=inner, dp_mesh=mesh, use_owner_comm_stream=False
+    )
+
+    # Hand-coded reference replicating `_step_non_matrix` (Muon EMA, no
+    # orthogonalization, no scale, weight_decay=0, nesterov=False, no pre/post hooks).
+    ref_state: dict = {}
+
+    def ref_step(m: NonMatrixModel, x: torch.Tensor) -> None:
+        for p in m.parameters():
+            p.grad = None
+        m(x).sum().backward()
+        for p in m.parameters():
+            if p.grad is None:
+                continue
+            st = ref_state.setdefault(p, {})
+            if "momentum_buffer" not in st:
+                st["momentum_buffer"] = torch.zeros_like(p.data)
+            mom = st["momentum_buffer"]
+            grad = p.grad
+            if grad.dtype != mom.dtype:
+                grad = grad.to(dtype=mom.dtype)
+            mom.lerp_(grad, 1 - momentum)
+            update = mom  # non-nesterov
+            with torch.no_grad():
+                p.data.add_(update, alpha=-lr)
+
+    x = torch.randn(4, 8, device=device)
+    for _ in range(3):
+        sharded_opt.zero_grad(set_to_none=True)
+        model(x).sum().backward()
+        sharded_opt.step()
+        ref_step(baseline, x)
+    full = _gather_full_1d_param(model.bias_mod.bias, mesh, world_size)
+    torch.testing.assert_close(full, baseline.bias_mod.bias.data, atol=0, rtol=0)
+
+
+def test_step_mixed_paths_matches_reference(distributed_setup):
+    """A model with both 2D (matrix) and 1D (non-matrix) boundary parameters.
+
+    `MixedModel` has a 2D `fc.weight` (boundary, updated by the owner-compute P2P + Newton-Schulz
+    path) and a 1D `bias` (boundary, updated by the momentum-SGD fallback). Both are
+    Flat-sharded in separate FSDP groups so each spans all DP ranks with equal
+    shards. The 2D result matches a single-rank `Muon` (orthogonalize) bitwise;
+    the 1D result matches a hand-coded Muon-EMA reference (nesterov disabled) bitwise.
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2 or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            "Needs >=2 ranks and >=1 GPU per rank; "
+            "a 1-GPU-multi-rank config cannot run the owner-compute P2P step."
+        )
+    mesh = init_device_mesh(device.type, (world_size,))
+
+    torch.manual_seed(1234)
+    model = MixedModel().to(device)
+    fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
+    fully_shard(model.bias_mod, mesh=mesh, placements=_flat_placements())
+
+    torch.manual_seed(1234)
+    baseline = MixedModel().to(device)
+    full_w = _gather_full_param(model.fc.weight, mesh, world_size)
+    with torch.no_grad():
+        baseline.fc.weight.data.copy_(full_w)
+    full_b = _gather_full_1d_param(model.bias_mod.bias, mesh, world_size)
+    with torch.no_grad():
+        baseline.bias_mod.bias.data.copy_(full_b)
+
+    lr, momentum, weight_decay = 0.05, 0.9, 0.0
+    inner = Muon(
+        model.parameters(),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=True,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+        use_syrk=False,
+    )
+    sharded_opt = FsdpMuon(
+        model.parameters(), inner_optimizer=inner, dp_mesh=mesh, use_owner_comm_stream=False
+    )
+    # Reference for the 2D `fc.weight`: a single-rank Muon (orthogonalize).
+    base_opt = Muon(
+        [baseline.fc.weight],
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=True,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+    )
+
+    # Hand-coded reference for the 1D `bias` (Muon EMA, no orthogonalization).
+    ref_state: dict = {}
+
+    def ref_bias_step(m: MixedModel, x: torch.Tensor) -> None:
+        for p in m.parameters():
+            p.grad = None
+        m(x).sum().backward()
+        base_opt.step()  # updates only `baseline.fc.weight` (the 2D param).
+        p = baseline.bias_mod.bias
+        st = ref_state.setdefault(p, {})
+        if "momentum_buffer" not in st:
+            st["momentum_buffer"] = torch.zeros_like(p.data)
+        mom = st["momentum_buffer"]
+        grad = p.grad
+        if grad.dtype != mom.dtype:
+            grad = grad.to(dtype=mom.dtype)
+        mom.lerp_(grad, 1 - momentum)
+        # Match `_step_non_matrix`'s Nesterov path (`self._inner.nesterov` is True here
+        # so the fallback uses `grad.lerp(mom, momentum)`, not `mom`).
+        update = grad.lerp(mom, momentum)
+        with torch.no_grad():
+            p.data.add_(update, alpha=-lr)
+
+    x = torch.randn(4, 8, device=device)
+    for _ in range(3):
+        sharded_opt.zero_grad(set_to_none=True)
+        model(x).sum().backward()
+        sharded_opt.step()
+        ref_bias_step(baseline, x)
+
+    full_w = _gather_full_param(model.fc.weight, mesh, world_size)
+    torch.testing.assert_close(full_w, baseline.fc.weight, atol=0, rtol=0)
+    full_b = _gather_full_1d_param(model.bias_mod.bias, mesh, world_size)
+    torch.testing.assert_close(full_b, baseline.bias_mod.bias.data, atol=0, rtol=0)
+
+
 def test_step_losses_track_torch_muon(distributed_setup):
     """The FSDP Muon step should track torch.optim.Muon over several steps.
 
@@ -889,6 +1121,21 @@ def _gather_full_param(param, mesh, world_size):
     return torch.cat([p.view(-1, row_size) if p.numel() else p for p in parts], dim=0)[
         : full_shape[0]
     ]
+
+
+def _gather_full_1d_param(param, mesh, world_size):
+    """All-gather a Flat-sharded 1D DTensor parameter into its full vector.
+
+    The parameter must be Flat-sharded in its own FSDP group so it spans all DP ranks
+    with equal shards; `dist.all_gather` requires equal-sized parts on every
+    rank and would deadlock on a fully-local 1D parameter (0-size shard on
+    some ranks).
+    """
+    local = param.to_local().contiguous()
+    parts = [torch.empty_like(local) for _ in range(world_size)]
+    dist.all_gather(parts, local, group=mesh.get_group())
+    # Flat shards are contiguous elements in rank order; concatenate along dim 0.
+    return torch.cat(parts, dim=0)
 
 
 def test_owner_p2p_round_trip_multi_owner(distributed_setup):
