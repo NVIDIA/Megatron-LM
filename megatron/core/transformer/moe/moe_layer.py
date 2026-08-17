@@ -124,7 +124,14 @@ class SharedExpertsBuilder(Protocol):
 class RouterInterface(Protocol):
     """Interface for the router used in an MoELayer."""
 
-    def forward(self, input: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        input: torch.Tensor,
+        /,
+        padding_mask: torch.Tensor | None = None,
+        seq_aux_loss_sample_ids: torch.Tensor | None = None,
+        seq_aux_loss_num_samples: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass of the router.
 
         Returns:
@@ -442,13 +449,27 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def route(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        seq_aux_loss_sample_ids: torch.Tensor | None = None,
+        seq_aux_loss_num_samples: int | None = None,
+    ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        seq_aux_loss_kwargs = {}
+        if seq_aux_loss_sample_ids is not None:
+            seq_aux_loss_kwargs = {
+                "seq_aux_loss_sample_ids": seq_aux_loss_sample_ids,
+                "seq_aux_loss_num_samples": seq_aux_loss_num_samples,
+            }
+        probs, routing_map = apply_module(self.router)(
+            hidden_states, padding_mask, **seq_aux_loss_kwargs
+        )
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -616,6 +637,8 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
+        seq_aux_loss_sample_ids: torch.Tensor | None = None,
+        seq_aux_loss_num_samples: int | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -630,6 +653,9 @@ class MoELayer(BaseMoELayer):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            seq_aux_loss_sample_ids (torch.Tensor, optional): Logical sample index for each
+                local token in a variable-length packed input.
+            seq_aux_loss_num_samples (int, optional): Total logical sample count.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -655,11 +681,21 @@ class MoELayer(BaseMoELayer):
             padding_mask = padding_mask.transpose(0, 1).bool()
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+        def custom_forward(
+            hidden_states,
+            intermediate_tensors=None,
+            padding_mask=None,
+            seq_aux_loss_sample_ids=None,
+        ):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    probs, routing_map = self.route(
+                        hidden_states,
+                        padding_mask,
+                        seq_aux_loss_sample_ids,
+                        seq_aux_loss_num_samples,
+                    )
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:
@@ -708,13 +744,21 @@ class MoELayer(BaseMoELayer):
                     hidden_states,
                     intermediate_tensors,
                     padding_mask,
+                    seq_aux_loss_sample_ids,
                 )
             else:
                 outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
+                    custom_forward,
+                    False,
+                    hidden_states,
+                    intermediate_tensors,
+                    padding_mask,
+                    seq_aux_loss_sample_ids,
                 )
         else:
-            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
+            outputs = custom_forward(
+                hidden_states, intermediate_tensors, padding_mask, seq_aux_loss_sample_ids
+            )
 
         return outputs
 

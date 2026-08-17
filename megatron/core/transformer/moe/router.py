@@ -7,6 +7,7 @@ import torch
 
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
+from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
@@ -455,29 +456,67 @@ class TopKRouter(Router):
         seq_length: int,
         bsz: int,
         with_padding_mask: bool = False,
+        sample_ids: torch.Tensor | None = None,
+        num_samples: int | None = None,
     ):
         """Apply the sequence-level auxiliary loss for the given scores and routing map.
 
         To calculate the sequence-level aux loss, we reshape the batch_size dimension to
         experts dimension. The resulted loss by switch_load_balancing_loss_func is equal
         to the sum of aux loss for each sequence in the batch. And then we divide the aux
-        loss by the batch size to get averaged aux loss.
+        loss by the batch size to get averaged aux loss. Variable-length packed inputs use
+        sample IDs to accumulate the same per-sample expert dimension without materializing
+        a dense sequence-by-batch tensor.
         """
         seq_aux_loss_coeff = self.get_aux_loss_coeff("seq_aux_loss")
         if seq_aux_loss_coeff == 0:
             return probs
 
-        scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
-        routing_map = routing_map.reshape(seq_length, -1)
+        if sample_ids is None:
+            scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
+            routing_map = routing_map.reshape(seq_length, -1)
 
-        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
-            get_tokens_per_expert_and_token_count(
-                routing_map=routing_map,
-                reduce_group=self.tp_cp_group,
-                with_padding_mask=with_padding_mask,
-                topk=self.topk * bsz,
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                get_tokens_per_expert_and_token_count(
+                    routing_map=routing_map,
+                    reduce_group=self.tp_cp_group,
+                    with_padding_mask=with_padding_mask,
+                    topk=self.topk * bsz,
+                )
             )
-        )
+            valid_token_count = local_num_tokens * bsz
+        else:
+            if num_samples is None or num_samples < 1:
+                raise ValueError(
+                    "num_samples must be positive when sample_ids are provided for seq_aux_loss."
+                )
+            sample_ids = sample_ids.reshape(-1).to(device=routing_map.device, dtype=torch.long)
+            if sample_ids.numel() != routing_map.shape[0]:
+                raise ValueError(
+                    "seq_aux_loss sample_ids must contain one entry per local router token."
+                )
+
+            num_experts = routing_map.shape[-1]
+            scatter_indices = sample_ids.unsqueeze(-1).expand(-1, num_experts)
+            local_tokens_per_expert = torch.zeros(
+                (num_samples, num_experts), dtype=torch.long, device=routing_map.device
+            )
+            local_tokens_per_expert.scatter_add_(
+                0, scatter_indices, routing_map.to(dtype=torch.long)
+            )
+            global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+                local_tokens_per_expert, self.tp_cp_group
+            )
+
+            scores_per_expert = scores_for_aux_loss.new_zeros((num_samples, num_experts))
+            scores_per_expert.scatter_add_(0, scatter_indices, scores_for_aux_loss)
+            scores_for_aux_loss = scores_per_expert.reshape(1, -1)
+            global_tokens_per_expert = global_tokens_per_expert.reshape(-1)
+
+            local_num_tokens = local_tokens_per_expert.sum() / self.topk
+            total_num_tokens = global_tokens_per_expert.sum() / (self.topk * num_samples)
+            bsz = num_samples
+            valid_token_count = local_num_tokens
 
         aux_loss = (
             switch_load_balancing_loss_func(
@@ -498,9 +537,9 @@ class TopKRouter(Router):
             aux_loss,
             "seq_load_balancing_loss",
             self.tp_cp_group,
-            # local_num_tokens is per-sequence (bsz folded into the expert dim above);
-            # * bsz recovers the micro-batch total, else per-token-loss scaling keeps a 1/MBS.
-            valid_token_count=local_num_tokens * bsz,
+            # In the fixed-width path local_num_tokens is per sequence, while the segmented
+            # path directly computes the total number of local valid tokens.
+            valid_token_count=valid_token_count,
         )
         return probs
 
@@ -741,7 +780,13 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def routing(
+        self,
+        logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        seq_aux_loss_sample_ids: torch.Tensor | None = None,
+        seq_aux_loss_num_samples: int | None = None,
+    ):
         """Top-k routing function
 
         Args:
@@ -749,6 +794,10 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            seq_aux_loss_sample_ids (torch.Tensor, optional): Logical sample index for each
+                local router token in a variable-length packed input.
+            seq_aux_loss_num_samples (int, optional): Total logical sample count, including
+                samples with no tokens on this rank.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -821,6 +870,8 @@ class TopKRouter(Router):
                 seq_length,
                 bsz,
                 with_padding_mask=padding_mask is not None,
+                sample_ids=seq_aux_loss_sample_ids,
+                num_samples=seq_aux_loss_num_samples,
             )
             probs = self._apply_global_aux_loss(
                 probs,
@@ -840,7 +891,13 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        seq_aux_loss_sample_ids: torch.Tensor | None = None,
+        seq_aux_loss_num_samples: int | None = None,
+    ):
         """
         Forward pass of the router.
 
@@ -849,6 +906,9 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            seq_aux_loss_sample_ids (torch.Tensor, optional): Logical sample index for each
+                local router token in a variable-length packed input.
+            seq_aux_loss_num_samples (int, optional): Total logical sample count.
         """
         self._maintain_float32_expert_bias()
 
@@ -866,7 +926,12 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        probs, routing_map = self.routing(
+            logits,
+            padding_mask=padding_mask,
+            seq_aux_loss_sample_ids=seq_aux_loss_sample_ids,
+            seq_aux_loss_num_samples=seq_aux_loss_num_samples,
+        )
 
         return probs, routing_map
 
@@ -977,12 +1042,20 @@ class InferenceTopKRouter(TopKRouter):
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        seq_aux_loss_sample_ids: torch.Tensor | None = None,
+        seq_aux_loss_num_samples: int | None = None,
+    ):
         """Simplified forward pass for inference - returns dense tensors only.
 
         Args:
             input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Not used in inference.
+            seq_aux_loss_sample_ids (torch.Tensor, optional): Used only by the training router.
+            seq_aux_loss_num_samples (int, optional): Used only by the training router.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
@@ -991,6 +1064,8 @@ class InferenceTopKRouter(TopKRouter):
         """
 
         if not InferenceMode.is_active():
-            return super().forward(input, padding_mask)
+            return super().forward(
+                input, padding_mask, seq_aux_loss_sample_ids, seq_aux_loss_num_samples
+            )
 
         return self._forward(input, padding_mask)

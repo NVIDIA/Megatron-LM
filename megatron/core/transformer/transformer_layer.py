@@ -799,6 +799,39 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return output
         return output.transpose(0, 1).reshape(mbs * packed_seq_params.tokens_per_sample, 1, -1)
 
+    def _uses_variable_packed_seq_aux_loss(self, packed_seq_params):
+        """Return whether variable packed sequence-level MoE accounting is required."""
+        routing_type = self.config.moe_router_load_balancing_type
+        uses_seq_aux_loss = routing_type == "seq_aux_loss" or (
+            isinstance(routing_type, list) and "seq_aux_loss" in routing_type
+        )
+        return (
+            self.is_moe_layer
+            and uses_seq_aux_loss
+            and packed_seq_params is not None
+            and packed_seq_params.tokens_per_sample is None
+        )
+
+    def _get_seq_aux_loss_sample_ids(self, hidden_states, packed_seq_params):
+        """Get local logical sample ownership for variable-length packed seq_aux_loss."""
+        if (
+            not self._uses_variable_packed_seq_aux_loss(packed_seq_params)
+            or not self.training
+            or not torch.is_grad_enabled()
+        ):
+            return None, None
+
+        tp_group = self.pg_collection.tp
+        cp_group = self.pg_collection.cp
+        return packed_seq_params.get_seq_aux_loss_sample_ids(
+            hidden_states.shape[0] * hidden_states.shape[1],
+            cp_size=cp_group.size(),
+            tp_size=tp_group.size(),
+            tp_rank=get_pg_rank(tp_group),
+            sequence_parallel=self.config.sequence_parallel,
+            device=hidden_states.device,
+        )
+
     def _forward_mlp(
         self,
         hidden_states: Tensor,
@@ -844,6 +877,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
             pre_mlp_layernorm_output, padding_mask, packed_seq_params
         )
+        seq_aux_loss_sample_ids, seq_aux_loss_num_samples = self._get_seq_aux_loss_sample_ids(
+            pre_mlp_layernorm_output, packed_seq_params
+        )
+        seq_aux_loss_kwargs = {}
+        if seq_aux_loss_sample_ids is not None:
+            seq_aux_loss_kwargs = {
+                "seq_aux_loss_sample_ids": seq_aux_loss_sample_ids,
+                "seq_aux_loss_num_samples": seq_aux_loss_num_samples,
+            }
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -853,12 +895,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and not inference_context.is_decode_only()
             and not isinstance(self.mlp, IdentityOp)
             and not self.config.transformer_impl == "inference_optimized"
+            and seq_aux_loss_sample_ids is None
         )
         should_chunk_mlp_for_training = (
             self.config.mlp_chunks_for_training > 1
             and inference_context is None
             and self.training
             and not isinstance(self.mlp, IdentityOp)
+            and seq_aux_loss_sample_ids is None
         )
 
         using_fused_tp_inference_kernel = (
@@ -877,10 +921,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
                     padding_mask=padding_mask,
+                    **seq_aux_loss_kwargs,
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(apply_module(self.mlp), padding_mask=padding_mask),
+                    functools.partial(
+                        apply_module(self.mlp), padding_mask=padding_mask, **seq_aux_loss_kwargs
+                    ),
                     False,
                     pre_mlp_layernorm_output,
                 )
@@ -912,7 +959,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
             mlp_output_with_bias = apply_module(self.mlp)(
-                pre_mlp_layernorm_output, padding_mask=padding_mask
+                pre_mlp_layernorm_output, padding_mask=padding_mask, **seq_aux_loss_kwargs
             )
 
         if moe_unflatten_mbs is not None:
@@ -1143,6 +1190,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
+        if self._uses_variable_packed_seq_aux_loss(kwargs.get("packed_seq_params")):
+            raise ValueError(
+                "Variable-length packed seq_aux_loss is not supported with Transformer Engine "
+                "CUDA graphs. Use cuda_graph_impl='local' or disable CUDA graphs."
+            )
+
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
@@ -1199,6 +1252,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         However, CUDA graph accepts only Tensor inputs.
         Hence, `inference_context` and `packed_seq_params` are excluded from input list.
         """
+        if self._uses_variable_packed_seq_aux_loss(kwargs.get("packed_seq_params")):
+            raise ValueError(
+                "Variable-length packed seq_aux_loss is not supported with Transformer Engine "
+                "CUDA graphs. Use cuda_graph_impl='local' or disable CUDA graphs."
+            )
+
         context = None
         if (
             self.config.cuda_graph_modules
@@ -1638,7 +1697,13 @@ class MoETransformerLayer(TransformerLayer):
         self._router_dtoh_event.record()
         self._router_dtoh_event.synchronize()
 
-    def _forward_mlp_router(self, hidden_states, padding_mask=None):
+    def _forward_mlp_router(
+        self,
+        hidden_states,
+        padding_mask=None,
+        seq_aux_loss_sample_ids=None,
+        seq_aux_loss_num_samples=None,
+    ):
         """
         Executes the router phase of the MoE block.
 
@@ -1662,8 +1727,17 @@ class MoETransformerLayer(TransformerLayer):
         if self.config.fp32_residual_connection:
             residual = residual.float()
 
+        seq_aux_loss_kwargs = {}
+        if seq_aux_loss_sample_ids is not None:
+            seq_aux_loss_kwargs = {
+                "seq_aux_loss_sample_ids": seq_aux_loss_sample_ids,
+                "seq_aux_loss_num_samples": seq_aux_loss_num_samples,
+            }
         hidden_states, probs, shared_expert_output = apply_module(self.mlp)(
-            pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
+            pre_mlp_layernorm_output,
+            intermediate_tensors=(),
+            padding_mask=padding_mask,
+            **seq_aux_loss_kwargs,
         )
 
         if self.use_partial_cudagraphs:
@@ -1732,9 +1806,18 @@ class MoETransformerLayer(TransformerLayer):
             )
 
         def _forward_mlp_partial_cudagraphs(
-            hidden_states, inference_context=None, padding_mask=None
+            hidden_states,
+            inference_context=None,
+            padding_mask=None,
+            seq_aux_loss_sample_ids=None,
+            seq_aux_loss_num_samples=None,
         ):
-            router_outputs = self._forward_mlp_router(hidden_states, padding_mask=padding_mask)
+            router_outputs = self._forward_mlp_router(
+                hidden_states,
+                padding_mask=padding_mask,
+                seq_aux_loss_sample_ids=seq_aux_loss_sample_ids,
+                seq_aux_loss_num_samples=seq_aux_loss_num_samples,
+            )
             (
                 residual,
                 hidden_states,
@@ -1758,6 +1841,9 @@ class MoETransformerLayer(TransformerLayer):
             hidden_states, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
                 hidden_states, padding_mask, packed_seq_params
             )
+            seq_aux_loss_sample_ids, seq_aux_loss_num_samples = self._get_seq_aux_loss_sample_ids(
+                hidden_states, packed_seq_params
+            )
 
             if self.moe_layer_recompute:
                 if self.config.fp8 or self.config.fp4:
@@ -1770,17 +1856,27 @@ class MoETransformerLayer(TransformerLayer):
                         parallel_state.get_tensor_model_parallel_group(),
                         hidden_states,
                         padding_mask=padding_mask,
+                        seq_aux_loss_sample_ids=seq_aux_loss_sample_ids,
+                        seq_aux_loss_num_samples=seq_aux_loss_num_samples,
                     )
                 else:
                     result = tensor_parallel.checkpoint(
                         functools.partial(
-                            _forward_mlp_partial_cudagraphs, padding_mask=padding_mask
+                            _forward_mlp_partial_cudagraphs,
+                            padding_mask=padding_mask,
+                            seq_aux_loss_sample_ids=seq_aux_loss_sample_ids,
+                            seq_aux_loss_num_samples=seq_aux_loss_num_samples,
                         ),
                         False,
                         hidden_states,
                     )
             else:
-                result = _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=padding_mask)
+                result = _forward_mlp_partial_cudagraphs(
+                    hidden_states,
+                    padding_mask=padding_mask,
+                    seq_aux_loss_sample_ids=seq_aux_loss_sample_ids,
+                    seq_aux_loss_num_samples=seq_aux_loss_num_samples,
+                )
 
             result = self._maybe_reflatten_from_moe(result, packed_seq_params, moe_unflatten_mbs)
 
