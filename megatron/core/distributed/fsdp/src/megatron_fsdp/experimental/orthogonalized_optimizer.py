@@ -1067,8 +1067,8 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 flag = torch.tensor(int(has_boundary), device=self._device(), dtype=torch.int)
                 dist.all_reduce(flag, op=dist.ReduceOp.SUM, group=self._dp_group())
                 self._owner_comm_needed = flag.item() > 0
-                if self._owner_comm_needed:
-                    self._init_collective_groups()
+            if self._owner_comm_needed:
+                self._init_collective_groups()
 
         fsdp_parameter_groups: set[FsdpParameterGroup] = set()
         for group in self.param_groups:
