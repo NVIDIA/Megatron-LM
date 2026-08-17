@@ -24,7 +24,6 @@ from megatron.core.ssm.gated_delta_net.common import (
     causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
-    get_parameter_local_cp_headwise,
     l2norm,
 )
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
@@ -36,6 +35,35 @@ try:
 except ImportError:
     causal_conv1d_update = None
     fused_recurrent_gated_delta_rule = None
+
+
+def get_parameter_local_cp_headwise(
+    param: torch.Tensor,
+    dim: int,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    split_sections: Optional[list[int]] = None,
+) -> torch.Tensor:
+    """Get the local parameter slice for headwise context parallelism."""
+
+    cp_size = cp_group.size() if cp_group is not None else 1
+
+    if cp_size == 1:
+        return param
+
+    cp_rank = cp_group.rank()
+
+    if split_sections is not None:
+        inputs = torch.split(param, split_sections, dim=dim)
+        outputs = []
+        for p in inputs:
+            p = get_parameter_local_cp_headwise(p, dim, cp_group)
+            outputs.append(p)
+        return torch.cat(outputs, dim=dim)
+
+    slices = [slice(None)] * param.dim()
+    dim_size = param.size(dim=dim)
+    slices[dim] = slice(cp_rank * dim_size // cp_size, (cp_rank + 1) * dim_size // cp_size)
+    return param[slices]
 
 
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
