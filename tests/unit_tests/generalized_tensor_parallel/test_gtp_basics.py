@@ -813,9 +813,7 @@ def _worker_mxfp8_linear(rank, world_size, port, mxfp8_2d_quantization):
     batch, in_f, out_f = 32, 64, 128  # out_f % (16*world_size)==0 → no padding
     dtype = torch.bfloat16
     gtp_remat_group = dist.new_group(list(range(world_size)))
-    recipe = get_mxfp8_block_scaling_recipe(
-        mxfp8_2d_quantization=mxfp8_2d_quantization
-    )
+    recipe = get_mxfp8_block_scaling_recipe(mxfp8_2d_quantization=mxfp8_2d_quantization)
     layer = _make_native_fp8_gtp_linear(in_f, out_f, gtp_remat_group, dtype, recipe)
 
     # The weight IS the native FP8 shard: a QuantizedTensor with the GTP surface attached.
@@ -864,9 +862,7 @@ def _worker_mxfp8_linear_unaligned(rank, world_size, port, mxfp8_2d_quantization
     batch = 32
     dtype = torch.bfloat16
     gtp_remat_group = dist.new_group(list(range(world_size)))
-    recipe = get_mxfp8_block_scaling_recipe(
-        mxfp8_2d_quantization=mxfp8_2d_quantization
-    )
+    recipe = get_mxfp8_block_scaling_recipe(mxfp8_2d_quantization=mxfp8_2d_quantization)
     layer = _make_native_fp8_gtp_linear(in_f, out_f, gtp_remat_group, dtype, recipe)
     assert layer.weight.pad_length == 8, f"expected pad 8, got {layer.weight.pad_length}"
 
