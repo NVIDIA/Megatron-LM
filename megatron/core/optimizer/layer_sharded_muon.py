@@ -348,6 +348,9 @@ class LayerShardedMuon(Muon):
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> None:
+        """Run one optimizer step: momentum update, shard exchange to the NS homes,
+        full-matrix Newton-Schulz there, reverse exchange, weight update (see the
+        class docstring for the per-stage breakdown)."""
         if closure is not None:
             raise ValueError("closure is not supported")
 
@@ -452,6 +455,20 @@ class LayerShardedMuon(Muon):
             # than electing a home and broadcasting the result back.
             replicated, routed = [], []
             for i, p in enumerate(params):
+                # A TP-sharded param that is not GTP-sharded is REPLICATED across the
+                # GTP group; stage-1 would concatenate the G identical copies as if
+                # they were dim-0 shards and hand Newton-Schulz a (G*rows, cols)
+                # matrix. The reverse-path shape asserts come out numerically
+                # consistent, so this corrupts silently — reject it loudly instead.
+                if gtp_size > 1 and _partition_dim(p) is not None and not _gtp_sharded(p):
+                    raise ValueError(
+                        f"LayerShardedMuon: param of shape {tuple(p.shape)} is TP-sharded "
+                        f"(partition_dim={getattr(p, 'partition_dim', None)}) but not GTP-sharded "
+                        f"(is_gtp_weight_remat absent/False) while gtp_size={gtp_size} > 1. "
+                        "The GTP exchange would concatenate replicated copies as shards and "
+                        "silently corrupt the update. Tag the param with is_gtp_weight_remat "
+                        "or run it in a domain without a GTP axis."
+                    )
                 target = (
                     routed if (_gtp_sharded(p) or _partition_dim(p) is not None) else replicated
                 )
@@ -494,6 +511,15 @@ class LayerShardedMuon(Muon):
             # blocks and assembles them in the exact same order, so the NS input is
             # bit-identical to the two-stage path.
             if fused_group is not None:
+                # The fused exchange assumes flat rank g * tp_size + t (TP innermost).
+                # A group built with any other rank order scatters blocks to the wrong
+                # coordinates — silently, since all split sizes still line up.
+                fused_rank = torch.distributed.get_rank(fused_group)
+                assert fused_rank == gtp_rank * tp_size + tp_rank, (
+                    f"LayerShardedMuon: fused_group rank {fused_rank} != "
+                    f"gtp_rank({gtp_rank}) * tp_size({tp_size}) + tp_rank({tp_rank}); the "
+                    "flattened (GTP x TP) group must be built with TP innermost."
+                )
                 pdims = [_partition_dim(p) for p in params]
                 with fp32_matmul_precision(self.fp32_matmul_prec):
                     with _phase("a2a_fwd"):
