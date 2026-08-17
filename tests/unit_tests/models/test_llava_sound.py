@@ -6,6 +6,7 @@ RADIO models) and instead invoke the relevant unbound methods on a
 ``SimpleNamespace`` stub. This focuses the test surface on the new sound
 code paths without dragging in the full multimodal stack.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
