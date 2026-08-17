@@ -1053,17 +1053,14 @@ def test_async_bookkeeping_retains_finished_handoff_state():
     context.kv_block_allocator.retain_memory_blocks.assert_called_once_with([10, 11])
 
 
-def test_finished_hybrid_handoff_retains_live_ssm_slot():
+def test_finished_hybrid_handoff_detaches_live_ssm_slot():
     context = _make_async_sched_context(total_request_count=2)
     context.is_hybrid_model = True
     context.kv_block_allocator = SimpleNamespace(
         enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
     )
     context.request_to_kv_block_ids = torch.tensor([[10, 11, -1], [12, 13, -1]], dtype=torch.int32)
-    context.mamba_metadata = SimpleNamespace(
-        request_to_mamba_state_idx=torch.tensor([4, 7], dtype=torch.int32),
-        retain_state_slot=mock.Mock(),
-    )
+    context.mamba_metadata = SimpleNamespace(detach_state_slot=mock.Mock(return_value=7))
     controller = _make_async_sched_controller(context)
 
     blocks, ssm_slots, decode_tokens = controller._collect_finished_handoff_state(
@@ -1073,7 +1070,7 @@ def test_finished_hybrid_handoff_retains_live_ssm_slot():
     assert blocks == {11: [12, 13]}
     assert ssm_slots == {11: 7}
     assert decode_tokens == {11: [92]}
-    context.mamba_metadata.retain_state_slot.assert_called_once_with(7)
+    context.mamba_metadata.detach_state_slot.assert_called_once_with(1)
 
 
 @pytest.mark.parametrize(

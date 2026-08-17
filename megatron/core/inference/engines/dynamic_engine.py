@@ -1396,7 +1396,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 finished requests, saved before update_requests released them.
                 Used for per-block routing reconstruction.
             finished_handoff_block_ids: Prompt KV block IDs retained for state handoff.
-            finished_handoff_ssm_slots: Live SSM slots retained for state handoff.
+            finished_handoff_ssm_slots: Live SSM slots detached for state handoff.
             finished_handoff_decode_tokens: First sampled token and optional MTP proposals
                 needed to resume directly from imported prefill state on decode.
 

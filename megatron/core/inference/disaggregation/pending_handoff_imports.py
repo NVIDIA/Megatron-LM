@@ -29,7 +29,7 @@ class DeferredKvHandoff:
 class PendingSSMImport:
     """Exact SSM state being transferred into a reserved live request slot."""
 
-    handles: dict[str, Any]
+    handles: list[Any]
     live_slot: int
 
 

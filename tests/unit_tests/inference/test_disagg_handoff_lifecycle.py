@@ -98,7 +98,6 @@ class _MambaMetadata:
         self.mamba_state_free_slot_count = available
         self.next_slot = 20
         self.freed = []
-        self.released_retained = []
 
     def allocate_slot(self):
         if self.mamba_state_free_slot_count == 0:
@@ -110,10 +109,6 @@ class _MambaMetadata:
 
     def free_slot(self, slot):
         self.freed.append(slot)
-        self.mamba_state_free_slot_count += 1
-
-    def release_retained_state_slot(self, slot):
-        self.released_retained.append(slot)
         self.mamba_state_free_slot_count += 1
 
 
@@ -321,7 +316,7 @@ def test_completed_exact_ssm_handoff_enters_decode_without_waiting_queue(handoff
         cached_prefix_block_count=0,
         handle=None,
         future=handoff_loop.create_future(),
-        ssm=PendingSSMImport(handles={}, live_slot=20),
+        ssm=PendingSSMImport(handles=[], live_slot=20),
         resume_tokens=[55],
     )
 
@@ -396,6 +391,9 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
 
         def export_meta(self):
             return {"transport": "test"}
+
+        def new_registered_buffer(self, **kwargs):
+            return type(self)(**kwargs)
 
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
@@ -550,13 +548,13 @@ def test_reset_rejects_pinned_prefill_blocks(handoff_loop):
     assert engine._pinned_handoff_blocks == {7: [10]}
 
 
-def test_release_handoff_returns_retained_prefill_ssm_slot(handoff_loop):
+def test_release_handoff_returns_detached_prefill_ssm_slot(handoff_loop):
     engine = _HandoffHarness(handoff_loop, hybrid=True)
     engine._pinned_handoff_ssm_slots[7] = 3
 
     engine.release_handoff_blocks(7)
 
-    assert engine.context.mamba_metadata.released_retained == [3]
+    assert engine.context.mamba_metadata.freed == [3]
     assert engine._pinned_handoff_ssm_slots == {}
 
 
@@ -841,13 +839,48 @@ def test_handoff_metadata_batches_completed_requests_across_pipeline(monkeypatch
     assert requests[1].disaggregated_params["kv_meta"]["pp_metas"][1]["block_ids"] == [12, 13, 14]
 
 
+def test_handoff_metadata_error_releases_all_finished_state():
+    engine = object.__new__(InferenceStateHandoffMixin)
+    engine._initialize_disaggregation_state()
+    engine.pg_collection = SimpleNamespace(tp=None, pp=None, mp=None)
+    engine.context = SimpleNamespace(block_size_tokens=4, num_speculative_tokens=0)
+    engine._kv_peer_metas = None
+    engine._release_pinned_handoff_blocks = mock.Mock()
+    engine._release_pinned_handoff_ssm_slot = mock.Mock()
+    regular = SimpleNamespace(
+        request_id=7,
+        prompt_tokens=[1, 2, 3, 4],
+        sampling_params=SamplingParams(do_kv_handoff=False),
+    )
+    handoff = SimpleNamespace(
+        request_id=8, prompt_tokens=[1, 2, 3, 4], sampling_params=SamplingParams(do_kv_handoff=True)
+    )
+
+    with (
+        mock.patch(
+            "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_size",
+            return_value=1,
+        ),
+        pytest.raises(RuntimeError, match="transfer setup"),
+    ):
+        engine._prepare_handoff_metadata_batch(
+            [(regular, [10], 3), (handoff, [11], 4)], decode_tokens_by_request={}
+        )
+
+    assert engine._release_pinned_handoff_blocks.call_args_list == [
+        mock.call([10]),
+        mock.call([11]),
+    ]
+    assert engine._release_pinned_handoff_ssm_slot.call_args_list == [mock.call(3), mock.call(4)]
+
+
 def test_hybrid_handoff_keeps_partial_block_for_exact_decode_resume():
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
     engine.pg_collection = SimpleNamespace(tp=None, pp=None, mp=None)
     engine.context = SimpleNamespace(block_size_tokens=4, num_speculative_tokens=0)
     engine._kv_peer_metas = {"global_rank": 0}
-    engine._tp_ssm_peer_metas = {"conv": {"global_rank": 0}, "recurrent": {"global_rank": 0}}
+    engine._pp_ssm_peer_metas = [{"conv": {"global_rank": 0}, "recurrent": {"global_rank": 0}}]
     engine._ssm_transfer_agents = {"conv": mock.Mock(), "recurrent": mock.Mock()}
     engine._release_pinned_handoff_blocks = mock.Mock()
     request = SimpleNamespace(
@@ -1098,8 +1131,7 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
             for state in ("conv", "recurrent")
         }
 
-    engine._tp_ssm_peer_metas = stage_ssm_metas(0)
-    engine._pp_ssm_peer_metas = [engine._tp_ssm_peer_metas, stage_ssm_metas(1)]
+    engine._pp_ssm_peer_metas = [stage_ssm_metas(0), stage_ssm_metas(1)]
     engine.context = SimpleNamespace(
         block_size_tokens=4, num_speculative_tokens=0, memory_buffer=torch.empty(1)
     )

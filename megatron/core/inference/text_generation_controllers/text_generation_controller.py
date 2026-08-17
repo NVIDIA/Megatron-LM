@@ -1908,7 +1908,7 @@ class TextGenerationController:
         sampled_tokens_cpu: Tensor,
         sampled_mtp_tokens_cpu: Optional[Tensor],
     ) -> Tuple[Dict[int, List[int]], Dict[int, int], Dict[int, List[int]]]:
-        """Retain completed prompt state and capture tokens needed to resume decode."""
+        """Preserve completed prompt state and capture tokens needed to resume decode."""
 
         context = self.inference_wrapped_model.inference_context
         allocator = context.kv_block_allocator
@@ -1928,15 +1928,12 @@ class TextGenerationController:
                 # active=1, retain=2, request cleanup=1, coordinator RELEASE_KV=0.
                 allocator.retain_memory_blocks(valid_blocks)
                 if context.is_hybrid_model:
-                    ssm_slot = int(
-                        context.mamba_metadata.request_to_mamba_state_idx[finished_idx].item()
+                    # Transfer ownership out of the finished request before normal
+                    # cleanup; the slot stays absent from the free-slot stack until
+                    # the prefill engine receives RELEASE_KV.
+                    finished_ssm_slots[request_id] = context.mamba_metadata.detach_state_slot(
+                        finished_idx
                     )
-                    if ssm_slot < 0:
-                        raise RuntimeError(
-                            f"Finished hybrid request {request_id} has no live SSM state slot"
-                        )
-                    context.mamba_metadata.retain_state_slot(ssm_slot)
-                    finished_ssm_slots[request_id] = ssm_slot
 
             active_idx = finished_idx - context.paused_request_count
             decode_tokens = [int(sampled_tokens_cpu[active_idx].item())]

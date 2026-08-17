@@ -106,9 +106,6 @@ class MambaMetadata:
             self.max_requests, dtype=torch.int32, device='cpu'
         )
         self.mamba_state_free_slot_count = self.max_requests
-        # A finished handoff request may keep its live state as a transfer source.
-        self._retained_state_slots = torch.zeros(self.max_requests, dtype=torch.bool, device='cpu')
-        self._retained_state_slot_count = 0
 
         # Intermediate state extraction buffers (CUDA graph compatible). Sized by
         # the per-step token-budget cap shared from DynamicInferenceContext.
@@ -152,19 +149,14 @@ class MambaMetadata:
 
     def reset(self) -> None:
         """
-        Reset request mappings while preserving externally retained live slots.
+        Resets all Mamba states and frees all allocated slots.
         """
         self.request_to_mamba_state_idx.fill_(-1)
 
         self.reset_varlen_metadata()
 
-        if self._retained_state_slot_count:
-            free_slots = torch.nonzero(~self._retained_state_slots, as_tuple=True)[0]
-            self.mamba_state_free_slots[: free_slots.numel()] = free_slots.to(torch.int32)
-            self.mamba_state_free_slot_count = free_slots.numel()
-        else:
-            torch.arange(self.max_requests, out=self.mamba_state_free_slots)
-            self.mamba_state_free_slot_count = self.max_requests
+        torch.arange(self.max_requests, out=self.mamba_state_free_slots)
+        self.mamba_state_free_slot_count = self.max_requests
 
     def reset_varlen_metadata(self) -> None:
         """Resets varlen metadata."""
@@ -757,35 +749,24 @@ class MambaMetadata:
 
         return mamba_idx
 
-    def retain_state_slot(self, mamba_idx: int) -> None:
-        """Retain a live state slot independently of its active request."""
+    def detach_state_slot(self, request_idx: int) -> int:
+        """Detach and return a request's live state slot without freeing it."""
 
-        if not 0 <= mamba_idx < self.max_requests:
-            raise ValueError(f"Mamba state slot {mamba_idx} is outside the live state pool")
-        if self._retained_state_slots[mamba_idx]:
-            raise RuntimeError(f"Mamba state slot {mamba_idx} is already retained")
-        self._retained_state_slots[mamba_idx] = True
-        self._retained_state_slot_count += 1
+        mamba_idx = int(self.request_to_mamba_state_idx[request_idx].item())
+        if mamba_idx < 0:
+            raise RuntimeError(f"Request index {request_idx} has no live Mamba state slot")
+        self.request_to_mamba_state_idx[request_idx] = -1
+        return mamba_idx
 
     def free_slot(self, mamba_idx: int) -> None:
         """Return one unbound slot to the live Mamba state pool."""
 
         if not 0 <= mamba_idx < self.max_requests:
             raise ValueError(f"Mamba state slot {mamba_idx} is outside the live state pool")
-        if self._retained_state_slots[mamba_idx]:
-            raise RuntimeError(f"Cannot free retained Mamba state slot {mamba_idx}")
-        self._return_slots(torch.tensor([mamba_idx], dtype=torch.int32, device='cpu'))
-
-    def release_retained_state_slot(self, mamba_idx: int) -> None:
-        """Release a live state slot retained after its request completed."""
-
-        if not 0 <= mamba_idx < self.max_requests:
-            raise ValueError(f"Mamba state slot {mamba_idx} is outside the live state pool")
-        if not self._retained_state_slots[mamba_idx]:
-            raise RuntimeError(f"Mamba state slot {mamba_idx} is not retained")
-        self._retained_state_slots[mamba_idx] = False
-        self._retained_state_slot_count -= 1
-        self._return_slots(torch.tensor([mamba_idx], dtype=torch.int32, device='cpu'))
+        if self.mamba_state_free_slot_count >= self.max_requests:
+            raise RuntimeError("Cannot free a Mamba state slot when the pool is already full")
+        self.mamba_state_free_slots[self.mamba_state_free_slot_count] = mamba_idx
+        self.mamba_state_free_slot_count += 1
 
     def batch_allocate_slots(self, num_slots: int) -> Optional[torch.Tensor]:
         """
@@ -830,10 +811,6 @@ class MambaMetadata:
 
         # Filter out any invalid indices (e.g., -1)
         mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free != -1]
-        if self._retained_state_slot_count:
-            mamba_indices_to_free = mamba_indices_to_free[
-                ~self._retained_state_slots[mamba_indices_to_free.long()]
-            ]
         self._return_slots(mamba_indices_to_free)
 
         # Invalidate the Mamba state index for the finished requests

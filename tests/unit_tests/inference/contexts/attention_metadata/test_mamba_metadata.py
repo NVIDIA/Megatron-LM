@@ -51,20 +51,18 @@ class TestMambaMetadata:
         assert metadata.mamba_state_free_slot_count == 2
         assert int(metadata.allocate_slot()) == slot
 
-    def test_retained_live_slot_survives_request_cleanup_and_reset(self, monkeypatch):
-        monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    def test_detached_live_slot_survives_request_cleanup(self):
         metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
         slot = int(metadata.allocate_slot())
         metadata.request_to_mamba_state_idx[0] = slot
 
-        metadata.retain_state_slot(slot)
+        assert metadata.detach_state_slot(0) == slot
         metadata.free_slots(torch.tensor([0], dtype=torch.int64))
-        metadata.reset()
 
         assert metadata.mamba_state_free_slot_count == 1
         assert int(metadata.allocate_slot()) != slot
 
-        metadata.release_retained_state_slot(slot)
+        metadata.free_slot(slot)
 
         assert metadata.mamba_state_free_slot_count == 1
         assert int(metadata.allocate_slot()) == slot
