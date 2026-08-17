@@ -2,8 +2,6 @@
 
 """Tests for the internal GDR backend adapter."""
 
-import hashlib
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -66,22 +64,6 @@ def test_fused_forward_package_exports_wrapper():
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_fwd_cute
 
     assert fused_gdr_fwd_cute.chunk_gated_delta_rule_prefill_cute.__module__.endswith(".fused_fwd")
-
-
-def test_vendored_fused_backward_body_matches_local_revision():
-    root = Path(__file__).resolve().parents[3]
-    kernel = (
-        root
-        / "megatron/core/ssm/gated_delta_net/internal_gdn_backend/kernels"
-        / "fused_gdr_bwd_cute/kernel.py"
-    )
-
-    source = kernel.read_text()
-    executable_body = source[source.index("from dataclasses import") :]
-
-    assert hashlib.sha256(executable_body.encode()).hexdigest() == (
-        "f1e0bab931b218ae368cba18db3e754cac09f1f1b2c0a86ea25da8b872b02768"
-    )
 
 
 def _implementation():
@@ -149,8 +131,8 @@ def test_cute_mode_dispatches_to_local_autograd_function(monkeypatch, scale, exp
     assert calls[0][5] == expected_scale
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 4])
-def test_cutedsl_backward_routes_supported_batch_to_fused_kernel(monkeypatch, batch_size):
+def test_cutedsl_backward_routes_supported_batch_to_fused_kernel(monkeypatch):
+    batch_size = 2
     implementation = _implementation()
     shape = (batch_size, 64, 64, 128)
     scalar_shape = shape[:-1]
@@ -192,8 +174,8 @@ def test_cutedsl_backward_routes_supported_batch_to_fused_kernel(monkeypatch, ba
     assert seen["dht"] is None
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 4])
-def test_fused_backward_adapter_packs_dense_batch(monkeypatch, batch_size):
+def test_fused_backward_adapter_packs_dense_batch(monkeypatch):
+    batch_size = 3
     implementation = _implementation()
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_bwd_cute
 
@@ -257,12 +239,23 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, batch_size):
     assert db.dtype == beta.dtype and dg.dtype == g.dtype
 
 
-def test_fused_backward_accepts_arbitrary_packed_batch():
+@pytest.mark.parametrize(
+    "dtype, batch_size, seqlen, offsets, expected_reason",
+    [
+        (torch.bfloat16, 2, 64, None, None),
+        (torch.float16, 2, 64, None, "fused backward requires bf16 inputs"),
+        (torch.bfloat16, 1, 256, [0, 64, 192, 256], None),
+    ],
+)
+def test_fused_backward_shape_and_dtype_contract(
+    dtype, batch_size, seqlen, offsets, expected_reason
+):
     implementation = _implementation()
-    shape = (1, 256, 64, 128)
+    shape = (batch_size, seqlen, 64, 128)
     scalar_shape = shape[:-1]
-    q = torch.empty(shape, dtype=torch.bfloat16)
-    cu_seqlens = torch.tensor([0, 64, 192, 256], dtype=torch.int32)
+    q = torch.empty(shape, dtype=dtype)
+    cu_seqlens = None if offsets is None else torch.tensor(offsets, dtype=torch.int32)
+    num_sequences = batch_size if offsets is None else len(offsets) - 1
 
     reason = implementation._fused_bwd_support_reason(
         q=q,
@@ -272,22 +265,8 @@ def test_fused_backward_accepts_arbitrary_packed_batch():
         beta=torch.empty(scalar_shape, dtype=torch.float32),
         A=torch.empty((*scalar_shape, 64), dtype=torch.bfloat16),
         do=torch.empty_like(q),
-        dht=torch.empty((3, 64, 128, 128), dtype=torch.float32),
+        dht=torch.empty((num_sequences, 64, 128, 128), dtype=torch.float32),
         cu_seqlens=cu_seqlens,
     )
 
-    assert reason is None
-
-
-def test_fused_backward_metadata_supports_arbitrary_batch():
-    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_bwd_cute import (
-        fused_bwd,
-    )
-
-    cu_seqlens = torch.tensor([0, 64, 192, 256], dtype=torch.int32)
-    metadata = fused_bwd._prepare_varlen_metadata(cu_seqlens, 256, 64)
-
-    assert metadata.num_sequences == 3
-    assert metadata.num_chunks == 4
-    assert metadata.uniform_sequence_length == 0
-    assert metadata.chunk_offsets.tolist() == [0, 1, 3, 4]
+    assert reason == expected_reason

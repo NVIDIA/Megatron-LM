@@ -191,7 +191,7 @@ def _allocate_outputs(q, k, v, g, beta, dht):
 
 
 def _launch_fused_gdr_bwd_out(**kwargs):
-    from .kernel import launch_fused_gdr_bwd
+    from .launcher import launch_fused_gdr_bwd
 
     launch_fused_gdr_bwd(**kwargs)
 

@@ -1,4 +1,4 @@
-"""SM100 CuTeDSL layout and launch shell for fused GDR backward.
+"""SM100 CuTe DSL device kernel for fused GDR backward.
 
 This module is a CuTe DSL derivative of the fused GDR backward algorithm and
 warp-specialized schedule from QwenLM/FlashQLA commit
@@ -13,26 +13,21 @@ The inline-PTX helpers in ``tcgen05_ws.py`` are adapted from TileLang's CuTeDSL
 backend. Copyright (c) Tile-AI. Licensed under the MIT License.
 """
 
-from dataclasses import dataclass, field
-import os
-import threading
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import llvm
-from cutlass._mlir import ir
 import cutlass.pipeline as pipeline
 import cutlass.utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack
-import torch
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from . import tcgen05_ws
-
 
 try:
     from cutlass.cute.experimental import iket as _cute_iket
@@ -1002,114 +997,6 @@ def get_layout_budget() -> LayoutBudget:
     )
 
 
-def _cutlass_dtype(dtype: torch.dtype):
-    if dtype == torch.bfloat16:
-        return cutlass.BFloat16
-    if dtype == torch.float32:
-        return cutlass.Float32
-    if dtype == torch.int32:
-        return cutlass.Int32
-    raise TypeError(f"unsupported fused GDR CuTeDSL dtype: {dtype}")
-
-
-@dataclass(frozen=True)
-class _CompileCacheKey:
-    """All properties that can change one compiled device specialization."""
-
-    input_dtypes: tuple[str, ...]
-    output_dtypes: tuple[str, ...]
-    heads: int
-    grouped_heads: int
-    num_sequences: int
-    use_dht: bool
-    state_v_first: bool
-    device_index: int
-    capability: tuple[int, int]
-    uniform_sequence_length: int = 0
-    enable_iket: bool = False
-
-
-@dataclass(frozen=True)
-class _CompiledKernelArtifacts:
-    """Published artifacts that never own compile-call tensor descriptors."""
-
-    compiled: Any
-    kernel: Any
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedFusedGdrBwdLaunch:
-    """Immutable strong owner for one fixed-stream compiled replay."""
-
-    artifacts: _CompiledKernelArtifacts
-    launch_args: tuple[Any, ...]
-    torch_stream: Any
-    tensor_refs: tuple[Any, ...]
-
-    def __call__(self) -> None:
-        self.artifacts.compiled(*self.launch_args)
-
-
-@dataclass
-class _CompileCacheEntry:
-    """One independently synchronized specialization slot."""
-
-    lock: Any = field(default_factory=threading.Lock)
-    artifacts: _CompiledKernelArtifacts | None = None
-
-
-_COMPILE_CACHE_LOCK = threading.Lock()
-_COMPILE_CACHE: dict[_CompileCacheKey, _CompileCacheEntry] = {}
-
-
-def _clear_compile_cache_for_test() -> None:
-    """Drop published and in-flight entries between isolated tests."""
-
-    with _COMPILE_CACHE_LOCK:
-        _COMPILE_CACHE.clear()
-
-
-def _get_or_compile(
-    key: _CompileCacheKey,
-    build: Callable[[], _CompiledKernelArtifacts],
-) -> _CompiledKernelArtifacts:
-    """Return one atomically published build per specialization key."""
-
-    while True:
-        with _COMPILE_CACHE_LOCK:
-            entry = _COMPILE_CACHE.get(key)
-            if entry is None:
-                entry = _CompileCacheEntry()
-                _COMPILE_CACHE[key] = entry
-
-        artifacts = entry.artifacts
-        if artifacts is not None:
-            return artifacts
-
-        with entry.lock:
-            artifacts = entry.artifacts
-            if artifacts is not None:
-                return artifacts
-
-            with _COMPILE_CACHE_LOCK:
-                if _COMPILE_CACHE.get(key) is not entry:
-                    continue
-
-            try:
-                artifacts = build()
-            except BaseException:
-                with _COMPILE_CACHE_LOCK:
-                    if _COMPILE_CACHE.get(key) is entry:
-                        _COMPILE_CACHE.pop(key)
-                raise
-
-            with _COMPILE_CACHE_LOCK:
-                if _COMPILE_CACHE.get(key) is not entry:
-                    continue
-                entry.artifacts = artifacts
-            return artifacts
-
-
 class FusedGdrBwdKernel:
     """SM100 role, memory, MMA, TMA, and launch structure."""
 
@@ -1249,6 +1136,12 @@ class FusedGdrBwdKernel:
             )
         return cute.make_tiled_mma(op)
 
+    @staticmethod
+    def _mma_operand_view(staged_layout):
+        """Drop the singleton stage mode from an MMA SMEM layout."""
+
+        return cute.select(staged_layout, mode=[0, 1, 2])
+
     def _build_mma_layouts(self) -> _MmaLayoutFamily:
         """Build every operation orientation and its shared physical views."""
 
@@ -1297,7 +1190,7 @@ class FusedGdrBwdKernel:
         family = _MmaLayoutFamily(
             variants=variants,
             views={
-                name: cute.select(layout, mode=[0, 1, 2])
+                name: self._mma_operand_view(layout)
                 for name, layout in staged_views.items()
             },
             staged_views=staged_views,
@@ -1480,7 +1373,7 @@ class FusedGdrBwdKernel:
         ):
             staged = family.staged_views[name]
             view = family.views[name]
-            assert cute.select(staged, mode=[0, 1, 2]) == view
+            assert self._mma_operand_view(staged) == view
             assert cute.cosize(staged) == expected
             assert cute.cosize(view) == expected
 
@@ -1641,10 +1534,10 @@ class FusedGdrBwdKernel:
         token = family.variants["mm_64_64_128_k_k"]
         square = family.variants["mm_64_64_64_k_k"]
         state = family.variants["mm_128_64_128_k_k"]
-        token_a = cute.select(token.smem_a, mode=[0, 1, 2])
-        token_b = cute.select(token.smem_b, mode=[0, 1, 2])
-        square_a = cute.select(square.smem_a, mode=[0, 1, 2])
-        state_a = cute.select(state.smem_a, mode=[0, 1, 2])
+        token_a = self._mma_operand_view(token.smem_a)
+        token_b = self._mma_operand_view(token.smem_b)
+        square_a = self._mma_operand_view(square.smem_a)
+        state_a = self._mma_operand_view(state.smem_a)
 
         # Generic S2G TMA needs a flat top-level tile, unlike the nested
         # operand layouts accepted by the MMA-aware G2S helpers. These
@@ -6513,204 +6406,9 @@ class FusedGdrBwdKernel:
         )
 
 
-def _mark_token_mode(tensor: torch.Tensor, mode: int, divisibility: int):
-    cute_tensor = from_dlpack(tensor, assumed_align=16)
-    cute_tensor.mark_compact_shape_dynamic(
-        mode=mode,
-        stride_order=tuple(range(tensor.ndim)),
-        divisibility=divisibility,
-    )
-    return cute_tensor
-
-
-def _resolve_device_index(device) -> int:
-    index = device.index
-    if index is None:
-        index = torch.cuda.current_device()
-    return int(index)
-
-
-def prepare_fused_gdr_bwd_launch(
-    *,
-    q,
-    k,
-    v,
-    a,
-    g,
-    beta,
-    do,
-    dht,
-    h,
-    scale,
-    metadata,
-    outputs,
-    torch_stream,
-) -> _PreparedFusedGdrBwdLaunch:
-    """Bind one compiled CuTeDSL replay to tensors and a fixed torch stream."""
-
-    dq, dk, dv, dg, db, dh0 = outputs
-    cu_seqlens = metadata.cu_seqlens
-    chunk_offsets = metadata.chunk_offsets
-    heads = v.shape[2]
-    grouped_heads = q.shape[2]
-    if grouped_heads != heads:
-        raise ValueError(
-            "grouped_heads must equal heads; GQA head mapping is unsupported"
-        )
-    use_dht = True
-    state_v_first = False
-    uniform_sequence_length = getattr(metadata, "uniform_sequence_length", 0)
-    num_sequences = metadata.num_sequences
-    enable_iket = os.environ.get("FUSED_GDR_BWD_ENABLE_IKET") == "1"
-
-    input_tensors = (
-        q,
-        k,
-        v,
-        a,
-        g,
-        beta,
-        do,
-        dht,
-        h,
-        cu_seqlens,
-        chunk_offsets,
-    )
-    output_tensors = (dq, dk, dv, dg, db, dh0)
-    tensor_refs = input_tensors + output_tensors
-    device_index = _resolve_device_index(q.device)
-    for tensor in tensor_refs[1:]:
-        tensor_device_index = _resolve_device_index(tensor.device)
-        if tensor_device_index != device_index:
-            raise ValueError(
-                f"tensor device cuda:{tensor_device_index} does not match "
-                f"q device cuda:{device_index}"
-            )
-    stream_device_index = _resolve_device_index(torch_stream.device)
-    if stream_device_index != device_index:
-        raise ValueError(
-            f"torch_stream device cuda:{stream_device_index} does not match "
-            f"tensor device cuda:{device_index}"
-        )
-
-    capability = tuple(torch.cuda.get_device_capability(q.device))
-    driver_stream = cuda.CUstream(torch_stream.cuda_stream)
-    key = _CompileCacheKey(
-        input_dtypes=tuple(
-            str(tensor.dtype) for tensor in input_tensors
-        ),
-        output_dtypes=tuple(
-            str(tensor.dtype) for tensor in output_tensors
-        ),
-        heads=heads,
-        grouped_heads=grouped_heads,
-        num_sequences=num_sequences,
-        use_dht=use_dht,
-        state_v_first=state_v_first,
-        uniform_sequence_length=uniform_sequence_length,
-        device_index=device_index,
-        capability=capability,
-        enable_iket=enable_iket,
-    )
-
-    def build() -> _CompiledKernelArtifacts:
-        kernel = FusedGdrBwdKernel(
-            io_dtype=_cutlass_dtype(q.dtype),
-            acc_dtype=_cutlass_dtype(dht.dtype),
-            heads=heads,
-            grouped_heads=grouped_heads,
-            num_sequences=num_sequences,
-            use_dht=use_dht,
-            state_v_first=state_v_first,
-            uniform_sequence_length=uniform_sequence_length,
-            enable_iket=enable_iket,
-        )
-
-        compile_descriptors = (
-            _mark_token_mode(q, 1, _BT),
-            _mark_token_mode(k, 1, _BT),
-            _mark_token_mode(v, 1, _BT),
-            _mark_token_mode(a, 1, _BT),
-            _mark_token_mode(g, 1, _BT),
-            _mark_token_mode(beta, 1, _BT),
-            _mark_token_mode(do, 1, _BT),
-            from_dlpack(dht, assumed_align=16),
-            _mark_token_mode(h, 1, 1),
-            from_dlpack(cu_seqlens, assumed_align=4),
-            from_dlpack(chunk_offsets, assumed_align=4),
-            _mark_token_mode(dq, 1, _BT),
-            _mark_token_mode(dk, 1, _BT),
-            _mark_token_mode(dv, 1, _BT),
-            _mark_token_mode(dg, 1, _BT),
-            _mark_token_mode(db, 1, _BT),
-            from_dlpack(dh0, assumed_align=16),
-        )
-        compiled = cute.compile(
-            kernel,
-            *compile_descriptors,
-            scale,
-            driver_stream,
-            options="--enable-tvm-ffi --opt-level 2",
-        )
-        return _CompiledKernelArtifacts(
-            compiled=compiled,
-            kernel=kernel,
-        )
-
-    try:
-        artifacts = _get_or_compile(key, build)
-    finally:
-        del build
-
-    launch_args = tensor_refs + (scale, driver_stream)
-    return _PreparedFusedGdrBwdLaunch(
-        artifacts=artifacts,
-        launch_args=launch_args,
-        torch_stream=torch_stream,
-        tensor_refs=tensor_refs,
-    )
-
-
-def launch_fused_gdr_bwd(
-    *,
-    q,
-    k,
-    v,
-    a,
-    g,
-    beta,
-    do,
-    dht,
-    h,
-    scale,
-    metadata,
-    outputs,
-) -> None:
-    """Prepare and immediately replay on the caller's current torch stream."""
-
-    prepared = prepare_fused_gdr_bwd_launch(
-        q=q,
-        k=k,
-        v=v,
-        a=a,
-        g=g,
-        beta=beta,
-        do=do,
-        dht=dht,
-        h=h,
-        scale=scale,
-        metadata=metadata,
-        outputs=outputs,
-        torch_stream=torch.cuda.current_stream(device=q.device),
-    )
-    prepared()
-
-
 __all__ = [
     "FusedGdrBwdKernel",
     "LayoutBudget",
     "SharedStorage",
     "get_layout_budget",
-    "launch_fused_gdr_bwd",
-    "prepare_fused_gdr_bwd_launch",
 ]
