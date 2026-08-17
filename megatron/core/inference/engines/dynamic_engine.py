@@ -3073,10 +3073,19 @@ class DynamicInferenceEngine(AbstractEngine):
                 # server/coordinator side before the ZMQ hop so the engine
                 # receives ready tensors.
                 try:
-                    vlm_kwargs = resolve_multimodal_data_for_engine(
-                        multi_modal_data,
-                        image_preprocessing_config=self.context.config.image_preprocessing_config,
-                    )
+                    if multi_modal_data is None:
+                        # Skip the config-attribute lookup for text-only
+                        # requests so test fixtures (DummyContext) without an
+                        # image_preprocessing_config don't AttributeError on
+                        # every SUBMIT_REQUEST and desync the ranks.
+                        vlm_kwargs = {}
+                    else:
+                        vlm_kwargs = resolve_multimodal_data_for_engine(
+                            multi_modal_data,
+                            image_preprocessing_config=(
+                                self.context.config.image_preprocessing_config
+                            ),
+                        )
                     if vlm_kwargs:
                         self.add_request(request_id, prompt, sampling_params, **vlm_kwargs)
                     else:
