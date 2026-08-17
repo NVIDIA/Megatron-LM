@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from abc import ABC, abstractmethod
-from typing import Awaitable, Callable, Generic, NamedTuple, TypeAlias, TypeVar
+from typing import Awaitable, Callable, Generic, NamedTuple, TypeVar
 
 from pydantic import BaseModel
 
@@ -42,16 +42,6 @@ class GroupedRolloutRequest(Request):
 
 KNOWN_ROLLOUT_STATUSES = ('ok', 'placeholder', 'masked', 'graded')
 
-
-class EpochBoundary(NamedTuple):
-    """RLE boundary: `epoch` applies from `start_token_index` until the next boundary."""
-
-    start_token_index: int
-    epoch: int
-
-
-RolloutEpochBoundaries: TypeAlias = list[list[EpochBoundary]]
-"""Per-turn lists of epoch boundaries over the turn's cumulative token sequence."""
 
 
 class Rollout(AgentBaseModel):

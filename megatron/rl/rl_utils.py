@@ -80,7 +80,6 @@ from megatron.rl.agent.api import (
     GroupedRollouts,
     RewardEvaluationResult,
     Rollout,
-    RolloutEpochBoundaries,
     RolloutGroup,
     TokenRollout,
 )
@@ -287,6 +286,16 @@ def verify_model_weights_swap(
         if inf_was_training:
             inf_core.train()
 
+
+class EpochBoundary(NamedTuple):
+    """RLE boundary: `epoch` applies from `start_token_index` until the next boundary."""
+
+    start_token_index: int
+    epoch: int
+
+
+RolloutEpochBoundaries: TypeAlias = list[list[EpochBoundary]]
+"""Per-turn lists of epoch boundaries over the turn's cumulative token sequence."""
 
 
 class EpochSegment(NamedTuple):
