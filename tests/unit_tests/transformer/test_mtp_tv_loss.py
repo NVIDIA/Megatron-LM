@@ -5,13 +5,14 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.fusions import fused_mtp_tv as fused_tv_module
+from megatron.core.fusions.fused_mtp_tv import vocab_parallel_tv_distance
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import multi_token_prediction as mtp_module
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossAutoScaler,
     prepare_mtp_sequence_roll_context,
     process_mtp_loss,
-    vocab_parallel_tv_distance,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -124,6 +125,19 @@ def test_mtp_loss_type_validation():
         )
 
 
+def test_process_mtp_e2e_tv_requires_tp_group_for_sharded_logits(monkeypatch):
+    """A missing explicit TP group cannot silently normalize each vocab shard."""
+    monkeypatch.setattr(parallel_state, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", lambda: 2)
+    draft_logits = torch.randn(2, 1, 7, requires_grad=True)
+    target_logits = torch.randn_like(draft_logits)
+
+    with pytest.raises(ValueError, match="tp_group must be provided"):
+        vocab_parallel_tv_distance(
+            draft_logits, target_logits, tp_group=None, logits_are_vocab_sharded=True
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_full_vocab_tv_forward_and_gradient_match_native_reference(dtype):
@@ -217,6 +231,80 @@ def test_process_mtp_e2e_tv_matches_native_alignment_and_gradient():
         _assert_similarity(actual_grad, draft_reference.grad)
         torch.testing.assert_close(actual_grad, draft_reference.grad, rtol=1e-5, atol=1e-6)
     assert output_layer.weight.grad is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_process_mtp_e2e_tv_uses_fused_tv_prefix_and_logs_each_depth(monkeypatch):
+    """The integrated materialized-roll path dispatches both fused objectives."""
+    torch.manual_seed(26)
+    mtp_num_layers = 2
+    sequence_length = 7
+    hidden_size = 257
+    config = _make_tv_config(mtp_num_layers, hidden_size)
+    output_layer = _OutputLayer(torch.eye(hidden_size, device="cuda"))
+    hidden_states = torch.randn(
+        (1 + mtp_num_layers) * sequence_length, 1, hidden_size, device="cuda", requires_grad=True
+    )
+    loss_mask = torch.ones(1, sequence_length, device="cuda")
+    fused_tv_distances = []
+    fused_prefix_losses = []
+    logged = []
+
+    original_fused_tv = fused_tv_module._fused_vocab_parallel_tv_distance
+
+    def record_fused_tv(draft_logits, target_logits, tp_group, logits_are_vocab_sharded):
+        assert draft_logits.is_contiguous()
+        assert target_logits.is_contiguous()
+        result = original_fused_tv(draft_logits, target_logits, tp_group, logits_are_vocab_sharded)
+        fused_tv_distances.append(result.detach().clone())
+        return result
+
+    original_prefix_objective = mtp_module.mtp_e2e_prefix_objective
+
+    def record_prefix_objective(acceptances):
+        objective, prefix_losses = original_prefix_objective(acceptances)
+        fused_prefix_losses.append(prefix_losses.detach().clone())
+        return objective, prefix_losses
+
+    def record_loss(loss_sum, num_tokens, layer_number, num_layers, **kwargs):
+        assert num_layers == mtp_num_layers
+        assert kwargs["avg_group"] is None
+        logged.append((loss_sum.detach().clone(), num_tokens.detach().clone(), layer_number))
+
+    monkeypatch.setattr(fused_tv_module, "_fused_vocab_parallel_tv_distance", record_fused_tv)
+    monkeypatch.setattr(mtp_module, "mtp_e2e_prefix_objective", record_prefix_objective)
+    monkeypatch.setattr(parallel_state, "get_data_parallel_group", lambda **_: None)
+    monkeypatch.setattr(mtp_module.MTPLossLoggingHelper, "save_loss_to_tracker", record_loss)
+
+    MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0, device="cuda"))
+    result = process_mtp_loss(
+        hidden_states=hidden_states,
+        labels=torch.zeros(1, sequence_length, dtype=torch.long, device="cuda"),
+        loss_mask=loss_mask,
+        output_layer=output_layer,
+        output_weight=None,
+        runtime_gather_output=True,
+        is_training=True,
+        compute_language_model_loss=lambda *_: pytest.fail("cross entropy must not run for e2e TV"),
+        config=config,
+    )
+    result.sum().backward()
+
+    assert len(fused_tv_distances) == mtp_num_layers
+    assert len(fused_prefix_losses) == 1
+    actual_tv_distances = torch.stack(fused_tv_distances)
+    expected_prefix_losses = 1.0 - torch.cumprod(1.0 - actual_tv_distances, dim=0)
+    torch.testing.assert_close(fused_prefix_losses[0], expected_prefix_losses, rtol=1e-5, atol=1e-6)
+
+    chain_mask = torch.zeros(sequence_length, 1, device="cuda")
+    chain_mask[: sequence_length - mtp_num_layers] = 1
+    assert len(logged) == mtp_num_layers
+    for layer_number, (loss_sum, num_tokens, logged_layer_number) in enumerate(logged):
+        assert logged_layer_number == layer_number
+        torch.testing.assert_close(num_tokens, chain_mask.sum(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            loss_sum, torch.sum(fused_prefix_losses[0][layer_number] * chain_mask), rtol=0, atol=0
+        )
 
 
 def test_process_mtp_e2e_tv_masks_incomplete_packed_chains():
@@ -373,8 +461,9 @@ def test_process_mtp_e2e_tv_contiguous_packed_cp2_matches_global_reference(monke
         Utils.destroy_model_parallel()
 
 
-def test_vocab_parallel_tv_tp2_matches_full_vocab_reference():
-    """TP-sharded forward and local gradients match a full-vocabulary reference."""
+@pytest.mark.parametrize("logits_are_vocab_sharded", [False, True], ids=["gathered", "sharded"])
+def test_vocab_parallel_tv_tp2_matches_full_vocab_reference(logits_are_vocab_sharded):
+    """TP gathered/sharded forward and local gradients match a full-vocabulary reference."""
     if Utils.world_size < 2:
         pytest.skip("A distributed run with at least two ranks is required")
     Utils.initialize_model_parallel(tensor_model_parallel_size=2)
@@ -385,12 +474,19 @@ def test_vocab_parallel_tv_tp2_matches_full_vocab_reference():
         full_shape = (2, 1, 128256)
         full_draft_data = torch.randn(full_shape, dtype=torch.float32).cuda()
         full_target = torch.randn(full_shape, dtype=torch.float32).cuda()
-        local_draft_data = full_draft_data.chunk(2, dim=-1)[tp_rank].contiguous()
-        local_target = full_target.chunk(2, dim=-1)[tp_rank].contiguous()
+        if logits_are_vocab_sharded:
+            local_draft_data = full_draft_data.chunk(2, dim=-1)[tp_rank].contiguous()
+            local_target = full_target.chunk(2, dim=-1)[tp_rank].contiguous()
+        else:
+            local_draft_data = full_draft_data
+            local_target = full_target
 
         local_draft = local_draft_data.detach().clone().requires_grad_(True)
         actual = vocab_parallel_tv_distance(
-            local_draft, local_target, tp_group=tp_group, logits_are_vocab_sharded=True
+            local_draft,
+            local_target,
+            tp_group=tp_group,
+            logits_are_vocab_sharded=logits_are_vocab_sharded,
         )
         actual.sum().backward()
 
@@ -401,7 +497,11 @@ def test_vocab_parallel_tv_tp2_matches_full_vocab_reference():
         torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-6)
         assert local_draft.grad is not None
         assert full_draft.grad is not None
-        expected_local_grad = full_draft.grad.chunk(2, dim=-1)[tp_rank]
+        expected_local_grad = (
+            full_draft.grad.chunk(2, dim=-1)[tp_rank]
+            if logits_are_vocab_sharded
+            else full_draft.grad
+        )
         _assert_similarity(local_draft.grad, expected_local_grad)
         torch.testing.assert_close(local_draft.grad, expected_local_grad, rtol=1e-5, atol=1e-6)
     finally:
