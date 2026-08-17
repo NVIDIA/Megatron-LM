@@ -37,10 +37,10 @@ import torch
 from packaging.version import Version
 
 from megatron.core.tensor_parallel.gtp_cuda_graphs import (
-    allocate_graph_wgrad_rings,
     cuda_graph_pool_allocation,
+    get_graph_persistent_buffer,
     register_capture_comm,
-    register_capture_wgrad_ring_slot,
+    register_capture_wgrad_finalize,
 )
 from megatron.core.utils import ensure_params_ready, log_single_rank
 
@@ -294,6 +294,34 @@ _RS_STREAMS: Dict[str, torch.cuda.Stream] = {}
 # wgrad bufs need address stability for CG replay and are not pool-recycled.
 _wgrad_buf_pool: Dict[tuple, list] = {}
 
+
+def _get_reduce_scatter_output(weight, cache):
+    """Return a graph-persistent or ordinary cached reduce-scatter output."""
+    output = weight._gtp_rs_output
+    if output is not None:
+        return output
+    if weight._rs_ticket is None:
+        raise RuntimeError(f"GTP weight {weight._debug_name} has no reduce-scatter output")
+    return cache.get(weight._rs_ticket)
+
+
+def _release_reduce_scatter_output(weight, cache) -> None:
+    """Release the transient output or return an ungraphed output to the cache."""
+    output = weight._gtp_rs_output
+    if output is None and weight._rs_ticket is not None:
+        output = cache.get(weight._rs_ticket)
+    if output is not None and not torch.cuda.is_current_stream_capturing():
+        # Deferred accumulation consumes this output on the GTP RS stream. During eager discovery
+        # the fallback tensor was allocated on the caller stream, so transfer allocator ownership
+        # before dropping its final reference. Capture-owned arena views remain alive via the plan.
+        output.record_stream(torch.cuda.current_stream())
+
+    if weight._gtp_rs_output is not None:
+        weight._gtp_rs_output = None
+    elif weight._rs_ticket is not None:
+        cache.release(weight._rs_ticket)
+
+
 # Double-buffering for the grouped one-block-ahead chains (docs §3.4):
 #   - the weight cache shares ONE buffer per (shape, dtype, expert_idx) -> safe only while at
 #     most one same-key weight is live;
@@ -373,18 +401,6 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
     return _RS_STREAMS[key]
 
 
-def initialize_graph_wgrad_rings() -> None:
-    """Allocate persistent wgrad inputs before local CUDA-graph capture."""
-    allocate_graph_wgrad_rings(
-        _GTP_PARAMS,
-        full_iteration=_FULL_ITERATION,
-        async_reduction=GTP_CONFIG.async_reduction,
-        ring_size=GTP_CONFIG.graph_wgrad_ring_size,
-        graphed_chain_id=GTPChain.GRAPHED.value,
-        stream_key=_stream_key,
-    )
-
-
 def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """Fence the current stream against all GTP backward grad work before the DP gradient sync.
 
@@ -432,11 +448,6 @@ class GTPRematConfig:
     # wire, but accumulation no longer loses precision as the axis grows. Bypassed at axis size
     # <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
     reduce_scatter_with_fp32_accumulation: bool = False
-    # Persistent wgrad slots per scheduling/shape domain for partial-CG asynchronous reduce-scatter.
-    # Two slots cover the usual case of one same-key writer per graph. A graph containing multiple
-    # same-key writers may need more slots to keep all in-flight RS inputs distinct.
-    # TODO: Infer each domain's ring size automatically.
-    graph_wgrad_ring_size: int = 2
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -904,8 +915,10 @@ def _init_gtp_runtime_attrs(obj):
     obj.rs_state = GTPWeightState.NONE
     obj._wgrad_rs_handle = None
     obj.rs_event = torch.cuda.Event(external=True)
+    # GRAPHED chains retain eager outputs directly during discovery/warmup and substitute a
+    # planned fixed-address view during capture. UNGRAPHED chains continue to use _rs_ticket.
+    obj._gtp_rs_output = None
     obj._rs_ticket = None
-    obj._rs_a2a_bufs = None  # all-to-all scratch held by an in-flight fp32-accum RS
     # Padding
     obj.pad_length = 0
     # Debug
@@ -1734,13 +1747,24 @@ class GTPShardedParam(torch.nn.Parameter):
         return self.all_gather_and_prefetch(**kwargs)
 
     def get_wgrad_tensor(self):
-        """Return a logical-shape view of stable ring storage or ordinary scratch.
-
-        Capture ownership is registered later, when the final RS input is selected.
-        """
-        ring_slot = getattr(self, "_gtp_graph_wgrad_ring_slot", None)
-        if ring_slot is not None:
-            return self._gtp_graph_wgrad_ring_view
+        """Return wgrad scratch from the active persistent layout or eager pool."""
+        self._gtp_graph_wgrad_workspace = None
+        if _chain_is_graphed(self.chain_id):
+            padded = get_graph_persistent_buffer(self._unsharded_shape_padded, self.main_grad.dtype)
+            if padded is not None:
+                logical = (
+                    padded.narrow(0, 0, self._unsharded_shape[0]) if self.pad_length > 0 else padded
+                )
+                self._gtp_graph_wgrad_workspace = (padded, logical)
+                return logical
+            logical = torch.empty(
+                self._unsharded_shape,
+                dtype=self.main_grad.dtype,
+                device=self.device,
+                requires_grad=False,
+            )
+            self._gtp_graph_wgrad_workspace = (None, logical)
+            return logical
         return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
 
     def register_grad_accum_hook(
@@ -1778,8 +1802,10 @@ class GTPShardedParam(torch.nn.Parameter):
             dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype, zero=True)
         else:
             dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
-        if getattr(param, "_grad_accum_hook", None) is not None:
-            param._grad_accum_hook()
+        hook = getattr(param, "_grad_accum_hook", None)
+        if hook is not None:
+            register_capture_wgrad_finalize(param)
+            hook()
 
         param._set_rs_state(GTPWeightState.NONE)
         return dummy_grad
@@ -1806,31 +1832,29 @@ class GTPShardedParam(torch.nn.Parameter):
             if self._wgrad_rs_handle is not None:
                 waited = True
                 self._wgrad_rs_handle.wait()
-                self._record_graph_wgrad_ring_slots_ready()
                 self._wgrad_rs_handle = None
                 self.rs_event.record()
                 if finalize_grad:
                     cache = get_global_GTP_cache()
-                    for w in self._weights:
-                        wgrad_rs = cache.get(w._rs_ticket)
-                        w.main_grad.add_(wgrad_rs)
-                        cache.release(w._rs_ticket)
+                    for weight in self._weights:
+                        wgrad_rs = _get_reduce_scatter_output(weight, cache)
+                        weight.main_grad.add_(wgrad_rs)
+                        _release_reduce_scatter_output(weight, cache)
                     # Fire grad-ready AFTER all adds (separate loop so a bucket-completing
                     # grad-ready can't dispatch the RS before a sibling's add). With autograd
                     # grad-ready suppressed for GTP params (DDP register_grad_accum_hook), this
                     # is the only grad-ready for a weight finalized here; else the bucket orphans.
-                    for w in self._weights:
-                        self._handle_megatron_grad_accum(w)
+                    for weight in self._weights:
+                        self._handle_megatron_grad_accum(weight)
                     self._already_finalized = True
         self._release_comm_scratch()
         return waited
 
-    def _release_comm_scratch(self, attrs=("_wgrad_input_bufs", "_rs_a2a_bufs")):
+    def _release_comm_scratch(self, attrs=("_wgrad_input_bufs",)):
         """Release the buffers a finished RS was reading.
 
-        Its wgrad inputs, and the fp32-accum all-to-all scratch (input to the deferred FP32 sum,
-        so only free once the handle has been waited on). UNGRAPHED buffers go back to the pool;
-        GRAPHED just drops Python refs (addresses must stay stable for CG).
+        UNGRAPHED wgrad inputs go back to the pool after communication completes. GRAPHED inputs
+        just drop their Python references because their addresses belong to the persistent plan.
         """
         for attr in attrs:
             bufs = getattr(self, attr, None)
@@ -1840,16 +1864,6 @@ class GTPShardedParam(torch.nn.Parameter):
                 for buf in bufs:
                     _wgrad_pool_put(buf)
             setattr(self, attr, None)
-
-    def _record_graph_wgrad_ring_slots_ready(self) -> None:
-        """Publish that this RS has finished reading its persistent input slots."""
-        seen = set()
-        for weight in self._weights:
-            slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
-            if slot is None or id(slot) in seen:
-                continue
-            seen.add(id(slot))
-            slot.ready_event.record()
 
     def _prescale_wgrads_for_mean_rs(self, wgrads):
         """Pre-scale wgrad by 1/gtp_remat so the SUM reduce-scatter yields the gtp_remat mean.
@@ -1864,15 +1878,16 @@ class GTPShardedParam(torch.nn.Parameter):
         if gtp_remat_size > 1 and not GTP_CONFIG.calculate_per_token_loss:
             torch._foreach_mul_(list(wgrads), 1.0 / gtp_remat_size)
 
-    def _reduce_scatter_fp32_accum(self, tensor, out_buffer):
+    def _reduce_scatter_fp32_accum(self, tensor, out_buffer, weight):
         """Issue one fp32-accum reduce-scatter (all-to-all now, FP32 sum at wait) -> (out, handle).
 
         Always issued async, even for a sync RS: under a coalescing manager the all-to-all is
         only enqueued at context exit, so the handle's FP32 sum must never run inline here. The
         caller waits the handle (immediately when sync) and then releases the scratch.
 
-        The all-to-all scratch is unsharded-sized, so it comes from the wgrad pool: GTP keeps
-        several RS in flight and an empty_like each would add that much peak memory.
+        During capture, caller-provided scratch comes from the runner's persistent arena. Outside
+        capture, the work handle owns helper-allocated scratch until ``wait`` completes; using the
+        wgrad pool here is unsafe because that pool has no stream-completion fence.
         """
         # Local import: tensor_parallel has no top-level dependency on core.distributed.
         from megatron.core.distributed.reduce_scatter_with_fp32_accumulation import (
@@ -1884,7 +1899,11 @@ class GTPShardedParam(torch.nn.Parameter):
             out_shape = [tensor.shape[0] // self.group.size(), *tensor.shape[1:]]
             out_buffer = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
 
-        a2a_buf = _wgrad_pool_get(tuple(tensor.shape), tensor.dtype, tensor.device)
+        a2a_buf = None
+        fp32_accum_buf = None
+        if _chain_is_graphed(weight.chain_id):
+            a2a_buf = get_graph_persistent_buffer(tensor.shape, tensor.dtype)
+            fp32_accum_buf = get_graph_persistent_buffer(out_buffer.shape, torch.float32)
         handle = reduce_scatter_with_fp32_accumulation(
             out_buffer,
             tensor,
@@ -1892,10 +1911,8 @@ class GTPShardedParam(torch.nn.Parameter):
             group=self.group,
             async_op=True,
             all_to_all_output_tensor=a2a_buf,
+            fp32_accumulation_output_tensor=fp32_accum_buf,
         )
-        # Input to the deferred FP32 sum: held until the handle is waited on, then released by
-        # _release_comm_scratch (from _wait_reduce_scatter, or inline on the sync path).
-        self._rs_a2a_bufs = (self._rs_a2a_bufs or []) + [a2a_buf]
         return out_buffer, handle
 
     def _reduce_scatter(self, wgrads, async_op, nvtx_label=None):
@@ -1919,9 +1936,22 @@ class GTPShardedParam(torch.nn.Parameter):
             out_buffers = []
             cache = get_global_GTP_cache()
             for p, dt in zip(self._weights, dtypes):
-                if p._rs_ticket is None:
-                    p._rs_ticket = cache.reserve(p, dt, fwd=False, reduce_scatter=True)
-                out_buffers.append(cache.get(p._rs_ticket))
+                if _chain_is_graphed(p.chain_id):
+                    output = get_graph_persistent_buffer(p._sharded_padded_shape, dt)
+                    if output is None:
+                        output = torch.empty(
+                            p._sharded_padded_shape,
+                            dtype=dt,
+                            device=p.device,
+                            memory_format=torch.contiguous_format,
+                        )
+                    p._gtp_rs_output = output
+                else:
+                    p._gtp_rs_output = None
+                    if p._rs_ticket is None:
+                        p._rs_ticket = cache.reserve(p, dt, fwd=False, reduce_scatter=True)
+                    output = cache.get(p._rs_ticket)
+                out_buffers.append(output)
         else:
             out_buffers = [None] * len(wgrads)
 
@@ -1957,8 +1987,8 @@ class GTPShardedParam(torch.nn.Parameter):
                     with torch.distributed._coalescing_manager(
                         group=self.group, device=wgrads[0].device, async_ops=True
                     ) as cm:
-                        for out_buffer, tensor in zip(out_buffers, wgrads):
-                            out, h = self._reduce_scatter_fp32_accum(tensor, out_buffer)
+                        for weight, out_buffer, tensor in zip(self._weights, out_buffers, wgrads):
+                            out, h = self._reduce_scatter_fp32_accum(tensor, out_buffer, weight)
                             outputs.append(out)
                             sum_handles.append(h)
                     # The grouped work from _end_coalescing is the real completion; the per-op
@@ -1967,16 +1997,15 @@ class GTPShardedParam(torch.nn.Parameter):
                         h.all_to_all_handle = None
                     handle = _GTPCompositeWorkHandle([cm, *sum_handles])
                 else:
-                    out, handle = self._reduce_scatter_fp32_accum(wgrads[0], out_buffers[0])
+                    out, handle = self._reduce_scatter_fp32_accum(
+                        wgrads[0], out_buffers[0], self._weights[0]
+                    )
                     outputs.append(out)
                 nvtx_range_pop(f"{nvtx_label}.gtp_rs_fp32accum")
                 if async_op:
                     return outputs, handle
                 # Sync RS: the FP32 sums were deferred out of the issue loop, so finish here.
-                # Only the a2a scratch is ours to release — the wgrad inputs belong to the
-                # caller on this path (recycled in wgrad_reduce_scatter).
                 handle.wait()
-                self._release_comm_scratch(("_rs_a2a_bufs",))
                 return outputs, None
 
             if len(wgrads) == 1:
@@ -2000,31 +2029,42 @@ class GTPShardedParam(torch.nn.Parameter):
             return outputs, cm if async_op else None
 
     def _prepare_wgrad_reduce_scatter_inputs(self, wgrads):
-        """Return alignment-padded RS inputs with stable ownership when ring-backed.
-
-        A ring slot owns the full padded tensor. The wgrad GEMM writes only its logical prefix,
-        while the zero tail remains untouched. If a caller did not produce wgrad directly into
-        that prefix, copy it there before RS.
-        """
+        """Return padded RS inputs backed by persistent storage during graph capture."""
         prepared = []
         for weight, wgrad in zip(self._weights, wgrads):
-            slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
-            if slot is None:
+            workspace = getattr(weight, "_gtp_graph_wgrad_workspace", None)
+            if workspace is not None:
+                padded, logical_view = workspace
+            elif _chain_is_graphed(weight.chain_id):
+                padded = get_graph_persistent_buffer(weight._unsharded_shape_padded, wgrad.dtype)
+                logical_view = None
+            else:
+                padded = None
+                logical_view = None
+
+            weight._gtp_graph_wgrad_workspace = None
+            if padded is None:
                 if weight.pad_length > 0:
                     wgrad = torch.nn.functional.pad(wgrad, (0, 0, 0, weight.pad_length))
                 prepared.append(wgrad)
                 continue
 
-            register_capture_wgrad_ring_slot(slot, weight)
-            logical_view = weight._gtp_graph_wgrad_ring_view
+            if logical_view is None:
+                logical_view = (
+                    padded.narrow(0, 0, weight._unsharded_shape[0])
+                    if weight.pad_length > 0
+                    else padded
+                )
             if tuple(wgrad.shape) != tuple(logical_view.shape):
                 raise RuntimeError(
-                    f"GTP wgrad shape {tuple(wgrad.shape)} does not match ring view "
+                    f"GTP wgrad shape {tuple(wgrad.shape)} does not match persistent view "
                     f"{tuple(logical_view.shape)} for {weight._debug_name}"
                 )
             if wgrad.data_ptr() != logical_view.data_ptr():
                 logical_view.copy_(wgrad)
-            prepared.append(slot.tensor)
+            if weight.pad_length > 0:
+                padded.narrow(0, weight._unsharded_shape[0], weight.pad_length).zero_()
+            prepared.append(padded)
 
         return prepared
 
@@ -2095,17 +2135,17 @@ class GTPShardedParam(torch.nn.Parameter):
                 self.next_w.rs_event.wait()
                 cache = get_global_GTP_cache()
                 next_weights = self.next_w._weights
-                wgrads = [cache.get(w._rs_ticket) for w in next_weights]
+                wgrads = [_get_reduce_scatter_output(weight, cache) for weight in next_weights]
                 nvtx_range_push(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
                 # Only batch with _foreach_add_ when finalizing multiple (routed) weights.
                 if len(next_weights) == 1:
                     next_weights[0].main_grad.add_(wgrads[0])
                 else:
-                    torch._foreach_add_([w.main_grad for w in next_weights], wgrads)
+                    torch._foreach_add_([weight.main_grad for weight in next_weights], wgrads)
                 nvtx_range_pop(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
-                for w in next_weights:
-                    self._handle_megatron_grad_accum(w)
-                    cache.release(w._rs_ticket)
+                for weight in next_weights:
+                    self._handle_megatron_grad_accum(weight)
+                    _release_reduce_scatter_output(weight, cache)
 
         return ret
 
@@ -2302,20 +2342,18 @@ class GTPWeightCache:
     def release(self, ticket: int):
         """Release a reusable buffer to the pool while keeping its ticket valid.
 
-        Captured reduce-scatter tickets keep exclusive ownership. ``slot.buf`` is never cleared,
-        so every CUDA-graph ticket retains a stable address across replays.
+        An ungraphed reduce-scatter ticket must relinquish its buffer ownership. A later ``get``
+        then checks out storage again instead of retaining an alias to another live RS output.
         """
         slot = self._slots[ticket]
         if slot.buf is None:
-            return
-        # Independently replayed graphs may overlap, so a captured RS output must not be recycled
-        # into another fixed-address ticket.
-        if slot.chain_id == GTPChain.GRAPHED.value and slot.reduce_scatter:
             return
         # Use identity check — tensor == tensor returns a multi-element bool tensor
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
         if not any(b is slot.buf for b in self._pool.get(slot.key, [])):
             self._pool[slot.key].append(slot.buf)
+        if slot.reduce_scatter and not _chain_is_graphed(slot.chain_id):
+            slot.buf = None
 
     def clear(self):
         """Drop all buffers; tickets remain valid and lazily re-allocate on next get()."""
@@ -2382,7 +2420,9 @@ def wait_async_comms(
             rs_was_in_scope = (
                 had_rs
                 if params is not None
-                else any(w._rs_ticket is not None for w in param._weights)
+                else any(
+                    w._rs_ticket is not None or w._gtp_rs_output is not None for w in param._weights
+                )
             )
             param._wait_reduce_scatter(finalize_grad=finalize_after_drain)
             # Fallback inline-accumulation: only when finalize is requested, _wait_reduce_scatter
@@ -2398,9 +2438,9 @@ def wait_async_comms(
                 param.rs_event.wait()
                 for w in param._weights:
                     w._set_rs_state(GTPWeightState.NONE)
-                    wgrad_rs = cache.get(w._rs_ticket)
+                    wgrad_rs = _get_reduce_scatter_output(w, cache)
                     w.main_grad.add_(wgrad_rs)
-                    cache.release(w._rs_ticket)
+                    _release_reduce_scatter_output(w, cache)
                     if hasattr(w, "grad_added_to_main_grad"):
                         w.grad_added_to_main_grad = True
                 param._already_finalized = True

@@ -24,7 +24,7 @@ Test groups
 - TestGTPDDPBucketAlignment  - GTP/regular DDP bucket ends padded for dist-opt alignment
 - TestGTPDDPGradReadyWiring  - GTP params drive DDP grad-ready via the manual hook, not autograd
 - TestGTPWeightCacheSchedulingDomain - cache reuse stays within one chain/process-group domain
-- TestGTPGraphWgradRing       - partial-CG wgrad ring ownership and RS-input correctness
+- TestGTPPersistentBuffers    - inferred partial-CG wgrad workspace ownership
 
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` != the required world size (4).
 """
@@ -52,6 +52,13 @@ from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTPShardedParam,
     GTPWeightCache,
     wrap_module_params_gtp,
+)
+from megatron.core.tensor_parallel.gtp_cuda_graphs import (
+    GraphPersistentBufferPlan,
+    GraphPersistentBufferState,
+    get_graph_persistent_buffer,
+    set_graph_persistent_buffer_discovery,
+    use_graph_persistent_buffer_state,
 )
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
     _make_gtp_linear,
@@ -109,6 +116,24 @@ class TestGTPWeightCacheSchedulingDomain:
         other = self._make_param(other_group, GTPChain.UNGRAPHED.value)
         other_ticket = cache.reserve(other, torch.bfloat16, fwd=True)
         assert cache.get(other_ticket) is not first_buffer
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
+    def test_ungraphed_rs_ticket_reacquires_released_storage(self):
+        cache = GTPWeightCache()
+        group = _FakeGroup(size=2)
+        first = self._make_param(group, GTPChain.UNGRAPHED.value)
+        second = self._make_param(group, GTPChain.UNGRAPHED.value)
+
+        first_ticket = cache.reserve(first, torch.bfloat16, fwd=False, reduce_scatter=True)
+        first_buffer = cache.get(first_ticket)
+        cache.release(first_ticket)
+        second_ticket = cache.reserve(second, torch.bfloat16, fwd=False, reduce_scatter=True)
+        second_buffer = cache.get(second_ticket)
+        assert second_buffer is first_buffer
+
+        # MTP can leave both results pending at a chain tail. Reacquiring the first ticket while
+        # the second is live must not retain the pooled alias now owned by the second ticket.
+        assert cache.get(first_ticket) is not second_buffer
 
 
 def _worker_sharding_aligned(rank, world_size, port):
@@ -1440,7 +1465,7 @@ class TestGTPDDPGradReadyWiring:
         _run_distributed(_worker_gtp_ddp_grad_ready_wiring, 4)
 
 
-class TestGTPGraphWgradRing:
+class TestGTPPersistentBuffers:
     @staticmethod
     def _make_padded_chain(count=4):
         group = _FakeGroup(size=2)
@@ -1456,94 +1481,128 @@ class TestGTPGraphWgradRing:
         return weights
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
-    def test_partial_cg_wgrad_ring_ownership(self, monkeypatch):
-        monkeypatch.setattr(gtp_module, "_FULL_ITERATION", False)
-        monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
-        monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
-        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
+    def test_repeated_wgrads_infer_distinct_persistent_slices(self):
+        weight = self._make_padded_chain(count=1)[0]
+        state = GraphPersistentBufferState()
 
-        weights = self._make_padded_chain()
-        monkeypatch.setattr(gtp_module, "_GTP_PARAMS", weights)
-        gtp_module.initialize_graph_wgrad_rings()
+        try:
+            set_graph_persistent_buffer_discovery(state)
+            for value in range(3):
+                wgrad = weight.get_wgrad_tensor()
+                if value == 1:
+                    # Some TE paths may return a different GEMM output than grad_buffer().
+                    assert weight._gtp_graph_wgrad_workspace[1] is wgrad
+                    wgrad = torch.empty_like(wgrad)
+                wgrad.fill_(value + 1)
+                weight._prepare_wgrad_reduce_scatter_inputs([wgrad])
+            set_graph_persistent_buffer_discovery(None)
 
-        slot_1 = weights[1]._gtp_graph_wgrad_ring_slot
-        slot_2 = weights[2]._gtp_graph_wgrad_ring_slot
-        slot_3 = weights[3]._gtp_graph_wgrad_ring_slot
-        assert slot_1 is not slot_2
-        assert slot_1 is slot_3
-        assert len(gtp_cuda_graphs._GRAPH_WGRAD_RINGS) == 1
-        assert slot_1.ready_event.query()
+            assert len(state.capacities) == 1
+            plan = GraphPersistentBufferPlan.create([state])
 
-        capture_state = gtp_cuda_graphs.GTPCaptureCommState()
-        monkeypatch.setattr(gtp_cuda_graphs, "_ACTIVE_CAPTURE_COMM_STATE", capture_state)
-        logical_view = weights[1].get_wgrad_tensor()
-        assert not capture_state.wgrad_ring_slots
-        assert slot_1.tensor.shape == (6, 4)
-        assert logical_view.shape == (4, 4)
-        assert logical_view.data_ptr() == slot_1.tensor.data_ptr()
+            captured_inputs = []
+            with use_graph_persistent_buffer_state(state):
+                for value in range(3):
+                    wgrad = weight.get_wgrad_tensor()
+                    wgrad.fill_(value + 1)
+                    captured_inputs.append(weight._prepare_wgrad_reduce_scatter_inputs([wgrad])[0])
 
-        logical_view.fill_(7)
-        prepared = weights[1]._prepare_wgrad_reduce_scatter_inputs([logical_view])
-        assert capture_state.wgrad_ring_slots == [slot_1]
-        assert prepared[0] is slot_1.tensor
-        assert torch.count_nonzero(slot_1.tensor[4:]) == 0
+            assert len({tensor.data_ptr() for tensor in captured_inputs}) == 3
+            for value, tensor in enumerate(captured_inputs, start=1):
+                assert tensor.shape == (6, 4)
+                torch.testing.assert_close(tensor[:4], torch.full_like(tensor[:4], value))
+                assert torch.count_nonzero(tensor[4:]) == 0
+        finally:
+            set_graph_persistent_buffer_discovery(None)
+            if "plan" in locals():
+                plan.clear()
 
-        with pytest.raises(RuntimeError, match="increase GTP_CONFIG.graph_wgrad_ring_size"):
-            weights[3]._prepare_wgrad_reduce_scatter_inputs([logical_view])
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_graphed_rs_output_does_not_require_a_weight_cache_ticket(self):
+        weight = self._make_padded_chain(count=1)[0]
+        output = torch.empty(weight._sharded_padded_shape, device="cuda")
+        weight._gtp_rs_output = output
+        weight._rs_ticket = None
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
-    def test_native_fp8_style_param_uses_wgrad_ring(self, monkeypatch):
-        """GTP-tagged native-FP8 params are not GTPShardedParam instances."""
+        class RejectCache:
+            def get(self, ticket):
+                raise AssertionError("graphed RS output unexpectedly used the weight cache")
 
-        class NativeFP8StyleParam:
-            def __init__(self, group):
-                self.is_gtp_weight_remat = True
-                self.group = group
-                self.chain_id = GTPChain.GRAPHED.value
-                self.pad_length = 2
-                self.expert_idx = 0
-                self.device = torch.device("cuda")
-                self.main_grad = torch.empty(3, 4, device=self.device)
-                self._unsharded_shape = (4, 4)
-                self._unsharded_shape_padded = (6, 4)
-                self.prev_w = None
-                self.next_w = None
-                self._weights = [self]
+            def release(self, ticket):
+                raise AssertionError("graphed RS output unexpectedly released a cache ticket")
 
-        monkeypatch.setattr(gtp_module, "_FULL_ITERATION", False)
-        monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
-        monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
-        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
-
-        group = _FakeGroup(size=2)
-        first = NativeFP8StyleParam(group)
-        second = NativeFP8StyleParam(group)
-        first.next_w = second
-        second.prev_w = first
-        monkeypatch.setattr(gtp_module, "_GTP_PARAMS", [first, second])
-
-        gtp_module.initialize_graph_wgrad_rings()
-
-        assert second._gtp_graph_wgrad_ring_slot.tensor.shape == (6, 4)
-        assert len(gtp_cuda_graphs._GRAPH_WGRAD_RINGS) == 1
+        cache = RejectCache()
+        assert gtp_module._get_reduce_scatter_output(weight, cache) is output
+        gtp_module._release_reduce_scatter_output(weight, cache)
+        assert weight._gtp_rs_output is None
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
-    def test_rs_input_copies_into_ring(self, monkeypatch):
-        monkeypatch.setattr(gtp_module, "_FULL_ITERATION", False)
-        monkeypatch.setattr(gtp_module.GTP_CONFIG, "async_reduction", True)
-        monkeypatch.setattr(gtp_module.GTP_CONFIG, "graph_wgrad_ring_size", 2)
-        monkeypatch.setattr(gtp_cuda_graphs, "_GRAPH_WGRAD_RINGS", {})
+    def test_empty_runner_does_not_consume_a_generation(self):
+        first = GraphPersistentBufferState()
+        first.record((16,), torch.float32)
+        empty = GraphPersistentBufferState()
+        second = GraphPersistentBufferState()
+        second.record((16,), torch.float32)
+        states = [first, empty, second]
 
-        weights = self._make_padded_chain(count=2)
-        monkeypatch.setattr(gtp_module, "_GTP_PARAMS", weights)
-        gtp_module.initialize_graph_wgrad_rings()
+        plan = GraphPersistentBufferPlan.create(states)
+        try:
+            with use_graph_persistent_buffer_state(first):
+                first_view = get_graph_persistent_buffer((16,), torch.float32)
+            with use_graph_persistent_buffer_state(empty):
+                pass
+            with use_graph_persistent_buffer_state(second):
+                second_view = get_graph_persistent_buffer((16,), torch.float32)
 
-        wgrad = torch.arange(16, dtype=torch.float32, device="cuda").reshape(4, 4)
-        rs_input = weights[1]._prepare_wgrad_reduce_scatter_inputs([wgrad])[0]
+            assert empty.generation is None
+            assert first.generation != second.generation
+            assert first_view.data_ptr() != second_view.data_ptr()
+        finally:
+            plan.clear()
 
-        assert rs_input is weights[1]._gtp_graph_wgrad_ring_slot.tensor
-        torch.testing.assert_close(rs_input[:4], wgrad)
-        assert torch.count_nonzero(rs_input[4:]) == 0
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
+    def test_generation_fences_allow_reordered_replay(self):
+        states = []
+        for _ in range(3):
+            state = GraphPersistentBufferState()
+            state.record((16,), torch.float32)
+            states.append(state)
+        plan = GraphPersistentBufferPlan.create(states)
+
+        try:
+
+            class RecordingStream:
+                def __init__(self):
+                    self.waited_events = []
+
+                def wait_event(self, event):
+                    self.waited_events.append(event)
+
+            recording_stream = RecordingStream()
+            states[0].wait_for_reuse(recording_stream)
+            assert recording_stream.waited_events == [plan._ready_events[states[0].generation]]
+
+            stream = torch.cuda.current_stream()
+            for runner_index in (0, 1, 2, 1):
+                state = states[runner_index]
+                state.wait_for_reuse(stream)
+                state.mark_reusable_after(stream)
+            stream.synchronize()
+        finally:
+            plan.clear()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
+    def test_capture_must_consume_discovered_capacity(self):
+        state = GraphPersistentBufferState()
+        state.record((128,), torch.float32)
+        plan = GraphPersistentBufferPlan.create([state])
+
+        try:
+            with pytest.raises(RuntimeError, match="consumed 64/128"):
+                with use_graph_persistent_buffer_state(state):
+                    get_graph_persistent_buffer((64,), torch.float32)
+        finally:
+            plan.clear()
 
 
 class TestActivationRecomputePhaseFlag:
@@ -1591,3 +1650,16 @@ class TestActivationRecomputePhaseFlag:
             f"expected [original fwd=False, recompute fwd=True], got {observed}: "
             "in_activation_recompute_phase no longer tracks BF16 activation recompute"
         )
+
+
+class TestGTPCaptureWgradFinalize:
+    def test_wgrad_finalization_preserves_repeated_occurrences(self):
+        first = object()
+        second = object()
+
+        with gtp_cuda_graphs.track_gtp_capture_comms() as capture:
+            gtp_cuda_graphs.register_capture_wgrad_finalize(first)
+            gtp_cuda_graphs.register_capture_wgrad_finalize(second)
+            gtp_cuda_graphs.register_capture_wgrad_finalize(first)
+
+        assert capture.finalized_params == [first, second, first]

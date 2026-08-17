@@ -94,12 +94,12 @@ CG compatibility is designed-in from day one, not retrofitted. The entire sync /
 
 - **Chains never cross-link across the capture axis** (`GTPChain.GRAPHED` / `GTPChain.UNGRAPHED`, plus the eager-only grouped-expert chains of §3.4). `prev_w` / `next_w` only connect same-chain params, so a captured traversal never reaches into eager Python and vice-versa.
 - **`torch.cuda.Event(external=True)`** for `ag_event` / `rs_event` — the events survive CG capture boundaries and can be waited on from replay-time streams.
-- **Idempotent ticket cache**: `GTPWeightCache.get(ticket)` keeps `slot.buf` set even after `release()`, so replays read the same buffer address as capture. `clear()` drops buffers while keeping tickets valid → supports CG re-capture with lazy re-allocation.
-- **Allocate-in-pool at creation** (`set_cuda_graph_mempool` + `cuda_graph_pool_allocation`): GRAPHED-chain AG/RS buffers and quantized weight storage are allocated **directly into the CG memory pool** at first creation (during warmup, before capture), so no CUDA allocations happen inside the captured graph and no post-hoc reallocation/clone is needed. UNGRAPHED buffers stay in regular allocator memory.
+- **Idempotent gather cache**: `GTPWeightCache.get(ticket)` keeps `slot.buf` set even after `release()`, so captured all-gathers replay against the same address. `clear()` drops buffers while keeping tickets valid, supporting CG re-capture with lazy re-allocation. Ungraphed RS outputs use the same cache; graphed RS outputs use the persistent backward arenas below.
+- **Stable graph-owned backward storage**: padded wgrad inputs, asynchronous RS outputs, and FP32-RS scratch are discovered eagerly and allocated before capture in two fixed-address generations outside the CG memory pool. Capture only takes stable views; it does not allocate a per-weight ring or cache ticket.
 - **Lazy, one-shot chain linking**: `prefetch_initialized` is flipped during the first fwd (warmup), so the chain-construction Python side-effects never execute inside a captured graph. The link table is buffered and flushed atomically at the second forward.
 - **DDP hook manual triggering**: `register_grad_accum_hook` stores the DDP hook on the param; `_CudagraphReplayNode.backward` calls it manually after replay (since `AccumulateGrad` hooks are silenced by replay). This is also how the `assert self.grad_reduce_handle is not None` failure from partial-CG + overlap-grad-reduce is resolved.
-- **Warmup is side-effect-free on `main_grad`**: GTP_remat accumulates wgrad into `main_grad` *inside* the backward (the fusion path returns wgrads as graph outputs instead). Graph capture only *records* ops; it never runs them. But `create_fwd_graph` runs an **eager** warmup fwd+bwd before capturing. That warmup backward executes GTP_remat's `main_grad.add_`. Its deferred cascade adds into a cross-graph `next_w` (another module) from a **stale RS ticket** — the prior backward's wgrad. And `create_cudagraphs()` runs *after* `finalize_model_grads`. So this overwrites the finalized (reduced + per-token-scaled) grads and spikes the step's grad norm. **Fix**: `create_fwd_graph` snapshots the grads its warmup touches — own params + cross-graph `next_w` — via `_backup_grads_before_capture`, then restores them after capture. The bwd graph has no warmup, so it needs none. Bounded to one module's grads.
-- **Graph-owned two-stage backward drain**: Stage 1 drains only the all-gathers issued by the current graph and records `bwd_completion_event`, allowing the next backward graph to start. Stage 2 drains that graph's reduce-scatters, accumulates the result into `main_grad`, and releases its persistent wgrad-ring slots. See [§3.6](#cross-graph-backward-reduce-scatter-overlap).
+- **Warmup is side-effect-free on `main_grad`**: GTP_remat accumulates wgrad into `main_grad` *inside* the backward (the fusion path returns wgrads as graph outputs instead). Graph capture only *records* ops; it never runs them. But `create_fwd_graph` runs an **eager** warmup fwd+bwd before capturing. That warmup backward executes GTP_remat's `main_grad.add_`, including a deferred cross-graph `next_w` finalize from the prior backward. And `create_cudagraphs()` runs *after* `finalize_model_grads`. So this overwrites the finalized (reduced + per-token-scaled) grads and spikes the step's grad norm. **Fix**: `create_fwd_graph` snapshots the grads its warmup touches — own params + cross-graph `next_w` — via `_backup_grads_before_capture`, then restores them after capture. The bwd graph has no warmup, so it needs none. Bounded to one module's grads.
+- **Graph-owned two-stage backward drain**: Stage 1 drains only the all-gathers issued by the current graph and records `bwd_completion_event`, allowing the next backward graph to start. Stage 2 preserves the existing reduce-scatter drain and gradient-finalization schedule. After the graph tail, the replay wrapper releases its persistent workspace generation. See [§3.6](#cross-graph-backward-reduce-scatter-overlap).
 - **Side-stream registration**: the `(GRAPHED, gtp_remat_group)` ag/rs streams are materialized at runner init (`_register_gtp_side_streams`) so they are captured before the first forward.
 
 ### 1.3 Low-precision gather (native FP8 / NVFP4 param)
@@ -243,7 +243,6 @@ The table below covers every GTP-related CLI flag and Python knob. "Required" me
 | `weight_prefetch` | `True` | Disable only to debug the synchronous cold-start path. |
 | `async_reduction` | `True` | Async wgrad reduce-scatter; disable for easier debugging. |
 | `calculate_per_token_loss` | `False` | Must mirror `config.calculate_per_token_loss` (SUM vs MEAN RS). |
-| `graph_wgrad_ring_size` | `2` | Persistent wgrad ring slots per scheduling domain (§3.6). Increase if capture rejects same-key writers. |
 
 ### 2.2 Required flags
 
@@ -312,7 +311,7 @@ At iter-0 you'll see one rank-0 log line confirming the active config:
 ```
 GTP_remat enabled. GTPRematConfig(pad_for_alignment=16, check_param_states=False,
   weight_prefetch=True, async_reduction=True, calculate_per_token_loss=False,
-  reduce_scatter_with_fp32_accumulation=False, graph_wgrad_ring_size=2)
+  reduce_scatter_with_fp32_accumulation=False)
 ```
 
 ### 2.5 Tuning knobs
@@ -326,7 +325,6 @@ update_gtp_config(
     async_reduction=True,         # Whether to perform GTP_remat gradient reduction asynchronously
     calculate_per_token_loss=False,  # Mirror config.calculate_per_token_loss (SUM vs MEAN RS)
     reduce_scatter_with_fp32_accumulation=False,  # wgrad RS: BF16 all-to-all + FP32 sum (§2.6)
-    graph_wgrad_ring_size=2,      # Persistent wgrad slots per graph scheduling domain
 )
 ```
 
@@ -418,9 +416,10 @@ The figure visualizes the per-class split from the list above: green = resolves 
 
 #### Buffer / memory management
 
-Two distinct pools with explicit lifecycle rules:
+Three storage paths cover three different lifetimes:
 
-- **`GTPWeightCache`** (AG/RS output buffers) — ticket-based, keyed on `(shape, dtype, fwd, expert_idx, reduce_scatter)`, plus a `("recompute", parity)` suffix for recompute-chain gathers. Same-shape buffers across layers are shared, **except between chain neighbours** — one-step-ahead keeps the predecessor and the current weight live at once, so `_ensure_no_shared_buffer_with` folds a parity bit into the key when the two would collide, at the cost of one extra buffer for the second of the pair. The caller names which chain to guard, because the chains disagree on who a weight's neighbour is: on the fwd chain the check is normally inert (neighbours are different roles, hence different shapes) and fires only when CG capture leaves two same-shaped weights adjacent — embedding + output_layer alone in the `UNGRAPHED` chain — whereas on a recompute chain same-shape adjacency is the norm. Tickets persistent; buffer allocated lazily on first `get()`; addresses stable across iterations for CG replay.
+- **`GTPWeightCache`** (AG and ungraphed RS outputs) — ticket-based, keyed on `(shape, dtype, fwd, expert_idx, reduce_scatter)`, plus a `("recompute", parity)` suffix for recompute-chain gathers. Same-shape buffers across layers are shared, **except between chain neighbours** — one-step-ahead keeps the predecessor and the current weight live at once, so `_ensure_no_shared_buffer_with` folds a parity bit into the key when the two would collide, at the cost of one extra buffer for the second of the pair. The caller names which chain to guard, because the chains disagree on who a weight's neighbour is: on the fwd chain the check is normally inert (neighbours are different roles, hence different shapes) and fires only when CG capture leaves two same-shaped weights adjacent — embedding + output_layer alone in the `UNGRAPHED` chain — whereas on a recompute chain same-shape adjacency is the norm. Tickets persist; buffers allocate lazily on first `get()`.
+- **`GraphPersistentBufferPlan`** (graphed backward temporaries) — eager discovery records each runner's aligned per-dtype capacity. Capture bump-allocates fixed views for padded wgrads, RS outputs, and FP32-RS scratch from bounded alternating arenas. A generation event protects every reused address through the full graph and side-stream tail.
 - **`_wgrad_buf_pool`** (wgrad-GEMM output recycling) — holds the **full, unsharded** wgrad-GEMM output buffer (shape `_unsharded_shape`, dtype `main_grad.dtype` — fp32 when `grad_reduce_in_fp32`, else bf16). The TE backward writes the wgrad into it via `main_grad_func = weight.grad_buffer` (a `DistributedWeight` protocol method backed by `get_wgrad_tensor`; it is a *scratch*, distinct from the sharded `param.main_grad`); the protocol's `finalize_group_grads` (backed by `wgrad_reduce_scatter`) then reduce-scatters it down to the shard and the buffer is returned here. This is a full-weight-shaped fp32/bf16 transient — one of the larger per-weight buffers — and is **precision-independent** (wgrad is always computed in high precision), so it is identical in BF16 vs MXFP8 runs. Buffers are tagged `_from_gtp_wgrad_pool=True` at `_wgrad_pool_get`; `_wgrad_pool_put` no-ops on foreign buffers (fresh allocs from Megatron `layers.py` or aten F.embedding bwd) → caching allocator handles those, so the pool never accumulates untagged buffers.
 
 #### Overlap design summary
@@ -694,7 +693,7 @@ Stage 1: graph-owned AG handles -> wait graph-owned AG streams
 Stage 2: graph-owned RS handles -> finalize main_grad -> wait graph-owned RS streams
 ```
 
-`bwd_completion_event` is recorded after Stage 2. The next graph therefore starts after the current graph's AG, RS, and `main_grad` finalization have completed. Because the RS input lifetime cannot extend into the next graph, no persistent cross-graph wgrad ring is required.
+`bwd_completion_event` is recorded after Stage 2. The next graph therefore starts after the current graph's AG, RS, and `main_grad` finalization have completed. Because the RS input lifetime cannot extend into the next graph, no persistent cross-graph workspace is required.
 
 ```text
 time -------------------------------------------------------------------------------->
@@ -708,21 +707,21 @@ main stream                                                             wait com
 
 *Design.* Cross-graph overlap keeps the same two drain stages but moves `bwd_completion_event` between them. Stage 1 establishes that the graph's all-gathers are complete, which is sufficient to release the next graph. Stage 2 remains ordered after the event and drains RS before finalizing `main_grad`. This creates a compute window for the RS tail without changing the collective or gradient math.
 
-*With cross-graph overlap.* The main stream may launch the next backward graph while the current graph's RS and `main_grad` finalization continue. Fixed-address ring slots and replay-time events protect each RS input for the longer lifetime.
+*With cross-graph overlap.* The main stream may launch the next backward graph while the current graph's RS and `main_grad` finalization continue. Fixed-address persistent workspaces and replay-time events protect every graph-owned tensor whose lifetime crosses that boundary.
 
 ```text
 time ------------------------------------------------------------------------------------>
 
-runner i       wait ready[S0] -> wgrad_i writes S0 -> Stage 1 -> completion_i
-RS stream                                      +------ RS_i(S0) ------> ready[S0] -> add_i
+runner i       wait ready[G0] -> wgrad_i writes G0 -> Stage 1 -> completion_i
+RS stream                                      +------ RS_i(G0) ------> add_i
 main stream                                                     +-> launch runner i-1
-runner i-1                                                         wait ready[S1]
-                                                                   wgrad_i-1 writes S1
-RS stream                                                          +--- RS_i-1(S1) ---> ready[S1]
+runner i-1                                                         wait ready[G1]
+                                                                   wgrad_i-1 writes G1
+RS stream                                                          +--- RS_i-1(G1) ---> add_i-1
 main stream                                                                        +-> runner i-2
-runner i-2                                                                            wait ready[S0]
+runner i-2                                                                            wait ready[G0]
 
-                  S0 and S1 are allocated before capture, outside the shared graph pool.
+             G0 and G1 are inferred and allocated before capture, outside the graph pool.
 ```
 
 The two modes differ only in release timing and the storage required to make early release safe:
@@ -731,19 +730,21 @@ The two modes differ only in release timing and the storage required to make ear
 |---|---|---|
 | `bwd_completion_event` | After Stage 2 | Between Stage 1 and Stage 2 |
 | RS overlap with the next graph | No | Yes |
-| Persistent wgrad ring | Not required | Required |
-| Additional persistent memory | None for the ring | Bounded by `graph_wgrad_ring_size` |
+| Persistent cross-graph workspace | Not required | Inferred alternating generations |
+| Additional persistent memory | None | Up to three maximum per-runner workspace footprints |
 
 *Implementation.* Cross-graph overlap is implemented by the following cooperating mechanisms:
 
 1. **Capture-local communication ownership.** `track_gtp_capture_comms()` creates one `GTPCaptureCommState` per backward capture. `register_capture_comm()` records the exact params, AG streams, and RS streams touched by that graph. Both drain stages pass `capture_comms.params` to `wait_async_comms()`, so a graph drains only communication it owns.
-2. **Two-stage completion protocol.** Stage 1 calls `wait_async_comms(..., skip_rs=True)` and joins graph-owned AG streams before recording `bwd_completion_event`. Stage 2 drains graph-owned RS handles, accumulates reduced wgrads into `main_grad`, and joins the RS streams.
-3. **Persistent wgrad-ring allocation.** `initialize_graph_wgrad_rings()` runs after DDP creates `main_grad` and before graph capture. `allocate_graph_wgrad_rings()` allocates fixed-address tensors outside the shared graph pool. Slots are keyed by communication domain, unsharded shape, padded shape, dtype, and expert index. The default ring size is two.
-4. **Actual RS-input ownership.** `_prepare_wgrad_reduce_scatter_inputs()` registers the ring slot selected as the actual NCCL input. If one graph maps multiple parameters to the same slot, capture fails with a request to increase `graph_wgrad_ring_size`.
-5. **Replay fencing.** Before replay writes a slot, the graph runner waits for its `ready_event`. The RS stream publishes that event only after NCCL has stopped reading the slot. Different slots may remain live concurrently; reuse of an occupied slot waits.
+2. **Two-stage completion protocol.** Stage 1 calls `wait_async_comms(..., skip_rs=True)` and joins graph-owned AG streams before recording `bwd_completion_event`. Stage 2 uses the existing successor-cascade and capture-drain logic to finalize reduced wgrads and join the RS streams.
+3. **Eager capacity discovery.** A graph-owned allocation calls `get_graph_persistent_buffer(shape, dtype)` in both eager discovery and capture. Discovery records only the aligned per-dtype capacity required by each runner; capture bump-allocates stable views from that capacity. The call covers padded RS inputs, asynchronous RS outputs, FP32-accumulation scratch, and repeated MTP uses without allocation names or an explicit prepare step.
+4. **Bounded generation allocation.** `GraphPersistentBufferPlan` packs each buffer-owning runner's discovered capacity into up to three per-dtype arenas on the current GPU, outside the CUDA graph pool. Runners with no persistent allocation do not consume a generation. Non-adjacent runners reuse the maximum arena footprint assigned to their generation.
+5. **Replay fencing.** Before replay, a runner waits for its arena generation. The graph tail publishes the generation's reuse event after graph-owned work has finished. `bwd_completion_event` still releases the next graph after Stage 1.
 6. **Final gradient fence.** `wait_for_gtp_grad_reduction_on_current_stream()` joins GTP side streams and graph-runner streams before DDP or the optimizer consumes `main_grad`.
 
-*Result and cost.* The ring owns the padded RS input. The wgrad GEMM writes the logical prefix, the alignment tail remains zero, and a non-ring producer is copied into the logical view before reduce-scatter. The bounded memory cost is up to `graph_wgrad_ring_size` full unsharded wgrad buffers for each matching scheduling/shape domain, rather than one buffer per layer. The default ring size of two is sufficient when each graph has one same-key writer: one slot may remain an in-flight RS input while the next graph writes the other, and reuse waits on the older slot's `ready_event`. A larger ring is needed only when one graph contains multiple same-key writers whose reduce-scatter inputs can be live together. Capture rejects unsafe same-slot reuse instead of silently aliasing it.
+The persistent-buffer mechanism does not change the AG/RS launch order, two-stage drain, or gradient-finalization stream. It only replaces the former ring/cache ownership for graph-lived tensors and fences an address before that address is reused.
+
+*Result and cost.* The persistent layout owns the padded RS input. The wgrad GEMM writes the logical prefix, the alignment tail is zeroed, and a producer that did not write directly into that view is copied before reduce-scatter. GTP workspace memory is bounded by up to three copies of the maximum per-runner footprint rather than one persistent buffer per layer. Capture validates the per-dtype capacity consumed by each runner. Per-generation events make reuse safe without constraining replay order.
 
 The feature applies only to **local/partial CUDA graphs** and is enabled automatically. Full-iteration CUDA graphs do not use this feature because their backward execution has no local graph boundary.
 
@@ -758,7 +759,7 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 
 | Test file | What it guards |
 |-----------|----------------|
-| `test_gtp_basics.py` | Core GTP_remat shard/gather, cache ownership, wgrad ring, and DDP bucket alignment. Also pins TE's recompute-phase flag as dtype-agnostic (true under BF16, not just FP8), which the forward-only readiness gate in §3.2 relies on. |
+| `test_gtp_basics.py` | Core GTP_remat shard/gather, cache ownership, persistent wgrad workspaces, and DDP bucket alignment. Also pins TE's recompute-phase flag as dtype-agnostic (true under BF16, not just FP8), which the forward-only readiness gate in §3.2 relies on. |
 | `test_attention_gtp.py` | GTP_remat on attention linears, loss parity vs no-GTP_remat. |
 | `test_mamba_gtp.py` | GTP_remat on Mamba projection weights. |
 | `test_tp_gtp.py` | GTP_remat composed with tensor parallelism (`tp_group × gtp_remat_group`). |
@@ -766,7 +767,7 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_gtp_loss_correctness.py` | End-to-end: GTP_remat per-step loss trajectory matches a no-GTP_remat baseline. |
 | `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. Also the fp32-accumulation reduce-scatter (§2.6): gtp_remat-axis and DDP-axis parity, plus the size-2 bypass. |
 | `test_gtp_cudagraph_grad.py` | Capture-step grad-norm guard (§1.2): `_backup_grads_before_capture`/`_restore_grads_after_capture` keep a graph capture from clobbering finalized `main_grad` (own params + cross-graph `next_w`, incl. routed-expert `weight_list`). |
-| `test_gtp_partial_cg.py` | Four-layer partial-CG loss and eager-vs-replay grad-norm parity with two-slot ring reuse across independently replayed graphs (§3.5). |
+| `test_gtp_partial_cg.py` | Four-layer partial-CG loss and eager-vs-replay grad-norm parity with two-generation workspace reuse across independently replayed graphs (§3.6). |
 | `test_gtp_dcp.py` | DCP sharding metadata (§3.3): TP×GTP_remat offsets, pad reshard, `replica_id`, native-FP8 save/load. Also the SSM `in_proj` gather+split: the gated-delta-product mixer's factory build/merge at MXFP8 alignment, and a full DCP save→load roundtrip of that mixer. |
 | `test_gtp_muon_dcp.py` | Muon optimizer-state DCP roundtrip (§1.6): `replica_id` fold + native-FP8 backfill matching. |
 | `test_gtp_recompute_chain.py` | Recompute-chain buffers (§3.1): adjacent nodes never share a gather buffer, dense and grouped, plus dgrad/wgrad parity vs no-recompute. |
