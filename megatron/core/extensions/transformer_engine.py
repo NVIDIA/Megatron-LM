@@ -85,44 +85,7 @@ except ImportError:
         HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
-_TE_GROUPED_LINEAR_TP_ATTR_PATCH_VERSION = PkgVersion("2.15.0+42b84005")
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
-
-
-def _apply_te_grouped_linear_tp_attr_patch():
-    """Patch TE 2.15 GroupedLinear to restore per-GEMM TP metadata setup."""
-    if not HAVE_TE or get_te_version() != _TE_GROUPED_LINEAR_TP_ATTR_PATCH_VERSION:
-        return
-
-    grouped_linear_cls = getattr(te.pytorch, "GroupedLinear", None)
-    if grouped_linear_cls is None or getattr(
-        grouped_linear_cls, "_megatron_tp_attr_patch_applied", False
-    ):
-        return
-
-    original_reset_parameters = grouped_linear_cls.reset_parameters
-
-    def patched_reset_parameters(self, defer_init=False):
-        original_reset_parameters(self, defer_init=defer_init)
-        if defer_init or getattr(self, "single_grouped_weight", False):
-            return
-
-        set_tensor_parallel_attributes = getattr(self, "set_tensor_parallel_attributes", None)
-        if set_tensor_parallel_attributes is None:
-            return
-
-        weights = [getattr(self, f"weight{i}", None) for i in range(getattr(self, "num_gemms", 0))]
-        if any(weight is not None and hasattr(weight, "tensor_model_parallel") for weight in weights):
-            return
-
-        set_tensor_parallel_attributes(defer_init=defer_init)
-
-    grouped_linear_cls.reset_parameters = patched_reset_parameters
-    grouped_linear_cls._megatron_tp_attr_patch_applied = True
-    grouped_linear_cls._megatron_tp_attr_patch_original_reset_parameters = original_reset_parameters
-
-
-_apply_te_grouped_linear_tp_attr_patch()
 
 
 def _set_expert_parameter_attributes(

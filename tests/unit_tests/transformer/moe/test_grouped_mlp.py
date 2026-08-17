@@ -18,7 +18,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -84,18 +83,6 @@ def test_clamped_swiglu_allows_te_op_fuser():
 
     assert config.activation_func_clamp_value == 10.0
     assert config.use_transformer_engine_op_fuser is True
-
-
-def test_hybridep_alignment_without_quantization():
-    config = SimpleNamespace(
-        use_transformer_engine_op_fuser=False,
-        moe_token_dispatcher_type="flex",
-        moe_flex_dispatcher_backend="hybridep",
-        fp8=False,
-        fp4=False,
-    )
-
-    assert get_align_size_for_quantization(config) == 128
 
 
 def test_remove_glu_interleaving_restores_contiguous_gate_and_linear_halves():

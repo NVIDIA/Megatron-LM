@@ -2655,18 +2655,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
-                # There is one dict per microbatch. Average over the total
-                # number of tokens across the global batch. This keeps SFT loss
-                # logging comparable to non-SFT and avoids biasing packed SFT
-                # toward microbatches with fewer trainable tokens.
+                # there is one dict per microbatch. in new reporting, we average
+                # over the total number of tokens across the global batch.
                 val = torch.vstack(val).sum(dim=0)
                 torch.distributed.all_reduce(val, group=dp_cp_group)
-                denominator = torch.clamp(val[1], min=1.0)
-                loss_reduced[key] = torch.where(
-                    val[1] > 0,
-                    val[0] / denominator,
-                    torch.zeros_like(val[0]),
-                )
+                loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
                 val = torch.cat(val).mean()
@@ -2710,15 +2703,6 @@ def training_log(
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
-
-    def _scalarize_optional_stat(stat):
-        if isinstance(stat, torch.Tensor):
-            return stat.detach().item()
-        return stat
-
-    grad_norm = _scalarize_optional_stat(grad_norm)
-    params_norm = _scalarize_optional_stat(params_norm)
-    num_zeros_in_grad = _scalarize_optional_stat(num_zeros_in_grad)
 
     # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
     should_reset = not is_first_iteration
