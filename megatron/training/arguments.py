@@ -41,7 +41,6 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args  # noqa: F401 # pylint: disable=unused-import
 
 
-
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
 
@@ -682,7 +681,7 @@ def validate_args(args, defaults={}):
         for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) or \
             args.per_split_data_args_path is not None
     if use_per_split_data_path:
-         # Exactly one of the two has to be None if we use it.
+        # Exactly one of the two has to be None if we use it.
         assert any(elt is not None
                    for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
             args.per_split_data_args_path is None
@@ -1456,7 +1455,6 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
-
     # Derive the internal gtp_weight_remat_size from the user-facing
     # --tensor-parallel-num-weight-shards. gtp_weight_remat_size has no CLI flag (it is excluded
     # from argument generation), so it is set here as a fresh attribute on args before it is
@@ -1691,9 +1689,13 @@ def validate_args(args, defaults={}):
             args.use_distributed_optimizer = False
 
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
-
+        assert (
+            not args.use_megatron_fsdp
+        ), "Emerging optimizer does not support Megatron-FSDP for now."
+        assert args.ckpt_format in [
+            "torch",
+            "torch_dist",
+        ], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     if args.use_layer_wise_distributed_optimizer:
         if not args.use_layer_wise_param_layout:
