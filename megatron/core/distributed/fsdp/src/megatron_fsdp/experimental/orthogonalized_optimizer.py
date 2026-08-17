@@ -1,37 +1,33 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Owner-compute orthogonalized optimizer for Megatron-FSDP v2.
+"""
+Owner-compute orthogonalized optimizer for Megatron-FSDP v2.
 
-This module implements the Muon-style orthogonalizing optimizer step on top of
-M-FSDPv2's all-`Flat` placements (`parameter=Flat, gradient=Flat,
-optimizer=Flat`). It reuses the `emerging_optimizers` Newton-Schulz kernels
-through `OrthogonalizedOptimizer`.
+This module implements the Muon-style orthogonalizing optimizer step on top of M-FSDPv2's all-`Flat`
+placements (`parameter=Flat, gradient=Flat, optimizer=Flat`). It reuses the `emerging_optimizers`
+Newton-Schulz kernels through `OrthogonalizedOptimizer`.
 
-Algorithm (per optimizer step, for 2D "matrix" parameters that cross FSDP rank
-boundaries), matching an owner-compute + scatter design:
+Algorithm (per optimizer step, for 2D "matrix" parameters that cross FSDP rank boundaries), matching
+an owner-compute + scatter design:
 
-    1. Compute local orthogonalization-input ("pre-NS") shards: weight decay,
-       momentum update, and (optional) Nesterov combination, all on each rank's
-       local gradient shard.
-    2. P2P-send the pre-NS shards to their owner ranks. Owners are balanced
-       across ranks by an orthogonalization compute-cost heuristic so no single
-       rank serializes all Newton-Schulz work. The owner's own shard is kept
-       locally (no self-send).
-    3. On each owner, reconstruct the full pre-NS matrix and run Newton-Schulz
-       orthogonalization to produce the full update.
+    1. Compute local orthogonalization-input ("pre-NS") shards: weight decay, momentum update, and
+       (optional) Nesterov combination, all on each rank's local gradient shard.
+    2. P2P-send the pre-NS shards to their owner ranks. Owners are balanced across ranks by an
+       orthogonalization compute-cost heuristic so no single rank serializes all Newton-Schulz work.
+       The owner's own shard is kept locally (no self-send).
+    3. On each owner, reconstruct the full pre-NS matrix and run Newton-Schulz orthogonalization to
+       produce the full update.
     4. P2P-send the update shards from owners back to their destination ranks.
     5. Each rank applies its local update shard to its local weight shard.
 
-Fully local parameters (owned by a single rank) skip the communication and run
-Newton-Schulz locally; their compute overlaps the boundary P2P. Non-2D
-parameters fall back to a plain momentum-SGD step (no orthogonalization).
+Fully local parameters (owned by a single rank) skip the communication and run Newton-Schulz
+locally; their compute overlaps the boundary P2P. Non-2D parameters fall back to a plain
+momentum-SGD step (no orthogonalization).
 
-Communication is asynchronous and issued on a dedicated owner-comm stream using
-a dedicated (duplicate) owner-comm process group, so owner P2P ordering is
-independent of FSDP's forward/backward collectives. The synchronous waiting
-(`_wait_for_dist_buffer`) is deferred as late as possible so local Newton-Schulz
-work overlaps owner gathers/scatters.
-"""
+Communication is asynchronous and issued on a dedicated owner-comm stream using a dedicated
+(duplicate) owner-comm process group, so owner P2P ordering is independent of FSDP's
+forward/backward collectives. The synchronous waiting (`_wait_for_dist_buffer`) is deferred as late
+as possible so local Newton-Schulz work overlaps owner gathers/scatters. """
 
 from __future__ import annotations
 

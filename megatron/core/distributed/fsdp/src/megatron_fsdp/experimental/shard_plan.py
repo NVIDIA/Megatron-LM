@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Pure shard-planning and owner-compute packing logic for the Muon + M-FSDPv2 owner-compute P2P
+"""
+Pure shard-planning and owner-compute packing logic for the Muon + M-FSDPv2 owner-compute P2P
 algorithm.
 
 The central data structure is `ShardPlan`, which describes how a single 2D parameter's full matrix

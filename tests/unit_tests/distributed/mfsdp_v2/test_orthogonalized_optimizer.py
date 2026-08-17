@@ -1,13 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for the M-FSDPv2 owner-compute orthogonalized (Muon) optimizer.
-
-The pure-function tests (shard-plan math, owner assignment, pack/unpack) run on
-CPU without a process group. The optimizer-step numerics tests run under
-`torchrun` and compare the sharded FSDP optimizer against a single-rank
-reference using the same Newton-Schulz kernel (bitwise) and against
-`torch.optim.Muon` (tolerance, since the kernels normalize differently).
 """
+Unit tests for the M-FSDPv2 owner-compute orthogonalized (Muon) optimizer.
+
+The pure-function tests (shard-plan math, owner assignment, pack/unpack) run on CPU without a
+process group. The optimizer-step numerics tests run under `torchrun` and compare the sharded FSDP
+optimizer against a single-rank reference using the same Newton-Schulz kernel (bitwise) and against
+`torch.optim.Muon` (tolerance, since the kernels normalize differently). """
 
 import contextlib
 import types
