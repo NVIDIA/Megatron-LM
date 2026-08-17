@@ -771,6 +771,37 @@ class TransformerConfig(ModelParallelConfig):
     use_grouped_gemm_for_shared_expert is set.
     """
 
+    use_mok_megakernel: bool = False
+    """Experimental: replace MoE dispatch, routed/shared expert MLPs, and combine with
+    the external Mixture-of-Kittens megakernel. MCore still owns routing and trainable
+    parameters. This path currently requires TP=1, a shared expert, and
+    gradient_accumulation_fusion=False; routed weights may use BF16 or MXFP8."""
+
+    mok_fwd_num_comm_sms: int = 40
+    """Number of communication SMs used by the MoK forward megakernel."""
+
+    mok_bwd_num_comm_sms: int = 28
+    """Number of communication SMs used by the MoK backward megakernel."""
+
+    mok_minibatch_size: int = 4096
+    """MoK persistent-kernel scheduling minibatch size."""
+
+    mok_macrobatch_size: int = 131072
+    """MoK persistent-kernel scheduling macrobatch size."""
+
+    mok_schedule_capacity_multiplier: float = 0.5
+    """Multiplier used to size the MoK token schedule workspace."""
+
+    mok_all_gather_top_experts_chunk_bytes: int = 2048
+    """Chunk size for MoK symmetric-memory expert-ID all-gather."""
+
+    mok_use_mxfp8_weights: bool = True
+    """Use MOK's MXFP8 routed-expert path; otherwise use BF16 routed weights."""
+
+    mok_scale_router_before_fc2: bool = False
+    """Apply router probabilities before routed FC2-input MXFP8 quantization to match
+    MCore GroupedMLP numerical ordering. This is ignored by the BF16 path."""
+
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
@@ -2047,6 +2078,31 @@ class TransformerConfig(ModelParallelConfig):
             ]:
                 raise ValueError(
                     f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
+                )
+
+        if self.use_mok_megakernel:
+            if self.mok_use_mxfp8_weights and (
+                not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8
+            ):
+                raise ValueError("use_mok_megakernel currently requires fp8_recipe=mxfp8")
+            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
+                raise ValueError("use_mok_megakernel currently requires TP=1 and expert TP=1")
+            if self.expert_model_parallel_size not in (4, 8, 16, 32, 64):
+                raise ValueError("use_mok_megakernel requires EP in {4, 8, 16, 32, 64}")
+            if self.moe_shared_expert_intermediate_size is None:
+                raise ValueError("use_mok_megakernel requires a shared expert")
+            if self.moe_shared_expert_gate or self.moe_shared_expert_overlap:
+                raise ValueError(
+                    "use_mok_megakernel does not support the MCore shared-expert gate/overlap"
+                )
+            if self.moe_latent_size is not None:
+                raise ValueError("use_mok_megakernel does not support latent MoE")
+            if not self.gated_linear_unit or self.activation_func != F.silu:
+                raise ValueError("use_mok_megakernel currently requires SwiGLU")
+            if self.gradient_accumulation_fusion:
+                raise ValueError(
+                    "use_mok_megakernel currently requires "
+                    "gradient_accumulation_fusion=False"
                 )
 
         if isinstance(self.moe_router_load_balancing_type, list):
