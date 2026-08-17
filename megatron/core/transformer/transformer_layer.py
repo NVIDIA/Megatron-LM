@@ -845,6 +845,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             pre_mlp_layernorm_output, padding_mask, packed_seq_params
         )
 
+        # SeqTopK routing needs the packed-sequence metadata to define per-sequence boundaries.
+        # Only MoE layers accept this kwarg; dense MLPs do not.
+        moe_extra_kwargs = (
+            {"packed_seq_params": packed_seq_params} if self.is_moe_layer else {}
+        )
+
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
         should_chunk_mlp_for_prefill = (
@@ -877,10 +883,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
                     padding_mask=padding_mask,
+                    **moe_extra_kwargs,
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(apply_module(self.mlp), padding_mask=padding_mask),
+                    functools.partial(
+                        apply_module(self.mlp), padding_mask=padding_mask, **moe_extra_kwargs
+                    ),
                     False,
                     pre_mlp_layernorm_output,
                 )
@@ -912,7 +921,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
             mlp_output_with_bias = apply_module(self.mlp)(
-                pre_mlp_layernorm_output, padding_mask=padding_mask
+                pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_extra_kwargs
             )
 
         if moe_unflatten_mbs is not None:

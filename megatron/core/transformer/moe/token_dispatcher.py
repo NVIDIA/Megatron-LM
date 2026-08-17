@@ -1295,10 +1295,16 @@ class _DeepepManager(_DispatchManager):
 
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
         probs = probs.reshape(num_tokens, self.num_experts)
-        # Convert the format of routing map from multihot to indices.
+        # Convert the format of routing map from multihot to indices. Under SeqTopK the per-token
+        # selected count is variable (<= router_topk=U); torch.topk(probs, U) returns the real
+        # selected experts first (positive probs) and zero-prob phantom experts for the remaining
+        # slots. Mask those zero-prob phantoms (and capacity-dropped tokens) to -1 so the dispatch
+        # kernel skips them.
         self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
-        # Mask the indices of dropped tokens with -1
-        if self.capacity_factor is not None:
+        # Mask the indices of dropped / phantom slots with -1
+        if self.capacity_factor is not None or getattr(
+            self.config, "moe_router_topk_mode", "topk"
+        ) == "seq_topk":
             mask = self.token_probs == 0
             self.token_indices = self.token_indices.masked_fill(mask, -1)
 
@@ -1826,12 +1832,20 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
+        # Under SeqTopK a token may activate up to U experts (variable per-token count), so the
+        # fixed-slot dispatch must use U (not the base topk K) as the per-token slot count.
+        if getattr(self.config, "moe_router_topk_mode", "topk") == "seq_topk":
+            dispatch_topk = self.tp_size * (
+                self.config.moe_router_seq_topk_upper_bound or (2 * self.config.moe_router_topk)
+            )
+        else:
+            dispatch_topk = self.tp_size * self.config.moe_router_topk
         if self.config.moe_flex_dispatcher_backend == "deepep":
             assert self.tp_size * self.ep_size > 1, "DeepEP dispatcher requires TPxEP > 1"
             self._comm_manager = _DeepepManager(
                 group=self.tp_ep_group,
                 num_local_experts=self.num_local_experts,
-                router_topk=self.tp_size * self.config.moe_router_topk,
+                router_topk=dispatch_topk,
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
@@ -1849,7 +1863,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self._comm_manager = _NCCLEPManager(
                 group=self.tp_ep_group,
                 num_local_experts=self.num_local_experts,
-                router_topk=self.tp_size * self.config.moe_router_topk,
+                router_topk=dispatch_topk,
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )

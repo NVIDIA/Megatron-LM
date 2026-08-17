@@ -20,6 +20,7 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
 )
 from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.seq_topk import build_seq_idx
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -442,13 +443,18 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def route(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        seq_idx: Optional[torch.Tensor] = None,
+    ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask, seq_idx=seq_idx)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -616,6 +622,7 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params=None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -630,9 +637,26 @@ class MoELayer(BaseMoELayer):
             padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                    Shape [seq_length, bsz]. True for valid tokens,
                                                    False for padding tokens. Defaults to None.
+            packed_seq_params (PackedSeqParams, optional): Packed-sequence metadata. When
+                SeqTopK routing is enabled, the per-token contiguous sequence id is derived
+                from ``cu_seqlens_q`` so expert-budget competition stays within a sequence.
+                Only the THD packing path (``cu_seqlens_q`` set, ``tokens_per_sample`` None) is
+                supported; otherwise SeqTopK falls back to standard topk.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
+        # Build per-token sequence id for SeqTopK routing (THD packing only).
+        seq_idx = None
+        if (
+            getattr(self.config, "moe_router_topk_mode", "topk") == "seq_topk"
+            and packed_seq_params is not None
+            and getattr(packed_seq_params, "cu_seqlens_q", None) is not None
+            and getattr(packed_seq_params, "tokens_per_sample", None) is None
+        ):
+            num_tokens = hidden_states.shape[0] * hidden_states.shape[1]
+            seq_idx = build_seq_idx(
+                packed_seq_params.cu_seqlens_q, num_tokens, hidden_states.device
+            )
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"
@@ -659,7 +683,7 @@ class MoELayer(BaseMoELayer):
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    probs, routing_map = self.route(hidden_states, padding_mask, seq_idx)
                     hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:

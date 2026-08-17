@@ -3443,6 +3443,19 @@ def _add_moe_args(parser):
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE; "quantile_balancing" (QB) uses dual coordinate descent on a per-expert bias to handle load balance internally; "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
+    group.add_argument('--moe-router-topk-mode', type=str, default='topk',
+                       choices=['topk', 'seq_topk'],
+                       help='Top-K routing mode. "topk" is standard per-token TopK. '
+                            '"seq_topk" enables Sequence-level TopK (SeqTopK, arXiv 2511.06494): '
+                            'the top (T*K) (token,expert) pairs are selected per sequence using '
+                            'packed_seq_params cu_seqlens_q boundaries, preserving the T*K budget '
+                            'while dynamically allocating more experts to harder tokens. Requires '
+                            'THD packed sequences; decode and uniform tokens_per_sample packing '
+                            'fall back to topk.')
+    group.add_argument('--moe-router-seq-topk-upper-bound', type=int, default=None,
+                       help='Per-token expert cap U for seq_topk mode. A token may activate 0..U '
+                            'experts. Must be > moe-router-topk. Defaults to 2*topk. Also sets the '
+                            'DeepEP dispatch slot count under seq_topk.')
     # Token dispatcher arguments
     # MoE communication overlap arguments
 

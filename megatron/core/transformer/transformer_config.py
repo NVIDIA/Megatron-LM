@@ -746,6 +746,27 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
 
+    moe_router_topk_mode: Literal["topk", "seq_topk"] = "topk"
+    """Top-K routing mode.
+    - "topk": standard per-token TopK, each token selects exactly `moe_router_topk` experts.
+    - "seq_topk": Sequence-level TopK (SeqTopK, https://arxiv.org/abs/2511.06494). The expert
+      budget is moved from the token level to the sequence level: the top (T * K) (token, expert)
+      pairs are selected across all T tokens within each sequence (using `packed_seq_params`
+      `cu_seqlens_q` boundaries), so harder tokens get more experts and easier tokens fewer
+      (possibly zero), while the total budget T*K per sequence is preserved. Requires
+      `moe_router_seq_topk_upper_bound` to set the per-token cap U (>= topk) for fixed-slot
+      dispatchers (e.g. DeepEP). Compatible with group-limited routing (`moe_router_num_groups` /
+      `moe_router_group_topk`), which first filters candidate experts before the per-sequence
+      budget is allocated. Currently supports training and full-sequence eval forward; autoregressive
+      decode falls back to "topk".
+    """
+
+    moe_router_seq_topk_upper_bound: Optional[int] = None
+    """Per-token expert upper bound U for SeqTopK routing (`moe_router_topk_mode="seq_topk"`).
+    A token may activate at most U experts (and as few as 0). U must be > `moe_router_topk`.
+    Defaults to 2 * `moe_router_topk` when unset. Also determines the fixed dispatch slot count
+    for the DeepEP dispatcher under SeqTopK."""
+
     moe_enable_routing_replay: bool = False
     """If True, enable the routing replay feature for MoE layers."""
 
@@ -2471,6 +2492,56 @@ class TransformerConfig(ModelParallelConfig):
             )
             self.moe_router_group_topk = self.moe_router_topk_limited_devices
             self.moe_router_num_groups = self.expert_model_parallel_size
+
+        if self.moe_router_topk_mode == "seq_topk":
+            # Resolve the per-token expert cap U. Default to 2 * topk.
+            if self.moe_router_seq_topk_upper_bound is None:
+                self.moe_router_seq_topk_upper_bound = 2 * self.moe_router_topk
+            upper_bound = self.moe_router_seq_topk_upper_bound
+            assert upper_bound > self.moe_router_topk, (
+                f"moe_router_seq_topk_upper_bound ({upper_bound}) must be strictly greater than "
+                f"moe_router_topk ({self.moe_router_topk}); otherwise SeqTopK degenerates to TopK."
+            )
+            assert upper_bound <= self.num_moe_experts, (
+                f"moe_router_seq_topk_upper_bound ({upper_bound}) must not exceed the total "
+                f"number of experts ({self.num_moe_experts})."
+            )
+            # SeqTopK produces a variable per-token expert count (0..U) in the routing_map, which
+            # only some token dispatchers tolerate. Restrict to the ones known to be safe:
+            #   - 'allgather': dense-mask driven, sizes buffers from routing_map.sum() (no fixed-K
+            #     assumption).
+            #   - 'flex' + 'deepep': fixed-slot, but sized to tp*U and phantom (zero-prob) slots
+            #     are masked to -1, which deep_ep's fused_dispatch skips.
+            # 'alltoall', 'flex'+'hybridep', and 'flex'+'ncclep' still hard-wire moe_router_topk
+            # (K) into their buffer/capacity sizing or lack phantom-slot masking, so they under-
+            # allocate / silently drop / ghost-dispatch under SeqTopK. 'ncclep' additionally needs
+            # TransformerEngine's ep_dispatch to skip -1/zero-weight slots, which is not yet
+            # verified. Block them until they are patched.
+            seq_topk_dispatcher_ok = self.moe_token_dispatcher_type == "allgather" or (
+                self.moe_token_dispatcher_type == "flex"
+                and self.moe_flex_dispatcher_backend == "deepep"
+            )
+            assert seq_topk_dispatcher_ok, (
+                "moe_router_topk_mode='seq_topk' requires a dispatcher that supports a variable "
+                "per-token expert count (0..U). Supported: moe_token_dispatcher_type='allgather', "
+                "or 'flex' with moe_flex_dispatcher_backend='deepep'. Got "
+                f"moe_token_dispatcher_type='{self.moe_token_dispatcher_type}', "
+                f"moe_flex_dispatcher_backend='{self.moe_flex_dispatcher_backend}'. "
+                "'alltoall', 'flex'+'hybridep', and 'flex'+'ncclep' are not yet supported."
+            )
+            # The chunked MLP path in TransformerLayer doesn't thread packed_seq_params into the
+            # per-chunk MoE forward, so SeqTopK would silently fall back to standard topk per chunk.
+            assert self.mlp_chunks_for_prefill <= 1 and self.mlp_chunks_for_training <= 1, (
+                "moe_router_topk_mode='seq_topk' is incompatible with MLP chunking "
+                "(mlp_chunks_for_prefill>1 or mlp_chunks_for_training>1); "
+                "use mlp_chunks_for_prefill/training=1 with seq_topk."
+            )
+            warnings.warn(
+                "SeqTopK routing is enabled. It requires THD packed sequences "
+                "(packed_seq_params.cu_seqlens_q) to define sequence boundaries; the uniform "
+                "tokens_per_sample packing path and autoregressive decode fall back to topk. "
+                f"Per-token expert cap U={upper_bound}."
+            )
 
         if self.enable_cuda_graph or self.external_cuda_graph:
             assert (
