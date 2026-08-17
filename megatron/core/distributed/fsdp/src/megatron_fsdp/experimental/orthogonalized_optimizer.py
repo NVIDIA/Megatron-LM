@@ -1049,7 +1049,11 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         5. P2P-send update shards from owners back to their destinations.
         6. Each rank applies its local update shard to its local weight shard.
         """
-        loss = None if closure is None else closure()
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        else:
+            loss = None
 
         if self._world_size() > 1:
             if self._owner_comm_needed is None:
