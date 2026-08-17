@@ -17,7 +17,7 @@ from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 from ..fp8_utils import (
     _stage_param_to_bf16,
     copy_back_gathered_bf16_into_fp8_param,
-    is_float8tensor,
+    is_layerwise_fp8_param,
     post_all_gather_processing,
 )
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
@@ -592,7 +592,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         self.shard_params(optimizers, full_param_layouts, model_chunks)
 
         # Engage FP8 param sync automatically when the decouple-managed params are actually
-        # quantized (fp8_param_gather on + TE Float8/MXFP8 weights). Off -> plain bf16 path.
+        # quantized (fp8_param_gather on + supported MXFP8/blockwise weights). Off -> plain bf16.
         # Also tag the gathered fp8 params: the fp8 all-gather (``_allgather_helper_fp8``)
         # requantizes bf16 -> each rank's fp8 ``param.data``, so the child optimizer's pre-gather
         # fp8 copy-back into ``param.data`` is redundant for them and is skipped. Params in these
@@ -605,7 +605,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     continue
                 for per_rank in params_list:
                     for p in per_rank:
-                        if is_float8tensor(p):
+                        if is_layerwise_fp8_param(p):
                             self.use_fp8_param_sync = True
                             p._layer_wise_fp8_gathered = True
 
@@ -952,7 +952,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         * **fp8** (``use_fp8_param_sync=True``): stage owned fp32 master->bf16, all-gather bf16,
           requantize into EVERY rank's ``param.data`` (owned included) so all hold
           ``Q(bf16(master))`` (== OFF/Adam). Then ``post_all_gather_processing`` rebuilds fp8
-          columnwise/transpose (blockwise/Float8; mxfp8 noop since copy-back already forced it).
+          columnwise storage (blockwise; mxfp8 is a noop since copy-back already forced it).
         """
 
         # FP8-aware variant: stage bf16, uneven all-gather bf16, requantize per rank.
@@ -1003,8 +1003,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     copy_back_gathered_bf16_into_fp8_param(model_p, updated_bf16)
 
             # Rebuild fp8 columnwise/transpose after the gather (mirrors the overlap / DistOpt
-            # paths; blockwise/Float8 build it, mxfp8 is a noop). Else it'd be deferred to forward.
-            fp8_params = [p for params in params_list for p in params if is_float8tensor(p)]
+            # paths; blockwise builds it, mxfp8 is a noop). Else it'd be deferred to forward.
+            fp8_params = [p for params in params_list for p in params if is_layerwise_fp8_param(p)]
             if fp8_params:
                 post_all_gather_processing(fp8_params)
 
@@ -1064,11 +1064,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             # flatten is invalid. For a pure-bf16 model (no fp32 Muon params) the native group is
             # empty and this collapses to the original single-helper dispatch.
             staged = [
-                [p for p in owned if is_float8tensor(p) or p.dtype != torch.float32]
+                [p for p in owned if is_layerwise_fp8_param(p) or p.dtype != torch.float32]
                 for owned in params_list
             ]
             native = [
-                [p for p in owned if not is_float8tensor(p) and p.dtype == torch.float32]
+                [p for p in owned if not is_layerwise_fp8_param(p) and p.dtype == torch.float32]
                 for owned in params_list
             ]
             if any(owned for owned in staged):

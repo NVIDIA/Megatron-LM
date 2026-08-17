@@ -46,7 +46,7 @@ from ..dist_checkpointing.optimizer import (
     optim_state_to_sharding_state,
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
-from ..fp8_utils import copy_back_gathered_bf16_into_fp8_param, is_float8tensor
+from ..fp8_utils import copy_back_gathered_bf16_into_fp8_param, is_layerwise_fp8_param
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
@@ -1138,7 +1138,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             other_model_data, other_main_data = [], []
             for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
                 for model_param, main_param in zip(model_group, main_group):
-                    if is_float8tensor(model_param):
+                    if is_layerwise_fp8_param(model_param):
                         # Gathered fp8 params get ``Q(bf16(master))`` written into ``param.data``
                         # by the fp8 all-gather's requantize (``_allgather_helper_fp8``), which
                         # would overwrite this copy -- so skip it for them. Non-gathered fp8 params

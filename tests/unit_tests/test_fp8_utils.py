@@ -23,6 +23,40 @@ mxfp8_available = HAVE_MXFP8_TENSOR and get_device_arch_version() >= 10
 reason_for_no_mxfp8 = "MXFP8 requires Transformer Engine and device arch >= 10"
 
 
+def test_is_layerwise_fp8_param_accepts_only_supported_storage_classes():
+    class MockMXFP8Tensor:
+        pass
+
+    class MockBlockwiseTensor:
+        pass
+
+    class MockOtherQuantizedTensor:
+        pass
+
+    with (
+        patch.object(fp8_utils, 'HAVE_TE_MXFP8TENSOR', True),
+        patch.object(fp8_utils, 'MXFP8Tensor', MockMXFP8Tensor),
+        patch.object(fp8_utils, 'HAVE_TE_BLOCKWISE_FP8TENSOR', True),
+        patch.object(fp8_utils, 'Float8BlockwiseQTensor', MockBlockwiseTensor),
+    ):
+        assert fp8_utils.is_layerwise_fp8_param(MockMXFP8Tensor())
+        assert fp8_utils.is_layerwise_fp8_param(MockBlockwiseTensor())
+        assert not fp8_utils.is_layerwise_fp8_param(MockOtherQuantizedTensor())
+
+
+def test_stage_param_to_bf16_requires_fp32_master():
+    param = nn.Parameter(torch.ones(4, dtype=torch.bfloat16))
+
+    with pytest.raises(RuntimeError, match=r"param\.main_param"):
+        fp8_utils._stage_param_to_bf16(param)
+
+    param.main_param = torch.tensor([1.25, -2.5, 3.75, -4.0], dtype=torch.float32)
+    staged = fp8_utils._stage_param_to_bf16(param)
+
+    assert staged.dtype == torch.bfloat16
+    assert torch.equal(staged, param.main_param.to(torch.bfloat16))
+
+
 @pytest.mark.skipif(not fp8_utils.HAVE_TE, reason="Transformer Engine is not installed")
 @pytest.mark.parametrize(
     ("is_init", "config_values", "te_helper"),

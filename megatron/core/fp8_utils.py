@@ -60,7 +60,16 @@ try:
     HAVE_TE_MXFP8TENSOR = True
 except (ImportError, ModuleNotFoundError):
     # MXFP8Tensor not found
+    MXFP8Tensor = None
     HAVE_TE_MXFP8TENSOR = False
+
+try:
+    from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
+
+    HAVE_TE_BLOCKWISE_FP8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    Float8BlockwiseQTensor = None
+    HAVE_TE_BLOCKWISE_FP8TENSOR = False
 
 try:
     from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
@@ -134,6 +143,23 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
 def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine MXFP8Tensor"""
     return HAVE_TE_MXFP8TENSOR and _is_instance_or_param_data(tensor, MXFP8Tensor)
+
+
+def is_blockwise_float8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine Float8BlockwiseQTensor."""
+    return HAVE_TE_BLOCKWISE_FP8TENSOR and _is_instance_or_param_data(
+        tensor, Float8BlockwiseQTensor
+    )
+
+
+def is_layerwise_fp8_param(tensor: torch.Tensor) -> bool:
+    """Check if an FP8 parameter uses storage supported by LayerWise parameter gather.
+
+    The compact LayerWise path stages whole parameters in BF16 and requantizes them on
+    copy-back. It supports plain MXFP8 and blockwise tensors only; generic Float8Tensor,
+    NVFP4, and GroupedTensor storage require different handling.
+    """
+    return is_mxfp8tensor(tensor) or is_blockwise_float8tensor(tensor)
 
 
 def is_grouped_tensor(tensor: torch.Tensor) -> bool:
@@ -309,11 +335,22 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
 
 
 def copy_back_gathered_bf16_into_fp8_param(model_p: torch.Tensor, src_bf16: torch.Tensor) -> None:
-    """Requantize a gathered bf16 whole-param into an fp8 (Float8/MXFP8) model param in place.
+    """Copy a gathered BF16 whole-param into a compact LayerWise bucket parameter.
 
-    mxfp8 columnwise can't be derived from rowwise, so force columnwise before copy_ (TE rebuilds
-    both directions from the bf16); blockwise/Float8 columnwise is a lossless transpose.
+    Plain BF16 parameters are allowed because a LayerWise bucket can contain BF16 siblings of
+    supported FP8 parameters. Quantized destinations are limited to MXFP8 and blockwise tensors.
+    MXFP8 columnwise data cannot be derived from rowwise data, so force both usages before copy_.
     """
+    if is_grouped_tensor_with_quantized_storage(model_p):
+        raise TypeError(
+            "LayerWise FP8 parameter gather does not support Transformer Engine GroupedTensor "
+            "quantized storage. Disable --moe-single-grouped-weight."
+        )
+    if is_float8tensor(model_p) and not is_layerwise_fp8_param(model_p):
+        raise TypeError(
+            "LayerWise FP8 parameter gather supports only MXFP8Tensor and "
+            "Float8BlockwiseQTensor destinations."
+        )
     if is_mxfp8tensor(model_p):
         quantizer = model_p.data._get_quantizer()
         quantizer.set_usage(rowwise=True, columnwise=True)
@@ -321,16 +358,13 @@ def copy_back_gathered_bf16_into_fp8_param(model_p: torch.Tensor, src_bf16: torc
 
 
 def _stage_param_to_bf16(p: torch.Tensor) -> torch.Tensor:
-    """Stage a param to a detached bf16 whole-param for fp8 param-gather transport.
-
-    Prefer the fp32 master (high-precision source); else dequantize an fp8 param; else copy bf16.
-    """
+    """Stage a locally owned LayerWise parameter's FP32 master in BF16 for transport."""
     main_param = getattr(p, "main_param", None)
-    if main_param is not None:
-        return main_param.detach().to(torch.bfloat16)
-    if is_float8tensor(p):
-        return dequantize_fp8_tensor(p).detach().to(torch.bfloat16)
-    return p.detach().to(torch.bfloat16)
+    if main_param is None:
+        raise RuntimeError(
+            "LayerWise FP8 parameter-gather staging requires param.main_param (FP32 master)."
+        )
+    return main_param.detach().to(torch.bfloat16)
 
 
 def _resolve_callable_from_python_import_path(dotted_path: str):

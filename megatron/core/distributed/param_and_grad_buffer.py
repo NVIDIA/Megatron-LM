@@ -36,6 +36,7 @@ from ..fp8_utils import (
     is_grouped_mxfp8tensor,
     is_grouped_tensor,
     is_grouped_tensor_with_quantized_storage,
+    is_layerwise_fp8_param,
     is_mxfp8tensor,
     modify_grouped_tensor_rowwise_storage,
     modify_underlying_storage,
@@ -491,22 +492,22 @@ class _ParamAndGradBucketGroup:
             local_rank = self.intra_distributed_optimizer_instance_rank
             group = self.intra_distributed_optimizer_instance_group
             layerwise_work_handles = []
-            # Decouple fp8 param-gather: model params are Float8/MXFP8 but the all-gather rides bf16
-            # — stage owned to bf16, gather, requantize on copy-back. Plain bf16 collapses to the
-            # original path.
+            # Decouple fp8 param-gather: supported MXFP8/blockwise model params ride BF16 — stage
+            # the local owner's FP32 master, gather, then requantize on copy-back. Plain BF16
+            # collapses to the original path.
             decouple = not getattr(self.ddp_config, 'use_layer_wise_param_layout', True)
             for bucket in self.buckets:
-                # A decoupled LayerWise (Muon) bucket can MIX fp8 and bf16 params:
+                # A decoupled LayerWise (Muon) bucket can MIX supported fp8 and bf16 params:
                 # merge_layerwise_fp8_grads keys fp8 Muon grads by their bf16 logical dtype so they
                 # share ONE buffer (hence bucket) with their bf16 siblings (e.g. an MoE router /
                 # DSA indexer / mHC weight that is not fp8-quantized). The bf16-staged path handles
-                # both dtypes, so a bucket holding ANY fp8 param must take it -- scanning only
-                # params_list[0] mis-routes a bf16-first mixed bucket into the raw
+                # both dtypes, so a bucket holding ANY supported fp8 param must take it -- scanning
+                # only params_list[0] mis-routes a bf16-first mixed bucket into the raw
                 # _flatten_dense_tensors() path, which crashes on the MXFP8 .view(-1).
                 bucket_is_fp8 = bool(
                     decouple
                     and bucket.params_list
-                    and any(is_float8tensor(p) for p in bucket.params_list)
+                    and any(is_layerwise_fp8_param(p) for p in bucket.params_list)
                 )
                 # TODO(perf, blockwise-only): blockwise could gather the owner's fp8 rowwise data
                 # (~2x less comm) + its small scale_inv and rebuild columnwise via transpose
@@ -997,7 +998,7 @@ def group_params_for_buffers(
         # share ONE fp32 all_reduce buffer; a split uint8/bf16 reduction diverges ~1 ULP from OFF.
         if (
             merge_layerwise_fp8_grads
-            and is_float8tensor(param)
+            and is_layerwise_fp8_param(param)
             and is_managed_by_layer_wise_optimizer
         ):
             param_dtype = param.dtype

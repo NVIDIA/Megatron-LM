@@ -1699,9 +1699,8 @@ def validate_args(args, defaults={}):
         if not args.use_layer_wise_param_layout:
             # Decoupled compact LayerWise: fp8 parameter gather is supported via the FP8-aware
             # whole-param all-gather. Only mxfp8/blockwise (fp4 out of scope); mxfp8 needs
-            # reuse_grad_buf. fp4 is rejected unconditionally -- the LayerWise gather routes
-            # buckets by is_float8tensor, so an NVFP4 param would silently take the raw
-            # flatten path.
+            # reuse_grad_buf. fp4 is rejected unconditionally because the compact LayerWise
+            # gather implements only MXFP8/blockwise BF16 staging and copy-back.
             assert not getattr(args, 'fp4_param_gather', False), (
                 "Decoupled compact LayerWise DDP layout supports fp8 parameter gather only "
                 "(mxfp8 or blockwise); fp4_param_gather is out of scope."
@@ -1710,6 +1709,12 @@ def validate_args(args, defaults={}):
                 assert args.fp8_recipe in ('mxfp8', 'blockwise'), (
                     "fp8 parameter gather on the decoupled compact LayerWise DDP layout requires "
                     f"fp8_recipe in {{'mxfp8', 'blockwise'}}; got {args.fp8_recipe!r}."
+                )
+                assert not getattr(args, 'moe_single_grouped_weight', False), (
+                    "fp8 parameter gather on the decoupled compact LayerWise DDP layout does not "
+                    "support --moe-single-grouped-weight: the LayerWise copy-back handles only "
+                    "plain MXFP8/Float8Blockwise tensors, not Transformer Engine GroupedTensor "
+                    "storage."
                 )
                 if args.fp8_recipe == 'mxfp8':
                     assert args.reuse_grad_buf_for_mxfp8_param_ag, (
