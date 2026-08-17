@@ -26,10 +26,12 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.orthogonalized_optimizer import (
     FsdpMuon,
     Muon,
+    _require_emerging_optimizers,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.shard_plan import (
     OwnerGatherPlan,
     OwnerScatterPlan,
     ShardPlan,
-    _require_emerging_optimizers,
     assign_owner_work,
     compute_shard_plan,
     pack_owner_work,
