@@ -923,7 +923,8 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             # the function tries to use it as a tensor, but we pass `None`. So we remove the `None`
             # type here to remove the type error for that parameter explicitly.
             param = cast(torch.Tensor, param)
-            return self._inner.orthogonalize(param, pre_ns, **kwargs)
+            # The Newton-Schulz kernel is FP32-only, so cast accordingly.
+            return self._inner.orthogonalize(param, pre_ns.to(torch.float32), **kwargs)
 
     def _apply_update(self, param: DTensor, update_shard: torch.Tensor, lr: float) -> None:
         """Update the given parameters in batched fashion with the result of orthogonalization."""
