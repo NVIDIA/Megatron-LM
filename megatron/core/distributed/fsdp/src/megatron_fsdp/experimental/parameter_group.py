@@ -106,7 +106,7 @@ class FsdpParameterGroup:
             mesh: Device mesh used for all DBuffer storage in this version.
             placements: Parameter, gradient, and optimizer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
-            allgather_stream: Stream on which to allocate the main- and model-weight buffers.
+            allgather_stream: Stream used to allocate model weights when a dtype cast is required.
             reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
             use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
