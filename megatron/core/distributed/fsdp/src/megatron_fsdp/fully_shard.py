@@ -370,14 +370,30 @@ def fully_shard_model(
 
     # Validate more arguments.
     _outer_fsdp_sharding = outer_dp_sharding_strategy == "optim"
-    if _outer_fsdp_sharding and zero_dp_strategy != "optim_grads_params":
-        # If sharding on outer DP using HSDP, then we must use HSDP buffers and
-        # we must be fully-sharding on inner DP. HSDP is an extension of FSDP.
-        # TODO(@shjwudp, @cspades): Requires various modifications to support.
+    _replicated_grad_strategies = sorted(
+        {
+            strategy
+            for strategy in (zero_dp_strategy, expert_zero_dp_strategy)
+            if strategy in ("no_shard", "optim")
+        }
+    )
+    if _outer_fsdp_sharding and _replicated_grad_strategies:
+        # Sharding the optimizer state over DP-Outer constrains how DP-Shard handles
+        # gradients, but deliberately not how it handles model weights.
+        #
+        # Gradients: the DP-Outer reduction reduce-scatters the DP-Shard gradient shard into
+        # a DP-wide gradient shard, so DP-Shard must already shard gradients. 'no_shard' and
+        # 'optim' replicate them instead, leaving no shard to feed that reduce-scatter.
+        #
+        # Model weights: no equivalent constraint, which is the point of this configuration.
+        # A group whose weights are replicated reassembles the whole bucket from the DP-wide
+        # weight shards rather than viewing a DP-Shard slice of it, so ZeRO-1/ZeRO-2 inner
+        # sharding can sit under DP-Outer optimizer sharding instead of requiring ZeRO-3.
         raise ValueError(
-            f"Sharding with Hybrid (Fully) Sharded Data Parallel (HSDP) requires "
-            "zero_dp_strategy to use FSDP ('optim_grads_params', 3), because "
-            "outer sharding is dependent on inner sharding."
+            "Sharding with Hybrid (Fully) Sharded Data Parallel (HSDP) requires a "
+            "zero_dp_strategy that shards gradients ('optim_grads', 2 or "
+            f"'optim_grads_params', 3), but got {_replicated_grad_strategies}, because "
+            "outer sharding is dependent on inner gradient sharding."
         )
     if (dp_outer_dim is None) ^ (hybrid_fsdp_group is None):
         # XOR - HSDP requires both or neither of dp_outer_dim and hybrid_fsdp_group
