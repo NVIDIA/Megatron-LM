@@ -1668,7 +1668,8 @@ class TestRLUtils:
         # and num_turns is what lets prep_wandb_metrics mask them downstream.
         # Placeholders join no records, so their epoch rows are empty.
         assert stats.num_turns == [[1, 1, 0], [0, 0, 0]]
-        assert stats.policy_epoch_segments == [[[(5, 3)], [(6, 4)], []], [[], [], []]]
+        seg = rl_utils.EpochSegment
+        assert stats.policy_epoch_segments == [[[seg(5, 3)], [seg(6, 4)], []], [[], [], []]]
         assert stats.traj_lens == [[3, 4, 0], [0, 0, 0]]
         # Per-turn lists exclude placeholders entirely: no sentinel epoch-0 stamp
         # in completed_epochs, no fake 0-length turn for all-placeholder groups.
@@ -1830,7 +1831,21 @@ class TestRLUtils:
         rollout_table = next(
             c for c in writer.Table.call_args_list if "traj_length" in c.kwargs.get("columns", [])
         )
-        assert rollout_table.kwargs["data"] == [(1.0, 3, 2, 2, 2, 1, 1, 1.5, 1.5, 0.5, 0.5, 'ok')]
+        (row,) = rollout_table.kwargs["data"]
+        assert dict(zip(rollout_table.kwargs["columns"], row)) == {
+            "reward": 1.0,
+            "traj_length": 3,
+            "num_evictions": 2,
+            "policy_staleness": 2,
+            "kv_staleness": 2,
+            "policy_last_token_staleness": 1,
+            "kv_last_token_staleness": 1,
+            "policy_avg_staleness": 1.5,
+            "kv_avg_staleness": 1.5,
+            "policy_staleness_std": 0.5,
+            "kv_staleness_std": 0.5,
+            "rollout_status": 'ok',
+        }
 
         # A window where nothing joined emits no staleness/eviction metrics at all.
         metrics = rl_utils.prep_wandb_metrics(
@@ -1854,20 +1869,23 @@ class TestRLUtils:
 
     def test_epoch_segment_helpers(self):
         expand, merge = rl_utils.expand_epoch_segments, rl_utils.merge_epoch_segments
-        seg = rl_utils.EpochSegment
+        seg, aligned = rl_utils.EpochSegment, rl_utils.AlignedEpochSegment
         # expand: boundaries -> (epoch, token_count). Multi-turn boundaries index
         # each turn's full CUMULATIVE sequence; boundary-less turns contribute nothing.
-        assert expand([[(0, 3), (4, 4)]], [6]) == [(3, 4), (4, 2)]
-        assert expand([[(0, 5)], [(0, 5), (4, 6)]], [4, 7]) == [(5, 4), (5, 4), (6, 3)]
-        assert expand([[], [(0, 2)]], [3, 5]) == [(2, 5)]
+        assert expand([[(0, 3), (4, 4)]], [6]) == [seg(3, 4), seg(4, 2)]
+        assert expand([[(0, 5)], [(0, 5), (4, 6)]], [4, 7]) == [seg(5, 4), seg(5, 4), seg(6, 3)]
+        assert expand([[], [(0, 2)]], [3, 5]) == [seg(2, 5)]
         # Per-turn lists of mismatched lengths raise instead of silently dropping turns.
         with pytest.raises(ValueError):
             expand([[(0, 9)]], [])
         # merge: (policy, kv, token_count) runs aligned by token position, not an
         # index-wise zip of the two segment lists; a tail covered by only one
         # stream (disagreeing totals) is dropped rather than misattributed.
-        assert list(merge([seg(10, 4)], [seg(9, 2), seg(8, 2)])) == [(10, 9, 2), (10, 8, 2)]
-        assert list(merge([seg(7, 3)], [seg(6, 1)])) == [(7, 6, 1)]
+        assert list(merge([seg(10, 4)], [seg(9, 2), seg(8, 2)])) == [
+            aligned(10, 9, 2),
+            aligned(10, 8, 2),
+        ]
+        assert list(merge([seg(7, 3)], [seg(6, 1)])) == [aligned(7, 6, 1)]
         assert list(merge([], [seg(1, 2)])) == []
 
     def test_per_token_staleness_is_token_weighted(self):
@@ -1891,8 +1909,9 @@ class TestRLUtils:
         stats = rl_utils.compute_group_stats(
             [[rollout]], MockTokenizer(), seq_len=16, request_ledger=ledger
         )
-        assert stats.policy_epoch_segments == [[[(1, 9), (5, 1)]]]
-        assert stats.kv_cache_epoch_segments == [[[(5, 10)]]]
+        seg = rl_utils.EpochSegment
+        assert stats.policy_epoch_segments == [[[seg(1, 9), seg(5, 1)]]]
+        assert stats.kv_cache_epoch_segments == [[[seg(5, 10)]]]
 
         writer = MagicMock()
         metrics = rl_utils.prep_wandb_metrics(
@@ -1920,10 +1939,23 @@ class TestRLUtils:
         # rollout_table carries the within-rollout dispersion: token-weighted avg
         # 6 - (1*9 + 5*1)/10 = 4.6 and std sqrt((9*0.4^2 + 3.6^2)/10) = 1.2 for
         # policy; kv is a single epoch, so avg 1.0 and std 0.
-        (rollout_row,) = next(
-            t["data"] for t in tables if "policy_staleness_std" in t.get("columns", [])
+        rollout_tbl = next(t for t in tables if "policy_staleness_std" in t.get("columns", []))
+        (rollout_row,) = rollout_tbl["data"]
+        assert dict(zip(rollout_tbl["columns"], rollout_row)) == pytest.approx(
+            {
+                "reward": 1.0,
+                "traj_length": 10,
+                "num_evictions": 0,
+                "policy_staleness": 5,
+                "kv_staleness": 1,
+                "policy_last_token_staleness": 1,
+                "kv_last_token_staleness": 1,
+                "policy_avg_staleness": 4.6,
+                "kv_avg_staleness": 1.0,
+                "policy_staleness_std": 1.2,
+                "kv_staleness_std": 0.0,
+            }
         )
-        assert np.allclose(rollout_row, (1.0, 10, 0, 5, 1, 1, 1, 4.6, 1.0, 1.2, 0.0))
         # Histogram feed = the same exact token-weighted per-rollout averages
         # (a per-segment mean would say 3.0 for policy).
         hists = [t["data"] for t in tables if t.get("columns") == ["staleness"]]
