@@ -22,12 +22,15 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
-from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
+from megatron.core.models.hybrid.shortcut_block import (
+    ShortcutMoEBlock,
+    group_layers_into_shortcut_blocks,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, annotate_first_last_layer
+from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
@@ -51,14 +54,6 @@ class HybridStackSubmodules:
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
-
-
-def _install_standalone_cudagraph_manager(layer, config):
-    """Restore the regular graph manager for a layer not consumed by a shortcut pair."""
-    if getattr(layer, '_shortcut_graph_output_proj', False) and not hasattr(
-        layer, 'cudagraph_manager'
-    ):
-        layer.cudagraph_manager = CudaGraphManager(config)
 
 
 class HybridStack(MegatronModule):
@@ -131,28 +126,8 @@ class HybridStack(MegatronModule):
         if getattr(self.config, "mla_down_proj_fusion", False):
             submodules = self._fuse_mla_down_proj(submodules)
 
-        # Precompute registered module paths. Shortcut pairs occupy one outer ModuleList slot
-        # and own their physical compute/MoE layers as named children.
-        layer_names = [None] * len(self.layer_type_list)
-        physical_index = 0
-        block_index = 0
-        while physical_index < len(self.layer_type_list):
-            next_is_moe = (
-                self.config.moe_shortcut_connection
-                and physical_index + 1 < len(self.layer_type_list)
-                and self.layer_type_list[physical_index + 1] == LayerSymbols.MOE
-            )
-            if next_is_moe:
-                layer_names[physical_index] = f"layers.{block_index}.compute_layer"
-                layer_names[physical_index + 1] = f"layers.{block_index}.moe_layer"
-                physical_index += 2
-            else:
-                layer_names[physical_index] = f"layers.{block_index}"
-                physical_index += 1
-            block_index += 1
-
-        # Build physical layers first, then group shortcut pairs into registered blocks.
-        physical_layers = []
+        # Build layers from the pre-selected segment
+        self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
             layer_number = i + 1 + pp_layer_offset
             if self.config.fp8:
@@ -169,7 +144,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
-                        name=(name + f".{layer_names[i]}") if name is not None else None,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     layer = build_module(
@@ -180,7 +155,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                        name=(name + f".{layer_names[i]}") if name is not None else None,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.DS_ATTENTION:
                     layer = build_module(
@@ -191,7 +166,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                        name=(name + f".{layer_names[i]}") if name is not None else None,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.MLA:
                     layer = build_module(
@@ -210,7 +185,7 @@ class HybridStack(MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
-                        name=(name + f".{layer_names[i]}") if name is not None else None,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.MOE:
                     layer = build_module(
@@ -220,7 +195,7 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
-                        name=(name + f".{layer_names[i]}") if name is not None else None,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif layer_type == LayerSymbols.GDN:
                     gdn_layer_spec = submodules.gdn_layer
@@ -238,17 +213,17 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
-                        name=(name + f".{layer_names[i]}") if name is not None else None,
+                        name=(name + f".layers.{i}") if name is not None else None,
                     )
                 else:
                     raise ValueError("unexpected layer_type")
-            physical_layers.append(layer)
+            self.layers.append(layer)
 
         if self.config.cuda_graph_impl == "local":
-            annotate_first_last_layer(physical_layers)
+            annotate_first_last_layer(self.layers)
 
         # Required for activation recomputation
-        self.num_layers_per_pipeline_rank = len(physical_layers)
+        self.num_layers_per_pipeline_rank = len(self.layers)
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
@@ -259,53 +234,12 @@ class HybridStack(MegatronModule):
             )
 
         if self.config.moe_shortcut_connection:
-            # Register each compute/MoE pair as one canonical module-tree node.
-            grouped_layers = nn.ModuleList()
-            i = 0
-            while i < len(physical_layers):
-                next_is_moe = (
-                    i + 1 < len(physical_layers)
-                    and self.layer_type_list[i + 1] == LayerSymbols.MOE
-                )
-                if not next_is_moe:
-                    _install_standalone_cudagraph_manager(physical_layers[i], self.config)
-                    grouped_layers.append(physical_layers[i])
-                    i += 1
-                    continue
-
-                paired_type = self.layer_type_list[i]
-                if paired_type not in (
-                    LayerSymbols.MAMBA,
-                    LayerSymbols.GDN,
-                    LayerSymbols.ATTENTION,
-                ):
-                    raise ValueError(
-                        "Shortcut MoE must be preceded by a Mamba, GDN, or attention layer"
-                    )
-                paired_layer = physical_layers[i]
-                if not getattr(paired_layer, '_supports_split_input_output', False):
-                    raise ValueError(
-                        f"{paired_type.name} does not support split input/output execution"
-                    )
-                moe_layer = physical_layers[i + 1]
-                enable_cudagraph = (
-                    getattr(paired_layer, '_shortcut_graph_output_proj', False)
-                    and getattr(moe_layer, '_shortcut_graph_shared_experts', False)
-                )
-                grouped_layers.append(
-                    ShortcutMoEBlock(
-                        paired_layer,
-                        moe_layer,
-                        is_mamba=paired_type == LayerSymbols.MAMBA,
-                        is_mtp_layer=self.is_mtp_layer,
-                        enable_cudagraph=enable_cudagraph,
-                        overlap_a2a=self.config.moe_shortcut_parallel,
-                    )
-                )
-                i += 2
-            self.layers = grouped_layers
-        else:
-            self.layers = nn.ModuleList(physical_layers)
+            self.layers = group_layers_into_shortcut_blocks(
+                self.layers,
+                self.layer_type_list,
+                self.config,
+                is_mtp_layer=self.is_mtp_layer,
+            )
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`
@@ -337,21 +271,12 @@ class HybridStack(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def _iter_physical_layers(self):
-        """Iterate the original physical layers through the registered block hierarchy."""
-        for layer in self.layers:
-            if isinstance(layer, ShortcutMoEBlock):
-                yield layer.compute_layer
-                yield layer.moe_layer
-            else:
-                yield layer
-
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """
         Returns the Mamba conv and ssm states shapes per input sequence
         if this block contains Mamba layers (this may not be the case with PP > 1).
         """
-        for layer_type, layer in zip(self.layer_type_list, self._iter_physical_layers()):
+        for layer_type, layer in zip(self.layer_type_list, self.layers):
             if layer_type == LayerSymbols.MAMBA:
                 return layer.mamba_state_shapes_per_request()
         return None
@@ -456,67 +381,7 @@ class HybridStack(MegatronModule):
                     padding_mask=padding_mask,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                 )
-            elif not self.config.moe_shortcut_connection:
-                for layer in self.layers:
-                    # Layers have 1-indexed layer numbers attribute.
-                    inner_quant_context = get_inner_quant_context(
-                        self.config, layer.layer_number - 1
-                    )
-                    with inner_quant_context:
-                        if isinstance(layer, TransformerLayer):
-                            hidden_states, _ = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                rotary_pos_emb=rotary_pos_emb,
-                                sequence_len_offset=sequence_len_offset,
-                                packed_seq_params=packed_seq_params,
-                                padding_mask=padding_mask,
-                            )
-                        else:  # MambaLayer, Expert, or MLP
-                            hidden_states = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                packed_seq_params=packed_seq_params,
-                            )
-                    # The attention layer (currently a simplified transformer layer)
-                    # outputs a tuple of (hidden_states, context). Context is intended
-                    # for cross-attention, and is not needed in our model.
-                    if isinstance(hidden_states, tuple):
-                        hidden_states = hidden_states[0]
             else:
-                # moe_shortcut_connection=True: process (non-MOE, MOE) layer pairs.
-                # Shortcut pairs run through ShortcutMoEBlock. Layers that are not
-                # followed by an MoE layer run normally.
-                def run_layer(layer, hidden_states):
-                    inner_quant_context = get_inner_quant_context(
-                        self.config, layer.layer_number - 1
-                    )
-                    with inner_quant_context:
-                        if isinstance(layer, TransformerLayer):
-                            hidden_states, _ = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                rotary_pos_emb=rotary_pos_emb,
-                                sequence_len_offset=sequence_len_offset,
-                                packed_seq_params=packed_seq_params,
-                                padding_mask=padding_mask,
-                            )
-                        else:  # MambaLayer, Expert, or MLP
-                            hidden_states = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                inference_context=inference_context,
-                                packed_seq_params=packed_seq_params,
-                            )
-                    # The attention layer outputs a tuple of (hidden_states, context).
-                    # Context is intended for cross-attention and is not needed here.
-                    if isinstance(hidden_states, tuple):
-                        hidden_states = hidden_states[0]
-                    return hidden_states
-
                 for layer in self.layers:
                     if isinstance(layer, ShortcutMoEBlock):
                         hidden_states = layer(
@@ -531,7 +396,34 @@ class HybridStack(MegatronModule):
                             quant_config=self.config,
                         )
                     else:
-                        hidden_states = run_layer(layer, hidden_states)
+                        # Layers have 1-indexed layer numbers attribute.
+                        inner_quant_context = get_inner_quant_context(
+                            self.config, layer.layer_number - 1
+                        )
+                        with inner_quant_context:
+                            if isinstance(layer, TransformerLayer):
+                                hidden_states, _ = layer(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    inference_context=inference_context,
+                                    rotary_pos_emb=rotary_pos_emb,
+                                    sequence_len_offset=sequence_len_offset,
+                                    packed_seq_params=packed_seq_params,
+                                    padding_mask=padding_mask,
+                                )
+                            else:  # MambaLayer, Expert, or MLP
+                                hidden_states = layer(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    inference_context=inference_context,
+                                    packed_seq_params=packed_seq_params,
+                                )
+
+                    # The attention layer (currently a simplified transformer layer)
+                    # outputs a tuple of (hidden_states, context). Context is intended
+                    # for cross-attention, and is not needed in our model.
+                    if isinstance(hidden_states, tuple):
+                        hidden_states = hidden_states[0]
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

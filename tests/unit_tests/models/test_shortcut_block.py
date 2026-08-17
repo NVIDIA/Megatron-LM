@@ -6,11 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.models.hybrid import hybrid_block as hybrid_block_module
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.shortcut_block import (
     ShortcutExecutionMode,
     ShortcutMoEBlock,
     _RecordCombineGradReady,
+    group_layers_into_shortcut_blocks,
 )
 from megatron.core.transformer.moe.shortcut_cudagraph import (
     AsyncCombineToPersistentBuffer as _AsyncCombineToPersistentBuffer,
@@ -21,17 +22,58 @@ from megatron.core.transformer.moe.token_dispatcher import MoEFlexTokenDispatche
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-def test_standalone_shortcut_candidate_restores_regular_cudagraph_manager(monkeypatch):
-    config = object()
-    manager = object()
-    layer = SimpleNamespace(_shortcut_graph_output_proj=True)
-    monkeypatch.setattr(
-        hybrid_block_module, "CudaGraphManager", lambda received: manager
+def test_group_layers_into_registered_shortcut_blocks():
+    config = SimpleNamespace(
+        pipeline_model_parallel_size=1,
+        mtp_use_repeated_layer=False,
+        mtp_num_layers=None,
+        moe_shortcut_parallel=False,
+        fp32_residual_connection=False,
     )
 
-    hybrid_block_module._install_standalone_cudagraph_manager(layer, config)
+    class FakeCompute(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = config
+            self.layer_number = 1
+            self.is_first_layer = True
+            self.is_last_layer = False
+            self._supports_split_input_output = True
+            self._shortcut_graph_output_proj = False
 
-    assert layer.cudagraph_manager is manager
+    class FakeMLP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.tp_group = None
+            self._shortcut_post_norm = torch.nn.Identity()
+
+    class FakeMoE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_number = 2
+            self.is_first_layer = False
+            self.is_last_layer = False
+            self._shortcut_graph_shared_experts = False
+            self.mlp = FakeMLP()
+
+    compute = FakeCompute()
+    moe = FakeMoE()
+    standalone = torch.nn.Identity()
+    grouped = group_layers_into_shortcut_blocks(
+        torch.nn.ModuleList([compute, moe, standalone]),
+        [LayerSymbols.MAMBA, LayerSymbols.MOE, LayerSymbols.ATTENTION],
+        config,
+    )
+
+    assert len(grouped) == 2
+    assert isinstance(grouped[0], ShortcutMoEBlock)
+    assert grouped[0].compute_layer is compute
+    assert grouped[0].moe_layer is moe
+    assert grouped[1] is standalone
+    registered_modules = dict(grouped.named_modules())
+    assert registered_modules["0.compute_layer"] is compute
+    assert registered_modules["0.moe_layer"] is moe
+    assert registered_modules["1"] is standalone
 
 
 @pytest.fixture

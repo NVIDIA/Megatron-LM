@@ -2,9 +2,11 @@
 
 from enum import Enum, auto
 from functools import partial
+from typing import Sequence
 
 import torch
 
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.moe.shortcut_cudagraph import (
@@ -12,6 +14,7 @@ from megatron.core.transformer.moe.shortcut_cudagraph import (
     RecordCombineGradReady as _RecordCombineGradReady,
     RouteGradFromPersistentBuffers as _RouteGradFromPersistentBuffers,
 )
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class ShortcutExecutionMode(Enum):
@@ -31,6 +34,75 @@ class ShortcutExecutionMode(Enum):
         if overlap_a2a:
             return cls.EAGER_OVERLAP
         return cls.EAGER_SERIAL
+
+
+def group_layers_into_shortcut_blocks(
+    layers: torch.nn.ModuleList,
+    layer_type_list: Sequence[str],
+    config: TransformerConfig,
+    *,
+    is_mtp_layer: bool = False,
+) -> torch.nn.ModuleList:
+    """Group physical layers into their registered shortcut-block hierarchy.
+
+    Grouping updates the layer names through the returned ``ModuleList`` hierarchy. Layers not
+    followed by an MoE remain direct children of the returned ``ModuleList``.
+
+    Args:
+        layers: Physical layers in execution order.
+        layer_type_list: Physical layer symbols in execution order.
+        config: Transformer configuration controlling shortcut scheduling.
+        is_mtp_layer: Whether the layers belong to a repeated MTP block.
+
+    Returns:
+        The registered logical layers.
+
+    Raises:
+        ValueError: If an MoE has an unsupported predecessor.
+    """
+    grouped_layers = torch.nn.ModuleList()
+    physical_index = 0
+    while physical_index < len(layers):
+        next_is_moe = (
+            physical_index + 1 < len(layers)
+            and layer_type_list[physical_index + 1] == LayerSymbols.MOE
+        )
+        if not next_is_moe:
+            grouped_layers.append(layers[physical_index])
+            physical_index += 1
+            continue
+
+        paired_type = layer_type_list[physical_index]
+        if paired_type not in (
+            LayerSymbols.MAMBA,
+            LayerSymbols.GDN,
+            LayerSymbols.ATTENTION,
+        ):
+            raise ValueError("Shortcut MoE must be preceded by a Mamba, GDN, or attention layer")
+
+        compute_layer = layers[physical_index]
+        if not getattr(compute_layer, '_supports_split_input_output', False):
+            raise ValueError(
+                f"Shortcut compute layer {paired_type!r} does not support split input/output"
+            )
+        moe_layer = layers[physical_index + 1]
+        enable_cudagraph = (
+            getattr(compute_layer, '_shortcut_graph_output_proj', False)
+            and getattr(moe_layer, '_shortcut_graph_shared_experts', False)
+        )
+        grouped_layers.append(
+            ShortcutMoEBlock(
+                compute_layer,
+                moe_layer,
+                is_mamba=paired_type == LayerSymbols.MAMBA,
+                is_mtp_layer=is_mtp_layer,
+                enable_cudagraph=enable_cudagraph,
+                overlap_a2a=config.moe_shortcut_parallel,
+            )
+        )
+        physical_index += 2
+
+    return grouped_layers
 
 
 class _RoutePersistentSlot:
