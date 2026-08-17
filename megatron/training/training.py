@@ -5020,6 +5020,21 @@ def train(
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
         cuda_graph_helper.delete_cuda_graphs()
+    elif args.cuda_graph_impl == "local":
+        from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+
+        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(
+            args, 'gtp_expert_remat_nccl_ub', False
+        ):
+            from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
+
+            # Local GTP graphs may own persistent arenas allocated from registered symmetric
+            # pools. Keep those tensors alive until their NCCL windows are deregistered; freeing
+            # an arena first can make allocation cleanup deregister a window behind the pool.
+            torch.distributed.barrier()
+            deregister_and_clear_gtp_symm_pools()
+
+        delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
     if args.optimizer_cuda_graph:
