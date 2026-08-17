@@ -627,6 +627,94 @@ def test_step_explicit_boundary_param_bitwise_matches_reference(distributed_setu
     torch.testing.assert_close(full, baseline.fc.weight, atol=0, rtol=0)
 
 
+def test_step_reconstruct_full_param_bitwise_matches_reference(distributed_setup):
+    """With `reconstruct_full_param=True`, the owner gathers weight shards too.
+
+    Same boundary-param setup as `test_step_explicit_boundary_param_bitwise_matches_reference`,
+    but the optimizer is constructed with `reconstruct_full_param=True` so the owner
+    performs a second P2P round to gather each rank's local weight shard,
+    reconstructs the full parameter, and passes it as the `param` argument to
+    `orthogonalize`. The result must still match the single-rank reference
+    bitwise, guarding the optional full-parameter reconstruction path.
+    """
+    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
+
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2 or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            "Needs >=2 ranks and >=1 GPU per rank; "
+            "a 1-GPU-multi-rank config cannot run the owner-compute P2P step."
+        )
+    rows = 16
+    in_features = 8
+    if rows % world_size != 0:
+        pytest.skip(f"rows {rows} not divisible by world_size {world_size}.")
+    mesh = init_device_mesh(device.type, (world_size,))
+
+    torch.manual_seed(1234)
+    model = BoundaryModel(rows, in_features).to(device)
+    fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
+
+    plan = compute_shard_plan(
+        torch.Size((rows, in_features)),
+        tensor_flat_offset=0,
+        rank_flat_shard_size=(rows * in_features) // world_size,
+        world_size=world_size,
+    )
+    assert plan.is_boundary(), "BoundaryModel weight must straddle the DP boundary."
+
+    torch.manual_seed(1234)
+    baseline = BoundaryModel(rows, in_features).to(device)
+    full = _gather_full_param(model.fc.weight, mesh, world_size)
+    with torch.no_grad():
+        baseline.fc.weight.copy_(full)
+
+    lr, momentum, nesterov, weight_decay = 0.05, 0.9, True, 0.0
+    inner = Muon(
+        model.parameters(),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=nesterov,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+        use_syrk=False,
+    )
+    sharded_opt = FsdpMuon(
+        model.parameters(),
+        inner_optimizer=inner,
+        dp_mesh=mesh,
+        use_owner_comm_stream=False,
+        reconstruct_full_param=True,
+    )
+    base_opt = Muon(
+        baseline.parameters(),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=nesterov,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+    )
+
+    x = torch.randn(4, in_features, device=device)
+    for _ in range(3):
+        sharded_opt.zero_grad(set_to_none=True)
+        base_opt.zero_grad(set_to_none=True)
+        model(x).sum().backward()
+        baseline(x).sum().backward()
+        sharded_opt.step()
+        base_opt.step()
+
+    full = _gather_full_param(model.fc.weight, mesh, world_size)
+    torch.testing.assert_close(full, baseline.fc.weight, atol=0, rtol=0)
+
+
 def test_step_losses_track_torch_muon(distributed_setup):
     """The FSDP Muon step should track torch.optim.Muon over several steps.
 
@@ -716,8 +804,9 @@ def test_step_mixed_dtypes_bitwise_matches_reference(distributed_setup):
     """The FSDP Muon step must handle a param group with mixed dtypes (fp32 + bf16).
 
     Exercises the `_group_updates` chunking: boundary params of different dtypes
-    must be processed in separate `_step_boundary` calls with matching P2P
-    buffer metadata, and the result must match a single-rank Muon reference.
+    must be processed in separate boundary chunks (one `_finish_boundary_step`
+    call each) with matching P2P buffer metadata, and the result must match a
+    single-rank Muon reference.
     """
     from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 
