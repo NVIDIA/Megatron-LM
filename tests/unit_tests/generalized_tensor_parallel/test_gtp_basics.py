@@ -46,6 +46,7 @@ from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
 import megatron.core.tensor_parallel.gtp_cuda_graphs as gtp_cuda_graphs
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import get_mxfp8_block_scaling_recipe
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTPChain,
@@ -792,14 +793,19 @@ def _make_native_fp8_gtp_linear(in_f, out_f, gtp_remat_group, dtype, recipe):
     return layer
 
 
-def _worker_mxfp8_linear(rank, world_size, port):
+def _requires_mxfp8_2d():
+    try:
+        get_mxfp8_block_scaling_recipe(mxfp8_2d_quantization=True)
+    except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+        pytest.skip(f"MXFP8 2D quantization is not available: {exc}")
+
+
+def _worker_mxfp8_linear(rank, world_size, port, mxfp8_2d_quantization):
     """Verify GTP Linear with a native MXFP8 param: all-gather + GEMM + backward.
 
     mxfp8 always implies --fp8-param-gather: the weight is built as a native FP8 shard at
     construction (no BF16 source, no per-forward cast).
     """
-    from transformer_engine.common.recipe import MXFP8BlockScaling
-
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
 
     torch.manual_seed(0)
@@ -807,7 +813,9 @@ def _worker_mxfp8_linear(rank, world_size, port):
     batch, in_f, out_f = 32, 64, 128  # out_f % (16*world_size)==0 → no padding
     dtype = torch.bfloat16
     gtp_remat_group = dist.new_group(list(range(world_size)))
-    recipe = MXFP8BlockScaling()
+    recipe = get_mxfp8_block_scaling_recipe(
+        mxfp8_2d_quantization=mxfp8_2d_quantization
+    )
     layer = _make_native_fp8_gtp_linear(in_f, out_f, gtp_remat_group, dtype, recipe)
 
     # The weight IS the native FP8 shard: a QuantizedTensor with the GTP surface attached.
@@ -838,7 +846,7 @@ def _worker_mxfp8_linear(rank, world_size, port):
     assert torch.isfinite(out2).all(), "MXFP8 GTP second-microbatch output has non-finite"
 
 
-def _worker_mxfp8_linear_unaligned(rank, world_size, port):
+def _worker_mxfp8_linear_unaligned(rank, world_size, port, mxfp8_2d_quantization):
     """Verify native-FP8 MXFP8 GTP when out_features needs padding.
 
     MXFP8 requires tensor dims divisible by 32, so shard_size (= M_padded / world_size)
@@ -847,8 +855,6 @@ def _worker_mxfp8_linear_unaligned(rank, world_size, port):
     holds 24 real rows zero-padded to 32. After all-gather, _strip_padding removes the
     padded rows before the GEMM, so the output has the original out_f columns.
     """
-    from transformer_engine.common.recipe import MXFP8BlockScaling
-
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import update_gtp_config
 
     torch.manual_seed(0)
@@ -858,7 +864,9 @@ def _worker_mxfp8_linear_unaligned(rank, world_size, port):
     batch = 32
     dtype = torch.bfloat16
     gtp_remat_group = dist.new_group(list(range(world_size)))
-    recipe = MXFP8BlockScaling()
+    recipe = get_mxfp8_block_scaling_recipe(
+        mxfp8_2d_quantization=mxfp8_2d_quantization
+    )
     layer = _make_native_fp8_gtp_linear(in_f, out_f, gtp_remat_group, dtype, recipe)
     assert layer.weight.pad_length == 8, f"expected pad 8, got {layer.weight.pad_length}"
 
@@ -874,15 +882,21 @@ def _worker_mxfp8_linear_unaligned(rank, world_size, port):
 
 
 class TestMXFP8LinearGTP:
-    def test_forward_backward(self):
+    @pytest.mark.parametrize("mxfp8_2d_quantization", [False, True], ids=["1d", "2d"])
+    def test_forward_backward(self, mxfp8_2d_quantization):
         _requires_mxfp8()
+        if mxfp8_2d_quantization:
+            _requires_mxfp8_2d()
         _requires_multi_gpu(4)
-        _run_distributed(_worker_mxfp8_linear, 4)
+        _run_distributed(_worker_mxfp8_linear, 4, mxfp8_2d_quantization)
 
-    def test_forward_unaligned_padding(self):
+    @pytest.mark.parametrize("mxfp8_2d_quantization", [False, True], ids=["1d", "2d"])
+    def test_forward_unaligned_padding(self, mxfp8_2d_quantization):
         _requires_mxfp8()
+        if mxfp8_2d_quantization:
+            _requires_mxfp8_2d()
         _requires_multi_gpu(4)
-        _run_distributed(_worker_mxfp8_linear_unaligned, 4)
+        _run_distributed(_worker_mxfp8_linear_unaligned, 4, mxfp8_2d_quantization)
 
 
 # ---------------------------------------------------------------------------

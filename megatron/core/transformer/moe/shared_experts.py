@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import HAVE_TE, get_mxfp8_block_scaling_recipe
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
@@ -34,11 +34,7 @@ from megatron.core.utils import (
 if HAVE_TE:
     import transformer_engine as te
 
-    from megatron.core.extensions.transformer_engine import (
-        TELinear,
-        get_mxfp8_block_scaling_recipe,
-        set_save_original_input,
-    )
+    from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
     from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 else:
     te = None

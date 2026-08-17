@@ -102,13 +102,8 @@ def get_mxfp8_block_scaling_recipe(*, mxfp8_2d_quantization: bool = False, **kwa
         RuntimeError: If 2D quantization is requested with an older Transformer Engine build.
     """
     if mxfp8_2d_quantization:
-        parameters = inspect.signature(te.common.recipe.MXFP8BlockScaling).parameters.values()
-        supports_2d_quantization = any(
-            parameter.name == "enable_2d_quantization"
-            or parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
-        )
-        if not supports_2d_quantization:
+        parameters = inspect.signature(te.common.recipe.MXFP8BlockScaling).parameters
+        if "enable_2d_quantization" not in parameters:
             raise RuntimeError(
                 "MXFP8 2D quantization requires a Transformer Engine build whose "
                 "MXFP8BlockScaling recipe supports enable_2d_quantization."

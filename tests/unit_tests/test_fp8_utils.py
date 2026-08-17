@@ -58,6 +58,14 @@ class TestMXFP82DRecipe:
     def test_get_fp8_recipe_forwards_2d_quantization_option(self, mxfp8_2d_quantization):
         recipe = object()
         recipe_constructor = Mock(return_value=recipe)
+
+        def mxfp8_recipe(fp8_format, fp8_dpa=False, enable_2d_quantization=False):
+            return recipe_constructor(
+                fp8_format=fp8_format,
+                fp8_dpa=fp8_dpa,
+                enable_2d_quantization=enable_2d_quantization,
+            )
+
         config = Mock(
             fp8="e4m3",
             fp8_recipe=Fp8Recipe.mxfp8,
@@ -69,7 +77,7 @@ class TestMXFP82DRecipe:
             patch.object(fp8_utils, "is_te_min_version", return_value=True),
             patch(
                 "megatron.core.extensions.transformer_engine.te.common.recipe.MXFP8BlockScaling",
-                recipe_constructor,
+                mxfp8_recipe,
             ),
         ):
             assert fp8_utils.get_fp8_recipe(config) is recipe
@@ -77,9 +85,8 @@ class TestMXFP82DRecipe:
         expected_kwargs = {
             "fp8_format": fp8_utils.transformer_engine.common.recipe.Format.E4M3,
             "fp8_dpa": False,
+            "enable_2d_quantization": mxfp8_2d_quantization,
         }
-        if mxfp8_2d_quantization:
-            expected_kwargs["enable_2d_quantization"] = True
         recipe_constructor.assert_called_once_with(**expected_kwargs)
 
     def test_get_fp8_recipe_rejects_te_without_2d_quantization_support(self):
@@ -98,6 +105,27 @@ class TestMXFP82DRecipe:
             patch(
                 "megatron.core.extensions.transformer_engine.te.common.recipe.MXFP8BlockScaling",
                 old_mxfp8_recipe,
+            ),
+            pytest.raises(RuntimeError, match="enable_2d_quantization"),
+        ):
+            fp8_utils.get_fp8_recipe(config)
+
+    def test_get_fp8_recipe_rejects_kwargs_only_2d_quantization_support(self):
+        config = Mock(
+            fp8="e4m3",
+            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_dot_product_attention=False,
+            mxfp8_2d_quantization=True,
+        )
+
+        def kwargs_only_mxfp8_recipe(**kwargs):
+            return Mock(**kwargs)
+
+        with (
+            patch.object(fp8_utils, "is_te_min_version", return_value=True),
+            patch(
+                "megatron.core.extensions.transformer_engine.te.common.recipe.MXFP8BlockScaling",
+                kwargs_only_mxfp8_recipe,
             ),
             pytest.raises(RuntimeError, match="enable_2d_quantization"),
         ):

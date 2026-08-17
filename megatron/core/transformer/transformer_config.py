@@ -1483,6 +1483,10 @@ class TransformerConfig(ModelParallelConfig):
                     "mxfp8_2d_quantization requires fp8_recipe='mxfp8', "
                     f"got '{self.fp8_recipe}'."
                 )
+            if self.moe_single_grouped_weight:
+                raise ValueError(
+                    "mxfp8_2d_quantization does not support moe_single_grouped_weight."
+                )
 
         if self.fp8_output_proj:
             if not self.fp8:

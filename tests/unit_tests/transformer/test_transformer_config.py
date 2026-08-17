@@ -72,6 +72,14 @@ def test_mxfp8_2d_quantization_accepts_mxfp8_recipe():
     [
         ({"fp8_recipe": "mxfp8"}, "together with fp8 mode"),
         ({"fp8": "e4m3", "fp8_recipe": "delayed"}, "requires fp8_recipe='mxfp8'"),
+        (
+            {
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+                "moe_single_grouped_weight": True,
+            },
+            "does not support moe_single_grouped_weight",
+        ),
     ],
 )
 def test_mxfp8_2d_quantization_rejects_incompatible_fp8_config(config_kwargs, match):
