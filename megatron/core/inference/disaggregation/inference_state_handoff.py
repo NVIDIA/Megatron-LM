@@ -53,6 +53,7 @@ class _PreparedHandoffMetadata:
     """Per-request metadata assembled once for a completed prefill batch."""
 
     local_blocks: list[int]  # Full prompt block table, including a partial tail.
+    local_ssm_slot: int | None
     kv_meta: Any
     ssm_meta: Any
     resume_tokens: list[int]
@@ -65,6 +66,7 @@ class InferenceStateHandoffMixin:
         """Initialize state without importing or constructing a transfer backend."""
 
         self._pinned_handoff_blocks: Dict[int, list] = {}  # Request ID -> pinned KV block IDs.
+        self._pinned_handoff_ssm_slots: Dict[int, int] = {}  # Request ID -> retained live slot.
         self._kv_transfer_agent = None
         self._kv_peer_metas = None  # KV descriptors for this PP stage's TP ranks.
         self._pp_kv_peer_metas = None  # Each PP stage's set of TP KV descriptors.
@@ -182,9 +184,9 @@ class InferenceStateHandoffMixin:
             raise RuntimeError(
                 "Cannot reset while KV handoff transfers may still access cache storage"
             )
-        if self._pinned_handoff_blocks:
+        if self._pinned_handoff_blocks or self._pinned_handoff_ssm_slots:
             raise RuntimeError(
-                "Cannot reset while KV handoff blocks remain pinned; wait for RELEASE_KV"
+                "Cannot reset while handoff state remains pinned; wait for RELEASE_KV"
             )
         self._handoff_completion_notifications.clear()
 
@@ -218,13 +220,7 @@ class InferenceStateHandoffMixin:
         if role not in ("prefill", "decode"):
             raise ValueError(f"KV transfer role must be 'prefill' or 'decode', got {role!r}")
         if self.context.is_hybrid_model:
-            ssm_cache = self.context.mamba_slot_allocator
-            if role == "prefill" and ssm_cache is None:
-                raise RuntimeError(
-                    "Hybrid prefill handoff requires an SSM state cache. Pass "
-                    "--inference-dynamic-batching-prefix-caching-mamba-gb <GB>."
-                )
-            if role == "decode" and ssm_cache is not None:
+            if role == "decode" and self.context.mamba_slot_allocator is not None:
                 raise RuntimeError(
                     "A hybrid decode handoff writes directly into live SSM state; "
                     "do not configure prefix_caching_mamba_gb on the decode engine"
@@ -290,19 +286,12 @@ class InferenceStateHandoffMixin:
             layer_end=layer_end,
         )
 
-        # Prefill sends from pinned snapshots; decode receives directly into
-        # live request slots and therefore has no durable recurrent cache.
+        # Both roles transfer directly between live recurrent-state slots. Prefill
+        # retains its source slot until decode acknowledges transfer completion.
         if self.context.is_hybrid_model:
-            ssm_cache = self.context.mamba_slot_allocator
-            if role == "prefill":
-                assert ssm_cache is not None
-                conv_states = ssm_cache.conv_states
-                recurrent_states = ssm_cache.ssm_states
-                state_slot_count = ssm_cache.max_slots
-            else:
-                conv_states = self.context.mamba_conv_states
-                recurrent_states = self.context.mamba_ssm_states
-                state_slot_count = self.context.max_requests
+            conv_states = self.context.mamba_conv_states
+            recurrent_states = self.context.mamba_ssm_states
+            state_slot_count = self.context.max_requests
 
             conv_shape = conv_states.shape
             ssm_shape = recurrent_states.shape
@@ -393,7 +382,7 @@ class InferenceStateHandoffMixin:
         self._pp_ssm_peer_metas = [entry["ssm"] for entry in gathered_stage_metas]
 
     def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
-        """Push a pinned hand-off's KV and SSM snapshots to the decode
+        """Push a pinned hand-off's KV and live SSM state to the decode
         instance described by `decode_metas` (two-sided transports only).
 
         The decode posted its matching receives when SUBMIT_REQUEST_WITH_KV
@@ -411,9 +400,9 @@ class InferenceStateHandoffMixin:
 
         ssm_pushes = []
         if self._ssm_transfer_agents:
-            slot = self.context.mamba_slot_allocator.get_slot(block_ids[-1])
-            if slot < 0:
-                raise RuntimeError(f"No pinned SSM state for handoff request {request_id}")
+            slot = self._pinned_handoff_ssm_slots.get(request_id)
+            if slot is None:
+                raise RuntimeError(f"No retained SSM state for handoff request {request_id}")
             for state_kind in _SSM_STATE_KINDS:
                 try:
                     peer_metas = [entry["ssm"][state_kind] for entry in decode_metas]
@@ -425,8 +414,8 @@ class InferenceStateHandoffMixin:
 
         kv_peer = {"tp_metas": list(decode_metas)}
         handles = [self._kv_transfer_agent.begin_push_blocks(kv_peer, block_ids)]
-        # The final KV block remains pinned until RELEASE_KV, so its SSM slot
-        # cannot be evicted or reused while these sends are active.
+        # The source live slot remains retained until RELEASE_KV, so request
+        # cleanup cannot reuse it while these sends are active.
         for agent, peer_metas, slots in ssm_pushes:
             handles.append(agent.begin_push_blocks({"tp_metas": peer_metas}, slots))
         self._pending_kv_pushes.append((request_id, handles))
@@ -456,7 +445,7 @@ class InferenceStateHandoffMixin:
 
     def _prepare_handoff_metadata_batch(
         self,
-        requests_and_blocks: list[tuple["DynamicInferenceRequest", list[int]]],
+        requests_and_state: list[tuple["DynamicInferenceRequest", list[int], int | None]],
         decode_tokens_by_request: Dict[int, list[int]],
     ) -> dict[int, _PreparedHandoffMetadata]:
         """Assemble metadata for all handoffs completed by one engine step.
@@ -465,13 +454,13 @@ class InferenceStateHandoffMixin:
         """
 
         handoffs = []
-        for request, block_ids in requests_and_blocks:
+        for request, block_ids, ssm_slot in requests_and_state:
             if not request.sampling_params.do_kv_handoff:
                 continue
             prompt_block_count = (
                 len(request.prompt_tokens) + self.context.block_size_tokens - 1
             ) // self.context.block_size_tokens
-            handoffs.append((request, list(block_ids[:prompt_block_count])))
+            handoffs.append((request, list(block_ids[:prompt_block_count]), ssm_slot))
         if not handoffs:
             return {}
         if self._kv_peer_metas is None:
@@ -479,8 +468,6 @@ class InferenceStateHandoffMixin:
 
         pp_size = get_pg_size(self.pg_collection.pp)
         try:
-            ssm_cache = self.context.mamba_slot_allocator if self._ssm_transfer_agents else None
-
             static_pp_metas = self._pp_kv_peer_metas or [self._kv_peer_metas]
             static_pp_ssm_metas = self._pp_ssm_peer_metas or [self._tp_ssm_peer_metas]
             if len(static_pp_metas) != pp_size:
@@ -495,7 +482,7 @@ class InferenceStateHandoffMixin:
                 )
 
             prepared = {}
-            for request, candidate_blocks in handoffs:
+            for request, candidate_blocks, ssm_slot in handoffs:
                 resume_tokens = list(decode_tokens_by_request.get(request.request_id, []))
                 expected_resume_tokens = self.context.num_speculative_tokens + 1
                 if len(resume_tokens) != expected_resume_tokens:
@@ -508,10 +495,7 @@ class InferenceStateHandoffMixin:
                     raise RuntimeError(
                         "Cannot create a decode-only handoff without the prompt KV state"
                     )
-                final_ssm_slot = (
-                    ssm_cache.get_slot(candidate_blocks[-1]) if ssm_cache is not None else -1
-                )
-                if ssm_cache is not None and final_ssm_slot < 0:
+                if self._ssm_transfer_agents and ssm_slot is None:
                     raise RuntimeError(
                         "Cannot create a hybrid decode-only handoff without the exact final "
                         "SSM state"
@@ -535,7 +519,7 @@ class InferenceStateHandoffMixin:
                 ssm_meta = None
                 if self._ssm_transfer_agents:
                     stage_state_metas = [
-                        self._ssm_stage_transfer_meta(static_meta, final_ssm_slot)
+                        self._ssm_stage_transfer_meta(static_meta, ssm_slot)
                         for static_meta in static_pp_ssm_metas
                     ]
                     ssm_meta = {}
@@ -552,14 +536,16 @@ class InferenceStateHandoffMixin:
 
                 prepared[request.request_id] = _PreparedHandoffMetadata(
                     local_blocks=block_ids,
+                    local_ssm_slot=ssm_slot,
                     kv_meta=kv_meta,
                     ssm_meta=ssm_meta,
                     resume_tokens=resume_tokens,
                 )
             return prepared
         except Exception:
-            for _, block_ids in handoffs:
+            for _, block_ids, ssm_slot in handoffs:
                 self._release_pinned_handoff_blocks(block_ids)
+                self._release_pinned_handoff_ssm_slot(ssm_slot)
             raise
 
     @staticmethod
@@ -599,6 +585,8 @@ class InferenceStateHandoffMixin:
         ssm_meta = prepared.ssm_meta
 
         self._pinned_handoff_blocks[rid] = list(block_ids)
+        if prepared.local_ssm_slot is not None:
+            self._pinned_handoff_ssm_slots[rid] = prepared.local_ssm_slot
 
         if isinstance(kv_meta, list):
             kv_meta = {"tp_metas": kv_meta}
@@ -628,11 +616,16 @@ class InferenceStateHandoffMixin:
         Side: prefill engine; pull and push transport paths.
         """
         block_ids = self._pinned_handoff_blocks.pop(request_id, None)
-        if not block_ids:
+        ssm_slot = self._pinned_handoff_ssm_slots.pop(request_id, None)
+        if not block_ids and ssm_slot is None:
             return
-        released = self._release_pinned_handoff_blocks(block_ids)
+        released = self._release_pinned_handoff_blocks(block_ids or [])
+        self._release_pinned_handoff_ssm_slot(ssm_slot)
         logging.info(
-            "DISAGG_PREFILL_RELEASE request_id=%d released_blocks=%d", request_id, released
+            "DISAGG_PREFILL_RELEASE request_id=%d released_blocks=%d ssm=%d",
+            request_id,
+            released,
+            int(ssm_slot is not None),
         )
 
     def _release_pinned_handoff_blocks(self, block_ids: list) -> int:
@@ -645,6 +638,12 @@ class InferenceStateHandoffMixin:
         allocator = self.context.kv_block_allocator
         allocator.release_memory_blocks(torch.tensor(block_ids, dtype=torch.int32, device="cpu"))
         return len(block_ids)
+
+    def _release_pinned_handoff_ssm_slot(self, ssm_slot: int | None) -> None:
+        """Release a prefill live-state slot after its handoff ownership ends."""
+
+        if ssm_slot is not None:
+            self.context.mamba_metadata.release_retained_state_slot(ssm_slot)
 
     def add_request_with_kv_handoff(
         self,

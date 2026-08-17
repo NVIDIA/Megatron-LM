@@ -3525,7 +3525,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             sa._intermediate_offsets_cpu[request_indexes] = 0
             sa._intermediate_block_ids_cpu[request_indexes] = -1
             sa._eos_cache_block_id_cpu[request_indexes] = -1
-            sa._eos_handoff_required_cpu[request_indexes] = False
 
     def _get_paused_request_count_within_block_budget(self) -> int:
         """Count the left-most paused requests whose blocks fit the paused budget."""

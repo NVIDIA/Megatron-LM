@@ -376,10 +376,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self._raise_kv_handoff_not_enabled("KV handoff completion notification")
 
     def _prepare_handoff_metadata_batch(
-        self, requests_and_blocks: list[tuple], decode_tokens_by_request: Dict[int, list[int]]
+        self, requests_and_state: list[tuple], decode_tokens_by_request: Dict[int, list[int]]
     ) -> dict:
         """Hook overridden by the KV-handoff engine composition."""
-        if any(request.sampling_params.do_kv_handoff for request, _ in requests_and_blocks):
+        if any(request.sampling_params.do_kv_handoff for request, *_ in requests_and_state):
             self._raise_kv_handoff_not_enabled("KV handoff completion")
         return {}
 
@@ -388,6 +388,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _release_pinned_handoff_blocks(self, block_ids: list) -> int:
         return 0
+
+    def _release_pinned_handoff_ssm_slot(self, ssm_slot: int | None) -> None:
+        return None
 
     def setup_kv_transfer(self, role: str, backend: str = "nixl") -> None:
         """Raising stub; the hand-off engine composition overrides it."""
@@ -437,6 +440,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.waiting_request_ids = deque()
         if hasattr(self, "_pinned_handoff_blocks"):
             self._pinned_handoff_blocks.clear()
+            self._pinned_handoff_ssm_slots.clear()
         self.failed_request_ids = []
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
@@ -1367,6 +1371,7 @@ class DynamicInferenceEngine(AbstractEngine):
         pre_fwd_step_count: Optional[int] = None,
         finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
         finished_handoff_block_ids: Optional[Dict[int, list[int]]] = None,
+        finished_handoff_ssm_slots: Optional[Dict[int, int]] = None,
         finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
@@ -1391,6 +1396,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 finished requests, saved before update_requests released them.
                 Used for per-block routing reconstruction.
             finished_handoff_block_ids: Prompt KV block IDs retained for state handoff.
+            finished_handoff_ssm_slots: Live SSM slots retained for state handoff.
             finished_handoff_decode_tokens: First sampled token and optional MTP proposals
                 needed to resume directly from imported prefill state on decode.
 
@@ -1428,9 +1434,14 @@ class DynamicInferenceEngine(AbstractEngine):
         # finished requests using the KV blocks retained before context cleanup.
         request_id_list = request_ids.tolist()
         handoff_blocks_by_request = finished_handoff_block_ids or {}
+        handoff_ssm_slots_by_request = finished_handoff_ssm_slots or {}
         prepared_handoff_metadata = self._prepare_handoff_metadata_batch(
             [
-                (self.get_request(request_id), handoff_blocks_by_request.get(request_id, []))
+                (
+                    self.get_request(request_id),
+                    handoff_blocks_by_request.get(request_id, []),
+                    handoff_ssm_slots_by_request.get(request_id),
+                )
                 for request_id in request_id_list
                 if request_id in finished_request_ids
             ],
@@ -1580,9 +1591,12 @@ class DynamicInferenceEngine(AbstractEngine):
                             request, prepared_handoff_metadata.get(request_id)
                         )
                     # A prefill-role engine may also serve regular requests; release the
-                    # temporary block references when no handoff was requested.
-                    elif handoff_blocks:
+                    # temporary state ownership when no handoff was requested.
+                    elif handoff_blocks or request_id in handoff_ssm_slots_by_request:
                         self._release_pinned_handoff_blocks(handoff_blocks)
+                        self._release_pinned_handoff_ssm_slot(
+                            handoff_ssm_slots_by_request.get(request_id)
+                        )
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
@@ -2420,6 +2434,7 @@ class DynamicInferenceEngine(AbstractEngine):
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
             finished_handoff_block_ids = step_result.get("finished_handoff_block_ids", None)
+            finished_handoff_ssm_slots = step_result.get("finished_handoff_ssm_slots", None)
             finished_handoff_decode_tokens = step_result.get("finished_handoff_decode_tokens", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
@@ -2443,6 +2458,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 pre_fwd_step_count=context_state.get("step_count"),
                 finished_routing_block_ids=finished_routing_block_ids,
                 finished_handoff_block_ids=finished_handoff_block_ids,
+                finished_handoff_ssm_slots=finished_handoff_ssm_slots,
                 finished_handoff_decode_tokens=finished_handoff_decode_tokens,
             )
 

@@ -98,6 +98,7 @@ class _MambaMetadata:
         self.mamba_state_free_slot_count = available
         self.next_slot = 20
         self.freed = []
+        self.released_retained = []
 
     def allocate_slot(self):
         if self.mamba_state_free_slot_count == 0:
@@ -109,6 +110,10 @@ class _MambaMetadata:
 
     def free_slot(self, slot):
         self.freed.append(slot)
+        self.mamba_state_free_slot_count += 1
+
+    def release_retained_state_slot(self, slot):
+        self.released_retained.append(slot)
         self.mamba_state_free_slot_count += 1
 
 
@@ -381,7 +386,7 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
         assert allocator.enable_handoff_pinning
 
 
-def test_decode_role_uses_live_ssm_buffers_and_rejects_durable_cache():
+def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
     class _Backend:
         instances = []
 
@@ -435,6 +440,19 @@ def test_decode_role_uses_live_ssm_buffers_and_rejects_durable_cache():
         engine.context.mamba_conv_states = torch.empty(1, 8, 18, 3)
         engine.context.mamba_ssm_states = torch.empty(1, 8, 2, 4, 5)
         engine.setup_kv_transfer("decode")
+
+    assert _Backend.instances[1].kwargs["memory_buffer"] is engine.context.mamba_conv_states
+    assert _Backend.instances[2].kwargs["memory_buffer"] is engine.context.mamba_ssm_states
+    assert [backend.kwargs["expected_num_blocks"] for backend in _Backend.instances[1:]] == [8, 8]
+
+    _Backend.instances.clear()
+    engine.context.mamba_slot_allocator = object()
+    with (
+        mock.patch(backend_factory, return_value=_Backend),
+        mock.patch(pg_size, return_value=1),
+        mock.patch(pg_rank, return_value=0),
+    ):
+        engine.setup_kv_transfer("prefill")
 
     assert _Backend.instances[1].kwargs["memory_buffer"] is engine.context.mamba_conv_states
     assert _Backend.instances[2].kwargs["memory_buffer"] is engine.context.mamba_ssm_states
@@ -526,10 +544,20 @@ def test_reset_rejects_pinned_prefill_blocks(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     engine._pinned_handoff_blocks[7] = [10]
 
-    with pytest.raises(RuntimeError, match="KV handoff blocks remain pinned"):
+    with pytest.raises(RuntimeError, match="handoff state remains pinned"):
         engine._reset_pending_kv_imports()
 
     assert engine._pinned_handoff_blocks == {7: [10]}
+
+
+def test_release_handoff_returns_retained_prefill_ssm_slot(handoff_loop):
+    engine = _HandoffHarness(handoff_loop, hybrid=True)
+    engine._pinned_handoff_ssm_slots[7] = 3
+
+    engine.release_handoff_blocks(7)
+
+    assert engine.context.mamba_metadata.released_retained == [3]
+    assert engine._pinned_handoff_ssm_slots == {}
 
 
 def test_reset_does_not_release_unsafe_import_destinations(handoff_loop):
@@ -793,7 +821,8 @@ def test_handoff_metadata_batches_completed_requests_across_pipeline(monkeypatch
         ),
     ):
         prepared = engine._prepare_handoff_metadata_batch(
-            zip(requests, local_blocks), {7: [71], 8: [81]}
+            [(request, blocks, None) for request, blocks in zip(requests, local_blocks)],
+            {7: [71], 8: [81]},
         )
         for request in requests:
             engine._capture_handoff_meta(request, prepared[request.request_id])
@@ -816,10 +845,7 @@ def test_hybrid_handoff_keeps_partial_block_for_exact_decode_resume():
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
     engine.pg_collection = SimpleNamespace(tp=None, pp=None, mp=None)
-    engine.context = SimpleNamespace(
-        block_size_tokens=4, num_speculative_tokens=0, mamba_slot_allocator=mock.Mock()
-    )
-    engine.context.mamba_slot_allocator.get_slot.return_value = 9
+    engine.context = SimpleNamespace(block_size_tokens=4, num_speculative_tokens=0)
     engine._kv_peer_metas = {"global_rank": 0}
     engine._tp_ssm_peer_metas = {"conv": {"global_rank": 0}, "recurrent": {"global_rank": 0}}
     engine._ssm_transfer_agents = {"conv": mock.Mock(), "recurrent": mock.Mock()}
@@ -834,12 +860,12 @@ def test_hybrid_handoff_keeps_partial_block_for_exact_decode_resume():
     with mock.patch(
         "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_size", return_value=1
     ):
-        prepared = engine._prepare_handoff_metadata_batch([(request, [10, 11, 12])], {7: [99]})
+        prepared = engine._prepare_handoff_metadata_batch([(request, [10, 11, 12], 9)], {7: [99]})
         engine._capture_handoff_meta(request, prepared[7])
 
     assert request.disaggregated_params["block_ids"] == [10, 11, 12]
     assert request.disaggregated_params["kv_meta"]["resume_tokens"] == [99]
-    engine.context.mamba_slot_allocator.get_slot.assert_called_once_with(12)
+    assert engine._pinned_handoff_ssm_slots == {7: 9}
     engine._release_pinned_handoff_blocks.assert_not_called()
 
 
@@ -1020,11 +1046,10 @@ def test_decode_role_rejects_prompt_scheduling(handoff_loop):
 def test_push_handoff_uses_final_pinned_blocks_ssm_slot():
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
-    engine.context = SimpleNamespace(mamba_slot_allocator=mock.Mock())
-    engine.context.mamba_slot_allocator.get_slot.return_value = 3
     engine._kv_transfer_agent = mock.Mock()
     engine._ssm_transfer_agents = {"conv": mock.Mock(), "recurrent": mock.Mock()}
     engine._pinned_handoff_blocks[7] = [20, 21]
+    engine._pinned_handoff_ssm_slots[7] = 3
     decode_metas = [
         {"ssm": {"conv": {"agent": "decode-conv"}, "recurrent": {"agent": "decode-ssm"}}}
     ]
@@ -1040,17 +1065,15 @@ def test_push_handoff_uses_final_pinned_blocks_ssm_slot():
     engine._ssm_transfer_agents["recurrent"].begin_push_blocks.assert_called_once_with(
         {"tp_metas": [{"agent": "decode-ssm"}]}, [3]
     )
-    engine.context.mamba_slot_allocator.get_slot.assert_called_once_with(21)
 
 
 def test_push_handoff_validates_ssm_metadata_before_posting_sends():
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
-    engine.context = SimpleNamespace(mamba_slot_allocator=mock.Mock())
-    engine.context.mamba_slot_allocator.get_slot.return_value = 3
     engine._kv_transfer_agent = mock.Mock()
     engine._ssm_transfer_agents = {"conv": mock.Mock(), "recurrent": mock.Mock()}
     engine._pinned_handoff_blocks[7] = [20]
+    engine._pinned_handoff_ssm_slots[7] = 3
 
     with pytest.raises(RuntimeError, match="recurrent SSM transfer state"):
         engine.push_handoff_kv(7, [{"ssm": {"conv": {"agent": "decode"}}}])
@@ -1078,10 +1101,7 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
     engine._tp_ssm_peer_metas = stage_ssm_metas(0)
     engine._pp_ssm_peer_metas = [engine._tp_ssm_peer_metas, stage_ssm_metas(1)]
     engine.context = SimpleNamespace(
-        block_size_tokens=4,
-        num_speculative_tokens=0,
-        mamba_slot_allocator=mock.Mock(),
-        memory_buffer=torch.empty(1),
+        block_size_tokens=4, num_speculative_tokens=0, memory_buffer=torch.empty(1)
     )
     requests = [
         SimpleNamespace(
@@ -1098,8 +1118,7 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
         ),
     ]
     local_blocks = [[10, 11, 12, 13], [14, 15, 16]]
-    slots = {10: 100, 11: 101, 12: 102, 13: 103, 14: 110, 15: 111, 16: 112}
-    engine.context.mamba_slot_allocator.get_slot.side_effect = lambda block: slots[block]
+    live_slots = [103, 112]
 
     pg_size = "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_size"
     with (
@@ -1110,15 +1129,16 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
         ),
     ):
         prepared = engine._prepare_handoff_metadata_batch(
-            zip(requests, local_blocks), {2: [90], 3: [91]}
+            [
+                (request, blocks, slot)
+                for request, blocks, slot in zip(requests, local_blocks, live_slots)
+            ],
+            {2: [90], 3: [91]},
         )
         for request in requests:
             engine._capture_handoff_meta(request, prepared[request.request_id])
 
-    assert engine.context.mamba_slot_allocator.get_slot.call_args_list == [
-        mock.call(13),
-        mock.call(16),
-    ]
+    assert engine._pinned_handoff_ssm_slots == {2: 103, 3: 112}
     first_ssm = requests[0].disaggregated_params["kv_meta"]["ssm"]
     assert [
         [tp_meta["block_ids"] for tp_meta in stage["tp_metas"]]

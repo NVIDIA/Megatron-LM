@@ -1452,7 +1452,7 @@ def test_mamba_lru_eviction_selects_only_requested_oldest_slots(monkeypatch):
 @pytest.mark.parametrize("max_slots", [0, 1])
 def test_optional_mamba_checkpoint_commit_uses_available_capacity(monkeypatch, max_slots):
     allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=3, max_slots=max_slots)
-    allocator._collect_commit_data = lambda: [(1, 101, 0, False, False), (2, 102, 0, True, False)]
+    allocator._collect_commit_data = lambda: ([1], [0], [2], [0], [101, 102])
     copy_calls = []
     store_calls = []
     register_calls = []
@@ -1467,59 +1467,9 @@ def test_optional_mamba_checkpoint_commit_uses_available_capacity(monkeypatch, m
     expected_slot = 0 if max_slots else -1
     assert allocator.block_to_slot.tolist() == [-1, expected_slot, -1]
     assert copy_calls == ([([0], [0])] if max_slots else [])
-    assert store_calls == []
+    assert store_calls == ([([], [])] if max_slots else [])
     assert register_calls == ([([1], [101])] if max_slots else [])
     assert clear_calls == [True]
-
-
-def test_required_handoff_state_takes_priority_over_optional_checkpoints(monkeypatch):
-    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=3, max_slots=1)
-    allocator._collect_commit_data = lambda: [(1, 101, 0, False, False), (2, -1, 0, True, True)]
-    copy_calls = []
-    store_calls = []
-    register_calls = []
-    clear_calls = []
-    allocator._copy_intermediate_to_cache = lambda *args: copy_calls.append(args)
-    allocator.store_from_live_batch = lambda *args: store_calls.append(args)
-    allocator.register_block_hashes_batch = lambda *args: register_calls.append(args)
-    allocator._clear_intermediate_state = lambda: clear_calls.append(True)
-
-    allocator.commit_intermediate_states()
-
-    assert allocator.block_to_slot.tolist() == [-1, -1, 0]
-    assert copy_calls == []
-    assert store_calls == [([0], [0])]
-    assert register_calls == [([2], [-1])]
-    assert clear_calls == [True]
-
-
-def test_required_handoff_state_replaces_optional_snapshot_for_same_block(monkeypatch):
-    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=2, max_slots=1)
-    allocator._collect_commit_data = lambda: [(1, 101, 0, False, False), (1, 101, 0, True, True)]
-    store_calls = []
-    register_calls = []
-    allocator._copy_intermediate_to_cache = lambda *_: pytest.fail(
-        "optional state must not overwrite the exact handoff state"
-    )
-    allocator.store_from_live_batch = lambda *args: store_calls.append(args)
-    allocator.register_block_hashes_batch = lambda *args: register_calls.append(args)
-    allocator._clear_intermediate_state = lambda: None
-
-    allocator.commit_intermediate_states()
-
-    assert store_calls == [([0], [0])]
-    assert register_calls == [([1], [101])]
-
-
-def test_exact_handoff_state_allocation_is_atomic(monkeypatch):
-    allocator = _make_cpu_mamba_slot_allocator(monkeypatch, total_blocks=3, max_slots=1)
-    allocator._collect_commit_data = lambda: [(1, -1, 0, True, True), (2, -1, 1, True, True)]
-    allocator.store_from_live_batch = lambda *_: pytest.fail("required state must not be copied")
-
-    with pytest.raises(MambaSlotCapacityError, match="requires 2 new durable slots"):
-        allocator.commit_intermediate_states()
-
-    assert allocator.block_to_slot.tolist() == [-1, -1, -1]
 
 
 class TestMambaSlotAllocator(PrefixCachingTestBase):
