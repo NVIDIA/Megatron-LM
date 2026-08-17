@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 from typing import Iterable, List, Union
 
 import torch
@@ -25,19 +26,142 @@ from torch.distributed.checkpoint.metadata import (
 from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
 from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
 
+from megatron.core.dist_checkpointing.core import CheckpointingException
 
-def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
-    """
-    Gather chunk metadata for a DTensor across all ranks and compute the
-    offsets and sizes of each chunk. This is necessary for handling uneven
-    sharding in distributed tensors.
-    """
+
+def _get_backend_name(group: dist.ProcessGroup) -> str:
+    """Return a normalized process group backend name."""
+    return str(dist.get_backend(group)).lower().removeprefix("backend.")
+
+
+def _get_collective_device(
+    group: dist.ProcessGroup, device_type: str | None = None
+) -> torch.device:
+    """Return a device supported by the process group's backend."""
+    # DeviceMesh process groups can report an ``undefined`` aggregate backend when
+    # PyTorch dispatches to a device-specific backend at collective time. Prefer the
+    # mesh's declared device type instead of trying to infer it from that name.
+    if device_type == "cuda":
+        return torch.device("cuda", torch.cuda.current_device())
+    if device_type == "cpu":
+        return torch.device("cpu")
+    backend = _get_backend_name(group)
+    if backend == "nccl" or (backend == "undefined" and torch.cuda.is_available()):
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def _all_gather_int64(
+    values: Iterable[int], group: dist.ProcessGroup, *, device_type: str | None = None
+) -> List[List[int]]:
+    """Gather a fixed-size list of integers without serializing Python objects."""
+    values = list(values)
+    if _get_backend_name(group) == "fake":
+        return [values.copy() for _ in range(dist.get_world_size(group))]
+
+    local_values = torch.tensor(
+        values,
+        dtype=torch.int64,
+        device=_get_collective_device(group, device_type),
+    )
+    gathered_values = [
+        torch.empty_like(local_values) for _ in range(dist.get_world_size(group))
+    ]
+    dist.all_gather(gathered_values, local_values, group=group)
+    return [value.cpu().tolist() for value in gathered_values]
+
+
+def _placement_contract(placement: object) -> str:
+    """Return a stable representation of a DTensor placement."""
+    if isinstance(placement, _StridedShard):
+        return f"strided_shard:{placement.dim}:{int(placement.split_factor)}"
+    if isinstance(placement, Shard):
+        return f"shard:{placement.dim}"
+    if isinstance(placement, Replicate):
+        return "replicate"
+    placement_type = type(placement)
+    return f"unsupported:{placement_type.__module__}.{placement_type.__qualname__}:{placement!r}"
+
+
+def _dtensor_contract(dtensor: DTensor, context: str | None = None) -> str:
+    """Build the rank-invariant part of an uneven DTensor's metadata contract."""
+    local_shape = tuple(int(size) for size in dtensor.to_local().shape)
+    global_shape = tuple(int(size) for size in dtensor.shape)
+    mesh_shape = tuple(int(size) for size in dtensor.device_mesh.shape)
+    mesh_ranks = tuple(int(rank) for rank in dtensor.device_mesh.mesh.flatten().tolist())
+    placements = tuple(
+        _placement_contract(placement) for placement in dtensor.placements
+    )
+    return (
+        f"context={context};local_ndim={len(local_shape)};global_shape={global_shape};"
+        f"mesh_shape={mesh_shape};mesh_ranks={mesh_ranks};placements={placements}"
+    )
+
+
+def _contract_digest(contract: str) -> List[int]:
+    """Encode a contract as four signed int64 values for fixed-size collectives."""
+    digest = hashlib.sha256(contract.encode("utf-8")).digest()
+    return [
+        int.from_bytes(digest[offset : offset + 8], byteorder="big", signed=True)
+        for offset in range(0, len(digest), 8)
+    ]
+
+
+def _mesh_has_failure(local_failure: bool, device_mesh) -> bool:
+    """Propagate a local validation failure to every rank in a Cartesian device mesh."""
+    failure = local_failure
+    for mesh_dim in range(device_mesh.ndim):
+        group = device_mesh.get_group(mesh_dim)
+        if _get_backend_name(group) == "fake":
+            continue
+        failure_tensor = torch.tensor(
+            [int(failure)],
+            dtype=torch.int64,
+            device=_get_collective_device(group, device_mesh.device_type),
+        )
+        dist.all_reduce(failure_tensor, op=dist.ReduceOp.MAX, group=group)
+        failure = bool(failure_tensor.item())
+    return failure
+
+
+def _validate_dtensor_contract(dtensor: DTensor, context: str | None = None) -> None:
+    """Fail symmetrically when ranks disagree on rank-invariant DTensor metadata."""
+    contract = _dtensor_contract(dtensor, context)
+    digest = _contract_digest(contract)
+    mismatched_groups = []
+
+    # Every rank traverses every mesh dimension before deciding whether to fail. This keeps
+    # placement mismatches from making one rank enter a shape collective while a peer skips it.
+    for mesh_dim in range(dtensor.device_mesh.ndim):
+        group = dtensor.device_mesh.get_group(mesh_dim)
+        group_digests = _all_gather_int64(
+            digest, group, device_type=dtensor.device_mesh.device_type
+        )
+        if any(group_digest != group_digests[0] for group_digest in group_digests[1:]):
+            mismatched_groups.append((mesh_dim, group_digests))
+
+    if _mesh_has_failure(bool(mismatched_groups), dtensor.device_mesh):
+        details = (
+            f"Mismatched mesh groups: {mismatched_groups}."
+            if mismatched_groups
+            else "A mismatch was detected by another rank in the device mesh."
+        )
+        raise CheckpointingException(
+            "[Megatron-FSDP] Uneven DTensor metadata contract mismatch before chunk "
+            f"collective. Local contract: {contract}. {details}"
+        )
+
+
+def _compute_chunk_metadata(
+    dtensor: DTensor,
+) -> tuple[ChunkStorageMetadata, tuple[int, ...], tuple[int, ...], list]:
+    """Collect local shapes and return metadata plus shape-validation details."""
     local_tensor = dtensor.to_local()
     local_shape = local_tensor.shape
     device_mesh = dtensor.device_mesh
-
     offsets = [0] * len(local_shape)
     cumulative_shape = list(local_shape).copy()
+    gathered_shapes = []
 
     def _update_offsets_and_cumulative_shape(
         mesh_dim: int, offsets: List[int], cumulative_shape: List[int]
@@ -45,10 +169,14 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
         shard_group = device_mesh.get_group(mesh_dim)
         shard_dim = p.dim
 
-        # Synchronize local shard dimensions across ranks
-        world_size = dist.get_world_size(shard_group)
-        global_shapes = [None] * world_size
-        dist.all_gather_object(global_shapes, cumulative_shape, group=shard_group)
+        # The contract preflight guarantees that every rank uses the same number of
+        # dimensions, so this fixed-shape tensor collective cannot disagree on sizes.
+        global_shapes = _all_gather_int64(
+            cumulative_shape,
+            shard_group,
+            device_type=device_mesh.device_type,
+        )
+        gathered_shapes.append((mesh_dim, global_shapes))
 
         # Calculate global offset for current rank's shard
         rank = dist.get_rank(shard_group)
@@ -90,16 +218,59 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
         else:
             raise ValueError(f"Unsupported placement type {type(p)} in DTensor: {dtensor}")
 
-    return ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(local_shape))
+    expected_shape = tuple(int(size) for size in dtensor.shape)
+    actual_shape = tuple(cumulative_shape)
+    return (
+        ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(local_shape)),
+        expected_shape,
+        actual_shape,
+        gathered_shapes,
+    )
 
 
-def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
+def _raise_for_invalid_shard_composition(
+    dtensor: DTensor,
+    expected_shape: tuple[int, ...],
+    actual_shape: tuple[int, ...],
+    gathered_shapes: list,
+) -> None:
+    """Raise symmetrically when local shards do not compose the logical shape."""
+    shape_mismatch = actual_shape != expected_shape
+    if _mesh_has_failure(shape_mismatch, dtensor.device_mesh):
+        details = (
+            f"Computed shape: {actual_shape}; gathered shapes: {gathered_shapes}."
+            if shape_mismatch
+            else "An invalid shard composition was detected by another rank in the device mesh."
+        )
+        raise CheckpointingException(
+            "[Megatron-FSDP] Uneven DTensor local shards do not compose the declared "
+            f"global shape {expected_shape}. Local shape: {tuple(dtensor.to_local().shape)}. "
+            f"{details}"
+        )
+
+
+def gather_and_compute_chunk_metadata(
+    dtensor: DTensor, *, context: str | None = None
+) -> ChunkStorageMetadata:
     """
-    Update the DTensor's chunk metadata to handle uneven sharding.
-    This function modifies the DTensor in-place to include chunk metadata
-    and write items closures for saving and loading.
+    Gather chunk metadata for a DTensor across all ranks and compute the
+    offsets and sizes of each chunk. This is necessary for handling uneven
+    sharding in distributed tensors.
     """
+    _validate_dtensor_contract(dtensor, context)
+    chunk_metadata, expected_shape, actual_shape, gathered_shapes = (
+        _compute_chunk_metadata(dtensor)
+    )
+    _raise_for_invalid_shard_composition(
+        dtensor, expected_shape, actual_shape, gathered_shapes
+    )
+    return chunk_metadata
 
+
+def _install_uneven_dtensor_chunk_metadata(
+    dtensor: DTensor, uneven_chunk_meta: ChunkStorageMetadata
+) -> None:
+    """Install PyTorch DCP chunk and write-item hooks on a DTensor."""
     def _chunk_list_closure(chunk_meta):
         return lambda: chunk_meta
 
@@ -123,17 +294,20 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
 
         return _write_items
 
-    # Get uneven chunk metadata for the DTensor
-    # TODO: Optimize gather_and_compute_chunk_metadata synchronization:
-    # 1. Add pre-check validation to verify tensor shape consistency
-    #    across devices before entering barrier (prevents potential hangs)
-    # 2. Implement batched barrier using grouped collectives
-    #    to amortize synchronization overhead
-    uneven_chunk_meta = gather_and_compute_chunk_metadata(dtensor)
-
-    # Set the chunk list and write items closure for the DTensor
     dtensor._local_tensor.__create_chunk_list__ = _chunk_list_closure([uneven_chunk_meta])
     dtensor._local_tensor.__create_write_items__ = _write_items_closure(uneven_chunk_meta)
+
+
+def update_uneven_dtensor_chunk_metadata(
+    dtensor: DTensor, *, context: str | None = None
+) -> dict:
+    """
+    Update the DTensor's chunk metadata to handle uneven sharding.
+    This function modifies the DTensor in-place to include chunk metadata
+    and write items closures for saving and loading.
+    """
+    uneven_chunk_meta = gather_and_compute_chunk_metadata(dtensor, context=context)
+    _install_uneven_dtensor_chunk_metadata(dtensor, uneven_chunk_meta)
 
 
 def validate_uneven_dtensor(dtensor: DTensor) -> None:
@@ -235,21 +409,109 @@ def get_unflattened_state_dict(state_dict, key_chain=[]):
     return current
 
 
+def _validate_state_dict_contract(dtensors: list[tuple[list, str, DTensor]]):
+    """Validate all state-dict keys and DTensor contracts with one collective."""
+    if not dtensors:
+        return None
+
+    contract_entries = tuple(
+        f"key_chain={key_path};{_dtensor_contract(dtensor)}"
+        for _, key_path, dtensor in dtensors
+    )
+    manifest_digest = hashlib.sha256(repr(contract_entries).encode("utf-8")).hexdigest()
+    contract_digest = [len(contract_entries), *_contract_digest(repr(contract_entries))]
+    anchor_mesh = dtensors[0][2].device_mesh
+    mismatched_groups = []
+    for mesh_dim in range(anchor_mesh.ndim):
+        group = anchor_mesh.get_group(mesh_dim)
+        group_contracts = _all_gather_int64(
+            contract_digest, group, device_type=anchor_mesh.device_type
+        )
+        if any(contract != group_contracts[0] for contract in group_contracts[1:]):
+            mismatched_groups.append((mesh_dim, group_contracts))
+
+    if _mesh_has_failure(bool(mismatched_groups), anchor_mesh):
+        details = (
+            f"Mismatched mesh groups: {mismatched_groups}."
+            if mismatched_groups
+            else "A mismatch was detected by another rank in the device mesh."
+        )
+        raise CheckpointingException(
+            "[Megatron-FSDP] Uneven DTensor metadata contract mismatch before chunk "
+            f"collective. Local manifest: entries={len(contract_entries)};"
+            f"sha256={manifest_digest}. {details}"
+        )
+    return anchor_mesh
+
+
+def _get_state_dict_dtensors(state_dict: dict) -> list[tuple[list, str, DTensor]]:
+    """Return DTensors in deterministic state-dict key order."""
+    key_chains = sorted(
+        filter_unflattened_state_dict(
+            state_dict, visit_condition=lambda value: isinstance(value, DTensor)
+        )
+    )
+    return [
+        (
+            key_chain,
+            repr(tuple(key_chain)),
+            get_unflattened_state_dict(state_dict, key_chain),
+        )
+        for key_chain in key_chains
+    ]
+
+
+def validate_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
+    """Validate a state dict before transformations that may enter DTensor collectives."""
+    dtensors = _get_state_dict_dtensors(state_dict)
+    if dtensors:
+        _validate_state_dict_contract(dtensors)
+    return state_dict
+
+
 def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
     """
     Preprocess the state_dict to prepare it for saving or loading unevenly sharded DTensors.
     This function modifies the DTensors in the state_dict to include chunk metadata
     and write items closures.
     """
-    visit_dtensor = filter_unflattened_state_dict(
-        state_dict, visit_condition=lambda x: isinstance(x, DTensor)
-    )
-    # Sort the keys, since some state dictionaries are mocked
-    # and extended to include empty global keys.
-    for key_chain in sorted(visit_dtensor):
-        # Get the DTensor at the key chain
-        dtensor = get_unflattened_state_dict(state_dict, key_chain)
-        update_uneven_dtensor_chunk_metadata(dtensor)
+    dtensors = _get_state_dict_dtensors(state_dict)
+
+    if not dtensors:
+        return state_dict
+
+    # Validate the complete key/metadata manifest once. Once this passes, every rank
+    # is guaranteed to enter the same fixed-size shape collectives in the same order.
+    anchor_mesh = _validate_state_dict_contract(dtensors)
+
+    computed_metadata = []
+    local_shape_failures = []
+    for _, key_path, dtensor in dtensors:
+        chunk_metadata, expected_shape, actual_shape, gathered_shapes = (
+            _compute_chunk_metadata(dtensor)
+        )
+        computed_metadata.append((dtensor, chunk_metadata))
+        if actual_shape != expected_shape:
+            local_shape_failures.append(
+                f"key_chain={key_path};expected_shape={expected_shape};"
+                f"actual_shape={actual_shape};gathered_shapes={gathered_shapes}"
+            )
+
+    # Shape collectives are now complete, so one mesh reduction can propagate every
+    # tensor's composition failure instead of reducing once per tensor.
+    if _mesh_has_failure(bool(local_shape_failures), anchor_mesh):
+        details = (
+            f"Local failures: {local_shape_failures}."
+            if local_shape_failures
+            else "An invalid shard composition was detected by another rank."
+        )
+        raise CheckpointingException(
+            "[Megatron-FSDP] Uneven DTensor local shards do not compose their declared "
+            f"global shapes. {details}"
+        )
+
+    for dtensor, chunk_metadata in computed_metadata:
+        _install_uneven_dtensor_chunk_metadata(dtensor, chunk_metadata)
     return state_dict
 
 

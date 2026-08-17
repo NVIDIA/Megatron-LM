@@ -51,6 +51,7 @@ from .utils import append_to_progress_log, is_last_rank, print_rank_0
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         preprocess_state_dict_for_uneven_dtensor,
+        validate_state_dict_for_uneven_dtensor,
     )
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
         handle_experts_in_state_dict,
@@ -1343,6 +1344,9 @@ def generate_state_dict(
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
+    # Validate the raw manifest before SWiGLU/GDN transformations create DTensors and
+    # enter per-tensor collectives. This makes key/order divergence fail symmetrically.
+    validate_state_dict_for_uneven_dtensor(state_dict)
     handle_fp8_extra_state_case(state_dict["model"])
     if args.swiglu:
         if "optimizer" in state_dict:
