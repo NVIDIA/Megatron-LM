@@ -1183,6 +1183,19 @@ def validate_args(args, defaults={}):
         elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
+    if (
+        args.moe_token_dispatcher_type == "flex"
+        and args.moe_flex_dispatcher_backend == "moonep"
+    ):
+        if args.use_torch_fsdp2 or args.use_megatron_fsdp:
+            raise ValueError("MoonEP currently supports MCore DDP, not FSDP.")
+        if not args.accumulate_allreduce_grads_in_fp32:
+            raise ValueError(
+                "MoonEP requires --accumulate-allreduce-grads-in-fp32 for owner and replica "
+                "expert gradient reduction."
+            )
+        if not args.gradient_accumulation_fusion:
+            raise ValueError("MoonEP requires --gradient-accumulation-fusion.")
     if args.cuda_graph_impl == "full_iteration":
         assert not args.check_for_nan_in_loss_and_grad, \
         "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-impl=full_iteration for training."

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -60,9 +61,18 @@ if HAVE_TE:
     import transformer_engine as te
 
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
+
+    try:
+        from transformer_engine.pytorch.ops.basic.grouped_linear import (
+            GRAD_INPUT_BUFFER_KEY,
+            OUTPUT_BUFFER_KEY,
+        )
+    except ImportError:
+        GRAD_INPUT_BUFFER_KEY = OUTPUT_BUFFER_KEY = None
 else:
     te = None  # type: ignore[assignment, misc]
     Fp8Padding, Fp8Unpadding = None, None
+    GRAD_INPUT_BUFFER_KEY = OUTPUT_BUFFER_KEY = None
 
 try:
     import flashinfer.fused_moe as fused_moe
@@ -198,6 +208,12 @@ class TEGroupedMLP(MegatronModule):
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
 
+        if self.config.moe_flex_dispatcher_backend == "moonep":
+            # MoonEP's VMM bridge requires TE to expose one contiguous grouped
+            # parameter. The CuTe DSL wgrad path is not used for this layout.
+            os.environ.setdefault("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+            os.environ.setdefault("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "1")
+
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
         if self.config.gated_linear_unit:
@@ -272,6 +288,7 @@ class TEGroupedMLP(MegatronModule):
             ), "Fused GroupedMLP is not supported for this configuration."
         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
+        self._moonep_weight_bridge = None
         if (
             self.config.gated_linear_unit
             and self.config.moe_mlp_glu_interleave_size is not None
@@ -291,6 +308,12 @@ class TEGroupedMLP(MegatronModule):
             self.quantization_unpadding = Fp8Unpadding(
                 self.num_local_experts, align_size=align_size
             )
+
+    def set_moonep_weight_bridge(self, bridge) -> None:
+        """Use MoonEP's unregistered E+B grouped runtime parameters."""
+        if self._fused_ops is not None:
+            raise RuntimeError("MoonEP weights must be bound before the first expert forward.")
+        self._moonep_weight_bridge = bridge
 
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
@@ -376,8 +399,44 @@ class TEGroupedMLP(MegatronModule):
 
         assert HAVE_TE, "_make_fused_ops requires Transformer Engine."
 
+        def register_grouped_linear_params(
+            op: torch.nn.Module,
+            linear: torch.nn.Module,
+            single_grouped_weight: bool,
+            single_grouped_bias: bool,
+        ) -> None:
+            """Register real GroupedLinear parameters on a meta TE op shell."""
+            if single_grouped_weight:
+                op.register_parameter("weight", linear.get_parameter("weight"))
+                for idx in range(linear.num_gemms):
+                    op.register_parameter(f"weight{idx}", None)
+            else:
+                op.register_parameter("weight", None)
+                for idx in range(linear.num_gemms):
+                    op.register_parameter(f"weight{idx}", linear.get_parameter(f"weight{idx}"))
+
+            if not linear.use_bias:
+                return
+            if single_grouped_bias:
+                op.register_parameter("bias", linear.get_parameter("bias"))
+                for idx in range(linear.num_gemms):
+                    op.register_parameter(f"bias{idx}", None)
+            else:
+                op.register_parameter("bias", None)
+                for idx in range(linear.num_gemms):
+                    op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
+
+        def register_moonep_weight(
+            op: torch.nn.Module, runtime_weight: torch.nn.Parameter
+        ) -> None:
+            """Attach an unregistered E+B MoonEP weight to a TE op shell."""
+            op.register_parameter("weight", runtime_weight)
+            for idx in range(op.num_groups):
+                op.register_parameter(f"weight{idx}", None)
+
         # Container for fusible ops
         ops = te.pytorch.ops.Sequential()
+        moonep_bridge = self._moonep_weight_bridge
 
         # Check if there are 1 or "num_gemms" params in the GroupedLinear module.
         fc1_single_grouped_weight = self.linear_fc1.single_grouped_weight
@@ -400,33 +459,40 @@ class TEGroupedMLP(MegatronModule):
         # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
         fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
         fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
+        fc1_num_gemms = (
+            moonep_bridge.num_runtime_experts
+            if moonep_bridge is not None
+            else self.linear_fc1.num_gemms
+        )
+        fc2_num_gemms = (
+            moonep_bridge.num_runtime_experts
+            if moonep_bridge is not None
+            else self.linear_fc2.num_gemms
+        )
 
         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
         # Using meta avoids allocating duplicate weights for the fused wrapper.
         op = te.pytorch.ops.GroupedLinear(
-            self.linear_fc1.num_gemms,
+            fc1_num_gemms,
             self.linear_fc1.in_features,
             self.linear_fc1.out_features,
             bias=self.linear_fc1.use_bias,
             device="meta",
             dtype=fc1_weight_dtype,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
-            single_grouped_weight=fc1_single_grouped_weight,
+            single_grouped_weight=(
+                True if moonep_bridge is not None else fc1_single_grouped_weight
+            ),
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
 
-        # Copy the weights from GroupedLinear module to GroupedLinear op.
-        if fc1_single_grouped_weight:
-            setattr(op, "weight", getattr(self.linear_fc1, "weight"))
-
-        for idx in range(self.linear_fc1.num_gemms):
-            if not fc1_single_grouped_weight:
-                setattr(op, f"weight{idx}", getattr(self.linear_fc1, f"weight{idx}"))
-            if self.linear_fc1.use_bias and not fc1_single_grouped_bias:
-                setattr(op, f"bias{idx}", getattr(self.linear_fc1, f"bias{idx}"))
-        if self.linear_fc1.use_bias and fc1_single_grouped_bias:
-            setattr(op, "bias", getattr(self.linear_fc1, "bias"))
+        if moonep_bridge is not None:
+            register_moonep_weight(op, moonep_bridge.runtime_fc1_weight)
+        else:
+            register_grouped_linear_params(
+                op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
+            )
         ops.append(op)
 
         # Activation and post-multiply probs (SwiGLU, clamped quick-GeGLU, or SReLU)
@@ -444,32 +510,28 @@ class TEGroupedMLP(MegatronModule):
             else:
                 op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
         elif self.config.activation_func == quick_gelu and self.config.gated_linear_unit:
-            clamp = self.config.activation_func_clamp_value
-            if clamp is not None:
-                if (
-                    "activation_recompute_in_mlp"
-                    in inspect.signature(te.pytorch.ops.ScaledClampedQGeGLU).parameters
-                ):
-                    op = te.pytorch.ops.ScaledClampedQGeGLU(
-                        glu_interleave_size=glu_interleave,
-                        activation_recompute_in_mlp=activation_recompute_in_mlp,
-                        limit=clamp,
-                    )
-                else:
-                    op = te.pytorch.ops.ScaledClampedQGeGLU(
-                        glu_interleave_size=glu_interleave, limit=clamp
-                    )
-            else:
-                if (
-                    "activation_recompute_in_mlp"
-                    in inspect.signature(te.pytorch.ops.ScaledClampedQGeGLU).parameters
-                ):
-                    op = te.pytorch.ops.ScaledClampedQGeGLU(
-                        glu_interleave_size=glu_interleave,
-                        activation_recompute_in_mlp=activation_recompute_in_mlp,
-                    )
-                else:
-                    op = te.pytorch.ops.ScaledClampedQGeGLU(glu_interleave_size=glu_interleave)
+            qgeglu_signature = inspect.signature(te.pytorch.ops.ScaledClampedQGeGLU)
+            qgeglu_kwargs = {
+                "glu_interleave_size": glu_interleave,
+                # Megatron's None means no clamp, while TE defaults to a finite limit.
+                "limit": (
+                    float("inf")
+                    if self.config.activation_func_clamp_value is None
+                    else self.config.activation_func_clamp_value
+                ),
+            }
+            if "alpha" in qgeglu_signature.parameters:
+                qgeglu_kwargs["alpha"] = 1.702
+            if "glu_linear_offset" in qgeglu_signature.parameters:
+                qgeglu_kwargs["glu_linear_offset"] = self.config.glu_linear_offset
+            elif self.config.glu_linear_offset != 0.0:
+                raise RuntimeError(
+                    "The installed Transformer Engine ScaledClampedQGeGLU does not support "
+                    "Megatron's nonzero glu_linear_offset."
+                )
+            if "activation_recompute_in_mlp" in qgeglu_signature.parameters:
+                qgeglu_kwargs["activation_recompute_in_mlp"] = activation_recompute_in_mlp
+            op = te.pytorch.ops.ScaledClampedQGeGLU(**qgeglu_kwargs)
         elif (
             self.config.activation_func == squared_relu
             and self.config.use_fused_weighted_squared_relu
@@ -493,29 +555,26 @@ class TEGroupedMLP(MegatronModule):
 
         # FC2
         op = te.pytorch.ops.GroupedLinear(
-            self.linear_fc2.num_gemms,
+            fc2_num_gemms,
             self.linear_fc2.in_features,
             self.linear_fc2.out_features,
             bias=self.linear_fc2.use_bias,
             device="meta",
             dtype=fc2_weight_dtype,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
-            single_grouped_weight=fc2_single_grouped_weight,
+            single_grouped_weight=(
+                True if moonep_bridge is not None else fc2_single_grouped_weight
+            ),
             single_grouped_bias=fc2_single_grouped_bias,
             delay_wgrad_compute=fc2_delay_wgrad_compute,
         )
 
-        # Copy the weights from GroupedLinear module to GroupedLinear op.
-        if fc2_single_grouped_weight:
-            setattr(op, "weight", getattr(self.linear_fc2, "weight"))
-
-        for idx in range(self.linear_fc2.num_gemms):
-            if not fc2_single_grouped_weight:
-                setattr(op, f"weight{idx}", getattr(self.linear_fc2, f"weight{idx}"))
-            if self.linear_fc2.use_bias and not fc2_single_grouped_bias:
-                setattr(op, f"bias{idx}", getattr(self.linear_fc2, f"bias{idx}"))
-        if self.linear_fc2.use_bias and fc2_single_grouped_bias:
-            setattr(op, "bias", getattr(self.linear_fc2, "bias"))
+        if moonep_bridge is not None:
+            register_moonep_weight(op, moonep_bridge.runtime_fc2_weight)
+        else:
+            register_grouped_linear_params(
+                op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
+            )
         ops.append(op)
 
         # Emulate submodule pre-forward hooks
@@ -545,6 +604,9 @@ class TEGroupedMLP(MegatronModule):
                             f"but a {submodule.__class__.__name__} submodule "
                             "has a pre-forward hook that modifies the input tensor."
                         )
+            if self._moonep_weight_bridge is not None:
+                self._moonep_weight_bridge.prepare_forward()
+                self._moonep_weight_bridge.prefetch(self._moonep_weight_bridge.last_plan)
 
         return forward_pre_hook
 
@@ -553,6 +615,8 @@ class TEGroupedMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        output_buffer: Optional[torch.Tensor] = None,
+        grad_input_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
@@ -605,11 +669,25 @@ class TEGroupedMLP(MegatronModule):
             stash_context = nullcontext()
         with stash_context:
             # Call fused impl
+            op_kwargs = {}
+            if output_buffer is not None:
+                if OUTPUT_BUFFER_KEY is None:
+                    raise RuntimeError(
+                        "The installed Transformer Engine does not support caller output buffers."
+                    )
+                op_kwargs[-1] = {OUTPUT_BUFFER_KEY: output_buffer}
+            if grad_input_buffer is not None:
+                if GRAD_INPUT_BUFFER_KEY is None:
+                    raise RuntimeError(
+                        "The installed Transformer Engine does not support caller dgrad buffers."
+                    )
+                op_kwargs[0] = {GRAD_INPUT_BUFFER_KEY: grad_input_buffer}
             output = ops(
                 permuted_local_hidden_states,
                 tokens_per_expert,  # FC1
                 permuted_probs,  # Scaled SwiGLU
                 tokens_per_expert,  # FC2
+                **({"op_kwargs": op_kwargs} if op_kwargs else {}),
             )
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
@@ -632,6 +710,8 @@ class TEGroupedMLP(MegatronModule):
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor,
+        output_buffer: Optional[torch.Tensor] = None,
+        grad_input_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of TEGroupedMLP
 
@@ -648,10 +728,18 @@ class TEGroupedMLP(MegatronModule):
         # Call fused impl if enabled
         if self._with_fused_impl:
             output = self._fused_forward(
-                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                permuted_probs,
+                output_buffer,
+                grad_input_buffer,
             )
             output_bias = None
             return output, output_bias
+
+        assert output_buffer is None and grad_input_buffer is None, (
+            "output_buffer/grad_input_buffer require the TE op-fuser path"
+        )
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None

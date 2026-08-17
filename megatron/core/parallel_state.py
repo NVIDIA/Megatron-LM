@@ -2092,6 +2092,13 @@ def get_all_ranks():
 
 def destroy_model_parallel():
     """Set the groups to none."""
+    # MoonEP VMM mappings must be released collectively while their process
+    # groups are still alive. The finalizer is idempotent and a no-op when the
+    # optional MoonEP backend has not been used.
+    from megatron.core.transformer.moe.moonep import moonep_finalize
+
+    moonep_finalize()
+
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
 
