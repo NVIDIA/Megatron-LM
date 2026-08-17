@@ -145,6 +145,7 @@ _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 # Partial Data parallel group information with context parallel combined.
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
+_INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 
 # combined parallel group of TP and CP
 _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
@@ -621,6 +622,7 @@ def initialize_model_parallel(
     sharp_enabled_group: Optional[str] = None,
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
+    expert_num_distributed_optimizer_instances: Optional[int] = None,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -707,6 +709,12 @@ def initialize_model_parallel(
         num_distributed_optimizer_instances (int, default = 1):
             The number of distributed optimizer replicas across the data-
             parallel domain.
+
+        expert_num_distributed_optimizer_instances (int, optional):
+            The number of distributed optimizer replicas across the expert
+            data-parallel domain. Defaults to ``num_distributed_optimizer_instances``.
+            MFSDP v2 sets this to 1 so hybrid sharding applies only to dense
+            parameters and expert parameters retain their full EDP domain.
 
         expert_tensor_parallel_size (int, default = tp_size):
             The number of GPUs to split individual tensors of expert.
@@ -881,6 +889,12 @@ def initialize_model_parallel(
         raise RuntimeError(
             f"world_size ({world_size}) is not divisible by expert_tensor_model_pipeline_parallel size ({expert_tensor_model_pipeline_parallel_size})"
         )
+    if num_distributed_optimizer_instances < 1:
+        raise ValueError("num_distributed_optimizer_instances must be at least 1")
+    if expert_num_distributed_optimizer_instances is None:
+        expert_num_distributed_optimizer_instances = num_distributed_optimizer_instances
+    if expert_num_distributed_optimizer_instances < 1:
+        raise ValueError("expert_num_distributed_optimizer_instances must be at least 1")
 
     expert_order = _inject_gtp_remat_axis(order, after="ep")
     expert_decoder_rank_generator = RankGenerator(
@@ -916,7 +930,11 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
+    assert (
+        _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is None
+    ), "Inter partial data parallel group is already initialized"
 
     assert (
         data_parallel_size * context_parallel_size
@@ -1008,6 +1026,26 @@ def initialize_model_parallel(
                     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
                         intra_partial_dp_group_with_cp_gloo
                     )
+
+            if expert_num_distributed_optimizer_instances != num_distributed_optimizer_instances:
+                # Historically MCore reused the expert hierarchy's outer group
+                # because dense DP and EDP used the same optimizer-instance
+                # factor. Dense-only HFSDP breaks that assumption, so only that
+                # topology needs an independent dense DP-outer communicator.
+                for inner_rank in range(intra_partial_data_parallel_size):
+                    inter_partial_dp_ranks_with_cp = ranks_with_cp[
+                        inner_rank::intra_partial_data_parallel_size
+                    ]
+                    inter_partial_dp_group_with_cp = create_group(
+                        inter_partial_dp_ranks_with_cp,
+                        timeout=timeout,
+                        # Preserve the established communicator tuning key used
+                        # by the equivalent shared expert outer group.
+                        pg_options=get_nccl_options("inter_ep_dp", nccl_comm_cfgs),
+                        group_desc="INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
+                    )
+                    if rank in inter_partial_dp_ranks_with_cp:
+                        _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = inter_partial_dp_group_with_cp
         else:
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
@@ -1444,10 +1482,10 @@ def initialize_model_parallel(
     ), "Inter partial expert data group is already initialized"
 
     assert (
-        expert_data_parallel_size % num_distributed_optimizer_instances == 0
-    ), "Expert data parallel size should be divisible by partial DistOpt shard factor"
+        expert_data_parallel_size % expert_num_distributed_optimizer_instances == 0
+    ), "Expert data parallel size should be divisible by its partial DistOpt shard factor"
     intra_partial_expert_data_parallel_size = (
-        expert_data_parallel_size // num_distributed_optimizer_instances
+        expert_data_parallel_size // expert_num_distributed_optimizer_instances
     )
 
     # Gloo only on the non-EGTP path (EGTP + Gloo out of scope; the EGTP optimizer uses DCP).
@@ -1470,17 +1508,24 @@ def initialize_model_parallel(
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
 
-        if num_distributed_optimizer_instances > 1:
+        if expert_num_distributed_optimizer_instances > 1:
             # Create groups for Partial DistOpt, one for intra-partial DP domain
             # Another for inter-partial DP domain
-
-            # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp_replica group.
-            if sharp_enabled_group == "dp_replica":
+            # Preserve the historical SHARP path when the expert and dense
+            # hierarchies share the same DP-outer communicator.
+            if (
+                sharp_enabled_group == "dp_replica"
+                and expert_num_distributed_optimizer_instances
+                == num_distributed_optimizer_instances
+            ):
                 os.environ["NCCL_COLLNET_ENABLE"] = "1"
             hierarchical_groups, hierarchical_groups_gloo = create_hierarchical_groups(
                 rank,
                 ranks,
-                [intra_partial_expert_data_parallel_size, num_distributed_optimizer_instances],
+                [
+                    intra_partial_expert_data_parallel_size,
+                    expert_num_distributed_optimizer_instances,
+                ],
                 create_gloo_process_groups=create_gloo_process_groups,
                 pg_options=[
                     get_nccl_options("intra_ep_dp", nccl_comm_cfgs),
@@ -1494,21 +1539,41 @@ def initialize_model_parallel(
                 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = hierarchical_groups_gloo[0]
                 _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[1]
 
-            if sharp_enabled_group == "dp_replica":
-                # PyTorch is performing lazy initialization of the communicator group.
-                # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
+            if (
+                sharp_enabled_group == "dp_replica"
+                and expert_num_distributed_optimizer_instances
+                == num_distributed_optimizer_instances
+            ):
+                # PyTorch lazily initializes communicators, so force initialization
+                # while NCCL_COLLNET_ENABLE is set.
                 if _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None:
                     torch.distributed.barrier(
                         group=_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
                         device_ids=[torch.cuda.current_device()],
                     )
                     torch.cuda.synchronize()
-                # Set NCCL_COLLNET_ENABLE to 0 to restrict SHARP application to the dp_replica group.
                 if "NCCL_COLLNET_ENABLE" in os.environ:
                     del os.environ["NCCL_COLLNET_ENABLE"]
+
         else:
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
+
+    if (
+        sharp_enabled_group == "dp_replica"
+        and expert_num_distributed_optimizer_instances != num_distributed_optimizer_instances
+    ):
+        # PyTorch lazily initializes communicators, so force initialization while
+        # NCCL_COLLNET_ENABLE is set. Dense-only HFSDP uses its independent dense
+        # DP-outer group because the expert hierarchy has a different outer axis.
+        os.environ["NCCL_COLLNET_ENABLE"] = "1"
+        inter_dist_opt_group = get_inter_distributed_optimizer_instance_group()
+        torch.distributed.barrier(
+            group=inter_dist_opt_group, device_ids=[torch.cuda.current_device()]
+        )
+        torch.cuda.synchronize()
+        if "NCCL_COLLNET_ENABLE" in os.environ:
+            del os.environ["NCCL_COLLNET_ENABLE"]
     # Full expert data-distribution group: spans gtp_remat explicitly. Used only
     # where distinct-data distribution matters; no Gloo. Aliases the default when EGTP is inactive.
     global _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_REMAT
@@ -2454,16 +2519,22 @@ def get_intra_distributed_optimizer_instance_group(check_initialized=True):
 
 
 def get_inter_distributed_optimizer_instance_group(check_initialized=True):
-    """Get the group spanning the different distributed optimizer instances.
-    Attention and MLP/Expert share same inter-instance group, so only built
-    inter_partial_expert_data_parallel_group, and return it at here.
+    """Get the group spanning dense distributed-optimizer instances.
+
+    Reuse the historical expert outer group when dense and expert instance
+    factors match. Dense-only HFSDP constructs and prefers an independent
+    dense outer group because expert DP has no corresponding outer axis.
     """
+    group = (
+        _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+        if _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
+        else _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    )
     if check_initialized:
-        assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
-            "Attention and MLP/Expert share same inter distributed optimize instance group, "
-            "which has not been initialized"
-        )
-    return _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+        assert (
+            group is not None
+        ), "The inter distributed optimizer instance group has not been initialized"
+    return group
 
 
 ### End of expert-related functions region
@@ -2538,6 +2609,9 @@ def destroy_model_parallel():
 
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
+
+    global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT
     _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_REMAT = None

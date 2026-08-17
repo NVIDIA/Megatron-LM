@@ -597,6 +597,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 gradient=[axis.gradient],
                 optimizer=[axis.optimizer],
             )
+        self.mesh = dp_mesh
+        self.moe_mesh = expert_dp_mesh
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:

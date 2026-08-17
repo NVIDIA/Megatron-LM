@@ -340,13 +340,20 @@ class FsdpParameterGroup:
             src_rank = torch.distributed.get_global_rank(group, 0)
             torch.distributed.broadcast(unsharded.local_buffer, src=src_rank, group=group)
 
-        if self.main_weight is not self.model_weight:
-            unsharded.cast(self.main_weight.dtype).redistribute(
-                self.main_weight.placements, out=self.main_weight
-            )
+        # Populate the compute shard first, then derive the optimizer shard from
+        # it. The unsharded and compute buffers both use self.dtype, so staging
+        # through model_weight is value-preserving even when main_weight uses a
+        # higher-precision dtype. For HFSDP this intentionally performs two
+        # one-axis transitions: Replicate,Replicate -> Replicate,Flat ->
+        # Flat,Flat. DBuffer rejects a direct redistribution that changes both
+        # mesh axes at once.
         unsharded.cast(self.model_weight.dtype).redistribute(
             self.model_weight.placements, out=self.model_weight
         )
+        if self.main_weight is not self.model_weight:
+            self.model_weight.cast(self.main_weight.dtype).redistribute(
+                self.main_weight.placements, out=self.main_weight
+            )
 
     def unshard_parameters(self, orientation: str = "rowwise") -> None:
         """Install full parameters for local compute.
@@ -432,18 +439,29 @@ class FsdpParameterGroup:
             torch.cuda.current_stream(self.main_weight.device)
             == owning_module.context.reduce_scatter_stream
         ), "main_grad must be allocated on the reduce-scatter stream."
-        self._main_grad = DBuffer(
+        self._main_grad = self._allocate_main_grad(self._main_grad_placements)
+        return self._main_grad
+
+    def _allocate_main_grad(self, placements: tuple[Placement, ...]) -> DBuffer:
+        """Allocate a gradient buffer with ``placements`` on the reduction stream."""
+        assert self.requires_grad
+        assert self._main_grad_dtype is not None
+        assert (
+            torch.cuda.current_stream(self.main_weight.device)
+            == self._owning_module().context.reduce_scatter_stream
+        ), "main_grad must be allocated on the reduce-scatter stream."
+        main_grad = DBuffer(
             mesh=self.mesh,
-            placements=self._main_grad_placements,
+            placements=placements,
             tensor_shapes=self.main_weight.layout.tensor_shapes,
             dtype=self._main_grad_dtype,
             device=self.main_weight.device,
         )
-        assert self._main_grad.layout == self.main_weight.layout, (
+        assert main_grad.layout == self.main_weight.layout, (
             "main_grad is built from main_weight tensor shapes on the same mesh, "
             "and DBuffer layouts are deterministic from those shapes and mesh size."
         )
-        return self._main_grad
+        return main_grad
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer.
@@ -457,9 +475,6 @@ class FsdpParameterGroup:
         """
         assert self.requires_grad
 
-        # NCCL symmetric-memory reduce-scatter only selects the symmetric kernel for SUM today.
-        # Preserve AVG semantics by reducing SUM and scaling the output below.
-        partial_op = dist.ReduceOp.AVG if self._symm_mem_pool is None else dist.ReduceOp.SUM
         grads: list[torch.Tensor] = []
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = self._get_unsharded_parameter(index).grad
@@ -469,7 +484,7 @@ class FsdpParameterGroup:
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
-                placements=[Partial(partial_op)] * self.mesh.ndim,
+                placements=[Partial("avg")] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
@@ -523,49 +538,40 @@ class FsdpParameterGroup:
         has_sharded_grads = self._has_sharded_grads()
 
         # A non-accumulation main_grad means the previous step finalized it; this
-        # only happens on the first microbatch. Restore it to the DP-outer-Partial
-        # accumulation placement. HSDP's finalize keeps the buffer size (Replicate
-        # on DP-outer), so relabel it in place; HFSDP's finalize reduce-scattered
-        # DP-outer to a smaller optimizer-sharded buffer, so allocate a fresh one
-        # (zeroed only when we accumulate into it, i.e. sharded grads are still set).
+        # only happens on the first microbatch. HSDP can relabel its replicated
+        # outer axis as Partial. HFSDP finalized that axis as Flat: when zero_grad
+        # cleared parameter grads, allocate a fresh accumulation buffer and let the
+        # first inner reduce-scatter overwrite it. If grads were retained, preserve
+        # them by all-gathering Flat -> Replicate before the Replicate -> Partial
+        # metadata relabel.
         if self.main_grad.placements != self._main_grad_placements:
             assert self.main_grad.allocation_stream == (
                 torch.cuda.current_stream(self.main_grad.device)
             )
-            reset_axis = changed_mesh_axis(self.main_grad.placements, self._main_grad_placements)
-            assert reset_axis is not None  # the placements differ, so an axis changed
-            if isinstance(self.main_grad.placements[reset_axis], Replicate):
-                # HSDP: Replicate -> Partial changes only metadata and reuses the tensor.
+            changed_axis = changed_mesh_axis(
+                self.main_grad.placements, self._main_grad_placements
+            )
+            if changed_axis is None:
+                raise RuntimeError("FSDP gradient accumulation requires a changed placement axis.")
+            if isinstance(self.main_grad.placements[changed_axis], Replicate):
+                # HSDP can restore its Partial accumulation placement as a metadata-only
+                # relabel, preserving retained gradients without allocating new storage.
                 self._main_grad = self.main_grad.redistribute(self._main_grad_placements)
+            elif not has_sharded_grads:
+                # HFSDP's finalized Flat buffer is smaller than the Partial accumulation
+                # buffer; allocate fresh storage for the first reduction to overwrite.
+                self._main_grad = self._allocate_main_grad(self._main_grad_placements)
             else:
-                # HFSDP: main_grad was reduce-scattered to the optimizer shard, too small
-                # to hold the accumulation, so re-allocate. This runs inside the
-                # reduce_scatter stream context (see FsdpModule._reduce_gradient_groups),
-                # so the buffer is allocated on that stream and stays race-safe. Zero it
-                # only when we accumulate (set_to_none=False); with set_to_none=True the
-                # reduction below overwrites it via out=.
-                self._main_grad = DBuffer(
-                    mesh=self.mesh,
-                    placements=self._main_grad_placements,
-                    tensor_shapes=self.main_weight.layout.tensor_shapes,
-                    dtype=self.main_grad.dtype,
-                    device=self.main_weight.device,
-                )
-                if has_sharded_grads:
-                    self.main_grad.local_buffer.zero_()
+                # With set_to_none=False, preserve HFSDP's retained optimizer shard by
+                # all-gathering Flat -> Replicate before relabeling it as Partial.
+                replicated_placements = list(self.main_grad.placements)
+                replicated_placements[changed_axis] = Replicate()
+                restored_grad = self.main_grad
+                if restored_grad.placements != tuple(replicated_placements):
+                    restored_grad = restored_grad.redistribute(replicated_placements)
+                self._main_grad = restored_grad.redistribute(self._main_grad_placements)
 
-        reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
-        if reduce_axis is None:
-            raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
-        partial_reduce_op = partial_grad.placements[reduce_axis].reduce_op
-        # Start from the caller's extra divisor (1 unless this group sees more than one
-        # contribution per mesh rank, as expert parallelism does), then add back the axis
-        # size when the collective reduced with SUM instead of averaging.
         grad_divisor = self.grad_divisor
-        if partial_reduce_op == dist.ReduceOp.SUM:
-            grad_divisor *= self.mesh.size(reduce_axis)
-        if self._symm_mem_pool is not None:
-            partial_grad.rendezvous(reduce_axis)
 
         if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
@@ -758,12 +764,25 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         parameter.grad = None
 
     def sync_model_weight_from_main_weight(self) -> None:
-        """Quantize the sharded main weights into the FP8 payload DBuffers."""
-        self._quantize_model_weight_from_main_weight()
+        """Quantize the sharded main weights into the fp8 payload DBuffers."""
+        quantize_source = self.main_weight
+        if quantize_source.placements != self._model_weight_placements:
+            # HFSDP shards optimizer weights across DP-outer while compute weights
+            # are replicated there. Reconstruct the DP-inner shard before quantizing
+            # so every outer replica receives complete row/column payloads and scale
+            # grids for its compute-weight shard.
+            quantize_source = quantize_source.redistribute(self._model_weight_placements)
+        self._quantize_model_weight_from_main_weight(quantize_source)
 
-    def _quantize_model_weight_from_main_weight(self) -> None:
-        """Quantize through TE's ``cast_master_weights_to_fp8``."""
-        main = self.main_weight.local_buffer
+    def _quantize_model_weight_from_main_weight(self, quantize_source: DBuffer) -> None:
+        """Quantize via TE's ``cast_master_weights_to_fp8``.
+
+        A full-size temporary MXFP8Tensor per fp8 tensor receives the
+        quantized shard in its row-wise and column-wise raw data (filled at
+        the shard's flat offset); the shard slices are then copied into the
+        group's payload DBuffers and the temporaries are released.
+        """
+        main = quantize_source.local_buffer
         cast_master_weights_to_fp8 = te_cast_master_weights_to_fp8()
         assert cast_master_weights_to_fp8 is not None
 
@@ -774,9 +793,9 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         temps = []
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             tensor = fsdp_parameter.unsharded
-            owned_range = self.main_weight._get_owned_range(index)
-            height, width = self.main_weight.layout.tensor_shapes[index]
-            temp = allocate_quantize_temp(tensor, height, width, self.main_weight.device)
+            owned_range = quantize_source._get_owned_range(index)
+            height, width = quantize_source.layout.tensor_shapes[index]
+            temp = allocate_quantize_temp(tensor, height, width, quantize_source.device)
             temps.append((temp, index, owned_range))
             model_weights.append(temp)
             if owned_range is None:
@@ -785,10 +804,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
                 master_weights.append(None)
                 start_offsets.append(0)
                 fsdp_shard_model_weights.append(
-                    (
-                        temp._rowwise_data.reshape(-1)[:0],
-                        temp._columnwise_data.reshape(-1)[:0],
-                    )
+                    (temp._rowwise_data.reshape(-1)[:0], temp._columnwise_data.reshape(-1)[:0])
                 )
                 continue
             numel = owned_range.numel
@@ -846,9 +862,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             target.reallocate_storage()
             gather_axis = changed_mesh_axis(source.placements, target.placements)
             if gather_axis is None:
-                raise RuntimeError(
-                    "FSDP fp8 parameter unshard requires a changed placement axis."
-                )
+                raise RuntimeError("FSDP fp8 parameter unshard requires a changed placement axis.")
             source.redistribute(target.placements, out=target)
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             tensor = fsdp_parameter.unsharded
