@@ -516,99 +516,85 @@ def _warmup_jit_function(tp_size=None):
         and args.bias_gelu_fusion
     )
 
+    # NOTE: the torch.rand draws and the fused bias+dropout+add warmup below
+    # consume the default CUDA RNG stream before training starts. Downstream
+    # training numerics (and the golden values of the functional tests) encode
+    # exactly those consumptions, so they must stay UNCONDITIONAL with their
+    # historical shapes and order, independent of any argument; otherwise the
+    # RNG stream shifts for configs that differ from the golden baselines.
+    # Only the bias_swiglu/bias_gelu/bias_geglu calls are gated on arguments:
+    # they consume no RNG, so skipping them cannot perturb determinism.
+    bias = torch.rand(
+        args.ffn_hidden_size // args.tensor_model_parallel_size, dtype=dtype, device="cuda"
+    )
+    input = torch.rand(
+        (
+            args.seq_length // args.context_parallel_size,
+            args.micro_batch_size,
+            args.ffn_hidden_size // args.tensor_model_parallel_size,
+        ),
+        dtype=dtype,
+        device="cuda",
+    )
+
+    # Warmup JIT fusions with the input grad_enable state of both forward
+    # prop and recomputation. The three branches are mutually exclusive.
     if warmup_bias_swiglu:
-        bias = torch.rand(
-            args.ffn_hidden_size // args.tensor_model_parallel_size, dtype=dtype, device="cuda"
-        )
-        input = torch.rand(
-            (
-                args.seq_length // args.context_parallel_size,
-                args.micro_batch_size,
-                args.ffn_hidden_size // args.tensor_model_parallel_size,
-            ),
-            dtype=dtype,
-            device="cuda",
-        )
-        # Warmup JIT fusions with the input grad_enable state of both forward
-        # prop and recomputation
         for bias_grad, input_grad in zip([True, True], [False, True]):
             bias.requires_grad, input.requires_grad = bias_grad, input_grad
             for _ in range(5):
                 output = bias_swiglu(input, bias)
-        del bias, input, output
-
-    if warmup_bias_gelu:
-        bias = torch.rand(
-            args.ffn_hidden_size // args.tensor_model_parallel_size, dtype=dtype, device="cuda"
-        )
-        input = torch.rand(
-            (
-                args.seq_length // args.context_parallel_size,
-                args.micro_batch_size,
-                args.ffn_hidden_size // args.tensor_model_parallel_size,
-            ),
-            dtype=dtype,
-            device="cuda",
-        )
-        # Warmup JIT fusions with the input grad_enable state of both forward
-        # prop and recomputation
+        del output
+    elif warmup_bias_gelu:
         for bias_grad, input_grad in zip([True, True], [False, True]):
             bias.requires_grad, input.requires_grad = bias_grad, input_grad
             for _ in range(5):
                 output = bias_gelu(bias, input)
-        del bias, input, output
-
-    # Warmup fused bias+geglu (gated gelu)
-    if warmup_bias_geglu:
-        # For geglu, input size is 2x ffn_hidden_size (will be split into two halves)
-        bias = torch.rand(
-            (args.ffn_hidden_size // args.tensor_model_parallel_size) * 2, dtype=dtype, device="cuda"
-        )
-        input = torch.rand(
-            (
-                args.seq_length // args.context_parallel_size,
-                args.micro_batch_size,
-                (args.ffn_hidden_size // args.tensor_model_parallel_size) * 2,
-            ),
-            dtype=dtype,
-            device="cuda",
-        )
-        # Warmup JIT fusions with the input grad_enable state of both forward
-        # prop and recomputation
+        del output
+    elif warmup_bias_geglu:
+        # bias_geglu splits the last dim into two GLU halves, so its tensors
+        # are 2x ffn-sized. torch.cat consumes no RNG, so doubling the drawn
+        # tensors here keeps the RNG stream identical to the historical code.
+        geglu_bias = torch.cat([bias, bias], dim=-1)
+        geglu_input = torch.cat([input, input], dim=-1)
         for bias_grad, input_grad in zip([True, True], [False, True]):
-            bias.requires_grad, input.requires_grad = bias_grad, input_grad
+            geglu_bias.requires_grad, geglu_input.requires_grad = bias_grad, input_grad
             for _ in range(5):
-                output = bias_geglu(bias, input)
-        del bias, input, output
+                output = bias_geglu(geglu_bias, geglu_input)
+        del output, geglu_bias, geglu_input
+    del bias, input
 
-    # Warmup fused bias+dropout+add
-    if args.bias_dropout_fusion:
-        if args.sequence_parallel:
-            # tp_size threaded by the caller (hetero MIMO language PGC); None -> mpu.
-            seq_length = args.seq_length // (tp_size or mpu.get_tensor_model_parallel_world_size())
-        else:
-            seq_length = args.seq_length
-        input = torch.rand(
-            (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
-            dtype=dtype,
-            device="cuda",
-        )
-        residual = torch.rand(
-            (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
-            dtype=dtype,
-            device="cuda",
-        )
-        bias = torch.rand((args.hidden_size), dtype=dtype, device="cuda").expand_as(residual)
-        dropout_rate = 0.1
-        # Warmup JIT fusions with the input grad_enable state of both forward
-        # prop and recomputation
-        for input_grad, bias_grad, residual_grad in zip([False, True], [True, True], [True, True]):
-            input.requires_grad = input_grad
-            bias.requires_grad = bias_grad
-            residual.requires_grad = residual_grad
-            for _ in range(5):
-                output = bias_dropout_add_fused_train([input, bias], residual, dropout_rate)
-        del bias, input, residual, output
+    # Warmup fused bias+dropout+add. Intentionally NOT gated on
+    # args.bias_dropout_fusion: the fused train calls consume RNG for the
+    # dropout mask, and conditioning them would shift downstream determinism
+    # relative to the historical behavior encoded in the golden values.
+    if args.sequence_parallel:
+        # tp_size threaded by the caller (hetero MIMO language PGC); None -> mpu.
+        seq_length = args.seq_length // (tp_size or mpu.get_tensor_model_parallel_world_size())
+    else:
+        seq_length = args.seq_length
+    input = torch.rand(
+        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    residual = torch.rand(
+        (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    bias = torch.rand((args.hidden_size), dtype=dtype, device="cuda").expand_as(residual)
+    dropout_rate = 0.1
+    # Warmup JIT fusions with the input grad_enable state of both forward
+    # prop and recomputation
+    for input_grad, bias_grad, residual_grad in zip([False, True], [True, True], [True, True]):
+        input.requires_grad = input_grad
+        bias.requires_grad = bias_grad
+        residual.requires_grad = residual_grad
+        for _ in range(5):
+            output = bias_dropout_add_fused_train([input, bias], residual, dropout_rate)
+    del bias, input, residual, output
+
     torch.cuda.empty_cache()
 
 
