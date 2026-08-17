@@ -1091,11 +1091,15 @@ def get_megatron_optimizer(
     if ddp_config.use_megatron_fsdp:
         # For no_shard, gradients are replicated across DP ranks after all-reduce, so grad stats
         # should only be reduced over TP/PP (model_parallel_group) to avoid inflating the norm.
-        effective_intra_dist_opt_group = (
-            mp_group
-            if ddp_config.data_parallel_sharding_strategy == 'no_shard'
-            else intra_dist_opt_group
-        )
+        if ddp_config.data_parallel_sharding_strategy == 'no_shard':
+            effective_intra_dist_opt_group = mp_group
+        elif ddp_config.outer_dp_sharding_strategy != 'no_shard':
+            # Hybrid FSDP that shards the optimizer state over DP-Outer leaves each optimizer
+            # instance with a distinct slice of the gradient instead of a replica of it, so the
+            # stats have to be reduced over every instance to cover the whole gradient.
+            effective_intra_dist_opt_group = dp_cp_group
+        else:
+            effective_intra_dist_opt_group = intra_dist_opt_group
         for model_chunk, overlap_param_gather_with_optimizer_step in zip(
             all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
         ):

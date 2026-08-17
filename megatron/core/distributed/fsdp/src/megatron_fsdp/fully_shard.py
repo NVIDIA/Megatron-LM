@@ -357,14 +357,24 @@ def fully_shard_model(
 
     # Validate more arguments.
     _outer_fsdp_sharding = outer_dp_sharding_strategy == "optim"
-    if _outer_fsdp_sharding and zero_dp_strategy != "optim_grads_params":
-        # If sharding on outer DP using HSDP, then we must use HSDP buffers and
-        # we must be fully-sharding on inner DP. HSDP is an extension of FSDP.
-        # TODO(@shjwudp, @cspades): Requires various modifications to support.
+    _replicated_grad_strategies = sorted(
+        {
+            strategy
+            for strategy in (zero_dp_strategy, zero_dp_strategy_experts)
+            if strategy in ("no_shard", "optim")
+        }
+    )
+    if _outer_fsdp_sharding and _replicated_grad_strategies:
+        # DP-Outer reduction reduce-scatters the DP-Shard gradient shard into the DP-wide
+        # gradient shard, so DP-Shard has to shard gradients; strategies that replicate them
+        # have no shard to feed it. Replicated model weights are supported: those groups
+        # reassemble the whole bucket from the DP-wide weight shards instead of viewing a
+        # DP-Shard slice of it.
         raise ValueError(
-            f"Sharding with Hybrid (Fully) Sharded Data Parallel (HSDP) requires "
-            "zero_dp_strategy to use FSDP ('optim_grads_params', 3), because "
-            "outer sharding is dependent on inner sharding."
+            "Sharding with Hybrid (Fully) Sharded Data Parallel (HSDP) requires a "
+            "zero_dp_strategy that shards gradients ('optim_grads', 2 or "
+            f"'optim_grads_params', 3), but got {_replicated_grad_strategies}, because "
+            "outer sharding is dependent on inner gradient sharding."
         )
     if (dp_outer_dim is None) ^ (hybrid_fsdp_group is None):
         # XOR - HSDP requires both or neither of dp_outer_dim and hybrid_fsdp_group
