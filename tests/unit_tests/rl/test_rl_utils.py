@@ -262,17 +262,23 @@ class TestRLUtils:
         agent = MagicMock()
 
         class FakePipeline:
-            def __init__(self, agent, request, parallel_generation_tasks):
+            def __init__(
+                self, agent, request, parallel_generation_tasks, bank=None, initial_batch_id=0
+            ):
                 captured["agent"] = agent
                 captured["request"] = request
                 captured["parallel_generation_tasks"] = parallel_generation_tasks
                 self.gate = SimpleNamespace(capacity=parallel_generation_tasks)
+                captured["bank"] = bank
+                captured["initial_batch_id"] = initial_batch_id
 
             def run(self):
                 return rollout_generator
 
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
         monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", None)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_AGENT", None)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_BANK", None)
         monkeypatch.setattr(rl_utils, "get_agent", lambda _env_config_path: agent)
         monkeypatch.setattr(rl_utils, "RolloutPipeline", FakePipeline)
 
@@ -287,6 +293,7 @@ class TestRLUtils:
             consumption_granularity="B",
             generation_lag=generation_lag,
             env_config_path="unused.yaml",
+            current_iteration=17,
         )
 
         assert result is rollout_generator
@@ -296,6 +303,7 @@ class TestRLUtils:
         # independent of submission granularity.
         assert captured["parallel_generation_tasks"] == generation_lag + 1
         assert captured["request"].submission_granularity == submission_granularity
+        assert captured["initial_batch_id"] == 17
 
     @pytest.mark.parametrize(
         "overrides, match",
