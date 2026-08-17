@@ -140,7 +140,6 @@ def create_args():
     args.vocab_file = None
     args.add_position_embedding = False
     args.ckpt_assume_constant_structure = False
-    args.stream_ckpt_dequant = True
     args.ckpt_load_validate_sharding_integrity = True
     args.dist_ckpt_strictness = "assume_ok_unexpected"
     args.fp16 = False
@@ -222,6 +221,7 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
     args.num_attention_heads = 8
     # Ckpt format
     args.ckpt_format = "torch_dist"
+    args.save_tokenizer_assets = False
     set_args(args)
 
     def set_tp_pp_vpp(tp, pp, vpp=None, pp_layout=None, destroy_first=True):

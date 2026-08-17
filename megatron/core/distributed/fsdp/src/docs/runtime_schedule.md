@@ -92,12 +92,13 @@ figure.
 
 ## Single Communication Stream
 
-Prototype: [PR #5416](https://github.com/NVIDIA/Megatron-LM/pull/5416)
-
 PyTorch’s CUDA caching allocator maintains memory pools on a per-stream basis. Consolidating
 communication onto a single stream, rather than using separate streams for AllGather and
 ReduceScatter, can reduce allocator fragmentation by allowing allocations to be reused from
 the same stream-local pool.
+
+Using a single communication stream may also improve determinism by imposing a consistent
+ordering on communication operations that could otherwise make independent progress.
 
 A potential drawback is the introduction of artificial dependencies between AllGather (AG)
 and ReduceScatter (RS) operations. When AG and RS use separate NCCL communicators and CUDA

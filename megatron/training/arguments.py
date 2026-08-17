@@ -526,9 +526,29 @@ def validate_args(args, defaults={}):
         submit_rollouts_at_rollout_granularity = (
             args.rl_submission_granularity == "R"
         )
-        if args.rl_generation_lag > 0:
-            assert args.rl_partial_rollouts, \
-                "--rl-generation-lag requires --rl-partial-rollouts."
+        if args.rl_max_inflight_requests is not None:
+            requests_per_batch = args.grpo_prompts_per_step * args.grpo_group_size
+            assert args.rl_generation_lag is None, \
+                "--rl-generation-lag and --rl-max-inflight-requests are mutually exclusive."
+            assert args.rl_max_inflight_requests >= 1, \
+                f"--rl-max-inflight-requests ({args.rl_max_inflight_requests}) must be >= 1."
+            if args.rl_max_inflight_requests > requests_per_batch:
+                assert args.rl_partial_rollouts, \
+                    f"--rl-max-inflight-requests above one training batch " \
+                    f"({requests_per_batch} requests) requires --rl-partial-rollouts."
+            # Total in-flight requests = (lag + 1) trainer batches of P * G requests each.
+            args.rl_generation_lag = args.rl_max_inflight_requests / requests_per_batch - 1
+        if args.rl_generation_lag is None:
+            # With --rl-partial-rollouts the lag is autotuned from engine capacity
+            # at inference launch; otherwise generation is fully synchronous.
+            if not args.rl_partial_rollouts:
+                args.rl_generation_lag = 0
+        else:
+            assert args.rl_generation_lag >= -1, \
+                f"--rl-generation-lag ({args.rl_generation_lag}) must be >= -1."
+            if args.rl_generation_lag > 0:
+                assert args.rl_partial_rollouts, \
+                    "--rl-generation-lag requires --rl-partial-rollouts."
         if submit_rollouts_at_rollout_granularity:
             assert (
                 args.rl_partial_rollouts
@@ -1052,6 +1072,7 @@ def validate_args(args, defaults={}):
     args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
     args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
     args.mamba_training_ssm_states_dtype = map_dtype(args.mamba_training_ssm_states_dtype)
+    args.logit_dtype = map_dtype(getattr(args, 'logit_dtype', None))
 
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
@@ -1079,23 +1100,6 @@ def validate_args(args, defaults={}):
         and not is_flashinfer_min_version("0.6.4")
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
-
-    # Streaming dequantize is unsafe with tensorwise (current) FP8 scaling.
-    # The streaming planner does a BF16->FP8 ``copy_`` per slice; tensorwise
-    # recomputes the per-tensor scale from each slice's amax, so multi-shard
-    # destinations (e.g. resharded loads) end up with inconsistent scales
-    # across slices and the loaded weights are corrupted. Block-scaled
-    # recipes (mxfp8, blockwise, nvfp4) carry per-block scales and are
-    # unaffected. Force the upfront ``force_all_tensors_to_non_fp8`` path
-    # for tensorwise.
-    if args.fp8 and args.fp8_recipe == "tensorwise" and args.stream_ckpt_dequant:
-        warn_rank_0(
-            "--fp8-recipe=tensorwise is incompatible with the streaming "
-            "checkpoint dequantize path; falling back to the upfront "
-            "dequantize pass. Pass --no-stream-ckpt-dequant to silence "
-            "this warning."
-        )
-        args.stream_ckpt_dequant = False
 
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -1774,6 +1778,25 @@ def validate_args(args, defaults={}):
                 "Currently only the 'broadcast' exchange algorithm is supported for fully parallel load. "
                 "Other algorithms cannot guarantee numerical stability yet."
             )
+
+    # The PG-distribution cache stores one file per parallelization group, keyed by
+    # that group's minimum global rank, and each file holds both the save and the
+    # load distribution. If save and load used different parallelization groups,
+    # two distinct groups could map to the same file (they can share a minimum
+    # global rank), so one side would silently read a distribution computed for the
+    # other group's layout. Require both sides to use the same group.
+    if args.ckpt_pg_tensors_cache_path is not None:
+        assert (
+            args.ckpt_fully_parallel_save_process_group
+            == args.ckpt_fully_parallel_load_process_group
+        ), (
+            "--ckpt-pg-tensors-cache-path requires --ckpt-fully-parallel-save-process-group and "
+            "--ckpt-fully-parallel-load-process-group to be identical, but got "
+            f"save='{args.ckpt_fully_parallel_save_process_group}' and "
+            f"load='{args.ckpt_fully_parallel_load_process_group}'. The cache is keyed by the "
+            "parallelization group, so mixing groups can read a distribution computed for a "
+            "different layout."
+        )
 
     if args.load_main_params_from_ckpt:
         assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
@@ -2590,6 +2613,9 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
                        choices=['blockwise', 'duplicated', 'distributed'],
                        help='How to perform NS calculation for tensor model parallel weights')
+    group.add_argument('--muon-use-syrk', action='store_true',
+                       help='Use the Triton SYRK kernel for the Gram matrix '
+                       'in Newton-Schulz iteration.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
@@ -2625,10 +2651,21 @@ def _add_rl_args(parser):
                        help="Number of GRPO groups (G in the paper).")
     group.add_argument('--grpo-group-size', type=int, default=2,
                        help="Number of samples per a GRPO group.")
-    group.add_argument('--rl-generation-lag', type=int, default=0,
-                       help='Number of trainer batches of rollout generation lag to allow. '
+    group.add_argument('--rl-generation-lag', type=float, default=None,
+                       help='Number of trainer batches of rollout generation lag to allow '
                             'The number of in-flight trainer batches is this value plus one. '
-                            'Requires --rl-partial-rollouts when greater than 0.')
+                            'May be fractional or negative; the minimum of -1 keeps a single unit '
+                            'of generation work in flight. If omitted, the lag is autotuned to the '
+                            'inference engine\'s request capacity when --rl-partial-rollouts is '
+                            'set, and is 0 otherwise. '
+                            'Requires --rl-partial-rollouts when greater than 0. '
+                            'Mutually exclusive with --rl-max-inflight-requests.')
+    group.add_argument('--rl-max-inflight-requests', type=int, default=None,
+                       help='Maximum number of inference requests RL generation may keep inflight: '
+                            'equivalent to (--rl-generation-lag + 1) training batches '
+                            'of grpo_prompts_per_step * grpo_group_size requests each. '
+                            'Requires --rl-partial-rollouts when above one training batch; '
+                            'mutually exclusive with --rl-generation-lag.')
     # TODO: Refactor these string literals back to an enum after the megatron.training refactor.
     group.add_argument('--rl-submission-granularity', type=str,
                        default="B",
@@ -2918,7 +2955,7 @@ def _add_learning_rate_args(parser):
 def _add_checkpointing_args(parser):
     from megatron.training.config import CheckpointConfig
 
-    ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_tokenizer_assets", "save_optim", "save_rng", "load_optim", "load_rng"])
+    ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_optim", "save_rng", "load_optim", "load_rng"])
     group = ckpt_factory.build_group(parser, "checkpointing")
 
     group.add_argument('--no-save-optim', action='store_true', default=None,
@@ -2946,6 +2983,17 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
+    group.add_argument('--ckpt-drop-redundant-extra-state', action='store_true',
+                       default=False,
+                       help='Drop TE `_extra_state` artifacts that carry no '
+                       'irreplaceable state (no FP8, or block/current FP8 '
+                       'scaling) from the distributed checkpoint, keeping them '
+                       'local instead of writing them. Only delayed-scaling '
+                       '`_extra_state` (amax history + scale) is ever needed and '
+                       'it is always persisted regardless of this flag. By '
+                       'default (flag off) all `_extra_state` are persisted, '
+                       'preserving the previous behavior. Older checkpoints load '
+                       'unchanged either way.')
     return parser
 
 
@@ -2974,6 +3022,11 @@ def _add_mixed_precision_args(parser):
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
+    group.add_argument('--output-logit-dtype', type=str, choices=['bf16', 'fp32'], default=None,
+                       dest='logit_dtype',
+                       help='Output dtype for the language-model output-layer GEMM. When the '
+                       'requested dtype differs from the input dtype, Transformer Engine '
+                       'general_gemm is used. By default, logits use the output-layer input dtype.')
     group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true',
                        help='If True, reuse the grad buffer for MXFP8 parameter all-gather.')
     group.add_argument('--mamba-training-ssm-states-dtype', type=str,
@@ -3030,6 +3083,12 @@ def _add_distributed_args(parser):
                        default=False, help='If set, use a reduce-scatter implementation which sends lower-precision '
                        'values over the wire (using an all-to-all to keep total communication overhead in line '
                        'with the standard ring implementation) but performs accumulation locally in FP32.')
+    group.add_argument('--gtp-remat-reduce-scatter-with-fp32-accumulation', action='store_true',
+                       default=False, help='Same trade as --ddp-reduce-scatter-with-fp32-accumulation, but for '
+                       'the wgrad reduce-scatter GTP weight-remat performs over the gtp_remat axis: send '
+                       'low-precision values over the wire via an all-to-all and accumulate locally in FP32. '
+                       'Independent of the DDP flag (different collective, different process group). Costs one '
+                       'extra unsharded-wgrad-sized scratch buffer per in-flight reduce-scatter.')
     group.add_argument('--ddp-param-name-patterns-for-fp32-local-accumulation', nargs='+', default=[],
                        help='List of param_name patterns (in Python\'s fnmatch format) to match against '
                        'to do local gradient accumulation in FP32. The special pattern \'all\' matches '
