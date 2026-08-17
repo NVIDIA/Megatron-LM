@@ -3804,7 +3804,12 @@ class ParamAndGradBuffer:
             scaling_factor = gbuf.gradient_scaling_factor
             if self.ddp_config.check_for_nan_in_grad:
                 _check_nan_in_grad(gbuf.data)
-            reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
+            reduce_op = gradient_reduce_preprocessing(
+                gbuf.data,
+                scaling_factor,
+                self.ddp_config,
+                group_size=gbuf.data_parallel_group.size(),
+            )
             reduce_scatter_handler = torch.distributed.reduce_scatter_tensor(
                 output=gbuf.get_shard_from_local_buffer(),
                 input=gbuf.data,
@@ -3844,7 +3849,12 @@ class ParamAndGradBuffer:
             scaling_factor = gbuf.gradient_scaling_factor
             if self.ddp_config.check_for_nan_in_grad:
                 _check_nan_in_grad(gbuf.data)
-            reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, self.ddp_config)
+            reduce_op = gradient_reduce_preprocessing(
+                gbuf.data,
+                scaling_factor,
+                self.ddp_config,
+                group_size=gbuf.data_parallel_group.size(),
+            )
             all_reduce_handler = torch.distributed.all_reduce(
                 gbuf.data, op=reduce_op, group=gbuf.data_parallel_group, async_op=async_op
             )
@@ -4277,7 +4287,10 @@ class GradReducePipeline:
                     # Pre-scale unsharded bucket gradient and prepare the ReduceOp.
                     scaling_factor = gbuf.gradient_scaling_factor
                     reduce_op = gradient_reduce_preprocessing(
-                        unreduced_grad, scaling_factor, ddp_config
+                        unreduced_grad,
+                        scaling_factor,
+                        ddp_config,
+                        group_size=gbuf.data_parallel_group.size(),
                     )
 
                     # Gradients are copied into an unsharded buffer under 'no_shard' and
@@ -5064,9 +5077,11 @@ class AllGatherPipeline:
 
 
 @torch.no_grad()
-def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config):
+def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config, group_size=None):
     """
     Gradient reduce preprocessing for gradient averaging and gradient scaling.
+
+    ``group_size`` is the reduction group's rank count; None skips the one-rank case below.
     """
 
     # TODO(@cspades): Clean up this logic in conjunction with
@@ -5078,6 +5093,14 @@ def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config):
     elif ddp_config.average_in_collective:
         # Scaling overridden by AVG reduction.
         reduce_op = torch.distributed.ReduceOp.AVG
+    elif group_size == 1:
+        # A reduction over a single rank degenerates into a copy, which does not necessarily
+        # carry the pre-multiplier of a premul-sum reduction, so scale the gradient directly.
+        # The scale is 1/dp_cp_size while the reduction runs over a narrower group, so a
+        # one-rank group arises whenever expert parallelism spans the data parallel domain,
+        # and again under HFSDP when DP-Shard holds a single rank.
+        grad_data.mul_(scaling_factor)
+        reduce_op = torch.distributed.ReduceOp.SUM
     elif ddp_config.gradient_reduce_div_fusion and grad_data.dtype != torch.bfloat16:
         # Fused SUM reduction.
         reduce_op = torch.distributed._make_nccl_premul_sum(scaling_factor)

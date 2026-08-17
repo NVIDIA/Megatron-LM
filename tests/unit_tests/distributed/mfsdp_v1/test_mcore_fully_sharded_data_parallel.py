@@ -1669,3 +1669,50 @@ class TestMegatronFsdpGradStatsGroup:
             self._grad_stats_group("no_shard").size()
             == Utils.world_size // self.NUM_OPTIMIZER_INSTANCES
         )
+
+
+class TestMegatronFsdpSynchronousGradReduce:
+    """Gradient reduction with overlap_grad_reduce disabled, which reduces in one bulk call."""
+
+    @staticmethod
+    def _reduce_once(sharding_strategy):
+        """Run one backward pass and reduce its gradients without overlapping the reduction."""
+        Utils.initialize_model_parallel()
+        try:
+            fsdp_model = FullyShardedDataParallel(
+                config=TransformerConfig(
+                    num_attention_heads=1, num_layers=1, context_parallel_size=1
+                ),
+                ddp_config=DistributedDataParallelConfig(
+                    data_parallel_sharding_strategy=sharding_strategy,
+                    overlap_grad_reduce=False,
+                    bucket_size=10000,
+                    use_megatron_fsdp=True,
+                ),
+                module=TestModel(input_dim=13, output_dim=17).cuda(),
+                fsdp_unit_modules=[torch.nn.Linear],
+            )
+            fsdp_model(torch.randn(4, 13).cuda()).sum().backward()
+            # Without overlap the per-bucket reduction never runs, so this is the only call
+            # that reduces anything.
+            fsdp_model.start_grad_sync()
+            fsdp_model.finish_grad_sync()
+            torch.cuda.synchronize()
+        finally:
+            Utils.destroy_model_parallel()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim"])
+    def test_replicated_gradients_reduce_in_one_call(self, sharding_strategy):
+        """
+        Both replicating strategies have to reduce gradients when the overlap is disabled.
+
+        'no_shard' all-reduces the whole gradient and 'optim' reduce-scatters it, and each
+        applies the gradient averaging scale on a group whose width the caller supplies, so a
+        wrong width here rescales every gradient in the run.
+        """
+        self._reduce_once(sharding_strategy)
