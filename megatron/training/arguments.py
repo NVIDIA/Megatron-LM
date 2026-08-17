@@ -5081,7 +5081,7 @@ def _add_experimental_args(parser):
         '--hybrid-layer-pattern',
         type=str,
         default=None,
-        help='Specify a hybrid layer pattern using M (mamba), G (gdn), '
+        help='Specify a hybrid layer pattern using M (mamba), G (gdn), K (kda), '
         '* (attention), D (dsa), - (mlp), E (moe). Use | to define pipeline '
         'stage boundaries for flexible virtual pipeline parallel (fVPP). '
         'Use / to separate MTP patterns. '

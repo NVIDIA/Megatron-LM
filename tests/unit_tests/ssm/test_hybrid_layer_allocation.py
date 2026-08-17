@@ -78,6 +78,8 @@ class TestValidateSegmentLayers:
             ("GGG*GGG*", ['G', 'G', 'G', '*', 'G', 'G', 'G', '*']),
             ("GEGEGE*E", ['G', 'E', 'G', 'E', 'G', 'E', '*', 'E']),
             ("MDMD", ['M', 'D', 'M', 'D']),
+        ("K+K", ['K', '+', 'K']),
+        ("M+M+", ['M', '+', 'M', '+']),
         ]
         for pattern, expected in test_cases:
             result = validate_segment_layers(pattern)
@@ -326,6 +328,7 @@ class TestGetHybridLayerCounts:
             '*': 2,
             'D': 0,
             'G': 0,
+            'K': 0,
             'M': 2,
             '-': 0,
             'E': 0,
@@ -340,6 +343,7 @@ class TestGetHybridLayerCounts:
             '*': 1,
             'D': 0,
             'G': 1,
+            'K': 0,
             'M': 1,
             '-': 1,
             'E': 1,
@@ -351,7 +355,9 @@ class TestGetHybridLayerCounts:
             '*': 0,
             'D': 1,
             'G': 1,
+            'K': 0,
             'M': 1,
+            '+': 0,
             '-': 1,
             'E': 1,
         }
@@ -365,6 +371,7 @@ class TestGetHybridLayerCounts:
             '*': 2,
             'D': 0,
             'G': 0,
+            'K': 0,
             'M': 2,
             '-': 0,
             'E': 0,
@@ -376,6 +383,7 @@ class TestGetHybridLayerCounts:
             '*': 1,
             'D': 0,
             'G': 0,
+            'K': 0,
             'M': 4,
             '-': 4,
             'E': 0,
@@ -390,6 +398,7 @@ class TestGetHybridLayerCounts:
             '*': 2,
             'D': 0,
             'G': 0,
+            'K': 0,
             'M': 6,
             '-': 0,
             'E': 0,
@@ -405,6 +414,7 @@ class TestGetHybridLayerCounts:
             '*': 1,
             'D': 0,
             'G': 0,
+            'K': 0,
             'M': 8,
             '-': 4,
             'E': 0,
@@ -418,6 +428,7 @@ class TestGetHybridLayerCounts:
             '*': 0,
             'D': 0,
             'G': 0,
+            'K': 0,
             'M': 2,
             '-': 0,
             'E': 2,
@@ -432,6 +443,7 @@ class TestGetHybridLayerCounts:
             '*': 3,
             'D': 0,
             'G': 0,
+            'K': 0,
             'M': 7,
             '-': 0,
             'E': 0,
@@ -445,6 +457,7 @@ class TestGetHybridLayerCounts:
             '*': 0,
             'D': 0,
             'G': 2,
+            'K': 0,
             'M': 2,
             '-': 0,
             'E': 0,
@@ -459,6 +472,7 @@ class TestGetHybridLayerCounts:
             '*': 2,
             'D': 0,
             'G': 2,
+            'K': 0,
             'M': 1,
             '-': 0,
             'E': 0,
@@ -472,7 +486,36 @@ class TestGetHybridLayerCounts:
             '*': 0,
             'D': 2,
             'G': 0,
+            'K': 0,
             'M': 2,
+        '+': 0,
+        '-': 0,
+        'E': 0,
+    }
+
+    def test_mla_pattern(self):
+        assert get_hybrid_layer_counts("+M+M") == {
+            'C': 0,
+            'H': 0,
+            'W': 0,
+            '*': 0,
+            'D': 0,
+            'G': 0,
+            'K': 0,
+            'M': 2,
+            '+': 2,
+            '-': 0,
+            'E': 0,
+        }
+
+    def test_kda_pattern(self):
+        assert get_hybrid_layer_counts("K+K/K") == {
+            '*': 0,
+            'D': 0,
+            'G': 0,
+            'K': 3,
+            'M': 0,
+            '+': 1,
             '-': 0,
             'E': 0,
         }
@@ -485,6 +528,7 @@ class TestGetHybridLayerCounts:
             '*': 0,
             'D': 0,
             'G': 0,
+            'K': 0,
             'M': 0,
             '-': 0,
             'E': 0,
@@ -779,6 +823,13 @@ class TestGetLayerMapsFromLayerTypeList:
         assert mamba_map == {1: 0}
         assert mlp_map == {2: 0}
         assert moe_map == {3: 0}
+        assert maps[Symbols.KDA] == {}
+
+    def test_kda(self):
+        """KDA layers are tracked independently from MLA and standard attention."""
+        maps = get_layer_maps_from_layer_type_list(["K", "+", "K"])
+        assert maps[Symbols.KDA] == {0: 0, 2: 1}
+        assert maps[Symbols.MLA] == {1: 0}
 
     def test_dsa(self):
         """D (DSA) layers are treated as separate layers for KV cache mapping."""

@@ -15,7 +15,12 @@ from megatron.core.models.gpt.moe_module_specs import (
     get_moe_module_spec,
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.gated_delta_net import (
+    GatedDeltaNet,
+    GatedDeltaNetSubmodules,
+    KimiDeltaAttention,
+    KimiDeltaAttentionSubmodules,
+)
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
@@ -114,6 +119,22 @@ hybrid_stack_spec = ModuleSpec(
                     module=GatedDeltaNet,
                     submodules=GatedDeltaNetSubmodules(
                         in_proj=TELayerNormColumnParallelLinear,
+                        out_norm=TENorm,
+                        out_proj=TERowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        kda_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=ModuleSpec(
+                    module=KimiDeltaAttention,
+                    submodules=KimiDeltaAttentionSubmodules(
+                        in_proj=TEColumnParallelLinear,
+                        beta_proj=TEColumnParallelLinear,
                         out_norm=TENorm,
                         out_proj=TERowParallelLinear,
                     ),
