@@ -149,7 +149,7 @@ def assign_owner_work(plans: Sequence[ShardPlan], num_ns_steps: int) -> dict[int
         Mapping from parameter index (in `plans`) to owner rank.
     """
     assignments: dict[int, int] = {}
-    running: dict[int, float] = {r: 0.0 for r in range(plans[0].world_size)} if plans else {}
+    running: dict[int, int] = {r: 0 for r in range(plans[0].world_size)} if plans else {}
     for param_index, plan in enumerate(plans):
         candidates = plan.owner_candidates()
         if not candidates:
@@ -163,7 +163,7 @@ def assign_owner_work(plans: Sequence[ShardPlan], num_ns_steps: int) -> dict[int
             continue
         rows, cols = plan.full_shape
         short_dim = min(rows, cols)
-        cost = float(plan.full_numel() * (short_dim * num_ns_steps + 1))
+        cost = plan.full_numel() * (short_dim * num_ns_steps + 1)
         owner = min(candidates, key=lambda r: (running[r], r))
         assignments[param_index] = owner
         running[owner] += cost
