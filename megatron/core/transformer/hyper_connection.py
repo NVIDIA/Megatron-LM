@@ -272,7 +272,7 @@ class HyperConnectionModule(MegatronModule):
         x_2d = x.reshape(s * b, nC).to(torch.float32)
         weight = self.mapping_proj.weight.to(torch.float32)
         proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
-        return proj.view(s, b, -1), r.view(s, b, 1)
+        return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
     @torch.compile

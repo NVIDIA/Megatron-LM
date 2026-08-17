@@ -19,7 +19,6 @@ DEPENDENCIES:
         apt-get install -y --no-install-recommends \
             sudo gdb bash-builtins git zsh autojump tmux curl gettext libfabric-dev
         wget https://github.com/mikefarah/yq/releases/download/v4.27.5/yq_linux_arm64 -O /usr/bin/yq
-        echo "ea360a0ecdff30c8625ccd0b97f8714b8308a429fd839cf8ccc481f311e217c6  /usr/bin/yq" | sha256sum --check -
         chmod +x /usr/bin/yq
         apt-get clean
         rm -rf /var/lib/apt/lists/*
@@ -113,9 +112,9 @@ ENV_VARS:
 ARGS:
   tokenizer_type: HuggingFaceTokenizer
   tokenizer_model: unsloth/DeepSeek-V3
-  num_layers: 43
-  hidden_size: 4096
-  num_attention_heads: 64
+  num_layers: 61
+  hidden_size: 7168
+  num_attention_heads: 128
   kv_channels: 512
   max_position_embeddings: 4096
   normalization: RMSNorm
@@ -127,33 +126,33 @@ ARGS:
   rotary_base: 10000
   make_vocab_size_divisible_by: 3232
   multi_latent_attention: true
-  q_lora_rank: 1024
+  q_lora_rank: 1536
   qk_pos_emb_head_dim: 64
   v_head_dim: 512
   rotary_scaling_factor: 4
   mscale: 1.0
   mscale_all_dim: 1.0
   qk_layernorm: true
-  o_groups: 8
+  o_groups: 16
   o_lora_rank: 1024
   original_max_position_embeddings: 65536
   experimental_attention_variant: dsv4_hybrid
   csa_window_size: 128
-  csa_compress_ratios: ([0,0,4]+[128,4]*20+[0])
+  csa_compress_ratios: ([128,128,4]+[128,4]*29+[0])
   csa_compress_rotary_base: 40000
   dsa_indexer_n_heads: 64
   dsa_indexer_head_dim: 128
-  dsa_indexer_topk: 512
+  dsa_indexer_topk: 1024
   dsa_indexer_loss_coeff: 1e-2
   dsa_indexer_use_sparse_loss: true
-  num_experts: 256
+  num_experts: 384
   moe_n_hash_layers: 3
-  moe_ffn_hidden_size: 2048
-  moe_shared_expert_intermediate_size: 2048
+  moe_ffn_hidden_size: 3072
+  moe_shared_expert_intermediate_size: 3072
   moe_router_load_balancing_type: seq_aux_loss
   moe_router_topk: 6
   moe_aux_loss_coeff: 1e-4
-  moe_router_topk_scaling_factor: 1.5
+  moe_router_topk_scaling_factor: 2.5
   moe_router_score_function: sqrtsoftplus
   moe_router_enable_expert_bias: true
   moe_router_bias_update_rate: 1e-3
@@ -169,11 +168,13 @@ ARGS:
   mock_data: true
   seq_length: 4096
   moe_router_force_load_balancing: true
+  distributed_timeout_minutes: 60
   tensor_model_parallel_size: 1
-  pipeline_model_parallel_size: 1
+  pipeline_model_parallel_size: 4
   expert_model_parallel_size: 64
   context_parallel_size: 1
   expert_tensor_parallel_size: 1
+  pipeline_model_parallel_layout: Et*4|(tttt|)*14tmL
   use_distributed_optimizer: true
   sequence_parallel: true
   overlap_grad_reduce: true
@@ -188,36 +189,42 @@ ARGS:
   recompute_granularity: selective
   recompute_modules:
   - mla_up_proj
+  - mhc
+  fine_grained_activation_offloading: true
+  offload_modules:
+  - core_attn
+  fine_grained_offloading_max_inflight_offloads: 2
   use_transformer_engine_op_fuser: true
   moe_mlp_glu_interleave_size: 32
-  moe_paged_stash: true
-  moe_paged_stash_page_size: 64
-  moe_paged_stash_buffer_size_factor_cuda: 1.2
-  moe_paged_stash_buffer_size_factor_cpu: 0.0
-  moe_pad_experts_for_cuda_graph_inference: true
   moe_expert_rank_capacity_factor: 1.5
+  moe_paged_stash: true
+  moe_paged_stash_buffer_size_factor_cuda: 1.2
+  moe_pad_experts_for_cuda_graph_inference: true
   cuda_graph_impl: local
   cuda_graph_scope: full_iteration
+  cuda_graph_warmup_steps: 3
   use_mcore_models: true
   use_flash_attn: true
   transformer_impl: transformer_engine
   micro_batch_size: 1
-  global_batch_size: 2048
-  train_samples: 585937500
+  global_batch_size: 4096
+  train_iters: 50
   exit_duration_in_mins: 220
   no_save_optim: true
   no_check_for_nan_in_loss_and_grad: true
   cross_entropy_loss_fusion: true
   cross_entropy_fusion_impl: native
   no_create_attention_mask_in_dataloader: true
+  num_workers: 0
+  num_dataset_builder_threads: 1
   manual_gc: true
   manual_gc_interval: 10
   lr: 3.9e-06
   min_lr: 3.9e-07
   lr_warmup_init: 3.9e-07
   lr_decay_style: cosine
-  lr_decay_samples: 584765624
-  lr_warmup_samples: 1536000
+  lr_decay_iters: 50
+  lr_warmup_iters: 0
   weight_decay: 0.1
   clip_grad: 1.0
   adam_beta1: 0.9
@@ -228,13 +235,13 @@ ARGS:
   fp8_param_gather: true
   reuse_grad_buf_for_mxfp8_param_ag: true
   use_precision_aware_optimizer: true
-  main_grads_dtype: fp32
+  main_grads_dtype: bf16
   main_params_dtype: fp32
   exp_avg_dtype: bf16
   exp_avg_sq_dtype: bf16
   moe_router_padding_for_quantization: true
   init_method_std: 0.02
-  eval_iters: 32
+  eval_iters: 0
   eval_interval: 200
   finetune: false
   no_load_optim: true
@@ -249,6 +256,8 @@ ARGS:
   log_timers_to_tensorboard: true
   log_memory_to_tensorboard: true
   log_validation_ppl_to_tensorboard: true
+  log_memory_interval: 1
+  log_device_memory_used: true
   tensorboard_dir: ${OUTPUT_PATH}/tensorboard
-  wandb_exp_name: DeepSeek-V4-Flash-GB200-MXFP8-TP1PP1EP64-GBS2048SEQLEN4096
+  wandb_exp_name: DeepSeek-V4-Pro-GB300-MXFP8-TP1PP4EP64-GBS4096SEQLEN4096
   enable_experimental: true

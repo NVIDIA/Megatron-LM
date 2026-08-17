@@ -611,15 +611,30 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             extract_layer_indices = set()
         intermediate_hidden_states: List[Tensor] = []
 
+        # Unpack dual RoPE before checkpointing because autograd only accepts
+        # tensors (or None) in save_for_backward.
+        is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
+        assert (
+            not is_dual_rope or len(rotary_pos_emb) == 2
+        ), "Dual RoPE input length is not equal to 2"
+        rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
+
         def custom(start: int, end: int):
             def custom_forward(
                 hidden_states,
                 attention_mask,
                 context,
                 context_mask,
-                rotary_pos_emb,
+                rotary_pos_emb_local,
+                rotary_pos_emb_global,
                 padding_mask=None,
             ):
+                rotary_pos_emb = (
+                    (rotary_pos_emb_local, rotary_pos_emb_global)
+                    if is_dual_rope
+                    else rotary_pos_emb_global
+                )
+
                 for index in range(start, end):
                     layer = self._get_layer(index)
 
@@ -669,7 +684,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     attention_mask,
                     context,
                     context_mask,
-                    rotary_pos_emb,
+                    *rotary_pos_emb,
                     padding_mask,
                 )
             else:
@@ -680,7 +695,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     attention_mask,
                     context,
                     context_mask,
-                    rotary_pos_emb,
+                    *rotary_pos_emb,
                     padding_mask,
                 )
 
@@ -725,7 +740,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
                     hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                        hidden_states, attention_mask, context, context_mask, *rotary_pos_emb
                     )
 
                 # Feature extraction: collect hidden states at specified global layer indices
