@@ -397,8 +397,15 @@ class MegatronFSDP(torch.nn.Module):
         """
         Whether this parameter's gradients are sharded, and therefore reduced on every
         backward pass rather than once per optimization cycle.
+
+        A single-rank DP-Shard group shards nothing, so its buffer accumulates microbatches
+        in place and must reduce once per cycle: a one-rank reduction cannot carry a
+        premul-sum multiplier, so reducing per microbatch rescales that buffer repeatedly.
         """
-        return self._sharding_strategy_for_param(param) in ["optim_grads", "optim_grads_params"]
+        if self._sharding_strategy_for_param(param) not in ["optim_grads", "optim_grads_params"]:
+            return False
+        bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+        return self.grad_reduce_pipeline.get_fsdp_buffer(bucket_id).data_parallel_group.size() > 1
 
     def _init_fsdp_param_and_grad_buffer(self):
         if self.calculate_per_token_loss:

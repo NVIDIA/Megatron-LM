@@ -44,8 +44,9 @@ NUM_STEPS = 3
 LEARNING_RATE = 0.1
 
 # (DP_OUTER, DP_SHARD) factorizations. Each case is skipped unless it spans the world, so
-# that the same test file covers the 8-GPU CI world and smaller local worlds.
-HYBRID_MESHES = [(2, 2), (2, 4), (4, 2)]
+# that the same test file covers the 8-GPU CI world and smaller local worlds. DP_SHARD of
+# one is included because it makes the DP-Shard reduction collective degenerate.
+HYBRID_MESHES = [(2, 2), (4, 1), (2, 4), (4, 2), (8, 1)]
 
 
 class ToyMoEModel(torch.nn.Module):
@@ -161,6 +162,30 @@ def assert_loss_curve_matches_reference(fsdp_model, fsdp_optimizer, reference_mo
         fsdp_optimizer.zero_grad()
 
     torch.testing.assert_close(torch.stack(losses), torch.stack(reference_losses))
+
+
+def assert_reduction_schedule_matches_group_width(fsdp_model):
+    """
+    A bucket may reduce on every backward pass only if its DP-Shard group is wider than one rank.
+
+    A one-rank reduction cannot carry a premul-sum multiplier, so reducing such a bucket per
+    microbatch rescales its accumulating buffer repeatedly instead of once per cycle.
+    """
+    checked = 0
+    # Walk the buffer's own mapping rather than fsdp_model.parameters(): once sharded, the
+    # module exposes DTensors, which are not the keys this mapping was built from.
+    for param, bucket_id in fsdp_model.param_and_grad_buffer.param_to_param_group.items():
+        buffer = fsdp_model.grad_reduce_pipeline.get_fsdp_buffer(bucket_id)
+        group_width = buffer.data_parallel_group.size()
+        reduces_every_backward = fsdp_model._reduces_grad_every_backward(param)
+        if group_width == 1:
+            assert not reduces_every_backward, (
+                f"bucket {bucket_id} has a single-rank DP-Shard group but is scheduled to "
+                f"reduce on every backward pass, which rescales its accumulating buffer once "
+                f"per microbatch"
+            )
+            checked += 1
+    assert checked, "no single-rank DP-Shard bucket was exercised, so nothing was verified"
 
 
 class TestShardingStrategyResolution:
@@ -456,6 +481,20 @@ class TestHybridFsdpOverReplicatedWeights:
         )
 
         assert_loss_curve_matches_reference(fsdp_model, optimizer, reference_model)
+        destroy_device_mesh(device_mesh)
+
+    # A DP-Shard width of one is the case under test, and it is reached both by sharding
+    # everything over DP-Outer and by an expert group whose parallelism spans DP-Shard.
+    @pytest.mark.parametrize("mesh_shape", [(4, 1), (8, 1)])
+    def test_single_rank_dp_shard_group_reduces_once_per_cycle(self, mesh_shape):
+        """A single-rank DP-Shard bucket must not be reduced on every backward pass."""
+        device_mesh = build_hybrid_mesh(*mesh_shape)
+        _, model = build_replicated_models()
+
+        fsdp_model = self.hybrid_shard_model(
+            model, device_mesh, OPTIM_GRADS, experts_strategy=OPTIM_GRADS_PARAMS
+        )
+        assert_reduction_schedule_matches_group_width(fsdp_model)
         destroy_device_mesh(device_mesh)
 
     @pytest.mark.parametrize("replicating_strategy", [NO_SHARD, OPTIM])
