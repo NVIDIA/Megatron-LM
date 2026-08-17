@@ -249,6 +249,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     pre-fetch allowlist check."""
 
     def http_error_301(self, req, fp, code, msg, headers):
+        """Turn a 3xx redirect into an HTTPError so the fetch fails closed."""
         raise urllib.error.HTTPError(
             req.full_url, code, "redirects disabled for image_url fetches", headers, fp
         )
