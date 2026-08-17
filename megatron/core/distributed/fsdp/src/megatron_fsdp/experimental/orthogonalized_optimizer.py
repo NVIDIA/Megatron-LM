@@ -320,17 +320,20 @@ def pack_owner_work(
     )
 
 
-def reconstruct_orthogonalization_input(
+def reconstruct_full_tensor(
     param_index: int,
     plan: ShardPlan,
     gather_plan: OwnerGatherPlan,
     recv_buffers: dict[int, torch.Tensor],
     owner_rank: int,
 ) -> torch.Tensor:
-    """Reconstruct the full pre-NS matrix for one owned parameter.
+    """Reconstruct the full 2D tensor for one owned parameter from its per-rank shards.
 
-    Concatenates shards in rank order: the owner's own local shard at its rank
-    rows and each source's received shard at that source's rank rows.
+    Concatenates shards in rank order: the owner's own local shard at its rank rows and each
+    source's received shard at that source's rank rows. The shard content lives in `gather_plan`
+    (`own_shards` + `recv_offsets`), so this works for the pre-NS owner-gather path and for a weight
+    gather plan alike – pass a weight gather plan built with `pack_owner_work` to reconstruct the
+    full weight parameter instead.
 
     Args:
         param_index: Index of the parameter within the chunk.
@@ -340,7 +343,7 @@ def reconstruct_orthogonalization_input(
         owner_rank: The owner rank (== the rank running reconstruction).
 
     Returns:
-        The full `(rows, cols)` pre-NS matrix.
+        The full `(rows, cols)` tensor.
     """
     world_size = plan.world_size
     shards: list[torch.Tensor] = []
@@ -482,6 +485,34 @@ def unpack_update_shards(
     return updates
 
 
+@dataclasses.dataclass
+class _BoundaryChunkState:
+    """In-flight owner-gather state for one boundary chunk, between issue and finish.
+
+    `FsdpOrthogonalizedOptimizer.step` issues every chunk's owner-gather first
+    (so fully-local Newton-Schulz overlaps the gathers), then finishes each chunk
+    (wait gather, orthogonalize, scatter, apply). This object carries everything
+    `_finish_boundary_step` needs across that gap.
+    """
+
+    b_params: Sequence[DTensor]
+    b_plans: Sequence[ShardPlan]
+    b_owners: dict[int, int]
+    gather_plan: OwnerGatherPlan
+    recv_buffers: dict[int, torch.Tensor]
+    gather_works: list[dist.Work]
+    device: torch.device
+    dtype: torch.dtype
+    lr: float
+    group_kwargs: dict[str, Any]
+    # Only populated when `reconstruct_full_param` is enabled: a second owner-gather
+    # round that collects each rank's local *weight* shard (instead of the pre-NS
+    # shard) so the owner can reconstruct the full parameter for `orthogonalize`.
+    weight_gather_plan: OwnerGatherPlan | None = None
+    weight_recv_buffers: dict[int, torch.Tensor] | None = None
+    weight_gather_works: list[dist.Work] | None = None
+
+
 class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
     """Owner-compute orthogonalized optimizer for all-`Flat` M-FSDPv2 parameters.
 
@@ -510,6 +541,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         use_owner_comm_stream: Whether to use a separate communication stream for
             owner-based peer-to-peer communications. Useful to disable for testing
             reasons, giving a synchronous algorithm. Defaults to True.
+        reconstruct_full_param: Whether to also gather local weight shards and pass
+            them to orthogonalization. When False, `None` is passed as the
+            parameter to orthogonalize. Defaults to False, since it's not used in
+            the standard case.
         num_ns_steps: Newton-Schulz iteration count, also used by the owner
             load-balancing cost heuristic. If None, defaults to 1.
     """
@@ -527,6 +562,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         inner_optimizer: OrthogonalizedOptimizer,
         dp_mesh: DeviceMesh,
         use_owner_comm_stream: bool = True,
+        reconstruct_full_param: bool = False,
         num_ns_steps: int | None = None,
     ) -> None:
         _require_emerging_optimizers()
@@ -543,6 +579,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         # cannot reliably run NCCL P2P on a separate stream, so this flag lets
         # tests (the only synchronous-use case) fall back to the default stream.
         self.use_owner_comm_stream: bool = use_owner_comm_stream
+        self.reconstruct_full_param: bool = reconstruct_full_param
         self._owner_comm_needed: bool | None = None
         self._shard_plans: dict[int, ShardPlan] = {}
         self._owners: dict[int, int] = {}
@@ -902,25 +939,16 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
     ) -> None:
         """Run orthogonalization on the given orthogonalization inputs and update the given
         parameter with the result of orthogonalization. (Fully-local path: no communication.)
+
+        For a fully-local parameter the owning rank's local shard *is* the full
+        parameter, so no gather is needed: pass it directly when
+        `reconstruct_full_param` is enabled, else `None` (matching the
+        boundary path).
         """
         group_kwargs = {k: v for k, v in group.items() if k != "params"}
-        update = self._orthogonalize_with_precision(param, pre_ns, **group_kwargs)
+        param_arg = param.to_local() if self.reconstruct_full_param else None
+        update = self._orthogonalize_with_precision(param_arg, pre_ns, **group_kwargs)
         self._apply_update(param, update, lr)
-
-    def _reconstruct_orthogonalization_input(
-        self,
-        param_index: int,
-        plan: ShardPlan,
-        gather_plan: OwnerGatherPlan,
-        recv_buffers: dict[int, torch.Tensor],
-        owner_rank: int,
-    ) -> torch.Tensor:
-        """Merge the gathered orthogonalization input shards back to the original, full, unsharded
-        input tensor.
-        """
-        return reconstruct_orthogonalization_input(
-            param_index, plan, gather_plan, recv_buffers, owner_rank
-        )
 
     # Owner-scatter communication (P2P)
     # =================================
@@ -1011,10 +1039,15 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         Separates collective (P2P) and local (NS) work into phases so that no
         rank is blocked waiting on another rank computing NS to reach P2P:
 
-        1. Compute momentum updates locally for all params.
-        2. P2P-send boundary pre-NS shards to owners - all P2P, no NS interleaved.
-        3. Newton-Schulz + weight update locally (fully-local params overlap the
-           owner gather; boundary params wait for their gather then NS+scatter).
+        1. Compute local pre-NS shards (weight decay + momentum + Nesterov) for
+           all matrix params.
+        2. P2P-send all boundary pre-NS shards to their owners (async, no NS).
+        3. Newton-Schulz + weight update for fully-local params on the default
+           stream, overlapping the boundary owner-gathers issued in phase 2.
+        4. On each owner, wait gather, reconstruct, and orthogonalize to produce
+           the full updates.
+        5. P2P-send update shards from owners back to their destinations.
+        6. Each rank applies its local update shard to its local weight shard.
         """
         loss = None if closure is None else closure()
 
@@ -1082,36 +1115,47 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 i for i in range(len(matrix_plans)) if matrix_plans[i].is_boundary()
             }
 
-            # Group boundary params by collective group, shard device/dtype,
-            # and parameter dtype (see `_group_updates`) so each chunk uses
-            # consistent P2P buffer metadata. A single optimizer param group
-            # may span multiple FSDP groups and/or mixed dtypes (e.g. FP32 + BF16).
+            # Phase 2: issue all boundary owner-gathers (async on the owner-comm
+            # stream) before any Newton-Schulz, so the fully-local NS in phase 3
+            # overlaps the gathers. This matches the V1 pseudocode, which runs the
+            # owner-gather before the local orthogonalization. Boundary params are
+            # grouped by collective group, shard device/dtype, and parameter dtype
+            # (see `_group_updates`) so each chunk uses consistent P2P metadata; a
+            # single optimizer param group may span multiple FSDP groups and/or
+            # mixed dtypes (e.g. FP32 + BF16).
+            chunk_states: list[_BoundaryChunkState] = []
             for chunk_indices in self._group_updates(matrix_params, local_shards):
                 chunk_boundary = [i for i in chunk_indices if i in boundary_indices_set]
                 if not chunk_boundary:
                     continue
                 shard_device = local_shards[chunk_boundary[0]].device
                 shard_dtype = local_shards[chunk_boundary[0]].dtype
-                self._step_boundary(
-                    matrix_params,
-                    matrix_plans,
-                    owners,
-                    chunk_boundary,
-                    local_shards,
-                    shard_device,
-                    shard_dtype,
-                    lr,
-                    group_kwargs,
+                chunk_states.append(
+                    self._issue_owner_gather(
+                        matrix_params,
+                        matrix_plans,
+                        owners,
+                        chunk_boundary,
+                        local_shards,
+                        shard_device,
+                        shard_dtype,
+                        lr,
+                        group_kwargs,
+                    )
                 )
 
-            # Fully-local path: orthogonalize the full local matrix and update.
-            # Runs on the default stream, overlapping the boundary P2P issued
-            # above on the owner-comm stream.
+            # Phase 3: fully-local Newton-Schulz + weight update on the default
+            # stream, overlapping the boundary owner-gathers issued above.
             for i in local_indices:
                 plan = matrix_plans[i]
                 if plan.rank_row_count(self._this_rank()) == 0:
                     continue
                 self._orthogonalize_and_update(matrix_params[i], local_shards[i], lr, group)
+
+            # Phases 4-6: finish each boundary chunk - wait gather, orthogonalize
+            # on owners, scatter updates, and apply local update shards.
+            for state in chunk_states:
+                self._finish_boundary_step(state)
 
             for param in matrix_params:
                 pg = get_containing_parameter_group(param)
@@ -1122,7 +1166,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             parameter_group.sync_model_weight_from_main_weight()
         return loss
 
-    def _step_boundary(
+    def _issue_owner_gather(
         self,
         matrix_params: Sequence[DTensor],
         matrix_plans: Sequence[ShardPlan],
@@ -1133,24 +1177,72 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         dtype: torch.dtype,
         lr: float,
         group_kwargs: dict[str, Any],
-    ) -> None:
-        """Owner-compute P2P step for the boundary parameters of one chunk."""
+    ) -> _BoundaryChunkState:
+        """Pack and asynchronously P2P-send this chunk's pre-NS shards to owners.
+
+        Returns the in-flight gather state; `step` finishes it later with
+        `_finish_boundary_step` so fully-local Newton-Schulz overlaps the gathers.
+        """
         b_plans = [matrix_plans[i] for i in boundary_indices]
         b_params = [matrix_params[i] for i in boundary_indices]
         b_local = [local_shards[i] for i in boundary_indices]
         b_owners = {i: owners[boundary_indices[i]] for i in range(len(boundary_indices))}
+        gather_plan = self._pack_owner_work(b_plans, b_owners, b_local, device, dtype)
+        recv_buffers, gather_works = self._send_to_owner(gather_plan, device, dtype)
+
+        # Optionally also gather each rank's local *weight* shard so the owner can
+        # reconstruct the full parameter and pass it to `orthogonalize` (some
+        # subclasses read `p`). This is a second, parallel P2P round issued on the
+        # same owner-comm stream so it overlaps the pre-NS gather; it reuses the
+        # same shard plans/owners (only the shard content differs).
+        weight_gather_plan = None
+        weight_recv_buffers = None
+        weight_gather_works = None
+        if self.reconstruct_full_param:
+            weight_local = [p.to_local() for p in b_params]
+            weight_dtype = b_params[0].dtype
+            weight_gather_plan = self._pack_owner_work(
+                b_plans, b_owners, weight_local, device, weight_dtype
+            )
+            weight_recv_buffers, weight_gather_works = self._send_to_owner(
+                weight_gather_plan, device, weight_dtype
+            )
+        return _BoundaryChunkState(
+            b_params=b_params,
+            b_plans=b_plans,
+            b_owners=b_owners,
+            gather_plan=gather_plan,
+            recv_buffers=recv_buffers,
+            gather_works=gather_works,
+            device=device,
+            dtype=dtype,
+            lr=lr,
+            group_kwargs=group_kwargs,
+            weight_gather_plan=weight_gather_plan,
+            weight_recv_buffers=weight_recv_buffers,
+            weight_gather_works=weight_gather_works,
+        )
+
+    def _finish_boundary_step(self, state: _BoundaryChunkState) -> None:
+        """Finish one boundary chunk: wait gather, orthogonalize, scatter, apply."""
+        b_params = state.b_params
+        b_plans = state.b_plans
+        b_owners = state.b_owners
+        gather_plan = state.gather_plan
+        recv_buffers = state.recv_buffers
+        device = state.device
+        lr = state.lr
+        group_kwargs = state.group_kwargs
         this_rank = self._this_rank()
         stream = self._owner_comm_stream(device)
 
-        # Phase 2: pack + P2P-send pre-NS shards to owners (async on owner stream).
-        gather_plan = self._pack_owner_work(b_plans, b_owners, b_local, device, dtype)
-        recv_buffers, gather_works = self._send_to_owner(gather_plan, device)
-
-        # Phase 3 (owner): wait gather, reconstruct, orthogonalize. Default
+        # Phase 4 (owner): wait gather, reconstruct, orthogonalize. Default
         # stream waits for the owner stream so the recv buffers are ready.
         if stream is not None:
             torch.cuda.current_stream(device).wait_stream(stream)
-        self._wait_for_dist_buffer(gather_works)
+        self._wait_for_dist_buffer(state.gather_works)
+        if state.weight_gather_works:
+            self._wait_for_dist_buffer(state.weight_gather_works)
 
         full_updates: dict[int, torch.Tensor] = {}
         for i in range(len(b_params)):
@@ -1159,20 +1251,39 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             plan = b_plans[i]
             if plan.rank_row_count(this_rank) == 0:
                 continue
-            full = self._reconstruct_orthogonalization_input(
-                i, plan, gather_plan, recv_buffers, owner_rank=this_rank
-            )
-            full_updates[i] = self._orthogonalize_with_precision(None, full, **group_kwargs)
+            # Merge the gathered orthogonalization input shards back to the original, full,
+            # unsharded input tensor.
+            full = reconstruct_full_tensor(i, plan, gather_plan, recv_buffers, owner_rank=this_rank)
+            # `full` is the reconstructed pre-NS matrix and is the
+            # orthogonalization input (`pre_ns`). The `param` (`p`) argument is
+            # unused by the default `OrthogonalizedOptimizer.orthogonalize`, so
+            # by default (`reconstruct_full_param=False`) we pass `None`. When the
+            # flag is enabled, reconstruct the full parameter from the gathered
+            # weight shards (a second P2P round issued in `_issue_owner_gather`) and
+            # pass it as `param` for subclasses that read `p`.
+            if self.reconstruct_full_param and state.weight_gather_plan is not None:
+                param_arg = reconstruct_full_tensor(
+                    i,
+                    plan,
+                    state.weight_gather_plan,
+                    state.weight_recv_buffers,
+                    owner_rank=this_rank,
+                )
+            else:
+                param_arg = None
+            full_updates[i] = self._orthogonalize_with_precision(param_arg, full, **group_kwargs)
 
-        # Phase 4: pack + P2P-send update shards from owners (async on owner stream).
-        scatter_plan = self._pack_update_shards(full_updates, b_plans, b_owners, device, dtype)
-        scatter_recv, scatter_works = self._send_to_destination(scatter_plan, device, dtype)
+        # Phase 5: pack + P2P-send update shards from owners (async on owner stream).
+        scatter_plan = self._pack_update_shards(
+            full_updates, b_plans, b_owners, device, state.dtype
+        )
+        scatter_recv, scatter_works = self._send_to_destination(scatter_plan, device, state.dtype)
         if stream is not None:
             torch.cuda.current_stream(device).wait_stream(stream)
         self._wait_for_dist_buffer(scatter_works)
         received = self._unpack_update_shards(scatter_plan, scatter_recv)
 
-        # Phase 5: apply local update shards.
+        # Phase 6: apply local update shards.
         for i, param in enumerate(b_params):
             plan = b_plans[i]
             if b_owners[i] == this_rank:
@@ -1230,6 +1341,7 @@ class FsdpMuon(FsdpOrthogonalizedOptimizer):
         inner_optimizer: Muon,
         dp_mesh: DeviceMesh,
         use_owner_comm_stream: bool = True,
+        reconstruct_full_param: bool = False,
     ) -> None:
         _require_emerging_optimizers()
 
@@ -1250,5 +1362,9 @@ class FsdpMuon(FsdpOrthogonalizedOptimizer):
                 muon_sig = inspect.signature(inner_optimizer)
                 self._num_ns_steps = muon_sig.parameters["num_ns_steps"].default
         super().__init__(
-            params, inner_optimizer, dp_mesh=dp_mesh, use_owner_comm_stream=use_owner_comm_stream
+            params,
+            inner_optimizer,
+            dp_mesh=dp_mesh,
+            use_owner_comm_stream=use_owner_comm_stream,
+            reconstruct_full_param=reconstruct_full_param,
         )

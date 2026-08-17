@@ -32,7 +32,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.orthogonalize
     compute_shard_plan,
     pack_owner_work,
     pack_update_shards,
-    reconstruct_orthogonalization_input,
+    reconstruct_full_tensor,
     unpack_update_shards,
 )
 
@@ -229,10 +229,10 @@ def test_pack_and_reconstruct_round_trip():
     recv = _simulate_p2p(per_rank_send, world_size)
 
     # Rank0 owns param0; reconstruct and compare to full_p0.
-    full0 = reconstruct_orthogonalization_input(0, plan0, per_rank_gather[0], recv[0], owner_rank=0)
+    full0 = reconstruct_full_tensor(0, plan0, per_rank_gather[0], recv[0], owner_rank=0)
     torch.testing.assert_close(full0, full_p0, atol=0, rtol=0)
     # Rank1 owns param1; reconstruct and compare to full_p1.
-    full1 = reconstruct_orthogonalization_input(1, plan1, per_rank_gather[1], recv[1], owner_rank=1)
+    full1 = reconstruct_full_tensor(1, plan1, per_rank_gather[1], recv[1], owner_rank=1)
     torch.testing.assert_close(full1, full_p1, atol=0, rtol=0)
 
 
@@ -756,7 +756,7 @@ def test_owner_p2p_round_trip_multi_owner(distributed_setup):
         plan = plans[local_index]
         if plan.rank_row_count(this_rank) == 0:
             continue
-        full = reconstruct_orthogonalization_input(
+        full = reconstruct_full_tensor(
             local_index, plan, gather_plan, recv_buffers, owner_rank=this_rank
         )
         full_updates[local_index] = full
