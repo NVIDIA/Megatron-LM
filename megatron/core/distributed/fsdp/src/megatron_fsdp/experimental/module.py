@@ -25,6 +25,7 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy, fp8_need_transpose_data, is_float8tensor
+from .allocator import TracePoolAllocator
 from .execution_runner import FsdpExecutionRunner
 from .indexed_order import IndexedOrder
 from .parameter_group import Fp8ParameterGroup, FsdpParameterGroup, get_containing_parameter_group
@@ -60,6 +61,7 @@ class FsdpContext:
     backward_order: IndexedOrder["FsdpModule"]
     # Selects static-order lookahead or traced VPP occurrence-order replay.
     runner: FsdpExecutionRunner
+    trace_pool_allocator: TracePoolAllocator | None
 
     def __init__(
         self,
@@ -68,6 +70,7 @@ class FsdpContext:
         unify_communication_stream: bool = False,
         *,
         use_trace_replay: bool = False,
+        enable_trace_pool: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -79,7 +82,12 @@ class FsdpContext:
                 communication stream to reduce peak transient memory.
             use_trace_replay: Trace the actual execution order during the first batch
                 and replay it for later prefetches. Defaults to static-order lookahead.
+            enable_trace_pool: Trace temporary-buffer lifetimes, then reuse a fixed
+                storage pool. With execution replay, planning waits until one full
+                prefetch-enabled replay batch has also been observed.
         """
+        if use_symmetric_memory and enable_trace_pool:
+            raise ValueError("MFSDP trace-pool and symmetric-memory buffers are incompatible.")
         self.device = device
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
@@ -87,6 +95,7 @@ class FsdpContext:
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         self.runner = FsdpExecutionRunner(context=self, use_trace_replay=use_trace_replay)
+        self.trace_pool_allocator = TracePoolAllocator() if enable_trace_pool else None
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
@@ -135,6 +144,20 @@ class FsdpContext:
             raise RuntimeError(
                 "FSDP context is not finalized. Exit fully_shard_context before running forward."
             )
+
+    def complete_trace(self) -> None:
+        """Compile execution replay and the optional storage pool once per batch."""
+        runner_was_tracing = self.runner.is_tracing
+        has_execution_events = self.runner.has_events_since_boundary
+        self.runner.complete_trace()
+        if self.trace_pool_allocator is not None and self.trace_pool_allocator.phase == "trace":
+            if self.runner.use_trace_replay and (runner_was_tracing or not has_execution_events):
+                # The first fine-grained batch learns execution order with prefetch
+                # disabled. Its lifetimes do not describe replay. Keep tracing
+                # storage through one replay batch, then plan from both sets of
+                # intervals. The no-events case is a duplicate VPP chunk boundary.
+                return
+            self.trace_pool_allocator.plan()
 
     def current_stream(self) -> torch.cuda.Stream:
         """Current stream on this context's device."""
@@ -239,6 +262,7 @@ class FsdpModule:
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
                     fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+                    trace_pool_allocator=context.trace_pool_allocator,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
@@ -536,6 +560,7 @@ class FsdpModule:
             reduce_scatter_stream.wait_stream(current_stream)
             with torch.cuda.stream(reduce_scatter_stream):
                 group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
+                group.release_partial_grad_buffer()
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
