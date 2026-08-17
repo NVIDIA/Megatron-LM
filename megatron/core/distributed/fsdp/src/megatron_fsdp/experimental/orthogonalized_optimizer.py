@@ -64,6 +64,7 @@ from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import ParamsT
 
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
+from .placement import Flat
 from .shard_plan import (
     OwnerGatherPlan,
     OwnerScatterPlan,
@@ -193,6 +194,25 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         with self._without_property_methods():
             super().__init__(params, {})
         self._inner = inner_optimizer
+
+        # Assert all-`Flat` placements: this optimizer only supports the
+        # all-Flat layout (parameter=Flat, gradient=Flat, optimizer=Flat).
+        _seen_groups: set[FsdpParameterGroup] = set()
+        for _param in self._all_params():
+            _group = get_containing_parameter_group(_param)
+            if _group is None or _group in _seen_groups:
+                continue
+            _seen_groups.add(_group)
+            for _buf in (_group.main_weight, _group.model_weight, _group.main_grad):
+                if _buf is None:
+                    continue
+                if not all(isinstance(_p, Flat) for _p in _buf.placements):
+                    raise ValueError(
+                        "FsdpOrthogonalizedOptimizer requires all-Flat placements "
+                        "(parameter=Flat, gradient=Flat, optimizer=Flat), but "
+                        f"{_group} has non-Flat placements "
+                        f"{[type(_p).__name__ for _p in _buf.placements]}."
+                    )
 
     @property
     def param_groups(self) -> list[dict[str, Any]]:
