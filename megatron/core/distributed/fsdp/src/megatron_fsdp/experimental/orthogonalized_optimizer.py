@@ -55,9 +55,9 @@ try:
 
     HAVE_EMERGING_OPTIMIZERS = True
 except (ModuleNotFoundError, ImportError):
-    eo_utils = None
-    OrthogonalizedOptimizer = object
-    Muon = object
+    eo_utils = cast(Any, None)
+    OrthogonalizedOptimizer = cast(Any, object)
+    Muon = cast(Any, object)
     HAVE_EMERGING_OPTIMIZERS = False
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
@@ -411,7 +411,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
     # =============================
 
     def _group_updates(
-        self, params: Sequence[DTensor], local_shards: Sequence[torch.Tensor]
+        self, params: Sequence[torch.Tensor], local_shards: Sequence[torch.Tensor]
     ) -> list[list[int]]:
         """Using the shard plans, group the updates into chunks.
 
@@ -501,6 +501,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         default_stream = torch.cuda.current_stream() if stream is not None else None
         with torch.cuda.stream(stream) if stream is not None else nullcontext():
             if stream is not None:
+                assert default_stream is not None
                 stream.wait_stream(default_stream)
             works = dist.batch_isend_irecv(ops) if ops else []
             for buf in list(gather_plan.send_buffers.values()) + list(recv_buffers.values()):
@@ -613,6 +614,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         default_stream = torch.cuda.current_stream() if stream is not None else None
         with torch.cuda.stream(stream) if stream is not None else nullcontext():
             if stream is not None:
+                assert default_stream is not None
                 stream.wait_stream(default_stream)
             works = dist.batch_isend_irecv(ops) if ops else []
             for buf in list(scatter_plan.send_buffers.values()) + list(recv_buffers.values()):
@@ -870,6 +872,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             # weight shards (a second P2P round issued in `_issue_owner_gather`) and
             # pass it as `param` for subclasses that read `p`.
             if self.reconstruct_full_param and state.weight_gather_plan is not None:
+                assert state.weight_recv_buffers is not None
                 param_arg = reconstruct_full_tensor(
                     i,
                     plan,
