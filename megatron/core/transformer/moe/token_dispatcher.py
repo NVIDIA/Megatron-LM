@@ -111,6 +111,18 @@ class MoETokenDispatcher:
             attr = getattr(attr, name)
         setattr(attr, hier_attr_name[-1], value)
 
+    def reset_transient_forward_state(self) -> None:
+        """Release the transient per-forward routing state held on the dispatcher
+        (probs / routing map / permutation mappings, etc.).
+
+        Used by the EP A2A overlap VPP-stage full recompute path: after the initial
+        no-grad forward, this state is no longer needed until the backward-time
+        recompute, which re-runs ``dispatch_preprocess`` and unconditionally
+        repopulates all of it. Freeing it here is therefore correctness-neutral and
+        only reduces the metadata retained across the forward->backward gap. The base
+        implementation is a no-op; dispatchers that cache such state override it.
+        """
+
     @abstractmethod
     def dispatch_preprocess(
         self, tokens: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
@@ -627,6 +639,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         ), "cuda_sync_point must be after cuda_dtoh_point."
         return num_tokens_per_local_expert
 
+    def reset_transient_forward_state(self) -> None:
+        """Release the routing metadata cached by ``dispatch_preprocess`` /
+        ``combine_postprocess`` (probs, routing map, permutation mapping, cached
+        shapes). ``dispatch_preprocess`` reassigns all of these unconditionally, so
+        the backward-time recompute repopulates them before combine runs; clearing
+        them after the initial forward only frees the across-gap metadata."""
+        self.probs = None
+        self.routing_map = None
+        self.reversed_local_input_permutation_mapping = None
+        self.hidden_shape = None
+        self.hidden_shape_before_permute = None
+
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
@@ -975,6 +999,41 @@ class _DispatchManager(ABC):
     num_instances is the maximum number of tokens instances dispatched into a target rank, it
     can be the number of local experts, or the size of sub_group.
     """
+
+    # Per-forward routing metadata cached on the manager that is (a) reassigned
+    # unconditionally by setup_metadata / dispatch / get_permuted_hidden_states_by_experts
+    # on the next forward, and (b) not needed by the backward autograd graph (the
+    # combine kernels save what they need via save_for_backward, which is why
+    # ``combine`` already nulls handle / dispatched_* itself). Names cover all flex
+    # backends; getattr-guarded so each manager only clears what it actually holds:
+    #   - all backends: token_probs, token_indices, tokens_per_expert
+    #   - HybridEP:     routing_map, dispatched_probs
+    #   - DeepEP / v2:  dispatched_indices, dispatched_probs, dispatched_routing_map,
+    #                   reversed_mapping_for_combine, pad_offsets
+    _TRANSIENT_FORWARD_ATTRS = (
+        "token_probs",
+        "token_indices",
+        "tokens_per_expert",
+        "routing_map",
+        "dispatched_probs",
+        "dispatched_indices",
+        "dispatched_routing_map",
+        "reversed_mapping_for_combine",
+        "pad_offsets",
+    )
+
+    def reset_transient_forward_state(self) -> None:
+        """Release the transient per-forward routing metadata cached on the manager.
+
+        Used by the EP A2A overlap VPP-stage full recompute path: the backward-time
+        recompute re-runs setup_metadata / dispatch / get_permuted, which repopulate
+        all of this before combine, and the backward reads autograd-saved tensors
+        rather than these attributes. Clearing them after the initial forward is
+        therefore correctness-neutral and only frees the metadata retained across the
+        forward->backward gap (persistent comm buffers / bootstrap state are kept)."""
+        for attr in self._TRANSIENT_FORWARD_ATTRS:
+            if getattr(self, attr, None) is not None:
+                setattr(self, attr, None)
 
     @abstractmethod
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
@@ -1870,6 +1929,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
                 "Please set --moe-flex-dispatcher-backend to deepep, deepepv2, hybridep, or ncclep"
             )
+
+    def reset_transient_forward_state(self) -> None:
+        """Delegate to the active communication manager to free its transient
+        per-forward routing metadata (see _DispatchManager.reset_transient_forward_state)."""
+        self._comm_manager.reset_transient_forward_state()
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """

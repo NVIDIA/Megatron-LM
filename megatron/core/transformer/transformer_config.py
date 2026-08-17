@@ -310,7 +310,11 @@ class TransformerConfig(ModelParallelConfig):
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
-    """How THD sequence rows are partitioned across context-parallel ranks."""
+    """How THD sequence rows are partitioned across context-parallel ranks.
+
+    Contiguous partitioning is defined only for THD inputs; BSHD context parallelism uses the
+    standard zigzag layout.
+    """
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
@@ -594,7 +598,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc", "gdn".
+             "shared_experts", "mhc", "gdn", "gdn_norm_out".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -609,7 +613,10 @@ class TransformerConfig(ModelParallelConfig):
     "gdn": recompute the entire GatedDeltaNet module (in_proj, conv1d, gated delta rule,
             gated norm, CP all-to-all and out_proj). Requires
             experimental_attention_variant="gated_delta_net".
-    "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
+    "gdn_norm_out": recompute the GatedDeltaNet gated normalization output via
+            CheckpointWithoutOutput. Requires experimental_attention_variant="gated_delta_net".
+    "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use
+    output-discarding checkpointing,
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
 
@@ -1556,12 +1563,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.cp_partition_mode not in ("zigzag", "contiguous"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
 
-        if self.experimental_attention_variant == "dsv4_hybrid" and (
+        if self.cp_partition_mode == "contiguous" and (
             self.context_parallel_size > 1 or self.dynamic_context_parallel
         ):
-            assert (
-                self.sequence_packing_scheduler is not None
-            ), "DSv4 Hybrid with CP requires a sequence_packing_scheduler for THD inputs."
+            if self.sequence_packing_scheduler is None:
+                raise ValueError(
+                    "cp_partition_mode='contiguous' with context parallelism requires THD "
+                    "inputs from a sequence_packing_scheduler; BSHD inputs are not supported."
+                )
 
         if self.context_parallel_size > 1:
             if (
@@ -2119,18 +2128,30 @@ class TransformerConfig(ModelParallelConfig):
                     'or "selective".'
                 )
 
+            # EP A2A overlap drives its own VPP-stage full recompute (the whole model
+            # chunk is recomputed as a single unit) and therefore does not use
+            # recompute_method / recompute_num_layers. Skip the block/uniform
+            # requirement below in that case.
+            ep_overlap_full_recompute = (
+                self.overlap_moe_expert_parallel_comm and self.recompute_granularity == "full"
+            )
+
             if self.recompute_method is not None:
                 if self.recompute_method not in ["block", "uniform"]:
                     raise ValueError(
                         f'recompute_method: {self.recompute_method} must be "block" or "uniform".'
                     )
-            elif self.recompute_granularity != "selective":
+            elif self.recompute_granularity != "selective" and not ep_overlap_full_recompute:
                 raise ValueError(
                     f"Using recompute_granularity: {self.recompute_granularity} so "
                     'recompute_method must be "block" or "uniform"'
                 )
 
-            if self.recompute_granularity != "selective" and self.recompute_num_layers is None:
+            if (
+                self.recompute_granularity != "selective"
+                and self.recompute_num_layers is None
+                and not ep_overlap_full_recompute
+            ):
                 raise ValueError(
                     f"When using recompute_granularity: {self.recompute_granularity} "
                     "recompute_num_layers must be between "
@@ -2166,6 +2187,7 @@ class TransformerConfig(ModelParallelConfig):
                     "shared_experts",
                     "mhc",
                     "gdn",
+                    "gdn_norm_out",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -2185,12 +2207,27 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if (
+                "gdn_norm_out" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_norm_out in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
+                )
+
+            if (
                 "gdn" in self.recompute_modules
                 and self.experimental_attention_variant != "gated_delta_net"
             ):
                 raise ValueError(
                     "gdn in recompute_modules is only supported with "
                     "experimental_attention_variant='gated_delta_net'."
+                )
+
+            if "gdn" in self.recompute_modules and "gdn_norm_out" in self.recompute_modules:
+                raise ValueError(
+                    "'gdn' and 'gdn_norm_out' in recompute_modules cannot be used together. "
+                    "'gdn' recomputes the full GatedDeltaNet module, including gated norm."
                 )
 
             if "core_attn" in self.recompute_modules:
@@ -3186,15 +3223,74 @@ class TransformerConfig(ModelParallelConfig):
                 'flex',
             ], 'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'
 
-            assert (
-                self.recompute_granularity != 'full'
-            ), 'disable full recomputation when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.recompute_method is None
-            ), 'disable recomputation method when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.recompute_num_layers is None
-            ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
+            if self.recompute_granularity == 'full':
+                # EP A2A overlap supports full recompute through a dedicated
+                # VPP-stage (model-chunk) recompute path: only the input tensor of
+                # each VPP stage is retained across the forward->backward gap, and
+                # the whole stage forward is recomputed (with an exposed,
+                # non-overlapped A2A) at the start of its backward. The normal
+                # forward/backward A2A overlap is preserved.
+                # See megatron/core/models/common/model_chunk_schedule_plan.py.
+                assert self.recompute_method is None, (
+                    'recompute_method must be None with overlap_moe_expert_parallel_comm full '
+                    'recompute: the whole VPP stage (model chunk) is recomputed as a single unit'
+                )
+                assert self.recompute_num_layers is None, (
+                    'recompute_num_layers must be None with overlap_moe_expert_parallel_comm '
+                    'full recompute (the whole VPP stage is recomputed as a single unit)'
+                )
+                # The recompute replays the stage forward. With attention/hidden
+                # dropout the forward RNG stream is interleaved across microbatches
+                # in the 1F1B schedule and cannot yet be faithfully replayed, so the
+                # recomputed activations would diverge from the forward pass.
+                assert self.attention_dropout == 0.0 and self.hidden_dropout == 0.0, (
+                    'overlap_moe_expert_parallel_comm full recompute currently requires '
+                    'attention_dropout==0 and hidden_dropout==0 (RNG replay across the '
+                    'interleaved 1F1B schedule is not yet supported for nonzero dropout)'
+                )
+                # The VPP-stage recompute re-runs the stage forward at backward time.
+                # Combining it with CUDA graphs is not yet supported: the graph captures
+                # a fixed forward/backward node sequence and pre-allocates static buffers,
+                # which the inserted (no_grad) initial forward + backward-time recompute
+                # pass does not fit. Full recompute (drop+recompute activations) and CUDA
+                # graphs (fixed pre-allocated buffers) also target opposite memory regimes.
+                assert self.cuda_graph_impl == "none", (
+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '
+                    'together with CUDA graphs (cuda_graph_impl != "none").'
+                )
+                # Paged stash keeps per-layer activations in a paged buffer, while full
+                # recompute drops and recomputes them — the two activation-memory
+                # strategies are redundant and their stash/restore lifecycle conflicts
+                # with the recompute activation release. Not yet supported together.
+                assert not self.moe_paged_stash, (
+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '
+                    'together with moe_paged_stash.'
+                )
+                # Delayed-scaling FP8 accumulates amax into a persistent
+                # amax_history across microbatches. Both the initial no_grad forward
+                # and the backward-time recompute run under the delayed FP8 autocast,
+                # and this path does not enter TE's activation-recompute
+                # (recompute_phase) machinery that te_checkpoint uses to snapshot and
+                # restore FP8 metadata, so the recompute would update amax_history a
+                # second time and silently diverge. Current-scaling recipes
+                # (tensorwise / mxfp8 / blockwise) derive scales from the current
+                # tensor each pass, so the replayed forward re-derives identical
+                # scales (validated bitwise-identical to recompute-off); only delayed
+                # scaling is rejected here.
+                assert not (self.fp8 and self.fp8_recipe == Fp8Recipe.delayed), (
+                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '
+                    'with delayed-scaling FP8 (fp8_recipe="delayed"): the backward-time '
+                    'recompute would double-update the persistent amax_history. Use a '
+                    'current-scaling recipe (tensorwise / mxfp8 / blockwise) instead.'
+                )
+            else:
+                assert self.recompute_method is None, (
+                    'disable recomputation method when enabling ' 'overlap_moe_expert_parallel_comm'
+                )
+                assert self.recompute_num_layers is None, (
+                    'recompute_num_layers must be None when enabling '
+                    'overlap_moe_expert_parallel_comm'
+                )
             assert (
                 "moe" not in self.recompute_modules
             ), 'disable moe in recompute_modules when enabling overlap_moe_expert_parallel_comm'

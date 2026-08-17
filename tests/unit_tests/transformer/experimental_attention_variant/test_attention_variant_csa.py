@@ -17,6 +17,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CSAIndexer,
     CSAIndexerSubmodules,
     _apply_rope,
+    _compute_unfused_csa_non_compressed_lse,
     build_cu_seqlens_kv_full,
     cat_per_segment,
     get_compress_topk_idxs,
@@ -24,6 +25,11 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     get_window_topk_idxs,
     get_window_topk_idxs_thd,
     unfused_compressed_sparse_attn,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    FusedDSAIndexerLoss,
+    compute_dsa_indexer_loss,
+    fused_qk_topk_naive,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -64,6 +70,210 @@ def patch_hadamard_if_needed():
 # ===========================================================================
 # Helper function tests
 # ===========================================================================
+
+
+class _SingleRankTP:
+    @staticmethod
+    def size():
+        return 1
+
+
+class _SingleRankPG:
+    tp = _SingleRankTP()
+
+
+@pytest.mark.parametrize("layout", ["sbhd", "thd"])
+def test_unfused_csa_non_compressed_lse_matches_window_and_sink_oracle(layout):
+    torch.manual_seed(17)
+    num_heads, head_dim = 2, 4
+    sink = torch.randn(num_heads, requires_grad=True)
+
+    if layout == "sbhd":
+        seqlen_q, batch_size, n_kv = 3, 2, 5
+        query = torch.randn(seqlen_q, batch_size, num_heads, head_dim, requires_grad=True)
+        kv_full = torch.randn(n_kv, batch_size, head_dim, requires_grad=True)
+        window_indices = torch.tensor([[[-1, 0], [0, 1], [1, 2]], [[-1, 0], [0, 2], [2, 4]]])
+        expected = torch.empty(batch_size, num_heads, seqlen_q)
+        with torch.no_grad():
+            for batch in range(batch_size):
+                for row in range(seqlen_q):
+                    for head in range(num_heads):
+                        logits = [sink[head]]
+                        for key_index in window_indices[batch, row]:
+                            if key_index >= 0:
+                                logits.append(
+                                    torch.dot(query[row, batch, head], kv_full[key_index, batch])
+                                )
+                        expected[batch, head, row] = torch.logsumexp(torch.stack(logits), dim=0)
+    else:
+        seqlen_q, batch_size, n_kv = 4, 1, 6
+        query = torch.randn(seqlen_q, num_heads, head_dim, requires_grad=True)
+        kv_full = torch.randn(n_kv, head_dim, requires_grad=True)
+        window_indices = torch.tensor([[-1, 0], [0, 1], [2, 3], [4, 5]])
+        expected = torch.empty(batch_size, num_heads, seqlen_q)
+        with torch.no_grad():
+            for row in range(seqlen_q):
+                for head in range(num_heads):
+                    logits = [sink[head]]
+                    for key_index in window_indices[row]:
+                        if key_index >= 0:
+                            logits.append(torch.dot(query[row, head], kv_full[key_index]))
+                    expected[0, head, row] = torch.logsumexp(torch.stack(logits), dim=0)
+
+    actual = _compute_unfused_csa_non_compressed_lse(
+        query, kv_full, sink, window_indices, softmax_scale=1.0
+    )
+
+    assert actual.shape == (batch_size, num_heads, seqlen_q)
+    assert actual.dtype == torch.float32
+    assert not actual.requires_grad
+    torch.testing.assert_close(actual, expected)
+
+    for teacher_tensor in (query, kv_full, sink):
+        assert teacher_tensor.grad is None
+
+
+def _independent_csa_indexer_loss(
+    index_scores,
+    topk_indices,
+    query,
+    compressed_kv,
+    window_kv,
+    window_indices,
+    sink,
+    *,
+    sparse_loss,
+    loss_coeff,
+):
+    batch_size, seqlen_q, n_compressed = index_scores.shape
+    num_heads = query.shape[2]
+    losses = []
+    for batch in range(batch_size):
+        for row in range(seqlen_q):
+            selected = (
+                topk_indices[batch, row].tolist() if sparse_loss else list(range(n_compressed))
+            )
+            target = []
+            for compressed_index in selected:
+                head_mass = 0.0
+                for head in range(num_heads):
+                    non_compressed_logits = [sink[head]]
+                    for window_index in window_indices[batch, row]:
+                        if window_index >= 0:
+                            non_compressed_logits.append(
+                                torch.dot(query[row, batch, head], window_kv[window_index, batch])
+                            )
+                    compressed_logits = [
+                        torch.dot(query[row, batch, head], compressed_kv[key_index, batch])
+                        for key_index in selected
+                    ]
+                    denominator = torch.logsumexp(
+                        torch.stack(non_compressed_logits + compressed_logits), dim=0
+                    )
+                    head_mass = head_mass + torch.exp(
+                        compressed_logits[selected.index(compressed_index)] - denominator
+                    )
+                target.append(head_mass)
+            target = torch.stack(target)
+            target = target / target.sum()
+            predict_log = torch.log_softmax(index_scores[batch, row, selected], dim=-1)
+            losses.append((target * (torch.log(target) - predict_log)).sum())
+    return torch.stack(losses).mean() * loss_coeff
+
+
+@pytest.mark.parametrize("sparse_loss", [False, True], ids=["dense", "sparse"])
+def test_csa_lse_custom_autograd_matches_full_teacher_and_reference(sparse_loss):
+    torch.manual_seed(29)
+    seqlen_q, batch_size, num_heads, head_dim = 4, 1, 2, 3
+    n_compressed, index_heads, index_dim = 3, 2, 2
+    index_topk, loss_coeff = 2, 0.7
+
+    q = torch.randn(seqlen_q, batch_size, index_heads, index_dim, requires_grad=True)
+    weights = torch.randn(seqlen_q, batch_size, index_heads, requires_grad=True)
+    k = torch.randn(n_compressed, batch_size, index_dim, requires_grad=True)
+    query = torch.randn(seqlen_q, batch_size, num_heads, head_dim, requires_grad=True)
+    window_kv = torch.randn(seqlen_q, batch_size, head_dim, requires_grad=True)
+    compressed_kv = torch.randn(n_compressed, batch_size, head_dim, requires_grad=True)
+    sink = torch.randn(num_heads, requires_grad=True)
+    window_indices = torch.tensor([[[-1, 0], [0, 1], [1, 2], [2, 3]]])
+    kv_full = torch.cat([window_kv, compressed_kv], dim=0)
+    non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
+        query, kv_full, sink, window_indices, softmax_scale=1.0
+    )
+    key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, num_heads, -1)
+    compressed_mask = torch.zeros(seqlen_q, n_compressed)
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    weights_ref = weights.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    index_scores_ref, topk_ref = fused_qk_topk_naive(q_ref, k_ref, weights_ref, index_topk)
+    index_scores_oracle = index_scores_ref.detach().clone()
+    loss_ref = compute_dsa_indexer_loss(
+        index_scores_ref,
+        topk_ref,
+        query.detach(),
+        key_for_loss.detach(),
+        1.0,
+        loss_coeff,
+        sparse_loss,
+        _SingleRankPG(),
+        mask=compressed_mask,
+        non_compressed_lse=non_compressed_lse,
+    )
+    loss_ref.backward()
+
+    saved_shapes = []
+
+    def pack_hook(tensor):
+        saved_shapes.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+        topk_actual, loss_actual = FusedDSAIndexerLoss.apply(
+            q,
+            weights,
+            k,
+            query,
+            key_for_loss,
+            1.0,
+            index_topk,
+            loss_coeff,
+            compressed_mask,
+            sparse_loss,
+            _SingleRankPG(),
+            None,
+            None,
+            None,
+            None,
+            False,
+            True,
+            non_compressed_lse,
+        )
+        loss_actual.backward()
+
+    independent_loss = _independent_csa_indexer_loss(
+        index_scores_oracle,
+        topk_ref,
+        query.detach(),
+        compressed_kv.detach(),
+        window_kv.detach(),
+        window_indices,
+        sink.detach(),
+        sparse_loss=sparse_loss,
+        loss_coeff=loss_coeff,
+    )
+
+    torch.testing.assert_close(loss_actual, independent_loss)
+    torch.testing.assert_close(loss_actual, loss_ref)
+    torch.testing.assert_close(topk_actual, topk_ref)
+    torch.testing.assert_close(q.grad, q_ref.grad)
+    torch.testing.assert_close(weights.grad, weights_ref.grad)
+    torch.testing.assert_close(k.grad, k_ref.grad)
+    assert (batch_size, seqlen_q, n_compressed) not in saved_shapes
+    assert tuple(non_compressed_lse.shape) in saved_shapes
+
+    for teacher_tensor in (query, window_kv, compressed_kv, sink):
+        assert teacher_tensor.grad is None
 
 
 class TestGetWindowTopkIdxs:

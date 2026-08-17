@@ -1525,8 +1525,6 @@ def _pad_sparse_backward_topk(
     attn_score: Tensor, index_score: Tensor, topk_indices: Tensor, block_size: int
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Pad sparse indexer-backward top-k tensors to cuDNN's block-size multiple."""
-    # The backward wrapper has no separate top-k length; zero-score slots still need valid indices.
-    topk_indices = topk_indices.clamp_min(0)
     topk = topk_indices.size(-1)
     padded_topk = round_up_to_nearest_multiple(topk, block_size)
     if padded_topk == topk:
@@ -1535,7 +1533,9 @@ def _pad_sparse_backward_topk(
     pad_width = padded_topk - topk
     attn_score = torch.nn.functional.pad(attn_score, (0, pad_width), value=0.0)
     index_score = torch.nn.functional.pad(index_score, (0, pad_width), value=0.0)
-    topk_indices = torch.nn.functional.pad(topk_indices, (0, pad_width), value=0)
+    # Negative indices are rejected by the kernel's bounds guard before K loads
+    # and dK atomics, so preserve the invalid-slot sentinel through padding.
+    topk_indices = torch.nn.functional.pad(topk_indices, (0, pad_width), value=-1)
     return attn_score.contiguous(), index_score.contiguous(), topk_indices.contiguous()
 
 
@@ -1859,13 +1859,15 @@ def _compute_sparse_indexer_loss_and_grads(
             .mul(skv)
         )
         topk_indices_for_bwd = topk_indices_for_bwd + batch_offsets
-    topk_indices_for_bwd = topk_indices_for_bwd.masked_fill(~valid_positions, 0)
+    topk_indices_for_bwd = topk_indices_for_bwd.masked_fill(~valid_positions, -1)
     attn_score_for_bwd = target
     # The cuDNN sparse indexer-backward score-grad kernel gates the KL gradient
     # on positive predicted probabilities. Preserve the mathematically correct
     # ``predict - target`` gradient for underflowed softmax entries by keeping
-    # selected probabilities nonzero before handing them to cuDNN.
+    # selected probabilities nonzero before handing them to cuDNN. Invalid slots
+    # stay zero and use negative indices so the main kernel skips their K/dK work.
     index_score_for_bwd = predict.clamp_min(_CLIP_PROB_MIN)
+    index_score_for_bwd.masked_fill_(~valid_positions, 0.0)
     block_i = 128
     attn_score_for_bwd, index_score_for_bwd, topk_indices_for_bwd = _pad_sparse_backward_topk(
         attn_score_for_bwd, index_score_for_bwd, topk_indices_for_bwd, block_i

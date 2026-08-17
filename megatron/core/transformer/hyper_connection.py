@@ -216,11 +216,15 @@ class HyperConnectionModule(MegatronModule):
         # a trivial a+b+c) is not worth it for a pure memory-bound elementwise op.
         self._fused_add_3_op = native_fused_add_3
 
+        # The fused path computes the projection and compute_h in one op, so
+        # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
+        # reached on the unfused path.
+        self._proj_rms_op = native_proj_rms
+
         if config.use_fused_mhc:
             from megatron.core.fusions.fused_mhc_kernels import (
                 fused_h_aggregate,
                 fused_h_post_bda,
-                fused_proj_rms,
                 fused_proj_rms_compute_h,
                 fused_sinkhorn,
                 log_fused_mhc_backend_once,
@@ -230,13 +234,11 @@ class HyperConnectionModule(MegatronModule):
             self._sinkhorn_op = fused_sinkhorn
             self._h_aggregate_op = fused_h_aggregate
             self._h_post_bda_op = fused_h_post_bda
-            self._proj_rms_op = fused_proj_rms
             self._proj_rms_compute_h_op = fused_proj_rms_compute_h
         else:
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
             self._h_post_bda_op = native_h_post_bda
-            self._proj_rms_op = native_proj_rms
             self._proj_rms_compute_h_op = None
 
         self._init_weights()
@@ -270,7 +272,7 @@ class HyperConnectionModule(MegatronModule):
         x_2d = x.reshape(s * b, nC).to(torch.float32)
         weight = self.mapping_proj.weight.to(torch.float32)
         proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
-        return proj.view(s, b, -1), r.view(s, b, 1)
+        return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
     @torch.compile

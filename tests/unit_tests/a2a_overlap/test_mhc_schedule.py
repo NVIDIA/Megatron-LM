@@ -125,6 +125,15 @@ class _RecordingChunk:
     def release_state(self):
         self.calls.append("chunk.release_state")
 
+    def snapshot_rng_for_recompute(self):
+        # This chunk exercises mHC selective recompute, not VPP-stage full recompute,
+        # so the real method short-circuits to a no-op (recompute_vpp_stage is off).
+        pass
+
+    def recompute_model_chunk_schedule_plan(self):
+        # No-op for the same reason as snapshot_rng_for_recompute above.
+        pass
+
 
 def _assert_called_before(calls, first, second):
     assert calls.count(first) == 1

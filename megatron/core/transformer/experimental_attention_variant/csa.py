@@ -15,9 +15,14 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import csa_cp_layout_kernels
-from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
-from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_layout_kernels as csa_cp_layout_kernels,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_compressor import (
+    maybe_compress_thd_fused,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (  # pylint: disable=line-too-long
     FusedCSAIndexerSparseAttnFromTopkFunc,
     batch_of_row,
     build_flat_topk_idxs,
@@ -29,6 +34,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
     FusedDSAIndexerLoss,
+    _compute_indexer_teacher_probabilities,
+    _normalize_indexer_teacher_target,
     fused_qk_topk_naive,
     rotate_activation,
 )
@@ -118,15 +125,20 @@ def _get_csa_compressed_capacity(
 
 
 def _build_compressed_thd_indexer_metadata(
-    cu_seqlens_q: torch.Tensor, cu_seqlens_compressed: torch.Tensor, total_q: int, ratio: int
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
+    total_q: int,
+    ratio: int,
+    cu_seqlens_q_unpadded: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Lower packed compressed-THD metadata to DSA row-wise varlen bounds.
 
     Compressed keys are concatenated segment-major. For query row ``i`` in
     segment ``b``, the legal global compressed-key interval is
     ``[cu_comp[b], cu_comp[b] + floor((pos_i + 1) / ratio))``. Rows beyond
-    ``cu_seqlens_q[-1]`` are static-capacity padding and receive an empty
-    interval plus ``query_valid_rows=False``.
+    their segment's unpadded length are static-capacity padding and receive
+    an empty interval plus ``query_valid_rows=False``. Physical query and
+    compressed offsets always come from the padded cumulative lengths.
 
     Returns ``(starts, ends, query_valid_rows, compressed_offset_per_row)``.
     The final tensor converts DSA's global compressed indices back to the
@@ -142,6 +154,13 @@ def _build_compressed_thd_indexer_metadata(
         )
     if cu_seqlens_q.device != cu_seqlens_compressed.device:
         raise ValueError("query and compressed cumulative lengths must be on the same device")
+    if cu_seqlens_q_unpadded is not None:
+        if cu_seqlens_q_unpadded.ndim != 1 or cu_seqlens_q_unpadded.shape != cu_seqlens_q.shape:
+            raise ValueError(
+                "unpadded query cumulative lengths must match the physical query segment shape"
+            )
+        if cu_seqlens_q_unpadded.device != cu_seqlens_q.device:
+            raise ValueError("physical and unpadded query lengths must be on the same device")
 
     device = cu_seqlens_q.device
     row_idx = torch.arange(total_q, device=device, dtype=torch.int64)
@@ -150,8 +169,12 @@ def _build_compressed_thd_indexer_metadata(
     compressed_starts = cu_seqlens_compressed[segment_ids].to(dtype=torch.int64)
     compressed_limits = cu_seqlens_compressed[segment_ids + 1].to(dtype=torch.int64)
 
-    query_valid_rows = row_idx < cu_seqlens_q[-1].to(dtype=torch.int64)
     position_in_segment = row_idx - query_starts
+    if cu_seqlens_q_unpadded is None:
+        query_valid_rows = row_idx < cu_seqlens_q[-1].to(dtype=torch.int64)
+    else:
+        real_lens = (cu_seqlens_q_unpadded[1:] - cu_seqlens_q_unpadded[:-1]).to(dtype=torch.int64)
+        query_valid_rows = position_in_segment < real_lens[segment_ids]
     causal_ends = compressed_starts + torch.div(
         position_in_segment + 1, ratio, rounding_mode="floor"
     )
@@ -182,7 +205,7 @@ def _compressed_thd_topk_to_local(
 # THD (packed) variants of the index helpers above.
 #
 # Both produce per-row local-to-segment indices in the SAME index space that
-# ``csa_kernels.local_to_global_flat(..., cu_seqlens_q=..., cu_seqlens_kv=...)``
+# ``csa_utils.fused_sparse_attention.local_to_global_flat(...)``
 # expects: each row is one query token in the packed layout, each value is
 # either ``-1`` (invalid / future position) or a non-negative local KV id in
 # ``[0, seqlen_kv_full[batch_of_row])`` where ``seqlen_kv_full[b] =
@@ -685,6 +708,105 @@ def unfused_compressed_sparse_attn(
     return output.reshape(b, sq, np_ * hn).permute(1, 0, 2).contiguous()
 
 
+@torch.no_grad()
+def _compute_unfused_csa_non_compressed_lse(
+    query: torch.Tensor,
+    kv_full: torch.Tensor,
+    attn_sink: torch.Tensor,
+    window_indices: torch.Tensor,
+    softmax_scale: float,
+    chunk_size: int = 512,
+) -> torch.Tensor:
+    """Return detached sliding-window-plus-sink log mass for the CSA teacher.
+
+    The returned canonical layout is ``[batch, local_heads, seqlen_q]`` for
+    both SBHD and packed THD inputs. THD callers must pass flat-global window
+    indices into ``kv_full``.
+    """
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    if attn_sink.ndim != 1:
+        raise ValueError(f"attn_sink must be 1D, got shape {tuple(attn_sink.shape)}")
+
+    if query.ndim == 4:
+        seqlen_q, batch_size, num_heads, head_dim = query.shape
+        if kv_full.ndim != 3 or kv_full.shape[1:] != (batch_size, head_dim):
+            raise ValueError(
+                "SBHD non-compressed LSE expects kv_full shape "
+                f"[sk, {batch_size}, {head_dim}], got {tuple(kv_full.shape)}"
+            )
+        if window_indices.ndim != 3 or window_indices.shape[:2] != (batch_size, seqlen_q):
+            raise ValueError(
+                "SBHD non-compressed LSE expects window_indices shape "
+                f"[{batch_size}, {seqlen_q}, window], got {tuple(window_indices.shape)}"
+            )
+
+        n_kv = kv_full.shape[0]
+        q_flat = query.detach().permute(1, 0, 2, 3).reshape(-1, num_heads, head_dim)
+        kv_flat = kv_full.detach().permute(1, 0, 2).reshape(-1, head_dim)
+        batch_offsets = (
+            torch.arange(batch_size, device=window_indices.device, dtype=torch.int64) * n_kv
+        ).view(batch_size, 1, 1)
+        window_indices_i64 = window_indices.to(dtype=torch.int64)
+        global_indices = torch.where(
+            window_indices_i64 >= 0, window_indices_i64 + batch_offsets, window_indices_i64
+        ).reshape(batch_size * seqlen_q, -1)
+    elif query.ndim == 3:
+        total_q, num_heads, head_dim = query.shape
+        if kv_full.ndim != 2 or kv_full.shape[1] != head_dim:
+            raise ValueError(
+                "THD non-compressed LSE expects kv_full shape "
+                f"[total_kv, {head_dim}], got {tuple(kv_full.shape)}"
+            )
+        if window_indices.ndim != 2 or window_indices.shape[0] != total_q:
+            raise ValueError(
+                "THD non-compressed LSE expects window_indices shape "
+                f"[{total_q}, window], got {tuple(window_indices.shape)}"
+            )
+
+        q_flat = query.detach()
+        kv_flat = kv_full.detach()
+        global_indices = window_indices.to(dtype=torch.int64)
+    else:
+        raise ValueError(
+            "non-compressed LSE query must be SBHD [sq, b, h, d] or "
+            f"THD [total_q, h, d], got {tuple(query.shape)}"
+        )
+
+    if attn_sink.numel() != num_heads:
+        raise ValueError(f"attn_sink must contain {num_heads} head values, got {attn_sink.numel()}")
+    if not (query.device == kv_full.device == attn_sink.device == global_indices.device):
+        raise ValueError("query, kv_full, attn_sink, and window_indices must be on the same device")
+
+    sink = attn_sink.detach().to(dtype=torch.float32).view(1, num_heads)
+    lse_chunks = []
+    num_rows = q_flat.shape[0]
+    for start in range(0, num_rows, chunk_size):
+        end = min(start + chunk_size, num_rows)
+        indices = global_indices[start:end]
+        safe_indices = indices.clamp(min=0)
+        gathered_kv = kv_flat.index_select(0, safe_indices.reshape(-1)).reshape(
+            end - start, indices.shape[-1], head_dim
+        )
+        window_logits = torch.einsum("rhd,rkd->rhk", q_flat[start:end].float(), gathered_kv.float())
+        window_logits = (window_logits * softmax_scale).masked_fill(
+            (indices < 0).unsqueeze(1), float("-inf")
+        )
+        window_lse = torch.logsumexp(window_logits, dim=-1)
+        lse_chunks.append(torch.logaddexp(window_lse, sink))
+
+    if lse_chunks:
+        lse_flat = torch.cat(lse_chunks, dim=0)
+    else:
+        lse_flat = torch.empty((0, num_heads), dtype=torch.float32, device=query.device)
+
+    if query.ndim == 4:
+        return lse_flat.reshape(batch_size, seqlen_q, num_heads).permute(0, 2, 1).contiguous()
+    return (
+        lse_flat.transpose(0, 1).unsqueeze(0).reshape(1, num_heads, lse_flat.shape[0]).contiguous()
+    )
+
+
 def _unfused_indexer_sparse_attn_from_topk(
     query: torch.Tensor,
     kv_full: torch.Tensor,
@@ -698,12 +820,13 @@ def _unfused_indexer_sparse_attn_from_topk(
     softmax_scale: float,
     indexer_softmax_scale: float,
     loss_coeff: float,
-    loss_divisor: float,
+    loss_divisor: Union[float, torch.Tensor],
     sparse_loss: bool,
     ratio: int,
     _max_seqlen_q: int,
     indexer_layout: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     q_padding_mask: Optional[torch.Tensor] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """PyTorch sparse attention plus caller-supplied indexer loss for THD CP.
 
@@ -717,6 +840,36 @@ def _unfused_indexer_sparse_attn_from_topk(
 
     total_q, np_, hn = query.shape
     cu_seqlens_q, cu_seqlens_k, q_causal_offsets = indexer_layout
+    indexer_topk = indexer_topk_indices.shape[-1]
+    attention_indices = topk_indices
+    if q_padding_mask is not None:
+        attention_indices = attention_indices.masked_fill(q_padding_mask.unsqueeze(-1), -1)
+    non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
+        query, kv_full, attn_sink, attention_indices[:, indexer_topk:], softmax_scale
+    )
+
+    def compressed_teacher_target(
+        logits: torch.Tensor, valid_mask: torch.Tensor, row_slice: slice
+    ) -> torch.Tensor:
+        lse_slice = non_compressed_lse[:, :, row_slice]
+        probabilities = _compute_indexer_teacher_probabilities(
+            logits.permute(1, 0, 2).unsqueeze(0),
+            valid_mask.unsqueeze(0),
+            non_compressed_lse=lse_slice,
+        )
+        target = probabilities.sum(dim=1).squeeze(0)
+        if tp_group is not None and tp_group.size() > 1:
+            torch.distributed.all_reduce(target, group=tp_group)
+        return _normalize_indexer_teacher_target(target, lse_slice)
+
+    def scale_local_loss(raw_local_loss: torch.Tensor) -> torch.Tensor:
+        if torch.is_tensor(loss_divisor):
+            divisor = loss_divisor.to(device=raw_local_loss.device, dtype=torch.float32).clamp_min(
+                1.0
+            )
+        else:
+            divisor = max(float(loss_divisor), 1.0)
+        return raw_local_loss * float(loss_coeff) / divisor
 
     if not sparse_loss:
         q_rows = torch.arange(total_q, dtype=cu_seqlens_q.dtype, device=query.device)
@@ -764,15 +917,9 @@ def _unfused_indexer_sparse_attn_from_topk(
             target_logits = (target_logits * softmax_scale).masked_fill(
                 ~valid.unsqueeze(1), float("-inf")
             )
-            target_logits = torch.where(row_valid.unsqueeze(1), target_logits, 0.0)
-            sink = attn_sink.detach().view(1, np_, 1).float()
-            scores_max = torch.maximum(target_logits.max(dim=-1, keepdim=True).values, sink)
-            exp_scores = torch.exp(target_logits - scores_max)
-            exp_sink = torch.exp(sink - scores_max)
-            target = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
-            target = (target * row_valid.unsqueeze(1).float()).sum(dim=1)
+            target = compressed_teacher_target(target_logits, valid, slice(start, end))
             eps = torch.finfo(torch.float32).tiny
-            target = target / target.sum(dim=-1, keepdim=True).clamp(min=eps)
+            target = target * row_valid.float()
             target = target.clamp(min=eps)
             predict = predict.clamp(min=eps)
 
@@ -782,9 +929,7 @@ def _unfused_indexer_sparse_attn_from_topk(
             )
             raw_local_loss = raw_local_loss + kl_per_row.sum()
 
-        return output, raw_local_loss * float(loss_coeff) / float(loss_divisor)
-
-    indexer_topk = indexer_topk_indices.shape[-1]
+        return output, scale_local_loss(raw_local_loss)
 
     if q_padding_mask is not None:
         indexer_topk_indices = indexer_topk_indices.masked_fill(q_padding_mask.unsqueeze(-1), -1)
@@ -816,19 +961,12 @@ def _unfused_indexer_sparse_attn_from_topk(
     selected_kv = compressed_kv.detach().index_select(0, safe_indices.reshape(-1))
     selected_kv = selected_kv.reshape(total_q, indexer_topk, hn)
 
-    # This fallback does not run FlashMLA, so it cannot reuse the fused path's
-    # lse_indexer-based target helper. Recompute the same sink-aware target and
-    # KL terms explicitly to keep the no-fusion path numerically aligned.
+    # Normalize selected compressed logits with the same sliding-window and
+    # sink mass used by the real CSA attention teacher.
     attn_scores = torch.einsum("rhd,rkd->rhk", query.detach().float(), selected_kv.float())
     attn_scores = attn_scores * softmax_scale
     attn_scores = attn_scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
-    sink = attn_sink.detach().view(1, np_, 1).float()
-    scores_max = torch.maximum(attn_scores.max(dim=-1, keepdim=True).values, sink)
-    exp_scores = torch.exp(attn_scores - scores_max)
-    exp_sink = torch.exp(sink - scores_max)
-    attn_probs = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
-    target = attn_probs.sum(dim=1)
-    target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+    target = compressed_teacher_target(attn_scores, valid, slice(None))
     target = target * row_valid.float()
 
     eps = torch.finfo(torch.float32).tiny
@@ -838,7 +976,7 @@ def _unfused_indexer_sparse_attn_from_topk(
     kl_per_row = torch.where(row_valid.squeeze(-1), kl_per_row, torch.zeros_like(kl_per_row))
     raw_local_loss = kl_per_row.sum()
 
-    indexer_loss = raw_local_loss * float(loss_coeff) / float(loss_divisor)
+    indexer_loss = scale_local_loss(raw_local_loss)
     return output, indexer_loss
 
 
@@ -909,6 +1047,9 @@ class Compressor(MegatronModule):
         self.head_dim = head_dim
         self.overlap = compress_ratio == 4
         self.coff = 1 + int(self.overlap)
+        # Same switch as the other optional CSA/DSA fused kernels: attempt the fused
+        # compressor when enabled, keep the eager region otherwise.
+        self.use_fused_compressor = use_fused_dsa_kernels(config)
         self.rotate = rotate
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
 
@@ -1117,47 +1258,67 @@ class Compressor(MegatronModule):
         kv, _ = self.linear_wkv(x)  # (total, 1, coff * head_dim)
         score, _ = self.linear_wgate(x)  # (total, 1, coff * head_dim)
 
-        if pre_grouped:
-            # Compressor-prep already groups rows as ``[g * ratio, (g + 1) * ratio)``.
-            kv_grouped = kv.reshape(total_comp, ratio, 1, -1)
-            score_grouped = score.reshape(total_comp, ratio, 1, -1)
-            local_pos = None
-        else:
-            # Build gather index: (total_comp, ratio). ``total_comp`` can be a
-            # static capacity for CUDA graph capture, so rows beyond the true
-            # ``cu_seqlens_compressed[-1]`` are mapped to a safe source row and left
-            # as tail padding by downstream index lowering.
-            row_idx = torch.arange(total_comp, device=device, dtype=cu_seqlens_compressed.dtype)
-            batch_ids = batch_of_row(cu_seqlens_compressed, total_q=total_comp)
-            valid_comp = row_idx < cu_seqlens_compressed[-1]
-            local_pos = row_idx - cu_seqlens_compressed[batch_ids]
-            local_pos = torch.where(valid_comp, local_pos, torch.zeros_like(local_pos))
-            # (total_comp, 1) + (1, ratio)  →  (total_comp, ratio)
-            base = cu_seqlens[batch_ids].unsqueeze(1) + local_pos.unsqueeze(1) * ratio
-            base = torch.where(valid_comp.unsqueeze(1), base, torch.zeros_like(base))
-            offsets = torch.arange(ratio, device=device, dtype=base.dtype).unsqueeze(0)
-            gather_idx = base + offsets  # (total_comp, ratio)
-
-            kv_grouped = kv[gather_idx]  # (total_comp, ratio, 1, coff * d)
-            score_grouped = score[gather_idx]
-
-        # APE: (ratio, coff * d) → broadcast (1, ratio, 1, coff * d).
-        score_grouped = score_grouped + self.ape.view(1, ratio, 1, -1)
-
-        if self.overlap:
-            if pre_grouped:
-                is_first = compressed_group_ids[:total_comp] == 0
-            else:
-                is_first = local_pos == 0  # (total_comp,)
-            kv_grouped = self._overlap_transform_thd(kv_grouped, is_first, fill_value=0)
-            score_grouped = self._overlap_transform_thd(
-                score_grouped, is_first, fill_value=float("-inf")
+        # Additive fused fast path (CuTe DSL, one kernel per direction) for the
+        # gather / overlap-window / softmax / weighted-sum region below. Returns None
+        # (-> keep the eager region) for any unsupported configuration; see
+        # csa_utils/fused_compressor.py for the gating rules.
+        compressed_thd = None
+        if not pre_grouped:
+            compressed_thd = maybe_compress_thd_fused(
+                kv,
+                score,
+                self.ape,
+                cu_seqlens,
+                cu_seqlens_compressed,
+                total_comp,
+                ratio=ratio,
+                head_dim=self.head_dim,
+                coff=self.coff,
+                enabled=self.use_fused_compressor,
             )
 
-        # Batched softmax + weighted sum — single kernel for all entries.
-        # (total_comp, [2*]ratio, 1, [coff*]d)  →  (total_comp, 1, head_dim)
-        weights = torch.softmax(score_grouped, dim=1, dtype=torch.float32).to(kv_grouped.dtype)
-        compressed_thd = (kv_grouped * weights).sum(dim=1)
+        if compressed_thd is None:
+            if pre_grouped:
+                # Compressor-prep already groups rows as ``[g * ratio, (g + 1) * ratio)``.
+                kv_grouped = kv.reshape(total_comp, ratio, 1, -1)
+                score_grouped = score.reshape(total_comp, ratio, 1, -1)
+                local_pos = None
+            else:
+                # Build gather index: (total_comp, ratio). ``total_comp`` can be a
+                # static capacity for CUDA graph capture, so rows beyond the true
+                # ``cu_seqlens_compressed[-1]`` are mapped to a safe source row and left
+                # as tail padding by downstream index lowering.
+                row_idx = torch.arange(total_comp, device=device, dtype=cu_seqlens_compressed.dtype)
+                batch_ids = batch_of_row(cu_seqlens_compressed, total_q=total_comp)
+                valid_comp = row_idx < cu_seqlens_compressed[-1]
+                local_pos = row_idx - cu_seqlens_compressed[batch_ids]
+                local_pos = torch.where(valid_comp, local_pos, torch.zeros_like(local_pos))
+                # (total_comp, 1) + (1, ratio)  →  (total_comp, ratio)
+                base = cu_seqlens[batch_ids].unsqueeze(1) + local_pos.unsqueeze(1) * ratio
+                base = torch.where(valid_comp.unsqueeze(1), base, torch.zeros_like(base))
+                offsets = torch.arange(ratio, device=device, dtype=base.dtype).unsqueeze(0)
+                gather_idx = base + offsets  # (total_comp, ratio)
+
+                kv_grouped = kv[gather_idx]  # (total_comp, ratio, 1, coff * d)
+                score_grouped = score[gather_idx]
+
+            # APE: (ratio, coff * d) → broadcast (1, ratio, 1, coff * d).
+            score_grouped = score_grouped + self.ape.view(1, ratio, 1, -1)
+
+            if self.overlap:
+                if pre_grouped:
+                    is_first = compressed_group_ids[:total_comp] == 0
+                else:
+                    is_first = local_pos == 0  # (total_comp,)
+                kv_grouped = self._overlap_transform_thd(kv_grouped, is_first, fill_value=0)
+                score_grouped = self._overlap_transform_thd(
+                    score_grouped, is_first, fill_value=float("-inf")
+                )
+
+            # Batched softmax + weighted sum — single kernel for all entries.
+            # (total_comp, [2*]ratio, 1, [coff*]d)  →  (total_comp, 1, head_dim)
+            weights = torch.softmax(score_grouped, dim=1, dtype=torch.float32).to(kv_grouped.dtype)
+            compressed_thd = (kv_grouped * weights).sum(dim=1)
 
         compressed_thd = self.norm(compressed_thd.to(dtype))
 
@@ -1709,11 +1870,10 @@ class CompressedSparseAttention(MegatronModule):
                     )
                     indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
                     key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, np, -1)
-                    # ``FusedDSAIndexerLoss`` does not accept a separate
-                    # indexer_softmax_scale; apply it here via the
-                    # weights-scaling trick so the effective weights match
-                    # the pre-scale-split behaviour.
                     weights_for_unfused = weights_indexer.float() * self.indexer.softmax_scale
+                    non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
+                        query, kv_full[:offset], self.attn_sink, window_idxs, self.softmax_scale
+                    )
                     topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
                         q_indexer,
                         weights_for_unfused,
@@ -1731,6 +1891,8 @@ class CompressedSparseAttention(MegatronModule):
                         None,
                         None,
                         self.config.calculate_per_token_loss,
+                        True,
+                        non_compressed_lse,
                     )
                     if indexer_loss_coeff > 0:
                         DSAIndexerLossLoggingHelper.save_loss_to_tracker(
@@ -2035,31 +2197,25 @@ class CompressedSparseAttention(MegatronModule):
                     weights_for_unfused = w_thd * self.indexer.softmax_scale
                     indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
 
-                    # Build loss metadata from the original unpadded lengths.
-                    # Indexer K may retain static-capacity tail rows, but DSA's
-                    # row-wise bounds never admit those keys and
-                    # ``query_valid_rows`` zeroes padded query gradients.
-                    cu_seqlens_q_for_loss = packed_seq_params.cu_seqlens_q
-                    seg_lens_q = cu_seqlens_q_for_loss[1:] - cu_seqlens_q_for_loss[:-1]
-                    cu_seqlens_compressed_idx_for_loss = torch.cat(
-                        [
-                            torch.zeros(
-                                1,
-                                dtype=cu_seqlens_q_for_loss.dtype,
-                                device=cu_seqlens_q_for_loss.device,
-                            ),
-                            (seg_lens_q // self.compress_ratio)
-                            .cumsum(0)
-                            .to(cu_seqlens_q_for_loss.dtype),
-                        ]
-                    )
+                    # Physical padded offsets define the packed address space;
+                    # unpadded lengths identify the real rows within each segment.
                     (varlen_starts, varlen_ends, query_valid_rows, compressed_offsets) = (
                         _build_compressed_thd_indexer_metadata(
-                            cu_seqlens_q_for_loss,
-                            cu_seqlens_compressed_idx_for_loss,
+                            cu_seqlens_q,
+                            cu_seqlens_compressed_idx,
                             total_q=q_thd.shape[0],
                             ratio=self.compress_ratio,
+                            cu_seqlens_q_unpadded=packed_seq_params.cu_seqlens_q,
                         )
+                    )
+                    flat_window_idxs, _ = build_flat_topk_idxs(
+                        window_idxs,
+                        batch_size=-1,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_kv=cu_seqlens_kv_full,
+                    )
+                    non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
+                        query, kv_full_thd, self.attn_sink, flat_window_idxs, self.softmax_scale
                     )
                     topk_indices_global, indexer_loss = FusedDSAIndexerLoss.apply(
                         q_thd.unsqueeze(1),
@@ -2079,6 +2235,7 @@ class CompressedSparseAttention(MegatronModule):
                         query_valid_rows,
                         self.config.calculate_per_token_loss,
                         True,
+                        non_compressed_lse,
                     )
                     topk_indices_cmp = _compressed_thd_topk_to_local(
                         topk_indices_global, compressed_offsets
@@ -2583,11 +2740,16 @@ class CompressedSparseAttention(MegatronModule):
                 real_seqlens = cu_seqlens_q_unpadded[1:] - cu_seqlens_q_unpadded[:-1]
                 positions = global_rows - cu_seqlens[batch_ids]
                 q_padding_mask = positions >= real_seqlens[batch_ids]
-            output, indexer_loss = (
-                FusedCSAIndexerSparseAttnFromTopkFunc.apply
-                if self.use_fused_kernels
-                else _unfused_indexer_sparse_attn_from_topk
-            )(
+            loss_divisor = 1 if self.config.calculate_per_token_loss else l_local * cp_size
+            if (
+                not self.use_fused_kernels
+                and not self.config.calculate_per_token_loss
+                and cu_seqlens_q_unpadded is not None
+            ):
+                # Match the reference DSA mean over real query rows. Keep the
+                # scalar on device so padded THD remains CUDA-graph safe.
+                loss_divisor = cu_seqlens_q_unpadded[-1]
+            indexer_loss_args = (
                 query,
                 kv_full_thd,
                 self.attn_sink.float(),
@@ -2600,13 +2762,21 @@ class CompressedSparseAttention(MegatronModule):
                 self.softmax_scale,
                 indexer.softmax_scale,
                 indexer_loss_coeff,
-                1 if self.config.calculate_per_token_loss else l_local * cp_size,
+                loss_divisor,
                 sparse_indexer_loss,
                 ratio,
                 max_seqlen_q,
                 indexer_layout,
                 q_padding_mask,
             )
+            if self.use_fused_kernels:
+                output, indexer_loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
+                    *indexer_loss_args
+                )
+            else:
+                output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
+                    *indexer_loss_args, tp_group=indexer.pg_collection.tp
+                )
             if indexer_loss_coeff > 0:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
