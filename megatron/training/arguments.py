@@ -526,9 +526,29 @@ def validate_args(args, defaults={}):
         submit_rollouts_at_rollout_granularity = (
             args.rl_submission_granularity == "R"
         )
-        if args.rl_generation_lag > 0:
-            assert args.rl_partial_rollouts, \
-                "--rl-generation-lag requires --rl-partial-rollouts."
+        if args.rl_max_inflight_requests is not None:
+            requests_per_batch = args.grpo_prompts_per_step * args.grpo_group_size
+            assert args.rl_generation_lag is None, \
+                "--rl-generation-lag and --rl-max-inflight-requests are mutually exclusive."
+            assert args.rl_max_inflight_requests >= 1, \
+                f"--rl-max-inflight-requests ({args.rl_max_inflight_requests}) must be >= 1."
+            if args.rl_max_inflight_requests > requests_per_batch:
+                assert args.rl_partial_rollouts, \
+                    f"--rl-max-inflight-requests above one training batch " \
+                    f"({requests_per_batch} requests) requires --rl-partial-rollouts."
+            # Total in-flight requests = (lag + 1) trainer batches of P * G requests each.
+            args.rl_generation_lag = args.rl_max_inflight_requests / requests_per_batch - 1
+        if args.rl_generation_lag is None:
+            # With --rl-partial-rollouts the lag is autotuned from engine capacity
+            # at inference launch; otherwise generation is fully synchronous.
+            if not args.rl_partial_rollouts:
+                args.rl_generation_lag = 0
+        else:
+            assert args.rl_generation_lag >= -1, \
+                f"--rl-generation-lag ({args.rl_generation_lag}) must be >= -1."
+            if args.rl_generation_lag > 0:
+                assert args.rl_partial_rollouts, \
+                    "--rl-generation-lag requires --rl-partial-rollouts."
         if submit_rollouts_at_rollout_granularity:
             assert (
                 args.rl_partial_rollouts
@@ -1723,6 +1743,25 @@ def validate_args(args, defaults={}):
                 "Other algorithms cannot guarantee numerical stability yet."
             )
 
+    # The PG-distribution cache stores one file per parallelization group, keyed by
+    # that group's minimum global rank, and each file holds both the save and the
+    # load distribution. If save and load used different parallelization groups,
+    # two distinct groups could map to the same file (they can share a minimum
+    # global rank), so one side would silently read a distribution computed for the
+    # other group's layout. Require both sides to use the same group.
+    if args.ckpt_pg_tensors_cache_path is not None:
+        assert (
+            args.ckpt_fully_parallel_save_process_group
+            == args.ckpt_fully_parallel_load_process_group
+        ), (
+            "--ckpt-pg-tensors-cache-path requires --ckpt-fully-parallel-save-process-group and "
+            "--ckpt-fully-parallel-load-process-group to be identical, but got "
+            f"save='{args.ckpt_fully_parallel_save_process_group}' and "
+            f"load='{args.ckpt_fully_parallel_load_process_group}'. The cache is keyed by the "
+            "parallelization group, so mixing groups can read a distribution computed for a "
+            "different layout."
+        )
+
     if args.load_main_params_from_ckpt:
         assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
 
@@ -2576,10 +2615,21 @@ def _add_rl_args(parser):
                        help="Number of GRPO groups (G in the paper).")
     group.add_argument('--grpo-group-size', type=int, default=2,
                        help="Number of samples per a GRPO group.")
-    group.add_argument('--rl-generation-lag', type=int, default=0,
-                       help='Number of trainer batches of rollout generation lag to allow. '
+    group.add_argument('--rl-generation-lag', type=float, default=None,
+                       help='Number of trainer batches of rollout generation lag to allow '
                             'The number of in-flight trainer batches is this value plus one. '
-                            'Requires --rl-partial-rollouts when greater than 0.')
+                            'May be fractional or negative; the minimum of -1 keeps a single unit '
+                            'of generation work in flight. If omitted, the lag is autotuned to the '
+                            'inference engine\'s request capacity when --rl-partial-rollouts is '
+                            'set, and is 0 otherwise. '
+                            'Requires --rl-partial-rollouts when greater than 0. '
+                            'Mutually exclusive with --rl-max-inflight-requests.')
+    group.add_argument('--rl-max-inflight-requests', type=int, default=None,
+                       help='Maximum number of inference requests RL generation may keep inflight: '
+                            'equivalent to (--rl-generation-lag + 1) training batches '
+                            'of grpo_prompts_per_step * grpo_group_size requests each. '
+                            'Requires --rl-partial-rollouts when above one training batch; '
+                            'mutually exclusive with --rl-generation-lag.')
     # TODO: Refactor these string literals back to an enum after the megatron.training refactor.
     group.add_argument('--rl-submission-granularity', type=str,
                        default="B",
