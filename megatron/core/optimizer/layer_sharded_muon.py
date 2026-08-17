@@ -174,9 +174,11 @@ class LayerShardedMuon(Muon):
             batched Newton-Schulz on a home. MoE homes own hundreds of identically
             shaped expert weights, where the per-matrix loop is kernel-launch bound;
             batching trades a transient ``ns_batch_size x matrix`` stack for far
-            fewer launches. Set to 1 to disable. Note that a batch of more than one
+            fewer launches. Defaults to 1 (no batching): a batch of more than one
             runs through ``baddbmm`` rather than ``addmm``, so results differ from
-            the unbatched path by kernel-level floating point rounding.
+            the unbatched path by kernel-level floating point rounding and bitwise
+            parity with duplicated mode is lost. Raise (e.g. to 32) to trade that
+            parity for launch-bound MoE-home throughput.
         concurrent_groups: Run each param group's pipeline on its own CUDA stream
             instead of serializing them. Groups own disjoint params and, under MoE,
             disjoint process groups, so nothing orders them against each other; on a
@@ -216,7 +218,7 @@ class LayerShardedMuon(Muon):
         gtp_group: "torch.distributed.ProcessGroup",
         tp_group: "torch.distributed.ProcessGroup | None" = None,
         fused_group: "torch.distributed.ProcessGroup | None" = None,
-        ns_batch_size: int = 32,
+        ns_batch_size: int = 1,
         use_syrk: bool = False,
         concurrent_groups: bool = True,
     ) -> None:
