@@ -205,3 +205,31 @@ def test_pack_and_unpack_update_round_trip():
         rs, rc = plan.rank_rows[r]
         expected = full_updates_by_rank[owners[other]][other][rs : rs + rc]
         torch.testing.assert_close(received[other], expected, atol=0, rtol=0)
+
+
+def test_from_flat_layout_per_rank_data_not_uniform():
+    """Flat sharding with uniform buffer size but non-uniform per-rank tensor data.
+
+    `GlobalLayout.build` pads the total size to a multiple of `chunk_size * dp_size` so every rank's
+    flat buffer is the same size. However, the actual tensor data per rank is not necessarily
+    uniform.
+
+    This test verifies `from_flat_layout` correctly computes the non-uniform per-rank row counts
+    from a uniform `rank_flat_shard_size`.
+    """
+    # 5 rows, 4 cols = 20 elements. dp_size = 3.
+    # GlobalLayout.build pads to 24 (next multiple of chunk_size * dp_size = 4 * 3 = 12),
+    # so rank_flat_shard_size = 24 // 3 = 8 (uniform buffer per rank).
+    # But the tensor occupies only 20 of 24 elements:
+    #   rank 0: [0, 8)   -> 8 elements -> 2 rows
+    #   rank 1: [8, 16)  -> 8 elements -> 2 rows
+    #   rank 2: [16, 24) -> 4 elements -> 1 row  (4 elements of padding)
+    plan = ShardPlan.from_flat_layout(torch.Size((5, 4)), 0, 8, 3)
+    assert plan.rank_rows == ((0, 2), (2, 2), (4, 1))
+    assert plan.shard_numel(0) == 8
+    assert plan.shard_numel(1) == 8
+    assert plan.shard_numel(2) == 4
+    assert plan.rank_row_count(0) == 2
+    assert plan.rank_row_count(1) == 2
+    assert plan.rank_row_count(2) == 1
+    assert plan.is_boundary()
