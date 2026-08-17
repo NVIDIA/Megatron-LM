@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import weakref
 from enum import Enum, auto
 from functools import partial
 from typing import Sequence
@@ -9,12 +10,268 @@ import torch
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
-from megatron.core.transformer.moe.shortcut_cudagraph import (
-    PersistentBuffer,
-    RecordCombineGradReady as _RecordCombineGradReady,
-    RouteGradFromPersistentBuffers as _RouteGradFromPersistentBuffers,
-)
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+class PersistentBuffer:
+    """Own stable CUDA storage used across eager/CUDA-graph boundaries."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        requires_grad: bool = False,
+        prebound_graph_input: bool = False,
+        detach_on_reuse: bool = False,
+    ):
+        self.name = name
+        self.requires_grad = requires_grad
+        self.prebound_graph_input = prebound_graph_input
+        self.detach_on_reuse = detach_on_reuse
+        self._tensor = None
+        self._has_weak_storage = False
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        if self._tensor is None:
+            raise RuntimeError(f"Persistent {self.name} buffer has not been allocated")
+        return self._tensor
+
+    @staticmethod
+    def _metadata(tensor: torch.Tensor):
+        return tuple(tensor.shape), tensor.stride(), tensor.dtype, tensor.device
+
+    def acquire_like(self, like: torch.Tensor) -> torch.Tensor:
+        """Allocate once, then validate and return the same storage on every reuse."""
+        if not like.is_cuda:
+            raise ValueError(f"Persistent {self.name} buffer requires a CUDA tensor template")
+
+        if self._tensor is None:
+            from megatron.core.transformer.cuda_graphs import (
+                ArgMetadata,
+                alloc_tensor_from_graph_mempool,
+            )
+
+            metadata = ArgMetadata(like)
+            metadata.requires_grad = self.requires_grad
+            tensor = alloc_tensor_from_graph_mempool(metadata)
+        else:
+            expected = self._metadata(self._tensor)
+            received = self._metadata(like)
+            if received != expected:
+                raise AssertionError(
+                    f"Persistent {self.name} buffer metadata changed: "
+                    f"expected {expected}, received {received}"
+                )
+            if self.detach_on_reuse:
+                is_from_global_mempool = getattr(self._tensor, "is_from_global_mempool", False)
+                tensor = self._tensor.detach().requires_grad_(self.requires_grad)
+                if is_from_global_mempool:
+                    tensor.is_from_global_mempool = True
+            else:
+                tensor = self._tensor
+
+        if self.prebound_graph_input:
+            from megatron.core.transformer.cuda_graphs import mark_cuda_graph_prebound_input
+
+            mark_cuda_graph_prebound_input(tensor)
+
+        self._tensor = tensor
+        return tensor
+
+    def release_strong_reference(self) -> None:
+        """Replace graph-pinned storage ownership with a raw-pointer tensor wrapper."""
+        if self._tensor is None or self._has_weak_storage:
+            return
+        if not getattr(self._tensor, "is_from_global_mempool", False):
+            return
+
+        from megatron.core.transformer.cuda_graphs import make_weakref
+
+        weak_tensor = make_weakref(self._tensor, inplace=False)
+        if weak_tensor is not self._tensor:
+            self._tensor = weak_tensor
+            self._has_weak_storage = True
+
+    def copy_from(self, source: torch.Tensor) -> torch.Tensor:
+        """Copy a tensor into the stable allocation without adding an autograd edge."""
+        destination = self.acquire_like(source)
+        with torch.no_grad():
+            destination.copy_(source)
+        return destination
+
+
+class AsyncDispatchToPersistentGradBuffers(torch.autograd.Function):
+    """Bridge side-stream dispatch with gradients consumed by a CUDA graph."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        route_input,
+        route_probs,
+        backward_dependency,
+        moe_layer,
+        dispatch_stream,
+        route_input_grad_buffer,
+        route_probs_grad_buffer,
+        route_grad_ready_event,
+    ):
+        ctx.dispatch_stream = dispatch_stream
+        ctx.route_input_grad_buffer = route_input_grad_buffer
+        ctx.route_probs_grad_buffer = route_probs_grad_buffer
+        ctx.route_grad_ready_event = route_grad_ready_event
+
+        with torch.enable_grad(), torch.cuda.stream(dispatch_stream):
+            dispatch_input = route_input.detach().requires_grad_(route_input.requires_grad)
+            dispatch_probs = route_probs.detach().requires_grad_(route_probs.requires_grad)
+            dispatched_input, dispatched_probs = moe_layer.dispatch(
+                dispatch_input, dispatch_probs
+            )
+
+        ctx.save_for_backward(
+            dispatch_input,
+            dispatch_probs,
+            dispatched_input,
+            dispatched_probs,
+        )
+        return dispatched_input.detach(), dispatched_probs.detach()
+
+    @staticmethod
+    def backward(ctx, grad_dispatched_input, grad_dispatched_probs):
+        dispatch_input, dispatch_probs, dispatched_input, dispatched_probs = ctx.saved_tensors
+        dispatch_stream = ctx.dispatch_stream
+
+        dispatch_stream.wait_stream(torch.cuda.current_stream())
+        if grad_dispatched_input is not None:
+            grad_dispatched_input.record_stream(dispatch_stream)
+        if grad_dispatched_probs is not None:
+            grad_dispatched_probs.record_stream(dispatch_stream)
+
+        with torch.cuda.stream(dispatch_stream), torch.enable_grad():
+            if grad_dispatched_input is None:
+                grad_dispatched_input = torch.zeros_like(dispatched_input)
+            if grad_dispatched_probs is None:
+                grad_dispatched_probs = torch.zeros_like(dispatched_probs)
+            grad_route_input, grad_route_probs = torch.autograd.grad(
+                outputs=(dispatched_input, dispatched_probs),
+                inputs=(dispatch_input, dispatch_probs),
+                grad_outputs=(grad_dispatched_input, grad_dispatched_probs),
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            if grad_route_input is None:
+                raise RuntimeError(
+                    "Private dispatch backward is disconnected from its hidden-state input"
+                )
+            if grad_route_probs is None:
+                grad_route_probs = torch.zeros_like(dispatch_probs)
+            with torch.no_grad():
+                ctx.route_input_grad_buffer.copy_(grad_route_input)
+                ctx.route_probs_grad_buffer.copy_(grad_route_probs)
+            ctx.route_grad_ready_event.record(dispatch_stream)
+
+        ctx.dispatch_stream = None
+        ctx.route_input_grad_buffer = None
+        ctx.route_probs_grad_buffer = None
+        ctx.route_grad_ready_event = None
+        return None, None, None, None, None, None, None, None
+
+
+class AsyncCombineToPersistentBuffer(torch.autograd.Function):
+    """Bridge eager side-stream combine with a fused main-stream CUDA graph."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        expert_output,
+        moe_layer,
+        combine_stream,
+        persistent_output_factory,
+        ready_event,
+        grad_ready_event,
+    ):
+        ctx.main_stream = torch.cuda.current_stream()
+        ctx.combine_stream = combine_stream
+        ctx.grad_ready_event = grad_ready_event
+
+        with torch.enable_grad(), torch.cuda.stream(combine_stream):
+            combine_input = expert_output.detach().requires_grad_(expert_output.requires_grad)
+            combined = moe_layer.combine(combine_input)
+            persistent_output = persistent_output_factory(combined)
+            with torch.no_grad():
+                persistent_output.copy_(combined)
+            ready_event.record(combine_stream)
+
+        ctx.save_for_backward(combine_input, combined)
+        return persistent_output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        combine_input, combined = ctx.saved_tensors
+        combine_stream = ctx.combine_stream
+
+        combine_stream.wait_event(ctx.grad_ready_event)
+        grad_output.record_stream(combine_stream)
+        with torch.cuda.stream(combine_stream), torch.enable_grad():
+            (grad_input,) = torch.autograd.grad(
+                outputs=combined,
+                inputs=combine_input,
+                grad_outputs=grad_output,
+                retain_graph=False,
+                create_graph=False,
+            )
+
+        main_stream = ctx.main_stream
+        main_stream.wait_stream(combine_stream)
+        grad_input.record_stream(main_stream)
+
+        ctx.main_stream = None
+        ctx.combine_stream = None
+        ctx.grad_ready_event = None
+        return grad_input, None, None, None, None, None
+
+
+class RouteGradFromPersistentBuffers(torch.autograd.Function):
+    """Inject dispatch gradients into captured router backward at an external event."""
+
+    @staticmethod
+    def forward(ctx, route_input, route_probs, slot):
+        ctx.slot_ref = weakref.ref(slot)
+        return route_input.new_zeros(())
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        slot = ctx.slot_ref()
+        assert slot is not None
+        torch.cuda.current_stream().wait_event(slot.route_grad_ready_event)
+        ctx.slot_ref = None
+        return (
+            slot.route_input_grad_buffer.tensor,
+            slot.route_probs_grad_buffer.tensor,
+            None,
+        )
+
+
+class RecordCombineGradReady(torch.autograd.Function):
+    """Record an external event when fused postprocess produces the combine gradient."""
+
+    @staticmethod
+    def forward(ctx, combined_output, grad_ready_event):
+        ctx.grad_ready_event = grad_ready_event
+        return combined_output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        ctx.grad_ready_event.record(torch.cuda.current_stream())
+        ctx.grad_ready_event = None
+        return grad_output, None
+
+
+_AsyncDispatchToPersistentGradBuffers = AsyncDispatchToPersistentGradBuffers
+_AsyncCombineToPersistentBuffer = AsyncCombineToPersistentBuffer
+_RouteGradFromPersistentBuffers = RouteGradFromPersistentBuffers
+_RecordCombineGradReady = RecordCombineGradReady
 
 
 class ShortcutExecutionMode(Enum):
@@ -140,6 +397,8 @@ class _OutputPersistentSlot:
 class ShortcutMoEBlock(MegatronModule):
     """Own and execute one compute-layer/shortcut-MoE pair."""
 
+    _parallel_stream = None
+
     def __init__(
         self,
         compute_layer,
@@ -187,13 +446,16 @@ class ShortcutMoEBlock(MegatronModule):
         self.compute_layer = compute_layer
         self.moe_layer = moe_layer
 
-        # Move canonical ownership of shortcut post-norm to the registered pair wrapper.
-        assert moe_layer.mlp._shortcut_post_norm is not None
-        self.shortcut_post_norm = moe_layer.mlp._shortcut_post_norm
-        moe_layer.mlp._shortcut_post_norm = None
+        self.shortcut_post_norm = torch.nn.RMSNorm(
+            self.config.hidden_size, eps=self.config.layernorm_epsilon
+        )
+        for parameter in self.shortcut_post_norm.parameters():
+            setattr(parameter, 'sequence_parallel', self.config.sequence_parallel)
 
         self._route_persistent_slots = []
         self._output_persistent_slots = []
+        self._cached_dispatch_output = None
+        self._cached_combine_output = None
         self.route_ready_event = None
         if execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
             self._route_persistent_slots = [
@@ -411,6 +673,128 @@ class ShortcutMoEBlock(MegatronModule):
             persistent_slot=persistent_slot,
         )
 
+    def launch_dispatch_async(
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor,
+        ready_event: torch.cuda.Event = None,
+        route_grad_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
+        route_grad_ready_event: torch.cuda.Event | None = None,
+        backward_dependency: torch.Tensor | None = None,
+    ):
+        """Launch the A2A dispatch on the shortcut side stream."""
+        if ShortcutMoEBlock._parallel_stream is None:
+            ShortcutMoEBlock._parallel_stream = torch.cuda.Stream(priority=-1)
+
+        dispatch_stream = ShortcutMoEBlock._parallel_stream
+        if ready_event is not None:
+            dispatch_stream.wait_event(ready_event)
+        else:
+            dispatch_stream.wait_stream(torch.cuda.current_stream())
+
+        hidden_states.record_stream(dispatch_stream)
+        probs.record_stream(dispatch_stream)
+        moe_layer = self.moe_layer.mlp
+
+        if route_grad_buffers is not None:
+            if route_grad_ready_event is None or backward_dependency is None:
+                raise ValueError(
+                    "Persistent async dispatch requires a backward dependency and "
+                    "route-gradient-ready event"
+                )
+            dispatched_input, dispatched_probs = _AsyncDispatchToPersistentGradBuffers.apply(
+                hidden_states,
+                probs,
+                backward_dependency,
+                moe_layer,
+                dispatch_stream,
+                route_grad_buffers[0],
+                route_grad_buffers[1],
+                route_grad_ready_event,
+            )
+        else:
+            with torch.cuda.stream(dispatch_stream):
+                dispatched_input, dispatched_probs = moe_layer.dispatch(hidden_states, probs)
+        self._cached_dispatch_output = (dispatched_input, dispatched_probs)
+
+    def wait_dispatch(self):
+        """Wait for dispatch and return its outputs on the main stream."""
+        dispatch_stream = ShortcutMoEBlock._parallel_stream
+        torch.cuda.current_stream().wait_stream(dispatch_stream)
+
+        dispatched_input, dispatched_probs = self._cached_dispatch_output
+        self._cached_dispatch_output = None
+        main_stream = torch.cuda.current_stream()
+        dispatched_input.record_stream(main_stream)
+        dispatched_probs.record_stream(main_stream)
+        return dispatched_input, dispatched_probs
+
+    def launch_combine_async(
+        self,
+        output: torch.Tensor,
+        persistent_output_factory=None,
+        ready_event: torch.cuda.Event | None = None,
+        grad_ready_event: torch.cuda.Event | None = None,
+    ) -> torch.Tensor:
+        """Launch the A2A combine on the shortcut side stream."""
+        combine_stream = ShortcutMoEBlock._parallel_stream
+        combine_stream.wait_stream(torch.cuda.current_stream())
+        output.record_stream(combine_stream)
+        moe_layer = self.moe_layer.mlp
+
+        if persistent_output_factory is not None:
+            if ready_event is None or grad_ready_event is None:
+                raise ValueError(
+                    "Persistent async combine requires forward-ready and gradient-ready events"
+                )
+            combined = _AsyncCombineToPersistentBuffer.apply(
+                output,
+                moe_layer,
+                combine_stream,
+                persistent_output_factory,
+                ready_event,
+                grad_ready_event,
+            )
+            from megatron.core.transformer.cuda_graphs import mark_cuda_graph_prebound_input
+
+            mark_cuda_graph_prebound_input(combined)
+            set_tensor_grad_fn_sequence_sr(combined, torch.iinfo(torch.int).max)
+        else:
+            with torch.cuda.stream(combine_stream):
+                combined = moe_layer.combine(output)
+                if ready_event is not None:
+                    ready_event.record(combine_stream)
+
+        self._cached_combine_output = combined if persistent_output_factory is None else None
+        return combined
+
+    def wait_combine(self):
+        """Wait for combine and return its output on the main stream."""
+        combine_stream = ShortcutMoEBlock._parallel_stream
+        torch.cuda.current_stream().wait_stream(combine_stream)
+
+        combined = self._cached_combine_output
+        self._cached_combine_output = None
+        combined.record_stream(torch.cuda.current_stream())
+        set_tensor_grad_fn_sequence_sr(combined, torch.iinfo(torch.int).max)
+        return combined
+
+    def wait_dispatch_and_launch_combine(
+        self,
+        persistent_output_factory=None,
+        ready_event: torch.cuda.Event | None = None,
+        grad_ready_event: torch.cuda.Event | None = None,
+    ) -> torch.Tensor:
+        """Run routed experts after dispatch and launch combine asynchronously."""
+        dispatched_input, probs = self.wait_dispatch()
+        output, _ = self.moe_layer.mlp.routed_experts_compute(dispatched_input, probs)
+        return self.launch_combine_async(
+            output,
+            persistent_output_factory=persistent_output_factory,
+            ready_event=ready_event,
+            grad_ready_event=grad_ready_event,
+        )
+
     def launch_dispatch(
         self,
         persistent_slot: int,
@@ -425,7 +809,7 @@ class ShortcutMoEBlock(MegatronModule):
         route_input = slot.route_input_buffer.tensor
         route_probs = slot.route_probs_buffer.tensor
         self.moe_layer._restore_token_dispatcher_attrs(token_dispatcher_attr_outputs)
-        self.moe_layer.shortcut_launch_dispatch(
+        self.launch_dispatch_async(
             route_input,
             route_probs,
             slot.route_ready_event,
@@ -546,7 +930,7 @@ class ShortcutMoEBlock(MegatronModule):
                 padding_mask=padding_mask,
             )
 
-        moe_layer.shortcut_launch_dispatch(
+        self.launch_dispatch_async(
             permuted_input,
             dispatch_probs,
             self.route_ready_event,
@@ -557,7 +941,7 @@ class ShortcutMoEBlock(MegatronModule):
             # inputs. Do not add the CUDA-graph-only backward scheduling dependency here:
             # repeated MTP invocations can otherwise make multiple same-priority HybridEP
             # collectives ready at once, with no cross-rank ordering guarantee.
-            moe_layer.shortcut_wait_dispatch_and_launch_combine()
+            self.wait_dispatch_and_launch_combine()
             projected_hidden, shared_expert_output = self.output_and_shared(
                 *paired_state,
                 inference_context=inference_context,
@@ -565,7 +949,7 @@ class ShortcutMoEBlock(MegatronModule):
             )
 
         with quant_context_factory(quant_config, layer_number):
-            combined_output = moe_layer.mlp.wait_combine()
+            combined_output = self.wait_combine()
             return self.postprocess(
                 projected_hidden,
                 combined_output,
@@ -621,7 +1005,7 @@ class ShortcutMoEBlock(MegatronModule):
 
         with quant_context_factory(quant_config, layer_number):
             output_slot = self.get_output_persistent_slot(persistent_slot)
-            combined_output = moe_layer.shortcut_wait_dispatch_and_launch_combine(
+            combined_output = self.wait_dispatch_and_launch_combine(
                 persistent_output_factory=partial(
                     self.get_persistent_combined_output_buffer,
                     persistent_slot,

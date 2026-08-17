@@ -259,7 +259,6 @@ class TestHybridBlock:
         assert isinstance(shortcut, ShortcutMoEBlock)
         assert isinstance(shortcut.compute_layer, MambaLayer)
         assert isinstance(shortcut.moe_layer, TransformerLayer)
-        assert shortcut.moe_layer.mlp._shortcut_post_norm is None
         assert isinstance(shortcut.shortcut_post_norm, torch.nn.RMSNorm)
         assert block.num_layers_per_pipeline_rank == 2
 

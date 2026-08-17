@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol
+from typing import Optional, Protocol
 
 import torch
 
@@ -13,10 +13,6 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
-from megatron.core.transformer.moe.shortcut_cudagraph import (
-    AsyncCombineToPersistentBuffer as _AsyncCombineToPersistentBuffer,
-    AsyncDispatchToPersistentGradBuffers as _AsyncDispatchToPersistentGradBuffers,
-)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -25,10 +21,7 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
 )
 from megatron.core.transformer.moe.router import TopKRouter
-from megatron.core.transformer.moe.shared_experts import (
-    SharedExpertMLP,
-    set_tensor_grad_fn_sequence_sr,
-)
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
@@ -226,9 +219,6 @@ class MoELayer(BaseMoELayer):
     strategies such as All-to-All and All-Gather.
     """
 
-    # Class-level CUDA stream for parallel ScMoE execution (shared across layers)
-    _parallel_stream = None
-
     def __init__(
         self,
         config: TransformerConfig,
@@ -362,24 +352,6 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
-        # Shortcut normalization module
-        self._shortcut_post_norm = None
-
-        if self.config.moe_shortcut_connection:
-            # Use plain torch RMSNorm since the forward normalization is local to each token.
-            self._shortcut_post_norm = torch.nn.RMSNorm(
-                self.config.hidden_size, eps=self.config.layernorm_epsilon
-            )
-
-        # These parameters are replicated across TP ranks, but under sequence parallel each
-        # rank sees a different sequence shard. Mark them so finalize_model_grads performs the
-        # required TP gradient all-reduce, just as it does for router and normalization weights.
-        replicated_modules = [self._shortcut_post_norm]
-        for module in replicated_modules:
-            if module is not None:
-                for parameter in module.parameters():
-                    setattr(parameter, 'sequence_parallel', self.config.sequence_parallel)
-
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
             if config.inference_grouped_gemm_backend == 'auto':
@@ -414,10 +386,6 @@ class MoELayer(BaseMoELayer):
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
-
-        # Cached outputs for parallel ScMoE A2A-only async execution
-        self._cached_dispatch_output = None
-        self._cached_combine_output = None
 
         # Setup events and streams for delayed wgrad computation.
         self.setup_delayed_wgrad_for_dispatch_backward_overlap()
@@ -624,8 +592,6 @@ class MoELayer(BaseMoELayer):
           1. combine_postprocess (un-permute, weight)
           2. latent projection (if moe_latent_size)
           3. combine with shared and zero expert outputs
-          4. post_norm for standalone shortcut layers. Registered ShortcutMoEBlock pairs
-             apply their transferred post-norm at the outer block boundary.
 
         _latent_shared_expert_output is inference-only (latent-MoE + NVLS dispatcher with
         shared-expert overlap). It is populated in preprocess and joined here, after
@@ -648,165 +614,7 @@ class MoELayer(BaseMoELayer):
             output = output + self._latent_shared_expert_output
             self._latent_shared_expert_output = None
 
-        # Standalone shortcut layers retain local ownership. Registered shortcut pairs transfer
-        # this module to ShortcutMoEBlock, which applies it after the same combine boundary.
-        if self._shortcut_post_norm is not None:
-            output = self._shortcut_post_norm(output)
-
         return output
-
-    def launch_dispatch_async(
-        self,
-        hidden_states: torch.Tensor,
-        probs: torch.Tensor,
-        ready_event: torch.cuda.Event = None,
-        route_grad_buffers: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
-        route_grad_ready_event: Optional[torch.cuda.Event] = None,
-        backward_dependency: Optional[torch.Tensor] = None,
-    ):
-        """Launch ONLY the A2A dispatch on a side CUDA stream.
-
-        Only the NCCL All-to-All collective runs on the side stream. NCCL uses
-        dedicated NVLink/NIC hardware that overlaps with SM compute regardless of
-        CUDA_DEVICE_MAX_CONNECTIONS=1. All other compute stays on the main stream.
-
-        Args:
-            hidden_states: Pre-processed routed input (after preprocess/dispatch_preprocess).
-            probs: Routing probabilities.
-            ready_event: Event recorded when the forward inputs are ready for the side stream.
-            route_grad_buffers: Stable destinations for dispatch backward's two input gradients.
-            route_grad_ready_event: Event recorded after both gradient buffers are populated.
-            backward_dependency: CUDA-graph output whose backward must wait for dispatch backward.
-        """
-        if MoELayer._parallel_stream is None:
-            # High-priority side stream so the hybrid-ep A2A collectives are not
-            # starved behind main-stream compute
-            MoELayer._parallel_stream = torch.cuda.Stream(priority=-1)
-
-        s = MoELayer._parallel_stream
-
-        if ready_event is not None:
-            s.wait_event(ready_event)
-        else:
-            s.wait_stream(torch.cuda.current_stream())
-
-        hidden_states.record_stream(s)
-        probs.record_stream(s)
-
-        if route_grad_buffers is not None:
-            if route_grad_ready_event is None or backward_dependency is None:
-                raise ValueError(
-                    "Persistent async dispatch requires a backward dependency and "
-                    "route-gradient-ready event"
-                )
-            dispatched_input, dispatched_probs = _AsyncDispatchToPersistentGradBuffers.apply(
-                hidden_states,
-                probs,
-                backward_dependency,
-                self,
-                s,
-                route_grad_buffers[0],
-                route_grad_buffers[1],
-                route_grad_ready_event,
-            )
-        else:
-            with torch.cuda.stream(s):
-                dispatched_input, dispatched_probs = self.dispatch(hidden_states, probs)
-        self._cached_dispatch_output = (dispatched_input, dispatched_probs)
-
-    def wait_dispatch(self):
-        """Wait for A2A dispatch to complete and return results to the main stream.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: (dispatched_input, probs)
-        """
-        s = MoELayer._parallel_stream
-        torch.cuda.current_stream().wait_stream(s)
-
-        dispatched_input, dispatched_probs = self._cached_dispatch_output
-        self._cached_dispatch_output = None
-        # The outputs were allocated on the side stream and are consumed on the
-        # main stream. Keep their storage alive through those main-stream consumers.
-        main_stream = torch.cuda.current_stream()
-        dispatched_input.record_stream(main_stream)
-        dispatched_probs.record_stream(main_stream)
-
-        return dispatched_input, dispatched_probs
-
-    def launch_combine_async(
-        self,
-        output: torch.Tensor,
-        persistent_output_factory: Callable[[torch.Tensor], torch.Tensor] | None = None,
-        ready_event: torch.cuda.Event | None = None,
-        grad_ready_event: torch.cuda.Event | None = None,
-    ) -> torch.Tensor:
-        """Launch ONLY the A2A combine on a side CUDA stream.
-
-        Only the NCCL All-to-All collective runs on the side stream, overlapping
-        with shared expert compute on the main stream.
-
-        Args:
-            output: Expert output ready for combine (after combine_preprocess).
-            persistent_output_factory: Callable returning stable storage for the combined
-                output. The copy into that storage stays connected to autograd.
-            ready_event: Optional event recorded after the persistent output is populated.
-            grad_ready_event: Event recorded inside the fused backward graph when the gradient
-                for the combined output is ready for combine backward.
-        """
-        combine_stream = MoELayer._parallel_stream
-        combine_stream.wait_stream(torch.cuda.current_stream())
-        output.record_stream(combine_stream)
-
-        if persistent_output_factory is not None:
-            if ready_event is None or grad_ready_event is None:
-                raise ValueError(
-                    "Persistent async combine requires forward-ready and gradient-ready events"
-                )
-            # Apply this bridge on main so its autograd node has the fused graph's canonical
-            # stream. The bridge itself launches combine forward/backward on the side stream.
-            combined = _AsyncCombineToPersistentBuffer.apply(
-                output,
-                self,
-                combine_stream,
-                persistent_output_factory,
-                ready_event,
-                grad_ready_event,
-            )
-            from megatron.core.transformer.cuda_graphs import mark_cuda_graph_prebound_input
-
-            mark_cuda_graph_prebound_input(combined)
-            set_tensor_grad_fn_sequence_sr(combined, torch.iinfo(torch.int).max)
-        else:
-            with torch.cuda.stream(combine_stream):
-                combined = self.combine(output)
-                if ready_event is not None:
-                    ready_event.record(combine_stream)
-        # The persistent path returns the tensor directly to the fused graph. Keeping an
-        # additional cache reference would retain its private combine autograd graph until the
-        # next forward. The eager path is retrieved later through wait_combine().
-        self._cached_combine_output = combined if persistent_output_factory is None else None
-        return combined
-
-    def wait_combine(self):
-        """Wait for A2A combine to complete and return results to the main stream.
-
-        Returns:
-            torch.Tensor: Combined expert output after A2A.
-        """
-        s = MoELayer._parallel_stream
-        torch.cuda.current_stream().wait_stream(s)
-
-        combined = self._cached_combine_output
-        self._cached_combine_output = None
-
-        combined.record_stream(torch.cuda.current_stream())
-        # Boost the A2A_combine grad_fn's sequence_nr so autograd dispatches
-        # the side-stream combine backward BEFORE walking the shared_expert
-        # backward chain on main. Without this, natural sr puts shared_expert
-        # (forward later) ahead of combine_A2A → by the time A2A is queued on
-        # side, shared_expert has already finished on main → no overlap.
-        set_tensor_grad_fn_sequence_sr(combined, torch.iinfo(torch.int).max)
-        return combined
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""

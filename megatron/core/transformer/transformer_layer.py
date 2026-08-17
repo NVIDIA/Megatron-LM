@@ -6,7 +6,7 @@ import logging
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 import torch
 import torch.distributed
@@ -1985,41 +1985,6 @@ class MoETransformerLayer(TransformerLayer):
             routing_map,
         )
 
-    def shortcut_launch_dispatch(
-        self,
-        permuted_input,
-        probs,
-        route_ready_event=None,
-        route_grad_buffers=None,
-        route_grad_ready_event=None,
-        backward_dependency=None,
-    ):
-        """Launch A2A dispatch after paired attention has been submitted."""
-        self.mlp.launch_dispatch_async(
-            permuted_input,
-            probs,
-            route_ready_event,
-            backward_dependency=backward_dependency,
-            route_grad_buffers=route_grad_buffers,
-            route_grad_ready_event=route_grad_ready_event,
-        )
-
     def _shortcut_shared_experts(self, hidden_states):
         pre_mlp_output = self._forward_pre_mlp_layernorm(hidden_states)
         return self.mlp.shared_experts_compute(pre_mlp_output)
-
-    def shortcut_wait_dispatch_and_launch_combine(
-        self,
-        persistent_output_factory: Callable[[torch.Tensor], torch.Tensor] | None = None,
-        ready_event: torch.cuda.Event | None = None,
-        grad_ready_event: torch.cuda.Event | None = None,
-    ) -> torch.Tensor:
-        """Finish dispatch and routed experts, then launch combine asynchronously."""
-        dispatched_input, probs = self.mlp.wait_dispatch()
-        output, _ = self.mlp.routed_experts_compute(dispatched_input, probs)
-        return self.mlp.launch_combine_async(
-            output,
-            persistent_output_factory=persistent_output_factory,
-            ready_event=ready_event,
-            grad_ready_event=grad_ready_event,
-        )
