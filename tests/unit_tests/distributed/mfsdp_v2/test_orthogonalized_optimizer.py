@@ -377,6 +377,23 @@ class MixedDtypeModel(nn.Module):
         return self.fc2(x.to(self.fc2.weight.dtype))
 
 
+class BoundaryModel(nn.Module):
+    """A single 2D linear whose weight is sized to straddle the DP rank boundary.
+
+    With `world_size` ranks and the all-`Flat` layout, the weight
+    `(rows, in_features)` (`rows` divisible by `world_size`) occupies the
+    whole DBuffer, so every rank owns a contiguous row slice and the parameter
+    is a boundary parameter for `world_size > 1`.
+    """
+
+    def __init__(self, rows: int, in_features: int) -> None:
+        super().__init__()
+        self.fc = nn.Linear(in_features, rows, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(x)
+
+
 def _make_fsdp_model(device: torch.device, mesh, seed: int = 1234) -> TinyModel:
     torch.manual_seed(seed)
     model = TinyModel().to(device)
@@ -523,6 +540,91 @@ def test_step_bitwise_matches_single_rank_reference(distributed_setup):
         full = _gather_full_param(shard_param, mesh, world_size)
         expected = getattr(baseline, name.split(".")[0]).weight
         torch.testing.assert_close(full, expected, atol=0, rtol=0)
+
+
+def test_step_explicit_boundary_param_bitwise_matches_reference(distributed_setup):
+    """A parameter explicitly straddling the DP boundary is handled correctly.
+
+    Builds a single-linear model whose weight is a boundary parameter on every
+    rank, asserts the shard plan classifies it as boundary, then verifies the
+    FSDP Muon step matches a single-rank Muon reference bitwise. This guards the
+    owner-gather -> fully-local -> finish restructure and the `pre_ns` argument
+    to `_orthogonalize_with_precision` on the boundary path.
+    """
+    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
+
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2 or torch.cuda.device_count() < world_size:
+        pytest.skip(
+            "Needs >=2 ranks and >=1 GPU per rank; "
+            "a 1-GPU-multi-rank config cannot run the owner-compute P2P step."
+        )
+    rows = 16
+    in_features = 8
+    if rows % world_size != 0:
+        pytest.skip(f"rows {rows} not divisible by world_size {world_size}.")
+    mesh = init_device_mesh(device.type, (world_size,))
+
+    torch.manual_seed(1234)
+    model = BoundaryModel(rows, in_features).to(device)
+    fully_shard(model.fc, mesh=mesh, placements=_flat_placements())
+
+    # Assert the single parameter is a boundary parameter on this rank.
+    plan = compute_shard_plan(
+        torch.Size((rows, in_features)),
+        tensor_flat_offset=0,
+        rank_flat_shard_size=(rows * in_features) // world_size,
+        world_size=world_size,
+    )
+    assert plan.is_boundary(), "BoundaryModel weight must straddle the DP boundary."
+
+    # Baseline: single-rank model with the same initial full weights.
+    torch.manual_seed(1234)
+    baseline = BoundaryModel(rows, in_features).to(device)
+    full = _gather_full_param(model.fc.weight, mesh, world_size)
+    with torch.no_grad():
+        baseline.fc.weight.copy_(full)
+
+    lr, momentum, nesterov, weight_decay = 0.05, 0.9, True, 0.0
+    inner = Muon(
+        model.parameters(),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=nesterov,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+        use_syrk=False,
+    )
+    sharded_opt = FsdpMuon(
+        model.parameters(), inner_optimizer=inner, dp_mesh=mesh, use_owner_comm_stream=False
+    )
+    base_opt = Muon(
+        baseline.parameters(),
+        lr=lr,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        nesterov=nesterov,
+        coefficient_type="quintic",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        fp32_matmul_prec="medium",
+    )
+
+    x = torch.randn(4, in_features, device=device)
+    for _ in range(3):
+        sharded_opt.zero_grad(set_to_none=True)
+        base_opt.zero_grad(set_to_none=True)
+        model(x).sum().backward()
+        baseline(x).sum().backward()
+        sharded_opt.step()
+        base_opt.step()
+
+    full = _gather_full_param(model.fc.weight, mesh, world_size)
+    torch.testing.assert_close(full, baseline.fc.weight, atol=0, rtol=0)
 
 
 def test_step_losses_track_torch_muon(distributed_setup):
