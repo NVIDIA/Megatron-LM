@@ -152,21 +152,11 @@ class FsdpParameterGroup:
 
         tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
-        current_stream = torch.cuda.current_stream(allgather_stream.device)
-        # Wait for the input parameters produced on the main stream to be ready.
-        allgather_stream.wait_stream(current_stream)
-        # Allocate main_weight and model_weight on the all-gather stream so both
-        # buffers record it as their allocation stream.
-        with torch.cuda.stream(allgather_stream):
-            self.main_weight = DBuffer.distribute_tensors(
-                (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
-                mesh=self.mesh,
-                placements=main_weight_placements,
-            )
-            # Match the optimizer post-step and checkpoint-load state: compute weights
-            # begin as a cast of the optimizer weights and are restored to their
-            # configured placements by the first pre-forward unshard.
-            self.model_weight = self.main_weight.cast(self.dtype)
+        self.main_weight = DBuffer.distribute_tensors(
+            (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
+            mesh=self.mesh,
+            placements=main_weight_placements,
+        )
 
         if use_symmetric_memory:
             # PyTorch caches this in C++ and returns early when the backend is already NCCL.
@@ -174,6 +164,21 @@ class FsdpParameterGroup:
             self._symm_mem_pool = symm_mem.get_mem_pool(self.main_weight.device)
         else:
             self._symm_mem_pool = None
+        if main_weight_dtype == self.dtype:
+            self.model_weight = self.main_weight
+        else:
+            # Allocate model_weight on the all-gather stream to record its allocation stream.
+            with torch.cuda.stream(allgather_stream):
+                self.model_weight = DBuffer(
+                    mesh=self.mesh,
+                    placements=main_weight_placements,
+                    tensor_shapes=tensor_shapes,
+                    dtype=self.dtype,
+                    device=self.main_weight.device,
+                )
+            # Cast into the preallocated model_weight on the current stream without
+            # replacing its storage or its all-gather allocation stream.
+            self.main_weight.cast(self.model_weight.dtype, out=self.model_weight)
 
         with self._symmetric_memory_context():
             self._unsharded_model_weight = DBuffer(
