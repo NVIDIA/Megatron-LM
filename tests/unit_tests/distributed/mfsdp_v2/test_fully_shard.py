@@ -41,6 +41,51 @@ class TinyModel(nn.Module):
         return self.fc2(self.relu(self.fc1(x)))
 
 
+class _FusedWgradLinearFunction(torch.autograd.Function):
+    """Small stand-in for TE's direct-to-main-grad autograd contract."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: nn.Parameter, bias: nn.Parameter) -> torch.Tensor:
+        """Capture the getter during forward, as standard TE modules do."""
+        ctx.save_for_backward(x)
+        ctx.weight = weight
+        ctx.get_main_grad = weight.get_main_grad
+        return torch.nn.functional.linear(x, weight, bias)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Write wgrad into the MFSDP staging view and return a dummy hook grad."""
+        (x,) = ctx.saved_tensors
+        weight = ctx.weight
+        main_grad = ctx.get_main_grad()
+        torch.mm(grad_output.t(), x, out=main_grad)
+        weight.grad_added_to_main_grad = True
+        dummy_wgrad = torch.zeros_like(weight)
+        grad_bias = grad_output.sum(dim=0)
+        return None, dummy_wgrad, grad_bias
+
+
+class FusedWgradLinear(nn.Linear):
+    """Linear module that follows TE's fused-wgrad parameter protocol."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the test fused-wgrad autograd function."""
+        assert self.bias is not None
+        return _FusedWgradLinearFunction.apply(x, self.weight, self.bias)
+
+
+class MixedWgradLinear(FusedWgradLinear):
+    """Exercise one weight through both fused and ordinary autograd paths."""
+
+    def __init__(self, in_features: int, out_features: int) -> None:
+        super().__init__(in_features, out_features)
+        self.weight.zero_out_wgrad = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Model the tied embedding/output-weight accumulation contract."""
+        return super().forward(x) + torch.nn.functional.linear(x, self.weight)
+
+
 class CheckpointedTinyModel(TinyModel):
     """Tiny model that activation-checkpoints each shardable module."""
 
@@ -246,6 +291,56 @@ def test_fully_shard_sgd_losses_match_baseline(
         torch.stack(baseline_losses),
         msg="Sharded losses did not match baseline losses.",
     )
+
+
+@pytest.mark.parametrize("mixed_wgrad", [False, True], ids=["fused_only", "fused_and_ordinary"])
+def test_fused_wgrad_mixed_group_matches_baseline(distributed_setup, mixed_wgrad):
+    """A fused weight and ordinary bias in one group should train correctly."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    baseline = nn.Linear(8, 4).to(device)
+    model_cls = MixedWgradLinear if mixed_wgrad else FusedWgradLinear
+    model = model_cls(8, 4).to(device)
+    model.load_state_dict(baseline.state_dict())
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fuse_wgrad_accumulation=True)
+
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    inputs = [torch.randn(3, 8, device=device) for _ in range(3)]
+    targets = [torch.randn(3, 4, device=device) for _ in range(3)]
+    baseline_losses = []
+    losses = []
+
+    for x, target in zip(inputs, targets):
+        baseline_optimizer.zero_grad()
+        baseline_output = baseline(x)
+        if mixed_wgrad:
+            baseline_output = baseline_output + torch.nn.functional.linear(x, baseline.weight)
+        baseline_loss = torch.nn.functional.mse_loss(baseline_output, target)
+        baseline_loss.backward()
+        baseline_optimizer.step()
+        baseline_losses.append(baseline_loss.detach())
+
+        optimizer.zero_grad()
+        loss = torch.nn.functional.mse_loss(model(x), target)
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.detach())
+
+        parameter_group = model.parameter_groups[0]
+        assert parameter_group._fused_wgrad_buffer is None
+        for fsdp_parameter in parameter_group.fsdp_parameters:
+            assert fsdp_parameter.unsharded.main_grad is None
+            assert not fsdp_parameter.unsharded.grad_added_to_main_grad
+
+    torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
 
 
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])

@@ -132,6 +132,7 @@ def fully_shard(
     fine_grained: bool = False,
     skip_backward_callback: bool = False,
     grad_divisor: int = 1,
+    fuse_wgrad_accumulation: bool = False,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -149,6 +150,8 @@ def fully_shard(
         skip_backward_callback: Skip per-param post_accumulate_grad_hook. Required
             when ``delay_wgrad_compute=True`` so gradient reduction waits for
             ``backward_dw()`` to complete.
+        fuse_wgrad_accumulation: Let TE write weight gradients directly into a
+            full staging buffer that MFSDP subsequently reduce-scatters.
         grad_divisor: Additional divisor applied to the reduced gradient, on top of the
             averaging the mesh already performs. Defaults to 1, which is correct whenever
             each mesh rank contributes exactly one term to the gradient.
@@ -195,6 +198,7 @@ def fully_shard(
             skip_backward_callback=skip_backward_callback,
             grad_divisor=grad_divisor,
             use_symmetric_memory=context.use_symmetric_memory,
+            fuse_wgrad_accumulation=fuse_wgrad_accumulation,
         )
     except Exception:
         module.__class__ = original_cls
