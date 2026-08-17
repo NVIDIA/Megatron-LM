@@ -556,22 +556,27 @@ class MambaSlotAllocator:
     # Intermediate state commit
     # =========================================================================
 
-    def _allocate_slots_up_to_capacity(self, block_ids: list) -> tuple[list[int], list[int]]:
-        """Allocate candidates that fit and return their original indices and slots."""
+    def _allocate_slots_up_to_capacity(
+        self, block_ids: list, required_count: int
+    ) -> tuple[list[int], list[int]]:
+        """Allocate required candidates plus as many optional candidates as fit."""
 
         try:
             return list(range(len(block_ids))), self.allocate_slots_batch(block_ids)
         except MambaSlotCapacityError as error:
-            # Keep existing slots and the earliest unique new blocks that fit.
+            # Keep existing slots and the earliest new blocks that fit.
             existing_slots = self.block_to_slot[block_ids].tolist()
+            required_new = sum(slot < 0 for slot in existing_slots[:required_count])
+            if required_new > error.available:
+                raise MambaSlotCapacityError(required_new, error.available) from error
             kept_indices: list[int] = []
-            kept_new_bids: set[int] = set()
-            for index, (block_id, slot) in enumerate(zip(block_ids, existing_slots)):
-                if slot >= 0 or block_id in kept_new_bids:
+            new_slots_kept = 0
+            for index, slot in enumerate(existing_slots):
+                if slot >= 0:
                     kept_indices.append(index)
-                elif len(kept_new_bids) < error.available:
-                    kept_new_bids.add(block_id)
+                elif new_slots_kept < error.available:
                     kept_indices.append(index)
+                    new_slots_kept += 1
 
             kept_bids = [block_ids[index] for index in kept_indices]
             return kept_indices, self.allocate_slots_batch(kept_bids)
@@ -585,82 +590,50 @@ class MambaSlotAllocator:
         collected = self._collect_commit_data()
         if collected is None:
             return
-        (
-            intermediate_bids,
-            src_offsets,
-            eos_bids,
-            eos_ctx_indices,
-            eos_handoff_required,
-            all_hashes,
-        ) = collected
+        # Each candidate is (block ID, hash, source index, source is live,
+        # handoff required). Required states win both capacity and duplicate
+        # block IDs over optional reusable prefix snapshots.
+        required = [snapshot for snapshot in collected if snapshot[4]]
+        ordered = list(required)
+        ordered.extend(snapshot for snapshot in collected if not snapshot[4])
+        snapshots = []
+        claimed_bids = set()
+        for block_id, block_hash, source_index, source_is_live, _ in ordered:
+            if block_id in claimed_bids:
+                continue
+            snapshots.append((block_id, block_hash, source_index, source_is_live))
+            claimed_bids.add(block_id)
 
-        # Reserve slots for exact handoff states before optional prefix snapshots.
-        handoff_eos_indices = [
-            index for index, required in enumerate(eos_handoff_required) if required
-        ]
-        requested_handoff_bids = [eos_bids[index] for index in handoff_eos_indices]
-        requested_handoff_ctx_indices = [eos_ctx_indices[index] for index in handoff_eos_indices]
-        requested_handoff_hashes = [
-            all_hashes[len(intermediate_bids) + index] for index in handoff_eos_indices
-        ]
-        if requested_handoff_bids:
-            kept_handoffs, handoff_slots = self._allocate_slots_up_to_capacity(
-                requested_handoff_bids
-            )
-            handoff_bids = [requested_handoff_bids[index] for index in kept_handoffs]
-            handoff_ctx_indices = [requested_handoff_ctx_indices[index] for index in kept_handoffs]
-            handoff_hashes = [requested_handoff_hashes[index] for index in kept_handoffs]
-            self.store_from_live_batch(handoff_slots, handoff_ctx_indices)
-            self.register_block_hashes_batch(handoff_bids, handoff_hashes)
-
-        # Remove optional snapshots for blocks claimed by exact handoff state.
-        handoff_bid_set = set(requested_handoff_bids)
-        optional_eos_indices = [
-            index
-            for index, block_id in enumerate(eos_bids)
-            if index not in handoff_eos_indices and block_id not in handoff_bid_set
-        ]
-        eos_bids = [eos_bids[index] for index in optional_eos_indices]
-        eos_ctx_indices = [eos_ctx_indices[index] for index in optional_eos_indices]
-        eos_hashes = [all_hashes[len(intermediate_bids) + index] for index in optional_eos_indices]
-        keep_intermediate = [
-            index
-            for index, block_id in enumerate(intermediate_bids)
-            if block_id not in handoff_bid_set
-        ]
-        intermediate_bids = [intermediate_bids[index] for index in keep_intermediate]
-        src_offsets = [src_offsets[index] for index in keep_intermediate]
-        intermediate_hashes = [all_hashes[index] for index in keep_intermediate]
-        all_hashes = intermediate_hashes + eos_hashes
-
-        # Fill the remaining capacity with optional reusable prefix snapshots.
-        all_bids = intermediate_bids + eos_bids
-        n_intermediate = len(intermediate_bids)
-        kept_indices, all_slots = self._allocate_slots_up_to_capacity(all_bids)
-        if all_bids and not kept_indices:
+        required_count = len({snapshot[0] for snapshot in required})
+        kept_indices, slots = self._allocate_slots_up_to_capacity(
+            [block_id for block_id, _, _, _ in snapshots], required_count
+        )
+        if not kept_indices:
             self._clear_intermediate_state()
             return
-        if len(kept_indices) != len(all_bids):
-            # Keep block, hash, and state-source lists aligned after truncation.
-            all_bids = [all_bids[index] for index in kept_indices]
-            all_hashes = [all_hashes[index] for index in kept_indices]
-            src_offsets = [src_offsets[index] for index in kept_indices if index < n_intermediate]
-            eos_ctx_indices = [
-                eos_ctx_indices[index - n_intermediate]
-                for index in kept_indices
-                if index >= n_intermediate
-            ]
-            n_intermediate = len(src_offsets)
 
-        if all_bids:
-            # Intermediate snapshots come from the extraction buffers.
-            self._copy_intermediate_to_cache(src_offsets, all_slots[:n_intermediate])
+        intermediate_sources = []
+        intermediate_slots = []
+        live_sources = []
+        live_slots = []
+        committed_bids = []
+        committed_hashes = []
+        for index, slot in zip(kept_indices, slots):
+            block_id, block_hash, source_index, source_is_live = snapshots[index]
+            committed_bids.append(block_id)
+            committed_hashes.append(block_hash)
+            if source_is_live:
+                live_sources.append(source_index)
+                live_slots.append(slot)
+            else:
+                intermediate_sources.append(source_index)
+                intermediate_slots.append(slot)
 
-            # End-of-prefill snapshots come from the live request state.
-            self.store_from_live_batch(all_slots[n_intermediate:], eos_ctx_indices)
-
-            # Publish hashes only after their state has been copied.
-            self.register_block_hashes_batch(all_bids, all_hashes)
+        if intermediate_sources:
+            self._copy_intermediate_to_cache(intermediate_sources, intermediate_slots)
+        if live_sources:
+            self.store_from_live_batch(live_slots, live_sources)
+        self.register_block_hashes_batch(committed_bids, committed_hashes)
 
         self._clear_intermediate_state()
 
@@ -668,10 +641,8 @@ class MambaSlotAllocator:
         """Extract commit data from GPU intermediate state tracking.
 
         Returns:
-            Tuple of (intermediate_bids, src_offsets, eos_bids, eos_ctx_indices,
-            eos_handoff_required, all_hashes), or None if nothing needs to be
-            committed. ``all_hashes`` covers ``intermediate_bids + eos_bids``
-            in that order.
+            Candidate tuples of (block ID, hash, source index, source is live,
+            handoff required), or None if nothing needs to be committed.
         """
         ctx = self.context
         metadata = ctx.mamba_metadata
@@ -725,20 +696,26 @@ class MambaSlotAllocator:
             self._clear_intermediate_state()
             return None
 
-        # Single batch hash fetch for all block IDs (1 GPU sync)
+        # Fetch all hashes from the allocator's CPU bookkeeping in one indexed read.
         all_bids_for_hash = intermediate_bids + eos_bids
         device = ctx.kv_block_allocator.block_hashes.device
         bid_tensor = torch.tensor(all_bids_for_hash, dtype=torch.int64, device=device)
         all_hashes = ctx.kv_block_allocator.block_hashes[bid_tensor].tolist()
 
-        return (
-            intermediate_bids,
-            src_offsets,
-            eos_bids,
-            eos_ctx_indices,
-            eos_handoff_required,
-            all_hashes,
+        intermediate_count = len(intermediate_bids)
+        snapshots = [
+            (block_id, block_hash, source_offset, False, False)
+            for block_id, block_hash, source_offset in zip(
+                intermediate_bids, all_hashes[:intermediate_count], src_offsets
+            )
+        ]
+        snapshots.extend(
+            (block_id, block_hash, context_index, True, handoff_required)
+            for block_id, block_hash, context_index, handoff_required in zip(
+                eos_bids, all_hashes[intermediate_count:], eos_ctx_indices, eos_handoff_required
+            )
         )
+        return snapshots
 
     def _copy_intermediate_to_cache(self, src_offsets: list, slots: list) -> None:
         """Copy intermediate states from output buffers to cache slots.

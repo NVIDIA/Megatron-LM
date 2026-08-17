@@ -183,15 +183,11 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
         return False, 0
 
 
-def _meta(request_id, positions):
+def _meta(request_id):
     return {
         "request_id": request_id,
         "resume_tokens": [99],
-        "ssm": {
-            "positions": positions,
-            "conv": {"request_id": request_id},
-            "recurrent": {"request_id": request_id},
-        },
+        "ssm": {"conv": {"request_id": request_id}, "recurrent": {"request_id": request_id}},
     }
 
 
@@ -430,7 +426,7 @@ def test_decode_role_uses_live_ssm_buffers_and_rejects_durable_cache():
         mock.patch(pg_size, return_value=1),
         mock.patch(pg_rank, return_value=0),
     ):
-        with pytest.raises(AssertionError, match="directly into live SSM state"):
+        with pytest.raises(RuntimeError, match="directly into live SSM state"):
             engine.setup_kv_transfer("decode")
 
         _Backend.instances.clear()
@@ -448,7 +444,7 @@ def test_decode_role_uses_live_ssm_buffers_and_rejects_durable_cache():
 def test_capacity_miss_defers_before_any_transfer(handoff_loop):
     engine = _HandoffHarness(handoff_loop, hybrid=True, available=0)
     future = engine.add_request_with_kv_handoff(
-        7, [1, 2, 3, 4, 5], SamplingParams(num_tokens_to_generate=2), _meta(7, [1]), [100, 101]
+        7, [1, 2, 3, 4, 5], SamplingParams(num_tokens_to_generate=2), _meta(7), [100, 101]
     )
 
     assert not future.done()
@@ -475,7 +471,7 @@ def test_capacity_miss_defers_before_any_transfer(handoff_loop):
 def test_releasing_pending_hybrid_import_returns_live_slot(handoff_loop):
     engine = _HandoffHarness(handoff_loop, hybrid=True, available=1)
     engine.add_request_with_kv_handoff(
-        7, [1, 2, 3, 4], SamplingParams(num_tokens_to_generate=2), _meta(7, [0]), [100]
+        7, [1, 2, 3, 4], SamplingParams(num_tokens_to_generate=2), _meta(7), [100]
     )
     _drain_loop(handoff_loop)
 
@@ -842,9 +838,7 @@ def test_hybrid_handoff_keeps_partial_block_for_exact_decode_resume():
         engine._capture_handoff_meta(request, prepared[7])
 
     assert request.disaggregated_params["block_ids"] == [10, 11, 12]
-    assert request.disaggregated_params["kv_meta"]["ssm"]["positions"] == [2]
     assert request.disaggregated_params["kv_meta"]["resume_tokens"] == [99]
-    assert engine._pinned_handoff_ssm_slots[7] == [9]
     engine.context.mamba_slot_allocator.get_slot.assert_called_once_with(12)
     engine._release_pinned_handoff_blocks.assert_not_called()
 
@@ -1023,18 +1017,17 @@ def test_decode_role_rejects_prompt_scheduling(handoff_loop):
         engine.schedule_waiting_requests()
 
 
-def test_push_handoff_reuses_ssm_slots_advertised_during_capture():
+def test_push_handoff_uses_final_pinned_blocks_ssm_slot():
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
     engine.context = SimpleNamespace(mamba_slot_allocator=mock.Mock())
-    engine.context.mamba_slot_allocator.get_slot.side_effect = AssertionError(
-        "SEND_KV must use the captured SSM slots"
-    )
+    engine.context.mamba_slot_allocator.get_slot.return_value = 3
     engine._kv_transfer_agent = mock.Mock()
-    engine._ssm_transfer_agents = {"conv": mock.Mock()}
+    engine._ssm_transfer_agents = {"conv": mock.Mock(), "recurrent": mock.Mock()}
     engine._pinned_handoff_blocks[7] = [20, 21]
-    engine._pinned_handoff_ssm_slots[7] = [3]
-    decode_metas = [{"ssm": {"conv": {"agent": "decode"}}}]
+    decode_metas = [
+        {"ssm": {"conv": {"agent": "decode-conv"}, "recurrent": {"agent": "decode-ssm"}}}
+    ]
 
     engine.push_handoff_kv(7, decode_metas)
 
@@ -1042,8 +1035,28 @@ def test_push_handoff_reuses_ssm_slots_advertised_during_capture():
         {"tp_metas": decode_metas}, [20, 21]
     )
     engine._ssm_transfer_agents["conv"].begin_push_blocks.assert_called_once_with(
-        {"tp_metas": [{"agent": "decode"}]}, [3]
+        {"tp_metas": [{"agent": "decode-conv"}]}, [3]
     )
+    engine._ssm_transfer_agents["recurrent"].begin_push_blocks.assert_called_once_with(
+        {"tp_metas": [{"agent": "decode-ssm"}]}, [3]
+    )
+    engine.context.mamba_slot_allocator.get_slot.assert_called_once_with(21)
+
+
+def test_push_handoff_validates_ssm_metadata_before_posting_sends():
+    engine = object.__new__(InferenceStateHandoffMixin)
+    engine._initialize_disaggregation_state()
+    engine.context = SimpleNamespace(mamba_slot_allocator=mock.Mock())
+    engine.context.mamba_slot_allocator.get_slot.return_value = 3
+    engine._kv_transfer_agent = mock.Mock()
+    engine._ssm_transfer_agents = {"conv": mock.Mock(), "recurrent": mock.Mock()}
+    engine._pinned_handoff_blocks[7] = [20]
+
+    with pytest.raises(RuntimeError, match="recurrent SSM transfer state"):
+        engine.push_handoff_kv(7, [{"ssm": {"conv": {"agent": "decode"}}}])
+
+    engine._kv_transfer_agent.begin_push_blocks.assert_not_called()
+    engine._ssm_transfer_agents["conv"].begin_push_blocks.assert_not_called()
 
 
 def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
@@ -1106,11 +1119,7 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
         mock.call(13),
         mock.call(16),
     ]
-    assert engine._pinned_handoff_ssm_slots == {2: [103], 3: [112]}
     first_ssm = requests[0].disaggregated_params["kv_meta"]["ssm"]
-    second_ssm = requests[1].disaggregated_params["kv_meta"]["ssm"]
-    assert first_ssm["positions"] == [3]
-    assert second_ssm["positions"] == [2]
     assert [
         [tp_meta["block_ids"] for tp_meta in stage["tp_metas"]]
         for stage in first_ssm["conv"]["pp_metas"]
