@@ -433,7 +433,8 @@ def _worker_muon_qkv_padding(
     param.is_qkv = True
     param.is_gtp_weight_remat = True
     param.qkv_gtp_pad_length = pad_length
-    param.qkv_split_shapes = split_shapes
+    # Padded per-head shards intentionally have no rank-local logical split metadata.
+    param.qkv_split_shapes = None if split_per_head else split_shapes
     param.qkv_split_shapes_global = split_shapes
     param.qkv_split_heads_are_complete = False
     param.qkv_split_groups_are_complete = False
