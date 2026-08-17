@@ -826,7 +826,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         )
 
     def _send_to_owner(
-        self, gather_plan: OwnerGatherPlan, device: torch.device
+        self, gather_plan: OwnerGatherPlan, device: torch.device, dtype: torch.dtype
     ) -> tuple[dict[int, torch.Tensor], list[dist.Work]]:
         """Send orthogonalization input shards to their respective owner.
 
@@ -834,14 +834,14 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         allocations around setting up a large all-to-all buffer. Sends and recvs
         are issued on the owner-comm stream so they overlap local compute. The
         owner's own shard is not sent (kept locally for reconstruction).
+
+        Args:
+            gather_plan: This rank's owner-gather plan (send/recv buffers).
+            device: Device for the send/recv buffers (the pre-NS device).
+            dtype: Dtype for the send/recv buffers (the pre-NS dtype).
         """
         group = self._init_collective_groups()
         stream = self._owner_comm_stream(device)
-        dtype = (
-            next(iter(gather_plan.send_buffers.values())).dtype
-            if gather_plan.send_buffers
-            else torch.float32
-        )
         recv_buffers: dict[int, torch.Tensor] = {
             src: torch.empty(size, dtype=dtype, device=device)
             for src, size in gather_plan.recv_sizes.items()
@@ -943,21 +943,21 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         )
 
     def _send_to_destination(
-        self, scatter_plan: OwnerScatterPlan, device: torch.device
+        self, scatter_plan: OwnerScatterPlan, device: torch.device, dtype: torch.dtype
     ) -> tuple[dict[int, torch.Tensor], list[dist.Work]]:
         """Send update shards to their respective destination.
 
         Uses peer-to-peer communication (`batch_isend_irecv`) to avoid memory
         allocations around setting up a large all-to-all buffer. The owner's own
         update shard is not sent (applied directly).
+
+        Args:
+            scatter_plan: This rank's owner-scatter plan (send/recv buffers).
+            device: Device for the send/recv buffers (the update device).
+            dtype: Dtype for the send/recv buffers (the update dtype).
         """
         group = self._init_collective_groups()
         stream = self._owner_comm_stream(device)
-        dtype = (
-            next(iter(scatter_plan.send_buffers.values())).dtype
-            if scatter_plan.send_buffers
-            else torch.float32
-        )
         recv_buffers: dict[int, torch.Tensor] = {
             owner: torch.empty(size, dtype=dtype, device=device)
             for owner, size in scatter_plan.recv_sizes.items()
@@ -1144,7 +1144,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
 
         # Phase 4: pack + P2P-send update shards from owners (async on owner stream).
         scatter_plan = self._pack_update_shards(full_updates, b_plans, b_owners, device, dtype)
-        scatter_recv, scatter_works = self._send_to_destination(scatter_plan, device)
+        scatter_recv, scatter_works = self._send_to_destination(scatter_plan, device, dtype)
         if stream is not None:
             torch.cuda.current_stream(device).wait_stream(stream)
         self._wait_for_dist_buffer(scatter_works)

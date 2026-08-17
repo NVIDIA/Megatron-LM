@@ -745,7 +745,7 @@ def test_owner_p2p_round_trip_multi_owner(distributed_setup):
     gather_plan = pack_owner_work(
         plans, owners, local_shards, world_size, this_rank, device=device, dtype=torch.float32
     )
-    recv_buffers, works = optimizer._send_to_owner(gather_plan, device)
+    recv_buffers, works = optimizer._send_to_owner(gather_plan, device, dtype=torch.float32)
     optimizer._wait_for_dist_buffer(works)
 
     # Identity orthogonalization: the full update equals the gathered input.
@@ -764,7 +764,9 @@ def test_owner_p2p_round_trip_multi_owner(distributed_setup):
     scatter_plan = pack_update_shards(
         full_updates, plans, owners, world_size, this_rank, device=device, dtype=torch.float32
     )
-    scatter_recv, scatter_works = optimizer._send_to_destination(scatter_plan, device)
+    scatter_recv, scatter_works = optimizer._send_to_destination(
+        scatter_plan, device, dtype=torch.float32
+    )
     optimizer._wait_for_dist_buffer(scatter_works)
     received = unpack_update_shards(scatter_plan, scatter_recv)
 
