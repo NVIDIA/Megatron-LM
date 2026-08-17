@@ -20,7 +20,6 @@ import json
 from functools import partial
 
 from megatron.core.transformer.module import MegatronModule
-from megatron.inference.utils import add_inference_args
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import print_rank_0
@@ -36,6 +35,8 @@ from megatron.training.checkpointing import load_args_from_checkpoint, load_chec
 
 def add_vlm_inference_args(parser):
     """Add VLM-specific inference arguments on top of the standard inference args."""
+    from megatron.inference.utils import add_inference_args
+
     parser = add_inference_args(parser)
     group = parser.add_argument_group(title="VLM dynamic inference")
     group.add_argument(
