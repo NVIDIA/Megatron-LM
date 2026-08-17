@@ -7,6 +7,7 @@ from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -242,6 +243,30 @@ class TestHybridBlock:
         assert isinstance(layers[1].self_attention, SelfAttention)
         assert isinstance(layers[2], TransformerLayer)
         assert isinstance(layers[2].mlp, MLP)
+
+    def test_shortcut_pair_is_one_registered_block(self):
+        block = self.get_hybrid_block(
+            Symbols.MAMBA + Symbols.MOE,
+            num_moe_experts=1,
+            moe_router_topk=1,
+            moe_token_dispatcher_type="allgather",
+            moe_shortcut_connection=True,
+            moe_shared_expert_intermediate_size=256,
+        )
+
+        assert len(block.layers) == 1
+        shortcut = block.layers[0]
+        assert isinstance(shortcut, ShortcutMoEBlock)
+        assert isinstance(shortcut.compute_layer, MambaLayer)
+        assert isinstance(shortcut.moe_layer, TransformerLayer)
+        assert shortcut.moe_layer.mlp._shortcut_post_norm is None
+        assert isinstance(shortcut.shortcut_post_norm, torch.nn.RMSNorm)
+        assert block.num_layers_per_pipeline_rank == 2
+
+        state_keys = set(block.state_dict())
+        assert any(key.startswith("layers.0.compute_layer.") for key in state_keys)
+        assert any(key.startswith("layers.0.moe_layer.") for key in state_keys)
+        assert "layers.0.shortcut_post_norm.weight" in state_keys
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_symbol = 'X'

@@ -2023,20 +2023,3 @@ class MoETransformerLayer(TransformerLayer):
             ready_event=ready_event,
             grad_ready_event=grad_ready_event,
         )
-
-    def shortcut_postprocess_with_combined_output(
-        self,
-        hidden_states,
-        combined_output,
-        shared_expert_output,
-    ):
-        """Finish a shortcut layer after combine has completed."""
-        residual = hidden_states
-        if self.config.fp32_residual_connection:
-            residual = residual.float()
-
-        output = self.mlp.postprocess(combined_output, shared_expert_output)
-        output = self._forward_post_mlp((output, None), residual)
-        if isinstance(output, tuple):
-            output = output[0]
-        return output

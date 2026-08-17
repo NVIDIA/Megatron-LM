@@ -15,7 +15,7 @@ from enum import Enum
 from functools import partial
 from itertools import chain, zip_longest
 from math import ceil
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence
 
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
@@ -496,14 +496,14 @@ def _backup_grads_before_capture(runner):
     restore with '_restore_grads_after_capture'.
     """
     backup = {}
-    for p in runner.base_module.parameters():
+    for p in runner.iter_parameters():
         mg = getattr(p, "main_grad", None)
         if mg is not None:
             backup[id(p)] = (p, mg.clone())
 
     if runner.gtp_remat:
         # GTP only: also protect the cross-graph next_w the cascade accumulates into.
-        for p in runner.base_module.parameters():
+        for p in runner.iter_parameters():
             nw = getattr(p, "next_w", None) if getattr(p, "is_gtp_weight_remat", False) else None
             if nw is None:
                 continue
@@ -945,6 +945,9 @@ class _CudaGraphRunner(torch.nn.Module):
         fwd_graph_input_kwargs: Dict[str, Any],
         func,
         need_backward,
+        is_first_layer: bool | None = None,
+        is_last_layer: bool | None = None,
+        participant_modules: Sequence[torch.nn.Module] | None = None,
     ):
         """Creates a _CudaGraphRunner, which holds a single pair of fwd and bwd cudagraphs, which
         are not created until this runner records its graph creation into
@@ -953,6 +956,9 @@ class _CudaGraphRunner(torch.nn.Module):
         super().__init__()
 
         self.base_module = base_module
+        self.participant_modules = (
+            (base_module,) if participant_modules is None else tuple(participant_modules)
+        )
         self.mempool = mempool
 
         self.fwd_graph_input_arg_metas = [ArgMetadata(a) for a in fwd_graph_input_args]
@@ -992,8 +998,16 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
-        self.is_first_layer = getattr(base_module, "is_first_layer", True)
-        self.is_last_layer = getattr(base_module, "is_last_layer", True)
+        self.is_first_layer = (
+            getattr(base_module, "is_first_layer", True)
+            if is_first_layer is None
+            else is_first_layer
+        )
+        self.is_last_layer = (
+            getattr(base_module, "is_last_layer", True)
+            if is_last_layer is None
+            else is_last_layer
+        )
 
         # We use this attribute to record the value of 'is_first_microbatch' each fwd cudagraph
         # replay so that way we only update the value of this flag in FP8GlobalStateManager when
@@ -1140,7 +1154,25 @@ class _CudaGraphRunner(torch.nn.Module):
                 stack.extend(f for f, _ in fn.next_functions if f)
 
         # Return module params that were found in the graph, preserving original order
-        return tuple(p for p in self.base_module.parameters() if id(p) in p_ids)
+        return tuple(p for p in self.iter_parameters() if id(p) in p_ids)
+
+    def iter_parameters(self):
+        """Iterate graph-participating parameters once in stable module order."""
+        seen = set()
+        for module in self.participant_modules:
+            for parameter in module.parameters():
+                if id(parameter) not in seen:
+                    seen.add(id(parameter))
+                    yield parameter
+
+    def iter_buffers(self):
+        """Iterate graph-participating buffers once in stable module order."""
+        seen = set()
+        for module in self.participant_modules:
+            for buffer in module.buffers():
+                if id(buffer) not in seen:
+                    seen.add(id(buffer))
+                    yield buffer
 
     def _weakref_forward_buffers(
         self, preserve_forward_to_backward_lifetimes: bool
@@ -1225,7 +1257,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if self.training and torch.is_grad_enabled():
             buffer_backup = []
-            for buf in self.base_module.buffers():
+            for buf in self.iter_buffers():
                 buffer_backup.append(buf.clone())
 
             grad_backup = _backup_grads_before_capture(self)
@@ -1233,14 +1265,18 @@ class _CudaGraphRunner(torch.nn.Module):
             saved_fp8_tensors = None
             if self.fp8_enabled:
                 if is_te_min_version("1.13.0"):
-                    saved_fp8_tensors = save_fp8_tensors([self.base_module], self.fp8_recipe)
+                    saved_fp8_tensors = save_fp8_tensors(
+                        self.participant_modules, self.fp8_recipe
+                    )
                 else:
                     saved_fp8_tensors = save_fp8_tensors(
-                        [self.base_module], self.fp8_recipe.amax_history_len
+                        self.participant_modules, self.fp8_recipe.amax_history_len
                     )
             elif self.fp4_enabled:
                 if is_te_min_version("2.7.0.dev0"):
-                    saved_fp8_tensors = save_fp8_tensors([self.base_module], self.fp4_recipe)
+                    saved_fp8_tensors = save_fp8_tensors(
+                        self.participant_modules, self.fp4_recipe
+                    )
                 else:
                     raise ValueError("FP4 requires TE >= 2.7.0.dev0 for NVFP4BlockScaling support.")
 
@@ -1251,7 +1287,9 @@ class _CudaGraphRunner(torch.nn.Module):
         # The shortcut route/input graph owns an MoELayer child even though its composite wrapper
         # is not a MoETransformerLayer. Preserve the same aux-loss state across capture warmups.
         is_moe = isinstance(self.base_module, MoETransformerLayer) or any(
-            isinstance(module, MoELayer) for module in self.base_module.modules()
+            isinstance(module, MoELayer)
+            for participant in self.participant_modules
+            for module in participant.modules()
         )
         if is_moe:
             from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -1453,12 +1491,12 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fwd_graph_input_surface = self.fwd_graph_input_surface + self.params_to_backprop
 
             if self.fp8_enabled:
-                restore_fp8_tensors([self.base_module], saved_fp8_tensors)
+                restore_fp8_tensors(self.participant_modules, saved_fp8_tensors)
             # restore cached grads
             _restore_grads_after_capture(grad_backup)
 
             # restore cached buffers
-            for buf_copy, buf in zip(buffer_backup, self.base_module.buffers()):
+            for buf_copy, buf in zip(buffer_backup, self.iter_buffers()):
                 buf.copy_(buf_copy)
 
         if is_moe:
@@ -1854,6 +1892,9 @@ class CudaGraphManager(torch.nn.Module):
         pg_collection=None,
         inline_capture=False,
         num_warmup_steps=None,
+        is_first_layer: bool | None = None,
+        is_last_layer: bool | None = None,
+        participant_modules: Sequence[torch.nn.Module] | None = None,
     ):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
@@ -1865,9 +1906,18 @@ class CudaGraphManager(torch.nn.Module):
                 `inference_context` is present in the kwargs of the forward call.
                 Setting this argument to True always forces the inline capture path to be taken.
             num_warmup_steps: If set, overrides the per-runner warmup step count.
+            is_first_layer: Optional boundary override for method-level composite graphs.
+            is_last_layer: Optional boundary override for method-level composite graphs.
+            participant_modules: Optional module roots executed by a method-level graph. This
+                limits capture bookkeeping and DDP hooks without changing canonical ownership.
         """
         self._inline_capture = inline_capture
         self._num_warmup_steps = num_warmup_steps
+        self._is_first_layer = is_first_layer
+        self._is_last_layer = is_last_layer
+        self._participant_modules = (
+            None if participant_modules is None else tuple(participant_modules)
+        )
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
@@ -1985,6 +2035,9 @@ class CudaGraphManager(torch.nn.Module):
                         kwargs,
                         self.func,
                         self.need_backward,
+                        is_first_layer=self._is_first_layer,
+                        is_last_layer=self._is_last_layer,
+                        participant_modules=self._participant_modules,
                     )
                     if self._num_warmup_steps is not None:
                         runner.num_warmup_steps = self._num_warmup_steps
@@ -2005,6 +2058,9 @@ class CudaGraphManager(torch.nn.Module):
                     kwargs,
                     self.func,
                     self.need_backward,
+                    is_first_layer=self._is_first_layer,
+                    is_last_layer=self._is_last_layer,
+                    participant_modules=self._participant_modules,
                 )
                 self.cudagraph_runners.append(runner)
 
@@ -2038,9 +2094,17 @@ class CudaGraphManager(torch.nn.Module):
         if _CudagraphGlobalRecord.cudagraph_created:
             if self.training and torch.is_grad_enabled():
                 # Trigger Mcore DDP pre-forward hooks
-                self.call_ddp_preforward_hook(megatron_module)
-                for module in megatron_module.modules():
-                    self.call_ddp_preforward_hook(module)
+                if self._participant_modules is None:
+                    self.call_ddp_preforward_hook(megatron_module)
+                    for module in megatron_module.modules():
+                        self.call_ddp_preforward_hook(module)
+                else:
+                    visited = set()
+                    for participant in self._participant_modules:
+                        for module in participant.modules():
+                            if id(module) not in visited:
+                                visited.add(id(module))
+                                self.call_ddp_preforward_hook(module)
 
             runner = self.get_cudagraph_runner(
                 megatron_module, args, kwargs, self.reuse_cudagraphs, cache_key=cache_key

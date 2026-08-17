@@ -490,17 +490,12 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         probs: torch.Tensor,
         routing_map: torch.Tensor,
-        shared_expert_input: Optional[torch.Tensor] = None,
     ):
         """Preprocess token routing for dispatch.
 
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher.
 
-        Args:
-            shared_expert_input: When ScMoE is active and shared_expert_overlap is enabled,
-                this provides the current layer's hidden states for the shared expert (since
-                hidden_states here is the shortcut/routed input).
         """
         # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
         # expert on its side stream BEFORE fc1_latent_proj so it sees the full
@@ -531,7 +526,7 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs, shared_expert_input=shared_expert_input
+            hidden_states, routing_map, probs
         )
         return hidden_states, probs
 
@@ -629,7 +624,8 @@ class MoELayer(BaseMoELayer):
           1. combine_postprocess (un-permute, weight)
           2. latent projection (if moe_latent_size)
           3. combine with shared and zero expert outputs
-          4. post_norm
+          4. post_norm for standalone shortcut layers. Registered ShortcutMoEBlock pairs
+             apply their transferred post-norm at the outer block boundary.
 
         _latent_shared_expert_output is inference-only (latent-MoE + NVLS dispatcher with
         shared-expert overlap). It is populated in preprocess and joined here, after
@@ -652,22 +648,12 @@ class MoELayer(BaseMoELayer):
             output = output + self._latent_shared_expert_output
             self._latent_shared_expert_output = None
 
-        # Shortcut MoE always normalizes the final combined output.
-        if self.config.moe_shortcut_connection:
+        # Standalone shortcut layers retain local ownership. Registered shortcut pairs transfer
+        # this module to ShortcutMoEBlock, which applies it after the same combine boundary.
+        if self._shortcut_post_norm is not None:
             output = self._shortcut_post_norm(output)
 
         return output
-
-    def shortcut_graph_participants(
-        self,
-    ) -> tuple[tuple[torch.nn.Module, ...], tuple[torch.nn.Parameter, ...]]:
-        """Return modules and standalone parameters used by shortcut postprocess."""
-        modules = []
-        if self.config.moe_latent_size:
-            modules.append(self.fc2_latent_proj)
-        if self.config.moe_shortcut_connection:
-            modules.append(self._shortcut_post_norm)
-        return tuple(modules), ()
 
     def launch_dispatch_async(
         self,
@@ -884,16 +870,7 @@ class MoELayer(BaseMoELayer):
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
                     probs, routing_map = self.route(routed_input, padding_mask)
-                    routed_input, probs = self.preprocess(
-                        routed_input,
-                        probs,
-                        routing_map,
-                        shared_expert_input=(
-                            hidden_states
-                            if (shortcut_input is not None and self.shared_expert_overlap)
-                            else None
-                        ),
-                    )
+                    routed_input, probs = self.preprocess(routed_input, probs, routing_map)
 
                     if intermediate_tensors is not None:
                         return routed_input, probs, shared_expert_output

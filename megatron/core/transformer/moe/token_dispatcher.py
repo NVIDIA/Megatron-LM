@@ -101,7 +101,6 @@ class MoETokenDispatcher:
         tokens: torch.Tensor,
         routing_map: torch.Tensor,
         probs: torch.Tensor,
-        shared_expert_input: Optional[torch.Tensor] = None,
     ):
         """Prepares tokens for dispatch without inter-device communication.
 
@@ -276,7 +275,6 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         hidden_states: torch.Tensor,
         routing_map: torch.Tensor,
         probs: torch.Tensor,
-        shared_expert_input: Optional[torch.Tensor] = None,
     ):
         """Reshapes hidden states and caches the routing map."""
         self.hidden_shape = hidden_states.shape
@@ -633,7 +631,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         hidden_states: torch.Tensor,
         routing_map: torch.Tensor,
         probs: torch.Tensor,
-        shared_expert_input: Optional[torch.Tensor] = None,
     ):
         """Prepares hidden states and probabilities for dispatch.
 
@@ -644,10 +641,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             hidden_states (torch.Tensor): Input token embeddings.
             routing_map (torch.Tensor): The mapping of tokens to experts.
             probs (torch.Tensor): Routing probabilities.
-            shared_expert_input (torch.Tensor, optional): When ScMoE is active, provides
-                the current layer's hidden states for the shared expert overlap path
-                (since hidden_states may be the shortcut input for routing).
-
         Returns:
             A tuple of permuted hidden states and probabilities.
         """
@@ -669,8 +662,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self.preprocess(self.routing_map)
 
         if self.shared_experts is not None:
-            se_input = shared_expert_input if shared_expert_input is not None else hidden_states
-            self.shared_experts.pre_forward_comm(se_input.view(self.hidden_shape))
+            self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
 
         # Permutation 1: input to AlltoAll input
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -1936,7 +1928,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         hidden_states: torch.Tensor,
         routing_map: torch.Tensor,
         probs: torch.Tensor,
-        shared_expert_input: Optional[torch.Tensor] = None,
     ):
         """Initializes routing metadata and prepares tensors for fused dispatch.
 
