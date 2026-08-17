@@ -3152,6 +3152,10 @@ def _add_distributed_args(parser):
                         "Double-buffering the communication memory improves memory management efficiency by "
                         "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
                         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.")
+    group.add_argument('--fsdp-trace-pool', action='store_true',
+                       help="Enable trace-planned temporary-buffer storage for Megatron FSDP v2. "
+                        "The first global batch records buffer lifetimes; later batches reuse fixed slots. "
+                        "This is incompatible with NCCL user buffers/symmetric memory.")
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '

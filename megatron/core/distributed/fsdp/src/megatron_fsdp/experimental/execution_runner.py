@@ -155,6 +155,11 @@ class FsdpExecutionRunner:
         """Whether trace-and-replay prefetch is enabled."""
         return self._use_trace_replay
 
+    @property
+    def has_events_since_boundary(self) -> bool:
+        """Whether execution events were observed since the last completed batch."""
+        return self._events_since_boundary
+
     # ------------------------------------------------------------------
     # Interface 1: record execution events (consume, reshard)
     # ------------------------------------------------------------------
