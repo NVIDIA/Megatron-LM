@@ -356,12 +356,13 @@ class FsdpParameterGroup:
     ) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients.
 
-        For HSDP main_grad rests DP-outer-Partial (Partial where main_weight is
-        Replicate) between microbatches, accumulating each backward through the
-        standard zero_grad contract; the last microbatch reduces the DP-outer axes,
-        finalizing main_grad to main_weight's placements so ``.grad`` is the fully
-        reduced gradient before ``optimizer.step()``. With every axis Flat (plain
-        DP) main_grad already rests finalized.
+        For HSDP/HFSDP main_grad rests DP-outer-Partial between microbatches,
+        accumulating each backward through the standard zero_grad contract; the
+        last microbatch reduces the DP-outer axes, finalizing main_grad to
+        main_weight's placements (all-reduce to Replicate for HSDP, reduce-scatter
+        to Flat for HFSDP) so ``.grad`` is the fully reduced gradient before
+        ``optimizer.step()``. With every axis Flat (plain DP) main_grad already
+        rests finalized.
         """
         assert self.main_grad is not None
 
@@ -371,14 +372,36 @@ class FsdpParameterGroup:
         has_sharded_grads = self._has_sharded_grads()
 
         # A non-accumulation main_grad means the previous step finalized it; this
-        # only happens on the first microbatch. Redistribute it back to the
-        # DP-outer-Partial accumulation placement -- a metadata relabel for HSDP,
-        # and a fresh reduce-scattered buffer for HFSDP in the future.
+        # only happens on the first microbatch. Restore it to the DP-outer-Partial
+        # accumulation placement. HSDP's finalize keeps the buffer size (Replicate
+        # on DP-outer), so relabel it in place; HFSDP's finalize reduce-scattered
+        # DP-outer to a smaller optimizer-sharded buffer, so allocate a fresh one
+        # (zeroed only when we accumulate into it, i.e. sharded grads are still set).
         if self.main_grad.placements != self._accumulation_placements:
             assert self.main_grad.allocation_stream == (
                 torch.cuda.current_stream(self.main_grad.device)
             )
-            self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
+            reset_axis = changed_mesh_axis(self.main_grad.placements, self._accumulation_placements)
+            assert reset_axis is not None  # the placements differ, so an axis changed
+            if isinstance(self.main_grad.placements[reset_axis], Replicate):
+                # HSDP: Replicate -> Partial changes only metadata and reuses the tensor.
+                self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
+            else:
+                # HFSDP: main_grad was reduce-scattered to the optimizer shard, too small
+                # to hold the accumulation, so re-allocate. This runs inside the
+                # reduce_scatter stream context (see FsdpModule._reduce_gradient_groups),
+                # so the buffer is allocated on that stream and stays race-safe. Zero it
+                # only when we accumulate (set_to_none=False); with set_to_none=True the
+                # reduction below overwrites it via out=.
+                self.main_grad = DBuffer(
+                    mesh=self.mesh,
+                    placements=self._accumulation_placements,
+                    tensor_shapes=self.main_weight.layout.tensor_shapes,
+                    dtype=self.main_grad.dtype,
+                    device=self.main_weight.device,
+                )
+                if has_sharded_grads:
+                    self.main_grad.local_buffer.zero_()
 
         can_reduce_into_main_grad = (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype

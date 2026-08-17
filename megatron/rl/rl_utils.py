@@ -648,6 +648,12 @@ def get_rollout_generator(
             request=request,
             parallel_generation_tasks=generation_lag + 1,
         )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Rollout pipeline gate: {_ROLLOUT_PIPELINE.gate.capacity} "
+            f"{submission_granularity}-granularity slots (generation lag {generation_lag}).",
+        )
         _ROLLOUT_GENERATOR = _ROLLOUT_PIPELINE.run()
     return _ROLLOUT_GENERATOR
 

@@ -225,15 +225,16 @@ class RolloutPipeline:
         self.gran_policy = _GranularityConfig.from_request(
             request, [allocation.num_groups for allocation in self.allocations]
         )
+        # Lag may be fractional or negative (>= -1): clamp and round the slot math at granularity.
         self.gate = _SubmissionGate(
-            capacity=parallel_generation_tasks
-            * self.gran_policy.units_per_batch(),
+            capacity=max(
+                1, round(parallel_generation_tasks * self.gran_policy.units_per_batch())
+            ),
             submission=self.gran_policy.submission,
         )
-        self.num_infer_workers = (
-            parallel_generation_tasks
-            * self.gran_policy.num_groups_per_batch
-            * request.rollouts_per_group
+        rollouts_per_batch = self.gran_policy.num_groups_per_batch * request.rollouts_per_group
+        self.num_infer_workers = self.gate.capacity * (
+            rollouts_per_batch // self.gran_policy.units_per_batch()
         )
         if not request.streaming:
             self.num_infer_workers = min(

@@ -256,6 +256,7 @@ class TestRLUtils:
                 captured["agent"] = agent
                 captured["request"] = request
                 captured["parallel_generation_tasks"] = parallel_generation_tasks
+                self.gate = SimpleNamespace(capacity=parallel_generation_tasks)
 
             def run(self):
                 return rollout_generator
@@ -295,6 +296,26 @@ class TestRLUtils:
                 {"rl_generation_lag": 1},
                 "--rl-generation-lag requires --rl-partial-rollouts",
                 id="lag_requires_partial_rollouts",
+            ),
+            pytest.param({"rl_generation_lag": -2}, "must be >= -1", id="lag_below_minimum"),
+            pytest.param(
+                {
+                    "rl_generation_lag": 1,
+                    "rl_max_inflight_requests": 64,
+                    "rl_partial_rollouts": True,
+                },
+                "mutually exclusive",
+                id="lag_and_max_inflight_exclusive",
+            ),
+            pytest.param(
+                {"rl_max_inflight_requests": 128},
+                "requires --rl-partial-rollouts",
+                id="max_inflight_above_batch_requires_partial_rollouts",
+            ),
+            pytest.param(
+                {"rl_max_inflight_requests": 0, "rl_partial_rollouts": True},
+                "must be >= 1",
+                id="max_inflight_below_minimum",
             ),
             pytest.param(
                 {"rl_submission_granularity": "R"},
