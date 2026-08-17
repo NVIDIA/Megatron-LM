@@ -44,8 +44,12 @@ class MegatronAsyncLLM(_MegatronLLMBase):
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
-        inference_wrapper_cls: Type[AbstractModelInferenceWrapper] = GPTInferenceWrapper,
+        inference_wrapper_cls: Optional[Type[AbstractModelInferenceWrapper]] = None,
     ) -> None:
+        # Resolve the default at call time so tests can monkey-patch
+        # ``GPTInferenceWrapper`` on this module.
+        if inference_wrapper_cls is None:
+            inference_wrapper_cls = GPTInferenceWrapper
         # MegatronAsyncLLM requires coordinator mode: direct mode invokes the
         # synchronous ``engine.generate()`` from inside the caller's asyncio
         # loop, which collides with the engine's loop-bound internal state

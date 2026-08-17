@@ -2827,8 +2827,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Reset VLM data.
-        self._request_to_image_embeddings.clear()
-        self._request_to_image_token_mask.clear()
+        # Guarded because tests can construct via __new__ and skip __init__.
+        getattr(self, "_request_to_image_embeddings", {}).clear()
+        getattr(self, "_request_to_image_token_mask", {}).clear()
         self._request_to_image_token_count.clear()
 
     def reset(

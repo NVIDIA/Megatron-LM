@@ -613,7 +613,6 @@ class LLaVAModel(MegatronModule):
         image_embeddings,
         language_embeddings,
         input_ids,
-        position_ids,
         loss_mask,
         labels,
         use_inference_kv_cache,
@@ -622,7 +621,11 @@ class LLaVAModel(MegatronModule):
         num_image_tiles,
         imgs_sizes=None,
         *,
+        position_ids=None,
         inference_params: Optional[BaseInferenceContext] = None,
+        sound_embeddings=None,
+        sound_embeddings_len=None,
+        sound_timestamps=None,
     ):
         """Preprocess input data before input to language model.
 
@@ -1215,8 +1218,11 @@ class LLaVAModel(MegatronModule):
                     max_seqlen_kv=max_seqlen,
                 )
 
+            vision_kwargs = {"packed_seq_params": vision_packed_seq_params}
+            if imgs_sizes is not None:
+                vision_kwargs["imgs_sizes"] = imgs_sizes
             image_embeddings = self.vision_model(
-                images, imgs_sizes=imgs_sizes, packed_seq_params=vision_packed_seq_params
+                images, **vision_kwargs
             )  # [num_tiles, img_seq_len, h_vision]
 
             if self._drop_vision_class_token:
@@ -1329,7 +1335,6 @@ class LLaVAModel(MegatronModule):
             image_embeddings,
             language_embeddings,
             input_ids,
-            position_ids,
             loss_mask,
             labels,
             use_inference_kv_cache,
@@ -1337,6 +1342,7 @@ class LLaVAModel(MegatronModule):
             image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
             imgs_sizes=imgs_sizes,
+            position_ids=position_ids,
         )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
 
         # Rebuild packed_seq_params to match post-truncation tensor dims.

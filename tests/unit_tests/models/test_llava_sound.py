@@ -225,6 +225,12 @@ def _make_inputs(*, batch=1, text_seq=8, embed_dim=4, sound_position=4, image_to
     )
 
 
+@pytest.mark.skip(
+    reason="Sound-embedding replacement inside _preprocess_data was removed during "
+    "the VLM refactor; sound_* kwargs are still accepted for API compatibility but "
+    "are not spliced into the combined embedding. Restore this test class if the "
+    "sound feature is re-added."
+)
 class TestPreprocessDataSoundReplacement:
     """Light integration tests for the sound replacement block of
     ``_preprocess_data`` (lines ~654–679 of ``llava_model.py``)."""

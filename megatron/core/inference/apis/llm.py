@@ -45,8 +45,15 @@ class MegatronLLM(_MegatronLLMBase):
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
-        inference_wrapper_cls: Type[AbstractModelInferenceWrapper] = GPTInferenceWrapper,
+        inference_wrapper_cls: Optional[Type[AbstractModelInferenceWrapper]] = None,
     ) -> None:
+        # Resolve the default at call time so tests can monkey-patch
+        # ``GPTInferenceWrapper`` on this module. Binding it as the argument
+        # default would freeze the reference at import time and bypass the
+        # patch, which is why the previous ``= None`` version tripped
+        # ``None(model, context)``.
+        if inference_wrapper_cls is None:
+            inference_wrapper_cls = GPTInferenceWrapper
         super().__init__(
             model=model,
             tokenizer=tokenizer,
