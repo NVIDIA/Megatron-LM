@@ -2007,6 +2007,13 @@ class TransformerConfig(ModelParallelConfig):
                         "fused_group_mlp offloads the whole fused grouped MLP and cannot be "
                         f"combined with expert_fc1 or moe_act. Remove: {moe_partial_offload}"
                     )
+
+        if self.gdp_cutedsl_kernel:
+            assert 0 <= self.gdp_num_chunk_states_to_recompute <= 64, (
+                "gdp_num_chunk_states_to_recompute must be in range [0, 64], got "
+                f"{self.gdp_num_chunk_states_to_recompute}."
+            )
+
         if self.gtp_remat_opt_in_modules:
             _allowed_gtp_remat_opt_in_modules = {"moe_latent_proj"}
             invalid = set(self.gtp_remat_opt_in_modules) - _allowed_gtp_remat_opt_in_modules
