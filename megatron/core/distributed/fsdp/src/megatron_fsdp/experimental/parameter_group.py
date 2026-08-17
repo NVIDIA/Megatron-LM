@@ -497,7 +497,7 @@ class FsdpParameterGroup:
         return main_grad
 
     def prepare_fused_wgrad_buffer(self) -> None:
-        """Allocate and initialize the full gradient target before layer backward.
+        """Allocate the full gradient target before layer backward.
 
         The target is allocated on the current compute stream because TE writes its
         GEMM output there. It is fresh for every backward; reduced gradients continue
@@ -518,9 +518,6 @@ class FsdpParameterGroup:
             dtype=self._partial_grad_dtype,
             device=self.main_weight.device,
         )
-        # One group-level initialization covers skipped parameters and zero-token
-        # experts whose fused kernels may not write every logical weight.
-        self._fused_wgrad_buffer.local_buffer.zero_()
         for fsdp_parameter in self.fsdp_parameters:
             parameter = fsdp_parameter.unsharded
             parameter.grad_added_to_main_grad = False
@@ -595,7 +592,12 @@ class FsdpParameterGroup:
                 destinations.append(partial_grad.get_local_tensor(index))
                 sources.append(parameter.grad)
                 parameter.grad = None
-            elif not self.fuse_wgrad_accumulation:
+            elif self.fuse_wgrad_accumulation:
+                # TE overwrites every fused view and ordinary autograd gradients
+                # overwrite their views below. Initialize only an exceptional view
+                # that neither path produced instead of clearing the whole buffer.
+                partial_grad.get_local_tensor(index).zero_()
+            else:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
 
             if hasattr(parameter, "grad_added_to_main_grad"):

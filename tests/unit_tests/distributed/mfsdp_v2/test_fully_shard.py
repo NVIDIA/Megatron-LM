@@ -343,6 +343,46 @@ def test_fused_wgrad_mixed_group_matches_baseline(distributed_setup, mixed_wgrad
     torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
 
 
+def test_fused_wgrad_zero_token_expert_overwrites_staging_buffer(distributed_setup):
+    """A zero-token TE grouped GEMM must overwrite its poisoned wgrad view with zero."""
+    import transformer_engine.pytorch as te
+
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    layer = te.GroupedLinear(
+        num_gemms=2,
+        in_features=8,
+        out_features=8,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        device=device,
+        fuse_wgrad_accumulation=True,
+    )
+    with fully_shard_context(device=device):
+        fully_shard(layer, mesh=mesh, placements=_flat_placements(), fuse_wgrad_accumulation=True)
+
+    def poison_staging_buffer(module, _grad_output):
+        for parameter_group in module.parameter_groups:
+            assert parameter_group._fused_wgrad_buffer is not None
+            parameter_group._fused_wgrad_buffer.local_buffer.fill_(torch.nan)
+
+    # FSDP's hook was registered by fully_shard() first, so the staging buffer
+    # exists before this hook poisons it and TE's backward overwrites its views.
+    layer.register_full_backward_pre_hook(poison_staging_buffer)
+
+    inputs = torch.randn(4, 8, dtype=torch.bfloat16, device=device, requires_grad=True)
+    layer(inputs, [0, 4]).sum().backward()
+
+    active_grad = layer.weight1.grad.to_local()
+    zero_token_grad = layer.weight0.grad.to_local()
+    assert torch.isfinite(active_grad).all()
+    assert torch.count_nonzero(zero_token_grad) == 0
+
+
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
 def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup, use_reentrant):
     """Activation recomputation should leave every FSDP module resharded.
