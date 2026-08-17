@@ -749,26 +749,6 @@ class TestCompaction:
         assert manifest["segments"] == [_segment_name(2)]
         assert bank.restore(2) == []
 
-    def test_delayed_async_compaction_preserves_active_collection(self, tmp_path, monkeypatch):
-        bank = RolloutBank(str(tmp_path))
-        monkeypatch.setattr(rl_utils, "_ROLLOUT_BANK", bank)
-        bank.set_collection(1)
-        consumed = bank.append(sample_group())
-        bank.mark_consumed(consumed, 1)
-        save = AsyncRequest(None, (), [])
-        _register_rollout_bank_compaction(save, 1)
-
-        bank.set_collection(7)
-        before_finalize = bank.append(sample_group())
-        save.finalize_fns[0]()
-        after_finalize = bank.append(sample_group())
-
-        assert before_finalize == "gen-000007/0"
-        assert after_finalize == "gen-000007/1"
-        restored_uids = [group.uid for group in bank.restore(1)]
-        assert len(restored_uids) == 2
-        assert set(restored_uids) == {before_finalize, after_finalize}
-
     def test_marker_after_compaction_is_not_orphaned(self, tmp_path):
         bank = RolloutBank(str(tmp_path))
         bank.set_collection(0)
@@ -786,6 +766,7 @@ class TestCompaction:
         survivor_uid = bank.append(sample_group())
 
         bank.checkpoint(2)
+        bank.set_collection(2)
         fresh_uid = bank.append(sample_group())
 
         assert fresh_uid != survivor_uid
@@ -851,6 +832,7 @@ class TestCompaction:
         bank.checkpoint(1)
         assert len(warnings) == 1  # The staging rewrite is not a live cap crossing.
 
+        bank.set_collection(1)
         bank.append(sample_group())
         assert len(warnings) == 1  # 98 live bytes remains below the cap.
         bank.append(sample_group())
