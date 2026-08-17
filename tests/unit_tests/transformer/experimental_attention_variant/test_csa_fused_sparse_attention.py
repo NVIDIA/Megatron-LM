@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for ``megatron.core.transformer.experimental_attention_variant.csa_kernels``.
+"""Unit tests for fused compressed sparse attention integration.
 
 Coverage:
 
@@ -28,11 +28,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant import csa_kernels as dk
-from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    fused_sparse_attention as dk,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.csa_teacher_lse import (
+    can_use_fused_csa_teacher_lse,
+    fused_csa_teacher_lse,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
     CSASparseAttnFunc,
     FusedCSAIndexerSparseAttnFromTopkFunc,
     FusedCSAIndexerSparseAttnFunc,
+    _compute_csa_non_compressed_lse,
+    _compute_dense_csa_teacher_lse,
     _csa_fwd_flash_mla,
     _ensure_dsa_namespace,
     _ensure_flash_mla,
@@ -85,6 +93,13 @@ def _make_local_idxs(b: int, sq: int, topk: int, *, with_invalid: bool = False) 
         mask = torch.arange(topk).view(1, 1, topk) % 2 == 1
         base = torch.where(mask.expand(b, sq, topk), torch.full_like(base, -1), base)
     return base
+
+
+def _mock_compactify(global_idxs: torch.Tensor):
+    """Stable PyTorch reference for the mocked cuDNN compactify wrapper."""
+    valid = global_idxs >= 0
+    order = valid.int().argsort(dim=-1, descending=True, stable=True)
+    return {'indices': global_idxs.gather(-1, order), 'topk_length': valid.sum(dim=-1).int()}
 
 
 def _uniform_dist(B, S, K, dev):
@@ -285,6 +300,255 @@ class TestBuildFlatTopkIdxs:
         assert torch.equal(
             len_cpu, len_cuda.cpu()
         ), "(b) length tensor differs between CPU fallback and cuDNN kernel"
+
+
+# ---------------------------------------------------------------------------
+# CSA teacher LSE helpers
+# ---------------------------------------------------------------------------
+
+
+class TestCsaTeacherLse:
+    """Full-denominator teacher LSE helpers; CPU execution is sufficient."""
+
+    def test_non_compressed_lse_includes_window_and_sink(self):
+        query = torch.tensor([[[1.0, 0.0], [0.0, 1.0]], [[0.5, 0.5], [1.0, -1.0]]])
+        kv_full = torch.tensor([[1.0, 0.0], [0.0, 2.0], [2.0, -1.0]])
+        window_indices = torch.tensor([[0, -1], [1, 2]], dtype=torch.int32)
+        sink = torch.tensor([0.25, -0.5])
+
+        actual = _compute_csa_non_compressed_lse(
+            query, kv_full, sink, window_indices, softmax_scale=0.5
+        )
+
+        gathered = kv_full.index_select(0, window_indices.clamp_min(0).reshape(-1)).reshape(2, 2, 2)
+        logits = torch.einsum("rhd,rkd->rhk", query, gathered) * 0.5
+        logits = logits.masked_fill((window_indices < 0).unsqueeze(1), float("-inf"))
+        expected = torch.logaddexp(torch.logsumexp(logits, dim=-1), sink.view(1, -1))
+        torch.testing.assert_close(actual, expected)
+
+        all_invalid = torch.full_like(window_indices, -1)
+        sink_only = _compute_csa_non_compressed_lse(
+            query, kv_full, sink, all_invalid, softmax_scale=0.5
+        )
+        torch.testing.assert_close(sink_only, sink.view(1, -1).expand_as(sink_only))
+
+
+class TestFusedCsaTeacherLse:
+    """Triton online-LSE kernels match the score-matrix reference."""
+
+    @staticmethod
+    def _require_kernel(query, full_kv, compressed_kv, sink, window_indices):
+        if not can_use_fused_csa_teacher_lse(query, full_kv, compressed_kv, sink, window_indices):
+            pytest.skip("Triton CSA teacher-LSE kernel is unavailable")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_sbhd_matches_eager_reference(self):
+        torch.manual_seed(123)
+        device = "cuda"
+        seqlen_q, batch, num_heads, head_dim = 17, 2, 16, 32
+        seqlen_full, seqlen_compressed, window_width, ratio = 23, 9, 5, 3
+        scale = head_dim**-0.5
+
+        query = torch.randn(
+            seqlen_q, batch, num_heads, head_dim, device=device, dtype=torch.bfloat16
+        )
+        full_kv = torch.randn(seqlen_full, batch, head_dim, device=device, dtype=torch.bfloat16)
+        compressed_kv = torch.randn(
+            batch, seqlen_compressed, head_dim, device=device, dtype=torch.bfloat16
+        )
+        sink = torch.randn(num_heads, device=device, dtype=torch.float32)
+        window_local = torch.randint(
+            0, seqlen_full, (batch, seqlen_q, window_width), device=device, dtype=torch.int32
+        )
+        window_local[:, ::4, -1] = -1
+        window_global = local_to_global_flat(window_local, batch)
+        query_flat = query.reshape(seqlen_q * batch, num_heads, head_dim)
+        full_kv_flat = full_kv.reshape(seqlen_full * batch, head_dim)
+        self._require_kernel(query_flat, full_kv_flat, compressed_kv, sink, window_global)
+
+        actual = fused_csa_teacher_lse(
+            query_flat,
+            full_kv_flat,
+            compressed_kv,
+            sink,
+            window_global,
+            scale,
+            ratio,
+            batch_size=batch,
+            seqlen_q=seqlen_q,
+        )
+
+        non_compressed = _compute_csa_non_compressed_lse(
+            query_flat, full_kv_flat, sink, window_global, scale
+        )
+        non_compressed = (
+            non_compressed.reshape(seqlen_q, batch, num_heads).permute(1, 0, 2).contiguous()
+        )
+        expected = _compute_dense_csa_teacher_lse(
+            query.permute(1, 0, 2, 3).contiguous(), compressed_kv, non_compressed, scale, ratio
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
+
+        empty_window = window_global[:, :0]
+        sink_lse = sink.view(1, 1, num_heads).expand(batch, seqlen_q, num_heads)
+        sink_and_compressed_expected = _compute_dense_csa_teacher_lse(
+            query.permute(1, 0, 2, 3).contiguous(), compressed_kv, sink_lse, scale, ratio
+        )
+        sink_and_compressed_actual = fused_csa_teacher_lse(
+            query_flat,
+            full_kv_flat,
+            compressed_kv,
+            sink,
+            empty_window,
+            scale,
+            ratio,
+            batch_size=batch,
+            seqlen_q=seqlen_q,
+        )
+        torch.testing.assert_close(
+            sink_and_compressed_actual, sink_and_compressed_expected, atol=2e-2, rtol=1e-2
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_matches_eager_reference_with_offsets(self):
+        torch.manual_seed(456)
+        device = "cuda"
+        query_lengths = [5, 7]
+        full_kv_lengths = [8, 10]
+        compressed_lengths = [3, 4]
+        num_heads, head_dim, window_width, ratio = 16, 32, 4, 2
+        total_q = sum(query_lengths)
+        scale = head_dim**-0.5
+
+        query = torch.randn(total_q, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+        full_kv = torch.randn(sum(full_kv_lengths), head_dim, device=device, dtype=torch.bfloat16)
+        compressed_kv = torch.randn(
+            sum(compressed_lengths), head_dim, device=device, dtype=torch.bfloat16
+        )
+        sink = torch.randn(num_heads, device=device, dtype=torch.float32)
+        cu_q = _make_cu_seqlens(query_lengths, device=device)
+        cu_full = _make_cu_seqlens(full_kv_lengths, device=device)
+        cu_compressed = _make_cu_seqlens(compressed_lengths, device=device)
+        q_offsets = torch.tensor([1, 0], device=device, dtype=torch.int32)
+
+        window_global = torch.empty(total_q, window_width, device=device, dtype=torch.int32)
+        query_start = 0
+        for sequence, query_length in enumerate(query_lengths):
+            local = torch.randint(
+                0,
+                full_kv_lengths[sequence],
+                (query_length, window_width),
+                device=device,
+                dtype=torch.int32,
+            )
+            window_global[query_start : query_start + query_length] = local + cu_full[sequence]
+            query_start += query_length
+        window_global[::3, -1] = -1
+        self._require_kernel(query, full_kv, compressed_kv, sink, window_global)
+
+        actual = fused_csa_teacher_lse(
+            query,
+            full_kv,
+            compressed_kv,
+            sink,
+            window_global,
+            scale,
+            ratio,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_compressed,
+            max_seqlen_q=max(query_lengths),
+            max_seqlen_k=max(compressed_lengths),
+            q_causal_offsets=q_offsets,
+        )
+
+        non_compressed = _compute_csa_non_compressed_lse(query, full_kv, sink, window_global, scale)
+        expected = _compute_dense_csa_teacher_lse(
+            query,
+            compressed_kv,
+            non_compressed,
+            scale,
+            ratio,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_compressed,
+            max_seqlen_q=max(query_lengths),
+            max_seqlen_kv=max(compressed_lengths),
+            q_causal_offsets=q_offsets,
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
+
+
+class TestDenseCsaTeacherLseReference:
+    """Eager compressed-key LSE reference for SBHD and THD."""
+
+    def test_dense_sbhd_lse_adds_every_causal_compressed_key(self):
+        query = torch.tensor(
+            [
+                [
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    [[1.0, 1.0], [1.0, -1.0]],
+                    [[0.5, 1.0], [-1.0, 0.5]],
+                    [[2.0, -1.0], [0.25, 0.75]],
+                ]
+            ]
+        )
+        compressed_kv = torch.tensor([[[1.0, 0.0], [0.0, 2.0]]])
+        non_compressed_lse = torch.tensor([[[0.25, -0.5], [0.5, 0.75], [-0.25, 0.0], [1.0, -1.0]]])
+
+        actual = _compute_dense_csa_teacher_lse(
+            query, compressed_kv, non_compressed_lse, softmax_scale=0.5, ratio=2
+        )
+
+        expected = torch.empty_like(actual)
+        for q_pos in range(query.shape[1]):
+            visible = (q_pos + 1) // 2
+            if visible == 0:
+                compressed_lse = torch.full((query.shape[2],), float("-inf"))
+            else:
+                logits = (
+                    torch.einsum("hd,kd->hk", query[0, q_pos], compressed_kv[0, :visible]) * 0.5
+                )
+                compressed_lse = torch.logsumexp(logits, dim=-1)
+            expected[0, q_pos] = torch.logaddexp(non_compressed_lse[0, q_pos], compressed_lse)
+        torch.testing.assert_close(actual, expected)
+
+    def test_dense_thd_lse_honors_segment_offsets(self):
+        query = torch.tensor(
+            [[[1.0], [2.0]], [[2.0], [1.0]], [[3.0], [0.5]], [[1.5], [-1.0]], [[0.25], [4.0]]]
+        )
+        compressed_kv = torch.tensor([[1.0], [2.0], [3.0]])
+        cu_q = torch.tensor([0, 2, 5], dtype=torch.int32)
+        cu_k = torch.tensor([0, 1, 3], dtype=torch.int32)
+        q_offsets = torch.tensor([1, 0], dtype=torch.int32)
+        non_compressed_lse = torch.arange(10, dtype=torch.float32).reshape(5, 2) * 0.1
+
+        actual = _compute_dense_csa_teacher_lse(
+            query,
+            compressed_kv,
+            non_compressed_lse,
+            softmax_scale=0.25,
+            ratio=2,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_k,
+            max_seqlen_q=3,
+            max_seqlen_kv=2,
+            q_causal_offsets=q_offsets,
+        )
+
+        expected = torch.empty_like(actual)
+        for row in range(query.shape[0]):
+            batch = 0 if row < 2 else 1
+            q_pos = row - int(cu_q[batch])
+            visible = min(
+                (q_pos + int(q_offsets[batch]) + 1) // 2, int(cu_k[batch + 1] - cu_k[batch])
+            )
+            keys = compressed_kv[int(cu_k[batch]) : int(cu_k[batch]) + visible]
+            if visible == 0:
+                compressed_lse = torch.full((query.shape[1],), float("-inf"))
+            else:
+                logits = torch.einsum("hd,kd->hk", query[row], keys) * 0.25
+                compressed_lse = torch.logsumexp(logits, dim=-1)
+            expected[row] = torch.logaddexp(non_compressed_lse[row], compressed_lse)
+        torch.testing.assert_close(actual, expected)
 
 
 # ---------------------------------------------------------------------------
@@ -908,6 +1172,7 @@ def _install_full_dsa_mock(
         target_fn = predict_fn
 
     fake_dsa = MagicMock(name='_DSA_full_stub')
+    fake_dsa.compactify_wrapper.side_effect = _mock_compactify
 
     def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio):
         return {'scores': torch.zeros(b, sq, n_comp, dtype=torch.float32, device=q_bshd.device)}
@@ -1025,6 +1290,7 @@ def _install_full_dsa_mock_dense(
         )
 
     fake_dsa = MagicMock(name='_DSA_full_dense_stub')
+    fake_dsa.compactify_wrapper.side_effect = _mock_compactify
 
     def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio):
         return {'scores': torch.zeros(b, sq, n_comp, dtype=torch.float32, device=q_bshd.device)}
@@ -1212,7 +1478,8 @@ class TestFusedIndexerSparseAttn:
 
         # ---- (a) forward pass-through (no grads needed) ------------------
         inputs = self._make_inputs()
-        _, flash_stub_a = _install_full_dsa_mock(
+        inputs['window_idxs'][..., ::2] = -1
+        fake_dsa_a, flash_stub_a = _install_full_dsa_mock(
             b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
         )
         output_a, _ = fused_csa_indexer_sparse_attn(
@@ -1231,12 +1498,32 @@ class TestFusedIndexerSparseAttn:
             s['sq'], s['b'], s['np_'] * s['d']
         )
         assert torch.equal(output_a, expected_a), "(a) forward value pass-through"
+        target_lse = fake_dsa_a.sparse_attn_score_recompute_wrapper.call_args.args[2]
+        expected_target_lse = (
+            torch.logaddexp(flash_stub_a.last_lse, inputs['attn_sink'].view(1, s['np_']))
+            .reshape(s['sq'], s['b'], s['np_'])
+            .permute(1, 0, 2)
+        )
+        torch.testing.assert_close(target_lse, expected_target_lse)
+        assert (
+            flash_stub_a.call_args.kwargs['indexer_topk'] == 0
+        ), "(a) partial indexer LSE should not be requested"
+        expected_topk_length = torch.full(
+            (s['sq'] * s['b'],),
+            2 + inputs['window_idxs'].shape[-1] // 2,
+            dtype=torch.int32,
+            device='cuda',
+        )
+        torch.testing.assert_close(
+            flash_stub_a.call_args.kwargs['topk_length'], expected_topk_length
+        )
 
         # ---- (b) backward grad propagation -------------------------------
         dk._DSA = None  # fresh mocks
         dk._flash_mla_sparse_fwd = None
         inputs_b = self._make_inputs(requires_grad=True)
-        _install_full_dsa_mock(
+        inputs_b['window_idxs'][..., ::2] = -1
+        fake_dsa_b, _ = _install_full_dsa_mock(
             b=s['b'],
             sq=s['sq'],
             np_=s['np_'],
@@ -1275,6 +1562,11 @@ class TestFusedIndexerSparseAttn:
                 f"(b) {name}: grad does not equal full({value}); "
                 f"got first elem = {grad.float().flatten()[0].item()}"
             )
+        attn_bwd_call = fake_dsa_b.sparse_attention_backward_wrapper.call_args
+        torch.testing.assert_close(attn_bwd_call.kwargs['topk_length'], expected_topk_length)
+        assert torch.all(
+            attn_bwd_call.args[6] >= 0
+        ), "(b) ignored backward slots were not sanitized"
 
         # ---- (c) indexer_topk > n_comp clamp -----------------------------
         dk._DSA = None
@@ -1417,7 +1709,7 @@ class TestDenseFusedIndexerSparseAttn:
         ), f"got {indexer_loss.item()}, expected {expected}"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_dense_path_fwd_kernel_calls_and_bwd_grads(self, reset_lazy_kernel_state):
+    def test_dense_path_fwd_kernel_calls_and_bwd_grads(self, reset_lazy_kernel_state, monkeypatch):
         """Combined coverage for the dense-loss path's two non-numerical
         properties (assertion blocks self-label on failure):
 
@@ -1437,9 +1729,21 @@ class TestDenseFusedIndexerSparseAttn:
         softmax_scale = 0.5
         idx_scale = 0.125
         loss_coeff = 1.0
+        expected_teacher_lse = torch.full(
+            (s['b'], s['sq'], s['np_']), 37.0, dtype=torch.float32, device='cuda'
+        )
+        teacher_window_indices = []
+
+        def fake_dense_teacher_lse(*args, **kwargs):
+            teacher_window_indices.append(args[5].detach().clone())
+            del args, kwargs
+            return expected_teacher_lse
+
+        monkeypatch.setattr(dk, '_compute_full_csa_teacher_lse', fake_dense_teacher_lse)
 
         # ---- (a) forward kernel selection + arg shapes -------------------
         inputs_a = self._make_inputs()
+        inputs_a['window_idxs'][..., ::2] = -1
         fake_dsa_a, _ = _install_full_dsa_mock_dense(
             b=s['b'], sq=s['sq'], np_=s['np_'], d=s['d'], n_comp=s['n_comp'], idx_nh=s['idx_nh']
         )
@@ -1470,9 +1774,15 @@ class TestDenseFusedIndexerSparseAttn:
             s['d'],
         ), "(a) dense attn score: k shape (h_kv=1)"
         assert lse_arg.shape == (s['b'], s['sq'], s['np_']), "(a) dense attn score: lse shape"
+        assert torch.equal(
+            lse_arg, expected_teacher_lse
+        ), "(a) dense path did not use full teacher LSE"
         assert sm_arg == softmax_scale, "(a) dense attn score: positional softmax_scale"
         assert attn_call.kwargs['qhead_per_kv_head'] == s['np_']
         assert attn_call.kwargs['ratio'] == ratio
+        torch.testing.assert_close(
+            teacher_window_indices[0], local_to_global_flat(inputs_a['window_idxs'], s['b'])
+        )
 
         # ---- (b) forward-eager indexer backward + grad propagation --------
         dk._DSA = None
@@ -1527,15 +1837,258 @@ class TestDenseFusedIndexerSparseAttn:
             ), f"(b) {name}: grad does not equal full({value})"
 
 
+class TestFusedIndexerSparseAttnFromTopk:
+    """Full-denominator plumbing for the caller-supplied top-k fused path."""
+
+    @staticmethod
+    def _inputs():
+        total_q, num_heads, head_dim = 4, 2, 2
+        idx_heads, idx_dim, total_comp = 2, 3, 2
+        return dict(
+            query=torch.randn(total_q, num_heads, head_dim),
+            kv_full=torch.randn(6, head_dim),
+            attn_sink=torch.tensor([0.25, -0.5]),
+            topk_idxs=torch.tensor([[4, 0], [4, 1], [5, 2], [5, 3]], dtype=torch.int32),
+            q_indexer=torch.randn(total_q, idx_heads, idx_dim),
+            k_indexer=torch.randn(total_comp, idx_dim),
+            weights=torch.randn(total_q, idx_heads),
+            indexer_topk_idxs=torch.tensor([[0], [0], [1], [1]], dtype=torch.int32),
+            compressed_kv=torch.randn(total_comp, head_dim),
+        )
+
+    def test_sparse_loss_uses_full_flash_lse_plus_sink(self, monkeypatch):
+        inputs = self._inputs()
+        inputs['topk_idxs'][1, 0] = -1
+        total_q, num_heads, _ = inputs['query'].shape
+        full_lse = torch.arange(total_q * num_heads, dtype=torch.float32).reshape(
+            total_q, num_heads
+        )
+        partial_lse = full_lse + 100.0
+        seen = {}
+
+        def fake_flash(
+            query,
+            kv_full,
+            topk_idxs,
+            softmax_scale,
+            d_v=512,
+            attn_sink=None,
+            topk_length=None,
+            indexer_topk=0,
+        ):
+            del kv_full, softmax_scale, d_v, attn_sink
+            seen['indexer_topk'] = indexer_topk
+            seen['attention_topk'] = topk_idxs.detach().clone()
+            seen['topk_length'] = topk_length.detach().clone()
+            return torch.zeros_like(query), full_lse, partial_lse
+
+        class FakeDSA:
+            @staticmethod
+            def sparse_indexer_score_recompute_wrapper(q, k, w, topk, **kwargs):
+                del q, k, w, kwargs
+                return {'predict': torch.ones_like(topk, dtype=torch.float32)}
+
+            @staticmethod
+            def sparse_attn_score_recompute_wrapper(q, k, lse, topk, scale, **kwargs):
+                del q, k, scale, kwargs
+                seen['teacher_lse'] = lse.detach().clone()
+                return {'target': torch.ones_like(topk, dtype=torch.float32)}
+
+            @staticmethod
+            def indexer_backward_wrapper(q, w, k, *args, **kwargs):
+                del args, kwargs
+                return {
+                    'd_index_q': torch.zeros_like(q),
+                    'd_weights': torch.zeros_like(w),
+                    'd_index_k': torch.zeros_like(k),
+                }
+
+        monkeypatch.setattr(dk, '_ensure_dsa_namespace', lambda: None)
+        monkeypatch.setattr(dk, '_csa_fwd_flash_mla', fake_flash)
+        monkeypatch.setattr(dk, '_DSA', FakeDSA)
+
+        FusedCSAIndexerSparseAttnFromTopkFunc.apply(
+            *inputs.values(),
+            1.0,
+            1.0,
+            1.0,
+            float(total_q),
+            True,
+            2,
+            total_q,
+            (
+                torch.tensor([0, total_q], dtype=torch.int32),
+                torch.tensor([0, inputs['k_indexer'].shape[0]], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+            ),
+            None,
+        )
+
+        expected = torch.logaddexp(full_lse, inputs['attn_sink'].view(1, num_heads)).unsqueeze(0)
+        torch.testing.assert_close(seen['teacher_lse'], expected)
+        assert seen['indexer_topk'] == 0
+        expected_attention_topk = torch.tensor([[4, 0], [1, -1], [5, 2], [5, 3]], dtype=torch.int32)
+        torch.testing.assert_close(seen['attention_topk'], expected_attention_topk)
+        torch.testing.assert_close(
+            seen['topk_length'], torch.tensor([2, 1, 2, 2], dtype=torch.int32)
+        )
+
+    def test_dense_loss_passes_recomputed_full_teacher_lse(self, monkeypatch):
+        inputs = self._inputs()
+        total_q, num_heads, _ = inputs['query'].shape
+        max_seqlen_k = 2
+        sentinel_lse = torch.full((total_q, num_heads), 37.0)
+        seen = {}
+
+        def fake_flash(query, *args, **kwargs):
+            del args, kwargs
+            return torch.zeros_like(query), torch.zeros(total_q, num_heads), None
+
+        def fake_non_compressed(query, kv_full, sink, window_indices, scale):
+            del query, kv_full, sink, scale
+            torch.testing.assert_close(window_indices, inputs['topk_idxs'][:, 1:])
+            return torch.full((total_q, num_heads), 5.0)
+
+        def fake_dense_teacher(query, compressed_kv, non_compressed_lse, *args, **kwargs):
+            del query, compressed_kv, args, kwargs
+            torch.testing.assert_close(non_compressed_lse, torch.full((total_q, num_heads), 5.0))
+            seen['dense_teacher_called'] = True
+            return sentinel_lse
+
+        class FakeDSA:
+            @staticmethod
+            def dense_indexer_score_recompute_wrapper(q, k, w, **kwargs):
+                del q, k, w, kwargs
+                return {
+                    'out': torch.zeros(total_q, max_seqlen_k, dtype=torch.float32),
+                    'denom': torch.zeros(total_q, dtype=torch.float32),
+                }
+
+            @staticmethod
+            def dense_attn_score_recompute_wrapper(q, k, lse, scale, **kwargs):
+                del q, k, scale, kwargs
+                seen['teacher_lse'] = lse.detach().clone()
+                return {
+                    'out': torch.full((total_q, max_seqlen_k), 0.5),
+                    'denom': torch.ones(total_q),
+                }
+
+            @staticmethod
+            def dense_indexer_backward_wrapper(q, w, k, *args, **kwargs):
+                del args, kwargs
+                return {
+                    'd_index_q': torch.zeros_like(q),
+                    'd_weights': torch.zeros_like(w),
+                    'd_index_k': torch.zeros_like(k),
+                }
+
+        monkeypatch.setattr(dk, '_ensure_dsa_namespace', lambda: None)
+        monkeypatch.setattr(dk, '_csa_fwd_flash_mla', fake_flash)
+        monkeypatch.setattr(dk, '_compute_csa_non_compressed_lse', fake_non_compressed)
+        monkeypatch.setattr(dk, '_compute_dense_csa_teacher_lse', fake_dense_teacher)
+        monkeypatch.setattr(dk, '_DSA', FakeDSA)
+
+        FusedCSAIndexerSparseAttnFromTopkFunc.apply(
+            *inputs.values(),
+            1.0,
+            1.0,
+            1.0,
+            float(total_q),
+            False,
+            2,
+            total_q,
+            (
+                torch.tensor([0, total_q], dtype=torch.int32),
+                torch.tensor([0, max_seqlen_k], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+            ),
+            None,
+        )
+
+        assert seen['dense_teacher_called']
+        torch.testing.assert_close(seen['teacher_lse'], sentinel_lse)
+
+    def test_backward_reuses_compact_indices_and_length(self, monkeypatch):
+        inputs = self._inputs()
+        inputs['topk_idxs'][1] = -1
+        for name in ('query', 'kv_full', 'attn_sink', 'q_indexer', 'k_indexer', 'weights'):
+            inputs[name].requires_grad_(True)
+
+        total_q, num_heads, _ = inputs['query'].shape
+        q_padding_mask = torch.tensor([False, True, False, False])
+        seen = {}
+
+        def fake_flash(query, *args, **kwargs):
+            del args, kwargs
+            return torch.zeros_like(query), torch.full((total_q, num_heads), 3.0), None
+
+        class FakeDSA:
+            @staticmethod
+            def sparse_indexer_score_recompute_wrapper(q, k, w, topk, **kwargs):
+                del q, k, w, kwargs
+                return {'predict': torch.ones_like(topk, dtype=torch.float32)}
+
+            @staticmethod
+            def sparse_attn_score_recompute_wrapper(q, k, lse, topk, scale, **kwargs):
+                del q, k, lse, scale, kwargs
+                return {'target': torch.ones_like(topk, dtype=torch.float32)}
+
+            @staticmethod
+            def sparse_attention_backward_wrapper(
+                q, kv, out, dO, lse, sink, topk, *, softmax_scale, topk_length
+            ):
+                del out, softmax_scale
+                seen['topk'] = topk.detach().clone()
+                seen['topk_length'] = topk_length.detach().clone()
+                seen['dO'] = dO.detach().clone()
+                seen['lse'] = lse.detach().clone()
+                return {
+                    'dq': torch.zeros_like(q),
+                    'dkv': torch.zeros_like(kv),
+                    'd_sink': torch.zeros_like(sink),
+                }
+
+        monkeypatch.setattr(dk, '_ensure_dsa_namespace', lambda: None)
+        monkeypatch.setattr(dk, '_csa_fwd_flash_mla', fake_flash)
+        monkeypatch.setattr(dk, '_DSA', FakeDSA)
+
+        output, loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
+            *inputs.values(),
+            1.0,
+            1.0,
+            0.0,
+            float(total_q),
+            True,
+            2,
+            total_q,
+            (
+                torch.tensor([0, total_q], dtype=torch.int32),
+                torch.tensor([0, inputs['k_indexer'].shape[0]], dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+            ),
+            q_padding_mask,
+        )
+        (output.sum() + loss).backward()
+
+        torch.testing.assert_close(
+            seen['topk'], torch.tensor([[4, 0], [0, 0], [5, 2], [5, 3]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            seen['topk_length'], torch.tensor([2, 1, 2, 2], dtype=torch.int32)
+        )
+        assert torch.count_nonzero(seen['dO'][1]) == 0
+        assert torch.count_nonzero(seen['lse'][1]) == 0
+
+
 # ---------------------------------------------------------------------------
 # Real-kernel parity tests (cuDNN + optional FlashMLA)
 # ---------------------------------------------------------------------------
 #
 # Everything above this banner stubs ``cudnn.DSA`` and ``flash_mla`` with
 # ``MagicMock``-based fakes; that exercises the Python plumbing of
-# ``csa_kernels.py`` (shape transforms, autograd wiring, KL composition)
+# ``fused_sparse_attention.py`` (shape transforms, autograd wiring, KL composition)
 # but does NOT verify that the cuDNN kernels themselves compute what
-# ``csa_kernels.py`` expects them to compute.
+# ``fused_sparse_attention.py`` expects them to compute.
 #
 # The tests below close that gap by running each helper / public function
 # end-to-end against a small PyTorch reference implementation. Numeric
@@ -1859,7 +2412,9 @@ class TestRealKernelScoreHelpers:
             with_topk=case.startswith('sparse_'),
         )
 
-        from megatron.core.transformer.experimental_attention_variant import csa_kernels as _dk
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+            fused_sparse_attention as _dk,
+        )
 
         if case == 'sparse_indexer_predict':
             # The kernel takes sm_scale=1.0; scale is applied via weights
@@ -1993,7 +2548,7 @@ class TestRealKernelKLLossDense:
     @pytest.mark.parametrize("dummy", [None])
     def test_real_dense_kl_loss_matches_reference(self, dummy, reset_lazy_kernel_state):
         _skip_if_real_kernels_unavailable()
-        from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
             _compute_dense_attn_score,
             _compute_dense_indexer_score,
             _kl_loss_from_dense_scores,
@@ -2055,7 +2610,7 @@ class TestRealKernelIndexerTopk:
     @pytest.mark.parametrize("dummy", [None])
     def test_real_indexer_topk_set_matches_reference(self, dummy, reset_lazy_kernel_state):
         _skip_if_real_kernels_unavailable()
-        from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
             indexer_topk,
         )
 
@@ -2267,10 +2822,8 @@ class TestRealKernelFusedIndexerSparseAttn:
 
     def test_real_fused_dense_loss_matches_reference(self, reset_lazy_kernel_state):
         """Real dense path's KL loss value matches the all-PyTorch reference
-        on the same inputs. The reference uses an analytical
-        ``logsumexp(QK*scale, ratio mask)`` for ``lse_indexer`` (FlashMLA
-        emits its own internal lse_indexer that differs slightly), so the
-        tolerance is wider than for the kernel-only ``KLLossDense`` test.
+        on the same inputs, including the sliding-window and sink mass in
+        the dense teacher denominator.
         """
         _skip_if_real_kernels_unavailable(need_flash_mla=True)
         s = self.SHAPES
@@ -2318,41 +2871,18 @@ class TestRealKernelFusedIndexerSparseAttn:
         q_attn_bshd = query.permute(1, 0, 2, 3).contiguous().float()
         k_attn_bsd = kv_full[kv_offset:].permute(1, 0, 2).contiguous().float()
 
-        # The reference uses FlashMLA's actual normalization because it
-        # includes the selected top-k positions and the per-head sink term.
-        from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
-            _csa_fwd_flash_mla,
-            _indexer_topk_core,
-        )
-
-        # Run indexer + FlashMLA to capture the same ``lse_indexer`` the fused
-        # path consumes internally.
-        effective_topk = min(s['indexer_topk'], s['n_comp'])
-        q_idx_bshd_bf = q_indexer.permute(1, 0, 2, 3).contiguous()
-        k_idx_bsd_bf = k_indexer.permute(1, 0, 2).contiguous()
-        w_bsh_bf = weights.permute(1, 0, 2).contiguous()
-        if s['indexer_softmax_scale'] != 1.0:
-            w_bsh_scaled_bf = (w_bsh_bf.float() * s['indexer_softmax_scale']).to(w_bsh_bf.dtype)
-        else:
-            w_bsh_scaled_bf = w_bsh_bf
-        topk_indices_cmp, _, _ = _indexer_topk_core(
-            q_idx_bshd_bf, k_idx_bsd_bf, w_bsh_scaled_bf, effective_topk, s['ratio']
-        )
-        compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1)
-        combined_local = torch.cat([compress_topk_idxs, win_idxs], dim=-1)
-        global_idxs = local_to_global_flat(combined_local, s['b'])
+        window_global_idxs = local_to_global_flat(win_idxs, s['b'])
         q_flat = query.reshape(s['sq'] * s['b'], s['np_'], s['d'])
         kv_flat = kv_full.reshape(s['skv'] * s['b'], s['d'])
-        _, _, lse_indexer = _csa_fwd_flash_mla(
-            q_flat,
-            kv_flat,
-            global_idxs,
-            s['softmax_scale'],
-            attn_sink=attn_sink,
-            topk_length=None,
-            indexer_topk=effective_topk,
+        non_compressed_lse = _compute_csa_non_compressed_lse(
+            q_flat, kv_flat, attn_sink, window_global_idxs, s['softmax_scale']
         )
-        lse_indexer_bsqh = lse_indexer.reshape(s['sq'], s['b'], s['np_']).permute(1, 0, 2)
+        non_compressed_lse = (
+            non_compressed_lse.reshape(s['sq'], s['b'], s['np_']).permute(1, 0, 2).contiguous()
+        )
+        teacher_lse = _compute_dense_csa_teacher_lse(
+            q_attn_bshd, k_attn_bsd, non_compressed_lse, s['softmax_scale'], s['ratio']
+        )
 
         loss_ref = _ref_dense_indexer_loss(
             q_idx_bshd,
@@ -2360,7 +2890,7 @@ class TestRealKernelFusedIndexerSparseAttn:
             w_bsh,
             q_attn_bshd,
             k_attn_bsd,
-            lse_indexer_bsqh,
+            teacher_lse,
             indexer_softmax_scale=s['indexer_softmax_scale'],
             attn_softmax_scale=s['softmax_scale'],
             ratio=s['ratio'],
@@ -3251,9 +3781,9 @@ class TestRealKernelDenseIndexerBackward:
     gradients for ``q_indexer`` / ``k_indexer`` / ``weights``, then compares
     each against PyTorch autograd through the matching analytical
     ``_kl_loss_from_dense_scores`` formulation. ``attn_score`` /
-    ``attn_l1norm`` / ``lse_indexer`` are captured from the kernel and
-    treated as constants on the reference side (the attention-side
-    backward is a separate kernel, out of scope here).
+    ``attn_l1norm`` / full CSA teacher LSE are treated as constants on the
+    reference side (the attention-side backward is a separate kernel, out
+    of scope here).
 
     Mirrors the gradient parity check done by
     ``test_dsv4_hybrid_native_parity::test_dsv4_hybrid_attention_matches_native_reference``
@@ -3310,11 +3840,10 @@ class TestRealKernelDenseIndexerBackward:
         dk_kernel = k_idx_real.grad.detach().clone()
         dw_kernel = w_real.grad.detach().clone()
 
-        # ---- Reference: capture the kernel's attn-side / lse_indexer (treated
-        # as constants) and run autograd through the analytical dense KL.
-        from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+        # ---- Reference: recompute the full CSA teacher denominator (treated
+        # as constant) and run autograd through the analytical dense KL.
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
             _compute_dense_attn_score,
-            _csa_fwd_flash_mla,
             _indexer_topk_core,
             _kl_loss_from_dense_scores,
         )
@@ -3331,36 +3860,25 @@ class TestRealKernelDenseIndexerBackward:
 
         effective_topk = min(s['indexer_topk'], s['n_comp'])
         with torch.no_grad():
-            q_idx_bshd_bf, k_idx_bsd_bf, _, w_bsh_scaled_bf = _sbhd_to_bshd(
-                q_idx_init, k_idx_init, w_init, s['indexer_softmax_scale']
-            )
-            topk_indices_cmp, _, _ = _indexer_topk_core(
-                q_idx_bshd_bf, k_idx_bsd_bf, w_bsh_scaled_bf, effective_topk, s['ratio']
-            )
-            compress_topk_idxs = torch.where(
-                topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1
-            )
-            combined_local = torch.cat([compress_topk_idxs, win_idxs], dim=-1)
-            global_idxs = local_to_global_flat(combined_local, s['b'])
+            window_global_idxs = local_to_global_flat(win_idxs, s['b'])
             q_flat = query.reshape(s['sq'] * s['b'], s['np_'], s['d'])
             kv_flat = kv_full.reshape(s['skv'] * s['b'], s['d'])
-            _, _, lse_indexer = _csa_fwd_flash_mla(
-                q_flat,
-                kv_flat,
-                global_idxs,
-                s['softmax_scale'],
-                attn_sink=attn_sink,
-                topk_length=None,
-                indexer_topk=effective_topk,
+            non_compressed_lse = _compute_csa_non_compressed_lse(
+                q_flat, kv_flat, attn_sink, window_global_idxs, s['softmax_scale']
             )
-            lse_indexer_bsqh = lse_indexer.reshape(s['sq'], s['b'], s['np_']).permute(1, 0, 2)
+            non_compressed_lse = (
+                non_compressed_lse.reshape(s['sq'], s['b'], s['np_']).permute(1, 0, 2).contiguous()
+            )
 
             q_attn_bshd = query.permute(1, 0, 2, 3).contiguous()
             k_attn_bsd = kv_full[kv_offset:].permute(1, 0, 2).contiguous()
+            teacher_lse = _compute_dense_csa_teacher_lse(
+                q_attn_bshd, k_attn_bsd, non_compressed_lse, s['softmax_scale'], s['ratio']
+            )
             attn_score_const, attn_l1norm_const = _compute_dense_attn_score(
                 q_attn_bshd,
                 k_attn_bsd.unsqueeze(2),
-                lse_indexer_bsqh,
+                teacher_lse,
                 qhead_per_kv_head=s['np_'],
                 softmax_scale=s['softmax_scale'],
                 ratio=s['ratio'],
@@ -3449,10 +3967,14 @@ class TestPublicApi:
     """
 
     def test_public_surface(self):
-        from megatron.core.transformer.experimental_attention_variant import csa_kernels
+        from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+            fused_sparse_attention,
+        )
 
-        for name in csa_kernels.__all__:
-            assert hasattr(csa_kernels, name), f"__all__ lists {name!r} but it is missing"
+        for name in fused_sparse_attention.__all__:
+            assert hasattr(
+                fused_sparse_attention, name
+            ), f"__all__ lists {name!r} but it is missing"
 
         for fn in (
             _csa_fwd_flash_mla,

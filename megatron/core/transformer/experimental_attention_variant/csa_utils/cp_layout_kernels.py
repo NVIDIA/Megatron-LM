@@ -2,7 +2,7 @@
 """CuTeDSL kernels for DSv4 THD context parallel layout work.
 
 This module contains the CuTeDSL compaction and final-index kernels retained by
-the DSv4 CP path. ``csa_cp_utils.py`` owns row mapping and compressor
+the DSv4 CP path. ``cp_utils.py`` owns row mapping and compressor
 input layout; ``csa.py`` calls final-index lowering directly. Local THD RoPE
 reuses MCore's fused MLA implementation.
 """
@@ -583,7 +583,7 @@ if _CUTE_AVAILABLE:
 # =============================================================================
 # Torch Wrapper Functions
 # =============================================================================
-# Torch-facing entry points called by csa.py and csa_cp_utils.py. They validate
+# Torch-facing entry points called by csa.py and cp_utils.py. They validate
 # inputs, allocate outputs, and dispatch the CuTeDSL kernels defined above.
 # =============================================================================
 
