@@ -848,7 +848,9 @@ def _get_megatron_emerging_optimizer(
                 local_start = tp_rank * logical_tp_local_rows + gtp_rank * param.shape[0]
                 if config.muon_split_qkv_per_head:
                     if qkv_gtp_pad_length > 0:
-                        param.qkv_split_shapes = qkv_split_shapes
+                        # A padded GTP shard does not have a purely logical local layout.
+                        # Force the per-head path to use qkv_split_shapes_global instead.
+                        param.qkv_split_shapes = None
                         param.qkv_split_heads_are_complete = False
                     else:
                         param.qkv_split_shapes, param.qkv_split_heads_are_complete = (
