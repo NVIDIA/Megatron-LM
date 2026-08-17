@@ -31,7 +31,8 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 
 
 class GatedDeltaNet(_GDNBase):
-    # pylint: disable=missing-class-docstring
+    """Gated DeltaNet with a head-wise scalar memory-decay gate."""
+
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
         self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion

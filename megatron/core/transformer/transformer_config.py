@@ -613,8 +613,8 @@ class TransformerConfig(ModelParallelConfig):
     "gdn": recompute the entire GatedDeltaNet module (in_proj, conv1d, gated delta rule,
             gated norm, CP all-to-all and out_proj). Requires
             experimental_attention_variant="gated_delta_net".
-    "gdn_norm_out": recompute the GatedDeltaNet gated normalization output via
-            CheckpointWithoutOutput. Requires experimental_attention_variant="gated_delta_net".
+    "gdn_norm_out": recompute gated output normalization and layout restoration for
+            Gated DeltaNet-family layers, including GatedDeltaNet and KDA.
     "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use
     output-discarding checkpointing,
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
@@ -2224,15 +2224,6 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if (
-                "gdn_norm_out" in self.recompute_modules
-                and self.experimental_attention_variant != "gated_delta_net"
-            ):
-                raise ValueError(
-                    "gdn_norm_out in recompute_modules is only supported with "
-                    "experimental_attention_variant='gated_delta_net'."
-                )
-
-            if (
                 "gdn" in self.recompute_modules
                 and self.experimental_attention_variant != "gated_delta_net"
             ):
@@ -2246,7 +2237,6 @@ class TransformerConfig(ModelParallelConfig):
                     "'gdn' and 'gdn_norm_out' in recompute_modules cannot be used together. "
                     "'gdn' recomputes the full GatedDeltaNet module, including gated norm."
                 )
-
             if "core_attn" in self.recompute_modules:
                 warnings.warn(
                     "If you are using transformer_engine as the transformer implementation, "
