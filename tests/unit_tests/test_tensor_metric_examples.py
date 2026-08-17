@@ -38,10 +38,7 @@ def _value(
     is_placeholder: bool = False,
 ) -> MetricTensor:
     return MetricTensor(
-        tensor,
-        (MetricSite(name, kind),),
-        tuple(relations),
-        is_placeholder=is_placeholder,
+        tensor, (MetricSite(name, kind),), tuple(relations), is_placeholder=is_placeholder
     )
 
 
@@ -71,7 +68,7 @@ def _fake_distributed(monkeypatch, remote_values_by_op):
     return calls
 
 
-def test_parameter_l2_example_selects_parameters_and_groups_globally():
+def test_parameter_l2_example_selects_parameters_and_reduces_globally():
     values = [
         _value("decoder.layers.0.weight", "parameter", torch.tensor([3.0, 4.0])),
         _value("decoder.layers.0", "activation", torch.tensor([100.0])),
@@ -80,7 +77,7 @@ def test_parameter_l2_example_selects_parameters_and_groups_globally():
     result = _only_result(TensorMetricExecutor({}).run(ParameterL2NormExample(), values))
 
     assert result.label == "global"
-    torch.testing.assert_close(result.value.tensor, torch.tensor(5.0))
+    torch.testing.assert_close(result.tensor, torch.tensor(5.0))
 
 
 def test_global_parameter_amax_example_uses_zero_for_empty_parameters():
@@ -93,7 +90,7 @@ def test_global_parameter_amax_example_uses_zero_for_empty_parameters():
     result = _only_result(TensorMetricExecutor({}).run(GlobalParameterAmaxExample(), values))
 
     assert result.label == "global"
-    torch.testing.assert_close(result.value.tensor, torch.tensor(4.0))
+    torch.testing.assert_close(result.tensor, torch.tensor(4.0))
 
 
 def test_te_batched_parameter_l2_example_uses_one_per_tensor_kernel_call(monkeypatch):
@@ -123,10 +120,10 @@ def test_te_batched_parameter_l2_example_uses_one_per_tensor_kernel_call(monkeyp
         torch.tensor([25.0, 144.0, 0.0], device=device),
     )
     result = _only_result(executor.complete(metric, executor.start(metric, prepared)))
-    torch.testing.assert_close(result.value.tensor, torch.tensor(13.0, device=device))
+    torch.testing.assert_close(result.tensor, torch.tensor(13.0, device=device))
 
 
-def test_layer_parameter_l2_example_groups_by_numbered_layer():
+def test_layer_parameter_l2_example_reduces_by_numbered_layer():
     values = [
         _value("decoder.layers.0.attention.weight", "parameter", torch.tensor([3.0, 4.0])),
         _value("decoder.layers.0.mlp.weight", "parameter", torch.tensor([12.0])),
@@ -137,32 +134,26 @@ def test_layer_parameter_l2_example_groups_by_numbered_layer():
     results = TensorMetricExecutor({}).run(LayerParameterL2NormExample(), values)
 
     assert [result.label for result in results] == ["decoder.layers.0", "decoder.layers.1"]
-    torch.testing.assert_close(results[0].value.tensor, torch.tensor(13.0))
-    torch.testing.assert_close(results[1].value.tensor, torch.tensor(5.0))
+    torch.testing.assert_close(results[0].tensor, torch.tensor(13.0))
+    torch.testing.assert_close(results[1].tensor, torch.tensor(5.0))
 
 
-def test_multi_granularity_example_reuses_one_prepared_state_in_several_groups():
-    value = _value(
-        "decoder.layers.0.mlp.linear_fc1.weight",
-        "parameter",
-        torch.tensor([3.0, 4.0]),
-    )
+def test_multi_granularity_example_reuses_one_prepared_state_in_several_results():
+    value = _value("decoder.layers.0.mlp.linear_fc1.weight", "parameter", torch.tensor([3.0, 4.0]))
     metric = MultiGranularityParameterL2NormExample()
     executor = TensorMetricExecutor({})
 
     prepared = executor.prepare(metric, [value])
-    groups = metric.groups(prepared)
+    results = executor.complete(metric, executor.start(metric, prepared))
 
-    assert [group.label for group in groups] == [
+    assert [result.label for result in results] == [
         "tensor/decoder.layers.0.mlp.linear_fc1.weight",
         "family/decoder.layers.*.mlp.linear_fc1.weight",
         "layer/decoder.layers.0",
         "global",
     ]
-    assert all(group.items[0] is prepared[0] for group in groups)
-    results = executor.complete(metric, executor.start(metric, prepared))
     assert len(results) == 4
-    assert all(result.value.tensor == 5 for result in results)
+    assert all(result.tensor == 5 for result in results)
 
 
 def test_fp8_underflow_fraction_example_uses_explicit_tensor_unit_threshold():
@@ -171,12 +162,10 @@ def test_fp8_underflow_fraction_example_uses_explicit_tensor_unit_threshold():
         _value("decoder.layers.0.weight", "parameter", torch.tensor([0.0001])),
     ]
 
-    result = _only_result(
-        TensorMetricExecutor({}).run(FP8UnderflowFractionExample(0.001), values)
-    )
+    result = _only_result(TensorMetricExecutor({}).run(FP8UnderflowFractionExample(0.001), values))
 
-    assert result.value.tensor.dtype == torch.float64
-    torch.testing.assert_close(result.value.tensor, torch.tensor(0.25, dtype=torch.float64))
+    assert result.tensor.dtype == torch.float64
+    torch.testing.assert_close(result.tensor, torch.tensor(0.25, dtype=torch.float64))
 
     with pytest.raises(ValueError, match="must be positive"):
         FP8UnderflowFractionExample(0.0)
@@ -184,8 +173,7 @@ def test_fp8_underflow_fraction_example_uses_explicit_tensor_unit_threshold():
 
 def test_mean_row_l2_example_reconstructs_flat_shard_before_sqrt(monkeypatch):
     calls = _fake_distributed(
-        monkeypatch,
-        {torch.distributed.ReduceOp.SUM: [torch.tensor([25.0, 0.0, 225.0])]},
+        monkeypatch, {torch.distributed.ReduceOp.SUM: [torch.tensor([25.0, 0.0, 225.0])]}
     )
     value = _value(
         "decoder.layers.0.weight",
@@ -198,14 +186,13 @@ def test_mean_row_l2_example_reconstructs_flat_shard_before_sqrt(monkeypatch):
         TensorMetricExecutor({"dp": object()}).run(MeanRowL2NormExample(), [value])
     )
 
-    torch.testing.assert_close(result.value.tensor, torch.tensor(35.0 / 3.0))
+    torch.testing.assert_close(result.tensor, torch.tensor(35.0 / 3.0))
     assert [call[0] for call in calls] == [torch.Size([1, 3])]
 
 
 def test_mean_row_l2_example_uses_neutral_population_for_remotely_owned_wgrad(monkeypatch):
     calls = _fake_distributed(
-        monkeypatch,
-        {torch.distributed.ReduceOp.SUM: [torch.tensor([5.0, 1.0])]},
+        monkeypatch, {torch.distributed.ReduceOp.SUM: [torch.tensor([5.0, 1.0])]}
     )
     value = _value(
         "decoder.layers.0.weight",
@@ -219,7 +206,7 @@ def test_mean_row_l2_example_uses_neutral_population_for_remotely_owned_wgrad(mo
         TensorMetricExecutor({"dp": object()}).run(MeanRowL2NormExample(), [value])
     )
 
-    torch.testing.assert_close(result.value.tensor, torch.tensor(5.0))
+    torch.testing.assert_close(result.tensor, torch.tensor(5.0))
     assert [call[0] for call in calls] == [torch.Size([1, 2])]
 
 
@@ -227,10 +214,7 @@ def test_max_replica_drift_example_uses_extrema_then_reduces_shards(monkeypatch)
     calls = _fake_distributed(
         monkeypatch,
         {
-            torch.distributed.ReduceOp.MAX: [
-                torch.tensor([3.0, 2.0]),
-                torch.tensor([4.0, 0.5]),
-            ],
+            torch.distributed.ReduceOp.MAX: [torch.tensor([3.0, 2.0]), torch.tensor([4.0, 0.5])],
             torch.distributed.ReduceOp.MIN: [torch.tensor([3.0, 2.0])],
         },
     )
@@ -247,11 +231,8 @@ def test_max_replica_drift_example_uses_extrema_then_reduces_shards(monkeypatch)
         )
     )
 
-    torch.testing.assert_close(result.value.tensor, torch.tensor([4.0, 2.0 / 3.0]))
-    assert MaxReplicaDriftExample.result_components == (
-        "max_absolute_drift",
-        "max_relative_drift",
-    )
+    torch.testing.assert_close(result.tensor, torch.tensor([4.0, 2.0 / 3.0]))
+    assert MaxReplicaDriftExample.result_components == ("max_absolute_drift", "max_relative_drift")
     assert [call[0] for call in calls if call[1] is torch.distributed.ReduceOp.MAX] == [
         torch.Size([1, 2]),
         torch.Size([1, 2]),
@@ -279,7 +260,7 @@ def test_max_replica_drift_uses_symmetric_relative_scale_with_absolute_floor(mon
         )
     )
 
-    torch.testing.assert_close(result.value.tensor, torch.tensor([1.0, 1.0 / 101.0]))
+    torch.testing.assert_close(result.tensor, torch.tensor([1.0, 1.0 / 101.0]))
     assert len(calls) == 2
 
 
@@ -302,15 +283,12 @@ def test_max_replica_drift_reports_large_relative_sign_reversal(monkeypatch):
         TensorMetricExecutor({"dp": object()}).run(MaxReplicaDriftExample("dp"), [value])
     )
 
-    torch.testing.assert_close(result.value.tensor, torch.tensor([2.0, 2.0]))
+    torch.testing.assert_close(result.tensor, torch.tensor([2.0, 2.0]))
 
 
 def test_max_replica_drift_example_requires_replica_placement():
     value = _value(
-        "decoder.layers.0.weight",
-        "parameter",
-        torch.tensor([1.0]),
-        (RankRelation("dp", Shard(0)),),
+        "decoder.layers.0.weight", "parameter", torch.tensor([1.0]), (RankRelation("dp", Shard(0)),)
     )
 
     with pytest.raises(ValueError, match="must have Replica placement"):
@@ -331,9 +309,9 @@ def test_sampled_replica_drift_defaults_to_stable_one_in_one_hundred_sample():
 
     first = executor.prepare(SampledMaxReplicaDriftExample("dp"), [value])[0]
     repeated = executor.prepare(SampledMaxReplicaDriftExample("dp"), [value])[0]
-    different_seed = executor.prepare(
-        SampledMaxReplicaDriftExample("dp", sample_seed=1), [value]
-    )[0]
+    different_seed = executor.prepare(SampledMaxReplicaDriftExample("dp", sample_seed=1), [value])[
+        0
+    ]
 
     assert first.tensor.numel() == 10
     assert first.tensor.unique().numel() == 10
@@ -360,17 +338,12 @@ def test_sampled_replica_drift_reuses_exact_extrema_algorithm(monkeypatch):
     remote[0].add_(7.0)
     calls = _fake_distributed(
         monkeypatch,
-        {
-            torch.distributed.ReduceOp.MAX: [remote],
-            torch.distributed.ReduceOp.MIN: [remote],
-        },
+        {torch.distributed.ReduceOp.MAX: [remote], torch.distributed.ReduceOp.MIN: [remote]},
     )
 
     result = _only_result(executor.complete(metric, executor.start(metric, prepared)))
 
     original = prepared[0].tensor[0]
     expected_relative = 7.0 / max(abs(float(original)), abs(float(original + 7.0)), 1e-8)
-    torch.testing.assert_close(
-        result.value.tensor, torch.tensor([7.0, expected_relative])
-    )
+    torch.testing.assert_close(result.tensor, torch.tensor([7.0, expected_relative]))
     assert [call[0] for call in calls] == [torch.Size([1, 2]), torch.Size([1, 2])]

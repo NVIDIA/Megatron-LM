@@ -56,14 +56,7 @@ def _disable_tensor_metric_profiling(monkeypatch):
     )
 
 
-def _pg_collection(
-    dp_size=1,
-    dp_rank=0,
-    expert_dp_size=1,
-    expert_dp_rank=0,
-    ep_size=1,
-    ep_rank=0,
-):
+def _pg_collection(dp_size=1, dp_rank=0, expert_dp_size=1, expert_dp_rank=0, ep_size=1, ep_rank=0):
     return SimpleNamespace(
         tp=_ProcessGroup(),
         expt_tp=_ProcessGroup(),
@@ -228,8 +221,7 @@ def test_chained_optimizer_source_combines_children_and_deduplicates_model_param
     duplicate_optimizer = _fp32_optimizer(first)
 
     views = _local_optimizer_tensor_views(
-        _chained_optimizer(first_optimizer, second_optimizer, duplicate_optimizer),
-        _pg_collection(),
+        _chained_optimizer(first_optimizer, second_optimizer, duplicate_optimizer), _pg_collection()
     )
 
     assert [id(view.model_parameter) for view in views] == [id(first), id(second)]
@@ -275,14 +267,9 @@ def test_rank_symmetric_distributed_optimizer_source_adds_empty_flat_shard():
         _named_model(z_local=local_parameter, a_missing=missing_parameter)
     )
 
-    views = _optimizer_tensor_views(
-        parameter_names, optimizer, _pg_collection(dp_size=2)
-    )
+    views = _optimizer_tensor_views(parameter_names, optimizer, _pg_collection(dp_size=2))
 
-    assert [parameter_names[view.model_parameter] for view in views] == [
-        "a_missing",
-        "z_local",
-    ]
+    assert [parameter_names[view.model_parameter] for view in views] == ["a_missing", "z_local"]
     assert views[0].parameter.numel() == 0
     assert views[0].wgrad.numel() == 0
     assert not views[0].is_placeholder
@@ -389,9 +376,7 @@ def test_ep_manifest_materializes_remote_owned_parameter_slots(monkeypatch):
         assert group is pg_collection.ep
         assert len(local_entries) == 1
         remote_model_relations = tuple(
-            RankRelation(relation.axis, Owned(1))
-            if relation.axis == "ep"
-            else relation
+            RankRelation(relation.axis, Owned(1)) if relation.axis == "ep" else relation
             for relation in local_entries[0].model_relations
         )
         remote_entry = replace(
@@ -405,23 +390,15 @@ def test_ep_manifest_materializes_remote_owned_parameter_slots(monkeypatch):
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
 
-    manifest = _build_optimizer_parameter_manifest(
-        parameter_names, optimizer, pg_collection
-    )
+    manifest = _build_optimizer_parameter_manifest(parameter_names, optimizer, pg_collection)
     values = _optimizer_metric_tensors(
-        parameter_names,
-        optimizer,
-        pg_collection,
-        [MeanRowL2NormMetric()],
-        manifest,
+        parameter_names, optimizer, pg_collection, [MeanRowL2NormMetric()], manifest
     )
 
     assert [entry.name for entry in manifest] == ["local_expert", "remote_expert"]
     assert manifest[1].logical_shape == (3, 4)
     assert manifest[1].ep_owner == 1
-    remote_values = [
-        value for value in values if value.sites[0].name == "remote_expert"
-    ]
+    remote_values = [value for value in values if value.sites[0].name == "remote_expert"]
     assert len(remote_values) == 2
     assert all(not value.tensor.numel() for value in remote_values)
     assert all(value.is_placeholder for value in remote_values)
@@ -432,9 +409,7 @@ def test_ep_manifest_preserves_rank_local_dense_optimizer_shards(monkeypatch):
     parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
     parameter_names = CanonicalParameterNameMap(_named_model(weight=parameter))
     pg_collection = _pg_collection(dp_size=2, ep_size=2, ep_rank=0)
-    optimizer = _distributed_optimizer(
-        parameter, torch.nn.Parameter(torch.tensor([1.0])), 0, 1
-    )
+    optimizer = _distributed_optimizer(parameter, torch.nn.Parameter(torch.tensor([1.0])), 0, 1)
 
     monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
@@ -442,21 +417,16 @@ def test_ep_manifest_preserves_rank_local_dense_optimizer_shards(monkeypatch):
     def fake_all_gather_object(output, local_entries, group):
         assert group is pg_collection.ep
         remote_entry = replace(
-            local_entries[0],
-            storage_relations=(RankRelation("dp", FlatShard((2,), 1, 2)),),
+            local_entries[0], storage_relations=(RankRelation("dp", FlatShard((2,), 1, 2)),)
         )
         output[:] = [local_entries, (remote_entry,)]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
 
-    manifest = _build_optimizer_parameter_manifest(
-        parameter_names, optimizer, pg_collection
-    )
+    manifest = _build_optimizer_parameter_manifest(parameter_names, optimizer, pg_collection)
 
     assert len(manifest) == 1
-    assert manifest[0].storage_relations == (
-        RankRelation("dp", FlatShard((2,), 0, 1)),
-    )
+    assert manifest[0].storage_relations == (RankRelation("dp", FlatShard((2,), 0, 1)),)
 
 
 def test_rank_symmetric_flat_shards_execute_same_collective_with_empty_ranks():
@@ -486,9 +456,7 @@ def test_rank_symmetric_flat_shards_execute_same_collective_with_empty_ranks():
     world = torch.distributed.group.WORLD
 
     views = _optimizer_tensor_views(
-        parameter_names,
-        optimizer,
-        SimpleNamespace(dp_cp=world, expt_dp=world),
+        parameter_names, optimizer, SimpleNamespace(dp_cp=world, expt_dp=world)
     )
     values = [
         MetricTensor(
@@ -499,7 +467,7 @@ def test_rank_symmetric_flat_shards_execute_same_collective_with_empty_ranks():
     ]
     results = TensorMetricExecutor({"dp": world}).run(MeanRowL2NormMetric(), values)
 
-    torch.testing.assert_close(results[0].value.tensor, torch.tensor(9.0, device=device))
+    torch.testing.assert_close(results[0].tensor, torch.tensor(9.0, device=device))
 
 
 def test_observer_reduces_parameter_and_wgrad_flat_shards_end_to_end():
@@ -530,21 +498,10 @@ def test_observer_reduces_parameter_and_wgrad_flat_shards_end_to_end():
     else:
         optimizer = _stub_optimizer(DistributedOptimizer)
     world = torch.distributed.group.WORLD
-    pg_collection = SimpleNamespace(
-        tp=world,
-        expt_tp=world,
-        ep=world,
-        dp_cp=world,
-        expt_dp=world,
-    )
+    pg_collection = SimpleNamespace(tp=world, expt_tp=world, ep=world, dp_cp=world, expt_dp=world)
     captured = {}
     observer = build_tensor_metric_observer(
-        [
-            "global-param-l2:1",
-            "layer-param-l2:1",
-            "global-wgrad-l2:1",
-            "layer-wgrad-l2:1",
-        ],
+        ["global-param-l2:1", "layer-param-l2:1", "global-wgrad-l2:1", "layer-wgrad-l2:1"],
         result_sink=lambda metric, results, iteration: captured.update(
             {metric.name: (tuple(results), iteration)}
         ),
@@ -561,12 +518,10 @@ def test_observer_reduces_parameter_and_wgrad_flat_shards_end_to_end():
     ):
         results, iteration = captured[metric_name]
         assert iteration == 1
-        expected_labels = {
-            "global" if metric_name.startswith("global") else "decoder.layers.0"
-        }
+        expected_labels = {"global" if metric_name.startswith("global") else "decoder.layers.0"}
         if metric_name == "layer-wgrad-l2":
             expected_labels.add("global")
-        results_by_label = {str(result.label): result.value.tensor for result in results}
+        results_by_label = {result.label: result.tensor for result in results}
         assert set(results_by_label) == expected_labels
         for result in results_by_label.values():
             torch.testing.assert_close(result, torch.tensor(expected, device=device))
@@ -592,21 +547,13 @@ def test_observer_reduces_ep_owned_expert_values_end_to_end():
     model.decoder.layers = torch.nn.ModuleList([torch.nn.Module()])
     model.decoder.layers[0].mlp = torch.nn.Module()
     model.decoder.layers[0].mlp.experts = torch.nn.Module()
-    model.decoder.layers[0].mlp.experts.local_experts = torch.nn.ModuleList(
-        [torch.nn.Module()]
-    )
+    model.decoder.layers[0].mlp.experts.local_experts = torch.nn.ModuleList([torch.nn.Module()])
     model.decoder.layers[0].mlp.experts.local_experts[0].register_parameter(
         "weight", model_parameter
     )
 
     world = torch.distributed.group.WORLD
-    pg_collection = SimpleNamespace(
-        tp=world,
-        expt_tp=world,
-        ep=world,
-        dp_cp=world,
-        expt_dp=world,
-    )
+    pg_collection = SimpleNamespace(tp=world, expt_tp=world, ep=world, dp_cp=world, expt_dp=world)
     captured = {}
     observer = build_tensor_metric_observer(
         [
@@ -641,14 +588,10 @@ def test_observer_reduces_ep_owned_expert_values_end_to_end():
         ("global-wgrad-l2", expected_wgrad),
         ("layer-wgrad-l2", expected_wgrad),
     ):
-        expected_labels = {
-            "global" if metric_name.startswith("global") else "decoder.layers.0"
-        }
+        expected_labels = {"global" if metric_name.startswith("global") else "decoder.layers.0"}
         if metric_name == "layer-wgrad-l2":
             expected_labels.add("global")
-        results_by_label = {
-            str(result.label): result.value.tensor for result in captured[metric_name]
-        }
+        results_by_label = {result.label: result.tensor for result in captured[metric_name]}
         assert set(results_by_label) == expected_labels
         for result in results_by_label.values():
             torch.testing.assert_close(result, torch.tensor(expected, device=device))
@@ -682,21 +625,10 @@ def test_observer_reduces_layerwise_owned_values_end_to_end():
     optimizer.dp_cp_params_list = [[parameter] for parameter in parameters]
     optimizer.expt_dp_params_list = None
     world = torch.distributed.group.WORLD
-    pg_collection = SimpleNamespace(
-        tp=world,
-        expt_tp=world,
-        ep=world,
-        dp_cp=world,
-        expt_dp=world,
-    )
+    pg_collection = SimpleNamespace(tp=world, expt_tp=world, ep=world, dp_cp=world, expt_dp=world)
     captured = {}
     observer = build_tensor_metric_observer(
-        [
-            "global-param-l2:1",
-            "layer-param-l2:1",
-            "global-wgrad-l2:1",
-            "layer-wgrad-l2:1",
-        ],
+        ["global-param-l2:1", "layer-param-l2:1", "global-wgrad-l2:1", "layer-wgrad-l2:1"],
         result_sink=lambda metric, results, iteration: captured.update(
             {metric.name: tuple(results)}
         ),
@@ -708,19 +640,13 @@ def test_observer_reduces_layerwise_owned_values_end_to_end():
     expected_parameter = sum(float(index + 1) ** 2 for index in range(world_size)) ** 0.5
     expected_wgrad = sum(float(2 * index + 1) ** 2 for index in range(world_size)) ** 0.5
     torch.testing.assert_close(
-        captured["global-param-l2"][0].value.tensor,
-        torch.tensor(expected_parameter, device=device),
+        captured["global-param-l2"][0].tensor, torch.tensor(expected_parameter, device=device)
     )
     torch.testing.assert_close(
-        captured["global-wgrad-l2"][0].value.tensor,
-        torch.tensor(expected_wgrad, device=device),
+        captured["global-wgrad-l2"][0].tensor, torch.tensor(expected_wgrad, device=device)
     )
-    parameter_results = {
-        result.label: result.value.tensor for result in captured["layer-param-l2"]
-    }
-    wgrad_results = {
-        result.label: result.value.tensor for result in captured["layer-wgrad-l2"]
-    }
+    parameter_results = {result.label: result.tensor for result in captured["layer-param-l2"]}
+    wgrad_results = {result.label: result.tensor for result in captured["layer-wgrad-l2"]}
     layer_labels = {f"decoder.layers.{index}" for index in range(world_size)}
     assert set(parameter_results) == layer_labels
     assert set(wgrad_results) == layer_labels | {"global"}
@@ -732,6 +658,4 @@ def test_observer_reduces_layerwise_owned_values_end_to_end():
         torch.testing.assert_close(
             wgrad_results[label], torch.tensor(float(2 * index + 1), device=device)
         )
-    torch.testing.assert_close(
-        wgrad_results["global"], torch.tensor(expected_wgrad, device=device)
-    )
+    torch.testing.assert_close(wgrad_results["global"], torch.tensor(expected_wgrad, device=device))

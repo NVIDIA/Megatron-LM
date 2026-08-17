@@ -12,16 +12,15 @@ from megatron.core.transformer.moe.router_diagnostics import (
 from megatron.training.tensor_metrics import (
     AllGather,
     AllReduce,
+    CollectiveCompletion,
     CollectiveRequest,
-    CollectiveRequestSet,
+    CollectiveStage,
     FlatShard,
     LogicalReductionMetric,
-    MetricGroup,
     MetricResult,
     MetricSite,
     MetricTensor,
     Owned,
-    PerGroupTensorMetric,
     RankRelation,
     Replica,
     Shard,
@@ -56,16 +55,13 @@ def _item(
     is_placeholder: bool = False,
 ) -> MetricTensor:
     return MetricTensor(
-        tensor,
-        (MetricSite(name, kind),),
-        tuple(relations),
-        is_placeholder=is_placeholder,
+        tensor, (MetricSite(name, kind),), tuple(relations), is_placeholder=is_placeholder
     )
 
 
 def _result_tensor(results: Sequence[MetricResult]) -> torch.Tensor:
     assert len(results) == 1
-    return results[0].value.tensor
+    return results[0].tensor
 
 
 def _fake_distributed(monkeypatch, remote_values: Sequence[torch.Tensor]):
@@ -112,10 +108,9 @@ def test_metric_tensor_validates_and_updates_relations():
         )
 
     with pytest.raises(ValueError, match="must not be empty"):
-        MetricGroup(())
-
+        CollectiveStage((), None)
     with pytest.raises(ValueError, match="must not be empty"):
-        CollectiveRequestSet((), None)
+        CollectiveCompletion((), None)
 
 
 def test_flat_shard_validates_logical_interval():
@@ -129,16 +124,26 @@ def test_flat_shard_validates_logical_interval():
         FlatShard((2, 3), 0, 7)
 
 
-def test_default_groups_aggregate_globally():
+def test_metric_result_uses_a_nonempty_string_label():
+    tensor = torch.ones(1)
+
+    assert MetricResult(tensor).label == "global"
+    with pytest.raises(TypeError, match="must be a string"):
+        MetricResult(tensor, 1)
+    with pytest.raises(ValueError, match="must not be empty"):
+        MetricResult(tensor, "")
+
+
+def test_default_logical_reduction_aggregates_globally():
     metric = L2NormMetric()
     values = [_item("a", torch.ones(1)), _item("b", torch.ones(1))]
 
-    groups = metric.groups(values)
+    results = TensorMetricExecutor({}).run(metric, values)
 
-    assert len(groups) == 1
-    assert groups[0].items == tuple(values)
-    assert groups[0].label == "global"
-    assert metric.groups([]) == []
+    assert len(results) == 1
+    assert results[0].label == "global"
+    torch.testing.assert_close(results[0].tensor, torch.sqrt(torch.tensor(2.0)))
+    assert metric.start([]) == []
 
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32, torch.float64))
@@ -217,7 +222,7 @@ def test_executor_packs_compatible_metric_collectives(monkeypatch):
     results = TensorMetricExecutor({"tp": object()}).run(L2NormMetric(), items)
 
     assert [result.label for result in results] == ["global"]
-    torch.testing.assert_close(results[0].value.tensor, torch.sqrt(torch.tensor(68.0)))
+    torch.testing.assert_close(results[0].tensor, torch.sqrt(torch.tensor(68.0)))
     assert len(calls) == 1
     assert calls[0][0] == torch.Size([2])
 
@@ -252,7 +257,7 @@ def _named_item(name, kind, tensor, relations=()):
     return MetricTensor(tensor, (MetricSite(name, kind),), tuple(relations))
 
 
-def test_layer_l2_norm_metric_groups_selected_parameters_by_layer():
+def test_layer_l2_norm_metric_reduces_selected_parameters_by_layer():
     items = [
         _named_item(
             "decoder.layers.0.self_attention.linear_qkv.weight",
@@ -276,12 +281,11 @@ def test_layer_l2_norm_metric_groups_selected_parameters_by_layer():
     results = TensorMetricExecutor({}).run(LayerL2NormMetric(), items)
 
     assert [result.label for result in results] == ["decoder.layers.0", "decoder.layers.1"]
-    torch.testing.assert_close(results[0].value.tensor, torch.sqrt(torch.tensor(50.0)))
-    torch.testing.assert_close(results[1].value.tensor, torch.tensor(10.0))
-    assert results[0].value.sites == (items[0].sites[0], items[1].sites[0])
+    torch.testing.assert_close(results[0].tensor, torch.sqrt(torch.tensor(50.0)))
+    torch.testing.assert_close(results[1].tensor, torch.tensor(10.0))
 
 
-def test_layer_l2_norm_metric_can_add_an_exact_global_group():
+def test_layer_l2_norm_metric_can_add_an_exact_global_result():
     class LayerAndGlobalL2NormMetric(LayerL2NormMetric):
         include_global = True
 
@@ -297,9 +301,9 @@ def test_layer_l2_norm_metric_can_add_an_exact_global_group():
         "decoder.layers.1",
         "global",
     ]
-    torch.testing.assert_close(results[0].value.tensor, torch.tensor(5.0))
-    torch.testing.assert_close(results[1].value.tensor, torch.tensor(12.0))
-    torch.testing.assert_close(results[2].value.tensor, torch.tensor(13.0))
+    torch.testing.assert_close(results[0].tensor, torch.tensor(5.0))
+    torch.testing.assert_close(results[1].tensor, torch.tensor(12.0))
+    torch.testing.assert_close(results[2].tensor, torch.tensor(13.0))
 
 
 def test_layer_l2_norm_metric_prepare_rejects_tensor_spanning_layers():
@@ -316,7 +320,7 @@ def test_layer_l2_norm_metric_prepare_rejects_tensor_spanning_layers():
     assert results == []
 
 
-def test_grouped_l2_packs_tensor_states_for_distributed_reduction(monkeypatch):
+def test_layer_l2_packs_tensor_states_for_distributed_reduction(monkeypatch):
     calls = _fake_distributed(monkeypatch, [torch.tensor([3.0, 11.0])])
     relations = (RankRelation("tp", Shard(0)),)
     items = [
@@ -380,7 +384,7 @@ def test_layer_l2_metric_handles_heterogeneous_rank_relations(monkeypatch):
     assert all(value.tensor.numel() == 1 for value in prepared)
     initial_steps = executor.start(metric, prepared)
     assert len(initial_steps) == 1
-    assert isinstance(initial_steps[0], CollectiveRequestSet)
+    assert isinstance(initial_steps[0], CollectiveStage)
     assert len(initial_steps[0].requests) == 3
     results = executor.complete(metric, initial_steps)
 
@@ -389,7 +393,6 @@ def test_layer_l2_metric_handles_heterogeneous_rank_relations(monkeypatch):
     assert [call[0] for call in calls] == [torch.Size([3]), torch.Size([1])]
     assert [call[2] for call in calls] == [tp_group, ep_group]
     torch.testing.assert_close(calls[-1][3], torch.tensor([4.0]))
-    assert results[0].value.rank_relations == ()
 
 
 class _MeanMetric(LogicalReductionMetric):
@@ -423,9 +426,9 @@ class _IdentityMetric(LogicalReductionMetric):
         return tensor
 
 
-class _OrderedGroupMetric(_IdentityMetric):
-    def combine_contributions(self, group, contributions):
-        assert len(contributions) == len(group.items)
+class _OrderedReductionMetric(_IdentityMetric):
+    def combine_contributions(self, values, contributions):
+        assert len(contributions) == len(values)
         return torch.stack(tuple(contributions))
 
 
@@ -443,14 +446,13 @@ def test_logical_reduction_metric_reduces_shards_then_replicates_owned_axes(monk
 
     torch.testing.assert_close(_result_tensor(results), torch.tensor(2.5))
     assert [call[2] for call in calls] == [tp_group, ep_group]
-    assert results[0].value.rank_relations == ()
 
 
-def test_logical_reduction_metric_restores_heterogeneous_branches_to_group_order(monkeypatch):
+def test_logical_reduction_metric_restores_heterogeneous_branches_to_result_order(monkeypatch):
     calls = _fake_distributed(monkeypatch, [torch.tensor([[20.0]]), torch.tensor([[10.0]])])
     tp_group = object()
     ep_group = object()
-    metric = _OrderedGroupMetric(torch.distributed.ReduceOp.SUM)
+    metric = _OrderedReductionMetric(torch.distributed.ReduceOp.SUM)
     items = [
         _item("tp", torch.tensor([1.0]), (RankRelation("tp", Shard(0)),)),
         _item("ep", torch.tensor([2.0]), (RankRelation("ep", Shard(0)),)),
@@ -486,7 +488,7 @@ def test_logical_reduction_metric_supports_other_reduce_ops(monkeypatch):
         (torch.distributed.ReduceOp.BXOR, 6, 3, 5),
     ),
 )
-def test_logical_reduction_metric_combines_groups_with_reduction_op(
+def test_logical_reduction_metric_combines_values_with_reduction_op(
     reduction_op, left, right, expected
 ):
     metric = _IdentityMetric(reduction_op)
@@ -497,7 +499,7 @@ def test_logical_reduction_metric_combines_groups_with_reduction_op(
     torch.testing.assert_close(result, torch.tensor(expected))
 
 
-def test_logical_reduction_metric_stacks_numeric_group_states(monkeypatch):
+def test_logical_reduction_metric_stacks_numeric_result_states(monkeypatch):
     original_stack = torch.stack
     calls = []
 
@@ -564,7 +566,7 @@ def test_executor_can_prepare_locally_and_complete_steps_later(monkeypatch):
     assert prepared[0].tensor.numel() == 1
     deferred_steps = executor.start(metric, prepared)
     assert len(deferred_steps) == 1
-    assert isinstance(deferred_steps[0], CollectiveRequestSet)
+    assert isinstance(deferred_steps[0], CollectiveStage)
     assert deferred_steps[0].requests[0].value.tensor.numel() == 1
 
     result = _result_tensor(executor.complete(metric, deferred_steps))
@@ -584,7 +586,7 @@ def test_executor_detaches_prepare_inputs_and_outputs():
             assert values[0].tensor.grad_fn is None
             return [values[0].with_tensor(output_with_history)]
 
-        def start(self, groups):
+        def start(self, values):
             raise AssertionError("This test only exercises preparation.")
 
         def resume(self, completed):
@@ -604,11 +606,11 @@ class _QKVL2NormMetric(L2NormMetric):
     def accepts(self, site):
         return super().accepts(site) and ".linear_qkv" in site.name
 
-    def groups(self, values):
-        return [MetricGroup(tuple(values), label="all-qkv")] if values else []
+    def start(self, values):
+        return [self._start_logical_reduction(values, "all-qkv")] if values else []
 
 
-def test_prepared_activations_from_separate_calls_can_be_grouped_later():
+def test_prepared_activations_from_separate_calls_can_be_aggregated_later():
     metric = _QKVL2NormMetric()
     executor = TensorMetricExecutor({})
     items = [
@@ -716,7 +718,6 @@ def test_mean_row_l2_norm_combines_tensor_populations():
     results = TensorMetricExecutor({}).run(MeanRowL2NormMetric(), items)
 
     torch.testing.assert_close(_result_tensor(results), torch.tensor(22.0 / 3.0))
-    assert results[0].value.sites == (items[0].sites[0], items[1].sites[0])
 
 
 def test_mean_column_l2_norm_combines_tensor_populations():
@@ -730,7 +731,7 @@ def test_mean_column_l2_norm_combines_tensor_populations():
     torch.testing.assert_close(result, torch.tensor(6.0))
 
 
-def test_grouped_dimwise_l2_exposes_all_ready_branches(monkeypatch):
+def test_dimwise_l2_exposes_all_ready_branches(monkeypatch):
     calls = _fake_distributed(
         monkeypatch,
         [torch.tensor([[13.0, 1.0]]), torch.tensor([[11.0]]), torch.tensor([[4.0, 1.0]])],
@@ -752,7 +753,7 @@ def test_grouped_dimwise_l2_exposes_all_ready_branches(monkeypatch):
     initial_steps = executor.start(metric, prepared)
 
     assert len(initial_steps) == 1
-    assert isinstance(initial_steps[0], CollectiveRequestSet)
+    assert isinstance(initial_steps[0], CollectiveStage)
     assert len(initial_steps[0].requests) == 2
 
     result = _result_tensor(executor.complete(metric, initial_steps))
@@ -766,7 +767,7 @@ def test_grouped_dimwise_l2_exposes_all_ready_branches(monkeypatch):
     assert [call[2] for call in calls] == [ep_group, tp_group, ep_group]
 
 
-def test_grouped_dimwise_l2_packs_compatible_expert_branches(monkeypatch):
+def test_dimwise_l2_packs_compatible_expert_branches(monkeypatch):
     calls = _fake_distributed(
         monkeypatch, [torch.tensor([[11.0], [24.0]]), torch.tensor([[4.0, 1.0], [11.0, 2.0]])]
     )
@@ -881,12 +882,7 @@ def test_dimwise_l2_norm_rejects_flat_shard_length_mismatch():
 @pytest.mark.parametrize("metric", (MeanRowL2NormMetric(), MeanColumnL2NormMetric()))
 def test_empty_owned_dimwise_l2_contributes_zero_population(monkeypatch, metric):
     calls = _fake_distributed(monkeypatch, [torch.tensor([10.0, 2.0])])
-    item = _item(
-        "remote",
-        torch.empty(0),
-        (RankRelation("ep", Owned(1)),),
-        is_placeholder=True,
-    )
+    item = _item("remote", torch.empty(0), (RankRelation("ep", Owned(1)),), is_placeholder=True)
 
     result = _result_tensor(TensorMetricExecutor({"ep": object()}).run(metric, [item]))
 
@@ -898,16 +894,11 @@ def test_empty_owned_dimwise_l2_contributes_zero_population(monkeypatch, metric)
 def test_empty_owned_flat_shard_reduces_storage_before_owner(monkeypatch, metric):
     expert_dp_group = object()
     ep_group = object()
-    calls = _fake_distributed(
-        monkeypatch, [torch.zeros(1, 2), torch.tensor([[10.0, 2.0]])]
-    )
+    calls = _fake_distributed(monkeypatch, [torch.zeros(1, 2), torch.tensor([[10.0, 2.0]])])
     item = _item(
         "remote",
         torch.empty(0),
-        (
-            RankRelation("ep", Owned(1)),
-            RankRelation("expert_dp", FlatShard((2, 2), 0, 2)),
-        ),
+        (RankRelation("ep", Owned(1)), RankRelation("expert_dp", FlatShard((2, 2), 0, 2))),
         is_placeholder=True,
     )
 
@@ -932,17 +923,11 @@ def test_empty_local_owned_flat_shard_resolves_norm_before_population(
 ):
     expert_dp_group = object()
     ep_group = object()
-    calls = _fake_distributed(
-        monkeypatch,
-        [remote_norm_state, torch.zeros(1, 2)],
-    )
+    calls = _fake_distributed(monkeypatch, [remote_norm_state, torch.zeros(1, 2)])
     item = _item(
         "local-owner",
         torch.empty(0),
-        (
-            RankRelation("ep", Owned(0)),
-            RankRelation("expert_dp", FlatShard((3, 2), 0, 0)),
-        ),
+        (RankRelation("ep", Owned(0)), RankRelation("expert_dp", FlatShard((3, 2), 0, 0))),
     )
 
     result = _result_tensor(
@@ -962,80 +947,72 @@ def test_dimwise_l2_norm_rejects_unknown_shard_dimension(metric):
         TensorMetricExecutor({"tp": object()}).run(metric, [item])
 
 
-class _BatchMetric(TensorMetric):
+class _BatchStartMetric(TensorMetric):
     def __init__(self):
         self.batch_sizes = []
 
-    def groups(self, values):
-        return [MetricGroup((value,)) for value in values]
-
-    def start(self, groups):
-        self.batch_sizes.append(len(groups))
-        return [MetricResult(group.items[0]) for group in groups]
+    def start(self, values):
+        self.batch_sizes.append(len(values))
+        return [MetricResult(value.tensor, value.sites[0].name) for value in values]
 
     def resume(self, completed):
         raise AssertionError("This metric does not request collectives.")
 
 
-def test_metric_can_override_batch_execution():
-    metric = _BatchMetric()
+def test_metric_start_receives_all_prepared_values():
+    metric = _BatchStartMetric()
     items = [_item("a", torch.ones(1)), _item("b", torch.ones(1))]
 
     results = TensorMetricExecutor({}).run(metric, items)
 
-    assert [result.label for result in results] == [None, None]
+    assert [result.label for result in results] == ["a", "b"]
     assert metric.batch_sizes == [2]
 
 
-class _BatchResumeMetric(PerGroupTensorMetric):
+class _SingularResumeMetric(TensorMetric):
     def __init__(self):
-        self.batch_sizes = []
+        self.resume_calls = 0
 
-    def groups(self, values):
-        return [MetricGroup((value,)) for value in values]
-
-    def start_group(self, group):
-        return CollectiveRequestSet((CollectiveRequest(group.items[0], "tp", AllReduce()),), None)
-
-    def resume_group(self, completed):
-        raise AssertionError("The optimized batch implementation should be used.")
+    def start(self, values):
+        return [
+            CollectiveStage((CollectiveRequest(value, "tp", AllReduce()),), f"result-{index}")
+            for index, value in enumerate(values)
+        ]
 
     def resume(self, completed):
-        self.batch_sizes.append(len(completed))
-        return [MetricResult(completion_set.values[0]) for completion_set in completed]
+        self.resume_calls += 1
+        return MetricResult(completed.values[0].tensor, completed.continuation)
 
 
-def test_metric_can_override_batch_resume(monkeypatch):
+def test_executor_resumes_each_computation_independently_after_batching_collectives(monkeypatch):
     calls = _fake_distributed(monkeypatch, [torch.tensor([[2.0], [3.0]])])
-    metric = _BatchResumeMetric()
+    metric = _SingularResumeMetric()
     relations = (RankRelation("tp", Replica()),)
     items = [_item("a", torch.ones(1), relations), _item("b", torch.ones(1), relations)]
 
     results = TensorMetricExecutor({"tp": object()}).run(metric, items)
 
-    torch.testing.assert_close(results[0].value.tensor, torch.tensor([3.0]))
-    torch.testing.assert_close(results[1].value.tensor, torch.tensor([4.0]))
-    assert metric.batch_sizes == [2]
+    torch.testing.assert_close(results[0].tensor, torch.tensor([3.0]))
+    torch.testing.assert_close(results[1].tensor, torch.tensor([4.0]))
+    assert metric.resume_calls == 2
     assert calls[0][0] == torch.Size([2, 1])
 
 
-class _GatherMetric(PerGroupTensorMetric):
+class _GatherMetric(TensorMetric):
     def __init__(self, collective):
         self.collective = collective
 
-    def groups(self, values):
-        return [MetricGroup((value,)) for value in values]
+    def start(self, values):
+        return [
+            CollectiveStage((CollectiveRequest(value, "tp", self.collective),), "gathered")
+            for value in values
+        ]
 
-    def start_group(self, group):
-        assert len(group.items) == 1
-        return CollectiveRequestSet(
-            (CollectiveRequest(group.items[0], "tp", self.collective),), "gathered"
-        )
-
-    def resume_group(self, completed):
+    def resume(self, completed):
         assert completed.continuation == "gathered"
         assert len(completed.values) == 1
-        return MetricResult(completed.values[0])
+        assert completed.values[0].relation("tp").placement == Replica()
+        return MetricResult(completed.values[0].tensor)
 
 
 def _fake_all_gather(monkeypatch, remote_value):
@@ -1083,10 +1060,9 @@ def test_executor_all_gathers_a_replica_along_a_new_leading_dimension(monkeypatc
     results = TensorMetricExecutor({"tp": object()}).run(_GatherMetric(AllGather()), [item])
 
     torch.testing.assert_close(_result_tensor(results), torch.tensor([[1.0, 2.0], [1.0, 2.25]]))
-    assert results[0].value.relation("tp").placement == Replica()
 
 
-def test_global_group_can_contain_the_same_input_more_than_once():
+def test_global_result_can_contain_the_same_input_more_than_once():
     value = _item("duplicate", torch.ones(1))
 
     results = TensorMetricExecutor({}).run(L2NormMetric(), [value, value])
@@ -1107,24 +1083,18 @@ def test_executor_passes_through_torch_reduce_op(monkeypatch):
     calls = _fake_distributed(monkeypatch, [torch.tensor([[2.0]])])
     item = _item("replica", torch.ones(1), (RankRelation("tp", Replica()),))
 
-    class ExplicitMetric(PerGroupTensorMetric):
-        def groups(self, values):
-            return [MetricGroup((value,)) for value in values]
+    class ExplicitMetric(TensorMetric):
+        def start(self, values):
+            return [
+                CollectiveStage(
+                    (CollectiveRequest(value, "tp", AllReduce(torch.distributed.ReduceOp.MAX)),),
+                    None,
+                )
+                for value in values
+            ]
 
-        def start_group(self, group):
-            assert len(group.items) == 1
-            return CollectiveRequestSet(
-                (
-                    CollectiveRequest(
-                        group.items[0], "tp", AllReduce(torch.distributed.ReduceOp.MAX)
-                    ),
-                ),
-                None,
-            )
-
-        def resume_group(self, completed):
-            assert len(completed.values) == 1
-            return MetricResult(completed.values[0])
+        def resume(self, completed):
+            return MetricResult(completed.values[0].tensor)
 
     TensorMetricExecutor({"tp": object()}).run(ExplicitMetric(), [item])
 
@@ -1141,9 +1111,9 @@ def _router_results(metric, diagnostics: torch.Tensor) -> dict[str, torch.Tensor
     results = TensorMetricExecutor({}).run(metric, [_router_diagnostic_item(diagnostics)])
     layer_prefix = "decoder.layers.2/"
     return {
-        str(result.label).removeprefix(layer_prefix): result.value.tensor
+        result.label.removeprefix(layer_prefix): result.tensor
         for result in results
-        if str(result.label).startswith(layer_prefix)
+        if result.label.startswith(layer_prefix)
     }
 
 
@@ -1201,7 +1171,7 @@ def test_router_routing_balance_metric_compares_biased_and_unbiased_load():
         torch.testing.assert_close(results[name], torch.tensor(value))
 
 
-def test_router_diagnostic_global_group_reduces_layer_metrics_without_cancellation():
+def test_router_diagnostic_global_result_reduces_layer_metrics_without_cancellation():
     first = _diagnostics(rows=1)
     first[:, RouterDiagnosticChannel.MEAN_SCORE] = torch.tensor([[1.0, 0.0]])
     first[:, RouterDiagnosticChannel.AUX_LOAD] = torch.tensor([[1.0, 0.0]])
@@ -1214,8 +1184,8 @@ def test_router_diagnostic_global_group_reduces_layer_metrics_without_cancellati
 
     routing_results = TensorMetricExecutor({}).run(LayerRouterRoutingBalanceMetric(), items)
     seq_aux_results = TensorMetricExecutor({}).run(LayerRouterSeqAuxDecompositionMetric(), items)
-    routing_by_label = {str(result.label): result.value.tensor for result in routing_results}
-    seq_aux_by_label = {str(result.label): result.value.tensor for result in seq_aux_results}
+    routing_by_label = {result.label: result.tensor for result in routing_results}
+    seq_aux_by_label = {result.label: result.tensor for result in seq_aux_results}
 
     torch.testing.assert_close(
         routing_by_label["global/global-actual-max-over-mean"], torch.tensor(2.0)
@@ -1239,7 +1209,7 @@ def test_router_health_metric_contrasts_sequence_and_global_batch_loss():
     results = TensorMetricExecutor({}).run(
         LayerRouterHealthMetric(), [_router_diagnostic_item(diagnostics)]
     )
-    results_by_label = {str(result.label): result.value.tensor for result in results}
+    results_by_label = {result.label: result.tensor for result in results}
 
     expected = {
         "seq-loss": 1.25,
@@ -1276,7 +1246,7 @@ def test_router_health_metric_reports_the_worst_layer_for_each_signal():
     items = [_router_diagnostic_item(first, layer=2), _router_diagnostic_item(second, layer=3)]
 
     results = TensorMetricExecutor({}).run(LayerRouterHealthMetric(), items)
-    results_by_label = {str(result.label): result.value.tensor for result in results}
+    results_by_label = {result.label: result.tensor for result in results}
 
     torch.testing.assert_close(results_by_label["global/seq-loss"], torch.tensor(1.5))
     torch.testing.assert_close(results_by_label["worst-layer/seq-loss"], torch.tensor(2.0))

@@ -9,7 +9,7 @@ instructional metrics belong in :mod:`megatron.training.tensor_metrics.examples`
 import hashlib
 import math
 import re
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -18,20 +18,19 @@ import torch
 from .core import (
     AllGather,
     AllReduce,
-    CollectiveCompletionSet,
+    CollectiveCompletion,
     CollectiveRequest,
-    CollectiveRequestSet,
+    CollectiveStage,
     FlatShard,
     LogicalReductionMetric,
-    MetricGroup,
     MetricResult,
     MetricSite,
     MetricStep,
     MetricTensor,
     Owned,
-    PerGroupTensorMetric,
     RankRelation,
     Shard,
+    TensorMetric,
 )
 
 __all__ = [
@@ -102,10 +101,7 @@ class L2NormMetric(LogicalReductionMetric):
             for (device, _), entries in buckets.items():
                 overflow_buffer = torch.zeros(1, dtype=torch.int32, device=device)
                 _, per_tensor_norms = multi_tensor_applier(
-                    multi_tensor_l2norm,
-                    overflow_buffer,
-                    [[tensor for _, tensor in entries]],
-                    True,
+                    multi_tensor_l2norm, overflow_buffer, [[tensor for _, tensor in entries]], True
                 )
                 if per_tensor_norms is None or per_tensor_norms.numel() != len(entries):
                     raise RuntimeError(
@@ -150,7 +146,7 @@ class LayerL2NormMetric(L2NormMetric):
 
     Selected sites must contain a ``layers.<index>`` path segment. The full site-name prefix
     through the innermost such segment becomes the result label; for example, sites named
-    ``decoder.layers.3.mlp.linear_fc1.weight`` are grouped under ``decoder.layers.3``. The reusable
+    ``decoder.layers.3.mlp.linear_fc1.weight`` contributes to ``decoder.layers.3``. The reusable
     default selects parameters; training-specific subclasses may select another source kind.
     """
 
@@ -178,21 +174,19 @@ class LayerL2NormMetric(L2NormMetric):
         return [value for value in values if cls._layer_label(value) is not None]
 
     @classmethod
-    def _groups_by_layer(
+    def _reductions_by_layer(
         cls, values: Sequence[MetricTensor], *, include_global: bool = False
-    ) -> list[MetricGroup]:
-        grouped_values: dict[str, list[MetricTensor]] = {}
+    ) -> list[tuple[str, Sequence[MetricTensor]]]:
+        values_by_layer: dict[str, list[MetricTensor]] = {}
         for value in values:
             label = cls._layer_label(value)
             if label is None:
                 raise ValueError("A prepared layer metric tensor must identify one logical layer.")
-            grouped_values.setdefault(label, []).append(value)
-        groups = [
-            MetricGroup(tuple(grouped), label=label) for label, grouped in grouped_values.items()
-        ]
+            values_by_layer.setdefault(label, []).append(value)
+        reductions: list[tuple[str, Sequence[MetricTensor]]] = list(values_by_layer.items())
         if include_global and values:
-            groups.append(MetricGroup(tuple(values), label="global"))
-        return groups
+            reductions.append(("global", values))
+        return reductions
 
     def accepts(self, site: MetricSite) -> bool:
         """Select configured sites belonging to a numbered layer.
@@ -209,16 +203,18 @@ class LayerL2NormMetric(L2NormMetric):
         """Reject tensors spanning multiple layers, then prepare L2 contributions."""
         return super().prepare(self._selected_values(values))
 
-    def groups(self, values: Sequence[MetricTensor]) -> list[MetricGroup]:
-        """Group prepared tensor contributions by logical layer.
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start one logical reduction for each numbered layer.
 
         Args:
             values: Prepared tensor contributions accumulated by the caller.
 
         Returns:
-            Tensor groups in first-observation order.
+            One result or collective stage per layer, in first-observation order.
         """
-        return self._groups_by_layer(values, include_global=self.include_global)
+        return self._start_logical_reductions(
+            self._reductions_by_layer(values, include_global=self.include_global)
+        )
 
 
 class LayerMaxMetric(LogicalReductionMetric):
@@ -236,9 +232,11 @@ class LayerMaxMetric(LogicalReductionMetric):
         """Compact each selected tensor to a rank-local maximum."""
         return super().prepare(LayerL2NormMetric._selected_values(values))
 
-    def groups(self, values: Sequence[MetricTensor]) -> list[MetricGroup]:
-        """Group prepared maxima by logical layer."""
-        return LayerL2NormMetric._groups_by_layer(values, include_global=self.include_global)
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start one maximum reduction for each numbered layer."""
+        return self._start_logical_reductions(
+            LayerL2NormMetric._reductions_by_layer(values, include_global=self.include_global)
+        )
 
     def contribution(self, tensor: torch.Tensor) -> torch.Tensor:
         """Return one maximum contribution, using negative infinity for an empty shard."""
@@ -268,9 +266,11 @@ class LayerNormalizedEntropyMetric(LogicalReductionMetric):
         """Compact each distribution tensor to an entropy sum and population count."""
         return super().prepare(LayerL2NormMetric._selected_values(values))
 
-    def groups(self, values: Sequence[MetricTensor]) -> list[MetricGroup]:
-        """Group prepared entropy contributions by logical layer."""
-        return LayerL2NormMetric._groups_by_layer(values, include_global=self.include_global)
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start one entropy reduction for each numbered layer."""
+        return self._start_logical_reductions(
+            LayerL2NormMetric._reductions_by_layer(values, include_global=self.include_global)
+        )
 
     def contribution(self, tensor: torch.Tensor) -> torch.Tensor:
         """Return normalized entropy sum and number of distributions."""
@@ -292,10 +292,10 @@ class LayerNormalizedEntropyMetric(LogicalReductionMetric):
 @dataclass(frozen=True)
 class _SampledMedianContinuation:
     remaining_axes: tuple[str, ...]
-    label: Hashable | None
+    label: str
 
 
-class LayerSampledMedianMetric(PerGroupTensorMetric):
+class LayerSampledMedianMetric(TensorMetric):
     """Estimate each layer's median from a deterministic sample of its tensor elements.
 
     Approximately ``1 / sample_factor`` of every nonempty local tensor is retained during
@@ -341,15 +341,20 @@ class LayerSampledMedianMetric(PerGroupTensorMetric):
             sampled.append(value.with_tensor(tensor.index_select(0, indices)))
         return sampled
 
-    def groups(self, values: Sequence[MetricTensor]) -> list[MetricGroup]:
-        """Group prepared samples by logical layer."""
-        return LayerL2NormMetric._groups_by_layer(values, include_global=self.include_global)
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start one sampled-median computation for each numbered layer."""
+        return [
+            self._start_sample(layer_values, label)
+            for label, layer_values in LayerL2NormMetric._reductions_by_layer(
+                values, include_global=self.include_global
+            )
+        ]
 
-    def start_group(self, group: MetricGroup) -> MetricStep:
-        """Concatenate one layer's samples and start gathering sharded populations."""
-        relations = group.items[0].rank_relations
-        if any(value.rank_relations != relations for value in group.items[1:]):
-            raise ValueError("A sampled-median group requires identical rank relations.")
+    def _start_sample(self, values: Sequence[MetricTensor], label: str) -> MetricStep:
+        """Concatenate one result's samples and start gathering sharded populations."""
+        relations = values[0].rank_relations
+        if any(value.rank_relations != relations for value in values[1:]):
+            raise ValueError("A sampled-median result requires identical rank relations.")
         unsupported = tuple(
             relation.axis
             for relation in relations
@@ -360,16 +365,16 @@ class LayerSampledMedianMetric(PerGroupTensorMetric):
                 "Sampled median does not yet support FlatShard or Owned placements: "
                 f"{unsupported}."
             )
-        sites = tuple(site for value in group.items for site in value.sites)
-        sample = torch.cat(tuple(value.tensor for value in group.items))
-        value = MetricTensor(sample, sites, relations)
+        sites = tuple(site for value in values for site in value.sites)
+        sample = torch.cat(tuple(value.tensor for value in values))
+        sampled_value = MetricTensor(sample, sites, relations)
         shard_axes = tuple(
             relation.axis for relation in relations if isinstance(relation.placement, Shard)
         )
-        return self._gather_or_finish(value, shard_axes, group.label)
+        return self._gather_or_finish(sampled_value, shard_axes, label)
 
-    def resume_group(self, completed: CollectiveCompletionSet) -> MetricStep:
-        """Continue gathering the sample, or compute its median."""
+    def resume(self, completed: CollectiveCompletion) -> MetricStep:
+        """Continue gathering one sample, or compute its median."""
         continuation = completed.continuation
         if not isinstance(continuation, _SampledMedianContinuation):
             raise ValueError("Invalid sampled-median continuation.")
@@ -381,17 +386,17 @@ class LayerSampledMedianMetric(PerGroupTensorMetric):
 
     @staticmethod
     def _gather_or_finish(
-        value: MetricTensor, remaining_axes: tuple[str, ...], label: Hashable | None
+        value: MetricTensor, remaining_axes: tuple[str, ...], label: str
     ) -> MetricStep:
         if remaining_axes:
-            return CollectiveRequestSet(
+            return CollectiveStage(
                 (CollectiveRequest(value, remaining_axes[0], AllGather(dim=0)),),
                 _SampledMedianContinuation(remaining_axes[1:], label),
             )
         if not value.tensor.numel():
             raise ValueError("Sampled median requires at least one sampled element.")
         sample = value.tensor.to(dtype=_accumulation_dtype(value.tensor.dtype))
-        return MetricResult(MetricTensor(torch.quantile(sample, 0.5), value.sites), label)
+        return MetricResult(torch.quantile(sample, 0.5), label)
 
     def _permutation_seed(self, value: MetricTensor) -> int:
         digest = hashlib.blake2b(digest_size=16)
@@ -404,8 +409,8 @@ class LayerSampledMedianMetric(PerGroupTensorMetric):
         return int.from_bytes(digest.digest(), byteorder="little")
 
 
-class MeanRowL2NormMetric(PerGroupTensorMetric):
-    """Compute the population-weighted mean row L2 norm within each selected tensor group.
+class MeanRowL2NormMetric(TensorMetric):
+    """Compute the population-weighted mean row L2 norm over all selected tensors.
 
     The last tensor dimension contains each row's columns. The default produces one global result
     by averaging across the combined row population of all selected tensors.
@@ -416,31 +421,33 @@ class MeanRowL2NormMetric(PerGroupTensorMetric):
     def __init__(self) -> None:
         self._implementation = _MeanDimwiseL2NormMetric(norm_last_dim=True)
 
-    def start_group(self, group: MetricGroup) -> MetricStep:
-        """Start one mean row L2 norm computation.
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start one global mean row L2 norm computation.
 
         Args:
-            group: Tensors whose row norms contribute to one population-weighted mean.
+            values: Tensors whose row norms contribute to one population-weighted mean.
 
         Returns:
-            First collective request set or completed mean row L2 norm.
+            One global result or collective stage, or no steps when no values were prepared.
         """
-        return self._implementation.start(group)
+        if not values:
+            return []
+        return [self._implementation.start(values, "global")]
 
-    def resume_group(self, completed: CollectiveCompletionSet) -> MetricStep:
-        """Resume one mean row L2 norm computation.
+    def resume(self, completed: CollectiveCompletion) -> MetricStep:
+        """Resume one completed mean row L2 norm stage.
 
         Args:
             completed: Completed norm or population reductions for ready tensor branches.
 
         Returns:
-            Next collective request set or completed mean row L2 norm.
+            Next collective stage or completed mean row L2 norm.
         """
         return self._implementation.resume(completed)
 
 
-class MeanColumnL2NormMetric(PerGroupTensorMetric):
-    """Compute the population-weighted mean column L2 norm within each selected tensor group.
+class MeanColumnL2NormMetric(TensorMetric):
+    """Compute the population-weighted mean column L2 norm over all selected tensors.
 
     The last tensor dimension indexes columns. The default produces one global result by averaging
     across the combined column population of all selected tensors.
@@ -451,25 +458,27 @@ class MeanColumnL2NormMetric(PerGroupTensorMetric):
     def __init__(self) -> None:
         self._implementation = _MeanDimwiseL2NormMetric(norm_last_dim=False)
 
-    def start_group(self, group: MetricGroup) -> MetricStep:
-        """Start one mean column L2 norm computation.
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start one global mean column L2 norm computation.
 
         Args:
-            group: Tensors whose column norms contribute to one population-weighted mean.
+            values: Tensors whose column norms contribute to one population-weighted mean.
 
         Returns:
-            First collective request set or completed mean column L2 norm.
+            One global result or collective stage, or no steps when no values were prepared.
         """
-        return self._implementation.start(group)
+        if not values:
+            return []
+        return [self._implementation.start(values, "global")]
 
-    def resume_group(self, completed: CollectiveCompletionSet) -> MetricStep:
-        """Resume one mean column L2 norm computation.
+    def resume(self, completed: CollectiveCompletion) -> MetricStep:
+        """Resume one completed mean column L2 norm stage.
 
         Args:
             completed: Completed norm or population reductions for ready tensor branches.
 
         Returns:
-            Next collective request set or completed mean column L2 norm.
+            Next collective stage or completed mean column L2 norm.
         """
         return self._implementation.resume(completed)
 
@@ -488,7 +497,7 @@ class _DimwiseL2Branch:
 
 @dataclass(frozen=True)
 class _DimwiseL2Continuation:
-    group: MetricGroup
+    label: str
     branches: tuple[_DimwiseL2Branch, ...]
     states: tuple[torch.Tensor | None, ...]
 
@@ -497,16 +506,14 @@ class _MeanDimwiseL2NormMetric:
     def __init__(self, norm_last_dim: bool) -> None:
         self._norm_last_dim = norm_last_dim
 
-    def start(self, group: MetricGroup) -> MetricStep:
+    def start(self, values: Sequence[MetricTensor], label: str) -> MetricStep:
         requests = []
         branches = []
-        states: list[torch.Tensor | None] = [None] * len(group.items)
-        for index, value in enumerate(group.items):
+        states: list[torch.Tensor | None] = [None] * len(values)
+        for index, value in enumerate(values):
             if value.is_placeholder:
                 accumulation_dtype = _accumulation_dtype(value.tensor.dtype)
-                sum_and_count = torch.zeros(
-                    2, dtype=accumulation_dtype, device=value.tensor.device
-                )
+                sum_and_count = torch.zeros(2, dtype=accumulation_dtype, device=value.tensor.device)
                 population_axes = _dimwise_reduction_axes(value.rank_relations)
                 self._advance_branch(
                     index=index,
@@ -528,7 +535,7 @@ class _MeanDimwiseL2NormMetric:
                 branches=branches,
                 states=states,
             )
-        return self._request_or_finish(group, requests, branches, states)
+        return self._request_or_finish(label, requests, branches, states)
 
     def _local_norm_state(self, value: MetricTensor) -> tuple[MetricTensor, tuple[str, ...]]:
         flat_shards = tuple(
@@ -559,7 +566,7 @@ class _MeanDimwiseL2NormMetric:
         relations, norm_axes = _relations_after_dim_reduction(value.rank_relations, norm_dims, ndim)
         return value.with_tensor(local_sum, relations), norm_axes
 
-    def resume(self, completed: CollectiveCompletionSet) -> MetricStep:
+    def resume(self, completed: CollectiveCompletion) -> MetricStep:
         continuation = _expect_dimwise_l2_continuation(completed)
         if len(completed.values) != len(continuation.branches):
             raise ValueError(
@@ -578,7 +585,7 @@ class _MeanDimwiseL2NormMetric:
                 branches=branches,
                 states=states,
             )
-        return self._request_or_finish(continuation.group, requests, branches, states)
+        return self._request_or_finish(continuation.label, requests, branches, states)
 
     def _advance_branch(
         self,
@@ -617,16 +624,16 @@ class _MeanDimwiseL2NormMetric:
 
     @staticmethod
     def _request_or_finish(
-        group: MetricGroup,
+        label: str,
         requests: Sequence[CollectiveRequest],
         branches: Sequence[_DimwiseL2Branch],
         states: Sequence[torch.Tensor | None],
     ) -> MetricStep:
         if requests:
-            return CollectiveRequestSet(
+            return CollectiveStage(
                 requests=tuple(requests),
                 continuation=_DimwiseL2Continuation(
-                    group=group, branches=tuple(branches), states=tuple(states)
+                    label=label, branches=tuple(branches), states=tuple(states)
                 ),
             )
         resolved_states = []
@@ -640,8 +647,7 @@ class _MeanDimwiseL2NormMetric:
             packed = torch.stack(tuple(resolved_states), dim=0)
             total = packed.sum(dim=0, dtype=packed.dtype)
         result = total[0] / total[1]
-        sites = tuple(site for value in group.items for site in value.sites)
-        return MetricResult(MetricTensor(result, sites=sites), group.label)
+        return MetricResult(result, label)
 
 
 def _dimwise_reduction_axes(relations: Sequence[RankRelation]) -> tuple[str, ...]:
@@ -783,7 +789,7 @@ def _accumulation_dtype(dtype: torch.dtype) -> torch.dtype:
     return torch.float32
 
 
-def _expect_dimwise_l2_continuation(completed: CollectiveCompletionSet) -> _DimwiseL2Continuation:
+def _expect_dimwise_l2_continuation(completed: CollectiveCompletion) -> _DimwiseL2Continuation:
     if not isinstance(completed.continuation, _DimwiseL2Continuation):
         raise ValueError("Collective completion has an invalid dimwise L2 continuation.")
     return completed.continuation

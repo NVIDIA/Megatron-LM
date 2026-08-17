@@ -23,18 +23,17 @@ from megatron.core.transformer.moe.router_diagnostics import (
 
 from .core import (
     AllReduce,
-    CollectiveCompletionSet,
+    CollectiveCompletion,
     CollectiveRequest,
-    CollectiveRequestSet,
+    CollectiveStage,
     FlatShard,
-    MetricGroup,
     MetricResult,
     MetricSite,
     MetricStep,
     MetricTensor,
     Owned,
-    PerGroupTensorMetric,
     Shard,
+    TensorMetric,
 )
 from .definitions import (
     LayerL2NormMetric,
@@ -97,25 +96,17 @@ class _RouterOperation:
 
 
 @dataclass(frozen=True)
-class _RouterMetricLabel:
+class _RouterMetricContinuation:
+    remaining_axes: tuple[str, ...]
     layer: str
     operation: _RouterOperation
 
-    def __str__(self) -> str:
-        return f"{self.layer}/{self.operation.name}"
 
-
-@dataclass(frozen=True)
-class _RouterMetricContinuation:
-    remaining_axes: tuple[str, ...]
-    label: _RouterMetricLabel
-
-
-class _LayerRouterDiagnosticMetric(PerGroupTensorMetric):
+class _LayerRouterDiagnosticMetric(TensorMetric):
     source_kinds = frozenset({"router_diagnostics"})
     operations: tuple[_RouterOperation, ...] = ()
-    include_layer_groups = True
-    include_worst_layer_group = False
+    include_layer_results = True
+    include_worst_layer_result = False
 
     def accepts(self, site: MetricSite) -> bool:
         """Select router diagnostic sites belonging to numbered layers."""
@@ -139,42 +130,40 @@ class _LayerRouterDiagnosticMetric(PerGroupTensorMetric):
             prepared.append(value.with_tensor(tensor.float().clone()))
         return prepared
 
-    def groups(self, values: Sequence[MetricTensor]) -> list[MetricGroup]:
-        """Create configured layer, global, and worst-layer diagnostic result groups."""
-        grouped_values: dict[str, list[MetricTensor]] = {}
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start configured layer, global, and worst-layer diagnostic results."""
+        values_by_layer: dict[str, list[MetricTensor]] = {}
         for value in values:
             layer = LayerL2NormMetric._layer_label(value)
             if layer is None:
                 raise ValueError("A router diagnostic tensor must identify one logical layer.")
-            grouped_values.setdefault(layer, []).append(value)
+            values_by_layer.setdefault(layer, []).append(value)
 
-        groups = []
-        if self.include_layer_groups:
-            groups.extend(
-                MetricGroup(tuple(layer_values), label=_RouterMetricLabel(layer, operation))
-                for layer, layer_values in grouped_values.items()
+        steps = []
+        if self.include_layer_results:
+            steps.extend(
+                self._start_operation(layer_values, layer, operation)
+                for layer, layer_values in values_by_layer.items()
                 for operation in self.operations
             )
         if values:
-            groups.extend(
-                MetricGroup(tuple(values), label=_RouterMetricLabel("global", operation))
+            steps.extend(
+                self._start_operation(values, "global", operation) for operation in self.operations
+            )
+        if values and self.include_worst_layer_result:
+            steps.extend(
+                self._start_operation(values, "worst-layer", operation)
                 for operation in self.operations
             )
-        if values and self.include_worst_layer_group:
-            groups.extend(
-                MetricGroup(tuple(values), label=_RouterMetricLabel("worst-layer", operation))
-                for operation in self.operations
-            )
-        return groups
+        return steps
 
-    def start_group(self, group: MetricGroup) -> MetricStep:
+    def _start_operation(
+        self, values: Sequence[MetricTensor], layer: str, operation: _RouterOperation
+    ) -> MetricStep:
         """Build a compact contribution and reduce it over data-parallel ranks."""
-        label = group.label
-        if not isinstance(label, _RouterMetricLabel):
-            raise ValueError("Invalid router diagnostic metric label.")
-        relations = group.items[0].rank_relations
-        if any(value.rank_relations != relations for value in group.items[1:]):
-            raise ValueError("A router diagnostic group requires identical rank relations.")
+        relations = values[0].rank_relations
+        if any(value.rank_relations != relations for value in values[1:]):
+            raise ValueError("A router diagnostic result requires identical rank relations.")
         unsupported = tuple(
             relation.axis
             for relation in relations
@@ -187,81 +176,83 @@ class _LayerRouterDiagnosticMetric(PerGroupTensorMetric):
                 f"parallel observations; unsupported axes: {unsupported}."
             )
 
-        contribution = self._group_contribution(group, label)
-        sites = tuple(site for value in group.items for site in value.sites)
+        contribution = self._result_contribution(values, layer, operation)
+        sites = tuple(site for value in values for site in value.sites)
         value = MetricTensor(contribution, sites, relations)
         reduction_axes = tuple(
             relation.axis for relation in relations if isinstance(relation.placement, Shard)
         )
-        return self._reduce_or_finish(value, reduction_axes, label)
+        return self._reduce_or_finish(value, reduction_axes, layer, operation)
 
-    def _group_contribution(self, group: MetricGroup, label: _RouterMetricLabel) -> torch.Tensor:
-        if label.layer == "worst-layer":
+    def _result_contribution(
+        self, values: Sequence[MetricTensor], layer: str, operation: _RouterOperation
+    ) -> torch.Tensor:
+        if layer == "worst-layer":
             return torch.stack(
                 tuple(
                     self._contribution(
-                        torch.cat(tuple(value.tensor for value in layer_values), dim=0),
-                        label.operation,
+                        torch.cat(tuple(value.tensor for value in layer_values), dim=0), operation
                     )
-                    for layer_values in self._values_by_layer(group).values()
+                    for layer_values in self._values_by_layer(values).values()
                 )
             )
-        if label.layer != "global" or label.operation.aggregation != "global":
-            diagnostics = torch.cat(tuple(value.tensor for value in group.items), dim=0)
-            return self._contribution(diagnostics, label.operation)
+        if layer != "global" or operation.aggregation != "global":
+            diagnostics = torch.cat(tuple(value.tensor for value in values), dim=0)
+            return self._contribution(diagnostics, operation)
 
         return torch.stack(
             tuple(
                 self._contribution(
-                    torch.cat(tuple(value.tensor for value in layer_values), dim=0), label.operation
+                    torch.cat(tuple(value.tensor for value in layer_values), dim=0), operation
                 )
-                for layer_values in self._values_by_layer(group).values()
+                for layer_values in self._values_by_layer(values).values()
             )
         )
 
     @staticmethod
-    def _values_by_layer(group: MetricGroup) -> dict[str, list[MetricTensor]]:
+    def _values_by_layer(values: Sequence[MetricTensor]) -> dict[str, list[MetricTensor]]:
         values_by_layer: dict[str, list[MetricTensor]] = {}
-        for value in group.items:
+        for value in values:
             layer = LayerL2NormMetric._layer_label(value)
             if layer is None:
                 raise ValueError("A router diagnostic rollup requires numbered layers.")
             values_by_layer.setdefault(layer, []).append(value)
         return values_by_layer
 
-    def resume_group(self, completed: CollectiveCompletionSet) -> MetricStep:
-        """Finish a distributed diagnostic statistic after its reduction."""
+    def resume(self, completed: CollectiveCompletion) -> MetricStep:
+        """Finish one distributed diagnostic statistic after its reduction."""
         continuation = completed.continuation
         if not isinstance(continuation, _RouterMetricContinuation):
             raise ValueError("Invalid router diagnostic metric continuation.")
         if len(completed.values) != 1:
             raise ValueError("A router diagnostic metric requires one collective completion.")
         return self._reduce_or_finish(
-            completed.values[0], continuation.remaining_axes, continuation.label
+            completed.values[0],
+            continuation.remaining_axes,
+            continuation.layer,
+            continuation.operation,
         )
 
     def _reduce_or_finish(
-        self, value: MetricTensor, remaining_axes: tuple[str, ...], label: _RouterMetricLabel
+        self,
+        value: MetricTensor,
+        remaining_axes: tuple[str, ...],
+        layer: str,
+        operation: _RouterOperation,
     ) -> MetricStep:
         if remaining_axes:
-            return CollectiveRequestSet(
-                (
-                    CollectiveRequest(
-                        value, remaining_axes[0], AllReduce(label.operation.reduction_op)
-                    ),
-                ),
-                _RouterMetricContinuation(remaining_axes[1:], label),
+            return CollectiveStage(
+                (CollectiveRequest(value, remaining_axes[0], AllReduce(operation.reduction_op)),),
+                _RouterMetricContinuation(remaining_axes[1:], layer, operation),
             )
-        if label.layer == "worst-layer":
+        if layer == "worst-layer":
             layer_results = torch.stack(
-                tuple(
-                    self._finalize(contribution, label.operation) for contribution in value.tensor
-                )
+                tuple(self._finalize(contribution, operation) for contribution in value.tensor)
             )
-            result = layer_results.amin() if label.operation.worst_is_min else layer_results.amax()
+            result = layer_results.amin() if operation.worst_is_min else layer_results.amax()
         else:
-            result = self._finalize(value.tensor, label.operation)
-        return MetricResult(MetricTensor(result, value.sites), label)
+            result = self._finalize(value.tensor, operation)
+        return MetricResult(result, f"{layer}/{operation.name}")
 
     @staticmethod
     def _contribution(diagnostics: torch.Tensor, operation: _RouterOperation) -> torch.Tensor:
@@ -349,8 +340,8 @@ class LayerRouterHealthMetric(_LayerRouterDiagnosticMetric):
     """
 
     name = "layer-router-health"
-    include_layer_groups = False
-    include_worst_layer_group = True
+    include_layer_results = False
+    include_worst_layer_result = True
     operations = (
         _RouterOperation("seq-loss", "seq_aux_loss", "mean"),
         _RouterOperation("seq-assignment-imbalance", "aux_load_imbalance", "mean"),

@@ -9,7 +9,7 @@ the collectives needed to make progress.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import groupby
 from typing import TypeAlias
@@ -20,18 +20,16 @@ __all__ = [
     "AllGather",
     "AllReduce",
     "Collective",
-    "CollectiveCompletionSet",
+    "CollectiveCompletion",
     "CollectiveRequest",
-    "CollectiveRequestSet",
+    "CollectiveStage",
     "FlatShard",
     "LogicalReductionMetric",
-    "MetricGroup",
     "MetricResult",
     "MetricSite",
     "MetricStep",
     "MetricTensor",
     "Owned",
-    "PerGroupTensorMetric",
     "Placement",
     "RankRelation",
     "Replica",
@@ -236,31 +234,7 @@ class MetricTensor:
         is_placeholder = self.is_placeholder and any(
             isinstance(relation.placement, Owned) for relation in relations
         )
-        return replace(
-            self, rank_relations=relations, is_placeholder=is_placeholder
-        )
-
-
-@dataclass(frozen=True)
-class MetricGroup:
-    """A metric-selected group of prepared tensor contributions.
-
-    Groups produced by one metric need not be disjoint. The same prepared contribution may appear
-    in several groups when one preparation should feed several independently labeled results.
-
-    Args:
-        items: Prepared tensor contributions belonging to the group.
-        label: Optional metric-defined label for the result produced by this group. The executor
-            does not use labels to correlate work.
-    """
-
-    items: tuple[MetricTensor, ...]
-    label: Hashable | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "items", tuple(self.items))
-        if not self.items:
-            raise ValueError("MetricGroup.items must not be empty.")
+        return replace(self, rank_relations=relations, is_placeholder=is_placeholder)
 
 
 @dataclass(frozen=True)
@@ -305,16 +279,17 @@ class CollectiveRequest:
 
 
 @dataclass(frozen=True)
-class CollectiveRequestSet:
-    """Independent collectives requested together by one metric group.
+class CollectiveStage:
+    """One fan-out/fan-in stage of a metric computation.
 
-    The executor may pack compatible requests from this and other request sets. It completes every
-    request in the set before returning the corresponding :class:`CollectiveCompletionSet` to the
-    metric.
+    The executor may pack compatible requests from this and other stages. It completes every
+    request in the stage before returning one :class:`CollectiveCompletion` to the metric.
+    Branches that need to inspect one another's completions belong in the same stage and share its
+    continuation; independent computations use separate stages.
 
     Args:
         requests: Independent collectives ready to execute. Must not be empty.
-        continuation: Opaque group state returned unchanged with the completions.
+        continuation: Opaque metric state returned unchanged with the completions.
     """
 
     requests: tuple[CollectiveRequest, ...]
@@ -323,12 +298,12 @@ class CollectiveRequestSet:
     def __post_init__(self) -> None:
         object.__setattr__(self, "requests", tuple(self.requests))
         if not self.requests:
-            raise ValueError("CollectiveRequestSet.requests must not be empty.")
+            raise ValueError("CollectiveStage.requests must not be empty.")
 
 
 @dataclass(frozen=True)
-class CollectiveCompletionSet:
-    """Completed request set returned to one metric group.
+class CollectiveCompletion:
+    """Completed collective stage returned to one metric computation.
 
     Values have the same order as the corresponding requests, even when the executor reorders
     requests internally for communication batching.
@@ -336,7 +311,7 @@ class CollectiveCompletionSet:
     Args:
         values: One collective result per request, in request order. Each value has the targeted
             axis marked as replicated.
-        continuation: Opaque group state supplied by the request set.
+        continuation: Opaque metric state supplied by the stage.
     """
 
     values: tuple[MetricTensor, ...]
@@ -345,7 +320,7 @@ class CollectiveCompletionSet:
     def __post_init__(self) -> None:
         object.__setattr__(self, "values", tuple(self.values))
         if not self.values:
-            raise ValueError("CollectiveCompletionSet.values must not be empty.")
+            raise ValueError("CollectiveCompletion.values must not be empty.")
 
 
 @dataclass(frozen=True)
@@ -353,27 +328,32 @@ class MetricResult:
     """A fully computed metric value.
 
     Args:
-        value: Computed metric value and its observation sites. Finalized results need not carry
-            rank relations; those annotations are required while collective work is in progress.
-        label: Optional metric-defined label distinguishing this result from other results.
+        tensor: Computed metric value.
+        label: Metric-defined label distinguishing this result from other results.
     """
 
-    value: MetricTensor
-    label: Hashable | None = None
+    tensor: torch.Tensor
+    label: str = "global"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.label, str):
+            raise TypeError("MetricResult.label must be a string.")
+        if not self.label:
+            raise ValueError("MetricResult.label must not be empty.")
 
 
-MetricStep: TypeAlias = CollectiveRequestSet | MetricResult
+MetricStep: TypeAlias = CollectiveStage | MetricResult
 
 
 class TensorMetric(ABC):
-    """Complete definition of tensor preparation, grouping, and distributed computation.
+    """Complete definition of tensor preparation and distributed computation.
 
     A caller may use :meth:`accepts` to avoid constructing observations that cannot contribute.
     The executor applies the same site predicate before calling :meth:`prepare` while observed
     tensors are available. Callers may accumulate prepared contributions from several observation
-    points before passing them to :meth:`groups` and the batch-native :meth:`start`. Selection,
-    grouping, and group order must be deterministic across every rank that will participate in the
-    resulting collectives.
+    points before passing them to the batch-native :meth:`start`. Selection, aggregation, and
+    result order must be deterministic across every rank that will participate in the resulting
+    collectives.
     """
 
     name: str = ""
@@ -401,7 +381,7 @@ class TensorMetric(ABC):
 
         This method must not communicate. Metrics may override it to compact short-lived tensors
         into local contributions that retain the sites and rank relations needed for later
-        grouping and communication, or to perform additional tensor-aware filtering. The executor
+        aggregation and communication, or to perform additional tensor-aware filtering. The executor
         supplies detached inputs whose sites have passed :meth:`accepts` and detaches returned
         contributions. The default preserves every input.
 
@@ -413,98 +393,26 @@ class TensorMetric(ABC):
         """
         return list(values)
 
-    def groups(self, values: Sequence[MetricTensor]) -> list[MetricGroup]:
-        """Form independent groups from accumulated prepared contributions.
-
-        The default aggregates every contribution into one group labeled ``"global"``, keeping
-        result cardinality bounded. Metrics performing per-tensor or other structured aggregation
-        may override this method. Groups may overlap: reusing one prepared contribution in several
-        groups produces several results without invoking :meth:`prepare` again. Each group is
-        nevertheless executed independently, so overlapping groups may repeat communication.
-        Selection and preparation have already happened.
-
-        Args:
-            values: Prepared contributions accumulated by the caller.
-
-        Returns:
-            One global group, or no groups when no contributions were prepared.
-        """
-        return [MetricGroup(tuple(values), label="global")] if values else []
-
     @abstractmethod
-    def start(self, groups: Sequence[MetricGroup]) -> list[MetricStep]:
-        """Start a batch of independent metric groups.
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start distributed computation from accumulated prepared contributions.
 
         Args:
-            groups: Groups of prepared contributions available together.
+            values: Prepared contributions available together.
 
         Returns:
-            Request sets and completed results. Groups may be filtered by returning no
-            corresponding step.
+            Collective stages and completed results.
         """
 
     @abstractmethod
-    def resume(self, completed: Sequence[CollectiveCompletionSet]) -> list[MetricStep]:
-        """Resume a batch of independent metric groups.
+    def resume(self, completed: CollectiveCompletion) -> MetricStep:
+        """Resume one metric computation after a completed collective stage.
 
         Args:
-            completed: Completed request sets available together.
+            completed: Values and continuation from the computation's completed stage.
 
         Returns:
-            Further request sets and completed results.
-        """
-
-
-class PerGroupTensorMetric(TensorMetric):
-    """Convenience base adapting per-group implementations to the batch-native interface."""
-
-    def start(self, groups: Sequence[MetricGroup]) -> list[MetricStep]:
-        """Start groups independently using :meth:`start_group`.
-
-        Args:
-            groups: Groups of prepared contributions available together.
-
-        Returns:
-            Request sets and completed results. Groups may be filtered by returning no
-            corresponding step from :meth:`start_group`.
-        """
-        return [step for group in groups if (step := self.start_group(group)) is not None]
-
-    @abstractmethod
-    def start_group(self, group: MetricGroup) -> MetricStep | None:
-        """Start metric computation for one selected tensor group.
-
-        Args:
-            group: Prepared contributions belonging to one group.
-
-        Returns:
-            A collective request set, completed result, or ``None`` to filter the group.
-        """
-
-    def resume(self, completed: Sequence[CollectiveCompletionSet]) -> list[MetricStep]:
-        """Resume groups independently using :meth:`resume_group`.
-
-        Args:
-            completed: Completed request sets available together.
-
-        Returns:
-            Further request sets and completed results.
-        """
-        return [
-            step
-            for completion_set in completed
-            if (step := self.resume_group(completion_set)) is not None
-        ]
-
-    @abstractmethod
-    def resume_group(self, completed: CollectiveCompletionSet) -> MetricStep | None:
-        """Resume one grouped computation after its requested collectives.
-
-        Args:
-            completed: Collective outputs and the metric's opaque continuation.
-
-        Returns:
-            Another collective request set, a completed result, or ``None`` to filter the group.
+            Its next collective stage or completed result.
         """
 
 
@@ -516,7 +424,8 @@ class _LogicalReductionBranch:
 
 @dataclass(frozen=True)
 class _LogicalReductionContinuation:
-    group: MetricGroup
+    values: tuple[MetricTensor, ...]
+    label: str
     branches: tuple[_LogicalReductionBranch, ...]
     contributions: tuple[torch.Tensor | None, ...]
 
@@ -539,24 +448,24 @@ _LOCAL_BINARY_REDUCTION_OPS: dict[
 }
 
 
-class LogicalReductionMetric(PerGroupTensorMetric):
+class LogicalReductionMetric(TensorMetric):
     """Base class for simple reductions over complete logical tensors.
 
-    A subclass converts each rank-local tensor into a fixed-shaped, mergeable contribution. For
-    grouped metrics, it also defines how those contributions combine. This class all-reduces each
+    A subclass converts each rank-local tensor into a fixed-shaped, mergeable contribution and may
+    define how several contributions combine. This class all-reduces each
     contribution across every ``Shard`` axis and across every ``Owned`` axis, then calls
     :meth:`finalize`. Ranks without an ``Owned`` value must contribute the identity for
     :attr:`reduction_op`.
     Existing ``Replica`` axes require no communication.
 
     :meth:`prepare` creates the contributions. Each prepared contribution is reduced along all of
-    its ``Shard`` axes, then all of its ``Owned`` axes, before the contributions in a group are
-    combined. Every branch whose next collective is ready is returned in one request set, allowing
+    its ``Shard`` axes, then all of its ``Owned`` axes, before contributions for one result are
+    combined. Every branch whose next collective is ready is returned in one stage, allowing
     the executor to batch compatible requests across heterogeneous layouts.
 
     The default :meth:`combine_contributions` applies :attr:`reduction_op` locally for associative
     PyTorch reductions with direct tensor equivalents. A metric may override it for different
-    cross-tensor semantics. More complex layouts should override :meth:`start_group`. Subclasses
+    cross-tensor semantics. More complex layouts should override :meth:`start`. Subclasses
     may override :meth:`contribution_batch` to use fused or multi-tensor kernels.
     """
 
@@ -608,24 +517,24 @@ class LogicalReductionMetric(PerGroupTensorMetric):
         ]
 
     def combine_contributions(
-        self, group: MetricGroup, contributions: Sequence[torch.Tensor]
+        self, values: Sequence[MetricTensor], contributions: Sequence[torch.Tensor]
     ) -> torch.Tensor:
-        """Combine per-tensor contributions within one selected group.
+        """Combine per-tensor contributions for one result.
 
         Args:
-            group: Selected tensor group corresponding to ``contributions``.
-            contributions: One mergeable contribution per tensor in ``group``.
+            values: Prepared tensors corresponding to ``contributions``.
+            contributions: One mergeable contribution per prepared tensor.
 
         Returns:
             One combined contribution.
 
         Raises:
-            ValueError: If the contributions do not correspond to the group or a multi-tensor
-                group uses a reduction without default local semantics.
+            ValueError: If the contributions do not correspond to the prepared tensors or a
+                multi-tensor result uses a reduction without default local semantics.
         """
-        if len(contributions) != len(group.items):
+        if len(contributions) != len(values):
             raise ValueError(
-                "Logical reduction contributions must correspond to the grouped tensors."
+                "Logical reduction contributions must correspond to the prepared tensors."
             )
         if len(contributions) == 1:
             return contributions[0]
@@ -654,25 +563,51 @@ class LogicalReductionMetric(PerGroupTensorMetric):
         """
         return contribution
 
-    def start_group(self, group: MetricGroup) -> MetricStep:
-        """Request the first required reduction for every prepared contribution in a group.
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start one global logical reduction over every prepared contribution.
 
         Args:
-            group: Prepared contributions for one result.
+            values: Prepared contributions available together.
 
         Returns:
-            First collective request set or completed result.
+            One global result or collective stage, or no steps when no values were prepared.
         """
-        return self._start_from_contributions(group, tuple(value.tensor for value in group.items))
+        if not values:
+            return []
+        return [self._start_logical_reduction(values, "global")]
 
-    def resume_group(self, completed: CollectiveCompletionSet) -> MetricStep:
-        """Advance every completed logical-reduction branch.
+    def _start_logical_reductions(
+        self, reductions: Sequence[tuple[str, Sequence[MetricTensor]]]
+    ) -> list[MetricStep]:
+        """Start several independently labeled logical reductions."""
+        steps = []
+        for label, values in reductions:
+            if not values:
+                raise ValueError("A logical reduction must contain at least one prepared tensor.")
+            steps.append(self._start_logical_reduction(values, label))
+        return steps
+
+    def _start_logical_reduction(self, values: Sequence[MetricTensor], label: str) -> MetricStep:
+        """Start one labeled logical reduction."""
+        values = tuple(values)
+        if not values:
+            raise ValueError("A logical reduction must contain at least one prepared tensor.")
+        if not isinstance(label, str):
+            raise TypeError("A logical reduction label must be a string.")
+        if not label:
+            raise ValueError("A logical reduction label must not be empty.")
+        return self._start_from_contributions(
+            values, label, tuple(value.tensor for value in values)
+        )
+
+    def resume(self, completed: CollectiveCompletion) -> MetricStep:
+        """Advance one completed logical-reduction stage.
 
         Args:
             completed: Completed branch reductions and their shared continuation.
 
         Returns:
-            Next collective request set or completed result.
+            Next collective stage or completed result.
 
         Raises:
             ValueError: If the completion did not originate from this abstraction.
@@ -700,24 +635,25 @@ class LogicalReductionMetric(PerGroupTensorMetric):
             else:
                 contributions[branch.index] = value.tensor
         return self._request_or_finish(
-            group=continuation.group,
+            values=continuation.values,
+            label=continuation.label,
             requests=requests,
             branches=branches,
             contributions=contributions,
         )
 
     def _start_from_contributions(
-        self, group: MetricGroup, contributions: Sequence[torch.Tensor]
+        self, values: Sequence[MetricTensor], label: str, contributions: Sequence[torch.Tensor]
     ) -> MetricStep:
-        if len(contributions) != len(group.items):
+        if len(contributions) != len(values):
             raise ValueError(
-                "Logical reduction contributions must correspond to the grouped tensors."
+                "Logical reduction contributions must correspond to the prepared tensors."
             )
         requests = []
         branches = []
         resolved_contributions: list[torch.Tensor | None] = [None] * len(contributions)
-        for index, (grouped_value, contribution) in enumerate(zip(group.items, contributions)):
-            value = grouped_value.with_tensor(contribution)
+        for index, (prepared_value, contribution) in enumerate(zip(values, contributions)):
+            value = prepared_value.with_tensor(contribution)
             shard_axes = tuple(
                 relation.axis
                 for relation in value.rank_relations
@@ -739,21 +675,29 @@ class LogicalReductionMetric(PerGroupTensorMetric):
             else:
                 resolved_contributions[index] = contribution
         return self._request_or_finish(
-            group=group, requests=requests, branches=branches, contributions=resolved_contributions
+            values=values,
+            label=label,
+            requests=requests,
+            branches=branches,
+            contributions=resolved_contributions,
         )
 
     def _request_or_finish(
         self,
-        group: MetricGroup,
+        values: Sequence[MetricTensor],
+        label: str,
         requests: Sequence[CollectiveRequest],
         branches: Sequence[_LogicalReductionBranch],
         contributions: Sequence[torch.Tensor | None],
     ) -> MetricStep:
         if requests:
-            return CollectiveRequestSet(
+            return CollectiveStage(
                 requests=tuple(requests),
                 continuation=_LogicalReductionContinuation(
-                    group=group, branches=tuple(branches), contributions=tuple(contributions)
+                    values=tuple(values),
+                    label=label,
+                    branches=tuple(branches),
+                    contributions=tuple(contributions),
                 ),
             )
         resolved_contributions = []
@@ -761,16 +705,15 @@ class LogicalReductionMetric(PerGroupTensorMetric):
             if contribution is None:
                 raise ValueError("A logical reduction branch did not produce a final contribution.")
             resolved_contributions.append(contribution)
-        contribution = self.combine_contributions(group, resolved_contributions)
-        sites = tuple(site for value in group.items for site in value.sites)
-        return MetricResult(MetricTensor(self.finalize(contribution), sites=sites), group.label)
+        contribution = self.combine_contributions(values, resolved_contributions)
+        return MetricResult(self.finalize(contribution), label)
 
 
 class TensorMetricExecutor:
     """Execute tensor metrics using caller-supplied process groups.
 
-    Compatible requests are packed into a leading batch dimension before communication. No group
-    is discovered from Megatron global state.
+    Compatible requests are packed into a leading batch dimension before communication. No process
+    group is discovered from Megatron global state.
 
     Args:
         axis_process_groups: Mapping from abstract metric axes to concrete process groups. Mapping
@@ -784,7 +727,7 @@ class TensorMetricExecutor:
 
     @torch.no_grad()
     def run(self, metric: TensorMetric, values: Sequence[MetricTensor]) -> list[MetricResult]:
-        """Prepare, group, and run a metric to completion for observed tensors.
+        """Prepare and run a metric to completion for observed tensors.
 
         Args:
             metric: Metric implementation to run.
@@ -832,18 +775,18 @@ class TensorMetricExecutor:
 
     @torch.no_grad()
     def start(self, metric: TensorMetric, values: Sequence[MetricTensor]) -> list[MetricStep]:
-        """Group prepared contributions and start their distributed metric computations.
+        """Start distributed metric computations from prepared contributions.
 
         Args:
             metric: Metric implementation to start.
             values: Prepared contributions returned by :meth:`prepare`.
 
         Returns:
-            Results and explicit collective request sets, which may be passed to :meth:`complete`
+            Results and explicit collective stages, which may be passed to :meth:`complete`
             later.
 
         """
-        return metric.start(metric.groups(values))
+        return metric.start(values)
 
     @torch.no_grad()
     def complete(
@@ -856,8 +799,7 @@ class TensorMetricExecutor:
 
         Args:
             metric: Metric implementation that produced ``initial_steps``.
-            initial_steps: Request sets and results previously returned by :meth:`TensorMetric.start`
-                or :meth:`TensorMetric.resume`.
+            initial_steps: Stages and results previously returned by :meth:`TensorMetric.start`.
 
         Returns:
             Completed metric results in completion order.
@@ -870,29 +812,28 @@ class TensorMetricExecutor:
         results: list[MetricResult] = []
 
         while steps:
-            request_sets: list[CollectiveRequestSet] = []
+            stages: list[CollectiveStage] = []
             for step in steps:
                 if isinstance(step, MetricResult):
                     results.append(step)
                 else:
-                    request_sets.append(step)
+                    stages.append(step)
 
-            if not request_sets:
+            if not stages:
                 break
-            requests = [request for request_set in request_sets for request in request_set.requests]
+            requests = [request for stage in stages for request in stage.requests]
             completed_values = self._execute_requests(requests)
-            completion_sets = []
+            completions = []
             offset = 0
-            for request_set in request_sets:
-                end = offset + len(request_set.requests)
-                completion_sets.append(
-                    CollectiveCompletionSet(
-                        values=tuple(completed_values[offset:end]),
-                        continuation=request_set.continuation,
+            for stage in stages:
+                end = offset + len(stage.requests)
+                completions.append(
+                    CollectiveCompletion(
+                        values=tuple(completed_values[offset:end]), continuation=stage.continuation
                     )
                 )
                 offset = end
-            steps = metric.resume(completion_sets)
+            steps = [metric.resume(completion) for completion in completions]
 
         return results
 

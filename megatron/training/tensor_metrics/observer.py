@@ -265,9 +265,9 @@ class TrainingTensorMetricObserver:
         self._result_sink = _write_scalar_results if result_sink is None else result_sink
         self._parameter_names: CanonicalParameterNameMap | None = None
         self._parameter_names_key: tuple[tuple[int, ...], int, int] | None = None
-        self._optimizer_parameter_manifest: tuple[
-            _OptimizerParameterManifestEntry, ...
-        ] | None = None
+        self._optimizer_parameter_manifest: tuple[_OptimizerParameterManifestEntry, ...] | None = (
+            None
+        )
         self._optimizer_parameter_manifest_key: tuple[int, int] | None = None
         self._module_names: dict[int, str] | None = None
         self._module_names_key: tuple[int, ...] | None = None
@@ -334,9 +334,7 @@ class TrainingTensorMetricObserver:
         )
         self._active_pg_collection = pg_collection
         self._active_module_names = self._get_module_names(model)
-        self._prepared_forward_values = {
-            id(scheduled.metric): [] for scheduled in forward_metrics
-        }
+        self._prepared_forward_values = {id(scheduled.metric): [] for scheduled in forward_metrics}
         self._prepared_forward_iteration = iteration
 
         try:
@@ -452,9 +450,7 @@ class TrainingTensorMetricObserver:
                 executor = TensorMetricExecutor(_tensor_metric_process_groups(pg_collection))
                 prepared_forward_values = self._prepared_forward_values or {}
                 for scheduled in due_metrics:
-                    prepared_values = list(
-                        prepared_forward_values.get(id(scheduled.metric), ())
-                    )
+                    prepared_values = list(prepared_forward_values.get(id(scheduled.metric), ()))
                     prepared_values.extend(executor.prepare(scheduled.metric, optimizer_values))
                     results = executor.complete(
                         scheduled.metric, executor.start(scheduled.metric, prepared_values)
@@ -500,9 +496,7 @@ class TrainingTensorMetricObserver:
         return self._module_names
 
     def _get_parameter_names(
-        self,
-        model: Sequence[torch.nn.Module],
-        pg_collection: ProcessGroupCollection,
+        self, model: Sequence[torch.nn.Module], pg_collection: ProcessGroupCollection
     ) -> CanonicalParameterNameMap:
         """Return the cached canonical parameter names for this model topology."""
         ep_group = getattr(pg_collection, "ep", None)
@@ -511,9 +505,7 @@ class TrainingTensorMetricObserver:
         key = (tuple(id(model_chunk) for model_chunk in model), ep_rank, ep_size)
         if self._parameter_names is None or self._parameter_names_key != key:
             self._parameter_names = CanonicalParameterNameMap(
-                model,
-                expert_parallel_rank=ep_rank,
-                expert_parallel_size=ep_size,
+                model, expert_parallel_rank=ep_rank, expert_parallel_size=ep_size
             )
             self._parameter_names_key = key
         return self._parameter_names
@@ -570,19 +562,12 @@ def _validate_forward_observation_model(
             )
         if source_kinds.isdisjoint(
             {"router_logits", "router_scores", "router_diagnostics"}
-        ) or cuda_graph_impl not in {
-            "local",
-            "transformer_engine",
-        }:
+        ) or cuda_graph_impl not in {"local", "transformer_engine"}:
             continue
         graph_modules = tuple(getattr(config, "cuda_graph_modules", ()))
         if not graph_modules or any(
             graph_module
-            in {
-                CudaGraphModule.moe,
-                CudaGraphModule.moe_router,
-                CudaGraphModule.moe_preprocess,
-            }
+            in {CudaGraphModule.moe, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess}
             for graph_module in graph_modules
         ):
             raise NotImplementedError(
@@ -631,22 +616,18 @@ def _write_scalar_results(
     metric: TensorMetric, results: Sequence[MetricResult], iteration: int
 ) -> None:
     scalars = {}
-    for index, result in enumerate(results):
-        if result.value.tensor.numel() != 1:
+    for result in results:
+        if result.tensor.numel() != 1:
             raise ValueError(
                 f"The default tensor metric sink requires scalar results, but {metric.name!r} "
-                f"produced shape {tuple(result.value.tensor.shape)}."
+                f"produced shape {tuple(result.tensor.shape)}."
             )
-        if result.label is not None:
-            result_name = str(result.label)
-        elif len(result.value.sites) == 1:
-            result_name = result.value.sites[0].name
-        else:
-            result_name = f"result-{index}"
-        tag = f"tensor-metrics/{metric.name}/{result_name}"
+        tag = f"tensor-metrics/{metric.name}/{result.label}"
         if tag in scalars:
-            raise ValueError(f"Tensor metric {metric.name!r} produced duplicate result tag {tag!r}.")
-        scalars[tag] = result.value.tensor.detach()
+            raise ValueError(
+                f"Tensor metric {metric.name!r} produced duplicate result tag {tag!r}."
+            )
+        scalars[tag] = result.tensor.detach()
 
     tensorboard_writer = get_tensorboard_writer()
     if tensorboard_writer is not None:

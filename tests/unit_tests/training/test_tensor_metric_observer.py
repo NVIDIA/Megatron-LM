@@ -248,7 +248,7 @@ def test_observer_runs_only_due_metrics_and_combines_layer_parameters():
     assert iteration == 2
     assert len(results) == 1
     assert results[0].label == "decoder.layers.0"
-    torch.testing.assert_close(results[0].value.tensor, torch.tensor(5.0))
+    torch.testing.assert_close(results[0].tensor, torch.tensor(5.0))
 
 
 def test_observer_profiles_only_due_metric_work(monkeypatch):
@@ -356,12 +356,7 @@ def test_observer_runs_global_and_layer_parameter_and_wgrad_metrics():
     model.decoder.layers[0].weight.main_grad = torch.tensor([[0.0, 0.0], [5.0, 12.0]])
     model.decoder.layers[0].bias.main_grad = torch.zeros(2)
     observer = build_tensor_metric_observer(
-        [
-            "global-param-l2:1",
-            "layer-param-l2:1",
-            "global-wgrad-l2:1",
-            "layer-wgrad-l2:1",
-        ],
+        ["global-param-l2:1", "layer-param-l2:1", "global-wgrad-l2:1", "layer-wgrad-l2:1"],
         result_sink=lambda metric, results, iteration: captured.update(
             {metric.name: (tuple(results), iteration)}
         ),
@@ -369,10 +364,7 @@ def test_observer_runs_global_and_layer_parameter_and_wgrad_metrics():
     assert observer is not None
 
     observer(
-        model=[model],
-        optimizer=_fp32_optimizer(model),
-        iteration=0,
-        pg_collection=_pg_collection(),
+        model=[model], optimizer=_fp32_optimizer(model), iteration=0, pg_collection=_pg_collection()
     )
 
     assert set(captured) == {
@@ -393,7 +385,7 @@ def test_observer_runs_global_and_layer_parameter_and_wgrad_metrics():
         expected_labels = {expected_label}
         if metric_name == "layer-wgrad-l2":
             expected_labels.add("global")
-        results_by_label = {str(result.label): result.value.tensor for result in results}
+        results_by_label = {result.label: result.tensor for result in results}
         assert set(results_by_label) == expected_labels
         for result in results_by_label.values():
             torch.testing.assert_close(result, torch.tensor(expected))
@@ -421,40 +413,17 @@ def test_observer_prepares_and_accumulates_forward_sources_until_commit():
     assert observer is not None
     pg_collection = _pg_collection()
 
-    with observer.observe_forward_backward(
-        model=[model], iteration=0, pg_collection=pg_collection
-    ):
+    with observer.observe_forward_backward(model=[model], iteration=0, pg_collection=pg_collection):
         accumulator = torch.tensor([3.0, 4.0], requires_grad=True)
         observe_layer_residuals(layer, accumulator, accumulator + torch.tensor([3.0, 4.0]))
         observe_tensor(
-            model.output_layer,
-            "output_logits",
-            "output_logits",
-            torch.tensor([5.0, 12.0]),
+            model.output_layer, "output_logits", "output_logits", torch.tensor([5.0, 12.0])
         )
+        observe_tensor(model.output_layer, "mtp_logits.0", "mtp_logits", torch.tensor([3.0, 4.0]))
+        observe_tensor(model.output_layer, "mtp_logits.1", "mtp_logits", torch.tensor([0.0, 12.0]))
+        observe_tensor(layer.router, "router_logits", "router_logits", torch.tensor([8.0, 8.0]))
         observe_tensor(
-            model.output_layer,
-            "mtp_logits.0",
-            "mtp_logits",
-            torch.tensor([3.0, 4.0]),
-        )
-        observe_tensor(
-            model.output_layer,
-            "mtp_logits.1",
-            "mtp_logits",
-            torch.tensor([0.0, 12.0]),
-        )
-        observe_tensor(
-            layer.router,
-            "router_logits",
-            "router_logits",
-            torch.tensor([8.0, 8.0]),
-        )
-        observe_tensor(
-            layer.router,
-            "router_scores",
-            "router_scores",
-            torch.tensor([[0.5, 0.5], [1.0, 0.0]]),
+            layer.router, "router_scores", "router_scores", torch.tensor([[0.5, 0.5], [1.0, 0.0]])
         )
 
         assert observer._prepared_forward_values is not None
@@ -465,10 +434,7 @@ def test_observer_prepares_and_accumulates_forward_sources_until_commit():
         )
 
     observer(
-        model=[model],
-        optimizer=_fp32_optimizer(model),
-        iteration=0,
-        pg_collection=pg_collection,
+        model=[model], optimizer=_fp32_optimizer(model), iteration=0, pg_collection=pg_collection
     )
 
     expected = {
@@ -488,7 +454,7 @@ def test_observer_prepares_and_accumulates_forward_sources_until_commit():
         expected_labels = {label}
         if metric_name.startswith("layer-"):
             expected_labels.add("global")
-        results_by_label = {str(result.label): result.value.tensor for result in results}
+        results_by_label = {result.label: result.tensor for result in results}
         assert set(results_by_label) == expected_labels
         for result in results_by_label.values():
             torch.testing.assert_close(result, torch.tensor(value))
@@ -542,7 +508,7 @@ def test_observer_runs_router_diagnostic_metric_families():
         "layer-router-health",
     }
     results_by_metric = {
-        metric_name: {str(result.label): result.value.tensor for result in results}
+        metric_name: {result.label: result.tensor for result in results}
         for metric_name, (results, iteration) in captured.items()
         if iteration == 1
     }
@@ -603,17 +569,12 @@ def test_forward_observation_is_not_timed_by_a_synchronizing_timer(monkeypatch):
     assert observer is not None
     pg_collection = _pg_collection()
 
-    with observer.observe_forward_backward(
-        model=[model], iteration=0, pg_collection=pg_collection
-    ):
+    with observer.observe_forward_backward(model=[model], iteration=0, pg_collection=pg_collection):
         observe_tensor(
             model.output_layer, "output_logits", "output_logits", torch.tensor([5.0, 12.0])
         )
     observer(
-        model=[model],
-        optimizer=_fp32_optimizer(model),
-        iteration=0,
-        pg_collection=pg_collection,
+        model=[model], optimizer=_fp32_optimizer(model), iteration=0, pg_collection=pg_collection
     )
 
     forward_range, commit_range = ranges
@@ -628,8 +589,7 @@ def test_forward_metrics_allow_partial_cuda_graphs_outside_observation_sites():
     )
     assert observer is not None
     model = _forward_model(
-        cuda_graph_impl="local",
-        cuda_graph_modules=(CudaGraphModule.attn, CudaGraphModule.mamba),
+        cuda_graph_impl="local", cuda_graph_modules=(CudaGraphModule.attn, CudaGraphModule.mamba)
     )
 
     with observer.observe_forward_backward(
@@ -648,9 +608,7 @@ def test_forward_metrics_allow_partial_cuda_graphs_outside_observation_sites():
     ),
 )
 def test_router_metrics_reject_cuda_graphs_that_capture_router(specification):
-    observer = build_tensor_metric_observer(
-        [specification], result_sink=lambda *args: None
-    )
+    observer = build_tensor_metric_observer([specification], result_sink=lambda *args: None)
     assert observer is not None
     model = _forward_model(
         cuda_graph_impl="local", cuda_graph_modules=(CudaGraphModule.moe_router,)

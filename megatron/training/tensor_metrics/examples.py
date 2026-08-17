@@ -7,7 +7,7 @@ that a reader can understand any one metric without first learning a hierarchy o
 classes.  Production metrics may factor out policy or kernels once there is a demonstrated need.
 
 The examples are not registered with the training loop.  They show how to select observation
-sites, compact tensors during ``prepare()``, form result groups, and explicitly stage distributed
+sites, compact tensors during ``prepare()``, aggregate prepared values, and explicitly stage distributed
 collectives using the primitives in :mod:`megatron.training.tensor_metrics`.
 """
 
@@ -22,21 +22,20 @@ import torch
 
 from .core import (
     AllReduce,
-    CollectiveCompletionSet,
+    CollectiveCompletion,
     CollectiveRequest,
-    CollectiveRequestSet,
+    CollectiveStage,
     FlatShard,
     LogicalReductionMetric,
-    MetricGroup,
     MetricResult,
     MetricSite,
     MetricStep,
     MetricTensor,
     Owned,
-    PerGroupTensorMetric,
     RankRelation,
     Replica,
     Shard,
+    TensorMetric,
 )
 
 __all__ = [
@@ -58,7 +57,7 @@ class ParameterL2NormExample(LogicalReductionMetric):
     This is the smallest useful metric example.  ``source_kinds`` cheaply excludes observations
     other than parameters.  ``prepare()`` is inherited from ``LogicalReductionMetric``: it calls
     ``contribution()`` while each parameter is available and keeps only one sum-of-squares scalar.
-    The default ``groups()`` puts all prepared scalars in one group labeled ``"global"``.
+    The default ``start()`` reduces all prepared scalars into one result labeled ``"global"``.
 
     ``LogicalReductionMetric`` sums each scalar over every ``Shard``, ``FlatShard``, and ``Owned``
     relation described by the observer, then sums the resolved parameter scalars locally.  Only
@@ -89,7 +88,7 @@ class GlobalParameterAmaxExample(LogicalReductionMetric):
 
     This is the MAX counterpart to :class:`ParameterL2NormExample`.  Each parameter is compacted
     to one local absolute maximum, and ``LogicalReductionMetric`` applies MAX over every shard or
-    ownership axis and across the default global group.  Because absolute values are nonnegative,
+    ownership axis and across the default global result.  Because absolute values are nonnegative,
     zero is the correct identity for an empty ``FlatShard`` or remotely ``Owned`` parameter.
 
     The reduction is exact and communicates only one scalar per parameter and rank axis.  It is a
@@ -111,7 +110,7 @@ class TransformerEngineBatchedParameterL2NormExample(LogicalReductionMetric):
 
     The result and distributed semantics match :class:`ParameterL2NormExample`; only local
     preparation changes.  ``LogicalReductionMetric.prepare()`` passes all tensors available at an
-    observation point to ``contribution_batch()``. This implementation groups compatible tensors
+    observation point to ``contribution_batch()``. This implementation buckets compatible tensors
     by device and dtype, then calls TransformerEngine's ``multi_tensor_l2norm`` once per bucket
     with ``per_tensor=True``.
 
@@ -189,12 +188,12 @@ class LayerParameterL2NormExample(LogicalReductionMetric):
     """Compute one parameter L2 norm for every numbered model layer.
 
     This repeats the small amount of numerical code from :class:`ParameterL2NormExample` so the
-    grouping example stands on its own.  The interesting addition is the naming policy:
+    aggregation example stands on its own.  The interesting addition is the naming policy:
     ``decoder.layers.3.mlp.linear_fc1.weight`` belongs to ``decoder.layers.3``.  ``accepts()`` can
     apply that policy before the observer constructs a ``MetricTensor``; ``prepare()`` checks the
-    same policy for tensors carrying more than one site; and ``groups()`` assigns result labels.
+    same policy for tensors carrying more than one site; and ``start()`` assigns result labels.
 
-    Group order follows first observation order.  That order, and the selected groups themselves,
+    Result order follows first observation order.  That order, and the selected reductions,
     must be deterministic on ranks that will participate in the same collectives.
     """
 
@@ -224,15 +223,15 @@ class LayerParameterL2NormExample(LogicalReductionMetric):
         selected = [value for value in values if self._tensor_layer(value) is not None]
         return super().prepare(selected)
 
-    def groups(self, values: Sequence[MetricTensor]) -> list[MetricGroup]:
-        """Group prepared sum-of-squares contributions by layer name."""
-        grouped: dict[str, list[MetricTensor]] = {}
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start one sum-of-squares reduction for each layer name."""
+        values_by_layer: dict[str, list[MetricTensor]] = {}
         for value in values:
             label = self._tensor_layer(value)
             if label is None:
                 raise ValueError("A prepared layer metric tensor must identify one layer.")
-            grouped.setdefault(label, []).append(value)
-        return [MetricGroup(tuple(items), label=label) for label, items in grouped.items()]
+            values_by_layer.setdefault(label, []).append(value)
+        return self._start_logical_reductions(list(values_by_layer.items()))
 
     def contribution(self, tensor: torch.Tensor) -> torch.Tensor:
         """Compact one local parameter shard to its sum of squared magnitudes."""
@@ -252,18 +251,18 @@ class LayerParameterL2NormExample(LogicalReductionMetric):
 class MultiGranularityParameterL2NormExample(LogicalReductionMetric):
     """Report tensor, parameter-family, layer, and global parameter L2 norms together.
 
-    Every parameter is compacted exactly once by ``prepare()``.  ``groups()`` then places the same
-    prepared scalar in several overlapping ``MetricGroup`` objects.  This is the intended pattern
-    when several results share local preparation but differ only in grouping.
+    Every parameter is compacted exactly once by ``prepare()``.  ``start()`` then places the same
+    prepared scalar in several overlapping reductions.  This is the intended pattern when several
+    results share local preparation but differ only in aggregation.
 
     A family replaces a numbered ``layers.<index>`` segment with ``layers.*``.  For example, all
     ``decoder.layers.N.mlp.linear_fc1.weight`` parameters share one family.  Parameters outside a
     numbered layer still receive tensor, family, and global results, but no layer result.
 
-    Overlapping groups save local work, not necessarily communication: groups execute
+    Overlapping reductions save local work, not necessarily communication: results execute
     independently, so a sharded scalar may be reduced once for each result containing it.  A
     future executor optimization could coalesce such identical requests without changing this
-    metric's grouping policy.
+    metric's aggregation policy.
     """
 
     name = "example-multi-granularity-parameter-l2"
@@ -298,11 +297,10 @@ class MultiGranularityParameterL2NormExample(LogicalReductionMetric):
             raise ValueError("A prepared family metric tensor must identify one family.")
         return labels[0]
 
-    def groups(self, values: Sequence[MetricTensor]) -> list[MetricGroup]:
-        """Reuse prepared contributions in four sets of independently labeled groups."""
-        tensor_groups = [
-            MetricGroup((value,), label=f"tensor/{'+'.join(site.name for site in value.sites)}")
-            for value in values
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Reuse prepared contributions in four sets of independently labeled reductions."""
+        tensor_reductions = [
+            (f"tensor/{'+'.join(site.name for site in value.sites)}", (value,)) for value in values
         ]
 
         families: dict[str, list[MetricTensor]] = {}
@@ -313,14 +311,12 @@ class MultiGranularityParameterL2NormExample(LogicalReductionMetric):
             if layer is not None:
                 layers.setdefault(layer, []).append(value)
 
-        family_groups = [
-            MetricGroup(tuple(items), label=f"family/{label}") for label, items in families.items()
-        ]
-        layer_groups = [
-            MetricGroup(tuple(items), label=f"layer/{label}") for label, items in layers.items()
-        ]
-        global_groups = [MetricGroup(tuple(values), label="global")] if values else []
-        return tensor_groups + family_groups + layer_groups + global_groups
+        family_reductions = [(f"family/{label}", items) for label, items in families.items()]
+        layer_reductions = [(f"layer/{label}", items) for label, items in layers.items()]
+        global_reductions = [("global", values)] if values else []
+        return self._start_logical_reductions(
+            tensor_reductions + family_reductions + layer_reductions + global_reductions
+        )
 
     def contribution(self, tensor: torch.Tensor) -> torch.Tensor:
         """Compact one local parameter shard to its sum of squared magnitudes."""
@@ -333,7 +329,7 @@ class MultiGranularityParameterL2NormExample(LogicalReductionMetric):
         return tensor.to(dtype=accumulation_dtype).abs().square().sum()
 
     def finalize(self, contribution: torch.Tensor) -> torch.Tensor:
-        """Convert each group's complete sum of squares to an L2 norm."""
+        """Convert each result's complete sum of squares to an L2 norm."""
         return contribution.sqrt()
 
 
@@ -349,7 +345,7 @@ class FP8UnderflowFractionExample(LogicalReductionMetric):
     Exact zeros do not count as candidates, but all elements (including zeros) remain in the
     denominator. ``contribution()`` turns an arbitrarily large wgrad into the fixed contribution
     ``[candidate_count, element_count]``.  Both entries are additive, so ordinary logical SUM
-    reduction handles shards, distributed-optimizer flat shards, ownership, and global grouping.
+    reduction handles shards, distributed-optimizer flat shards, ownership, and global aggregation.
     """
 
     name = "example-fp8-underflow-fraction"
@@ -390,19 +386,19 @@ class _RowL2Branch:
 
 @dataclass(frozen=True)
 class _RowL2Continuation:
-    group: MetricGroup
+    label: str
     branches: tuple[_RowL2Branch, ...]
     states: tuple[torch.Tensor | None, ...]
 
 
-class MeanRowL2NormExample(PerGroupTensorMetric):
+class MeanRowL2NormExample(TensorMetric):
     """Report the population-weighted mean row L2 norm of selected wgrads.
 
     This is the first example that cannot use ``LogicalReductionMetric``.  A row split across a
     tensor-parallel axis must have its squared column contributions summed *before* the square
     root.  Rows split across another axis must have their final ``[norm_sum, row_count]`` state
     summed *after* the square root.  The continuation below makes those two stages explicit and
-    exposes all tensor branches that are ready at a stage in one request set.
+    exposes all tensor branches that are ready together in one collective stage.
 
     A ``FlatShard`` can begin in the middle of a row.  ``_flat_shard_row_sums()`` scatters the
     shard's squared elements into a fixed vector with one slot per logical row; an all-reduce then
@@ -418,12 +414,18 @@ class MeanRowL2NormExample(PerGroupTensorMetric):
     name = "example-mean-row-l2"
     source_kinds = frozenset({"wgrad"})
 
-    def start_group(self, group: MetricGroup) -> MetricStep:
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start one global population-weighted mean row L2 norm."""
+        if not values:
+            return []
+        return [self._start_mean(values, "global")]
+
+    def _start_mean(self, values: Sequence[MetricTensor], label: str) -> MetricStep:
         """Create local row sums and request every initially ready column reduction."""
         requests: list[CollectiveRequest] = []
         branches: list[_RowL2Branch] = []
-        states: list[torch.Tensor | None] = [None] * len(group.items)
-        for index, value in enumerate(group.items):
+        states: list[torch.Tensor | None] = [None] * len(values)
+        for index, value in enumerate(values):
             # A rank-symmetric placeholder has no local shape from which to construct row slots. It
             # can skip directly to the fixed population state because the Owned reduction will
             # combine this neutral contribution with the owner's state. An empty local FlatShard is
@@ -457,9 +459,9 @@ class MeanRowL2NormExample(PerGroupTensorMetric):
                 branches,
                 states,
             )
-        return self._request_or_finish(group, requests, branches, states)
+        return self._request_or_finish(label, requests, branches, states)
 
-    def resume_group(self, completed: CollectiveCompletionSet) -> MetricStep:
+    def resume(self, completed: CollectiveCompletion) -> MetricStep:
         """Advance all branches whose previous column or population reduction completed."""
         continuation = completed.continuation
         if not isinstance(continuation, _RowL2Continuation):
@@ -474,7 +476,7 @@ class MeanRowL2NormExample(PerGroupTensorMetric):
             self._advance(
                 branch.index, branch.stage, value, branch.remaining_axes, requests, branches, states
             )
-        return self._request_or_finish(continuation.group, requests, branches, states)
+        return self._request_or_finish(continuation.label, requests, branches, states)
 
     @staticmethod
     def _local_row_sums(value: MetricTensor) -> tuple[MetricTensor, tuple[str, ...]]:
@@ -613,14 +615,14 @@ class MeanRowL2NormExample(PerGroupTensorMetric):
 
     @staticmethod
     def _request_or_finish(
-        group: MetricGroup,
+        label: str,
         requests: Sequence[CollectiveRequest],
         branches: Sequence[_RowL2Branch],
         states: Sequence[torch.Tensor | None],
     ) -> MetricStep:
         if requests:
-            return CollectiveRequestSet(
-                tuple(requests), _RowL2Continuation(group, tuple(branches), tuple(states))
+            return CollectiveStage(
+                tuple(requests), _RowL2Continuation(label, tuple(branches), tuple(states))
             )
 
         resolved = []
@@ -629,13 +631,13 @@ class MeanRowL2NormExample(PerGroupTensorMetric):
                 raise ValueError("A row L2 branch did not produce its final state.")
             resolved.append(state)
         total = resolved[0] if len(resolved) == 1 else torch.stack(tuple(resolved)).sum(dim=0)
-        sites = tuple(site for value in group.items for site in value.sites)
-        return MetricResult(MetricTensor(total[0] / total[1], sites), group.label)
+        return MetricResult(total[0] / total[1], label)
 
 
 @dataclass(frozen=True)
 class _ReplicaExtremaContinuation:
-    group: MetricGroup
+    value_count: int
+    label: str
     remaining_axes: tuple[tuple[str, ...], ...]
 
 
@@ -647,12 +649,12 @@ class _ReplicaDriftBranch:
 
 @dataclass(frozen=True)
 class _ReplicaDriftContinuation:
-    group: MetricGroup
+    label: str
     branches: tuple[_ReplicaDriftBranch, ...]
     states: tuple[torch.Tensor | None, ...]
 
 
-class MaxReplicaDriftExample(PerGroupTensorMetric):
+class MaxReplicaDriftExample(TensorMetric):
     """Report absolute and scale-aware parameter drift across an expected-replica axis.
 
     ``replica_axis`` names the relation to check.  Each selected tensor must describe that axis as
@@ -702,11 +704,17 @@ class MaxReplicaDriftExample(PerGroupTensorMetric):
                 )
         return list(values)
 
-    def start_group(self, group: MetricGroup) -> MetricStep:
-        """Request full-tensor maxima and minima for every tensor in the group."""
+    def start(self, values: Sequence[MetricTensor]) -> list[MetricStep]:
+        """Start one global replica-drift computation."""
+        if not values:
+            return []
+        return [self._start_drift(values, "global")]
+
+    def _start_drift(self, values: Sequence[MetricTensor], label: str) -> MetricStep:
+        """Request full-tensor maxima and minima for every selected tensor."""
         requests = []
         remaining_axes = []
-        for value in group.items:
+        for value in values:
             requests.extend(
                 (
                     CollectiveRequest(
@@ -725,12 +733,12 @@ class MaxReplicaDriftExample(PerGroupTensorMetric):
                     and isinstance(relation.placement, (Shard, FlatShard, Owned))
                 )
             )
-        return CollectiveRequestSet(
-            tuple(requests), _ReplicaExtremaContinuation(group, tuple(remaining_axes))
+        return CollectiveStage(
+            tuple(requests), _ReplicaExtremaContinuation(len(values), label, tuple(remaining_axes))
         )
 
-    def resume_group(self, completed: CollectiveCompletionSet) -> MetricStep:
-        """Compact extrema to drift scalars, or advance their remaining MAX reductions."""
+    def resume(self, completed: CollectiveCompletion) -> MetricStep:
+        """Compact extrema to drift scalars, or advance remaining MAX reductions."""
         continuation = completed.continuation
         if isinstance(continuation, _ReplicaExtremaContinuation):
             return self._resume_extrema(completed.values, continuation)
@@ -744,17 +752,17 @@ class MaxReplicaDriftExample(PerGroupTensorMetric):
                 self._advance_drift(
                     branch.index, value, branch.remaining_axes, requests, branches, states
                 )
-            return self._request_or_finish(continuation.group, requests, branches, states)
+            return self._request_or_finish(continuation.label, requests, branches, states)
         raise ValueError("Collective completion has an invalid replica drift continuation.")
 
     def _resume_extrema(
         self, values: Sequence[MetricTensor], continuation: _ReplicaExtremaContinuation
     ) -> MetricStep:
-        if len(values) != 2 * len(continuation.group.items):
+        if len(values) != 2 * continuation.value_count:
             raise ValueError("Replica drift requires MAX and MIN completions for every tensor.")
         requests: list[CollectiveRequest] = []
         branches: list[_ReplicaDriftBranch] = []
-        states: list[torch.Tensor | None] = [None] * len(continuation.group.items)
+        states: list[torch.Tensor | None] = [None] * continuation.value_count
         for index, axes in enumerate(continuation.remaining_axes):
             maximum, minimum = values[2 * index : 2 * index + 2]
             if maximum.tensor.numel():
@@ -766,16 +774,16 @@ class MaxReplicaDriftExample(PerGroupTensorMetric):
                 maximum_tensor = maximum.tensor.to(dtype=accumulation_dtype)
                 minimum_tensor = minimum.tensor.to(dtype=accumulation_dtype)
                 absolute_drift = (maximum_tensor - minimum_tensor).abs()
-                relative_scale = torch.maximum(maximum_tensor.abs(), minimum_tensor.abs()).clamp_min(
-                    self.relative_scale_floor
-                )
+                relative_scale = torch.maximum(
+                    maximum_tensor.abs(), minimum_tensor.abs()
+                ).clamp_min(self.relative_scale_floor)
                 drift = torch.stack(
                     (absolute_drift.amax(), (absolute_drift / relative_scale).amax())
                 )
             else:
                 drift = maximum.tensor.new_zeros(2, dtype=torch.float32)
             self._advance_drift(index, maximum.with_tensor(drift), axes, requests, branches, states)
-        return self._request_or_finish(continuation.group, requests, branches, states)
+        return self._request_or_finish(continuation.label, requests, branches, states)
 
     @staticmethod
     def _advance_drift(
@@ -798,27 +806,22 @@ class MaxReplicaDriftExample(PerGroupTensorMetric):
 
     @staticmethod
     def _request_or_finish(
-        group: MetricGroup,
+        label: str,
         requests: Sequence[CollectiveRequest],
         branches: Sequence[_ReplicaDriftBranch],
         states: Sequence[torch.Tensor | None],
     ) -> MetricStep:
         if requests:
-            return CollectiveRequestSet(
-                tuple(requests), _ReplicaDriftContinuation(group, tuple(branches), tuple(states))
+            return CollectiveStage(
+                tuple(requests), _ReplicaDriftContinuation(label, tuple(branches), tuple(states))
             )
         resolved = []
         for state in states:
             if state is None:
                 raise ValueError("A replica drift branch did not produce its final state.")
             resolved.append(state)
-        maximum = (
-            resolved[0]
-            if len(resolved) == 1
-            else torch.stack(tuple(resolved)).amax(dim=0)
-        )
-        sites = tuple(site for value in group.items for site in value.sites)
-        return MetricResult(MetricTensor(maximum, sites), group.label)
+        maximum = resolved[0] if len(resolved) == 1 else torch.stack(tuple(resolved)).amax(dim=0)
+        return MetricResult(maximum, label)
 
 
 class SampledMaxReplicaDriftExample(MaxReplicaDriftExample):
