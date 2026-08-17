@@ -3,10 +3,10 @@
 """
 Pure CPU tests for the shard-planning and owner-compute packing logic.
 
-These tests exercise `ShardPlan`, `ShardPlan.from_flat_layout`, `assign_owner_work`,
-`pack_owner_work`, `OwnerGatherPlan.reconstruct_full`, `pack_result_shards`, and
-`OwnerScatterPlan.unpack` without a process group or any `torch.distributed` dependency. P2P
-communication is simulated in-process by `_simulate_p2p`.
+These tests exercise `ShardPlan.from_flat_layout`, `assign_owner_work`, `OwnerGatherPlan.pack`,
+`OwnerGatherPlan.reconstruct_full`, `OwnerScatterPlan.pack`, and `OwnerScatterPlan.unpack` without a
+process group or any `torch.distributed` dependency. P2P communication is simulated in-process by
+`_simulate_p2p`.
 """
 
 from collections.abc import Callable
