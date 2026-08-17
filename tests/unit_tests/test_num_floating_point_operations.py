@@ -29,6 +29,7 @@ def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
     training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
+    training_module._seqlen_stats_recording_enabled = True
 
 
 def _make_gpt_args(
@@ -503,13 +504,274 @@ class TestAccumulator:
         assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0]
 
 
+class _FakeChunk:
+    """Stand-in for one virtual model chunk. Only ``vp_stage`` matters here."""
+
+    def __init__(self, vp_stage):
+        self.vp_stage = vp_stage
+
+
+class _FakeModuleWrapper:
+    """Stand-in for DDP / Float16Module: exposes the chunk through ``.module``.
+
+    ``get_attr_wrapped_model`` walks this chain, so the gate must find
+    ``vp_stage`` on the wrapped chunk exactly as it does in production.
+    """
+
+    def __init__(self, module):
+        self.module = module
+
+
+class _ChunkWithoutVpStage:
+    """A model class that defines no ``vp_stage`` and has no ``.module``.
+
+    ``MimoModel`` is the in-tree example; it only acquires a ``vp_stage`` when
+    ``Float16Module`` wraps it, which happens for fp16/bf16 runs only. The gate
+    must degrade to "not interleaved" instead of raising.
+    """
+
+
+def _make_unguarded_forward_step(cu_seqlens, seen=None):
+    """Build a user ``forward_step`` that records UNCONDITIONALLY.
+
+    This is what ``pretrain_gpt.py`` / ``pretrain_hybrid.py`` actually ship: no
+    ``vp_stage`` guard at the call site. The signature matches every shape the
+    schedules use -- ``(data_iterator, model)``,
+    ``(data_iterator, model, checkpoint_activations_microbatch)`` and
+    ``(data_iterator, model, return_schedule_plan=True)``.
+    """
+
+    def forward_step(data_iterator, model, *args, **kwargs):
+        if seen is not None:
+            seen.append((model, args, kwargs))
+        update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+        return "output_tensor", "loss_func"
+
+    return forward_step
+
+
+def _record_like_forward_step(cu_seqlens, vp_stage, wrap=True):
+    """Drive the REAL gate over an unguarded user ``forward_step``.
+
+    This exercises the shipped mechanism rather than a copy of it:
+    ``train_step`` and ``evaluate`` wrap the user callable with
+    ``_gate_seqlen_stats_by_vp_stage``, and the schedule then invokes it once
+    per (micro-batch, model chunk) with a SINGLE chunk as the second positional
+    argument. ``wrap=False`` reproduces the un-gated legacy behaviour.
+    """
+    forward_step = _make_unguarded_forward_step(cu_seqlens)
+    if wrap:
+        forward_step = training_module._gate_seqlen_stats_by_vp_stage(forward_step)
+    return forward_step(iter([]), _FakeModuleWrapper(_FakeChunk(vp_stage)))
+
+
+class TestAccumulatorVirtualPipeline:
+    """Interleaved (virtual) pipeline parallelism must not multiply the stats.
+
+    With ``virtual_pipeline_model_parallel_size = V``, the schedule calls the
+    user ``forward_step`` once per (micro-batch, model chunk) and every chunk
+    observes an identical micro-batch through its own data iterator. The
+    whole-model FLOPs formula already covers all ``args.num_layers``, so only
+    the primary chunk may contribute -- otherwise reported FLOPs inflate by
+    exactly ``V``. The gate lives in ``megatron/training/training.py``: entry
+    points keep an unguarded ``update_seqlen_stats_from_cu_seqlens`` call and
+    ``train_step`` / ``evaluate`` wrap their ``forward_step_func`` with
+    ``_gate_seqlen_stats_by_vp_stage``. These tests drive that real wrapper.
+    """
+
+    def setup_method(self):
+        _reset_seqlen_accumulator()
+
+    def teardown_method(self):
+        _reset_seqlen_accumulator()
+
+    def test_only_virtual_stage_zero_records(self):
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        # Simulate VPP=4: the same micro-batch is seen by four model chunks.
+        for vp_stage in range(4):
+            _record_like_forward_step(cu, vp_stage)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        # Counted once, not four times.
+        assert total_real_tokens == 100 + 200
+        assert seqlen_squared_sum == 100**2 + 200**2
+
+    def test_none_vp_stage_means_no_interleaving(self):
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        _record_like_forward_step(cu, None)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == 100 + 200
+        assert seqlen_squared_sum == 100**2 + 200**2
+
+    def test_non_primary_chunk_alone_records_nothing(self):
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        _record_like_forward_step(cu, 1)
+        assert training_module._seqlen_stats_active is False
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens is None
+        assert seqlen_squared_sum is None
+
+    def test_multiple_microbatches_on_stage_zero_accumulate(self):
+        """VPP gating must not drop legitimate per-micro-batch accumulation."""
+        cu_a = torch.tensor([0, 100, 300], dtype=torch.int32)
+        cu_b = torch.tensor([0, 50], dtype=torch.int32)
+        for cu in (cu_a, cu_b):
+            for vp_stage in range(2):  # VPP=2
+                _record_like_forward_step(cu, vp_stage)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == (100 + 200) + 50
+        assert seqlen_squared_sum == (100**2 + 200**2) + 50**2
+
+    def test_unwrapped_forward_step_keeps_legacy_behaviour(self):
+        """Without the wrapper the gate stays open, i.e. exactly today's ``main``.
+
+        This pins that the module default is permissive: an entry point that
+        drives the schedule itself, or a direct call from a notebook or a unit
+        test, records every time. (It also reproduces the V-fold inflation this
+        PR fixes, which is why ``train_step`` / ``evaluate`` install the gate.)
+        """
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        for vp_stage in range(4):
+            _record_like_forward_step(cu, vp_stage, wrap=False)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == 4 * (100 + 200)
+        assert seqlen_squared_sum == 4 * (100**2 + 200**2)
+
+    def test_gate_is_scoped_to_the_wrapped_call(self):
+        """The override must not leak past the forward step it applies to.
+
+        A non-primary chunk closes the gate only for the duration of its own
+        forward step; a recorder running afterwards -- outside any wrapped
+        callable -- must still record. Otherwise the stats would silently be
+        dropped for the rest of the iteration, since the interleaved schedule
+        always ends on the LAST chunk.
+        """
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        _record_like_forward_step(cu, 3)  # last chunk of a VPP=4 run
+        assert training_module._seqlen_stats_recording_enabled is True
+        update_seqlen_stats_from_cu_seqlens(cu)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == 100 + 200
+        assert seqlen_squared_sum == 100**2 + 200**2
+
+    def test_gate_is_restored_when_forward_step_raises(self):
+        """The rerun state machine retries failed steps; a raise must not stick."""
+
+        def exploding_forward_step(data_iterator, model, *args, **kwargs):
+            raise RuntimeError("boom")
+
+        gated = training_module._gate_seqlen_stats_by_vp_stage(exploding_forward_step)
+        with pytest.raises(RuntimeError, match="boom"):
+            gated(iter([]), _FakeModuleWrapper(_FakeChunk(2)))
+        assert training_module._seqlen_stats_recording_enabled is True
+
+    def test_model_without_vp_stage_does_not_raise(self):
+        """``get_attr_wrapped_model`` raises when nothing in the chain has the
+        attribute (e.g. an fp32 ``MimoModel``, which only gets ``vp_stage`` from
+        ``Float16Module``). The gate must treat that as "not interleaved"
+        instead of failing training over a reporting metric."""
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        gated = training_module._gate_seqlen_stats_by_vp_stage(_make_unguarded_forward_step(cu))
+        gated(iter([]), _ChunkWithoutVpStage())
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == 100 + 200
+        assert seqlen_squared_sum == 100**2 + 200**2
+
+    def test_vp_stage_is_read_through_the_module_chain(self):
+        """DDP / FSDP / Float16Module nest the chunk under ``.module``."""
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        gated = training_module._gate_seqlen_stats_by_vp_stage(_make_unguarded_forward_step(cu))
+        # Two levels of wrapping around a non-primary chunk.
+        gated(iter([]), _FakeModuleWrapper(_FakeModuleWrapper(_FakeChunk(1))))
+        assert training_module._seqlen_stats_active is False
+
+    def test_wrapper_forwards_every_schedule_call_shape(self):
+        """The schedules call the user step with 2 or 3 positional args, or with
+        ``return_schedule_plan=True``. All must pass through untouched."""
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+        seen = []
+        gated = training_module._gate_seqlen_stats_by_vp_stage(
+            _make_unguarded_forward_step(cu, seen=seen)
+        )
+        chunk = _FakeModuleWrapper(_FakeChunk(0))
+        assert gated(iter([]), chunk) == ("output_tensor", "loss_func")
+        gated(iter([]), chunk, 0.5)  # checkpoint_activations_microbatch
+        gated(iter([]), chunk, return_schedule_plan=True)
+        assert [(a, k) for _, a, k in seen] == [
+            ((), {}),
+            ((0.5,), {}),
+            ((), {"return_schedule_plan": True}),
+        ]
+
+    def test_wrapper_preserves_identity_and_is_idempotent(self):
+        """``functools.wraps`` keeps the user step introspectable, and wrapping
+        an already-gated callable must not nest a second gate."""
+
+        def my_forward_step(data_iterator, model):
+            """Docstring."""
+            return None
+
+        gated = training_module._gate_seqlen_stats_by_vp_stage(my_forward_step)
+        assert gated.__name__ == "my_forward_step"
+        assert gated.__doc__ == "Docstring."
+        assert training_module._gate_seqlen_stats_by_vp_stage(gated) is gated
+
+    @pytest.mark.parametrize("vp_size", [1, 2, 4, 8])
+    def test_reported_flops_are_invariant_to_virtual_pipeline_size(self, vp_size):
+        """The reported FLOPs must not depend on how the model is chunked.
+
+        The interleaved schedule runs ``forward_step`` once per (micro-batch,
+        model chunk) and every chunk observes the same ``cu_seqlens`` for a
+        given micro-batch, while the closed-form formula already spans all
+        ``args.num_layers``. Chunking the model therefore must not change the
+        answer. Without the gate this fails with exactly ``vp_size``-fold
+        inflation.
+        """
+        args = _make_gpt_args()
+        num_microbatches = 3
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32)
+
+        # ``virtual_pipeline_model_parallel_size == 1`` is normalized to None in
+        # arguments.py, and the non-interleaved schedule never sets a vp_stage.
+        for _ in range(num_microbatches):
+            for chunk in range(vp_size):
+                _record_like_forward_step(cu, None if vp_size == 1 else chunk)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+
+        # Each micro-batch counted exactly once, whatever vp_size is.
+        assert total_real_tokens == num_microbatches * (100 + 200)
+        assert seqlen_squared_sum == num_microbatches * (100**2 + 200**2)
+
+        flops = num_floating_point_operations(
+            args,
+            num_microbatches,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum,
+            total_real_tokens_in_batch=total_real_tokens,
+        )
+
+        # ... and the user-visible number matches the unchunked reference.
+        _reset_seqlen_accumulator()
+        for _ in range(num_microbatches):
+            _record_like_forward_step(cu, None)
+        ref_tokens, ref_squared_sum = consume_seqlen_stats_in_iteration()
+        reference_flops = num_floating_point_operations(
+            args,
+            num_microbatches,
+            seqlen_squared_sum_in_batch=ref_squared_sum,
+            total_real_tokens_in_batch=ref_tokens,
+        )
+        assert flops == reference_flops
+
+
 class TestAccumulatorDistributed:
-    """All-reduce + ``TP*CP*PP`` deduplication.
+    """SUM all-reduce scoped to the pure data-parallel group (CP excluded).
 
     Each rank in a DP group sees identical ``cu_seqlens`` (broadcast across model
-    parallelism). The world all-reduce therefore overcounts by ``TP * CP * PP``,
-    which the consume helper divides back out. Run with at least 2 ranks via
-    ``torchrun --nproc_per_node=2``.
+    parallelism), so a sum over the pure-DP group -- ``TP``/``CP``/``PP`` peers
+    excluded -- visits each distinct micro-batch exactly once and yields the
+    global-batch total with no divisor. CP is excluded because CP ranks share the
+    same ``cu_seqlens`` and would double-count. When the DP group holds a single
+    rank the collective is skipped entirely. Run with at least 2 ranks via
+    ``torchrun --nproc_per_node=2``; the mixed TP x DP case needs >= 4.
     """
 
     def setup_method(self):
@@ -526,7 +788,8 @@ class TestAccumulatorDistributed:
 
         if Utils.world_size < 2:
             pytest.skip("requires >= 2 ranks")
-        # Pure DP: TP=CP=PP=1, world = DP. No deduplication, every rank's contribution sums.
+        # Pure DP: TP=CP=PP=1, so the DP group spans the world and every rank's
+        # contribution sums.
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
@@ -541,24 +804,49 @@ class TestAccumulatorDistributed:
         assert total_real_tokens == per_rank_sum * Utils.world_size
         assert seqlen_squared_sum == per_rank_sum_sq * Utils.world_size
 
-    def test_pure_tp_deduplicates(self):
-        """All TP ranks have the same cu_seqlens; deduplication divides the world sum."""
+    def test_mixed_tp_dp_reduces_over_the_dp_group(self):
+        """TP x DP: the sum spans the DP dim only, so TP replicas cannot inflate it.
+
+        Also pins the *scope*: exactly one all-reduce, issued on the pure-DP
+        group. A regression to a world reduce (even with a compensating divisor)
+        or to the CP-inclusive group changes the group identity and fails here.
+        """
+        from megatron.core import mpu
         from tests.unit_tests.test_utilities import Utils
 
-        if Utils.world_size < 2:
-            pytest.skip("requires >= 2 ranks")
+        if Utils.world_size < 4 or Utils.world_size % 2 != 0:
+            pytest.skip("requires an even world size >= 4")
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=Utils.world_size, pipeline_model_parallel_size=1
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
         )
 
+        dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+        dp_size = Utils.world_size // 2
+        assert dp_size == dp_group.size()
+
+        # Every rank contributes the same micro-batch; the two TP peers of each
+        # DP rank are duplicates and must be counted once, not twice.
         cu = torch.tensor([0, 100, 300], dtype=torch.int32, device='cuda')
         update_seqlen_stats_from_cu_seqlens(cu)
 
-        # All TP ranks updated the same value; after world all_reduce we get
-        # TP * (per_rank) and divide by TP -> per_rank.
-        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
-        assert total_real_tokens == 100 + 200
-        assert seqlen_squared_sum == 100**2 + 200**2
+        original_all_reduce = torch.distributed.all_reduce
+        groups = []
+
+        def spy(tensor, *args, **kwargs):
+            groups.append(kwargs.get('group', args[1] if len(args) > 1 else None))
+            return original_all_reduce(tensor, *args, **kwargs)
+
+        torch.distributed.all_reduce = spy
+        try:
+            total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        finally:
+            torch.distributed.all_reduce = original_all_reduce
+
+        per_rank_sum = 100 + 200
+        per_rank_sum_sq = 100**2 + 200**2
+        assert groups == [dp_group], "consume must reduce exactly once, over the pure-DP group"
+        assert total_real_tokens == per_rank_sum * dp_size
+        assert seqlen_squared_sum == per_rank_sum_sq * dp_size
 
     def test_bshd_path_skips_collective(self):
         """If no rank ever calls ``update_*``, ``consume_*`` must return
@@ -590,14 +878,50 @@ class TestAccumulatorDistributed:
         assert result == (None, None)
         assert calls == [], "consume must not issue all_reduce when no update happened"
 
+    def test_single_rank_dp_group_skips_collective(self):
+        """With a 1-rank DP group the local value is already the global-batch
+        total, so ``consume_*`` must return it *without* any collective. The
+        skip predicate is a global topology property, so every rank agrees and
+        nobody is stranded waiting on a peer's all-reduce."""
+        from megatron.core import mpu
+        from tests.unit_tests.test_utilities import Utils
+
+        if Utils.world_size < 2:
+            pytest.skip("requires >= 2 ranks")
+        # TP spans the world -> the pure-DP group has exactly one member.
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=Utils.world_size, pipeline_model_parallel_size=1
+        )
+        assert mpu.get_data_parallel_world_size(with_context_parallel=False) == 1
+
+        cu = torch.tensor([0, 100, 300], dtype=torch.int32, device='cuda')
+        update_seqlen_stats_from_cu_seqlens(cu)
+
+        original_all_reduce = torch.distributed.all_reduce
+        calls = []
+
+        def spy(tensor, *args, **kwargs):
+            calls.append(tensor)
+            return original_all_reduce(tensor, *args, **kwargs)
+
+        torch.distributed.all_reduce = spy
+        try:
+            total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        finally:
+            torch.distributed.all_reduce = original_all_reduce
+
+        assert calls == [], "consume must not issue all_reduce for a 1-rank DP group"
+        assert total_real_tokens == 100 + 200
+        assert seqlen_squared_sum == 100**2 + 200**2
+
 
 # 8-GPU topology matrix. Each tuple is ``(tp, cp, pp)`` with ``dp = 8 / (tp*cp*pp)``.
 # The matrix covers every model-parallel dim in isolation and the pairwise /
 # three-way combinations that fit in 8 GPUs. This pins the contract that:
 #   - ``cu_seqlens`` is broadcast-replicated across the TP/CP/PP dims (every
 #     rank within one DP group accumulates the same value), and
-#   - ``consume_*`` recovers the global DP-summed value by all-reducing across
-#     the world and dividing by ``TP * CP * PP``.
+#   - ``consume_*`` recovers the global DP-summed value by summing over the
+#     pure-DP group, which visits each distinct micro-batch exactly once.
 _TOPOLOGY_8GPU_PARAMS = [
     # (tp, cp, pp)
     pytest.param(1, 1, 1, id="dp8"),
@@ -618,9 +942,9 @@ class TestAccumulatorTopology:
     see the SAME ``cu_seqlens`` because it is broadcast across the
     model-parallel dimensions; across DP groups the data differs. The test
     simulates that by making every rank's contribution depend ONLY on its DP
-    rank, and asserts the deduplicated global sum matches the closed-form
-    expectation. Catches regressions where any of TP/CP/PP is dropped from the
-    dedup factor.
+    rank, and asserts the global sum matches the closed-form expectation.
+    Catches regressions where the reduction group picks up a replicated dim --
+    folding CP in, for instance, doubles every ``cp2`` row.
 
     Skipped unless launched with ``torchrun --nproc_per_node 8``.
     """
@@ -635,7 +959,7 @@ class TestAccumulatorTopology:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("tp,cp,pp", _TOPOLOGY_8GPU_PARAMS)
-    def test_dedup_across_topology(self, tp, cp, pp):
+    def test_dp_sum_across_topology(self, tp, cp, pp):
         from megatron.core import mpu
         from tests.unit_tests.test_utilities import Utils
 
@@ -655,7 +979,7 @@ class TestAccumulatorTopology:
         # Per-DP-group ``cu_seqlens``: a 2-chunk packed sequence whose lengths
         # depend on ``dp_rank`` so that every DP group contributes a DIFFERENT
         # ``sum(L)`` AND ``sum(L^2)``. Every rank in the same DP group must
-        # produce the same value -- that's what the consume() dedup unwinds.
+        # produce the same value -- the replication consume() must not sum.
         len_a = 100 * (dp_rank + 1)
         len_b = 200 * (dp_rank + 1)
         cu = torch.tensor([0, len_a, len_a + len_b], dtype=torch.int32, device='cuda')
