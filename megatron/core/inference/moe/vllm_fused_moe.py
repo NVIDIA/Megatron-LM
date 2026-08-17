@@ -524,7 +524,8 @@ def _moe_sum(
     """Fused topk reduction: [max_tokens*topk, K] bf16 → [max_tokens, K].
 
     Applies routing weights and reduces over topk in a single kernel.
-    Accumulates in fp32. When `out` is None, allocates and returns an fp32
+    Accumulates in fp32, or fp64 when `acc_fp64` is set (the output buffer
+    stays fp32 either way). When `out` is None, allocates and returns an fp32
     buffer. When `out` is provided (e.g. the RSV symmetric memory tensor),
     writes directly into it — tl.store handles the cast to the buffer's dtype.
     Only writes the first valid_tokens rows; rows beyond are left untouched
