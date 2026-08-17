@@ -13,7 +13,7 @@ those buffers.
 Two parts:
   - Pool lifecycle: create, register, query, and tear down the per-group pools,
     plus the allocation context ``gtp_symm_pool_ctx``.
-  - ``symmetric_wgrad_pool`` (a ``RegisteredLifoPool``): recycled, window-registered
+  - ``symmetric_wgrad_pool`` (a ``RegisteredLIFOPool``): recycled, window-registered
     send buffers for the wgrad reduce-scatter.
 
 The launcher must set ``NCCL_NVLS_ENABLE=1`` and
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+import typing
 from collections import defaultdict
 from contextlib import AbstractContextManager
 
@@ -40,18 +41,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # One MemPool per GTP/EGTP group, created once.
-_pools: "dict[str, torch.cuda.MemPool]" = {}
+_pools: typing.Dict[str, torch.cuda.MemPool] = {}
 
 # Groups whose pool registration is live. Maps name -> group (not a set) because
 # teardown needs the group object to deregister.
-_registered: "dict[str, object]" = {}
+_registered: typing.Dict[str, typing.Any] = {}
 
 # ---------------------------------------------------------------------------
 # Pool lifecycle: create -> warm -> register -> allocate-into -> query -> deregister
 # ---------------------------------------------------------------------------
 
 
-def get_gtp_symm_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
+def _get_gtp_symm_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
     """Return the per-group ``ncclMemAlloc``-backed MemPool, creating it once."""
     name = group.group_name
     pool = _pools.get(name)
@@ -73,11 +74,11 @@ def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPoo
         return None
     if not is_torch_min_version("2.9.0a0"):
         raise RuntimeError(
-            "[GTP] --gtp-remat-nccl-ub/--egtp-remat-nccl-ub require PyTorch >= 2.9: older "
+            "[GTP] --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require PyTorch >= 2.9: older "
             "versions cannot create a symmetric memory pool (create_nccl_mem_pool silently "
             "falls back to a non-symmetric one, so the reduce-scatter would not be symmetric)."
         )
-    pool = get_gtp_symm_pool(group)
+    pool = _get_gtp_symm_pool(group)
     if group.group_name in _registered:
         return pool
     # NCCL creates communicators lazily on the first collective; run one tiny all-reduce
@@ -98,7 +99,7 @@ def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPoo
 def gtp_symm_pool_ctx(group: dist.ProcessGroup) -> AbstractContextManager[None]:
     """Context manager: allocations inside it come from ``group``'s pool. Collective-free
     (capture-safe); register the pool first or allocations are not window-registered."""
-    return torch.cuda.use_mem_pool(get_gtp_symm_pool(group))
+    return torch.cuda.use_mem_pool(_get_gtp_symm_pool(group))
 
 
 def is_gtp_symm_pool_registered(group: dist.ProcessGroup | None) -> bool:
@@ -112,7 +113,7 @@ def is_gtp_symm_pool_registered(group: dist.ProcessGroup | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
-class RegisteredLifoPool:
+class RegisteredLIFOPool:
     """A recycling cache of window-registered buffers, one free list per group.
 
     The wgrad reduce-scatter can only use symmetric collectives if its send buffer is
@@ -155,7 +156,7 @@ class RegisteredLifoPool:
         else:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
-                    "[GTP] RegisteredLifoPool exhausted during CUDA-graph capture "
+                    "[GTP] RegisteredLIFOPool exhausted during CUDA-graph capture "
                     f"(group={group.group_name}, numel={numel}, dtype={dtype}). The "
                     "eager warmup did not pre-populate enough RS send buffers for "
                     "the reduce-scatter overlap depth -- run more warmup iters, or "
@@ -185,7 +186,7 @@ class RegisteredLifoPool:
 
 # The process-wide send-buffer cache, used by generalized_tensor_parallelism. Lives here
 # so deregister_and_clear_gtp_symm_pools can drop its buffers at teardown.
-symmetric_wgrad_pool = RegisteredLifoPool()
+symmetric_wgrad_pool = RegisteredLIFOPool()
 
 
 def deregister_and_clear_gtp_symm_pools() -> None:

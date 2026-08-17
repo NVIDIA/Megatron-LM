@@ -4,7 +4,7 @@
 
 Test groups
 -----------
-- TestRegisteredLifoPool    - LIFO recycling, keying, tagging, capture guard (single process)
+- TestRegisteredLIFOPool    - LIFO recycling, keying, tagging, capture guard (single process)
 - TestWgradSendBufferSplit  - get_wgrad_tensor / _prepare_wgrad_reduce_scatter_inputs routing:
                               symm scratch is a logical view of a registered padded LIFO
                               parent sent whole (zero-copy, padded or not) with ownership
@@ -40,7 +40,7 @@ import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_modul
 import megatron.core.tensor_parallel.gtp_symmetric_memory as gtp_symm
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG, GTPShardedParam
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
-    RegisteredLifoPool,
+    RegisteredLIFOPool,
     deregister_and_clear_gtp_symm_pools,
     gtp_symm_pool_ctx,
     is_gtp_symm_pool_registered,
@@ -74,7 +74,7 @@ class _StubGroup:
 
 _CONFIG_FIELDS = (
     "gtp_remat_nccl_ub",
-    "egtp_remat_nccl_ub",
+    "gtp_expert_remat_nccl_ub",
     "reduce_scatter_with_fp32_accumulation",
     "pad_for_alignment",
     "check_param_states",
@@ -92,7 +92,7 @@ def _restore_gtp_config():
 
 
 # ---------------------------------------------------------------------------
-# RegisteredLifoPool (single process)
+# RegisteredLIFOPool (single process)
 # ---------------------------------------------------------------------------
 
 
@@ -103,9 +103,9 @@ class TestRegisterVersionGuard:
             gtp_symm.register_gtp_symm_pool(_StubGroup(size=2))
 
 
-class TestRegisteredLifoPool:
+class TestRegisteredLIFOPool:
     def test_alloc_returns_tagged_view(self):
-        pool = RegisteredLifoPool()
+        pool = RegisteredLIFOPool()
         group = _StubGroup()
         buf = pool.alloc((8, 4), torch.bfloat16, "cuda", group)
         assert tuple(buf.shape) == (8, 4)
@@ -113,7 +113,7 @@ class TestRegisteredLifoPool:
         assert getattr(buf, "_gtp_symm_group", None) is group
 
     def test_free_then_alloc_recycles_lifo(self):
-        pool = RegisteredLifoPool()
+        pool = RegisteredLIFOPool()
         group = _StubGroup()
         a = pool.alloc((8, 4), torch.bfloat16, "cuda", group)
         b = pool.alloc((8, 4), torch.bfloat16, "cuda", group)
@@ -130,7 +130,7 @@ class TestRegisteredLifoPool:
         assert c.data_ptr() == a_ptr and tuple(c.shape) == (4, 8)
 
     def test_keying_isolates_dtype_numel_group(self):
-        pool = RegisteredLifoPool()
+        pool = RegisteredLIFOPool()
         g1, g2 = _StubGroup("g1"), _StubGroup("g2")
         a = pool.alloc((8,), torch.bfloat16, "cuda", g1)
         pool.free(a)
@@ -140,12 +140,12 @@ class TestRegisteredLifoPool:
         assert pool.alloc((8,), torch.bfloat16, "cuda", g1).data_ptr() == a.data_ptr()
 
     def test_free_untagged_is_noop(self):
-        pool = RegisteredLifoPool()
+        pool = RegisteredLIFOPool()
         pool.free(torch.empty(8, device="cuda"))
         assert not pool._free  # nothing entered the free lists
 
     def test_capture_guard_raises_on_empty_bucket(self, monkeypatch):
-        pool = RegisteredLifoPool()
+        pool = RegisteredLIFOPool()
         group = _StubGroup()
         warm = pool.alloc((8,), torch.bfloat16, "cuda", group)
         pool.free(warm)
@@ -178,7 +178,7 @@ def _worker_wgrad_split(rank, world_size, port):
     saved_pred = gtp_module.is_gtp_symm_pool_registered
     saved_symm_pred = gtp_symm.is_gtp_symm_pool_registered
     # Patch BOTH consuming namespaces: gtp_module's binding drives the routing decisions;
-    # gtp_symm's own drives RegisteredLifoPool.alloc's pool-vs-plain branch, so LIFO
+    # gtp_symm's own drives RegisteredLIFOPool.alloc's pool-vs-plain branch, so LIFO
     # allocations genuinely land in the group's ncclMemAlloc pool.
     gtp_module.is_gtp_symm_pool_registered = lambda g: g is group
     gtp_symm.is_gtp_symm_pool_registered = lambda g: g is group
@@ -252,12 +252,10 @@ def _worker_wgrad_split(rank, world_size, port):
         symmetric_wgrad_pool.free(wa._wgrad_symm_slot)
         wa._wgrad_symm_slot = None
 
-        # A registered pool takes precedence over fp32-accum: the symm send still wins,
-        # and the fp32-accum all-to-all route is off for this group.
+        # A registered pool takes precedence over fp32-accum: the symm send still wins.
         GTP_CONFIG.reduce_scatter_with_fp32_accumulation = True
         t = wa.get_wgrad_tensor()
         assert wa._wgrad_symm_slot is not None
-        assert not gtp_module._use_fp32_accum_rs(wa)
         symmetric_wgrad_pool.free(wa._wgrad_symm_slot)
         wa._wgrad_symm_slot = None
     finally:

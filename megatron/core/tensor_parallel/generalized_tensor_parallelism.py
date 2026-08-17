@@ -312,20 +312,6 @@ _wgrad_buf_pool: Dict[tuple, list] = {}
 _GTP_GROUPED_BUF_PARITY_COUNTER: Dict[tuple, int] = {}
 
 
-def _use_fp32_accum_rs(weight) -> bool:
-    """True when this weight's wgrad reduction runs as the fp32-accum all-to-all.
-
-    Size <= 2 gains nothing (one addition) and still costs the scratch, so it bypasses.
-    A registered pool takes precedence: its group keeps the plain (symmetric)
-    reduce-scatter, so fp32-accum applies only to unregistered groups.
-    """
-    return (
-        GTP_CONFIG.reduce_scatter_with_fp32_accumulation
-        and weight.group.size() > 2
-        and not is_gtp_symm_pool_registered(weight.group)
-    )
-
-
 def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
     """Padded send buffer from the registered LIFO, pad tail zeroed (the RS sends the
     whole buffer, and recycled LIFO storage may hold stale rows)."""
@@ -461,7 +447,7 @@ class GTPRematConfig:
     # <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
     reduce_scatter_with_fp32_accumulation: bool = False
     gtp_remat_nccl_ub: bool = False
-    egtp_remat_nccl_ub: bool = False
+    gtp_expert_remat_nccl_ub: bool = False
     # Persistent wgrad slots per scheduling/shape domain for partial-CG asynchronous reduce-scatter.
     # Two slots cover the usual case of one same-key writer per graph. A graph containing multiple
     # same-key writers may need more slots to keep all in-flight RS inputs distinct.
@@ -503,7 +489,7 @@ def configure_gtp_remat_from_recipe(
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
     gtp_remat_nccl_ub=False,
-    egtp_remat_nccl_ub=False,
+    gtp_expert_remat_nccl_ub=False,
 ):
     """
     Configure GTP weight-remat (padding + loss reduction + symm mem) from the training recipe.
@@ -517,7 +503,7 @@ def configure_gtp_remat_from_recipe(
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
         gtp_remat_nccl_ub=gtp_remat_nccl_ub,
-        egtp_remat_nccl_ub=egtp_remat_nccl_ub,
+        gtp_expert_remat_nccl_ub=gtp_expert_remat_nccl_ub,
     )
     if fp4:
         update_gtp_config(pad_for_alignment=16)
@@ -1998,8 +1984,12 @@ class GTPShardedParam(torch.nn.Parameter):
             rs_ctx = nullcontext()
 
         with rs_ctx:
-            # self.group is per chain, so each axis decides on its own.
-            if _use_fp32_accum_rs(self):
+            # fp32-accum all-to-all: skipped at size <= 2 and on symm-registered groups.
+            if (
+                GTP_CONFIG.reduce_scatter_with_fp32_accumulation
+                and self.group.size() > 2
+                and not is_gtp_symm_pool_registered(self.group)
+            ):
                 nvtx_range_push(f"{nvtx_label}.gtp_rs_fp32accum")
                 outputs, sum_handles = [], []
                 if len(wgrads) > 1:
