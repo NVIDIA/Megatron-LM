@@ -73,12 +73,19 @@ except ImportError:
 
 try:
     from fla.ops.gated_delta_product import chunk_gated_delta_product
-    from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
     HAVE_FLA = False
 
+# Dynamic-batching inference runs the in-tree fork of these kernels rather than
+# the pip `flash-linear-attention` ones. The fork is forward-only, so training
+# and the static-batching path (which shares the training body) keep calling
+# upstream, which owns the backward pass.
+from megatron.core.ssm.ops.gdp import (
+    chunk_gated_delta_product_varlen,
+    fused_recurrent_gated_delta_rule_update,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -670,7 +677,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             # for the scatter below; the padding rows' outputs are never scattered back.
             initial_state = ssm_state[batch_indices.clamp(min=0)]
 
-        core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule(
+        core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule_update(
             query,
             key,
             value,
@@ -778,17 +785,17 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             query = query.repeat_interleave(rep, dim=2)
             key = key.repeat_interleave(rep, dim=2)
 
-        core_attn_out, last_recurrent_state = chunk_gated_delta_product(
+        core_attn_out, last_recurrent_state = chunk_gated_delta_product_varlen(
             query,
             key,
             value,
             g=g,
             beta=beta,
+            num_householder=M,
+            cu_seqlens=cu_seqlens,
             initial_state=None,
             output_final_state=True,
-            num_householder=M,
             use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens,
         )
 
         # Write per-request final SSM states into the cache for subsequent decode.

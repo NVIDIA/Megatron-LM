@@ -8,6 +8,7 @@ Organized by which recurrence a kernel belongs to:
   gather/scatter, autotune determinism).
 * `mamba2` -- the Mamba2 state-space duality kernels, adapted from vLLM and
   state-spaces/mamba.
+* `gdp` -- the Gated Delta Product kernels, forked from flash-linear-attention.
 
 The re-exports below are the historical top-level entry points and are kept so
 existing callers do not have to spell out the subpackage.
