@@ -84,7 +84,7 @@ def _make_dense_non_hybrid(config: TransformerConfig) -> None:
 
 
 def _disable_gtp(config: TransformerConfig) -> None:
-    """Keep this module replicated across any language GTP axes."""
+    """Keep this module replicated across any LLM GTP axes."""
     config.tensor_parallel_num_weight_shards = config.tensor_model_parallel_size
     config.gtp_weight_remat_size = 1
     expert_tp = config.expert_tensor_parallel_size or config.tensor_model_parallel_size
