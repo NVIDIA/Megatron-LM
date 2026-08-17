@@ -749,6 +749,24 @@ class TestCompaction:
         assert manifest["segments"] == [_segment_name(2)]
         assert bank.restore(2) == []
 
+    def test_delayed_async_compaction_preserves_active_collection(self, tmp_path, monkeypatch):
+        bank = RolloutBank(str(tmp_path))
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_BANK", bank)
+        bank.set_collection(1)
+        consumed = bank.append(sample_group())
+        bank.mark_consumed(consumed, 1)
+        save = AsyncRequest(None, (), [])
+        _register_rollout_bank_compaction(save, 1)
+
+        bank.set_collection(7)
+        before_finalize = bank.append(sample_group())
+        save.finalize_fns[0]()
+        after_finalize = bank.append(sample_group())
+
+        assert before_finalize.startswith("gen-000007/")
+        assert after_finalize.startswith("gen-000007/")
+        assert {group.uid for group in bank.restore(1)} == {before_finalize, after_finalize}
+
     def test_marker_after_compaction_is_not_orphaned(self, tmp_path):
         bank = RolloutBank(str(tmp_path))
         bank.set_collection(0)

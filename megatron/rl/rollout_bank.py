@@ -837,6 +837,7 @@ class RolloutBank:
         once so delayed asynchronous checkpoint finalization remains correct.
         """
         with self._lock:
+            active_collection_iter = self._collection_iter
             survivors, markers = self._restore_state(iteration)
             survivor_uids = {group.uid for group in survivors}
             retained_markers = {
@@ -848,8 +849,11 @@ class RolloutBank:
             self._publish_generation(
                 iteration, survivors, retained_markers, timeline=manifest["timeline"]
             )
-            # Reopen the compacted segment for subsequent write-through appends.
-            self.set_collection(iteration)
+            # A delayed async-checkpoint callback can run several collection
+            # iterations after ``iteration``. Keep subsequent write-through
+            # appends on the collection that was active before compaction.
+            if active_collection_iter is not None:
+                self.set_collection(active_collection_iter)
             self._last_checkpoint_iter = iteration
 
     def recover(self, trained_through: int) -> list["RolloutGroup"]:
