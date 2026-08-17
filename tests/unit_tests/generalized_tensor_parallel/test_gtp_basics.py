@@ -502,6 +502,42 @@ class TestGroupedExpertChainClassification:
         assert gtp_module._chain_is_graphed("GTP_graphed")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GTPShardedParam requires CUDA")
+class TestLatentProjectionChainClassification:
+    """Classify opted-in latent projections through the public GTP chain API."""
+
+    FC1 = "decoder.layers.3.mlp.fc1_latent_proj.weight"
+    FC2 = "decoder.layers.3.mlp.fc2_latent_proj.weight"
+
+    def teardown_method(self, method):
+        gtp_module.set_cuda_graph_modules(None, cuda_graph_impl="none")
+        gtp_module.reset_gtp_state()
+
+    def _chains(self, *, cuda_graph_modules=None, cuda_graph_impl="none"):
+        params = tuple(GTPShardedParam(torch.zeros(1, device="cuda")) for _ in range(2))
+        assert all(isinstance(param, GTPShardedParam) for param in params)
+
+        class _Model:
+            def named_parameters(_self):
+                return iter(zip((self.FC1, self.FC2), params))
+
+        gtp_module.classify_gtp_remat_chains(
+            _Model(), cuda_graph_modules=cuda_graph_modules, cuda_graph_impl=cuda_graph_impl
+        )
+        return tuple(param.chain_id for param in params)
+
+    def test_eager_latent_projections_are_ungraphed(self):
+        assert self._chains() == (GTPChain.UNGRAPHED.value, GTPChain.UNGRAPHED.value)
+
+    def test_local_router_captures_both_latent_projections(self):
+        chains = self._chains(cuda_graph_modules={"moe_router"}, cuda_graph_impl="local")
+        assert chains == (GTPChain.GRAPHED.value, GTPChain.GRAPHED.value)
+
+    def test_unrelated_local_scope_leaves_latent_projections_ungraphed(self):
+        chains = self._chains(cuda_graph_modules={"mamba", "attn"}, cuda_graph_impl="local")
+        assert chains == (GTPChain.UNGRAPHED.value, GTPChain.UNGRAPHED.value)
+
+
 class TestGroupedDoubleBuffer:
     """One-block-ahead grouped chains must double-buffer: consecutive MoE layers get distinct
     gather buffers (else prefetching layer N+1 clobbers layer N's in-use weight). Pure cache-key
@@ -1439,3 +1475,50 @@ class TestGTPGraphWgradRing:
         assert rs_input is weights[1]._gtp_graph_wgrad_ring_slot.tensor
         torch.testing.assert_close(rs_input[:4], wgrad)
         assert torch.count_nonzero(rs_input[4:]) == 0
+
+
+class TestActivationRecomputePhaseFlag:
+    """GTP's forward-only readiness gate rests on TE's recompute flag being dtype-agnostic."""
+
+    def test_recompute_phase_flag_is_set_under_bf16(self):
+        """``in_activation_recompute_phase`` must be True for BF16 recompute, not just FP8.
+
+        GTP aliases TE's ``in_fp8_activation_recompute_phase`` under a name without ``fp8``
+        because TE assigns the underlying global unconditionally. ``_all_gather_weight`` uses it
+        to skip publishing during recompute (see
+        ``test_gtp_ddp_param_sync_race.py::test_recompute_forward_does_not_request_publication``).
+        If TE ever made it FP8-only, BF16 recompute would start asking DDP to publish inside
+        backward -- silently, since the failure is a wrong-buffer gather rather than an error.
+        """
+        _requires_multi_gpu(1)
+        import transformer_engine.pytorch as te
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        assert not FP8GlobalStateManager.is_fp8_enabled(), "must run outside fp8_autocast"
+
+        hidden, dtype = 128, torch.bfloat16
+        observed = []
+
+        class _Probe(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = te.Linear(hidden, hidden, bias=False, params_dtype=dtype, device="cuda")
+
+            def forward(self, x):
+                observed.append(gtp_module.in_activation_recompute_phase())
+                return self.lin(x)
+
+        x = torch.randn(8, hidden, dtype=dtype, device="cuda", requires_grad=True)
+        out = te.checkpoint(
+            _Probe(),
+            x,
+            distribute_saved_activations=False,
+            get_rng_state_tracker=None,
+            tp_group=None,
+        )
+        out.sum().backward()  # replays the forward -> second observation
+
+        assert observed == [False, True], (
+            f"expected [original fwd=False, recompute fwd=True], got {observed}: "
+            "in_activation_recompute_phase no longer tracks BF16 activation recompute"
+        )
