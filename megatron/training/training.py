@@ -384,6 +384,79 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
+def _topk_attended_positions_per_token(seqlen, topk, compress_ratio=1):
+    """Average number of KV entries a causal top-k query attends to.
+
+    A query at position ``i`` can only choose among the ``i // compress_ratio``
+    entries formed so far, so it attends to ``min(i // compress_ratio, topk)``
+    of them. Averaged over a sequence of length ``seqlen`` that is
+    ``eff * (1 - eff * compress_ratio / (2 * seqlen))`` with
+    ``eff = min(topk, seqlen // compress_ratio)``: ``topk`` once the sequence is
+    long enough, corrected for the early queries that have fewer than ``topk``
+    candidates available.
+
+    ``compress_ratio`` is the number of source tokens per selectable entry --
+    ``1`` for DSA (top-k over the original KV) and ``4`` for the DSv4 CSA layers
+    (top-k over 4x-compressed KV). Shared by both sparse-attention paths; they
+    differ only in how they consume the result (``dsa`` turns it into a scale
+    factor on a dense core-attention term, ``dsv4_hybrid`` uses the absolute
+    per-token entry count directly).
+    """
+    eff = min(topk, seqlen // compress_ratio)
+    return eff * (1 - eff * compress_ratio / (2 * seqlen))
+
+
+def _lightning_indexer_flops(
+    *,
+    hidden_size,
+    q_lora_rank,
+    n_heads,
+    head_dim,
+    num_indexer_layers,
+    key_proj_factor,
+    scoring_core_divisor,
+):
+    """Per-iteration lightning-indexer FLOPs coefficients.
+
+    Shared by the ``dsa`` and ``dsv4_hybrid`` paths -- ``CSAIndexer`` reuses
+    ``DSAIndexer``'s scoring logic, and the FLOPs follow: a Q projection off the
+    shared ``q_lora`` residual, a key path, a per-head weights projection, and a
+    dense scoring pass against every candidate key.
+
+    Args:
+        num_indexer_layers: Layers that run an indexer. For ``dsa`` the layers
+            in between reuse the most recent top-k (see ``is_dsa_skip_topk_layer``);
+            for ``dsv4_hybrid`` only ``ratio == 4`` layers have one.
+        key_proj_factor: Key-path cost in units of ``hidden_size * head_dim``.
+            ``1`` for DSA's single ``linear_wk``; ``4`` for DSv4, whose indexer
+            runs its own gated compressor (``wkv`` + ``wgate``, each
+            ``hidden_size -> 2 * head_dim``).
+        scoring_core_divisor: Divides the ``sum_i(L_i ** 2)`` coefficient.
+            ``2`` for DSA, which scores every past token under a causal mask;
+            ``4`` for DSv4, which scores the ``L / 4`` compressed entries.
+
+    Scoring is ``O(L^2)`` even though the attention consuming it is sparse, so
+    that term never gets the top-k scaling. The indexer KL loss
+    (``dsa_indexer_loss_coeff``) and the top-k selection itself are NOT counted:
+    like everywhere else in this file only the model's defining GEMMs enter the
+    estimate, not auxiliary-loss or sorting work.
+
+    Returns ``(token_linear, core)`` WITHOUT the fwd+bwd (x3) or FMA (x2)
+    expansion factors -- the caller applies those. Multiply ``token_linear`` by
+    the real (unpadded) token count and ``core`` by ``sum_i(L_i ** 2)``.
+    """
+    if num_indexer_layers <= 0 or not n_heads or not head_dim:
+        return 0, 0
+    index_dim = n_heads * head_dim
+    token_linear = num_indexer_layers * (
+        q_lora_rank * index_dim  # wq_b
+        + key_proj_factor * hidden_size * head_dim  # wk / gated compressor
+        + hidden_size * n_heads  # weights_proj
+    )
+    core = num_indexer_layers * index_dim / scoring_core_divisor
+    return token_linear, core
+
+
 def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_topk):
     """Fraction of dense causal (query, key) pairs that DSA actually attends to.
 
@@ -406,46 +479,9 @@ def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_to
     mean_seqlen = seqlen_squared_sum / total_real_tokens
     if mean_seqlen <= dsa_indexer_topk:
         return 1.0
-    dense_pairs = mean_seqlen * mean_seqlen / 2
-    topk_pairs = dsa_indexer_topk * mean_seqlen - dsa_indexer_topk * dsa_indexer_topk / 2
-    return topk_pairs / dense_pairs
-
-
-def _dsa_indexer_flops(
-    *, hidden_size, q_lora_rank, dsa_indexer_n_heads, dsa_indexer_head_dim, num_indexer_layers
-):
-    """Per-iteration DSA indexer FLOPs coefficients.
-
-    The indexer (``DSAIndexer``) runs only on layers that compute their own
-    top-k; layers in between reuse the most recent result (see
-    ``is_dsa_skip_topk_layer``). Per computing layer it costs:
-
-      * ``linear_wq_b``:        ``q_lora_rank -> n_heads * head_dim``
-      * ``linear_wk``:          ``hidden_size -> head_dim``
-      * ``linear_weights_proj``: ``hidden_size -> n_heads``
-      * scoring: ``einsum('sbhd,tbd->sbht')`` against every past position --
-        dense ``O(L^2)`` even though the attention that consumes it is sparse,
-        which is why this term does NOT get the top-k scaling.
-
-    The indexer KL loss (``dsa_indexer_loss_coeff``) and the top-k selection
-    itself are NOT counted: like everywhere else in this file only the model's
-    defining GEMMs enter the estimate, not auxiliary-loss or sorting work.
-
-    Returns ``(token_linear, core)`` WITHOUT the fwd+bwd (x3) or FMA (x2)
-    expansion factors -- the caller applies those. Multiply ``token_linear`` by
-    the real (unpadded) token count and ``core`` by ``sum_i(L_i ** 2)``.
-    """
-    if num_indexer_layers <= 0 or not dsa_indexer_n_heads or not dsa_indexer_head_dim:
-        return 0, 0
-    index_dim = dsa_indexer_n_heads * dsa_indexer_head_dim
-    token_linear = num_indexer_layers * (
-        q_lora_rank * index_dim  # wq_b
-        + hidden_size * dsa_indexer_head_dim  # wk
-        + hidden_size * dsa_indexer_n_heads  # weights_proj
-    )
-    # ``/2`` for the causal mask, matching the standard core-attention terms.
-    core = num_indexer_layers * index_dim / 2
-    return token_linear, core
+    attended = _topk_attended_positions_per_token(mean_seqlen, dsa_indexer_topk)
+    # Dense causal attention averages ``mean_seqlen / 2`` keys per query.
+    return attended / (mean_seqlen / 2)
 
 
 def _num_dsa_indexer_layers(num_layers, skip_topk_offset, topk_freq):
@@ -539,19 +575,24 @@ def _dsv4_hybrid_self_attention_flops(
         assert (
             dsa_indexer_topk is not None
         ), "dsa_indexer_topk must be set for dsv4_hybrid with ratio==4 layers."
-        effective_topk_4 = min(dsa_indexer_topk, seq_length // 4)
-        avg_comp_4 = effective_topk_4 * (1 - effective_topk_4 * 4 / (2 * seq_length))
+        avg_comp_4 = _topk_attended_positions_per_token(
+            seq_length, dsa_indexer_topk, compress_ratio=4
+        )
         sparse_attn_r4 = (
             n_layers_r4 * num_attention_heads * (csa_window_size + avg_comp_4) * v_head_dim * 2
         )
-        # Indexer token-linear: compressor (coff=2, wkv + wgate), Q proj, weights proj.
-        indexer_token_term = (
-            n_layers_r4 * hidden_size * (2 * dsa_indexer_head_dim) * 2
-            + n_layers_r4 * q_lora_rank * dsa_indexer_n_heads * dsa_indexer_head_dim
-            + n_layers_r4 * hidden_size * dsa_indexer_n_heads
+        # Indexer: shared with the ``dsa`` path. ``key_proj_factor=4`` covers the
+        # gated compressor (wkv + wgate, each ``hidden -> 2 * head_dim``);
+        # ``scoring_core_divisor=4`` is the ~L/4 compressed positions scored.
+        indexer_token_term, indexer_scoring_core = _lightning_indexer_flops(
+            hidden_size=hidden_size,
+            q_lora_rank=q_lora_rank,
+            n_heads=dsa_indexer_n_heads,
+            head_dim=dsa_indexer_head_dim,
+            num_indexer_layers=n_layers_r4,
+            key_proj_factor=4,
+            scoring_core_divisor=4,
         )
-        # Indexer L^2: scoring each query against ~L/4 compressed positions.
-        indexer_scoring_core = n_layers_r4 * dsa_indexer_n_heads * dsa_indexer_head_dim / 4
     else:
         sparse_attn_r4 = 0
         indexer_token_term = 0
@@ -1187,16 +1228,21 @@ def num_floating_point_operations(
             standard_self_attn_core_term *= _dsa_sparse_core_scale(
                 total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
             )
-            indexer_token_term, indexer_core_term = _dsa_indexer_flops(
+            # Indexer: shared with the ``dsv4_hybrid`` path. ``key_proj_factor=1``
+            # is DSA's single ``linear_wk``; ``scoring_core_divisor=2`` is the
+            # causal-masked scan over every past token.
+            indexer_token_term, indexer_core_term = _lightning_indexer_flops(
                 hidden_size=args.hidden_size,
                 q_lora_rank=(
                     args.q_lora_rank if args.q_lora_rank is not None else args.hidden_size
                 ),
-                dsa_indexer_n_heads=args.dsa_indexer_n_heads,
-                dsa_indexer_head_dim=args.dsa_indexer_head_dim,
+                n_heads=args.dsa_indexer_n_heads,
+                head_dim=args.dsa_indexer_head_dim,
                 num_indexer_layers=_num_dsa_indexer_layers(
                     num_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
                 ),
+                key_proj_factor=1,
+                scoring_core_divisor=2,
             )
             dsa_extra_term = (
                 forward_backward_expansion_factor * fma_expansion_factor * indexer_token_term
