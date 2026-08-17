@@ -717,6 +717,7 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
         state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes
         for state in optimizer.state.values()
     )
+    actual_training_growth = torch.cuda.max_memory_allocated(device) - allocated_before_training
 
     # Theoretical sharded Adam size.
     shard_numel = dim * dim // world_size
@@ -772,7 +773,6 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     theoretical_training_growth = max(theoretical_backward_growth, theoretical_optimizer_growth)
 
     assert actual_optimizer_size == theoretical_optimizer_size
-    actual_training_growth = torch.cuda.max_memory_allocated(device) - allocated_before_training
     assert abs(actual_training_growth - theoretical_training_growth) < 1024**2
 
 
