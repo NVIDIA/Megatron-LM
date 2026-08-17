@@ -103,6 +103,45 @@ def test_layerwise_fraction_zero_skips_offload_specific_child_inspection(monkeyp
     LayerWiseDistributedOptimizer._before_child_step(optimizer, 0)
 
 
+def test_layerwise_offload_rejects_multiple_nonempty_muon_children(monkeypatch):
+    """The supported LayerWise offload schema has at most one local Muon child."""
+
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
+
+    class FakeWrappedOptimizer:
+        def __init__(self, optimizer, config, grad_scaler, init_state_fn):
+            self.optimizer = optimizer
+            self.config = config
+            self.fp32_from_float16_groups = [[]]
+            self._optimizer_state_offloader = None
+
+    def fake_shard_params(self, optimizers, full_param_layouts=None, model_chunks=None):
+        self.dp_cp_params_list = []
+        self.expt_dp_params_list = []
+
+    raw_optimizers = []
+    for _ in range(2):
+        raw_optimizer = object.__new__(TensorParallelMuon)
+        raw_optimizer.param_groups = [{"params": [object()]}]
+        raw_optimizers.append(raw_optimizer)
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.layer_wise_optimizer.Float16OptimizerWithFloat16Params",
+        FakeWrappedOptimizer,
+    )
+    monkeypatch.setattr(LayerWiseDistributedOptimizer, "shard_params", fake_shard_params)
+    config = SimpleNamespace(
+        bf16=True,
+        chunked_optimizer_state_offload=True,
+        optimizer_state_offload_fraction=1.0,
+        overlap_param_gather=False,
+        use_layer_wise_param_layout=False,
+    )
+
+    with pytest.raises(AssertionError, match="at most one non-empty TensorParallelMuon child"):
+        LayerWiseDistributedOptimizer(raw_optimizers, config)
+
+
 def test_layerwise_param_sync_subset_excludes_distopt_buckets():
     """Forced pre-forward sync must leave sibling DistributedOptimizer buckets untouched."""
 
@@ -143,8 +182,8 @@ def test_outer_chain_only_syncs_children_requiring_master_before_offload():
     assert calls == [("layerwise", True)]
 
 
-def test_layerwise_pipelines_child_state_prefetch():
-    """LayerWise overlaps the first managed child, then uses the base chained step hook."""
+def test_layerwise_prefetches_single_managed_child_state():
+    """LayerWise prefetches its single managed child before the chained step."""
 
     events = []
 
@@ -156,7 +195,7 @@ def test_layerwise_pipelines_child_state_prefetch():
             step_with_ready_grads=lambda: events.append(f"step:{name}") or True,
         )
 
-    children = [child("a", True), child("b", False), child("c", True)]
+    children = [child("a", False), child("b", True), child("c", False)]
     optimizer = object.__new__(LayerWiseDistributedOptimizer)
     optimizer.chained_optimizers = children
     optimizer.config = SimpleNamespace(
@@ -164,15 +203,14 @@ def test_layerwise_pipelines_child_state_prefetch():
         optimizer_state_offload_fraction=1.0,
         overlap_param_gather_with_optimizer_step=False,
     )
-    optimizer._managed_optimizer_state_offload_indices = (0, 2)
-    optimizer._next_managed_optimizer_state_offload_index = {0: 2}
+    optimizer._managed_optimizer_state_offload_indices = (1,)
 
     optimizer.prefetch_optimizer_state_for_gradient_finalization()
-    assert events == ["master:a", "master:b", "master:c", "state:a"]
+    assert events == ["master:a", "master:b", "master:c", "state:b"]
 
     events.clear()
     assert optimizer._step()
-    assert events == ["state:a", "state:c", "step:a", "step:b", "step:c"]
+    assert events == ["state:b", "step:a", "step:b", "step:c"]
 
 
 @pytest.mark.skipif(

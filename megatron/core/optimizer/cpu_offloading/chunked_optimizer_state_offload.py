@@ -13,13 +13,18 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import logging
 import math
 from typing import Callable, Dict, Iterable, List, Mapping, Sequence
 
 import torch
 
+from megatron.core.utils import log_single_rank
+
 _MASTER_PARAM_KEY = "master_param"
 _NON_OFFLOADABLE_STATE_KEYS = frozenset({_MASTER_PARAM_KEY, "step", "found_inf"})
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -232,8 +237,13 @@ class ChunkedOptimizerStateOffloader:
         chunks = []
         current_params = []
         current_bytes = 0
+        oversized_param_count = 0
+        largest_oversized_param_bytes = 0
         for param in params:
             param_bytes = self._estimated_state_bytes(param)
+            if param_bytes > self.chunk_size_bytes:
+                oversized_param_count += 1
+                largest_oversized_param_bytes = max(largest_oversized_param_bytes, param_bytes)
             if current_params and current_bytes + param_bytes > self.chunk_size_bytes:
                 chunks.append(OptimizerStateChunk(tuple(current_params)))
                 current_params = []
@@ -242,6 +252,21 @@ class ChunkedOptimizerStateOffloader:
             current_bytes += param_bytes
         if current_params:
             chunks.append(OptimizerStateChunk(tuple(current_params)))
+        if oversized_param_count:
+            mib = 1024**2
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Optimizer-state offload target is %.2f MiB, but %d selected parameter(s) "
+                "have an atomic tensor-state payload larger than the target; the largest is "
+                "%.2f MiB for %s. These parameters cannot be split, so this manager's "
+                "two-slot GPU tensor-state window can exceed roughly twice the configured "
+                "target.",
+                self.chunk_size_bytes / mib,
+                oversized_param_count,
+                largest_oversized_param_bytes / mib,
+                type(self.optimizer).__name__,
+            )
         return tuple(chunks)
 
     @property

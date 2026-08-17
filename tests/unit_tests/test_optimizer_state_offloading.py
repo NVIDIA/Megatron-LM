@@ -3,6 +3,7 @@
 """Unit tests for chunked optimizer state and master-weight offload."""
 
 import dataclasses
+import logging
 import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -232,10 +233,7 @@ def test_training_args_treat_zero_offload_fraction_as_disabled(monkeypatch):
     assert validated_args.async_save
 
 
-@pytest.mark.parametrize("optimizer_name", ("muon", "dist_muon"))
-def test_training_args_reject_muon_offload_without_distributed_optimizer(
-    monkeypatch, optimizer_name
-):
+def test_training_args_reject_muon_offload_without_distributed_optimizer(monkeypatch):
     """Muon offload must route non-Muon groups to a sibling DistributedOptimizer."""
 
     monkeypatch.setattr(sys, 'argv', ['test_optimizer_state_offloading.py'])
@@ -250,13 +248,40 @@ def test_training_args_reject_muon_offload_without_distributed_optimizer(
     args.train_iters = 1
     args.lr = 1e-4
     args.tokenizer_type = 'NullTokenizer'
-    args.optimizer = optimizer_name
+    args.optimizer = 'muon'
     args.use_distributed_optimizer = False
     args.chunked_optimizer_state_offload = True
     args.ckpt_format = 'torch_dist'
 
-    with pytest.raises(AssertionError, match="requires --use-distributed-optimizer"):
+    with pytest.raises(AssertionError, match="requires the LayerWise distributed optimizer"):
         validate_args(args)
+
+
+def test_training_args_accept_deprecated_dist_muon_offload(monkeypatch):
+    """The deprecated dist_muon spelling normalizes to the supported LayerWise mode."""
+
+    monkeypatch.setattr(sys, 'argv', ['test_optimizer_state_offloading.py'])
+    args = parse_args()
+    args.num_layers = 2
+    args.vocab_size = 256
+    args.hidden_size = 64
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 128
+    args.seq_length = 128
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.optimizer = 'dist_muon'
+    args.use_distributed_optimizer = False
+    args.chunked_optimizer_state_offload = True
+    args.ckpt_format = 'torch_dist'
+
+    validated_args = validate_args(args)
+
+    assert validated_args.optimizer == 'muon'
+    assert validated_args.use_layer_wise_distributed_optimizer
+    assert not validated_args.use_distributed_optimizer
 
 
 @pytest.mark.parametrize(
@@ -437,6 +462,32 @@ def test_offloader_rejects_two_master_storage_schemes():
             offload_fraction=1.0,
             state_dtypes=(torch.float32,),
         )
+
+
+def test_oversized_atomic_state_chunks_log_once():
+    """A soft chunk target overflow is visible without splitting optimizer parameters."""
+
+    manager = object.__new__(ChunkedOptimizerStateOffloader)
+    manager.chunk_size_bytes = 1024**2
+    manager._state_bytes_per_param = torch.float32.itemsize
+    manager.optimizer = SimpleNamespace()
+    params = tuple(nn.Parameter(torch.empty(numel)) for numel in (300_000, 400_000, 10))
+
+    with mock.patch(
+        "megatron.core.optimizer.cpu_offloading.chunked_optimizer_state_offload.log_single_rank"
+    ) as log:
+        chunks = manager._build_chunks(params)
+
+    assert [[id(param) for param in chunk.params] for chunk in chunks] == [
+        [id(param)] for param in params
+    ]
+    log.assert_called_once()
+    _, level, _, target_mib, oversized_count, largest_mib, optimizer_name = log.call_args.args
+    assert level == logging.WARNING
+    assert target_mib == 1.0
+    assert oversized_count == 2
+    assert largest_mib == pytest.approx(400_000 * torch.float32.itemsize / 1024**2)
+    assert optimizer_name == "SimpleNamespace"
 
 
 def test_h2d_targets_record_the_transfer_stream():

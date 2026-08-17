@@ -1855,19 +1855,20 @@ def validate_args(args, defaults={}):
             args.optimizer = 'muon'
             args.use_layer_wise_distributed_optimizer = True
 
+        if args.use_distributed_optimizer:
+            args.use_layer_wise_distributed_optimizer = True
+            args.use_distributed_optimizer = False
+
         if (
             args.optimizer == 'muon'
             and (args.chunked_optimizer_state_offload or args.offload_optimizer_states)
             and args.optimizer_state_offload_fraction > 0.0
         ):
-            assert args.use_distributed_optimizer, (
-                "Muon optimizer state offload requires --use-distributed-optimizer so non-Muon "
-                "parameter groups are routed through a sibling DistributedOptimizer"
+            assert args.use_layer_wise_distributed_optimizer, (
+                "Muon optimizer state offload requires the LayerWise distributed optimizer "
+                "(--use-distributed-optimizer) so non-Muon parameter groups are routed through "
+                "a sibling DistributedOptimizer"
             )
-
-        if args.use_distributed_optimizer:
-            args.use_layer_wise_distributed_optimizer = True
-            args.use_distributed_optimizer = False
 
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
         assert (
@@ -3799,8 +3800,10 @@ def _add_training_args(parser):
         default=0,
         help='Target size of each optimizer tensor-state staging buffer in MiB. Two buffers '
         'can be live for overlap (roughly 2x this value per active offload manager). Zero '
-        'temporarily restores all selected tensor state for one full GPU update. This value '
-        'does not bound the selected master-weight window, which is always restored in full.',
+        'temporarily restores all selected tensor state for one full GPU update. A single '
+        'atomic parameter state may exceed this soft target and is reported at runtime. This '
+        'value does not bound the selected master-weight window, which is always restored in '
+        'full.',
     )
     group.add_argument(
         '--optimizer-state-offload-fraction',

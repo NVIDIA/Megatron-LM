@@ -50,22 +50,23 @@ Steady-state updates use two reusable GPU state windows per active offload manag
 next chunk, optimizer compute for the current chunk, and D2H for the previous chunk can overlap.
 The normal tensor-state staging bound is therefore about
 `2 * optimizer_state_offload_chunk_size_mb` per manager that is actively stepping, not one
-chunk; a single atomic parameter bundle can exceed the target. LayerWise also prefetches the first
-chunk of child `i+1` while child `i` owns its two-slot pipeline, so its cross-child steady-state
-peak is about `3 * optimizer_state_offload_chunk_size_mb` across those two managers. The 256 MiB
-example can consequently hold about 768 MiB during that LayerWise overlap window. Temporary state
-and master windows are allocated on the current compute stream so their reserved memory returns to
-the same allocator pool used by forward/backward; the H2D stream waits for both that compute stream
-and the D2H stream before writing them. D2H completion does not block the host at the forward
-boundary.
+chunk; a single parameter's atomic tensor-state payload can exceed the target and produces a
+runtime warning. LayerWise has at most one non-empty Muon child, so its internal state manager uses
+the same two-slot bound. In the outer split Muon + Adam chain, however, a sibling
+`DistributedOptimizer` can retain its first prefetched chunk while the LayerWise manager owns two
+slots. The aggregate across those two managers can therefore still approach
+`3 * optimizer_state_offload_chunk_size_mb`; the 256 MiB example can hold about 768 MiB during
+that overlap window. Temporary state and master windows are allocated on the current compute
+stream so their reserved memory returns to the same allocator pool used by forward/backward; the
+H2D stream waits for both that compute stream and the D2H stream before writing them. D2H
+completion does not block the host at the forward boundary.
 
 Every `ChainedOptimizer` recursively shares one copy-stream pair across its LayerWise and sibling
 `DistributedOptimizer` managers, including ordinary Adam dense/expert chains. Stream sharing
-serializes transfer order but does not merge managers' two-slot pools. LayerWise starts only its
-first managed child's first state chunk during gradient finalization, then pipelines later children
-and chunks with optimizer compute instead of prefetching every child's state at once. A host
-synchronization is used only for synchronous distributed-checkpoint access and one-time lazy state
-initialization.
+serializes transfer order but does not merge managers' two-slot pools. LayerWise starts its single
+managed child's first state chunk during gradient finalization, then pipelines that child's later
+chunks with optimizer compute. A host synchronization is used only for synchronous
+distributed-checkpoint access and one-time lazy state initialization.
 
 Selected master bindings and supported full-size state bindings become CPU tensors as soon as their
 asynchronous D2H copies are enqueued. CUDA readers must restore them through the optimizer offload

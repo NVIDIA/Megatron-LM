@@ -173,7 +173,6 @@ class MegatronOptimizer(ABC):
         self,
         master_params: List[torch.Tensor],
         state_dtypes: Tuple[torch.dtype, ...],
-        offload_fraction: float | None = None,
         optimizer_owned_master_dtypes: Dict[torch.Tensor, torch.dtype] | None = None,
         d2h_stream: torch.cuda.Stream | None = None,
         h2d_stream: torch.cuda.Stream | None = None,
@@ -183,8 +182,6 @@ class MegatronOptimizer(ABC):
         Args:
             master_params: Separate MCore-owned master parameters to offload.
             state_dtypes: Dtypes of full-size tensor states used by the byte planner.
-            offload_fraction: Optional per-wrapper override. LayerWise uses this to distribute
-                one global offload budget across its child optimizers.
             optimizer_owned_master_dtypes: Exact storage dtype for each optimizer-owned
                 master parameter, including native FP32 parameters when the optimizer creates
                 a separate ``master_param`` entry for them.
@@ -192,22 +189,17 @@ class MegatronOptimizer(ABC):
             h2d_stream: Optional H2D stream shared by related optimizer wrappers.
         """
 
-        effective_fraction = (
-            self.config.optimizer_state_offload_fraction
-            if offload_fraction is None
-            else offload_fraction
-        )
         if (
             self.optimizer is None
             or not self.config.chunked_optimizer_state_offload
-            or effective_fraction == 0.0
+            or self.config.optimizer_state_offload_fraction == 0.0
         ):
             return
         self._optimizer_state_offloader = ChunkedOptimizerStateOffloader(
             optimizer=self.optimizer,
             master_params=master_params,
             chunk_size_bytes=self.config.optimizer_state_offload_chunk_size_mb * 1024 * 1024,
-            offload_fraction=effective_fraction,
+            offload_fraction=self.config.optimizer_state_offload_fraction,
             state_dtypes=state_dtypes,
             optimizer_owned_master_dtypes=optimizer_owned_master_dtypes,
             d2h_stream=d2h_stream,
@@ -1583,8 +1575,8 @@ class ChainedOptimizer(MegatronOptimizer):
         """Eagerly prefetch state/master data for every optimizer in the chain.
 
         This general-purpose entry can exceed a configured chunk staging bound because every
-        child may hold a prefetched window concurrently. LayerWise uses its child-step pipeline
-        instead when bounded cross-child prefetch is required.
+        child may hold a prefetched window concurrently. LayerWise uses a dedicated
+        gradient-finalization policy for its single managed Muon child.
         """
 
         for optimizer in self.chained_optimizers:
