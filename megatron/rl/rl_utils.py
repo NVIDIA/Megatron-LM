@@ -1470,9 +1470,9 @@ def _collect_rollout_pipeline_metrics() -> dict:
         "rollout_pipeline_infer_queue_size": pipeline.infer_queue.qsize(),
         "rollout_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
         "rollout_pipeline_output_queue_size": pipeline.output_queue.qsize(),
-        "rollout_pipeline_filter_queue_size": pipeline.filter_queue.qsize(),
         "rollout_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
         "rollout_pipeline_consume_pending_groups": len(pipeline._consume_pending),
+        "rollout_pipeline_regen_pending_groups": len(pipeline._regen_tasks),
         "rollout_pipeline_gate_capacity": gate.capacity,
         "rollout_pipeline_gate_held": gate.held,
         "rollout_pipeline_gate_utilization": (
@@ -1492,7 +1492,6 @@ def _collect_rollout_pipeline_metrics() -> dict:
         ("infer_queue_dwell", pipeline.infer_queue_dwell),
         ("engine_dwell", pipeline.engine_dwell),
         ("assemble_queue_dwell", pipeline.assemble_queue_dwell),
-        ("filter_queue_dwell", pipeline.filter_queue_dwell),
         ("output_queue_dwell", pipeline.output_queue_dwell),
     ):
         if samples:
@@ -1522,7 +1521,6 @@ def _collect_rollout_pipeline_metrics() -> dict:
     pipeline.infer_queue_dwell = []
     pipeline.engine_dwell = []
     pipeline.assemble_queue_dwell = []
-    pipeline.filter_queue_dwell = []
     pipeline.output_queue_dwell = []
     pipeline.prepared_count = 0
     pipeline.inferred_count = 0

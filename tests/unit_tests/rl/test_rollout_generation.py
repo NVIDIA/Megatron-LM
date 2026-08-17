@@ -379,6 +379,48 @@ class TestGroupedRollouts:
             assert filtered_counts[-1] == num_degenerate
 
     @pytest.mark.asyncio
+    async def test_pending_regeneration_does_not_block_delivery(self):
+        """A regeneration pinned on R-slot acquires must not stall delivery of ready groups.
+
+        Rollouts run for minutes in production: with gate capacity 2, group 2's
+        gated rollouts hog both R slots, so group 0's regeneration sits inside
+        its slot acquires while group 1 is already assembled and deliverable.
+        """
+        events = {"t2": asyncio.Event()}
+
+        class GatedInference(MockInferenceInterface):
+            async def base_generate(self, request):
+                event = events.get(request.prompt[0].content)
+                if event is not None:
+                    await event.wait()
+                return await super().base_generate(request)
+
+        gen = FilteringMockGenerator(num_degenerate=1)
+        request = GroupedRolloutRequest(
+            num_groups=3,
+            rollouts_per_group=2,
+            inference_interface=GatedInference(),
+            filter_groups_with_same_reward=True,
+            submission_granularity="R",
+            consumption_granularity="G",
+        )
+        pipeline = RolloutPipeline(gen, request, parallel_generation_tasks=1 / 3)
+        assert pipeline.gate.capacity == 2
+        async with aclosing(pipeline.run()) as it:
+            # wait_for turns the pre-fix failure mode (the regeneration awaited
+            # inline on the delivery path, delivering nothing) into a test failure.
+            group = await asyncio.wait_for(anext(it), timeout=10)
+            await _flush()
+            assert [rollout.trajectory[0] for rollout in group.rollouts] == ["t1", "t1"]
+            assert pipeline.filtered_count == 1
+            assert len(pipeline._regen_tasks) == 1
+            assert gen.prepare_group_rollout_calls == 4
+            events["t2"].set()
+            rest = [await asyncio.wait_for(anext(it), timeout=10) for _ in range(2)]
+        assert sorted(g.rollouts[0].trajectory[0] for g in rest) == ["t2", "t3"]
+        assert not pipeline._regen_tasks
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         (
             "num_slow_calls, streaming, num_groups, submission_granularity, "
