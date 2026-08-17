@@ -468,12 +468,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         )
 
     def _fused_streamed_pre_gated_delta_rule(
-        self,
-        qkvzba,
-        cu_seqlens_q=None,
-        seq_idx=None,
-        cp_size_headwise=1,
-        cp_group_headwise=None,
+        self, qkvzba, cu_seqlens_q=None, seq_idx=None, cp_size_headwise=1, cp_group_headwise=None
     ):
         """Call the streamed fused pre-GDR wrapper."""
 
