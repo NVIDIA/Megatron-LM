@@ -293,7 +293,10 @@ class OptimizerConfig:
     Newton-Schulz GEMMs under layer-sharded muon, computing one triangle only —
     roughly a third off total NS FLOPs for near-square matrices. Only takes effect
     with muon_fp32_matmul_prec='medium', 8-aligned dims, Triton >= 3.4 and a
-    validated SM arch; applies to unbatched (2-D) NS chunks only. Same math,
+    validated SM arch. Unbatched (2-D) NS chunks always qualify; batched (3-D)
+    chunks additionally need an emerging-optimizers that ships the batched SYRK
+    kernel (batched_tsyrk_ex, >= 0.5.0a0) and otherwise fall back to baddbmm
+    with a one-time warning. Same math,
     different kernel: results differ from the GEMM path by kernel-level rounding.
 
     MEASURED: on GB300 (SM 10.3, Triton 3.4) this is a NET LOSS — NS on a
@@ -320,7 +323,16 @@ class OptimizerConfig:
     over the gtp and tp groups assemble the complete (P, Q) momentum on the home, the exact
     same full-matrix Newton-Schulz as duplicated mode runs there with zero communication and
     zero redundancy, and reverse all_to_all stages scatter the result back to the original
-    shards. Equivalent to setting muon_tp_mode="layer_sharded". Defaults to False."""
+    shards. Requires the layer-wise distributed optimizer path; muon_tp_mode is ignored
+    (layer sharding replaces the duplicated/distributed mode selection entirely).
+    Defaults to False."""
+
+    muon_concurrent_groups: bool = True
+    """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
+    on its own CUDA stream so one group's compute fills another group's all_to_all stall.
+    Bitwise-neutral (op order within a group is unchanged), but the transient buffers of
+    all groups are live at once — disable (or lower muon_ns_batch_size) if peak memory is
+    tight. Only used when use_layer_sharding_muon is set. Defaults to True."""
 
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
