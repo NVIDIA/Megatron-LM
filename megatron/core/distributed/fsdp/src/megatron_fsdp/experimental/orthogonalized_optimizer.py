@@ -857,9 +857,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         for src, buf in recv_buffers.items():
             ops.append(dist.P2POp(dist.irecv, buf, group_peer=src, group=group))
 
+        default_stream = torch.cuda.current_stream() if stream is not None else None
         with torch.cuda.stream(stream) if stream is not None else nullcontext():
             if stream is not None:
-                stream.wait_stream(torch.cuda.current_stream())
+                stream.wait_stream(default_stream)
             works = dist.batch_isend_irecv(ops) if ops else []
             for buf in list(gather_plan.send_buffers.values()) + list(recv_buffers.values()):
                 if stream is not None:
@@ -971,9 +972,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         for owner, buf in recv_buffers.items():
             ops.append(dist.P2POp(dist.irecv, buf, group_peer=owner, group=group))
 
+        default_stream = torch.cuda.current_stream() if stream is not None else None
         with torch.cuda.stream(stream) if stream is not None else nullcontext():
             if stream is not None:
-                stream.wait_stream(torch.cuda.current_stream())
+                stream.wait_stream(default_stream)
             works = dist.batch_isend_irecv(ops) if ops else []
             for buf in list(scatter_plan.send_buffers.values()) + list(recv_buffers.values()):
                 if stream is not None:
