@@ -2656,11 +2656,17 @@ def _add_regularization_args(parser):
                        'back. Mathematically identical to duplicated-mode NS. Requires '
                        'the layer-wise distributed optimizer path (emerging optimizer + '
                        '--use-distributed-optimizer).')
-    group.add_argument('--muon-ns-batch-size', type=int, default=32,
+    group.add_argument('--muon-ns-batch-size', type=int, default=1,
                        help='Max number of same-shape matrices fused into one batched '
                        'Newton-Schulz on an NS home under --use-layer-sharding-muon. '
+<<<<<<< HEAD
                        'Set to 1 to disable batching (bit-exact per-matrix path).')
 >>>>>>> 31d6e4180 (Wire LayerShardedMuon into the layer-wise distributed optimizer path)
+=======
+                       'The default of 1 keeps the bit-exact per-matrix path; raise '
+                       '(e.g. to 32) to cut kernel launches on MoE expert homes at '
+                       'the cost of bitwise parity (baddbmm vs addmm rounding).')
+>>>>>>> 0b20d07f8 (Default muon ns_batch_size to 1 to keep bitwise parity out of the box)
     group.add_argument('--muon-use-syrk', action='store_true',
                        help='Use the Triton SYRK kernel for the symmetric-output '
                        'Newton-Schulz GEMMs under --use-layer-sharding-muon (~1/3 off '
