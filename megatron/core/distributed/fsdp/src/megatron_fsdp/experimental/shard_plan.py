@@ -7,8 +7,9 @@ algorithm.
 The central data structure is `ShardPlan`, which describes how a single 2D parameter's full matrix
 is split across the DP group under M-FSDPv2's all-`Flat` layout. Given shard plans,
 `assign_owner_work` balances Newton-Schulz work across owner ranks, and the pack/unpack helpers
-(`pack_owner_work`/`pack_update_shards`/`unpack_update_shards`) build the flat P2P send/recv
-buffers. `reconstruct_full_tensor` stitches gathered shards back into the full matrix on the owner.
+(`pack_owner_work`/`pack_update_shards`) build the flat P2P send/recv buffers.
+`OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full matrix on the owner,
+and `OwnerScatterPlan.unpack` extracts received update shards.
 """
 
 from __future__ import annotations
@@ -28,6 +29,12 @@ class ShardPlan:
     M-FSDPv2's all-`Flat` layout shards dim-0 rows contiguously in rank order, so rank `r` owns the
     contiguous global row range `[start, start + count)` where `start`/`count` come from the flat
     DBuffer layout. A rank with `count == 0` holds no shard of this parameter.
+
+    Attributes:
+        full_shape: Global `(rows, cols)` shape of the parameter.
+        rank_rows: Per-rank `(row_start, row_count)` tuples; `row_count == 0` means the rank holds
+            no shard.
+        row_size: Number of elements per row (= `full_shape[1:].numel()`).
     """
 
     full_shape: torch.Size
@@ -44,6 +51,58 @@ class ShardPlan:
                 f"ShardPlan row_size {self.row_size} != full_shape row size "
                 f"{non_leading_numel(self.full_shape)}."
             )
+
+    @classmethod
+    def from_flat_layout(
+        cls,
+        full_shape: torch.Size,
+        tensor_flat_offset: int,
+        rank_flat_shard_size: int,
+        world_size: int,
+    ) -> ShardPlan:
+        """Compute the per-rank row ranges for one 2D parameter in a flat DBuffer.
+
+        Args:
+            full_shape: Global `(rows, cols)` shape of the parameter.
+            tensor_flat_offset: Flat-element offset of this parameter inside the DBuffer's global
+                layout.
+            rank_flat_shard_size: Flat elements each DP rank owns (uniform for the even all-`Flat`
+                layout: `layout.size // world_size`).
+            world_size: DP group size.
+        """
+        if len(full_shape) != 2:
+            raise ValueError(f"ShardPlan.from_flat_layout requires a 2D shape, got {full_shape}.")
+        row_size = non_leading_numel(full_shape)
+        if row_size <= 0:
+            raise ValueError(
+                f"ShardPlan.from_flat_layout requires non-empty rows, got shape {full_shape}."
+            )
+        tensor_end = tensor_flat_offset + full_shape.numel()
+
+        rank_rows: list[tuple[int, int]] = []
+        for rank in range(world_size):
+            rank_start = rank * rank_flat_shard_size
+            rank_end = rank_start + rank_flat_shard_size
+            overlap_start = max(tensor_flat_offset, rank_start)
+            overlap_end = min(tensor_end, rank_end)
+            if overlap_start >= overlap_end:
+                rank_rows.append((0, 0))
+                continue
+            if (overlap_start - tensor_flat_offset) % row_size != 0:
+                raise RuntimeError(
+                    f"Flat shard boundary is not row-aligned for shape {full_shape}: "
+                    f"overlap_start={overlap_start}, tensor_flat_offset={tensor_flat_offset}."
+                )
+            overlap_numel = overlap_end - overlap_start
+            if overlap_numel % row_size != 0:
+                raise RuntimeError(
+                    f"Flat shard overlap is not row-aligned for shape {full_shape}: "
+                    f"overlap_numel={overlap_numel}, row_size={row_size}."
+                )
+            row_start = (overlap_start - tensor_flat_offset) // row_size
+            row_count = overlap_numel // row_size
+            rank_rows.append((row_start, row_count))
+        return cls(full_shape=torch.Size(full_shape), rank_rows=tuple(rank_rows), row_size=row_size)
 
     @property
     def world_size(self) -> int:
@@ -69,57 +128,6 @@ class ShardPlan:
     def full_numel(self) -> int:
         """Return the total number of elements in the full (unsharded) parameter."""
         return self.full_shape.numel()
-
-
-def compute_shard_plan(
-    full_shape: torch.Size, tensor_flat_offset: int, rank_flat_shard_size: int, world_size: int
-) -> ShardPlan:
-    """Compute the per-rank row ranges for one 2D parameter in a flat DBuffer.
-
-    Args:
-        full_shape: Global `(rows, cols)` shape of the parameter.
-        tensor_flat_offset: Flat-element offset of this parameter inside the DBuffer's global
-            layout.
-        rank_flat_shard_size: Flat elements each DP rank owns (uniform for the even all-`Flat`
-            layout: `layout.size // world_size`).
-        world_size: DP group size.
-
-    Returns:
-        The `ShardPlan` describing which rows each rank owns.
-    """
-    if len(full_shape) != 2:
-        raise ValueError(f"compute_shard_plan requires a 2D shape, got {full_shape}.")
-    row_size = non_leading_numel(full_shape)
-    if row_size <= 0:
-        raise ValueError(f"compute_shard_plan requires non-empty rows, got shape {full_shape}.")
-    tensor_end = tensor_flat_offset + full_shape.numel()
-
-    rank_rows: list[tuple[int, int]] = []
-    for rank in range(world_size):
-        rank_start = rank * rank_flat_shard_size
-        rank_end = rank_start + rank_flat_shard_size
-        overlap_start = max(tensor_flat_offset, rank_start)
-        overlap_end = min(tensor_end, rank_end)
-        if overlap_start >= overlap_end:
-            rank_rows.append((0, 0))
-            continue
-        if (overlap_start - tensor_flat_offset) % row_size != 0:
-            raise RuntimeError(
-                f"Flat shard boundary is not row-aligned for shape {full_shape}: "
-                f"overlap_start={overlap_start}, tensor_flat_offset={tensor_flat_offset}."
-            )
-        overlap_numel = overlap_end - overlap_start
-        if overlap_numel % row_size != 0:
-            raise RuntimeError(
-                f"Flat shard overlap is not row-aligned for shape {full_shape}: "
-                f"overlap_numel={overlap_numel}, row_size={row_size}."
-            )
-        row_start = (overlap_start - tensor_flat_offset) // row_size
-        row_count = overlap_numel // row_size
-        rank_rows.append((row_start, row_count))
-    return ShardPlan(
-        full_shape=torch.Size(full_shape), rank_rows=tuple(rank_rows), row_size=row_size
-    )
 
 
 def assign_owner_work(plans: Sequence[ShardPlan], num_ns_steps: int) -> dict[int, int]:
@@ -182,6 +190,39 @@ class OwnerGatherPlan:
     recv_sizes: dict[int, int]
     own_shards: dict[int, torch.Tensor]
     recv_offsets: dict[tuple[int, int], tuple[int, int, int]]
+
+    def reconstruct_full(
+        self,
+        param_index: int,
+        plan: ShardPlan,
+        recv_buffers: dict[int, torch.Tensor],
+        owner_rank: int,
+    ) -> torch.Tensor:
+        """Reconstruct the full 2D tensor for one owned parameter from its per-rank shards.
+
+        Concatenates shards in rank order: the owner's own local shard at its rank rows and each
+        source's received shard at that source's rank rows.
+
+        Args:
+            param_index: Index of the parameter within the chunk.
+            plan: Shard plan for this parameter.
+            recv_buffers: Per-source-rank received buffer (only sources that sent).
+            owner_rank: The owner rank (== the rank running reconstruction).
+        """
+        shards: list[torch.Tensor] = []
+        for src in range(plan.world_size):
+            row_count = plan.rank_row_count(src)
+            if src == owner_rank:
+                shards.append(self.own_shards[param_index])
+            elif row_count == 0:
+                continue
+            else:
+                offset, numel, _ = self.recv_offsets[(param_index, src)]
+                buf = recv_buffers[src]
+                shards.append(buf[offset : offset + numel].view(row_count, plan.row_size))
+        if len(shards) == 1:
+            return shards[0].contiguous()
+        return torch.cat(shards, dim=0)
 
 
 def pack_owner_work(
@@ -260,48 +301,6 @@ def pack_owner_work(
     )
 
 
-def reconstruct_full_tensor(
-        param_index: int,
-        plan: ShardPlan,
-        gather_plan: OwnerGatherPlan,
-        recv_buffers: dict[int, torch.Tensor],
-        owner_rank: int,
-) -> torch.Tensor:
-    """Reconstruct the full 2D tensor for one owned parameter from its per-rank shards.
-
-    Concatenates shards in rank order: the owner's own local shard at its rank rows and each
-    source's received shard at that source's rank rows. The shard content lives in `gather_plan`
-    (`own_shards` + `recv_offsets`), so this works for the pre-NS owner-gather path and for a weight
-    gather plan alike – pass a weight gather plan built with `pack_owner_work` to reconstruct the
-    full weight parameter instead.
-
-    Args:
-        param_index: Index of the parameter within the chunk.
-        plan: Shard plan for this parameter.
-        gather_plan: This rank's owner-gather plan (own_shards, recv_offsets).
-        recv_buffers: Per-source-rank received buffer (only sources that sent).
-        owner_rank: The owner rank (== the rank running reconstruction).
-
-    Returns:
-        The full `(rows, cols)` tensor.
-    """
-    world_size = plan.world_size
-    shards: list[torch.Tensor] = []
-    for src in range(world_size):
-        row_count = plan.rank_row_count(src)
-        if src == owner_rank:
-            shards.append(gather_plan.own_shards[param_index])
-        elif row_count == 0:
-            continue
-        else:
-            offset, numel, _ = gather_plan.recv_offsets[(param_index, src)]
-            buf = recv_buffers[src]
-            shards.append(buf[offset : offset + numel].view(row_count, plan.row_size))
-    if len(shards) == 1:
-        return shards[0].contiguous()
-    return torch.cat(shards, dim=0)
-
-
 @dataclasses.dataclass
 class OwnerScatterPlan:
     """Metadata and send buffers for the owner-scatter P2P step of one chunk.
@@ -321,6 +320,25 @@ class OwnerScatterPlan:
     send_buffers: dict[int, torch.Tensor]
     recv_sizes: dict[int, int]
     recv_offsets: dict[tuple[int, int], tuple[int, int, int]]
+
+    def unpack(self, recv_buffers: dict[int, torch.Tensor]) -> dict[int, torch.Tensor]:
+        """Extract this rank's local update shards from the per-owner recv buffers.
+
+        Args:
+            recv_buffers: Per-owner-rank received buffer (only owners that sent).
+
+        Returns:
+            Mapping from parameter index to the local update shard `(row_count, cols)`, for
+            parameters this rank does NOT own.
+        """
+        updates: dict[int, torch.Tensor] = {}
+        for (param_index, owner), (offset, numel, row_count) in self.recv_offsets.items():
+            if numel == 0:
+                continue
+            buf = recv_buffers[owner]
+            row_size = numel // row_count if row_count else 1
+            updates[param_index] = buf[offset : offset + numel].view(row_count, row_size)
+        return updates
 
 
 def pack_update_shards(
@@ -398,26 +416,3 @@ def pack_update_shards(
     return OwnerScatterPlan(
         send_buffers=send_buffers, recv_sizes=recv_sizes, recv_offsets=recv_offsets
     )
-
-
-def unpack_update_shards(
-    scatter_plan: OwnerScatterPlan, recv_buffers: dict[int, torch.Tensor]
-) -> dict[int, torch.Tensor]:
-    """Extract this rank's local update shards from the per-owner recv buffers.
-
-    Args:
-        scatter_plan: This rank's owner-scatter plan (recv_offsets).
-        recv_buffers: Per-owner-rank received buffer (only owners that sent).
-
-    Returns:
-        Mapping from parameter index to the local update shard `(row_count, cols)`, for parameters
-        this rank does NOT own.
-    """
-    updates: dict[int, torch.Tensor] = {}
-    for (param_index, owner), (offset, numel, row_count) in scatter_plan.recv_offsets.items():
-        if numel == 0:
-            continue
-        buf = recv_buffers[owner]
-        row_size = numel // row_count if row_count else 1
-        updates[param_index] = buf[offset : offset + numel].view(row_count, row_size)
-    return updates
