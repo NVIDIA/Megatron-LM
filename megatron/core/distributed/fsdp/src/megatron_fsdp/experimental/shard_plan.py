@@ -192,7 +192,7 @@ def assign_owner_work(
 
 @dataclasses.dataclass
 class OwnerGatherPlan:
-    """Metadata and send buffers for the owner-gather P2P step of one chunk.
+    """Metadata and send buffers for the owner-gather P2P step of a set of parameters.
 
     The owner keeps its own shard locally (no self-send), so it only receives from the other
     shard-holding ranks and reconstructs each owned matrix by concatenating shards in rank order
@@ -301,7 +301,7 @@ class OwnerGatherPlan:
         source's received shard at that source's rank rows.
 
         Args:
-            param_index: Index of the parameter within the chunk.
+            param_index: Index of the parameter within the sequence of plans passed to `pack`.
             plan: Shard plan for this parameter.
             recv_buffers: Per-source-rank received buffer (only sources that sent).
             owner_rank: The owner rank (== the rank running reconstruction).
@@ -324,7 +324,7 @@ class OwnerGatherPlan:
 
 @dataclasses.dataclass
 class OwnerScatterPlan:
-    """Metadata and send buffers for the owner-scatter P2P step of one chunk.
+    """Metadata and send buffers for the owner-scatter P2P step of a set of parameters.
 
     The owner keeps its own result shard (applied directly), so it only sends to the other
     shard-holding ranks.
