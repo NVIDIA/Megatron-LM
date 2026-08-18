@@ -67,7 +67,9 @@ class GatedDeltaNet(_GDNBase):
         elif self.config.gdn_gdr_backend == "fla":
             self.gated_delta_rule = chunk_gated_delta_rule
         elif self.config.gdn_gdr_backend == "internal":
-            self.gated_delta_rule = internal_chunk_gated_delta_rule
+            self.gated_delta_rule = partial(
+                internal_chunk_gated_delta_rule, recompute_h=self.config.gdn_gdr_recompute_h
+            )
         else:
             raise ValueError(f"Unsupported GDN GDR backend: {self.config.gdn_gdr_backend!r}.")
 
