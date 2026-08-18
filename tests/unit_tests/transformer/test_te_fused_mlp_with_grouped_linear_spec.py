@@ -262,9 +262,7 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
             return recipe
 
         def make_mxfp8_recipe(*, enable_2d_quantization=False):
-            return make_recipe(
-                "MXFP8BlockScaling", enable_2d_quantization=enable_2d_quantization
-            )
+            return make_recipe("MXFP8BlockScaling", enable_2d_quantization=enable_2d_quantization)
 
         monkeypatch.setattr(te_ext, "get_tensor_model_parallel_world_size", lambda: 1)
         monkeypatch.setattr(
@@ -274,10 +272,7 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
             raising=False,
         )
         monkeypatch.setattr(
-            te_ext.te.common.recipe,
-            "MXFP8BlockScaling",
-            make_mxfp8_recipe,
-            raising=False,
+            te_ext.te.common.recipe, "MXFP8BlockScaling", make_mxfp8_recipe, raising=False
         )
         monkeypatch.setattr(
             te_ext.te.pytorch,
