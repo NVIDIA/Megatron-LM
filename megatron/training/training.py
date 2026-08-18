@@ -456,7 +456,7 @@ def _lightning_indexer_flops(
     expansion factors -- the caller applies those. Multiply ``token_linear`` by
     the real (unpadded) token count and ``core`` by ``sum_i(L_i ** 2)``.
     """
-    if num_indexer_layers <= 0 or not n_heads or not head_dim:
+    if num_indexer_layers <= 0:
         return 0, 0
     index_dim = n_heads * head_dim
     token_linear = num_indexer_layers * (
