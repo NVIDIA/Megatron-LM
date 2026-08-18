@@ -15,9 +15,6 @@ Two parts:
     plus the allocation context ``gtp_symm_pool_ctx``.
   - ``symmetric_wgrad_pool`` (a ``RegisteredLIFOPool``): recycled, window-registered
     send buffers for the wgrad reduce-scatter.
-
-The launcher must set ``NCCL_NVLS_ENABLE=1`` and
-``TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK=0`` before ``init_process_group``.
 """
 
 from __future__ import annotations
@@ -190,9 +187,9 @@ symmetric_wgrad_pool = RegisteredLIFOPool()
 
 
 def deregister_and_clear_gtp_symm_pools() -> None:
-    """Deregister every GTP-owned pool (a window left registered at process-group
-    destruction makes NCCL abort) and drop the recycled send buffers living in them.
-    Call on all ranks before teardown; no-op if nothing was registered."""
+    """Tear down what this module owns: deregister the pools' windows, then drop the
+    recycled send buffers. Allocations owned by others (e.g. graph wgrad ring slots)
+    are not freed here. Call on all ranks before teardown; no-op if never registered."""
     # Wait for all GPU work to finish first: a kernel or collective still reading
     # pool memory would fault once the windows go away.
     if torch.cuda.is_available() and torch.cuda.is_initialized():

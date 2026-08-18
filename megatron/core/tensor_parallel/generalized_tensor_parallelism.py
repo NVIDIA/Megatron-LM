@@ -446,17 +446,11 @@ class GTPRematConfig:
     # wire, but accumulation no longer loses precision as the axis grows. Bypassed at axis size
     # <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
     reduce_scatter_with_fp32_accumulation: bool = False
-    gtp_remat_nccl_ub: bool = False
-    gtp_expert_remat_nccl_ub: bool = False
     # Persistent wgrad slots per scheduling/shape domain for partial-CG asynchronous reduce-scatter.
     # Two slots cover the usual case of one same-key writer per graph. A graph containing multiple
     # same-key writers may need more slots to keep all in-flight RS inputs distinct.
     # TODO: Infer each domain's ring size automatically.
     graph_wgrad_ring_size: int = 2
-
-    # Symmetric-memory registration: back the wgrad reduce-scatter send buffers with
-    # ncclMemAlloc pools registered on the GTP / EGTP group, so NCCL can use its
-    # symmetric (NVLS) kernels. Independent of --use-nccl-ub, which covers the DP group.
 
 
 GTP_CONFIG = GTPRematConfig()
@@ -488,11 +482,9 @@ def configure_gtp_remat_from_recipe(
     fp8=False,
     calculate_per_token_loss=False,
     reduce_scatter_with_fp32_accumulation=False,
-    gtp_remat_nccl_ub=False,
-    gtp_expert_remat_nccl_ub=False,
 ):
     """
-    Configure GTP weight-remat (padding + loss reduction + symm mem) from the training recipe.
+    Configure GTP weight-remat (padding + loss reduction) from the training recipe.
     Must be called once BEFORE model construction.
     """
     # gtp_remat grad reduction SUMs (not means) the gtp_remat axis under per-token-loss.
@@ -502,8 +494,6 @@ def configure_gtp_remat_from_recipe(
         calculate_per_token_loss=calculate_per_token_loss,
         check_param_states=False,
         reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
-        gtp_remat_nccl_ub=gtp_remat_nccl_ub,
-        gtp_expert_remat_nccl_ub=gtp_expert_remat_nccl_ub,
     )
     if fp4:
         update_gtp_config(pad_for_alignment=16)
@@ -2067,7 +2057,8 @@ class GTPShardedParam(torch.nn.Parameter):
                     # Alias check and copy
                     if wgrad.data_ptr() != symm_slot.data_ptr():
                         symm_slot[: weight._unsharded_shape[0]].copy_(wgrad)
-                        _wgrad_pool_put(wgrad)
+                        if not _chain_is_graphed(self.chain_id):
+                            _wgrad_pool_put(wgrad)
 
                     # Required to free the slot after the RS is waited on.
                     wgrads[index] = symm_slot

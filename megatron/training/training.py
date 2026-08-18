@@ -2734,8 +2734,6 @@ def setup_model_and_optimizer(
             reduce_scatter_with_fp32_accumulation=getattr(
                 args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
             ),
-            gtp_remat_nccl_ub=getattr(args, 'gtp_remat_nccl_ub', False),
-            gtp_expert_remat_nccl_ub=getattr(args, 'gtp_expert_remat_nccl_ub', False),
         )
 
         if getattr(args, 'gtp_remat_nccl_ub', False):

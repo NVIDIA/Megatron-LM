@@ -73,8 +73,6 @@ class _StubGroup:
 
 
 _CONFIG_FIELDS = (
-    "gtp_remat_nccl_ub",
-    "gtp_expert_remat_nccl_ub",
     "reduce_scatter_with_fp32_accumulation",
     "pad_for_alignment",
     "check_param_states",
@@ -94,6 +92,29 @@ def _restore_gtp_config():
 # ---------------------------------------------------------------------------
 # RegisteredLIFOPool (single process)
 # ---------------------------------------------------------------------------
+
+
+class TestTeardownContract:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pool test")
+    def test_teardown_clears_own_state_but_not_foreign_allocations(self):
+        group = _StubGroup(name="teardown_contract_group")
+        # A buffer owned by another subsystem (ring-slot style), allocated in the pool.
+        with gtp_symm.gtp_symm_pool_ctx(group):
+            foreign = torch.full((8,), 7.0, device="cuda")
+        assert group.group_name in gtp_symm._pools
+        # A LIFO-owned buffer sitting in the free list.
+        buf = symmetric_wgrad_pool.alloc((4,), torch.bfloat16, "cuda", group)
+        symmetric_wgrad_pool.free(buf)
+        del buf
+
+        deregister_and_clear_gtp_symm_pools()
+
+        # Own state is gone: registries empty, free lists dropped.
+        assert not gtp_symm._pools and not gtp_symm._registered
+        assert not symmetric_wgrad_pool._free
+        # Foreign allocations survive teardown untouched.
+        torch.cuda.synchronize()
+        assert torch.equal(foreign, torch.full((8,), 7.0, device="cuda"))
 
 
 class TestRegisterVersionGuard:
@@ -161,6 +182,30 @@ class TestRegisteredLIFOPool:
 # ---------------------------------------------------------------------------
 # get_wgrad_tensor / _prepare_wgrad_reduce_scatter_inputs routing (world 4)
 # ---------------------------------------------------------------------------
+
+
+def _worker_sync_plain_recycle(rank, world_size, port):
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    group = dist.new_group(list(range(world_size)))
+    layer = _make_gtp_linear(64, 128, group, dtype)
+    w = layer.weight
+    w.main_grad = torch.zeros(w.shape, dtype=dtype, device="cuda")
+
+    # Unregistered group: get_wgrad_tensor hands out plain pool scratch (the native
+    # zero-copy path with the ub flags off).
+    scratch = w.get_wgrad_tensor()
+    assert getattr(scratch, "_from_gtp_wgrad_pool", False)
+    ptr = scratch.data_ptr()
+    scratch.normal_()
+
+    # Chain head -> synchronous reduce-scatter; the release path must return the
+    # scratch to the plain pool (regression test for the sync-path dual release).
+    w.wgrad_reduce_scatter(scratch)
+    torch.cuda.synchronize()
+    again = gtp_module._wgrad_pool_get(tuple(w._unsharded_shape), dtype, "cuda")
+    assert again.data_ptr() == ptr, "sync RS did not recycle the plain wgrad scratch"
+    gtp_module._wgrad_pool_put(again)
 
 
 def _worker_wgrad_split(rank, world_size, port):
@@ -264,6 +309,12 @@ def _worker_wgrad_split(rank, world_size, port):
         GTP_CONFIG.reduce_scatter_with_fp32_accumulation = False
         # Drop the LIFO buffers and the (unregistered) pools created via gtp_symm_pool_ctx.
         deregister_and_clear_gtp_symm_pools()
+
+
+class TestSyncPlainScratchRecycle:
+    def test_sync_rs_returns_plain_scratch_to_pool(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_sync_plain_recycle, 4)
 
 
 class TestWgradSendBufferSplit:
