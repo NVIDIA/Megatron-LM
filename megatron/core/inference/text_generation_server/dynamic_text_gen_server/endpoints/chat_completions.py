@@ -12,6 +12,9 @@ from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
+from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
+from ..openai_streaming import StreamingChatParser, openai_stream
+
 logger = logging.getLogger(__name__)
 
 # pylint: disable=line-too-long
@@ -398,14 +401,30 @@ try:
         message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None
     ):
         """Runs CPU-intensive text parsing."""
-        meta = {}
         for parser in parsers_list:
             if parser not in PARSER_MAPPING:
                 raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
 
+        implicit_reasoning_end_markers = (
+            tuple(
+                marker
+                for parser_name in parsers_list
+                for marker in getattr(
+                    PARSER_MAPPING[parser_name], "implicit_reasoning_end_markers", ()
+                )
+            )
+            if tools_requested
+            else ()
+        )
+
+        meta = {}
+        for parser in parsers_list:
             prev_text = message_text
             parsed_text, new_info = PARSER_MAPPING[parser].parse(
-                message_text, tools=tools, chat_template_kwargs=chat_template_kwargs
+                message_text,
+                tools=tools,
+                chat_template_kwargs=chat_template_kwargs,
+                implicit_reasoning_end_markers=implicit_reasoning_end_markers,
             )
             if "tool_calls" in new_info:
                 new_info["tool_calls"] = _normalize_tool_calls(
@@ -603,11 +622,76 @@ try:
                 add_BOS=add_BOS,
                 termination_id=-1 if ignore_eos else None,
                 return_prompt_tokens=return_prompt_tokens,
+                streaming_interval=int(_get_non_none(req, "streaming_interval", 1)),
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
 
         # --- 3. Send Requests to Engine ---
+        stream_requested = bool(req.get("stream", False))
+        if stream_requested:
+            # Streaming currently supports only Hugging Face fast tokenizers.
+            try:
+                incremental_detokenizers = [
+                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    for _ in range(n)
+                ]
+            except ValueError as error:
+                return Response(str(error), status=400)
+
+            streams = [
+                client.add_request_streaming(prompt_tokens, sampling_params) for _ in range(n)
+            ]
+            chat_parsers = None
+            if parsers:
+                marker_prefixes = (
+                    tuple(
+                        marker
+                        for parser_name in parsers
+                        for marker in getattr(PARSER_MAPPING[parser_name], "streaming_markers", ())
+                    )
+                    if tools_requested
+                    else ()
+                )
+
+                def parse_streaming_text(text):
+                    parsed_text, metadata = apply_parsers(
+                        text,
+                        tools,
+                        parsers,
+                        tools_requested,
+                        chat_template_kwargs=chat_template_kwargs,
+                    )
+                    metadata["tool_calls"] = _maybe_filter_parallel_tool_calls(
+                        metadata.get("tool_calls", []), parallel_tool_calls
+                    )
+                    return parsed_text, metadata
+
+                is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
+                chat_parsers = [
+                    StreamingChatParser(
+                        parse_streaming_text,
+                        marker_prefixes=marker_prefixes,
+                        named_tool_choice=is_named_tool_choice,
+                    )
+                    for _ in range(n)
+                ]
+            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
+            response = Response(
+                openai_stream(
+                    streams,
+                    tokenizer,
+                    incremental_detokenizers,
+                    chat=True,
+                    return_log_probs=return_log_probs,
+                    include_usage=include_usage,
+                    chat_parsers=chat_parsers,
+                ),
+                content_type="text/event-stream",
+            )
+            response.timeout = None
+            return response
+
         tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
 
         if current_app.config['verbose']:
@@ -669,8 +753,11 @@ try:
         # at submit time (above) and drive both the response shape here and whether the
         # engine kept the prompt_tokens tensor on the payload.
         request_idx = 0
+        response_uid = None
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
+            if response_uid is None:
+                response_uid = result["uid"]
 
             text_output = result["generated_text"]
             # The engine always reports prompt_length (for usage), but drops the
@@ -756,12 +843,8 @@ try:
             if return_raw_text:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])
                 message["raw_text"] = prompt_str + text_output
-            # Small RL/debug scalars (a few bytes each); harmless to keep for
-            # NeMo-RL compatibility.
+            # Small RL/debug scalars (a few bytes each); harmless to keep for NeMo-RL compatibility.
             message["generation_log_probs"] = result.get("generated_log_probs", [])
-            message["policy_epoch"] = result["policy_epoch"]
-            message["kv_cache_epoch"] = result["kv_cache_epoch"]
-            message["num_evictions"] = sum(1 for e in result["events"] if e.get("type") == "EVICT")
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
@@ -810,7 +893,7 @@ try:
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         cached_token_count = max(cached_tokens_counts) if cached_tokens_counts else 0
         response = {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "id": response_uid,
             "created": int(time.time()),
             "model": "EMPTY",
             "object": "chat.completion",

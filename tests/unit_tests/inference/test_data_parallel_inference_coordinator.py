@@ -2,6 +2,7 @@
 
 import asyncio
 import itertools
+import logging
 import multiprocessing
 import os
 import time
@@ -17,6 +18,10 @@ import torch
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
+)
+from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
+    HANDLERS,
+    handle_engine_reply,
 )
 from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import (
@@ -46,6 +51,11 @@ except ImportError:
 NUM_REQUESTS = 10
 NUM_TOKENS = 2
 DEFAULT_PORT = 46581
+
+
+def test_coordinator_registers_client_kv_handoff_handlers():
+    assert Headers.SUBMIT_REQUEST_WITH_KV in HANDLERS
+    assert Headers.RELEASE_KV in HANDLERS
 
 
 class DummyTokenizer:
@@ -862,3 +872,35 @@ class TestRoutingPolicies:
         _set_hash_rank(coord, 99, b"rank-0", 1)
 
         assert coord.get_best_data_parallel_rank([99]) == b"rank-2"
+
+    def test_reply_routing_survives_engine_removal(self, caplog):
+        """A removed engine's queued replies still deliver; never-connected senders assert."""
+
+        def reply(fid):
+            return [
+                Headers.ENGINE_REPLY.value,
+                [{"request_id": fid, "generated_tokens": [1], "sampling_params": {}}],
+            ]
+
+        coord = _make_routing_coordinator(num_ranks=2)
+        coord.tokenizer = DummyTokenizer()
+        coord.request_id_to_client_id = {11: b"client-A"}
+        coord.request_id_to_client_request_id = {11: 7}
+        coord.client_request_to_request_id = {(b"client-A", 7): 11}
+        coord.request_id_to_rank = {}
+        coord.router_socket = unittest.mock.MagicMock()
+
+        # A sender that never registered is a protocol violation.
+        with pytest.raises(AssertionError, match="never-connected"):
+            handle_engine_reply(coord, b"impostor", reply(11))
+        assert coord.router_socket.send_multipart.call_count == 0
+        assert 11 in coord.request_id_to_client_id
+
+        # Removal happens on failed *sends*, so the removed engine's in-flight
+        # reply can still arrive - and must reach its client.
+        coord._remove_engine(b"rank-0")
+        with caplog.at_level(logging.WARNING):
+            handle_engine_reply(coord, b"rank-0", reply(11))
+        assert "removed engine" in caplog.text
+        assert coord.router_socket.send_multipart.call_args[0][0][0] == b"client-A"
+        assert 11 not in coord.request_id_to_client_id

@@ -689,6 +689,31 @@ class ProcessGroupCollection:
             return result
 
 
+def resolve_gtp_remat_group(
+    pg_collection: Optional["ProcessGroupCollection"], is_expert: bool
+) -> Optional[torch.distributed.ProcessGroup]:
+    """Resolve the gtp_remat / expt_gtp_remat group for a weight-owning module.
+
+    Prefers the group carried by ``pg_collection``; falls back to the MPU globals when the
+    caller passed no collection, or one predating the gtp_remat fields. The fallback keeps
+    pre-pg_collection callers working — a collection that does carry the field is always
+    honored, including when it holds a custom (non-MPU) group.
+
+    Args:
+        pg_collection: Collection supplied by the caller, or None.
+        is_expert: Select the expert axis (``expt_gtp_remat``) instead of the dense one.
+    """
+    attr = 'expt_gtp_remat' if is_expert else 'gtp_remat'
+    # `vars()`, not hasattr: __getattr__ makes hasattr always True, so the fallback below
+    # would be unreachable.
+    if pg_collection is not None and attr in vars(pg_collection):
+        return getattr(pg_collection, attr)
+    mpu_pgs = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['gtp_remat', 'expt_gtp_remat']
+    )
+    return getattr(mpu_pgs, attr)
+
+
 @dataclass
 class MultiModuleProcessGroupCollection:
     """Process group collection for multi-module pipelines.
