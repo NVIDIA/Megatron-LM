@@ -1800,6 +1800,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
         "rollout_pipeline_assembled_count": pipeline.assembled_count,
         "rollout_pipeline_filtered_count": pipeline.filtered_count,
         "rollout_pipeline_refilled_placeholder_groups": pipeline.refilled_placeholder_groups,
+        "rollout_pipeline_restored_count": pipeline.restored_count,
         "rollout_pipeline_yielded_count": pipeline.yielded_count,
     })
     # Refilled groups never reach the trainer-side failure accounting,
@@ -1828,6 +1829,9 @@ def _collect_rollout_pipeline_metrics() -> dict:
         metrics[f"{allocation.env_id}_assembled_groups"] = (
             pipeline.assembled_groups_per_env[env_index]
         )
+        metrics[f"{allocation.env_id}_restored_groups"] = (
+            pipeline.restored_groups_per_env[env_index]
+        )
         metrics[f"{allocation.env_id}_yielded_groups"] = (
             pipeline.yielded_groups_per_env[env_index]
         )
@@ -1853,6 +1857,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
     num_envs = len(pipeline.gran_policy.num_groups_per_env)
     pipeline.prepared_groups_per_env = [0] * num_envs
     pipeline.assembled_groups_per_env = [0] * num_envs
+    pipeline.restored_groups_per_env = [0] * num_envs
     pipeline.yielded_groups_per_env = [0] * num_envs
     gate.prepare_blocked_seconds = 0.0
     gate.acquire_calls = 0
