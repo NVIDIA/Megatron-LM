@@ -12,7 +12,7 @@ from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+from torch._utils import _unflatten_dense_tensors
 from torch.distributed import _coalescing_manager
 
 import megatron.core.nccl_allocator as nccl_allocator
@@ -29,8 +29,7 @@ from ..fp4_utils import (
     modify_nvfp4_rowwise_storage,
 )
 from ..fp8_utils import (
-    _stage_param_to_bf16,
-    copy_back_gathered_bf16_into_fp8_param,
+    copy_back_gathered_bf16_into_fp8_params,
     copy_tensors_to_quantized_params,
     is_float8tensor,
     is_grouped_mxfp8tensor,
@@ -188,7 +187,8 @@ def _layerwise_copy_back_gathered_params(bucket, local_rank: int, fp8_staged: bo
     * bf16 (``fp8_staged=False``): unflatten against the params, ``copy_`` into non-owned
       ``model_p.data`` (owned already hold the staged value).
     * fp8 (``fp8_staged=True``): the all-gather rode bf16; requantize ALL ranks (owned included)
-      via ``copy_back_gathered_bf16_into_fp8_param`` so every owner holds ``Q(bf16(master))``.
+      via ``copy_back_gathered_bf16_into_fp8_params`` so every owner holds
+      ``Q(bf16(master))``.
 
     no_grad: in-place copy_ on a leaf param trips autograd's in-place guard.
     """
@@ -198,8 +198,7 @@ def _layerwise_copy_back_gathered_params(bucket, local_rank: int, fp8_staged: bo
         if fp8_staged:
             templates = [torch.empty(p.shape, device="meta", dtype=torch.bfloat16) for p in params]
             updated_params = _unflatten_dense_tensors(bucket.layerwise_gather_list[idx], templates)
-            for updated_p, model_p in zip(updated_params, params):
-                copy_back_gathered_bf16_into_fp8_param(model_p, updated_p)
+            copy_back_gathered_bf16_into_fp8_params(params, updated_params)
             continue
         # bf16 transport: owned params already hold the staged bf16 value in their data, so only
         # non-owned ranks need the copy.
@@ -541,35 +540,37 @@ class _ParamAndGradBucketGroup:
                     offset += size
                 local_slot_view = gather_list[local_rank]
 
-                # Flatten local params and copy into the local rank's slot.
-                # Detach from autograd since start_param_sync may be called
-                # during the forward pass where autograd is active.
+                # Copy local params directly into their views of the flat transport slot.
+                # This avoids allocating one BF16 tensor per parameter and then flattening it.
+                # Detach from autograd since start_param_sync may be called during forward.
                 if local_size > 0:
-                    if bucket_is_fp8:
-                        # Decoupled layout: stage fp32 master->bf16 (high-precision source), not
-                        # lossy dequant(fp8). Copy-back requantizes every rank, owner included.
-                        staged = [
-                            _stage_param_to_bf16(p)
-                            for p in bucket.layerwise_params_list[local_rank]
-                        ]
-                        flat_local_params = _flatten_dense_tensors(staged)
-                    else:
-                        # Padded LayerWise layout: MXFP8 params can't be flattened (view(-1)
-                        # unsupported); gather the fp32 master (param.main_param -> bf16), which
-                        # the receive-side copy_ re-quantizes. Non-mxfp8 params flatten as-is.
-                        src_params = []
-                        for p in bucket.layerwise_params_list[local_rank]:
-                            if is_mxfp8tensor(p):
-                                main_param = getattr(p, "main_param", None)
-                                assert main_param is not None, (
-                                    "LayerWise mxfp8 param sync needs param.main_param (fp32 "
-                                    "master) to stage the all-gather source; got None."
+                    local_offset = 0
+                    for param in bucket.layerwise_params_list[local_rank]:
+                        param_numel = param.numel()
+                        transport_view = local_slot_view[local_offset : local_offset + param_numel]
+                        if bucket_is_fp8 or is_mxfp8tensor(param):
+                            # Decoupled FP8 buckets stage every param from its FP32 master so
+                            # mixed FP8/BF16 buckets all use the same high-precision source.
+                            # Padded buckets need the same source only for MXFP8, whose tensor
+                            # subclass cannot be flattened.
+                            source = getattr(param, "main_param", None)
+                            if source is None:
+                                raise RuntimeError(
+                                    "LayerWise FP8 parameter-gather staging requires "
+                                    "param.main_param (FP32 master)."
                                 )
-                                src_params.append(main_param.to(param_dtype))
-                            else:
-                                src_params.append(p)
-                        flat_local_params = _flatten_dense_tensors(src_params).detach()
-                    local_slot_view.copy_(flat_local_params)
+                        else:
+                            source = param
+                        source = source.detach()
+                        if source.numel() != param_numel:
+                            raise RuntimeError(
+                                "LayerWise parameter-gather staging source size mismatch: "
+                                f"source has {source.numel()} elements, parameter has "
+                                f"{param_numel}."
+                            )
+                        transport_view.copy_(source.reshape(-1))
+                        local_offset += param_numel
+                    assert local_offset == local_size
                 bucket.layerwise_gather_list = gather_list
 
                 work = torch.distributed.all_gather(

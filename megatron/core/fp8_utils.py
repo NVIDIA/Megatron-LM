@@ -176,6 +176,21 @@ def is_grouped_tensor_with_quantized_storage(tensor: torch.Tensor) -> bool:
     return rowwise_data is not None and rowwise_data.dtype == torch.uint8
 
 
+def pop_high_precision_init_val(param: torch.Tensor) -> Optional[torch.Tensor]:
+    """Return and clear a Transformer Engine preserved high-precision initial value.
+
+    The returned tensor is left unmodified so each optimizer path can preserve its
+    existing slicing, cloning, device placement, and dtype conversion behavior.
+    """
+    getter = getattr(param, "get_high_precision_init_val", None)
+    if getter is None:
+        return None
+
+    high_precision_init_val = getter()
+    param.clear_high_precision_init_val()
+    return high_precision_init_val
+
+
 def _get_grouped_quantized_recipe(tensor: torch.Tensor):
     """Return TE recipe for grouped quantized storage, or None if unavailable."""
     tensor = _unwrap_parameter_data(tensor)
@@ -334,37 +349,46 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
         return fp8_tensor.from_float8()
 
 
-def copy_back_gathered_bf16_into_fp8_param(model_p: torch.Tensor, src_bf16: torch.Tensor) -> None:
-    """Copy a gathered BF16 whole-param into a compact LayerWise bucket parameter.
+def copy_back_gathered_bf16_into_fp8_params(
+    model_params: List[torch.Tensor], srcs_bf16: List[torch.Tensor]
+) -> None:
+    """Copy gathered BF16 whole-params into compact LayerWise bucket parameters.
 
     Plain BF16 parameters are allowed because a LayerWise bucket can contain BF16 siblings of
     supported FP8 parameters. Quantized destinations are limited to MXFP8 and blockwise tensors.
-    MXFP8 columnwise data cannot be derived from rowwise data, so force both usages before copy_.
+    MXFP8 columnwise data cannot be derived from rowwise data, so force both usages before the
+    batched quantized copy. Validate the entire batch before mutating any quantizer usage.
     """
-    if is_grouped_tensor_with_quantized_storage(model_p):
-        raise TypeError(
-            "LayerWise FP8 parameter gather does not support Transformer Engine GroupedTensor "
-            "quantized storage. Disable --moe-single-grouped-weight."
+    if len(model_params) != len(srcs_bf16):
+        raise ValueError(
+            "LayerWise FP8 parameter gather copy-back requires one source per parameter: "
+            f"got {len(model_params)} parameters and {len(srcs_bf16)} sources."
         )
-    if is_float8tensor(model_p) and not is_layerwise_fp8_param(model_p):
-        raise TypeError(
-            "LayerWise FP8 parameter gather supports only MXFP8Tensor and "
-            "Float8BlockwiseQTensor destinations."
-        )
-    if is_mxfp8tensor(model_p):
-        quantizer = model_p.data._get_quantizer()
+
+    mxfp8_quantizers = []
+    for model_p in model_params:
+        if is_grouped_tensor_with_quantized_storage(model_p):
+            raise TypeError(
+                "LayerWise FP8 parameter gather does not support Transformer Engine "
+                "GroupedTensor quantized storage. Disable --moe-single-grouped-weight."
+            )
+        if is_float8tensor(model_p) and not is_layerwise_fp8_param(model_p):
+            raise TypeError(
+                "LayerWise FP8 parameter gather supports only MXFP8Tensor and "
+                "Float8BlockwiseQTensor destinations."
+            )
+        if is_mxfp8tensor(model_p):
+            mxfp8_quantizers.append(model_p.data._get_quantizer())
+
+    for quantizer in mxfp8_quantizers:
         quantizer.set_usage(rowwise=True, columnwise=True)
-    model_p.data.copy_(src_bf16)
+
+    copy_tensors_to_quantized_params(model_params, srcs_bf16)
 
 
-def _stage_param_to_bf16(p: torch.Tensor) -> torch.Tensor:
-    """Stage a locally owned LayerWise parameter's FP32 master in BF16 for transport."""
-    main_param = getattr(p, "main_param", None)
-    if main_param is None:
-        raise RuntimeError(
-            "LayerWise FP8 parameter-gather staging requires param.main_param (FP32 master)."
-        )
-    return main_param.detach().to(torch.bfloat16)
+def copy_back_gathered_bf16_into_fp8_param(model_p: torch.Tensor, src_bf16: torch.Tensor) -> None:
+    """Single-parameter compatibility wrapper for LayerWise BF16 copy-back."""
+    copy_back_gathered_bf16_into_fp8_params([model_p], [src_bf16])
 
 
 def _resolve_callable_from_python_import_path(dotted_path: str):
@@ -406,11 +430,9 @@ def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, F
     try:
         custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
     except AttributeError:
-        raise ValueError(
-            """CustomRecipe recipe is not available in this version of 
-            Transformer Engine. Please make sure you are using TE version 
-            >= 2.9.0.dev0."""
-        )
+        raise ValueError("""CustomRecipe recipe is not available in this version of
+            Transformer Engine. Please make sure you are using TE version
+            >= 2.9.0.dev0.""")
     return custom_recipe
 
 

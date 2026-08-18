@@ -15,8 +15,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
 from ..fp8_utils import (
-    _stage_param_to_bf16,
-    copy_back_gathered_bf16_into_fp8_param,
+    copy_back_gathered_bf16_into_fp8_params,
     is_layerwise_fp8_param,
     post_all_gather_processing,
 )
@@ -968,16 +967,33 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # No rank owns any param in this buffer -> nothing to gather.
                 return
 
-            # Stage fp32 master->bf16 (high-precision source), not lossy dequant(fp8).
-            owned = params_list[rank]
-            src = (
-                _flatten_dense_tensors([_stage_param_to_bf16(p) for p in owned])
-                if len(owned) > 0
-                else torch.empty(0, device=device, dtype=torch.bfloat16)
-            )
             flat_sizes = [sum(p.numel() for p in params) for params in params_list]
             if max(flat_sizes) == 0:
                 return
+
+            # Stage FP32 masters directly into one flat BF16 transport tensor rather than
+            # allocating a temporary BF16 tensor per parameter and flattening those copies.
+            owned = params_list[rank]
+            src = torch.empty(flat_sizes[rank], device=device, dtype=torch.bfloat16)
+            offset = 0
+            for param in owned:
+                main_param = getattr(param, "main_param", None)
+                if main_param is None:
+                    raise RuntimeError(
+                        "LayerWise FP8 parameter-gather staging requires "
+                        "param.main_param (FP32 master)."
+                    )
+                param_numel = param.numel()
+                main_param = main_param.detach()
+                if main_param.numel() != param_numel:
+                    raise RuntimeError(
+                        "LayerWise parameter-gather staging source size mismatch: "
+                        f"source has {main_param.numel()} elements, parameter has "
+                        f"{param_numel}."
+                    )
+                src[offset : offset + param_numel].copy_(main_param.reshape(-1))
+                offset += param_numel
+            assert offset == flat_sizes[rank]
 
             gather_list = []
             for i in range(dp_size):
@@ -999,8 +1015,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     torch.empty(p.shape, device="meta", dtype=torch.bfloat16) for p in params
                 ]
                 updated_params = _unflatten_dense_tensors(gather_list[idx], templates)
-                for updated_bf16, model_p in zip(updated_params, params):
-                    copy_back_gathered_bf16_into_fp8_param(model_p, updated_bf16)
+                copy_back_gathered_bf16_into_fp8_params(params, updated_params)
 
             # Rebuild fp8 columnwise/transpose after the gather (mirrors the overlap / DistOpt
             # paths; blockwise builds it, mxfp8 is a noop). Else it'd be deferred to forward.

@@ -58,6 +58,7 @@ from ..fp8_utils import (
     get_grouped_quantized_members,
     is_float8tensor,
     is_grouped_tensor_with_quantized_storage,
+    pop_high_precision_init_val,
     quantize_param_shard,
 )
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
@@ -428,15 +429,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         if is_nvfp4tensor(model_param) or cls._is_distopt_quantized_param(
                             model_param
                         ):
-                            if hasattr(model_param, 'get_high_precision_init_val'):
+                            high_precision_init_val = pop_high_precision_init_val(model_param)
+                            if high_precision_init_val is not None:
                                 shard_main_param = (
-                                    model_param.get_high_precision_init_val()
-                                    .view(-1)[param_range.start : param_range.end]
+                                    high_precision_init_val.view(-1)[
+                                        param_range.start : param_range.end
+                                    ]
                                     .clone()
                                     .to(model_param.device)
                                     .float()
                                 )
-                                model_param.clear_high_precision_init_val()
                             else:
                                 shard_main_param = model_param.float().view(-1)[
                                     param_range.start : param_range.end
