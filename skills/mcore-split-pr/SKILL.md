@@ -1,8 +1,8 @@
 ---
 name: mcore-split-pr
-description: Split a PR into multiple PRs to reduce the number of required CODEOWNERS reviewer groups, and manage the resulting stack through review and merge.
+description: Split a PR into multiple PRs to reduce the number of required CODEOWNERS reviewer groups.
 license: Apache-2.0
-when_to_use: User asks to split a PR, reduce reviewer groups, break up a large PR, or stack dependent PRs; 'too many CODEOWNERS', 'split this PR', 'break up PR', 'reduce reviewers needed', 'stacked PRs', 'clean per-PR diffs'.
+when_to_use: User asks to split a PR, reduce reviewer groups, or break up a large PR; 'too many CODEOWNERS', 'split this PR', 'break up PR', 'reduce reviewers needed'.
 user_invocable: true
 argument: "PR URL or number"
 metadata:
@@ -28,49 +28,22 @@ workflow:
   separate PR just to reduce reviewer groups.
 - If PR B depends on symbols renamed in PR A, call out the dependency and put
   backward-compatible aliases, re-exports, or shims in PR A when needed.
-- **Create every PR with base `main`.** Stacked bases come later: the
-  `pull-request/<N>` mirror refs used for stacking do not exist until a vetter
-  runs `/ok to test`, so creating a PR with such a base fails.
-- **Never merge a PR whose base is a `pull-request/*` ref.** GitHub merges into
-  the base branch: merging while mirror-based writes the commits into the
-  bot's scratch ref (which gets force-pushed away), lands nothing on `main`,
-  and leaves an unreopenable MERGED PR. Retarget to `main` first, then merge.
-- **Un-stack children the moment their parent is approved.** copy-pr-bot
-  deletes `pull-request/<N>` when PR N merges or closes, and GitHub then
-  auto-closes (unreopenably) every PR based on that ref — one merge can
-  domino-close the rest of the stack. Retarget the child to `main` as soon as
-  the parent is approved, before the parent becomes mergeable.
+- Create every PR with base `main`; the `pull-request/<N>` mirror refs do not
+  exist until a vetter comments `/ok to test <head-sha>` (copy-pr-bot). Once
+  the mirror exists, stack a dependent PR with
+  `gh pr edit <child> --base pull-request/<base PR number>`.
+- Never merge a PR while its base is a `pull-request/*` ref: the squash lands
+  in the bot's scratch ref, not `main`, and the PR ends up MERGED and
+  unreopenable. Retarget to `main` first.
+- Retarget each dependent PR back to `main` as soon as its base PR is
+  approved: copy-pr-bot deletes `pull-request/<N>` when PR N merges or
+  closes, and GitHub then auto-closes (unreopenably) every PR based on that
+  ref. After the base PR squash-merges, rebase dependents onto the new `main`
+  and force-push.
 - Wait for user approval before execution.
-- Execution creates draft PRs, applies file-scoped diffs with
-  `git diff upstream/main..<source-branch> -- <paths> | git apply`, pushes
+- Execution creates draft PRs from the right base, applies file-scoped diffs
+  with `git diff upstream/main..<source-branch> -- <paths> | git apply`, pushes
   to the user's fork, and never pushes directly to upstream.
-
-## How Megatron-LM's CI shapes stacked PRs
-
-Understand this model before touching PR bases; every stacking step below
-derives from it.
-
-- CI runs on self-hosted runners, so fork PRs get **no CI** until a trusted
-  vetter comments `/ok to test <head-sha>` (copy-pr-bot). The bot then copies
-  the vetted SHA into a real upstream branch, `refs/heads/pull-request/<N>`,
-  and workflows run against that trusted copy — never against the fork ref.
-- That mirror branch is the **only** upstream ref containing a fork PR's
-  commits, and GitHub requires a PR's base to be an upstream branch — which is
-  why `pull-request/<parent-N>` is the one legal way to get stacked
-  (per-layer) diffs in a fork-only repo.
-- The mirror is a **vetted snapshot, not a live mirror**: it refreshes only on
-  the next `/ok to test`. After pushing to a parent, child diffs go slightly
-  stale until the parent is re-vetted. This is the security model working as
-  intended, not a bug.
-- The `linting` job checks the PR **merged with current main**, using main's
-  tool pins (e.g. black version from main's `pyproject.toml`), over changed
-  `.py` files under `megatron/core` and `tests/` only. A touched file must be
-  fully clean under main's formatter version — pre-existing lines can fail
-  after a formatter bump on main, and a local older formatter will not
-  reproduce the complaint.
-- Merges are **squash** merges: a child's diff does not collapse automatically
-  when its parent merges. The child must be rebased onto the new `main`
-  (the parent's commits drop out as already-applied) and force-pushed.
 
 ## Workflow
 
@@ -92,11 +65,6 @@ Strategy:
 3. Remaining files form one or more additional PRs, each ideally requiring only one or two reviewer groups.
 4. If a split creates a dependency (e.g., PR B uses symbols renamed in PR A), the dependent PR must be merged after the first. Note this explicitly.
 5. Each PR must be independently mergeable to main — no broken imports, no missing symbols. Backward-compatible aliases and re-export stubs in the first PR can make this possible.
-6. A PR with **two dependencies** cannot have a clean stacked diff (a git branch
-   has one parent). Linearize: stack it on one parent's branch and cherry-pick a
-   copy of the other parent's commit beneath it. Its diff shows the copied
-   commit until that other parent merges to `main`, after which the next rebase
-   drops the copy and the diff collapses — note this in the PR body.
 
 Present the proposed split as a table:
 - PR name/description
@@ -111,70 +79,17 @@ Wait for user approval before proceeding.
 For each new PR:
 1. Create a new branch from the appropriate local base (`main`, or a dependency PR's branch).
 2. Extract the relevant changes: `git diff upstream/main..<source-branch> -- <file paths> | git apply`.
-3. Stage, commit with `-s -S` and a clear message, and push to the user's fork.
-4. Create the PR as a **draft** with base `main` (per repo contributing
-   guidelines; the mirror refs for stacking do not exist yet).
+3. Stage, commit with a clear message, and push to the user's fork.
+4. Create the PR as a **draft** with base `main` (per repo contributing guidelines). Retarget dependent PRs to `pull-request/<base PR number>` only after a vetter's `/ok to test` has created that mirror ref.
 5. If the original PR needs to be narrowed in scope, confirm with the user before force-pushing.
 6. Report all PR URLs when done.
-
-### 4. Stack for review (once a vetter is available)
-
-1. Have a vetter comment `/ok to test <head-sha>` on every PR in the series —
-   this both unblocks CI and creates the `pull-request/<N>` mirrors.
-2. Confirm the refs exist: `git ls-remote origin 'refs/heads/pull-request/<N>'`.
-3. Retarget each child onto its parent's mirror:
-   `gh pr edit <child> --base pull-request/<parent-N>`.
-   Roots keep base `main`.
-4. Each PR's Files-changed now shows only its own layer. Reviews proceed in
-   parallel across the whole stack.
-5. While reviewing: pushes to a child require rebasing its descendants
-   (cascade + force-push). Do **not** use GitHub's "Update branch" button on
-   stacked branches — it injects merge commits that fight the rebase cascade.
-
-### 5. Merge (bottom-up through the dependency DAG)
-
-Reviews are parallel; merges are strictly parents-before-children.
-
-**Un-stack on approval, not at merge time.** When copy-pr-bot's mirror ref
-`pull-request/<N>` is deleted — which the bot does automatically the moment
-PR N merges *or* closes — GitHub instantly auto-closes every PR based on
-that ref, and a PR closed by base-branch deletion cannot be reopened while
-the ref is gone. One merge can therefore domino-close the entire remaining
-stack before you can react. The only safe window to leave the mirror is
-*before* the parent becomes mergeable:
-
-- The moment a parent PR is **approved**, retarget its direct child to
-  `main` (`gh pr edit <child> --base main`). The child's diff temporarily
-  shows the parent's layer too; that is cosmetic and resolves when the
-  parent merges and the child is rebased.
-- Never let any PR merge or close while another PR still bases on its
-  mirror.
-
-For each PR whose dependencies have all merged:
-
-1. **Retarget to `main`:** `gh pr edit <N> --base main` (already done if the
-   approval rule above was followed). Never click merge while the header
-   says "into `pull-request/...`".
-2. Rebase the branch onto latest `origin/main` if needed; push; re-vet for CI.
-3. Squash-merge into `main`.
-4. Immediately rebase every descendant onto the new `main` and force-push
-   (the merged parent's commits drop out as already-applied).
-5. The next child's diff has now collapsed to its own layer; re-vet its
-   descendants' mirrors and re-stack them on the refreshed refs.
-
-Independent roots can merge at any time, in any order — the ordering
-constraint is the dependency DAG, not the PR-number sequence.
 
 ## Important guidelines
 
 - Always create PRs as **drafts** and push to the user's fork, never directly to upstream.
 - Backward-compatible changes (aliases, re-exports, deprecation shims) should go in the first PR so subsequent PRs can depend on them.
+- Dependent PRs target `pull-request/<base PR number>` while stacked, and must be retargeted to `main` as soon as the base PR is approved — before it can merge or close and take the mirror ref (and every PR based on it) down with it.
 - Test files should go with the production code they test, not in a separate PR.
 - Prefer a single clean commit per split PR over replaying the original commit history.
 - If a file is hard to categorize (e.g., it touches two groups), ask the user which PR it should go in.
 - If the current GitHub user is not the author of the original PR, each new PR's description must explicitly credit the original author (e.g., "Original changes by @<author> in #<number>").
-- Consider a watchdog for the three stacking failure modes: a PR reaching
-  approved state while still mirror-based (merge hazard), a *parent* reaching
-  approved state while a child still bases on its mirror (auto-close hazard —
-  retarget the child to `main` now), and a parent merging (a rebase cascade
-  is now due).
