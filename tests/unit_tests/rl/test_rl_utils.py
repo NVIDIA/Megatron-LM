@@ -952,6 +952,22 @@ class TestRLUtils:
         assert bounded == rl_utils._bounded_artifact_key(long_key)
         assert bounded != rl_utils._bounded_artifact_key(long_key + "y")
 
+    def test_placeholder_rewards_do_not_affect_advantage_normalization(self):
+        # Group of 3 with one zero-turn placeholder: the two real rollouts
+        # normalize against each other, so the placeholder's synthetic 0.0
+        # reward manufactures no advantage.
+        advs = rl_utils.calculate_grpo_advantages([[0, 1, 0]], [[0, 1, 1]])
+        torch.testing.assert_close(
+            torch.tensor(advs), torch.tensor([1.0, -1.0]), atol=3e-4, rtol=1e-5
+        )
+
+    def test_all_placeholder_group_has_no_advantages(self):
+        assert rl_utils.calculate_grpo_advantages([[0, 0]], [[0, 0]]) == []
+
+    def test_advantage_shape_mismatch_raises(self):
+        with pytest.raises(AssertionError, match="matching shape"):
+            rl_utils.calculate_grpo_advantages([[1.0, 0.0]], [[1, 1, 1]])
+
     @pytest.mark.parametrize(
         "scenario, expected_turn_lens, expected_traj_lens, expected_num_turns",
         [
@@ -1404,6 +1420,9 @@ class TestRLUtils:
         # Per-turn max epoch stamps (when each turn completed)
         completed_epochs = [[5, 3], [5, 1]]
         num_evictions = [[0, 1], [0, 0]]
+        # "env/timeout" sits outside KNOWN_ROLLOUT_STATUSES and needs key sanitization.
+        rollout_statuses = [["graded", "ok"], ["env/timeout", "ok"]]
+        failure_reasons = [[None, None], [None, None]]
         current_iteration = 6
         if inject_placeholders:
             for lst, sentinel in (
@@ -1420,6 +1439,12 @@ class TestRLUtils:
                     # Placeholders pop no ledger records, so their epoch rows are empty.
                     group.append([])
                 lst.append([[], []])
+            for group in rollout_statuses:
+                group.append("placeholder")
+            rollout_statuses.append(["placeholder", "placeholder"])
+            for group in failure_reasons:
+                group.append("http_500")
+            failure_reasons.append(["http_500", "http_500"])
             # Placeholders contribute no turns, and compute_group_stats already
             # excludes them from completed_epochs; the failed group adds empty
             # inner lists, which the group-level stats must skip, not crash on.
@@ -1439,12 +1464,51 @@ class TestRLUtils:
             completed_epochs=completed_epochs,
             num_evictions=num_evictions,
             current_iteration=current_iteration,
+            rollout_statuses=rollout_statuses,
+            failure_reasons=failure_reasons,
         )
         assert metrics["failed_rollouts/count"] == (4 if inject_placeholders else 0)
         assert metrics["failed_rollouts/ratio"] == (0.5 if inject_placeholders else 0.0)
-        # Reward aggregates keep the placeholder zeros by design: group means
-        # become [2/3, 1/3, 0] instead of [1, 0.5].
+        assert metrics["rollout/count"] == (8 if inject_placeholders else 4)
+        assert metrics["rollout/placeholder_count"] == (4 if inject_placeholders else 0)
+        assert metrics["rollout/placeholder_rate"] == (0.5 if inject_placeholders else 0.0)
+        # Statuses in KNOWN_ROLLOUT_STATUSES always emit a series, zeros included...
+        assert metrics["rollout/ok_count"] == 2
+        assert metrics["rollout/ok_rate"] == (0.25 if inject_placeholders else 0.5)
+        assert metrics["rollout/masked_count"] == 0
+        assert metrics["rollout/masked_rate"] == 0.0
+        assert metrics["rollout/graded_count"] == 1
+        # ...and statuses beyond the vocabulary are still counted, under a
+        # wandb-safe key.
+        assert metrics["rollout/env_timeout_count"] == 1
+        assert metrics["rollout/env_timeout_rate"] == (0.125 if inject_placeholders else 0.25)
+        assert not any(k.startswith("rollout/failure_reason/") for k in metrics)
+        assert "failure_reason_table" in metrics
+        reason_table_calls = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["failure_reason", "count", "rate"]
+        ]
+        assert len(reason_table_calls) == 1
+        expected_reason_rows = [["http_500", 4, 0.5]] if inject_placeholders else []
+        assert reason_table_calls[0].kwargs["data"] == expected_reason_rows
+        # The raw delivery aggregate keeps the placeholder zeros (mean of group
+        # means becomes 1/3 instead of 0.75); the valid view masks them. The
+        # pair diverging is the infrastructure-failure signature.
         assert np.isclose(metrics["mean_reward"], 1 / 3 if inject_placeholders else 0.75)
+        assert metrics["valid_mean_reward"] == 0.75
+        # Group means/stds mirror GRPO normalization: real rollouts only, 0.0
+        # rows for all-placeholder groups.
+        group_table_calls = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["group_means", "group_stds"]
+        ]
+        assert len(group_table_calls) == 1
+        expected_group_rows = [[1.0, 0.0], [0.5, 1.5]]
+        if inject_placeholders:
+            expected_group_rows.append([0.0, 0.0])
+        assert group_table_calls[0].kwargs["data"] == expected_group_rows
         assert metrics["mean_advantage"] == 0.5
         # The rollout table lists real rollouts only, in either case.
         rollout_table_calls = [
@@ -1488,8 +1552,8 @@ class TestRLUtils:
         # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
         assert metrics["mean_completion_gap"] == 2.5
 
-        # Case where every episode has failed: the wave still reports the
-        # failure counters (the one signal it carries) and skips the tables.
+        # Case where every episode has failed: the wave still reports the failure
+        # counters (now status series + reason table) and skips the rollout tables.
         writer = MagicMock()
         metrics = rl_utils.prep_wandb_metrics(
             writer,
@@ -1504,8 +1568,14 @@ class TestRLUtils:
             num_evictions=[],
             current_iteration=6,
         )
-        assert metrics == {'failed_rollouts/count': 0, 'failed_rollouts/ratio': 0.0}
-        writer.Table.assert_not_called()
+        assert metrics['rollout/count'] == 0
+        assert metrics['failed_rollouts/count'] == 0
+        assert metrics['failed_rollouts/ratio'] == 0.0
+        # Unstamped wave: the known-status series still emit, zeroed.
+        assert metrics['rollout/placeholder_count'] == 0
+        assert metrics['rollout/placeholder_rate'] == 0.0
+        assert 'rollout_table' not in metrics and 'mean_reward' not in metrics
+        assert [c.kwargs['data'] for c in writer.Table.call_args_list] == [[]]
 
         # All-placeholder wave: rewards exist (placeholders carry 0.0) but every
         # rollout is a zero-turn pad, so the masked stats have nothing to reduce
@@ -1523,9 +1593,22 @@ class TestRLUtils:
             completed_epochs=[[]],
             num_evictions=[[0, 0]],
             current_iteration=6,
+            rollout_statuses=[["placeholder", "placeholder"]],
+            failure_reasons=[["http_500", None]],
         )
-        assert metrics == {'failed_rollouts/count': 2, 'failed_rollouts/ratio': 1.0}
-        writer.Table.assert_not_called()
+        assert metrics['rollout/count'] == 2
+        assert metrics['failed_rollouts/count'] == 2
+        assert metrics['failed_rollouts/ratio'] == 1.0
+        assert metrics['rollout/placeholder_count'] == 2
+        assert metrics['rollout/placeholder_rate'] == 1.0
+        assert 'rollout_table' not in metrics and 'mean_reward' not in metrics
+        reason_calls = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["failure_reason", "count", "rate"]
+        ]
+        assert len(reason_calls) == 1
+        assert reason_calls[0].kwargs["data"] == [["http_500", 1, 0.5]]
 
     def test_compute_group_stats_excludes_placeholders_from_metric_fields(self):
         def real_rollout(tokens, problem_id):
@@ -1539,7 +1622,7 @@ class TestRLUtils:
                 completion_ids=_mint_cids(1),
             )
 
-        def placeholder():
+        def placeholder(rollout_status="ok", failure_reason=None):
             return TokenRollout(
                 trajectory=[],
                 generation_mask=[],
@@ -1547,12 +1630,21 @@ class TestRLUtils:
                 logprobs=[],
                 env_id="swe",
                 problem_id="placeholder",
+                rollout_status=rollout_status,
+                failure_reason=failure_reason,
             )
 
         eod = MockTokenizer().eod
         first = real_rollout([1, 2, eod], problem_id="p0")
         second = real_rollout([1, 2, 3, eod], problem_id="p0")
-        rollouts = [[first, second, placeholder()], [placeholder(), placeholder(), placeholder()]]
+        rollouts = [
+            [first, second, placeholder()],
+            [
+                placeholder(rollout_status="masked", failure_reason="judge_unparseable"),
+                placeholder(failure_reason="http_500"),
+                placeholder(),
+            ],
+        ]
         # Placeholders have no turns (and no completion ids): they pop no records.
         ledger = {
             first.completion_ids[0]: _ledger_record(5),
@@ -1572,12 +1664,26 @@ class TestRLUtils:
         # in completed_epochs, no fake 0-length turn for all-placeholder groups.
         assert stats.completed_epochs == [[5, 6], []]
         assert stats.turn_lens == [[3, 4], []]
-        # Rewards keep the placeholder zeros (they shape the GRPO baseline).
+        # Rewards keep the placeholder zeros: the lists stay rectangular for
+        # alignment; GRPO normalization masks them by num_turns downstream.
         assert stats.rewards == [[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]]
+        # Which the advantages reflect: both real rollouts earned 1.0, so with
+        # the placeholder masked there is no contrast left in the group.
+        assert stats.advantages == [0.0, 0.0]
+        # Adapter stamps pass through; bare empties are inferred to 'placeholder'.
+        assert stats.rollout_statuses == [
+            ["ok", "ok", "placeholder"],
+            ["masked", "placeholder", "placeholder"],
+        ]
+        assert stats.failure_reasons == [
+            [None, None, None],
+            ["judge_unparseable", "http_500", None],
+        ]
 
         # End to end: the placeholder rows never reach the staleness metrics.
+        writer = MagicMock()
         metrics = rl_utils.prep_wandb_metrics(
-            MagicMock(),
+            writer,
             stats.traj_lens,
             stats.turn_lens,
             stats.rewards,
@@ -1588,6 +1694,8 @@ class TestRLUtils:
             completed_epochs=stats.completed_epochs,
             num_evictions=stats.num_evictions,
             current_iteration=7,
+            rollout_statuses=stats.rollout_statuses,
+            failure_reasons=stats.failure_reasons,
         )
         assert metrics["max_policy_staleness"] == 2  # 7 - 5, not a placeholder sentinel
         assert metrics["min_traj_length"] == 3
@@ -1595,6 +1703,31 @@ class TestRLUtils:
         assert metrics["mean_completion_gap"] == np.mean([2, 1])
         assert metrics["failed_rollouts/count"] == 4
         assert np.isclose(metrics["failed_rollouts/ratio"], 4 / 6)
+        # GRPO-facing reward views mask the placeholders; raw delivery keeps them.
+        assert metrics["valid_mean_reward"] == 1.0
+        assert np.isclose(metrics["mean_reward"], 1 / 3)
+        group_rows = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["group_means", "group_stds"]
+        ][0].kwargs["data"]
+        assert group_rows == [[1.0, 0.0], [0.0, 0.0]]
+        # The stamped taxonomy decomposes the structural zero-turn count.
+        assert metrics["rollout/count"] == 6
+        assert metrics["rollout/ok_count"] == 2
+        assert metrics["rollout/placeholder_count"] == 3
+        assert metrics["rollout/masked_count"] == 1
+        assert metrics["rollout/graded_count"] == 0
+        assert (
+            metrics["rollout/placeholder_count"] + metrics["rollout/masked_count"]
+            == metrics["failed_rollouts/count"]
+        )
+        reason_rows = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["failure_reason", "count", "rate"]
+        ][0].kwargs["data"]
+        assert reason_rows == [["http_500", 1, 1 / 6], ["judge_unparseable", 1, 1 / 6]]
 
     def test_request_ledger_join(self):
         """compute_group_stats joins finished-request records to rollouts by each
@@ -1680,7 +1813,7 @@ class TestRLUtils:
         rollout_table = next(
             c for c in writer.Table.call_args_list if "traj_length" in c.kwargs.get("columns", [])
         )
-        assert rollout_table.kwargs["data"] == [(1.0, 3, 2, 2, 2, 1, 1)]
+        assert rollout_table.kwargs["data"] == [(1.0, 3, 2, 2, 2, 1, 1, 'ok')]
 
         # A window where nothing joined emits no staleness/eviction metrics at all.
         metrics = rl_utils.prep_wandb_metrics(
