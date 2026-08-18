@@ -1,8 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import json
 from unittest.mock import MagicMock
 
-import json
 import numpy as np
 import pytest
 import torch
@@ -595,10 +595,7 @@ class TestBuildTokenizer:
     def test_build_sp_tokenizer(self):
         tokenizer_model = "/opt/data/tokenizers/sentencepiece/tokenizer.model"
         chat_template = get_chat_template()
-        metadata_path = {
-            "library": "sentencepiece",
-            "chat_template": chat_template,
-        }
+        metadata_path = {"library": "sentencepiece", "chat_template": chat_template}
 
         config = TokenizerConfig(
             tokenizer_type="SentencePieceTokenizer",
