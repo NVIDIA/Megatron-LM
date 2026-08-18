@@ -367,7 +367,7 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                 pg_collection = getattr(unwrap_model(module), 'pg_collection', None)
                 assert (
                     pg_collection is not None
-                ), f"Module '{module_name}' must own a ProcessGroupCollection before optimizer setup"
+                ), f"Module '{module_name}' must own a ProcessGroupCollection for optimizer setup"
                 assert (
                     not hasattr(module, 'ddp_config')
                     or module.ddp_config is None
