@@ -370,6 +370,23 @@ class MambaSlotAllocator:
         mamba_indices = self.context.mamba_metadata.request_to_mamba_state_idx[
             req_tensor_cpu
         ].tolist()
+        # ReplaySSM: the live SSM state is a lazy checkpoint that may lag behind the
+        # ring buffer during decode. EOS-state saves, however, only ever happen for
+        # requests that just finished prefill (see compute_and_store_offsets), whose
+        # ring is empty (write_pos == 0) — so the live state is exact here. Enforce
+        # that assumption loudly: if this path ever starts saving decode-phase
+        # states, the save must first fold the ring into the state (after the
+        # step's commit, never between the forward pass and the commit).
+        if getattr(self.context, "mamba_replay_ssm", False):
+            _slots = [m for m in mamba_indices if m >= 0]
+            if _slots:
+                _wp = self.context.mamba_replay_write_pos[
+                    torch.tensor(_slots, dtype=torch.long, device=device)
+                ]
+                assert not bool((_wp != 0).any().item()), (
+                    "ReplaySSM: EOS-state save for a slot with a non-empty ring "
+                    "buffer; the live SSM state is stale and must be flushed first."
+                )
         mamba_idx_tensor = torch.tensor(mamba_indices, dtype=torch.int64, device=device)
         # Fancy-indexed copy (2 kernel launches instead of 2E)
         self.conv_states[:, slot_tensor] = self.context.mamba_conv_states[:, mamba_idx_tensor]

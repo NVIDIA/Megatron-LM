@@ -389,6 +389,38 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self._async_sched_token_offsets = None
 
+        # Intermediate (rollback) buffers checkpoint the state after every verification
+        # window position (the guaranteed-accepted free token + the drafted tokens).
+        self.num_mamba_intermediate_states = self.num_speculative_tokens + 1
+
+        # ReplaySSM: keep the live SSM state as a
+        # checkpoint plus a per-(layer, slot) circular ring buffer of cached post-conv inputs
+        # (x|B packed, raw dt). Verification outputs are computed directly from the checkpoint
+        # and the cached inputs (no intermediate SSM states at all); the checkpoint is
+        # re-materialized only on (early-)flush steps; speculative rollback is a device-side
+        # ring-pointer move. Only affects the SSM state; the conv intermediate machinery is
+        # unchanged. Inert when num_speculative_tokens == 0.
+        self.mamba_replay_ssm = (
+            inference_config.mamba_replay_ssm and self.num_speculative_tokens > 0
+        )
+        if self.mamba_replay_ssm:
+            # W = verification-window length (guaranteed bonus token + drafts).
+            self.mamba_replay_window = self.num_speculative_tokens + 1
+            # B = committed-history buffer length (config).
+            self.mamba_replay_buffer_len = inference_config.mamba_replay_buffer_len
+            assert self.mamba_replay_buffer_len >= self.mamba_replay_window, (
+                f"mamba_replay_buffer_len ({self.mamba_replay_buffer_len}) must be >= "
+                f"1 + num_speculative_tokens ({self.mamba_replay_window})"
+            )
+            # L = logical flush threshold; the physical ring is the next power of two.
+            self.mamba_replay_flush_threshold = (
+                self.mamba_replay_buffer_len + self.mamba_replay_window
+            )
+            self.mamba_replay_cache_buf_len = 1 << (
+                self.mamba_replay_flush_threshold - 1
+            ).bit_length()
+            self.mamba_replay_block_spec = 1 << (self.mamba_replay_window - 1).bit_length()
+
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
         # Otherwise:
@@ -508,21 +540,53 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
-            mamba_states_memory_per_request += (
+            _nheads, _headdim, _dstate = self.mamba_ssm_states_shape
+            if self.mamba_replay_ssm:
+                # Infer the (TP-local) number of SSM groups from the conv/ssm shapes
+                # (only the ReplaySSM buffers/kernels need it):
+                #   conv_dim = d_inner + 2*ngroups*d_state, with d_inner = nheads*headdim.
+                _bc = self.mamba_conv_states_shape[0] - _nheads * _headdim
+                assert _bc > 0 and _bc % (2 * _dstate) == 0, (
+                    f"mamba_replay_ssm cannot infer ngroups from "
+                    f"conv_dim={self.mamba_conv_states_shape[0]}, "
+                    f"nheads={_nheads}, headdim={_headdim}, dstate={_dstate}"
+                )
+                self.mamba_ngroups_local = _bc // (2 * _dstate)
+                assert _nheads % self.mamba_ngroups_local == 0
+                self.mamba_nheads_per_group = _nheads // self.mamba_ngroups_local
+
+            conv_bytes_per_layer = (
                 math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
             )
-            mamba_states_memory_per_request += (
+            ssm_bytes_per_layer = (
                 math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
             )
-            mamba_states_memory_per_request *= self.num_mamba_layers
+            mamba_states_memory_per_request += (
+                conv_bytes_per_layer + ssm_bytes_per_layer
+            ) * self.num_mamba_layers
             if self.num_speculative_tokens > 0:
-                # Add memory for intermediate conv and SSM states
+                # Conv intermediate (checkpointed full conv windows).
                 intermediate_memory_per_request = (
-                    math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
-                    + math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
+                    conv_bytes_per_layer
+                    * self.num_mamba_layers
+                    * self.num_mamba_intermediate_states
                 )
-                intermediate_memory_per_request *= self.num_mamba_layers
-                intermediate_memory_per_request *= self.num_speculative_tokens + 1
+                if self.mamba_replay_ssm:
+                    # ReplaySSM ring buffers instead of SSM intermediates: post-conv x|B
+                    # cache (conv-state precision) + raw-dt cache (fp32) per ring slot.
+                    _buf = self.mamba_replay_cache_buf_len
+                    _cache_conv_dim = _nheads * _headdim + self.mamba_ngroups_local * _dstate
+                    _replay_bytes = (
+                        _buf * _cache_conv_dim * self.mamba_conv_states_dtype.itemsize
+                        + _nheads * _buf * 4
+                    )
+                    intermediate_memory_per_request += _replay_bytes * self.num_mamba_layers
+                else:
+                    intermediate_memory_per_request += (
+                        ssm_bytes_per_layer
+                        * self.num_mamba_layers
+                        * self.num_mamba_intermediate_states
+                    )
                 mamba_states_memory_per_request += intermediate_memory_per_request
 
         # Unified memory and general tensor management.
@@ -886,11 +950,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             ]
 
             if self.num_speculative_tokens > 0:
-                spec_multiplier = self.num_speculative_tokens + 1
-                spec_bytes_per_req = mamba_bytes_per_req * spec_multiplier
+                conv_int_bytes = mamba_conv_bytes * self.num_mamba_intermediate_states
+                if self.mamba_replay_ssm:
+                    _ne, _he, _ds = self.mamba_ssm_states_shape
+                    _rb = (
+                        self.mamba_replay_cache_buf_len
+                        * (_ne * _he + self.mamba_ngroups_local * _ds)
+                        * self.mamba_conv_states_dtype.itemsize
+                        + _ne * self.mamba_replay_cache_buf_len * 4
+                    )
+                    ssm_int_bytes = _rb * self.num_mamba_layers
+                    spec_label = (
+                        f"ReplaySSM ring buffers, buf={self.mamba_replay_cache_buf_len}"
+                    )
+                else:
+                    ssm_int_bytes = mamba_ssm_bytes * self.num_mamba_intermediate_states
+                    spec_label = "full intermediate states"
+                spec_bytes_per_req = conv_int_bytes + ssm_int_bytes
                 spec_total_bytes = spec_bytes_per_req * self.max_requests
                 log_lines += [
-                    f"  Mamba speculative buffers (num_speculative_tokens={self.num_speculative_tokens}):",
+                    f"  Mamba speculative buffers ({spec_label}, "
+                    f"num_speculative_tokens={self.num_speculative_tokens}):",
                     f"    per_request:           {get_mem_size_str(spec_bytes_per_req)}",
                     f"    total ({self.max_requests} requests):  {get_mem_size_str(spec_total_bytes)}",
                 ]
@@ -1004,22 +1084,78 @@ class DynamicInferenceContext(BaseInferenceContext):
                     (
                         self.num_mamba_layers,
                         self.max_requests,
-                        self.num_speculative_tokens + 1,
+                        self.num_mamba_intermediate_states,
                         *self.mamba_conv_states_shape,
                     ),
                     dtype=self.mamba_conv_states_dtype,
                     device=torch.cuda.current_device(),
                 )
-                self.mamba_intermediate_ssm_states = torch.empty(
-                    (
-                        self.num_mamba_layers,
-                        self.max_requests,
-                        self.num_speculative_tokens + 1,
-                        *self.mamba_ssm_states_shape,
-                    ),
-                    dtype=self.mamba_ssm_states_dtype,
-                    device=torch.cuda.current_device(),
-                )
+                if self.mamba_replay_ssm:
+                    # ReplaySSM: circular ring buffers of cached SSM inputs replace the
+                    # intermediate SSM state buffer entirely. The live mamba_ssm_states
+                    # tensor becomes the checkpoint (stale between flush steps).
+                    nheads, headdim, dstate = self.mamba_ssm_states_shape
+                    d_inner = nheads * headdim
+                    cache_conv_dim = d_inner + self.mamba_ngroups_local * dstate
+                    buf = self.mamba_replay_cache_buf_len
+                    device = torch.cuda.current_device()
+                    # Circular post-conv input cache (packed x|B; C is never cached —
+                    # the kernels read it fresh from the current step's conv output).
+                    self.mamba_replay_conv_cache = torch.zeros(
+                        (self.num_mamba_layers, self.max_requests, buf, cache_conv_dim),
+                        dtype=self.mamba_conv_states_dtype,
+                        device=device,
+                    )
+                    # Raw-dt cache (fp32; dt_bias + softplus are applied on read).
+                    self.mamba_replay_dt_cache = torch.zeros(
+                        (self.num_mamba_layers, self.max_requests, nheads, buf),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    # Slot-keyed ring cursors, shared across all Mamba layers (every
+                    # layer commits the same tokens). Advanced only by the commit
+                    # kernel; reset in _execute_pending_mamba_ops.
+                    self.mamba_replay_write_pos = torch.zeros(
+                        (self.max_requests,), dtype=torch.int32, device=device
+                    )
+                    self.mamba_replay_origin = torch.zeros(
+                        (self.max_requests,), dtype=torch.int32, device=device
+                    )
+                    self.mamba_replay_is_flush = torch.zeros(
+                        (self.max_requests,), dtype=torch.int8, device=device
+                    )
+                    # Per-step scratch for the precomputed B·C inner products (fixed
+                    # address for CUDA graphs; rewritten by every layer within a step).
+                    self.mamba_replay_bc_pre = torch.zeros(
+                        (
+                            self.max_requests,
+                            self.mamba_ngroups_local,
+                            buf,
+                            self.mamba_replay_block_spec,
+                        ),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    # Fixed query_start_loc: every decode request occupies exactly W
+                    # (window) tokens in the packed decode token stream.
+                    self.mamba_replay_qsl = torch.arange(
+                        0,
+                        (self.max_requests + 1) * self.mamba_replay_window,
+                        self.mamba_replay_window,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                else:
+                    self.mamba_intermediate_ssm_states = torch.empty(
+                        (
+                            self.num_mamba_layers,
+                            self.max_requests,
+                            self.num_mamba_intermediate_states,
+                            *self.mamba_ssm_states_shape,
+                        ),
+                        dtype=self.mamba_ssm_states_dtype,
+                        device=torch.cuda.current_device(),
+                    )
             if (
                 self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
                 and not self._uses_torch_memory_saver
@@ -1040,12 +1176,25 @@ class DynamicInferenceContext(BaseInferenceContext):
                             self.mamba_intermediate_conv_states, device="cpu"
                         ).pin_memory()
                     )
-                    self._offloadable_tensor_names.add("mamba_intermediate_ssm_states")
-                    self._offloadable_cpu_backups["mamba_intermediate_ssm_states"] = (
-                        torch.empty_like(
-                            self.mamba_intermediate_ssm_states, device="cpu"
-                        ).pin_memory()
-                    )
+                    if self.mamba_replay_ssm:
+                        for _rname in (
+                            "mamba_replay_conv_cache",
+                            "mamba_replay_dt_cache",
+                            "mamba_replay_write_pos",
+                            "mamba_replay_origin",
+                            "mamba_replay_is_flush",
+                        ):
+                            self._offloadable_tensor_names.add(_rname)
+                            self._offloadable_cpu_backups[_rname] = torch.empty_like(
+                                getattr(self, _rname), device="cpu"
+                            ).pin_memory()
+                    else:
+                        self._offloadable_tensor_names.add("mamba_intermediate_ssm_states")
+                        self._offloadable_cpu_backups["mamba_intermediate_ssm_states"] = (
+                            torch.empty_like(
+                                self.mamba_intermediate_ssm_states, device="cpu"
+                            ).pin_memory()
+                        )
         else:
             self.mamba_metadata = None
 
@@ -1787,12 +1936,29 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_layer_number = self.layer_map[layer_number - 1]
         if intermediate:
             conv_state = self.mamba_intermediate_conv_states[mamba_layer_number]
-            ssm_state = self.mamba_intermediate_ssm_states[mamba_layer_number]
+            # In ReplaySSM mode there is no full intermediate SSM buffer.
+            ssm_state = (
+                None
+                if self.mamba_replay_ssm
+                else self.mamba_intermediate_ssm_states[mamba_layer_number]
+            )
         else:
             conv_state = self.mamba_conv_states[mamba_layer_number]
             ssm_state = self.mamba_ssm_states[mamba_layer_number]
 
         return (conv_state, ssm_state)
+
+    def mamba_replay_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
+        """Returns the per-layer ReplaySSM ring buffers `(post_conv_cache, dt_cache)`.
+
+        Only valid when `mamba_replay_ssm` is enabled.
+        """
+        assert self.is_hybrid_model and self.mamba_replay_ssm
+        mamba_layer_number = self.layer_map[layer_number - 1]
+        return (
+            self.mamba_replay_conv_cache[mamba_layer_number],
+            self.mamba_replay_dt_cache[mamba_layer_number],
+        )
 
     # =========================================================================
     # Mamba prefix cache infrastructure
@@ -2275,10 +2441,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_query_lengths[0:N],
             )
 
-            # 5. Mamba state: allocate slots for dummy requests.
-            self.mamba_metadata.request_to_mamba_state_idx[0:N] = (
-                self.mamba_metadata.batch_allocate_slots(N)
-            )
+            # 5. Mamba state: allocate slots for dummy requests. Queue them for
+            # zeroing like every other allocation site so the deferred Mamba ops
+            # (state zeroing + ReplaySSM cursor reset) treat them uniformly.
+            _dummy_slots = self.mamba_metadata.batch_allocate_slots(N)
+            self.mamba_metadata.request_to_mamba_state_idx[0:N] = _dummy_slots
+            self._pending_mamba_zeros.extend(_dummy_slots.tolist())
 
     def initialize_attention_state(
         self,
@@ -2572,6 +2740,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         if not (self._pending_mamba_restores or self._pending_mamba_zeros):
             return
+
+        # ReplaySSM: any slot that is (re)initialized — zeroed for a new request or
+        # restored from the prefix cache — starts with an empty ring buffer. The
+        # restored/zeroed state is the checkpoint; cursors must reset with it.
+        if self.mamba_replay_ssm:
+            _reset_slots = [m for _, _, m in self._pending_mamba_restores]
+            _reset_slots += list(self._pending_mamba_zeros)
+            if _reset_slots:
+                _idx = torch.tensor(
+                    _reset_slots, dtype=torch.long, device=self.mamba_replay_write_pos.device
+                )
+                self.mamba_replay_write_pos[_idx] = 0
+                self.mamba_replay_origin[_idx] = 0
+                self.mamba_replay_is_flush[_idx] = 0
 
         # Restore cached Mamba state to live buffers.  On failure, fall back to zeroing.
         for request_idx, block_id, mamba_idx in self._pending_mamba_restores:
