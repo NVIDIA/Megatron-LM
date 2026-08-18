@@ -1905,3 +1905,33 @@ class TestFusedThdAllToAll:
         back = self._batched_a2a_hp2cp(mid, cu, self.cp_group)
 
         assert torch.equal(back, local_t), "Batched cp2hp -> hp2cp not identity"
+
+
+def test_deterministic_mode_covers_every_nondeterministic_kernel():
+    """deterministic_mode must not leave a Triton kernel in the GDN forward path.
+
+    Regression guard. deterministic_mode swapped `gated_delta_rule` for its torch version but
+    left the q/k L2 norm as fla's Triton kernel. torch.use_deterministic_algorithms cannot see
+    inside Triton, so every determinism check in the training script passed while training was
+    not reproducible run to run: on one node, one session, the unfixed path deviated in 7 of 7
+    repeats and the fixed one in 0 of 11 (Fisher p~3e-5), by ~1e-4, growing to 1.6e-02 over 20
+    iterations.
+
+    This asserts the source text rather than running the layer, because building a GDN module
+    needs a process group and the point is only that no `l2norm(` call survives outside a
+    deterministic_mode branch -- a cheap check that fails loudly if someone reintroduces one.
+    """
+    import inspect
+
+    from megatron.core.ssm import gated_delta_net as gdn
+
+    fn = getattr(gdn, "_prepare_qkv_for_gated_delta_rule", None)
+    if fn is None:
+        fn = gdn.GatedDeltaNet._prepare_qkv_for_gated_delta_rule
+    src = inspect.getsource(fn)
+    assert "l2norm(" in src, "test is stale: the q/k L2 norm call moved or was renamed"
+    assert "deterministic_mode" in src, (
+        "the q/k L2 norm no longer consults deterministic_mode: fla's Triton l2norm is back on "
+        "the deterministic path, which makes training irreproducible while every "
+        "validate_deterministic() check still passes"
+    )

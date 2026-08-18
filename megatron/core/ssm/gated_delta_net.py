@@ -962,7 +962,23 @@ class GatedDeltaNet(MegatronModule):
 
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+            # deterministic_mode must cover this step too. It swaps gated_delta_rule for its
+            # torch implementation but historically left this one as fla's Triton kernel, and
+            # torch.use_deterministic_algorithms cannot see inside Triton -- so the whole
+            # determinism checklist passed while training stayed irreproducible run to run.
+            # Measured on one node in one session: with the Triton kernel the deviation appeared
+            # in 7 of 7 repeats (~1e-4, growing to 1.6e-02 over 20 iterations); with the torch
+            # implementation, 0 of 14 across two nodes (Fisher p~3e-5). The deviation reaches
+            # the scan present in q and k while v and beta are bit-identical, which is the
+            # signature of this step alone.
+            _pre_l2 = query_key.contiguous()
+            if self.config.deterministic_mode:
+                _f = _pre_l2.float()
+                query_key = (_f * torch.rsqrt(_f.pow(2).sum(-1, keepdim=True).clamp(min=1e-12))).to(
+                    _pre_l2.dtype
+                )
+            else:
+                query_key = l2norm(_pre_l2)
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size_headwise
