@@ -27,6 +27,43 @@ _SERVER_PROCESSES: List[mp.Process] = []
 _SHARED_SOCKET = None
 
 
+def build_app(client, tokenizer, parsers: Optional[List[str]] = None, verbose: bool = False):
+    """Build the OpenAI-compatible Quart app around an already-started client.
+
+    Split out from _run_text_gen_server so the HTTP layer can be exercised
+    against a test client without binding a socket or forking replicas.
+
+    Args:
+        client: An InferenceClient (or any object with the same add_request /
+            add_request_streaming interface).
+        tokenizer: Tokenizer used for prompt tokenization and detokenization.
+        parsers: Optional list of tool/reasoning parser names.
+        verbose: Whether endpoints should log per-batch timing.
+
+    Returns:
+        Quart: The configured app with every endpoint blueprint registered.
+    """
+    if not HAS_BACKEND:
+        raise RuntimeError("Web backend framework (Quart) not available")
+
+    app = Quart(__name__)
+
+    # Quart native way to handle max body size (1 GB; needed for large prompts)
+    app.config['MAX_CONTENT_LENGTH'] = 2**30
+
+    # Store client and tokenizer in app config for Blueprints to use
+    app.config['client'] = client
+    app.config['tokenizer'] = tokenizer
+    app.config['parsers'] = parsers
+    app.config['verbose'] = verbose
+
+    # Register all blueprints from the 'endpoints' package
+    for endpoint in endpoints.__all__:
+        app.register_blueprint(endpoint)
+
+    return app
+
+
 @contextmanager
 def temp_log_level(level, logger=None):
     """Enables temporarily overriding the logging level."""
@@ -70,20 +107,7 @@ async def _run_text_gen_server(
                 logger.warning(f"Could not get hostname: {e}")
                 hostname = "0.0.0.0"
 
-        app = Quart(__name__)
-
-        # Quart native way to handle max body size (1 GB; needed for large prompts)
-        app.config['MAX_CONTENT_LENGTH'] = 2**30
-
-        # Store client and tokenizer in app config for Blueprints to use
-        app.config['client'] = inference_client
-        app.config['tokenizer'] = tokenizer
-        app.config['parsers'] = parsers
-        app.config['verbose'] = verbose
-
-        # Register all blueprints from the 'endpoints' package
-        for endpoint in endpoints.__all__:
-            app.register_blueprint(endpoint)
+        app = build_app(inference_client, tokenizer, parsers, verbose)
 
         config = Config()
         config.keep_alive_timeout = 30.0  # Keep connection alive between long-running requests.

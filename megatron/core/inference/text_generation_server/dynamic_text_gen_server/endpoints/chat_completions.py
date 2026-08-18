@@ -14,6 +14,7 @@ from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import StreamingChatParser, openai_stream
+from .common import openai_error
 
 logger = logging.getLogger(__name__)
 
@@ -465,9 +466,9 @@ try:
             chat_template_kwargs = {}
         # --- 1. Parse Messages ---
         if not messages:
-            return Response("Missing 'messages' field", status=400)
+            return openai_error("Missing 'messages' field", 400, param="messages")
         if not isinstance(messages, list):
-            return Response("'messages' must be a list", status=400)
+            return openai_error("'messages' must be a list", 400, param="messages")
         template_messages = _sanitize_messages_for_template(messages)
         template_tools = _sanitize_tools_for_template(tools)
 
@@ -565,7 +566,7 @@ try:
                 )
         except Exception as e:
             logger.error(f"{traceback.format_exc()}")
-            return Response(f"Error processing 'messages': {e}", status=500)
+            return openai_error(f"Error processing 'messages': {e}", 500)
 
         # --- 2. Parse Sampling Params ---
         try:
@@ -625,7 +626,7 @@ try:
                 streaming_interval=int(_get_non_none(req, "streaming_interval", 1)),
             )
         except ValueError as e:
-            return Response(f"Invalid sampling parameter: {e}", status=400)
+            return openai_error(f"Invalid sampling parameter: {e}", 400)
 
         # --- 3. Send Requests to Engine ---
         stream_requested = bool(req.get("stream", False))
@@ -637,7 +638,7 @@ try:
                     for _ in range(n)
                 ]
             except ValueError as error:
-                return Response(str(error), status=400)
+                return openai_error(str(error), 400, param="stream")
 
             streams = [
                 client.add_request_streaming(prompt_tokens, sampling_params) for _ in range(n)
@@ -701,7 +702,7 @@ try:
             batch_results = await asyncio.gather(*tasks)
         except Exception as e:
             logger.error(f"Error during inference: {e}")
-            return Response(f"Error during inference: {e}", status=500)
+            return openai_error(f"Error during inference: {e}", 500)
 
         if current_app.config['verbose']:
             logging.info(
@@ -733,15 +734,17 @@ try:
             logger.error(f"Inference request(s) failed: {error_detail}")
 
             # NOTE: This exact string is required for compatibility with Nemo-RL, DO NOT MODIFY.
+            # It is preserved verbatim, now as the `error.message` of the OpenAI error
+            # envelope rather than the whole body.
             if "MaxSequenceLengthOverflowError" in error_detail:
                 error_msg = (
                     f"This model's maximum context length was exceeded. "
                     f"Your messages resulted in {len(prompt_tokens)} tokens. "
                     f"Please reduce the length of the messages. {error_detail}"
                 )
-                return Response(error_msg, status=400)
+                return openai_error(error_msg, 400, code="context_length_exceeded")
 
-            return Response(f"Inference request(s) failed: {error_detail}", status=status)
+            return openai_error(f"Inference request(s) failed: {error_detail}", status)
 
         # --- 5. Format OpenAI Response ---
         choices = []
@@ -771,7 +774,7 @@ try:
 
             logprobs_content = None
             if sampling_params.return_log_probs:
-                token_logprobs = result.get('log_probs', [])
+                token_logprobs = result.get('generated_log_probs') or []
 
                 tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
                 tokens = list(map(tokenizer.detokenize, tokens_to_decode))

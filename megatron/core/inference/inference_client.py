@@ -9,6 +9,7 @@ from typing import List, Optional, Union
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.wire_metrics import WireMetrics
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 from .headers import Headers
@@ -51,6 +52,8 @@ class InferenceClient:
         next_request_id (int): A counter for generating unique request IDs.
         listener_task (asyncio.Task): The background task that listens for
             completed requests.
+        wire_metrics (WireMetrics): Per-header message and byte counters for
+            everything this client puts on or takes off the socket.
     """
 
     def __init__(self, inference_coordinator_address: str, deserialize: bool = False):
@@ -87,6 +90,7 @@ class InferenceClient:
         self.next_request_id = 0
         self.streams: dict[int, AsyncStream[dict]] = {}
         self.aborted_request_ids: set[int] = set()
+        self.wire_metrics = WireMetrics()
 
     def add_request(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
@@ -207,8 +211,7 @@ class InferenceClient:
         if future is not None and not future.done():
             future.cancel()
         self.request_submission_times.pop(request_id, None)
-        payload = [Headers.ABORT_REQUEST.value, request_id]
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self._send([Headers.ABORT_REQUEST.value, request_id])
 
     def add_request_streaming(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
@@ -241,9 +244,30 @@ class InferenceClient:
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
         return self._submit_stream(payload, request_id)
 
+    def _send(self, payload: list) -> int:
+        """Pack a payload, send it to the coordinator, and account for its size.
+
+        Every message this client sends goes through here so that wire_metrics
+        sees all of them.
+
+        Args:
+            payload: The message as a list whose first element is the header value.
+
+        Returns:
+            int: The number of serialized payload bytes sent.
+        """
+        serialized = msgpack.packb(payload, use_bin_type=True)
+        self.socket.send(serialized)
+        self.wire_metrics.record_sent(payload[0], len(serialized))
+        return len(serialized)
+
+    def get_wire_metrics(self) -> dict:
+        """Return a snapshot of this client's message and byte counters."""
+        return self.wire_metrics.snapshot()
+
     def _submit_request(self, payload: list, request_id: int) -> asyncio.Future:
         """Send a prepared request and register its completion future."""
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self._send(payload)
         assert request_id not in self.completion_futures
         future = asyncio.get_running_loop().create_future()
         self.completion_futures[request_id] = future
@@ -252,7 +276,7 @@ class InferenceClient:
 
     def _submit_stream(self, payload: list, request_id: int) -> AsyncStream[dict]:
         """Send a prepared streaming request and register its response stream."""
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self._send(payload)
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop
         )
@@ -275,7 +299,9 @@ class InferenceClient:
         """
         while True:
             try:
-                data = msgpack.unpackb(self.socket.recv(flags=zmq.NOBLOCK), raw=False)
+                serialized = self.socket.recv(flags=zmq.NOBLOCK)
+                data = msgpack.unpackb(serialized, raw=False)
+                self.wire_metrics.record_received(data[0], len(serialized))
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
                     request_id, reply = data[1:]
@@ -322,13 +348,14 @@ class InferenceClient:
         Sends a CONNECT signal and waits for a CONNECT_ACK reply to ensure the
         connection is established and acknowledged by the coordinator.
         """
-        payload = [Headers.CONNECT.value]
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self._send([Headers.CONNECT.value])
         if timeout_seconds is not None and not self.socket.poll(
             timeout=max(0, int(timeout_seconds * 1000))
         ):
             raise TimeoutError("Timed out connecting to the Megatron inference coordinator")
-        reply = msgpack.unpackb(self.socket.recv(), raw=False)
+        serialized = self.socket.recv()
+        reply = msgpack.unpackb(serialized, raw=False)
+        self.wire_metrics.record_received(reply[0], len(serialized))
         assert Headers(reply[0]) == Headers.CONNECT_ACK
 
     def start(
@@ -356,9 +383,7 @@ class InferenceClient:
             signal: The signal to send, typically a value from the `Headers` enum.
             *args: Optional extra values to include in the payload.
         """
-        payload = [signal.value, *args]
-        payload_serialized = msgpack.packb(payload, use_bin_type=True)
-        self.socket.send(payload_serialized)
+        self._send([signal.value, *args])
 
     def pause_engines(self):
         """Sends PAUSE to all engines via coordinator.

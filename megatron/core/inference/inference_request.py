@@ -471,6 +471,14 @@ class DynamicInferenceRequest(InferenceRequest):
             saved_prompt_tokens = self.prompt_tokens
             self.prompt_tokens = None
 
+        # remaining_prompt_tokens is chunked-prefill bookkeeping: engine-side
+        # scratch state no client reads, which __post_init__ re-derives from
+        # prompt_tokens on deserialize. Drop it unconditionally — it starts out as
+        # a copy of prompt_tokens, so leaving it in shipped the whole prompt on
+        # every reply and silently undid the optimization above.
+        saved_remaining_prompt_tokens = self.remaining_prompt_tokens
+        self.remaining_prompt_tokens = None
+
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
@@ -488,6 +496,7 @@ class DynamicInferenceRequest(InferenceRequest):
 
         if drop_prompt:
             self.prompt_tokens = saved_prompt_tokens
+        self.remaining_prompt_tokens = saved_remaining_prompt_tokens
 
         nvtx_range_pop("DynamicInferenceRequest.serialize")
         return obj

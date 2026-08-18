@@ -59,9 +59,7 @@ def handle_connect(coordinator, sender_identity, payload):
         return
 
     coordinator.known_clients.add(sender_identity)
-    coordinator.router_socket.send_multipart(
-        [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
-    )
+    coordinator._send_to_client(sender_identity, [Headers.CONNECT_ACK.value])
 
 
 @message_handler(Headers.SUBMIT_REQUEST)
@@ -111,7 +109,9 @@ def handle_submit_request(coordinator, sender_identity, payload):
     # Account for the fact that some engines may have died.
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
         next_identity = coordinator.get_best_data_parallel_rank(request_hashes)
-        if coordinator._send_to_engine(next_identity, engine_payload):
+        if coordinator._send_to_engine(
+            next_identity, engine_payload, header=Headers.SUBMIT_REQUEST.value
+        ):
             break
     else:
         # If all engines have died, we are in an abnormal state, and must exit cleanly.
@@ -175,7 +175,9 @@ def handle_submit_request_with_kv(coordinator, sender_identity, payload):
 
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
         next_identity = coordinator.get_least_loaded_data_parallel_rank()
-        if coordinator._send_to_engine(next_identity, engine_payload):
+        if coordinator._send_to_engine(
+            next_identity, engine_payload, header=Headers.SUBMIT_REQUEST_WITH_KV.value
+        ):
             break
     else:
         logging.error("Coordinator: no reachable engines for handoff request %d", request_id)
@@ -272,14 +274,8 @@ def handle_engine_reply(coordinator, sender_identity, payload):
                 assert coordinator._pending_counts[idx] >= 1
                 coordinator._pending_counts[idx] -= 1
 
-        coordinator.router_socket.send_multipart(
-            [
-                client_identity,
-                msgpack.packb(
-                    [Headers.ENGINE_REPLY.value, client_request_id, finished_request],
-                    use_bin_type=True,
-                ),
-            ]
+        coordinator._send_to_client(
+            client_identity, [Headers.ENGINE_REPLY.value, client_request_id, finished_request]
         )
 
 
@@ -297,14 +293,8 @@ def handle_engine_reply_partial(coordinator, sender_identity, payload):
         client_identity = coordinator.request_id_to_client_id[request_id]
         client_request_id = coordinator.request_id_to_client_request_id[request_id]
         # Partial tokens are detokenized incrementally by the client-facing streaming layer.
-        coordinator.router_socket.send_multipart(
-            [
-                client_identity,
-                msgpack.packb(
-                    [Headers.ENGINE_REPLY_PARTIAL.value, client_request_id, partial],
-                    use_bin_type=True,
-                ),
-            ]
+        coordinator._send_to_client(
+            client_identity, [Headers.ENGINE_REPLY_PARTIAL.value, client_request_id, partial]
         )
 
 
@@ -323,6 +313,7 @@ def handle_abort_request(coordinator, sender_identity, payload):
         coordinator._send_to_engine(
             assigned_rank,
             msgpack.packb([Headers.ABORT_REQUEST.value, request_id], use_bin_type=True),
+            header=Headers.ABORT_REQUEST.value,
         )
 
 
