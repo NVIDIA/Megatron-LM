@@ -18,8 +18,8 @@ cover the Megatron-side wiring only:
     eager, gradients flow, and the module falls back to the bitwise-identical eager
     path when the frontend is unavailable.
 
-Without a cudnn-frontend that provides ``cudnn.csa`` (or without CUDA / off compute
-capability 10.0) every test skips.
+Without a cudnn-frontend that provides ``cudnn.csa`` (or without CUDA / below
+compute-capability major 10) every kernel test skips.
 """
 
 from types import SimpleNamespace
@@ -53,7 +53,7 @@ def _require_fused():
             f"is not available: {cfc._frontend_error!r}"
         )
     if not cfc.fused_compressor_available():
-        pytest.skip("fused CSA compressor requires compute capability 10.0")
+        pytest.skip("fused CSA compressor requires compute-capability major >= 10 (SM100+)")
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +325,7 @@ class TestCompressorFusedIntegration:
 
     @pytest.fixture(scope='class', autouse=True)
     def class_environment(self, request):
-        # Skip (do not crash) on machines without CUDA / the frontend / CC 10.0 before
+        # Skip (do not crash) on machines without CUDA / the frontend / SM100+ before
         # touching model-parallel state.
         _require_fused()
 

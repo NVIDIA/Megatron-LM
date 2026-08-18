@@ -43,8 +43,8 @@ https://github.com/NVIDIA/Megatron-LM/issues/5968.
 Dispatch gating (everything else keeps eager):
   - the caller's ``use_fused_dsa_kernels(config)`` decision, i.e. the same switch that
     gates the other optional CSA/DSA fused kernels (``Compressor.use_fused_compressor``);
-  - cudnn-frontend with the CSA compressor API importable, CUDA device with compute
-    capability 10.0 (the frontend's validated envelope);
+  - cudnn-frontend with the CSA compressor API importable, CUDA device with
+    compute-capability major >= 10 (SM100+, the frontend's validated envelope);
   - ``compress_ratio in {4, 128}`` and ``coff in {1, 2}`` (the frontend's validated
     envelope; ``Compressor`` itself only produces ``(4, 2)`` and ``(128, 1)``), with
     ``compress_ratio == 128`` additionally restricted to ``head_dim in {128, 512}``
@@ -68,10 +68,11 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# The compute capability the frontend kernels are validated for (its ``check_support``
-# raises on anything else); the dispatch pre-filters so other devices keep eager
-# silently. Mirrors ``cudnn.csa.compressor``'s envelope — widen together with it.
-_SUPPORTED_COMPUTE_CAPABILITY = (10, 0)
+# The frontend kernels use no architecture-specific features beyond the SM100 baseline,
+# so admit SM100 and newer GPU families. The dispatch pre-filters older devices so they
+# keep eager silently. Mirrors ``cudnn.csa.compressor``'s envelope -- widen together
+# with it.
+_MINIMUM_COMPUTE_CAPABILITY_MAJOR = 10
 
 # Mirrors ``cudnn.csa.compressor``'s validated envelope: ``ratio in {4, 128}`` x
 # ``coff in {1, 2}``. ``Compressor`` currently only produces (4, 2) and (128, 1) --
@@ -127,8 +128,8 @@ def fused_compressor_available(device: Optional[torch.device] = None) -> bool:
     """Return True when the fused kernels can run: supported device + frontend importable.
 
     The device is checked first so the missing-frontend warning below is only emitted
-    where the kernels could actually have run (compute capability 10.0); on every other
-    device the eager path is the expected outcome, not a misconfiguration.
+    where the kernels could actually have run (compute-capability major >= 10); on every
+    other device the eager path is the expected outcome, not a misconfiguration.
     """
     try:
         if not torch.cuda.is_available():
@@ -143,7 +144,8 @@ def fused_compressor_available(device: Optional[torch.device] = None) -> bool:
         return False
     supported = _DEVICE_SUPPORTED_CACHE.get(index)
     if supported is None:
-        supported = torch.cuda.get_device_capability(index) == _SUPPORTED_COMPUTE_CAPABILITY
+        capability = torch.cuda.get_device_capability(index)
+        supported = capability[0] >= _MINIMUM_COMPUTE_CAPABILITY_MAJOR
         _DEVICE_SUPPORTED_CACHE[index] = supported
     if not supported:
         return False
