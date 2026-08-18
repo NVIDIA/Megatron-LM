@@ -1355,3 +1355,61 @@ class TestDSAHybridMatchesStandard:
         dense = SimpleNamespace(**vars(hybrid))
         dense.experimental_attention_variant = None
         assert corrected < num_floating_point_operations(dense, batch_size)
+
+
+class TestDSAHelperEdgeCases:
+    """Direct coverage of the helper guards and the hybrid MTP layer walk."""
+
+    def test_indexer_flops_zero_layers(self):
+        """No indexer layers (or missing dims) contribute nothing."""
+        from megatron.training.training import _lightning_indexer_flops
+
+        assert _lightning_indexer_flops(
+            hidden_size=512,
+            q_lora_rank=128,
+            n_heads=4,
+            head_dim=32,
+            num_indexer_layers=0,
+            key_proj_factor=1,
+            scoring_core_divisor=2,
+        ) == (0, 0)
+
+    def test_sparse_core_scale_degenerate_inputs(self):
+        """Zero tokens or an unset top-k fall back to the dense scale of 1.0."""
+        from megatron.training.training import _dsa_sparse_core_scale
+
+        assert _dsa_sparse_core_scale(0, 0, 2048) == 1.0
+        assert _dsa_sparse_core_scale(512, 512 * 4096, None) == 1.0
+
+    def test_hybrid_indexer_layer_walk_with_mtp(self):
+        """MTP 'D' layers are numbered past the main pattern, once per depth.
+
+        Pattern ``D-D-/D-`` with two MTP depths: main 'D's sit at global
+        positions 1 and 3; each MTP depth restarts at ``len(main) + 1 = 5``.
+        With ``freq=2, offset=1`` a layer computes when ``(L - 1) % 2 == 0``
+        (odd positions), so all six 'D' layers compute; with ``freq=4`` only
+        ``L in (1, 5)`` do -- main layer 1 plus the (identically numbered)
+        MTP layer in each of the two depths.
+        """
+        from megatron.training.training import _num_hybrid_dsa_indexer_layers
+
+        assert _num_hybrid_dsa_indexer_layers("D-D-/D-/D-", 1, 2) == 4
+        assert _num_hybrid_dsa_indexer_layers("D-D-/D-/D-", 1, 4) == 3
+
+    def test_config_requires_indexer_topk(self):
+        """An unset dsa_indexer_topk must fail at config time, not mid-run."""
+        from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+        kwargs = dict(
+            num_layers=4,
+            hidden_size=512,
+            num_attention_heads=8,
+            experimental_attention_variant="dsa",
+            add_bias_linear=False,
+            dsa_indexer_n_heads=4,
+            dsa_indexer_head_dim=32,
+        )
+        with pytest.raises(ValueError, match="dsa_indexer_topk must be set"):
+            MLATransformerConfig(**kwargs)
+        cfg = MLATransformerConfig(**kwargs, dsa_indexer_topk=16)
+        assert cfg.dsa_indexer_topk == 16
