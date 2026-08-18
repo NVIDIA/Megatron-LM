@@ -39,6 +39,9 @@ def ensure_mxfp8_scale_dtype(scale: torch.Tensor) -> torch.Tensor:
 
 
 MXFP8Backend = Literal["flashinfer", "triton"]
+MXFP8_BLOCK_SIZE = 32
+MXFP8_SCALE_ROW_BLOCK = 128
+MXFP8_SCALE_COL_BLOCK = 4
 
 
 def validate_mxfp8_tensor(
@@ -75,7 +78,11 @@ def validate_mxfp8_tensor(
         "triton": torch.float8_e8m0fnu,
     }.get(backend)
     if expected_scale_dtype is None:
-        raise ValueError(f"{tensor_name} has no valid MXFP8 backend; got {backend!r}.")
+        raise ValueError(
+            f"{tensor_name} has no valid MXFP8 backend; got {backend!r}. "
+            "Construct it via MXFP8Tensor.from_bf16(..., backend=...) or pass "
+            "backend= explicitly to MXFP8Tensor."
+        )
     if tensor.scale.dtype != expected_scale_dtype:
         raise TypeError(
             f"{tensor_name} scales for backend {backend!r} must use "
@@ -83,28 +90,46 @@ def validate_mxfp8_tensor(
         )
 
     rows, cols = tensor.data.shape
-    if cols % 32 != 0:
+    if cols % MXFP8_BLOCK_SIZE != 0:
         raise ValueError(
-            f"{tensor_name} K dimension must be divisible by the MXFP8 block size 32, "
+            f"{tensor_name} K dimension must be divisible by the MXFP8 block size "
+            f"{MXFP8_BLOCK_SIZE}, "
             f"got {cols}."
         )
-    padded_rows = _ceil_div(rows, 128) * 128
-    padded_scale_cols = _ceil_div(cols // 32, 4) * 4
-    expected_scale_elements = padded_rows * padded_scale_cols
-    if tensor.scale.numel() != expected_scale_elements:
+    scale_cols = cols // MXFP8_BLOCK_SIZE
+    if tensor.scale.ndim == 2:
+        expected_scale_shape = (rows, scale_cols)
+        if tuple(tensor.scale.shape) != expected_scale_shape:
+            raise ValueError(
+                f"{tensor_name} 2D scale has shape {tuple(tensor.scale.shape)}; "
+                f"expected {expected_scale_shape} for data shape {tuple(tensor.data.shape)}."
+            )
+    elif tensor.scale.ndim == 1:
+        padded_rows = _ceil_div(rows, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
+        padded_scale_cols = (
+            _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK) * MXFP8_SCALE_COL_BLOCK
+        )
+        expected_scale_elements = padded_rows * padded_scale_cols
+        if tensor.scale.numel() != expected_scale_elements:
+            raise ValueError(
+                f"{tensor_name} swizzled scale storage has {tensor.scale.numel()} elements; "
+                f"expected {expected_scale_elements} for data shape "
+                f"{tuple(tensor.data.shape)}."
+            )
+    else:
         raise ValueError(
-            f"{tensor_name} scale storage has {tensor.scale.numel()} elements; "
-            f"expected {expected_scale_elements} for data shape {tuple(tensor.data.shape)}."
+            f"{tensor_name} scale must be a 1D swizzled tensor or a 2D unswizzled "
+            f"tensor, got shape {tuple(tensor.scale.shape)}."
         )
 
 
 @dataclass
 class MXFP8Tensor:
-    """MXFP8 tensor wrapper storing quantized fp8_e4m3 data and swizzled e8m0 scales."""
+    """MXFP8 tensor wrapper storing quantized data and E8M0 scale bytes."""
 
     data: torch.Tensor  # [M, K] fp8_e4m3fn
-    scale: torch.Tensor  # 1D, swizzled cuBLAS blocked layout, e8m0
-    backend: Optional[MXFP8Backend] = None
+    scale: torch.Tensor  # 1D swizzled or [M, K // 32] unswizzled scales
+    backend: Optional[MXFP8Backend] = None  # quantization and GEMM storage contract
 
     def size(self, idx: Optional[int] = None):
         """Wrapper for calling self.data.size()"""

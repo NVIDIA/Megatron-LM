@@ -279,6 +279,33 @@ class TestMXFP8Tensor:
         with pytest.raises(TypeError, match="MXFP8 scales must use"):
             ensure_mxfp8_scale_dtype(torch.ones(16, dtype=torch.bfloat16))
 
+    def test_validate_unswizzled_2d_scale_geometry(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import (
+            MXFP8Tensor,
+            validate_mxfp8_tensor,
+        )
+
+        data = torch.empty((64, 128), dtype=torch.float8_e4m3fn, device="cuda")
+        scale = torch.empty((64, 4), dtype=torch.uint8, device="cuda")
+
+        validate_mxfp8_tensor(MXFP8Tensor(data, scale, backend="flashinfer"))
+
+        invalid = MXFP8Tensor(data, scale[:63], backend="flashinfer")
+        with pytest.raises(ValueError, match="2D scale has shape"):
+            validate_mxfp8_tensor(invalid)
+
+    def test_missing_backend_error_is_actionable(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import (
+            MXFP8Tensor,
+            validate_mxfp8_tensor,
+        )
+
+        data = torch.empty((128, 128), dtype=torch.float8_e4m3fn, device="cuda")
+        scale = torch.empty(512, dtype=torch.uint8, device="cuda")
+
+        with pytest.raises(ValueError, match="backend= explicitly"):
+            validate_mxfp8_tensor(MXFP8Tensor(data, scale))
+
     @pytest.mark.parametrize("M,K", [(16, 128), (64, 256), (128, 2688)])
     def test_from_bf16_triton(self, M, K):
         """The Triton backend produces correct data and scales."""
@@ -430,9 +457,8 @@ class TestSquaredReluAndQuantizeMxfp8:
     """Compare fused squared_relu + mxfp8 quantize against PyTorch reference.
 
     Reference: torch.relu(x.float()).pow(2).to(bf16) -> ref_to_mxfp -> ref_swizzle.
-    The fused kernel computes squared ReLU in fp32 and quantizes to MXFP8 in one pass,
-    so the PyTorch fp32 reference is the correct baseline (not the unfused Triton path
-    which has an intermediate bf16 roundtrip).
+    The fused kernel matches the BF16 materialization used by training and the
+    unfused inference path before quantizing to MXFP8.
     """
 
     @pytest.mark.parametrize(
@@ -653,15 +679,17 @@ class TestPermuteAndQuantizeMxfp8:
         assert result.backend == "triton"
         assert result.data.dtype == torch.float8_e4m3fn
 
-    def test_fixed_buffer_rows_match_swizzled_scale_padding(self):
+    @pytest.mark.parametrize("alignment", [64, 128])
+    def test_fixed_buffer_rows_match_swizzled_scale_padding(self, alignment):
         from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
 
         hidden, probs, routing_map = self._make_inputs(72, 2688, 6, 128)
         result, _, _, _ = permute_and_quantize_mxfp8(
-            hidden, probs, routing_map, 0, 64, _vt(72), alignment=128
+            hidden, probs, routing_map, 0, 64, _vt(72), alignment=alignment
         )
 
-        assert result.data.shape[0] == 8704
+        unaligned_rows = 72 * 6 + alignment * 64
+        assert result.data.shape[0] == ceil_div(unaligned_rows, 128) * 128
         assert result.scale_2d().shape[0] == result.data.shape[0]
 
     @pytest.mark.parametrize("alignment", [128])

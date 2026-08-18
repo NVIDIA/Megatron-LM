@@ -230,6 +230,7 @@ def _squared_relu_quantize_kernel(
                 # squared ReLU materializes a BF16 activation before the next
                 # MXFP8 quantization. Keeping the product in FP32 here changes
                 # quantization bins and compounds across MoE layers.
+                # Convert back to FP32 for the scale reduction and reciprocal.
                 activated = (relu * relu).to(tl.bfloat16).to(tl.float32)
 
                 # Per-group-of-32 quantization

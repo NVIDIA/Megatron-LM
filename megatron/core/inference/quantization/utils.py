@@ -4,7 +4,10 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.mxfp8_tensor import (
+    MXFP8Tensor,
+    validate_mxfp8_tensor,
+)
 
 try:
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor as TEMXFP8Tensor
@@ -193,10 +196,18 @@ def quantize_params_to_mxfp8(
 
             if fqn in persistent_buffers:
                 # Subsequent call: copy into existing tensors to preserve addresses
+                persistent_tensor = persistent_buffers[fqn]
+                validate_mxfp8_tensor(
+                    persistent_tensor,
+                    expected_backend=backend,
+                    tensor_name=f"persistent MXFP8 parameter {fqn!r}",
+                )
                 new_tensor = MXFP8Tensor.from_bf16(bf16_data, backend=backend)
-                persistent_buffers[fqn].data.copy_(new_tensor.data)
-                persistent_buffers[fqn].scale.copy_(new_tensor.scale)
-                mcore_tensor = persistent_buffers[fqn]
+                persistent_tensor.data.copy_(new_tensor.data)
+                persistent_tensor.scale.view(torch.uint8).copy_(
+                    new_tensor.scale.view(torch.uint8)
+                )
+                mcore_tensor = persistent_tensor
             else:
                 # First call: create new MXFP8Tensor
                 mcore_tensor = MXFP8Tensor.from_bf16(bf16_data, backend=backend)

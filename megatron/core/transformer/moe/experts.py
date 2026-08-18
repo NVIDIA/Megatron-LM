@@ -23,7 +23,11 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, ensure_mxfp8_scale_dtype
+from megatron.core.inference.quantization.mxfp8_tensor import (
+    MXFP8Tensor,
+    ensure_mxfp8_scale_dtype,
+    validate_mxfp8_tensor,
+)
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -1054,6 +1058,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return McoreActivationType.SWIGLU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
 
+    @torch.inference_mode(False)
     def _build_concatenated_mxfp8_weights(self):
         """Build stacked MXFP8 weight tensors from per-expert MXFP8Tensor attributes.
 
@@ -1084,6 +1089,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
                         f"Expected MXFP8Tensor for {linear_name}.weight{i}, "
                         f"got {type(w).__name__}. Was quantize_model_to_mxfp8 called?"
                     )
+                validate_mxfp8_tensor(
+                    mxfp8,
+                    expected_backend="triton",
+                    tensor_name=f"{linear_name}.weight{i}",
+                )
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
@@ -1106,11 +1116,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 if isinstance(w, MXFP8Tensor):
                     w.data = stacked_data[i]
                     w.scale = stacked_scale[i]
-                    w.backend = "triton"
                 elif hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor):
                     w.data.data = stacked_data[i]
                     w.data.scale = stacked_scale[i]
-                    w.data.backend = "triton"
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):

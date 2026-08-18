@@ -254,7 +254,7 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     If the *target_model* uses an inference-optimized layer spec with MXFP8,
     this function:
       1. Computes which params are eligible for MXFP8 conversion.
-      2. Quantizes the target model's decoder weights to FlashInfer MXFP8Tensor
+      2. Quantizes the target model's decoder weights to MXFP8Tensor
          (creating persistent buffers whose addresses are later captured by
          CUDA graphs).
       3. Builds an ``MXFP8ReshardTransform`` and attaches it to ``plan.transform``.
@@ -279,7 +279,9 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
             convertible.add(f"decoder.{name}")
 
     # 2. Quantize decoder weights → persistent MXFP8Tensor buffers.
-    persistent_buffers = quantize_params_to_mxfp8(decoder)
+    # MXFP8 inference is supported by the torch grouped-GEMM path, whose
+    # persistent buffers require the Triton quantizer's E8M0 storage contract.
+    persistent_buffers = quantize_params_to_mxfp8(decoder, backend="triton")
 
     # 3. Build the transform and attach it to the plan.
     plan.transform = MXFP8ReshardTransform(

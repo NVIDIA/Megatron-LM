@@ -13,6 +13,7 @@ import torch
 
 from megatron.core.fp8_utils import dequantize_fp8_tensor, is_mxfp8tensor
 from megatron.core.inference.quantization.mxfp8_tensor import (
+    MXFP8Backend,
     MXFP8Tensor,
     ensure_mxfp8_scale_dtype,
     validate_mxfp8_tensor,
@@ -114,6 +115,15 @@ def _ensure_sendable(param: torch.Tensor) -> torch.Tensor:
     return param.data
 
 
+def _require_mxfp8_backend(
+    backend: MXFP8Backend | None, tensor_name: str
+) -> MXFP8Backend:
+    """Return a configured MXFP8 backend or raise an actionable error."""
+    if backend is None:
+        raise ValueError(f"{tensor_name} has no MXFP8 backend.")
+    return backend
+
+
 class MXFP8ReshardTransform(ReshardTransform):
     """MXFP8 format-conversion transform for reshard.
 
@@ -156,6 +166,8 @@ class MXFP8ReshardTransform(ReshardTransform):
         convert_on_send: if True, convert BF16 → MXFP8 on the sender and
             transmit two tensors (data + scale).  If False (default),
             transmit BF16 and convert on the receiver in ``finalize_recv``.
+        backend: backend storage contract for sender-side conversion. It is
+            inferred from persistent buffers on the receiver.
     """
 
     def __init__(
@@ -164,13 +176,32 @@ class MXFP8ReshardTransform(ReshardTransform):
         persistent_buffers: dict,
         buffer_key_prefix: str = "",
         convert_on_send: bool = False,
+        backend: MXFP8Backend | None = None,
     ):
         self.convertible_params = convertible_params
         self.persistent_buffers = persistent_buffers
         self.buffer_key_prefix = buffer_key_prefix
         self.convert_on_send = convert_on_send
-        for name, buffer in persistent_buffers.items():
-            validate_mxfp8_tensor(buffer, tensor_name=f"persistent refit buffer {name!r}")
+        self.backend = backend
+        buffer_backends: set[MXFP8Backend] = set()
+        for name, buffer in self.persistent_buffers.items():
+            validate_mxfp8_tensor(
+                buffer,
+                expected_backend=backend,
+                tensor_name=f"persistent refit buffer {name!r}",
+            )
+            buffer_backends.add(
+                _require_mxfp8_backend(buffer.backend, f"persistent refit buffer {name!r}")
+            )
+        if len(buffer_backends) > 1:
+            raise ValueError(
+                "All persistent MXFP8 refit buffers must use the same backend; "
+                f"got {sorted(buffer_backends)}."
+            )
+        if self.backend is None and buffer_backends:
+            self.backend = next(iter(buffer_backends))
+        if self.convert_on_send:
+            _require_mxfp8_backend(self.backend, "MXFP8 sender-side conversion")
         # Accumulation buffers for 1D-scale params that arrive in partial slices.
         # The 1D swizzled FlashInfer scale can't be updated partially; we collect
         # all BF16 slices here and quantize the full weight once it's assembled.
@@ -185,9 +216,9 @@ class MXFP8ReshardTransform(ReshardTransform):
     def prepare_send(self, param_name, src_slice, src_param):
         src_data = _ensure_sendable(src_param)
         if self.convert_on_send:
-
             bf16_data = src_data[src_slice].contiguous().to(torch.bfloat16)
-            mxfp8 = MXFP8Tensor.from_bf16(bf16_data)
+            backend = _require_mxfp8_backend(self.backend, "MXFP8 sender-side conversion")
+            mxfp8 = MXFP8Tensor.from_bf16(bf16_data, backend=backend)
             return [mxfp8.data.contiguous(), mxfp8.scale.contiguous()]
         else:
             # BF16 on the wire — same as the default reshard path.
@@ -266,7 +297,10 @@ class MXFP8ReshardTransform(ReshardTransform):
                         f"1D-scale param {param_name!r}: received {written} elements, "
                         f"expected {buf.data.numel()} (duplicate or missing slices?)"
                     )
-                mxfp8 = MXFP8Tensor.from_bf16(accum)
+                backend = _require_mxfp8_backend(
+                    buf.backend, f"Persistent MXFP8 buffer {buf_key!r}"
+                )
+                mxfp8 = MXFP8Tensor.from_bf16(accum, backend=backend)
                 buf.data.copy_(mxfp8.data)
                 buf.scale.view(torch.uint8).copy_(mxfp8.scale.view(torch.uint8))
                 del self._pending_1d[buf_key]
@@ -275,9 +309,10 @@ class MXFP8ReshardTransform(ReshardTransform):
         else:
             # 2D scale: each scale row covers exactly one data row, so partial
             # row-wise updates are independent and can be applied immediately.
-            mxfp8 = MXFP8Tensor.from_bf16(recv_buffers[0])
+            backend = _require_mxfp8_backend(
+                buf.backend, f"Persistent MXFP8 buffer {buf_key!r}"
+            )
+            mxfp8 = MXFP8Tensor.from_bf16(recv_buffers[0], backend=backend)
             buf.data[dst_slice].copy_(mxfp8.data)
             scale_slice = _scale_slice_from_data_slice(dst_slice)
             buf.scale[scale_slice].view(torch.uint8).copy_(mxfp8.scale.view(torch.uint8))
-
-        validate_mxfp8_tensor(buf, tensor_name=f"refitted parameter {param_name!r}")

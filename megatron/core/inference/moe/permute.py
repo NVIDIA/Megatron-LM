@@ -656,7 +656,10 @@ def permute_and_quantize_mxfp8(
         - permutation_map: [output_size] int32, original token index or -1 for padding
         - inclusive_offsets: [num_local_experts] int32 cumulative offsets for scaled_grouped_mm
     """
-    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+    from megatron.core.inference.quantization.mxfp8_tensor import (
+        MXFP8_SCALE_ROW_BLOCK,
+        MXFP8Tensor,
+    )
 
     max_tokens, K = hidden_states.shape
     topk = probs.shape[1]
@@ -677,11 +680,13 @@ def permute_and_quantize_mxfp8(
     unaligned_output_size = (
         max_tokens * min(topk, num_local_experts) + alignment * num_local_experts
     )
-    # Keep data rows consistent with the swizzled scale layout's row padding.
-    output_size = _ceil_div(unaligned_output_size, alignment) * alignment
+    # Keep data rows consistent with the swizzled scale layout's fixed row block.
+    output_size = (
+        _ceil_div(unaligned_output_size, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
+    )
 
     scale_cols = K // 32
-    n_row_blocks = _ceil_div(output_size, 128)
+    n_row_blocks = _ceil_div(output_size, MXFP8_SCALE_ROW_BLOCK)
     n_col_blocks = _ceil_div(scale_cols, 4)
     total_scale_bytes = n_row_blocks * n_col_blocks * 512
 
