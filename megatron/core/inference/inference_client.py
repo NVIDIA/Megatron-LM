@@ -17,6 +17,7 @@ from megatron.core.inference.inference_request import (
     split_multimodal_data,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.wire_metrics import WireMetrics
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 from .headers import Headers
@@ -59,6 +60,8 @@ class InferenceClient:
         next_request_id (int): A counter for generating unique request IDs.
         listener_task (asyncio.Task): The background task that listens for
             completed requests.
+        wire_metrics (WireMetrics): Per-header message and byte counters for
+            everything this client puts on or takes off the socket.
     """
 
     def __init__(
@@ -108,6 +111,7 @@ class InferenceClient:
         self.aborted_request_ids: set[int] = set()
         self.block_size_tokens = block_size_tokens
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
+        self.wire_metrics = WireMetrics()
 
     def _block_hashes(self, prompt, media_meta):
         """Hash the prompt into per-block routing hashes for the coordinator.
@@ -341,7 +345,9 @@ class InferenceClient:
         request_id, frames = self._make_kv_handoff_request(
             prompt, sampling_params, kv_meta, src_block_ids
         )
-        return self._submit_request(frames, request_id)
+        return self._submit_request(
+            frames, request_id, header=Headers.SUBMIT_REQUEST_WITH_KV.value
+        )
 
     def add_request_with_kv_handoff_streaming(
         self,
@@ -368,7 +374,9 @@ class InferenceClient:
         request_id, frames = self._make_kv_handoff_request(
             prompt, sampling_params, kv_meta, src_block_ids
         )
-        return self._submit_stream(frames, request_id)
+        return self._submit_stream(
+            frames, request_id, header=Headers.SUBMIT_REQUEST_WITH_KV.value
+        )
 
     def release_handoff(self, request_id: int) -> None:
         """Tell the coordinator to release the KV blocks pinned for `request_id`.
@@ -376,8 +384,7 @@ class InferenceClient:
         Fire-and-forget. The coordinator broadcasts RELEASE_KV to every engine;
         engines without that request_id ignore the message.
         """
-        payload = [Headers.RELEASE_KV.value, int(request_id)]
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self._send([Headers.RELEASE_KV.value, int(request_id)])
 
     def abort_request(self, request_id: int) -> None:
         """Cancel an in-flight request and close its local response stream."""
@@ -399,8 +406,7 @@ class InferenceClient:
         if future is not None and not future.done():
             future.cancel()
         self.request_submission_times.pop(request_id, None)
-        payload = [Headers.ABORT_REQUEST.value, request_id]
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self._send([Headers.ABORT_REQUEST.value, request_id])
 
     def add_request_streaming(
         self,
@@ -448,18 +454,48 @@ class InferenceClient:
         frames = self._pack_submit_frames(request_id, prompt, sampling_params, multi_modal_data)
         return self._submit_stream(frames, request_id)
 
-    def _submit_request(self, frames: list, request_id: int) -> asyncio.Future:
-        """Send a prepared request and register its completion future."""
+    def _send(self, payload: list) -> int:
+        """Pack a payload, send it to the coordinator, and account for its size.
+
+        Every message this client sends goes through here so that wire_metrics
+        sees all of them.
+
+        Args:
+            payload: The message as a list whose first element is the header value.
+
+        Returns:
+            int: The number of serialized payload bytes sent.
+        """
+        serialized = msgpack.packb(payload, use_bin_type=True)
+        return self._send_frames([serialized], payload[0])
+
+    def _send_frames(self, frames: list, header) -> int:
+        """Send prepared frames and account for their combined payload size."""
         self.socket.send_multipart(frames)
+        num_bytes = sum(map(len, frames))
+        self.wire_metrics.record_sent(header, num_bytes)
+        return num_bytes
+
+    def get_wire_metrics(self) -> dict:
+        """Return a snapshot of this client's message and byte counters."""
+        return self.wire_metrics.snapshot()
+
+    def _submit_request(
+        self, frames: list, request_id: int, header=Headers.SUBMIT_REQUEST.value
+    ) -> asyncio.Future:
+        """Send a prepared request and register its completion future."""
+        self._send_frames(frames, header)
         assert request_id not in self.completion_futures
         future = asyncio.get_running_loop().create_future()
         self.completion_futures[request_id] = future
         self.request_submission_times[request_id] = time.perf_counter()
         return future
 
-    def _submit_stream(self, frames: list, request_id: int) -> AsyncStream[dict]:
+    def _submit_stream(
+        self, frames: list, request_id: int, header=Headers.SUBMIT_REQUEST.value
+    ) -> AsyncStream[dict]:
         """Send a prepared streaming request and register its response stream."""
-        self.socket.send_multipart(frames)
+        self._send_frames(frames, header)
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop
         )
@@ -485,6 +521,7 @@ class InferenceClient:
                 # frames[0] is metadata; a reply body, when present, follows it.
                 frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
                 data = msgpack.unpackb(frames[0], raw=False)
+                self.wire_metrics.record_received(data[0], sum(map(len, frames)))
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
                     request_id = data[1]
@@ -532,13 +569,14 @@ class InferenceClient:
         Sends a CONNECT signal and waits for a CONNECT_ACK reply to ensure the
         connection is established and acknowledged by the coordinator.
         """
-        payload = [Headers.CONNECT.value]
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self._send([Headers.CONNECT.value])
         if timeout_seconds is not None and not self.socket.poll(
             timeout=max(0, int(timeout_seconds * 1000))
         ):
             raise TimeoutError("Timed out connecting to the Megatron inference coordinator")
-        reply = msgpack.unpackb(self.socket.recv_multipart()[0], raw=False)
+        frames = self.socket.recv_multipart()
+        reply = msgpack.unpackb(frames[0], raw=False)
+        self.wire_metrics.record_received(reply[0], sum(map(len, frames)))
         assert Headers(reply[0]) == Headers.CONNECT_ACK
 
     def start(
@@ -566,9 +604,7 @@ class InferenceClient:
             signal: The signal to send, typically a value from the `Headers` enum.
             *args: Optional extra values to include in the payload.
         """
-        payload = [signal.value, *args]
-        payload_serialized = msgpack.packb(payload, use_bin_type=True)
-        self.socket.send(payload_serialized)
+        self._send([signal.value, *args])
 
     def pause_engines(self):
         """Sends PAUSE to all engines via coordinator.

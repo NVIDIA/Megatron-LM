@@ -35,7 +35,7 @@ from ..openai_streaming import (
     json_safe_top_n_logprobs,
     openai_stream,
 )
-from .common import abort_requests
+from .common import abort_requests, openai_error
 
 logger = logging.getLogger(__name__)
 
@@ -767,9 +767,9 @@ try:
         chat_template_kwargs = _sanitize_chat_template_kwargs(req.get("chat_template_kwargs"))
         # --- 1. Parse Messages ---
         if not messages:
-            return Response("Missing 'messages' field", status=400)
+            return openai_error("Missing 'messages' field", 400, param="messages")
         if not isinstance(messages, list):
-            return Response("'messages' must be a list", status=400)
+            return openai_error("'messages' must be a list", 400, param="messages")
         prompt_config = current_app.config['multimodal_prompt_config']
         # Extract structured media before template sanitization. Remote image
         # fetches block, so keep this work off the event loop.
@@ -778,7 +778,7 @@ try:
                 _extract_multimodal_from_messages, messages, prompt_config
             )
         except ValueError as error:
-            return Response(str(error), status=400)
+            return openai_error(str(error), 400, param="messages")
         multi_modal_data = None
         if image_bytes_list:
             multi_modal_data = {"image": image_bytes_list}
@@ -960,10 +960,10 @@ try:
                 )
         except ValueError as e:
             logger.error(f"{traceback.format_exc()}")
-            return Response(f"Invalid 'messages': {e}", status=400)
+            return openai_error(f"Invalid 'messages': {e}", 400, param="messages")
         except Exception as e:
             logger.error(f"{traceback.format_exc()}")
-            return Response(f"Error processing 'messages': {e}", status=500)
+            return openai_error(f"Error processing 'messages': {e}", 500)
 
         # --- 2. Parse Sampling Params ---
         try:
@@ -1035,7 +1035,7 @@ try:
                 detokenize_generations=False,
             )
         except ValueError as e:
-            return Response(f"Invalid sampling parameter: {e}", status=400)
+            return openai_error(f"Invalid sampling parameter: {e}", 400)
 
         # --- 3. Send Requests to Engine ---
         # TODO(perf): with n > 1, the same ``image_bytes_list`` is forwarded n
@@ -1056,7 +1056,7 @@ try:
                     for _ in range(n)
                 ]
             except ValueError as error:
-                return Response(str(error), status=400)
+                return openai_error(str(error), 400, param="stream")
 
             streams = [
                 client.add_request_streaming(
@@ -1153,7 +1153,7 @@ try:
             raise
         except Exception as e:
             logger.error(f"Error during inference: {e}")
-            return Response(f"Error during inference: {e}", status=500)
+            return openai_error(f"Error during inference: {e}", 500)
 
         if current_app.config['verbose']:
             logging.info(
@@ -1185,15 +1185,17 @@ try:
             logger.error(f"Inference request(s) failed: {error_detail}")
 
             # NOTE: This exact string is required for compatibility with Nemo-RL, DO NOT MODIFY.
+            # It is preserved verbatim, now as the `error.message` of the OpenAI error
+            # envelope rather than the whole body.
             if "MaxSequenceLengthOverflowError" in error_detail:
                 error_msg = (
                     f"This model's maximum context length was exceeded. "
                     f"Your messages resulted in {len(prompt_tokens)} tokens. "
                     f"Please reduce the length of the messages. {error_detail}"
                 )
-                return Response(error_msg, status=400)
+                return openai_error(error_msg, 400, code="context_length_exceeded")
 
-            return Response(f"Inference request(s) failed: {error_detail}", status=status)
+            return openai_error(f"Inference request(s) failed: {error_detail}", status)
 
         # --- 5. Format OpenAI Response ---
         choices = []
@@ -1227,7 +1229,7 @@ try:
 
             logprobs_content = None
             if sampling_params.return_log_probs:
-                token_logprobs = json_safe_logprobs(result.get('log_probs') or [])
+                token_logprobs = json_safe_logprobs(result.get('generated_log_probs') or [])
 
                 tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
                 tokens = list(map(tokenizer.detokenize, tokens_to_decode))

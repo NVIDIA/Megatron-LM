@@ -10,7 +10,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import json_safe_logprobs, json_safe_top_n_logprobs, openai_stream
-from .common import abort_requests
+from .common import abort_requests, openai_error
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +29,12 @@ try:
 
         req = await request.get_json(force=True)
         if req is None:
-            return "Invalid or missing JSON body", 400
+            return openai_error("Invalid or missing JSON body", 400)
 
         # --- 1. Parse Prompt ---
         prompt_data = req.get("prompt")
         if not prompt_data:
-            return "Missing 'prompt' field", 400
+            return openai_error("Missing 'prompt' field", 400, param="prompt")
 
         try:
             if isinstance(prompt_data, str):
@@ -42,7 +42,7 @@ try:
                 prompts_as_strings = [prompt_data]
             elif isinstance(prompt_data, list):
                 if not prompt_data:
-                    return "'prompt' list is empty", 400
+                    return openai_error("'prompt' list is empty", 400, param="prompt")
                 if all(isinstance(p, str) for p in prompt_data):
                     prompts_as_tokens = [tokenizer.tokenize(p) for p in prompt_data]
                     prompts_as_strings = prompt_data
@@ -55,17 +55,18 @@ try:
                     prompts_as_tokens = prompt_data
                     prompts_as_strings = [tokenizer.detokenize(p) for p in prompt_data]
                 else:
-                    return (
-                        (
-                            "Invalid 'prompt' format. Must be str, list[str], "
-                            "list[int], or list[list[int]]"
-                        ),
+                    return openai_error(
+                        "Invalid 'prompt' format. Must be str, list[str], "
+                        "list[int], or list[list[int]]",
                         400,
+                        param="prompt",
                     )
             else:
-                return "Invalid 'prompt' type. Must be str or list", 400
+                return openai_error(
+                    "Invalid 'prompt' type. Must be str or list", 400, param="prompt"
+                )
         except Exception as e:
-            return f"Error tokenizing prompt: {e}", 500
+            return openai_error(f"Error tokenizing prompt: {e}", 500)
 
         # --- 2. Parse Sampling Params ---
         try:
@@ -149,7 +150,7 @@ try:
                 streaming_interval=int(req.get("streaming_interval", 1)),
             )
         except ValueError as e:
-            return f"Invalid sampling parameter: {e}", 400
+            return openai_error(f"Invalid sampling parameter: {e}", 400)
 
         # --- 3. Send Requests to Engine ---
         stream_requested = bool(req.get("stream", False))
@@ -162,7 +163,7 @@ try:
                     for prompt_tokens in prompts_as_tokens
                 ]
             except ValueError as error:
-                return str(error), 400
+                return openai_error(str(error), 400, param="stream")
 
         tasks = []
         # Populated on the non-streaming path only; the streaming path aborts
@@ -248,7 +249,7 @@ try:
             abort_requests(client, request_ids, "client disconnected")
             raise
         except Exception as e:
-            return f"Error during inference: {e}", 500
+            return openai_error(f"Error during inference: {e}", 500)
 
         if current_app.config['verbose']:
             logging.info(
@@ -278,7 +279,7 @@ try:
             error_detail = "; ".join(failed_errors)
             status = 400 if has_nontransient_error else 500
             logger.error(f"Inference request(s) failed: {error_detail}")
-            return f"Inference request(s) failed: {error_detail}", status
+            return openai_error(f"Inference request(s) failed: {error_detail}", status)
 
         # --- 5. Format Response (matching old_completions.py) ---
         choices = []
@@ -351,13 +352,16 @@ try:
                     # When echo=False, only return generated tokens and their logprobs
                     tokens = [tokenizer.detokenize([tok]) for tok in generated_tokens_list]
 
-                    # Prepend [None] to match OpenAI format
-                    token_logprobs = [None] + list(generated_log_probs)
+                    # No leading None here: that slot exists only for the prompt's
+                    # first token, which has no logprob, and the prompt is returned
+                    # solely when echo=True. Every generated token has a logprob, so
+                    # these must align 1:1 with `tokens` and `text_offset`.
+                    token_logprobs = list(generated_log_probs)
 
                     # Build top_logprobs
                     top_logprobs = None
                     if generated_top_n_logprobs:
-                        top_logprobs = [None] + list(generated_top_n_logprobs)
+                        top_logprobs = list(generated_top_n_logprobs)
 
                     # Calculate text_offset for generated tokens only
                     text_offset = []
