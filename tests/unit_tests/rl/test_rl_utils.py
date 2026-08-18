@@ -238,30 +238,28 @@ class TestRLUtils:
         assert not hasattr(args, "rl_parallel_generation_tasks")
 
     @pytest.mark.parametrize(
-        "rl_partial_rollouts, submission_granularity",
+        "submission_granularity",
         [
-            pytest.param(False, "B", id="non_streaming_batch"),
-            pytest.param(True, "B", id="streaming_batch"),
-            pytest.param(True, "G", id="streaming_group"),
-            pytest.param(True, "R", id="streaming_rollout"),
+            pytest.param("B", id="batch"),
+            pytest.param("G", id="group"),
+            pytest.param("R", id="rollout"),
         ],
     )
     def test_get_rollout_generator_keeps_num_groups_at_trainer_batch_size(
-        self, monkeypatch, rl_partial_rollouts, submission_granularity
+        self, monkeypatch, submission_granularity
     ):
         """Regression for the removed ``num_groups=1`` streaming override.
 
         Previously ``get_rollout_generator`` forced ``num_groups`` to 1 whenever it
         streamed with a non-batch submission granularity, collapsing the per-env
-        group layout so some environments received zero groups (now a loud
-        ``ValueError`` from ``rollout_allocations``). ``num_groups`` must stay at
-        the trainer batch size (``n_prompts``) regardless of streaming or
+        group layout so some environments received zero groups. ``num_groups``
+        must stay at the trainer batch size (``n_prompts``) regardless of
         submission granularity.
         """
         n_prompts = 8
         captured = {}
         rollout_generator = object()
-        agent = object()
+        agent = MagicMock()
 
         class FakePipeline:
             def __init__(self, agent, request, parallel_generation_tasks):
@@ -283,7 +281,6 @@ class TestRLUtils:
             ReturnsRaw(),
             n_prompts,
             4,
-            streaming=rl_partial_rollouts,
             generation_args={'temperature': 1.0, 'max_tokens': 128, 'top_p': 1.0, 'top_k': 0},
             filter_groups_with_same_reward=False,
             submission_granularity=submission_granularity,
@@ -295,7 +292,6 @@ class TestRLUtils:
         assert result is rollout_generator
         assert captured["agent"] is agent
         assert captured["request"].num_groups == n_prompts
-        assert captured["request"].streaming == rl_partial_rollouts
         # The gate depth handed to the pipeline is lag + 1 trainer batches,
         # independent of submission granularity.
         assert captured["parallel_generation_tasks"] == generation_lag + 1
@@ -331,8 +327,13 @@ class TestRLUtils:
             ),
             pytest.param(
                 {"rl_submission_granularity": "R"},
-                "Rollout submission granularity requires streaming grouped rollouts",
+                "--rl-submission-granularity R requires --rl-partial-rollouts",
                 id="rollout_submission_requires_partial_rollouts",
+            ),
+            pytest.param(
+                {"rl_submission_granularity": "G", "rl_consumption_granularity": "G"},
+                "--rl-submission-granularity G requires --rl-partial-rollouts",
+                id="group_submission_requires_partial_rollouts",
             ),
             pytest.param(
                 {"rl_consumption_granularity": "R"},

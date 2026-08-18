@@ -89,7 +89,7 @@ class _GranularityConfig(NamedTuple):
 
         Args:
             request: Grouped rollout request to check.
-            num_groups_per_env: Proposed per-env group layout.
+            num_groups_per_env: Constant per-env group layout.
         """
         assert (
             GRANULARITY_RANK[request.consumption_granularity]
@@ -231,10 +231,6 @@ class RolloutPipeline:
         self.num_infer_workers = self.gate.capacity * (
             rollouts_per_batch // self.gran_policy.units_per_batch()
         )
-        if not request.streaming:
-            self.num_infer_workers = min(
-                self.num_infer_workers, request.num_groups * request.rollouts_per_group
-            )
 
         # Core queues.
         self.infer_queue = asyncio_Queue()
@@ -292,15 +288,10 @@ class RolloutPipeline:
                 ),
                 None,
             )
-            expected_end = (
-                not self.request.streaming
-                and self.yielded_count == self.request.num_groups
-            )
-            if failure is not None or not expected_end:
-                raise RuntimeError(
-                    "RolloutPipeline output stream ended: a pipeline stage died"
-                    + ("" if failure is not None else " (no stage exception was recovered)")
-                ) from failure
+            raise RuntimeError(
+                "RolloutPipeline output stream ended: a pipeline stage died"
+                + ("" if failure is not None else " (no stage exception was recovered)")
+            ) from failure
         finally:
             regen_tasks = tuple(self._regen_tasks)
             for task in (*tasks, *regen_tasks):
@@ -335,17 +326,38 @@ class RolloutPipeline:
         if self._prepare_done and self._groups_in_flight <= 0:
             self.infer_queue.shutdown()
 
+    def assert_no_inflight_rollouts(self) -> None:
+        """Verify no rollouts are buffered or in-flight at an iteration boundary for lag=0."""
+        buffered = {
+            "infer_queue": self.infer_queue.qsize(),
+            "assemble_queue": self.assemble_queue.qsize(),
+            "output_queue": self.output_queue.qsize(),
+            "assemble_pending": sum(len(items) for items in self._assemble_pending.values()),
+            "consume_pending": sum(len(groups) for groups in self._consume_pending.values()),
+            "regen_pending": sum(1 for task in self._regen_tasks if not task.done()),
+        }
+        assert not any(buffered.values()), (
+            f"The rollout pipeline has buffered rollouts at iteration boundary: {buffered}. "
+            "The generator has run ahead under a stale policy."
+        )
+        # Filtered groups consume prepared rollouts without ever being yielded.
+        in_flight = self.prepared_count - (
+            (self.yielded_count + self.filtered_count) * self.request.rollouts_per_group
+        )
+        assert in_flight == 0, (
+            f"The rollout pipeline prepared {self.prepared_count} rollout(s) but yielded "
+            f"{self.yielded_count} and filtered {self.filtered_count} group(s) of "
+            f"{self.request.rollouts_per_group}; "
+            f"{in_flight} rollout(s) in flight at iteration boundary."
+        )
+
     async def stage_prepare(self) -> None:
         """Generate gated inference work items."""
-        assert (
-            self.request.streaming
-            or self.request.num_groups % self.gran_policy.num_groups_per_batch == 0
-        ), "non-streaming requires num_groups to be a multiple of num_groups_per_batch"
         group_id = 0
+        batch_id = 0
         try:
-            while self.request.streaming or group_id < self.request.num_groups:
+            while True:
                 await self.gate.acquire_for("B")
-                batch_id = group_id // self.gran_policy.num_groups_per_batch
 
                 for index_in_batch in range(self.gran_policy.num_groups_per_batch):
                     await self.gate.acquire_for("G")
@@ -354,6 +366,7 @@ class RolloutPipeline:
                         group_id=group_id, batch_id=batch_id, index_in_batch=index_in_batch
                     )
                     group_id += 1
+                batch_id += 1
         except BaseException:
             self.infer_queue.shutdown()
             raise

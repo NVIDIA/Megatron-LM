@@ -660,7 +660,6 @@ def get_rollout_generator(
     n_prompts: int,
     samples_per_group: int,
     *,
-    streaming: bool,
     generation_args: dict[str, Any],
     filter_groups_with_same_reward: bool,
     submission_granularity: SubmissionGranularity,
@@ -674,10 +673,9 @@ def get_rollout_generator(
         The async iterator produced by RolloutPipeline.run().
     """
     global _ROLLOUT_GENERATOR, _ROLLOUT_PIPELINE
-    if not streaming or _ROLLOUT_GENERATOR is None:
+    if _ROLLOUT_GENERATOR is None:
         request = GroupedRolloutRequest(
             num_groups=n_prompts,
-            streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
             generation_args=generation_args,
@@ -768,7 +766,6 @@ def get_environment_rollouts(
                     inference_interface,
                     n_prompts,
                     samples_per_group,
-                    streaming=args.rl_partial_rollouts,
                     generation_args={
                         'temperature': args.rl_default_temperature,
                         'max_tokens': args.inference_max_seq_length,
@@ -799,12 +796,7 @@ def get_environment_rollouts(
                     if torch.are_deterministic_algorithms_enabled():
                         rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
                     if not args.rl_partial_rollouts:
-                        while True:
-                            try:
-                                loop.run_until_complete(anext(rollout_generator))
-                                assert False, "Unexpected group left in generator."
-                            except StopAsyncIteration:
-                                break
+                        _ROLLOUT_PIPELINE.assert_no_inflight_rollouts()
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
@@ -1660,7 +1652,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
     """Snapshot pipeline instrumentation into wandb-loggable scalars.
 
     Reads the RolloutPipeline held by get_rollout_generator: queue sizes, gate state,
-    per-stage dwell times, and rate counters, plus per-env group counters for multi-env agents.
+    per-stage dwell times, and rate counters, plus per-env group counters.
 
     Returns:
         Metric name -> value dict; empty when no pipeline exists yet.
@@ -1668,7 +1660,6 @@ def _collect_rollout_pipeline_metrics() -> dict:
     if _ROLLOUT_PIPELINE is None:
         return {}
     pipeline = _ROLLOUT_PIPELINE
-    dist = getattr(pipeline.agent, "latest_distribution", None)
     metrics: dict = {}
     gate = pipeline.gate
     metrics.update({
@@ -1706,23 +1697,23 @@ def _collect_rollout_pipeline_metrics() -> dict:
             metrics[f"rollout_pipeline_max_{name}_s"] = float(arr.max())
             metrics[f"rollout_pipeline_p50_{name}_s"] = float(np.percentile(arr, 50))
             metrics[f"rollout_pipeline_p99_{name}_s"] = float(np.percentile(arr, 99))
-    # Per-env group counters, mapped from env_index to env_id via the multi-env layout.
-    if dist:
-        active_env_ids = [
-            env_id
-            for env_id, groups in zip(dist["env_ids"], dist["agent_groups"])
-            if groups > 0
-        ]
-        for env_index, env_id in enumerate(active_env_ids):
-            metrics[f"{env_id}_prepared_groups"] = (
-                pipeline.prepared_groups_per_env[env_index]
-            )
-            metrics[f"{env_id}_assembled_groups"] = (
-                pipeline.assembled_groups_per_env[env_index]
-            )
-            metrics[f"{env_id}_yielded_groups"] = (
-                pipeline.yielded_groups_per_env[env_index]
-            )
+    # Per-env metrics, in env layout order (the pipeline arrays are env-indexed;
+    # weighted env_ids are unique by construction).
+    for env_index, allocation in enumerate(pipeline.allocations):
+        metrics[f"{allocation.env_id}_prepared_groups"] = (
+            pipeline.prepared_groups_per_env[env_index]
+        )
+        metrics[f"{allocation.env_id}_assembled_groups"] = (
+            pipeline.assembled_groups_per_env[env_index]
+        )
+        metrics[f"{allocation.env_id}_yielded_groups"] = (
+            pipeline.yielded_groups_per_env[env_index]
+        )
+        metrics[f"{allocation.env_id}_agent_groups"] = allocation.num_groups
+        # The realized weight: the constant share of each batch the env actually owns.
+        metrics[f"{allocation.env_id}_weight"] = (
+            allocation.num_groups / pipeline.request.num_groups
+        )
     # Reset accumulators; queue sizes and gate held are point-in-time.
     pipeline.infer_queue_dwell = []
     pipeline.engine_dwell = []
@@ -1733,23 +1724,14 @@ def _collect_rollout_pipeline_metrics() -> dict:
     pipeline.assembled_count = 0
     pipeline.filtered_count = 0
     pipeline.yielded_count = 0
-    pipeline.prepared_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
-    pipeline.assembled_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
-    pipeline.yielded_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
+    num_envs = len(pipeline.gran_policy.num_groups_per_env)
+    pipeline.prepared_groups_per_env = [0] * num_envs
+    pipeline.assembled_groups_per_env = [0] * num_envs
+    pipeline.yielded_groups_per_env = [0] * num_envs
     gate.prepare_blocked_seconds = 0.0
     gate.acquire_calls = 0
     gate.release_calls = 0
 
-    # WeightedMultiTask per-batch group distribution.
-    if dist:
-        # An env_id can appear more than once in the config (e.g. an active
-        # entry plus an evaluation-only twin with zero weight). Sum per
-        # env_id so the zero twin does not overwrite the active entry.
-        per_env: dict = {}
-        for env_id, groups in zip(dist["env_ids"], dist["agent_groups"]):
-            per_env[env_id] = per_env.get(env_id, 0) + groups
-        for env_id, groups in per_env.items():
-            metrics[f"{env_id}_agent_groups"] = groups
     return metrics
 
 
