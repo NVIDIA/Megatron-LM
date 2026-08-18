@@ -143,6 +143,13 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
     """
 
+    fsdp_trace_pool: bool = False
+    """If true, Megatron-FSDP v2 traces one global batch of temporary communication
+      buffer lifetimes, then reuses a fixed set of physical storage slots. This avoids
+      steady-state CUDA caching-allocator churn and permits non-overlapping FSDP units
+      to share storage. It is incompatible with NCCL user buffers/symmetric memory.
+    """
+
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 

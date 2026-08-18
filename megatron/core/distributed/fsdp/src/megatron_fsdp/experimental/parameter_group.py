@@ -27,6 +27,7 @@ from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
+from .allocator import TracePoolAllocator
 from .dbuffer import DBuffer
 from .placement import Partial, Placement, Placements, Replicate, changed_mesh_axis
 from .quantization import (
@@ -40,6 +41,8 @@ from .quantization import (
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 _PARAMETER_GROUP_INDEX_ATTR = "_mfsdp_parameter_group_index"
+_ALLGATHER_ARENA = "allgather"
+_REDUCE_SCATTER_ARENA = "reduce_scatter"
 
 
 def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
@@ -115,6 +118,7 @@ class FsdpParameterGroup:
     # ``_main_grad`` is replaced (redistribute) or ``main_grad`` changes dtype.
     _grad_dtensor_cache: list[dist_tensor.DTensor | None]
     _grad_dtensor_cache_main_grad_id: int | None
+    _trace_pool_allocator: TracePoolAllocator | None
 
     def __init__(
         self,
@@ -128,6 +132,7 @@ class FsdpParameterGroup:
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
         fuse_wgrad_accumulation: bool = False,
+        trace_pool_allocator: TracePoolAllocator | None = None,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -141,6 +146,8 @@ class FsdpParameterGroup:
             reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
             use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
+            trace_pool_allocator: Optional trace-planned allocator for temporary
+                all-gather and reduce-scatter buffers.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
             fuse_wgrad_accumulation: Let TE write full weight gradients directly into
@@ -152,6 +159,8 @@ class FsdpParameterGroup:
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
         if use_symmetric_memory and fuse_wgrad_accumulation:
             raise ValueError("MFSDP v2 fused wgrad does not yet support symmetric-memory buffers.")
+        if use_symmetric_memory and trace_pool_allocator is not None:
+            raise ValueError("MFSDP trace-pool and symmetric-memory buffers are incompatible.")
 
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
@@ -171,6 +180,9 @@ class FsdpParameterGroup:
         self.mesh = mesh
         self.grad_divisor = grad_divisor
         self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
+        self._trace_pool_allocator = trace_pool_allocator
+        self._unsharded_allocation_key = (id(self), "unsharded_model_weight")
+        self._partial_grad_allocation_key = (id(self), "partial_grad")
         first_parameter = next(iter(parameter_to_fqns))
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
@@ -407,20 +419,32 @@ class FsdpParameterGroup:
         if self.model_weight.placements == self._unsharded_model_weight.placements:
             unsharded_model_weight = self.model_weight
         else:
-            with self._symmetric_memory_context():
-                self._unsharded_model_weight.reallocate_storage()
+            buffer = self._unsharded_model_weight
+            if self._trace_pool_allocator is None:
+                with self._symmetric_memory_context():
+                    buffer.reallocate_storage()
+            else:
+                local_buffer = self._trace_pool_allocator.allocate(
+                    self._unsharded_allocation_key,
+                    buffer.local_buffer.numel(),
+                    buffer.dtype,
+                    buffer.device,
+                    arena=_ALLGATHER_ARENA,
+                )
+                buffer.bind_local_buffer(local_buffer)
             # This buffer backs unsharded Parameters whose views may be saved by autograd.
             # Autograd records a tensor's version counter when saving it for backward, and
             # in-place writes like the out= redistribution below increment that counter even
             # under no_grad. Without preserving it, backward can fail with "modified by an
             # inplace operation" even though FSDP only materialized internal storage.
-            with torch.autograd._unsafe_preserve_version_counter(
-                self._unsharded_model_weight.local_buffer
-            ):
-                self.model_weight.redistribute(
-                    self._unsharded_model_weight.placements, out=self._unsharded_model_weight
-                )
-            unsharded_model_weight = self._unsharded_model_weight
+            gather_axis = changed_mesh_axis(self.model_weight.placements, buffer.placements)
+            if gather_axis is None:
+                raise RuntimeError("FSDP parameter unshard requires a changed placement axis.")
+            with torch.autograd._unsafe_preserve_version_counter(buffer.local_buffer):
+                if self._symm_mem_pool is not None:
+                    buffer.rendezvous(gather_axis)
+                self.model_weight.redistribute(buffer.placements, out=buffer)
+            unsharded_model_weight = buffer
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             fsdp_parameter.unsharded.data = unsharded_model_weight.get_local_tensor(index)
         self._switch_to_unsharded_parameters()
@@ -440,7 +464,10 @@ class FsdpParameterGroup:
         # post-backward reshard behavior would make the caller code less clean,
         # so keep the shared storage-release path.
         if self._unsharded_model_weight is not None:
-            self._unsharded_model_weight.release_storage()
+            if self._trace_pool_allocator is None:
+                self._unsharded_model_weight.release_storage()
+            else:
+                self._trace_pool_allocator.free(self._unsharded_allocation_key)
 
     @property
     def main_grad(self) -> DBuffer | None:
@@ -546,12 +573,10 @@ class FsdpParameterGroup:
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer.
 
-        NOTE: deliberately not cached across microbatches.  Reusing the buffer
-        made the NCCL symmetric-memory pool keep the storage registered across
-        microbatches, so the next backward's ``copy_`` write forced a device
-        sync (cudaEventSynchronize ~24x in nsys).  A fresh buffer per backward
-        keeps the allocate-on-reduce-scatter-stream + release invariant that
-        avoids allocator/symm-mem serialization.
+        The default path deliberately creates fresh storage across microbatches:
+        caching symmetric-memory storage made the next backward's ``copy_`` force
+        a device sync. The trace-pool path is mutually exclusive with symmetric
+        memory and safely reuses a slot within the ordered reduce-scatter arena.
         """
         assert self.requires_grad
 
@@ -564,14 +589,37 @@ class FsdpParameterGroup:
             if grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
             grads.append(grad)
+        partial_placements = tuple([Partial(partial_op)] * self.mesh.ndim)
+        tensor_shapes = tuple(grad.shape for grad in grads)
+        if self._trace_pool_allocator is not None:
+            _, local_numel = self.main_weight.layout.get_local_range(self.mesh, partial_placements)
+            local_buffer = self._trace_pool_allocator.allocate(
+                self._partial_grad_allocation_key,
+                local_numel,
+                grads[0].dtype,
+                grads[0].device,
+                arena=_REDUCE_SCATTER_ARENA,
+            )
+            return DBuffer.from_local(
+                local_buffer=local_buffer,
+                mesh=self.mesh,
+                placements=partial_placements,
+                tensor_shapes=tensor_shapes,
+            )
+
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
-                placements=[Partial(partial_op)] * self.mesh.ndim,
-                tensor_shapes=tuple(grad.shape for grad in grads),
+                placements=partial_placements,
+                tensor_shapes=tensor_shapes,
                 dtype=grads[0].dtype,
                 device=grads[0].device,
             )
+
+    def release_partial_grad_buffer(self) -> None:
+        """Release this group's trace-pooled reduce-scatter input buffer."""
+        if self._trace_pool_allocator is not None:
+            self._trace_pool_allocator.free(self._partial_grad_allocation_key)
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack ordinary gradients while preserving TE-written fused wgrads."""
@@ -789,6 +837,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
         fuse_wgrad_accumulation: bool = False,
+        trace_pool_allocator: TracePoolAllocator | None = None,
     ) -> None:
         # Keep the subclass constructor aligned with FsdpParameterGroup. The
         # shared module factory passes these keywords without knowing whether
@@ -811,7 +860,10 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             grad_divisor=grad_divisor,
             use_symmetric_memory=False,
             fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+            trace_pool_allocator=trace_pool_allocator,
         )
+        self._unsharded_rowwise_allocation_key = (id(self), "unsharded_rowwise")
+        self._unsharded_colwise_allocation_key = (id(self), "unsharded_colwise")
 
     def _init_compute_weight_storage(
         self,
@@ -968,11 +1020,22 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         both payloads are gathered.
         """
         del orientation
-        for source, target in (
-            (self._rowwise_buffer, self._unsharded_rowwise),
-            (self._colwise_buffer, self._unsharded_colwise),
+        for source, target, allocation_key in (
+            (self._rowwise_buffer, self._unsharded_rowwise, self._unsharded_rowwise_allocation_key),
+            (self._colwise_buffer, self._unsharded_colwise, self._unsharded_colwise_allocation_key),
         ):
-            target.reallocate_storage()
+            if self._trace_pool_allocator is None:
+                with self._symmetric_memory_context():
+                    target.reallocate_storage()
+            else:
+                local_buffer = self._trace_pool_allocator.allocate(
+                    allocation_key,
+                    target.local_buffer.numel(),
+                    target.dtype,
+                    target.device,
+                    arena=_ALLGATHER_ARENA,
+                )
+                target.bind_local_buffer(local_buffer)
             gather_axis = changed_mesh_axis(source.placements, target.placements)
             if gather_axis is None:
                 raise RuntimeError("FSDP fp8 parameter unshard requires a changed placement axis.")
@@ -987,8 +1050,12 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         """Detach FP8 payloads and release gathered buffers."""
         for fsdp_parameter in self.fsdp_parameters:
             clear_payloads(fsdp_parameter.unsharded)
-        self._unsharded_rowwise.release_storage()
-        self._unsharded_colwise.release_storage()
+        if self._trace_pool_allocator is None:
+            self._unsharded_rowwise.release_storage()
+            self._unsharded_colwise.release_storage()
+        else:
+            self._trace_pool_allocator.free(self._unsharded_rowwise_allocation_key)
+            self._trace_pool_allocator.free(self._unsharded_colwise_allocation_key)
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:

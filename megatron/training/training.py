@@ -2312,6 +2312,7 @@ def wrap_model_chunks_with_ddp(
         fully_shard_context(
             use_trace_replay=config.overlap_moe_expert_parallel_comm,
             use_symmetric_memory=ddp_config.nccl_ub,
+            enable_trace_pool=ddp_config.fsdp_trace_pool,
         )
         if wrap_v2_shared_context
         else nullcontext()

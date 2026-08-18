@@ -139,6 +139,31 @@ class DBuffer:
         # for a later reallocate_storage().
         self._resize_storage(0)
 
+    def bind_local_buffer(self, local_buffer: torch.Tensor) -> None:
+        """Rebind this DBuffer to allocator-owned flat storage.
+
+        The DBuffer object and its layout remain stable while a trace-pool slot
+        supplies the physical storage. Callers that retain per-tensor views must
+        refresh those views after this method returns.
+        """
+        if local_buffer.dim() != 1:
+            raise ValueError("Trace-pool local_buffer must be a flat 1D tensor.")
+        if not local_buffer.is_contiguous():
+            raise ValueError("Trace-pool local_buffer must be contiguous.")
+        if local_buffer.numel() != self.local_buffer.numel():
+            raise ValueError(
+                f"Expected trace-pool buffer with {self.local_buffer.numel()} elements, "
+                f"got {local_buffer.numel()}."
+            )
+        if local_buffer.dtype != self.dtype or local_buffer.device != self.device:
+            raise ValueError(
+                "Trace-pool buffer dtype/device mismatch: expected "
+                f"{(self.dtype, self.device)}, got "
+                f"{(local_buffer.dtype, local_buffer.device)}."
+            )
+        self.local_buffer.set_(local_buffer)
+        self._local_tensor_cache.clear()
+
     def rendezvous(self, mesh_axis: int) -> None:
         """Rendezvous this local buffer for symmetric-memory collectives."""
         group = self.mesh.get_group(mesh_axis)

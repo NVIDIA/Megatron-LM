@@ -647,11 +647,6 @@ def test_complete_trace_clears_dedup_so_replay_records(distributed_setup):
     assert not runner._consumed_this_round
     assert runner._complete_trace_calls == 1
 
-    # Multiple VPP chunk adapters share one runner and can report the same
-    # optimizer boundary. With no execution between calls, it is a no-op.
-    runner.complete_trace()
-    assert runner._complete_trace_calls == 1
-
     assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (
         layers[1],
         "rowwise",
@@ -661,3 +656,33 @@ def test_complete_trace_clears_dedup_so_replay_records(distributed_setup):
         layers[0],
         "rowwise",
     )
+
+
+def test_trace_pool_plans_after_first_execution_replay(distributed_setup):
+    """Storage planning must observe the prefetch-enabled replay lifetime."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=1).to(device)
+
+    with fully_shard_context(
+        device=device, use_trace_replay=True, enable_trace_pool=True
+    ) as context:
+        fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    runner = context.runner
+    allocator = context.trace_pool_allocator
+    assert allocator is not None
+
+    allocator.allocate("buffer", 8, torch.float32, device, arena="allgather")
+    allocator.free("buffer")
+    runner.record_unshard(model.layers[0], "rowwise")
+    runner.record_reshard(model.layers[0])
+    context.complete_trace()
+    assert allocator.phase == "trace"
+
+    allocator.allocate("buffer", 8, torch.float32, device, arena="allgather")
+    allocator.free("buffer")
+    runner.record_unshard(model.layers[0], "rowwise")
+    runner.record_reshard(model.layers[0])
+    context.complete_trace()
+    assert allocator.phase == "optimized"

@@ -65,7 +65,10 @@ try:
         fully_shard,
         fully_shard_context,
     )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
+        FsdpContext,
+        FsdpModule,
+    )
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -507,6 +510,11 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
 class FullyShardedDataParallelV2(_BaseDataParallel):
     """MFSDP v2 wrapper for the Megatron model."""
 
+    @property
+    def context(self) -> "FsdpContext":
+        """Return the runtime context shared by this model chunk."""
+        return self.module.context
+
     @staticmethod
     def _configure_te_grouped_mlp_wgrad_fusion(
         module: torch.nn.Module, enabled: bool
@@ -649,6 +657,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             reuse_existing=True,
             use_trace_replay=fine_grained,
             use_symmetric_memory=ddp_config.nccl_ub,
+            enable_trace_pool=ddp_config.fsdp_trace_pool,
         ):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
@@ -967,6 +976,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if ddp_config.nccl_ub and ddp_config.disable_symmetric_registration:
             raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
+        if ddp_config.fsdp_trace_pool and ddp_config.nccl_ub:
+            raise ValueError("MFSDP v2 trace-pool is incompatible with NCCL user buffers.")
+        if ddp_config.fsdp_trace_pool and ddp_config.fsdp_double_buffer:
+            raise ValueError("MFSDP v2 trace-pool is incompatible with FSDP double buffering.")
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
         if ddp_config.suggested_communication_unit_size is not None:
@@ -1004,10 +1017,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 gradient reduction is complete when backward returns."""
-
-    def complete_fsdp_trace(self) -> None:
-        """Mark a global-batch boundary for the shared execution runner."""
-        self.module.context.runner.complete_trace()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
