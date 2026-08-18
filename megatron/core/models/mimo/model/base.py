@@ -503,6 +503,8 @@ class MimoModel(MegatronModule):
             language_grid = grid_map[MIMO_LANGUAGE_MODULE_KEY]
             encoder_dp = encoder_grid.shape[encoder_grid.dim_names.index("dp")]
             language_dp = language_grid.shape[language_grid.dim_names.index("dp")]
+            if "gtp_remat" in language_grid.dim_names:
+                language_dp *= language_grid.shape[language_grid.dim_names.index("gtp_remat")]
             assert encoder_dp <= language_dp, (
                 f"Bridge fan-out split metadata with non-uniform per-sample sizes "
                 f"requires encoder DP <= LM DP (got encoder='{encoder_name}' "

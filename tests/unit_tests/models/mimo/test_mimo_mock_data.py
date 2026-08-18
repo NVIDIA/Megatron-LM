@@ -26,6 +26,7 @@ def _args():
         dataset_provider="mock",
         micro_batch_size=2,
         llm_dp=2,
+        gtp_weight_remat_size=1,
         encoder_dp=1,
         seq_length=8,
         image_seq_length=4,
@@ -46,10 +47,14 @@ def _args():
 def _topology(*, language_rank, encoder_rank=None):
     encoder = RADIO_ENCODER_MODULE_NAME
     grids = {"language": _grid(language_rank)}
-    pgs = {"language": SimpleNamespace(pp=_group(size=3), dp=_group(rank=0, size=2))}
+    pgs = {
+        "language": SimpleNamespace(
+            pp=_group(size=3), dp=_group(rank=0, size=2), dp_cp_gtp_remat=None
+        )
+    }
     if encoder_rank is not None:
         grids[encoder] = _grid(encoder_rank)
-        pgs[encoder] = SimpleNamespace(pp=_group(), dp=_group(rank=1, size=2))
+        pgs[encoder] = SimpleNamespace(pp=_group(), dp=_group(rank=1, size=2), dp_cp_gtp_remat=None)
     return SimpleNamespace(grids=grids, module_pgs=pgs)
 
 
