@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from megatron.training import get_args
 from megatron.training import print_rank_0
 from megatron.training import get_timers
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.bert.bert_model import BertModel
@@ -55,7 +56,9 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None, config=No
         parallel_output=True,
         pre_process=pre_process,
         post_process=post_process,
-        vp_stage=vp_stage)
+        vp_stage=vp_stage,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
 
     return model
 

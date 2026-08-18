@@ -10,6 +10,7 @@ Adding a new parallelism cell is a one-line append to
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -108,7 +109,9 @@ class TestHybridModelDeterminism:
                 pre_process=pre_process,
                 post_process=post_process,
                 vp_stage=vp_stage,
-            ).cuda()
+            
+                       pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                   ).cuda()
 
         runner = BitExactRunner(
             build_model=build,

@@ -6,6 +6,7 @@ import pytest
 import torch
 from packaging.version import Version
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_layer_specs,
     get_gpt_mtp_block_spec,
@@ -46,7 +47,9 @@ class TestFreezeBaseForMTP:
             mtp_block_spec=mtp_block_spec,
             vocab_size=100,
             max_sequence_length=8,
-        )
+        
+                         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                     )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

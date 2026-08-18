@@ -8,6 +8,7 @@ from typing import Optional
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state as ps
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec as gpt_local_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -57,7 +58,9 @@ def initialize_gpt_model(seed, layer_spec_fn=gpt_te_spec, vocab_size=128, **conf
         max_sequence_length=4,
         pre_process=pre_process,
         post_process=post_process,
-    )
+    
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
 
     with torch.no_grad():
         for p in model.parameters():

@@ -2,6 +2,7 @@
 
 import pytest
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt import GPTModel
@@ -81,7 +82,9 @@ class TestGPTModelKitchenQuantizationConfig:
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=max_position_embeddings,
-        )
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
 
         expected_types = {
             "decoder.layers.0.self_attention.linear_proj": KitchenRowParallelLinear,
@@ -186,7 +189,9 @@ class TestGPTModelKitchenQuantizationConfig:
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=max_position_embeddings,
-        )
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
 
         expected_types = {
             "decoder.layers.0.self_attention.linear_proj": KitchenRowParallelLinear,
@@ -304,7 +309,9 @@ class TestGPTModelKitchenQuantizationConfig:
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=max_position_embeddings,
-        )
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
 
         expected_types = {
             "decoder.layers.0.self_attention.linear_proj": KitchenRowParallelLinear,
@@ -421,7 +428,9 @@ class TestGPTModelKitchenQuantizationConfig:
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=max_position_embeddings,
-        )
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
 
         expected_types = {
             "decoder.layers.0.self_attention.linear_proj": KitchenRowParallelLinear,
@@ -535,7 +544,9 @@ class TestGPTModelKitchenQuantizationConfig:
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=max_position_embeddings,
-        )
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
 
         expected_types = {
             "decoder.layers.0.self_attention.linear_proj": KitchenRowParallelLinear,
@@ -628,7 +639,9 @@ class TestGPTModelTEQuantizationConfig:
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=max_position_embeddings,
-        )
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
 
         expected_types = {
             "decoder.layers.0.self_attention.linear_proj": TERowParallelLinear,

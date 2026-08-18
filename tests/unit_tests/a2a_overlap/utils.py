@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import config
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -298,7 +299,9 @@ def build_gpt_model(config, vocab_size=512, max_seq_len=300):
         pre_process=True,
         post_process=True,
         max_sequence_length=max_seq_len,
-    )
+    
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
     model.cuda()
     return model
 

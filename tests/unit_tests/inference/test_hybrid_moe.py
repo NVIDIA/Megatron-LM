@@ -21,6 +21,7 @@ import itertools
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
@@ -163,7 +164,9 @@ class _TestDynamicInferenceBase:
             vocab_size=self.VOCAB_SIZE,
             max_sequence_length=self.MAX_SEQ_LEN,
             hybrid_layer_pattern="ME*",
-        )
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                )
         model.cuda()
         model.eval()
         return model
@@ -300,7 +303,9 @@ class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
             vocab_size=self.VOCAB_SIZE,
             max_sequence_length=self.MAX_SEQ_LEN,
             hybrid_layer_pattern="ME*",
-        ).cuda()
+        
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                ).cuda()
         model.eval()
 
         input_ids = torch.arange(64, device="cuda", dtype=torch.long).unsqueeze(0)

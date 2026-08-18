@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.distributed.checkpoint
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.num_microbatches_calculator import (
@@ -344,7 +345,7 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
 
     iteration = 123
     config = TransformerConfig(num_layers=1, kv_channels=1)
-    model = MockModel(config)
+    model = MockModel(config, pg_collection=ProcessGroupCollection.use_mpu_process_groups())
     optimizer = MockState({"optimizer": "optimizer_state"})
     if ckpt_format == "fsdp_dtensor":
         model = FullyShardedDataParallel(
@@ -403,7 +404,7 @@ def test_load_checkpoint(
         # Create and save a checkpoint first.
         iteration = 123
         config = TransformerConfig(num_layers=1, kv_channels=1)
-        model = MockModel(config)
+        model = MockModel(config, pg_collection=ProcessGroupCollection.use_mpu_process_groups())
 
         optimizer = MockState({"optimizer": "optimizer_state"})
         opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
@@ -414,7 +415,7 @@ def test_load_checkpoint(
         )
 
         # Create new model, optimizer, and scheduler instances to load into.
-        new_model = MockModel(config)
+        new_model = MockModel(config, pg_collection=ProcessGroupCollection.use_mpu_process_groups())
         new_optimizer = MockState({"optimizer": "dummy1"})
         new_opt_param_scheduler = MockState({"opt_param_scheduler": "dummy2"})
 
@@ -524,7 +525,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
         # Create and save a checkpoint first.
         iteration = 123
         config = TransformerConfig(num_layers=1, kv_channels=1)
-        model = MockModel(config)
+        model = MockModel(config, pg_collection=ProcessGroupCollection.use_mpu_process_groups())
 
         optimizer = MockState({"optimizer": "optimizer_state"})
         opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})

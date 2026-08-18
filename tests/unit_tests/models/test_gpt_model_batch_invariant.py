@@ -5,6 +5,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
@@ -120,7 +121,9 @@ def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int 
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
         vocab_size=vocab_size,
         max_sequence_length=seq_len,
-    )
+    
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
     return model.cuda().eval()
 
 

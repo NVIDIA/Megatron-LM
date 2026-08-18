@@ -6,6 +6,7 @@ import pytest
 import torch
 from packaging.version import Version as PkgVersion
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.models.bert.bert_layer_specs import (
     bert_layer_local_spec,
     get_bert_layer_with_transformer_engine_spec,
@@ -45,7 +46,9 @@ class TestBertModel:
             transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
-        )
+        
+                              pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                          )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -107,7 +110,9 @@ class TestBertModel:
             max_sequence_length=self.bert_model.max_sequence_length,
             apply_lm_head=False,
             output_layer_bias=False,
-        )
+        
+                         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                     )
 
         assert bert_model.output_layer.bias is None
 
@@ -124,7 +129,9 @@ class TestBertModel:
             vocab_size=100,
             max_sequence_length=sequence_length,
             apply_lm_head=False,
-        )
+        
+                         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                     )
         assert bert_model.lm_head is None
         bert_model.cuda()
 
@@ -179,7 +186,9 @@ class TestBertModel:
             transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
-        )
+        
+                         pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                     )
         attention = bert_model.encoder.layers[0].self_attention
         assert isinstance(attention.q_layernorm, te_pytorch.LayerNorm)
         assert isinstance(attention.k_layernorm, te_pytorch.LayerNorm)
@@ -208,7 +217,9 @@ class TestBertModelAttentionDimensions:
             transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
-        )
+        
+                              pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                          )
 
     @pytest.mark.internal
     def test_local_spec(self, mocker):
@@ -272,7 +283,9 @@ class TestBertModelAttentionDimensions:
                 transformer_layer_spec=ModuleSpec(module=TransformerLayer, submodules=submodules),
                 vocab_size=100,
                 max_sequence_length=4,
-            )
+            
+                                  pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                              )
         assert str(exc_info.value) == (
             "Linear.__init__() got an unexpected keyword argument 'rng_tracker_name' when "
             "instantiating TERowParallelLinear when instantiating SelfAttention when "
@@ -311,7 +324,9 @@ class TestBertModelAttentionDimensions:
                 transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
                 vocab_size=100,
                 max_sequence_length=4,
-            )
+            
+                                  pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                              )
 
         assert str(exc_info.value) == (
             "Flash and fused attention is not supported with transformer engine version "

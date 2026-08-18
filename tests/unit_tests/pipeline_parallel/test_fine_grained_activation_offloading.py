@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
@@ -120,7 +121,9 @@ def _build_gpt_model(
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
-    ).bfloat16()
+    
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                ).bfloat16()
     return gpt_model
 
 
@@ -499,6 +502,8 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
                 ),
                 vocab_size=vocab_size,
                 max_sequence_length=seq_length,
+            
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             .bfloat16()
             .cuda()
@@ -698,7 +703,9 @@ def _build_gpt_model_with_cuda_graph(
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
-    ).bfloat16()
+    
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+                ).bfloat16()
     return gpt_model
 
 
