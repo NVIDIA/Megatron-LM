@@ -1414,9 +1414,16 @@ class TestRLUtils:
         rewards = [[1, 1], [-1, 2]]
         num_turns = [[42, 2], [10, 8]]
         advantages = [0, 1]
-        # Per-token epoch stamps, grouped by group then rollout
-        policy_epoch = [[[4, 5], [2, 3]], [[5], [0, 1]]]
-        kv_cache_epoch = [[[4, 5], [3, 4]], [[5], [1, 2]]]
+        # Per-rollout (epoch, token_count) segments, grouped by group then rollout
+        seg = rl_utils.EpochSegment
+        policy_epoch_segments = [
+            [[seg(4, 1), seg(5, 2)], [seg(2, 2), seg(3, 1)]],
+            [[seg(5, 1)], [seg(0, 3), seg(1, 1)]],
+        ]
+        kv_cache_epoch_segments = [
+            [[seg(4, 2), seg(5, 1)], [seg(3, 1), seg(4, 2)]],
+            [[seg(5, 1)], [seg(1, 2), seg(2, 2)]],
+        ]
         # Per-turn max epoch stamps (when each turn completed)
         completed_epochs = [[5, 3], [5, 1]]
         num_evictions = [[0, 1], [0, 0]]
@@ -1434,7 +1441,7 @@ class TestRLUtils:
                 for group in lst:
                     group.append(sentinel)
                 lst.append([sentinel, sentinel])  # the fully failed extra group
-            for lst in (policy_epoch, kv_cache_epoch):
+            for lst in (policy_epoch_segments, kv_cache_epoch_segments):
                 for group in lst:
                     # Placeholders pop no ledger records, so their epoch rows are empty.
                     group.append([])
@@ -1459,8 +1466,8 @@ class TestRLUtils:
             rewards,
             num_turns,
             advantages,
-            policy_epoch=policy_epoch,
-            kv_cache_epoch=kv_cache_epoch,
+            policy_epoch_segments=policy_epoch_segments,
+            kv_cache_epoch_segments=kv_cache_epoch_segments,
             completed_epochs=completed_epochs,
             num_evictions=num_evictions,
             current_iteration=current_iteration,
@@ -1519,6 +1526,9 @@ class TestRLUtils:
         assert len(rollout_table_calls) == 1
         rows = rollout_table_calls[0].kwargs["data"]
         assert [r[3] for r in rows] == [2, 4, 1, 6]  # policy_staleness column
+        # policy_avg_staleness column is token-weighted: rollout 4 covers epochs
+        # (0 x3 tokens, 1 x1 token) -> 6 - 1/4 = 5.75.
+        assert rows[3][7] == 5.75
         assert metrics["nonzero_groups_ratio"] == 0.5
         assert metrics["max_traj_length"] == 3
         assert metrics["min_traj_length"] == 1
@@ -1562,8 +1572,8 @@ class TestRLUtils:
             rewards=[],
             num_turns=[],
             advantages=[],
-            policy_epoch=[],
-            kv_cache_epoch=[],
+            policy_epoch_segments=[],
+            kv_cache_epoch_segments=[],
             completed_epochs=[],
             num_evictions=[],
             current_iteration=6,
@@ -1588,8 +1598,8 @@ class TestRLUtils:
             rewards=[[0.0, 0.0]],
             num_turns=[[0, 0]],
             advantages=[0.0, 0.0],
-            policy_epoch=[[[0], [0]]],
-            kv_cache_epoch=[[[0], [0]]],
+            policy_epoch_segments=[[[], []]],
+            kv_cache_epoch_segments=[[[], []]],
             completed_epochs=[[]],
             num_evictions=[[0, 0]],
             current_iteration=6,
@@ -1658,7 +1668,8 @@ class TestRLUtils:
         # and num_turns is what lets prep_wandb_metrics mask them downstream.
         # Placeholders join no records, so their epoch rows are empty.
         assert stats.num_turns == [[1, 1, 0], [0, 0, 0]]
-        assert stats.policy_epoch == [[[5], [6], []], [[], [], []]]
+        seg = rl_utils.EpochSegment
+        assert stats.policy_epoch_segments == [[[seg(5, 3)], [seg(6, 4)], []], [[], [], []]]
         assert stats.traj_lens == [[3, 4, 0], [0, 0, 0]]
         # Per-turn lists exclude placeholders entirely: no sentinel epoch-0 stamp
         # in completed_epochs, no fake 0-length turn for all-placeholder groups.
@@ -1689,8 +1700,8 @@ class TestRLUtils:
             stats.rewards,
             stats.num_turns,
             stats.advantages,
-            policy_epoch=stats.policy_epoch,
-            kv_cache_epoch=stats.kv_cache_epoch,
+            policy_epoch_segments=stats.policy_epoch_segments,
+            kv_cache_epoch_segments=stats.kv_cache_epoch_segments,
             completed_epochs=stats.completed_epochs,
             num_evictions=stats.num_evictions,
             current_iteration=7,
@@ -1777,8 +1788,14 @@ class TestRLUtils:
         ]
         stats = rl_utils.compute_group_stats(rollouts, MockTokenizer(), 8, ledger)
 
-        assert stats.policy_epoch == [[[7, 8], [5], []], [[6], [9], []]]
-        assert stats.kv_cache_epoch == [[[7, 8], [5], []], [[6], [9], []]]
+        assert stats.policy_epoch_segments == [
+            [[(7, 4), (8, 7)], [(5, 3)], []],
+            [[(6, 3)], [(9, 3)], []],
+        ]
+        assert stats.kv_cache_epoch_segments == [
+            [[(7, 4), (8, 7)], [(5, 3)], []],
+            [[(6, 3)], [(9, 3)], []],
+        ]
         assert stats.completed_epochs == [[7, 8, 5], [6, 9]]
         assert stats.num_evictions == [[1, 0, 0], [0, 0, 0]]
         assert not ledger  # all records consumed
@@ -1791,6 +1808,7 @@ class TestRLUtils:
         # Text (non-token) rollouts join no finished-request records and yield
         # empty epoch rows; staleness/eviction telemetry filters them out while
         # keeping the rollout table row-aligned.
+        seg = rl_utils.EpochSegment
         writer = MagicMock()
         metrics = rl_utils.prep_wandb_metrics(
             writer,
@@ -1799,8 +1817,8 @@ class TestRLUtils:
             rewards=[[1.0, -1.0]],
             num_turns=[[1, 1]],
             advantages=[0.5],
-            policy_epoch=[[[4, 5], []]],
-            kv_cache_epoch=[[[4, 5], []]],
+            policy_epoch_segments=[[[seg(4, 1), seg(5, 1)], []]],
+            kv_cache_epoch_segments=[[[seg(4, 1), seg(5, 1)], []]],
             completed_epochs=[[5]],
             num_evictions=[[2, 0]],
             current_iteration=6,
@@ -1813,7 +1831,21 @@ class TestRLUtils:
         rollout_table = next(
             c for c in writer.Table.call_args_list if "traj_length" in c.kwargs.get("columns", [])
         )
-        assert rollout_table.kwargs["data"] == [(1.0, 3, 2, 2, 2, 1, 1, 'ok')]
+        (row,) = rollout_table.kwargs["data"]
+        assert dict(zip(rollout_table.kwargs["columns"], row)) == {
+            "reward": 1.0,
+            "traj_length": 3,
+            "num_evictions": 2,
+            "policy_staleness": 2,
+            "kv_staleness": 2,
+            "policy_last_token_staleness": 1,
+            "kv_last_token_staleness": 1,
+            "policy_avg_staleness": 1.5,
+            "kv_avg_staleness": 1.5,
+            "policy_staleness_std": 0.5,
+            "kv_staleness_std": 0.5,
+            "rollout_status": 'ok',
+        }
 
         # A window where nothing joined emits no staleness/eviction metrics at all.
         metrics = rl_utils.prep_wandb_metrics(
@@ -1823,8 +1855,8 @@ class TestRLUtils:
             rewards=[[1.0]],
             num_turns=[[1]],
             advantages=[0.5],
-            policy_epoch=[[[]]],
-            kv_cache_epoch=[[[]]],
+            policy_epoch_segments=[[[]]],
+            kv_cache_epoch_segments=[[[]]],
             completed_epochs=[[]],
             num_evictions=[[0]],
             current_iteration=6,
@@ -1834,6 +1866,102 @@ class TestRLUtils:
         assert "total_eviction_count" not in metrics
         assert "rollout_table" not in metrics
         assert "per_token_table" not in metrics
+
+    def test_epoch_segment_helpers(self):
+        expand, merge = rl_utils.expand_epoch_segments, rl_utils.merge_epoch_segments
+        seg, aligned = rl_utils.EpochSegment, rl_utils.AlignedEpochSegment
+        # expand: boundaries -> (epoch, token_count). Multi-turn boundaries index
+        # each turn's full CUMULATIVE sequence; boundary-less turns contribute nothing.
+        assert expand([[(0, 3), (4, 4)]], [6]) == [seg(3, 4), seg(4, 2)]
+        assert expand([[(0, 5)], [(0, 5), (4, 6)]], [4, 7]) == [seg(5, 4), seg(5, 4), seg(6, 3)]
+        assert expand([[], [(0, 2)]], [3, 5]) == [seg(2, 5)]
+        # Per-turn lists of mismatched lengths raise instead of silently dropping turns.
+        with pytest.raises(ValueError):
+            expand([[(0, 9)]], [])
+        # merge: (policy, kv, token_count) runs aligned by token position, not an
+        # index-wise zip of the two segment lists; a tail covered by only one
+        # stream (disagreeing totals) is dropped rather than misattributed.
+        assert list(merge([seg(10, 4)], [seg(9, 2), seg(8, 2)])) == [
+            aligned(10, 9, 2),
+            aligned(10, 8, 2),
+        ]
+        assert list(merge([seg(7, 3)], [seg(6, 1)])) == [aligned(7, 6, 1)]
+        assert list(merge([], [seg(1, 2)])) == []
+
+    def test_per_token_staleness_is_token_weighted(self):
+        # One turn, 10 tokens: 9 at epoch 1 + 1 at epoch 5. Per-segment accounting
+        # scores both halves equally; per-token, the stale run must dominate.
+        eod = MockTokenizer().eod
+        rollout = TokenRollout(
+            trajectory=[[7] * 9 + [eod]],
+            generation_mask=[[False] + [True] * 9],
+            logprobs=[[0.0] * 10],
+            reward=1.0,
+            env_id="w",
+            problem_id="p",
+            completion_ids=_mint_cids(1),
+        )
+        ledger = {
+            rollout.completion_ids[0]: FinishedRequestRecord(
+                policy_epoch=[(0, 1), (9, 5)], kv_cache_epoch=[(0, 5)], num_evictions=0
+            )
+        }
+        stats = rl_utils.compute_group_stats(
+            [[rollout]], MockTokenizer(), seq_len=16, request_ledger=ledger
+        )
+        seg = rl_utils.EpochSegment
+        assert stats.policy_epoch_segments == [[[seg(1, 9), seg(5, 1)]]]
+        assert stats.kv_cache_epoch_segments == [[[seg(5, 10)]]]
+
+        writer = MagicMock()
+        metrics = rl_utils.prep_wandb_metrics(
+            writer,
+            stats.traj_lens,
+            stats.turn_lens,
+            stats.rewards,
+            stats.num_turns,
+            stats.advantages,
+            policy_epoch_segments=stats.policy_epoch_segments,
+            kv_cache_epoch_segments=stats.kv_cache_epoch_segments,
+            completed_epochs=stats.completed_epochs,
+            num_evictions=stats.num_evictions,
+            current_iteration=6,
+        )
+        # First/last-token scalars: a segment's first/last epoch is its first/last token's.
+        assert metrics["max_policy_staleness"] == 5  # 6 - 1
+        assert metrics["min_policy_last_token_staleness"] == 1  # 6 - 5
+        tables = [c.kwargs for c in writer.Table.call_args_list]
+        # per_token_table rows are (rollout, policy, kv, token_count) runs merged
+        # over positions; 'rollout' indexes rollout_table's rows.
+        assert [t["data"] for t in tables if "token_count" in t.get("columns", [])] == [
+            [(0, 5, 1, 9), (0, 1, 1, 1)]
+        ]
+        # rollout_table carries the within-rollout dispersion: token-weighted avg
+        # 6 - (1*9 + 5*1)/10 = 4.6 and std sqrt((9*0.4^2 + 3.6^2)/10) = 1.2 for
+        # policy; kv is a single epoch, so avg 1.0 and std 0.
+        rollout_tbl = next(t for t in tables if "policy_staleness_std" in t.get("columns", []))
+        (rollout_row,) = rollout_tbl["data"]
+        row_by_col = dict(zip(rollout_tbl["columns"], rollout_row))
+        assert row_by_col.pop("rollout_status") == 'ok'
+        assert row_by_col == pytest.approx(
+            {
+                "reward": 1.0,
+                "traj_length": 10,
+                "num_evictions": 0,
+                "policy_staleness": 5,
+                "kv_staleness": 1,
+                "policy_last_token_staleness": 1,
+                "kv_last_token_staleness": 1,
+                "policy_avg_staleness": 4.6,
+                "kv_avg_staleness": 1.0,
+                "policy_staleness_std": 1.2,
+                "kv_staleness_std": 0.0,
+            }
+        )
+        # Histogram feed = the same exact token-weighted per-rollout averages
+        # (a per-segment mean would say 3.0 for policy).
+        hists = [t["data"] for t in tables if t.get("columns") == ["staleness"]]
+        assert [[4.6]] in hists and [[1.0]] in hists
 
 
 def _ledger_record(epoch, num_evictions=0):
