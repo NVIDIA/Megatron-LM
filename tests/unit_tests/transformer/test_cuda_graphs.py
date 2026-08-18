@@ -70,20 +70,17 @@ fp8_available, _ = check_fp8_support()
 
 
 def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
-    device = 0
     created_streams = []
 
     class FakeStream:
-        def __init__(self, device):
-            assert device == 0
+        def __init__(self):
             self.cuda_stream = len(created_streams) + 1
             created_streams.append(self)
 
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: device)
     monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "32")
-    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_POOLS", {})
-    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_NEXT_SLOT", {device: 0})
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_POOLS", None)
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_NEXT_SLOT", 0)
 
     pool_size = cuda_graphs_module._CUDA_GRAPH_STREAM_POOL_SIZE
     assigned = [cuda_graphs_module._get_cuda_graph_stream() for _ in range(2 * pool_size)]
