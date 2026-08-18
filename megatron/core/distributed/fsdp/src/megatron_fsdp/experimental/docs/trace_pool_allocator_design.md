@@ -58,12 +58,11 @@ safe slot-collision failure when replay begins.
 
 ### Plan: boundary after the observed replay
 
-After the optimizer step, `complete_fsdp_trace()` reaches the shared
-`FsdpContext`. The context first completes execution-runner tracing. It defers
-storage planning while the runner is tracing, and ignores duplicate VPP chunk
-notifications with no intervening execution events. Planning occurs once at
-the boundary after the first complete replay and requires no live logical
-allocations.
+After the optimizer step, `FullyShardedOptimizer` calls `complete_trace()` once
+on the `FsdpContext` shared by all VPP chunks. The context first completes
+execution-runner tracing and defers storage planning while the runner is
+tracing. Planning occurs once at the boundary after the first complete replay
+and requires no live logical allocations.
 
 The allocator:
 

@@ -133,10 +133,6 @@ class FsdpExecutionRunner:
         self._replayed_occurrences = 0
         self._divergences = 0
         self._complete_trace_calls = 0
-        # VPP exposes one adapter per chunk, but all chunks share this runner.
-        # The optimizer can therefore report the same batch boundary more than
-        # once; only a boundary preceded by execution events advances the cycle.
-        self._events_since_boundary = False
         if use_trace_replay:
             logger.info("FsdpExecutionRunner: trace-and-replay prefetch enabled.")
 
@@ -154,11 +150,6 @@ class FsdpExecutionRunner:
     def use_trace_replay(self) -> bool:
         """Whether trace-and-replay prefetch is enabled."""
         return self._use_trace_replay
-
-    @property
-    def has_events_since_boundary(self) -> bool:
-        """Whether execution events were observed since the last completed batch."""
-        return self._events_since_boundary
 
     # ------------------------------------------------------------------
     # Interface 1: record execution events (consume, reshard)
@@ -184,7 +175,6 @@ class FsdpExecutionRunner:
             return
         self._consumed_this_round.add(module)
         self._last_orientation[module] = orientation
-        self._events_since_boundary = True
         self._validate_and_advance(EventKind.UNSHARD, module, orientation)
 
     def record_reshard(self, module: "FsdpModule") -> None:
@@ -205,7 +195,6 @@ class FsdpExecutionRunner:
         # entry so the next unshard (e.g. backward after forward) records a
         # fresh event.
         self._consumed_this_round.discard(module)
-        self._events_since_boundary = True
         self._validate_and_advance(EventKind.RESHARD, module, None)
 
     # ------------------------------------------------------------------
@@ -281,15 +270,13 @@ class FsdpExecutionRunner:
     def complete_trace(self) -> None:
         """Compile the recorded trace into the replay cycle.
 
-        Called by the training loop at every global-batch boundary. The
-        first batch (with a non-empty trace) transitions to ``REPLAYING``;
-        subsequent calls reset the replay cursor for the next batch while
-        keeping the compiled cycle. Duplicate notifications from VPP chunk
-        adapters are ignored when no execution event occurred between them.
+        Called once by the optimizer at every global-batch boundary. The first
+        batch (with a non-empty trace) transitions to ``REPLAYING``; subsequent
+        calls reset the replay cursor for the next batch while keeping the
+        compiled cycle.
         """
-        if not self._use_trace_replay or not self._events_since_boundary:
+        if not self._use_trace_replay:
             return
-        self._events_since_boundary = False
         self._complete_trace_calls += 1
         if self._phase is RunnerPhase.TRACING and self._trace:
             self._phase = RunnerPhase.REPLAYING
