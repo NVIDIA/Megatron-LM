@@ -14,6 +14,7 @@
 
 """Module mixin for the minimal Megatron-FSDP path."""
 
+import enum
 from collections.abc import Callable
 from typing import Literal, cast
 from weakref import ref
@@ -28,6 +29,11 @@ from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Placements
 
 
+def _is_in_backward() -> bool:
+    """Return whether the current thread is executing an autograd GraphTask."""
+    return torch._C._current_graph_task_id() != -1
+
+
 class FsdpContext:
     """Runtime stream and prefetch state shared by FSDP roots constructed together."""
 
@@ -37,19 +43,23 @@ class FsdpContext:
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
+    use_symmetric_memory: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, use_symmetric_memory: bool = False) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
             device: Device on which this context schedules communication.
+            use_symmetric_memory: Whether modules constructed in this context allocate
+                communication staging buffers from PyTorch's NCCL symmetric-memory pool.
         """
         self.is_last_microbatch = True
+        self.use_symmetric_memory = use_symmetric_memory
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         # Construction-only; empty after finalization.
@@ -119,6 +129,13 @@ class FsdpContext:
 class FsdpModule:
     """Mixin attached to modules managed by the minimal FSDP path."""
 
+    class Phase(enum.Enum):
+        """Lifecycle phase of this FsdpModule."""
+
+        RESTING = enum.auto()
+        FORWARD = enum.auto()
+        BACKWARD = enum.auto()
+
     # Name relative to the root FSDP module from named_modules().
     # Root uses "" and None means uninitialized.
     _name: str | None
@@ -131,6 +148,11 @@ class FsdpModule:
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
     _unshard_event: torch.cuda.Event | None
+    # ``phase`` is FORWARD between pre_forward() and post_forward(), BACKWARD
+    # between pre_backward() and post_backward(), and RESTING otherwise. The only
+    # exception is non-reentrant activation recomputation: it runs between pre_backward()
+    # and post_backward(), preserving BACKWARD through its nested forward hooks.
+    _phase: Phase
 
     def __init__(
         self,
@@ -138,17 +160,21 @@ class FsdpModule:
         mesh: DeviceMesh,
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
-        use_symm_mem: bool = False,
+        grad_divisor: int = 1,
+        use_symmetric_memory: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
         self._is_root = False
         self._name = None
         self._unshard_event = None
+        self._phase = FsdpModule.Phase.RESTING
         owned_parameters = _collect_owned_parameters(self)
         assert tuple(placements.dp_axes) == tuple(
             range(mesh.ndim)
         ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
+        if grad_divisor <= 0:
+            raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
         parameter_groups = [
             FsdpParameterGroup(
                 owning_module=self,
@@ -157,7 +183,8 @@ class FsdpModule:
                 placements=placements,
                 mixed_precision_policy=mixed_precision_policy,
                 reduce_scatter_stream=context.reduce_scatter_stream,
-                use_symm_mem=use_symm_mem,
+                grad_divisor=grad_divisor,
+                use_symmetric_memory=use_symmetric_memory,
             )
             for group_parameters in _group_parameters(owned_parameters)
         ]
@@ -173,6 +200,24 @@ class FsdpModule:
     def context(self) -> FsdpContext:
         """Return the FSDP context."""
         return self._context
+
+    @property
+    def phase(self) -> Phase:
+        """Return this module's lifecycle phase."""
+        return self._phase
+
+    @phase.setter
+    def phase(self, phase: Phase) -> None:
+        """Transition this module between its valid lifecycle phases."""
+        allowed_transitions = {
+            (FsdpModule.Phase.RESTING, FsdpModule.Phase.FORWARD),
+            (FsdpModule.Phase.FORWARD, FsdpModule.Phase.RESTING),
+            (FsdpModule.Phase.RESTING, FsdpModule.Phase.BACKWARD),
+            (FsdpModule.Phase.BACKWARD, FsdpModule.Phase.RESTING),
+        }
+        if (self._phase, phase) not in allowed_transitions:
+            raise RuntimeError(f"Invalid FSDP module phase transition: {self._phase} -> {phase}.")
+        self._phase = phase
 
     @property
     def name(self) -> str:
@@ -237,7 +282,14 @@ class FsdpModule:
         on the comm stream, so ``AG_{i+1}`` is launched before ``F_i`` finishes.
         """
         context = self.context
+        # This is the first MFSDP hook to run, so finalize the context here once
+        # before any module begins communication.
         context.ensure_finalized()
+        # A reentrant checkpoint recomputes before the child module's backward-pre
+        # hook runs. The active autograd GraphTask identifies that recomputation.
+        is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
+        if self.phase is not FsdpModule.Phase.BACKWARD:
+            self.phase = FsdpModule.Phase.FORWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
         self._num_ready_grad_parameters = 0
         allgather_stream = context.allgather_stream
@@ -252,9 +304,13 @@ class FsdpModule:
         # issued afterwards, so it is free to run concurrently with this FsdpModule).
         current_stream.wait_event(self._unshard_event)
 
-        next_module = context.forward_order.next_item(self)
-        if next_module is not None:
-            next_module._unshard_parameter_groups()
+        # Activation recomputation runs forward hooks inside backward. Do not
+        # prefetch the next module in forward order: its backward may already
+        # be complete, so no later backward hook would reshard it.
+        if not is_recomputing:
+            next_module = context.forward_order.next_item(self)
+            if next_module is not None:
+                next_module._unshard_parameter_groups()
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
@@ -275,7 +331,14 @@ class FsdpModule:
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
-        self._reshard_parameter_groups()
+        # Recomputed parameters are consumed immediately by this module's
+        # backward. Keep them materialized to avoid an unnecessary all-gather;
+        # post_backward() will reshard them after gradient reduction.
+        is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
+        if not is_recomputing:
+            self._reshard_parameter_groups()
+        if self.phase is FsdpModule.Phase.FORWARD:
+            self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
     def _reshard_parameter_groups(self) -> None:
@@ -298,6 +361,7 @@ class FsdpModule:
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
+        self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
@@ -324,6 +388,7 @@ class FsdpModule:
         """Reduce gradients and return parameters to their sharded resting state."""
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
+        self.phase = FsdpModule.Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
     def _reduce_gradient_groups(self) -> None:
