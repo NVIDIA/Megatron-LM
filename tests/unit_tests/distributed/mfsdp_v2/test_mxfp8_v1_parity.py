@@ -115,7 +115,17 @@ class TestMegatronFSDPE2EMxfp8:
                         tensor.copy_(reference)
 
     @classmethod
-    def _run_training(cls, use_mfsdp_v2, case, initial_parameters=None):
+    def _run_training(
+        cls,
+        use_mfsdp_v2,
+        case,
+        initial_parameters=None,
+        *,
+        gradient_accumulation_fusion=False,
+        num_steps=None,
+    ):
+        if num_steps is None:
+            num_steps = cls.NUM_STEPS
         model_parallel_config = case["model_parallel_config"]
         Utils.initialize_model_parallel(**model_parallel_config)
         data_parallel_group = mpu.get_data_parallel_group()
@@ -154,8 +164,8 @@ class TestMegatronFSDPE2EMxfp8:
                 vocab_size=cls.VOCAB_SIZE,
                 padded_vocab_size=cls.VOCAB_SIZE,
                 seq_length=cls.SEQUENCE_LENGTH,
-                train_iters=cls.NUM_STEPS,
-                gradient_accumulation_fusion=False,
+                train_iters=num_steps,
+                gradient_accumulation_fusion=gradient_accumulation_fusion,
                 use_distributed_optimizer=not use_mfsdp_v2,
                 **model_parallel_config,
                 **fp8_args,
@@ -171,7 +181,7 @@ class TestMegatronFSDPE2EMxfp8:
             data_iterators = [
                 make_gpt_mock_data_iterator(
                     dp_group=data_parallel_group,
-                    num_samples=cls.GLOBAL_BATCH_SIZE * cls.NUM_STEPS,
+                    num_samples=cls.GLOBAL_BATCH_SIZE * num_steps,
                     vocab_size=cls.VOCAB_SIZE,
                     sequence_length=cls.SEQUENCE_LENGTH,
                     batch_size=cls.MICRO_BATCH_SIZE,
@@ -184,8 +194,10 @@ class TestMegatronFSDPE2EMxfp8:
             grad_norms = []
             parameter_snapshots = []
             run_name = "MFSDP v2" if use_mfsdp_v2 else "MFSDP v1 reference"
+            if gradient_accumulation_fusion:
+                run_name += " fused wgrad"
 
-            for step in range(cls.NUM_STEPS):
+            for step in range(num_steps):
                 optimizer.zero_grad()
                 output = pretrain_forward_backward(
                     model=model,
@@ -218,7 +230,7 @@ class TestMegatronFSDPE2EMxfp8:
                     grad_norm_text = "None" if grad_norm is None else f"{float(grad_norm):.8f}"
                     print(
                         f"[{case['name']}][{run_name}] "
-                        f"step={step + 1}/{cls.NUM_STEPS} "
+                        f"step={step + 1}/{num_steps} "
                         f"loss={loss.item():.8f} grad_norm={grad_norm_text} "
                         f"update_successful={update_successful}",
                         flush=True,
@@ -235,6 +247,47 @@ class TestMegatronFSDPE2EMxfp8:
             }
         finally:
             Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _assert_training_parity(actual, reference, case):
+        assert len(actual["losses"]) == len(reference["losses"])
+        for step, (loss, reference_loss) in enumerate(zip(actual["losses"], reference["losses"])):
+            assert_close(
+                loss,
+                reference_loss,
+                **case["loss_tolerance"],
+                msg=lambda msg: f"Loss mismatch at step {step}: {msg}",
+            )
+
+        assert len(actual["grad_norms"]) == len(reference["grad_norms"])
+        for step, (grad_norm, reference_grad_norm) in enumerate(
+            zip(actual["grad_norms"], reference["grad_norms"])
+        ):
+            if grad_norm is not None and reference_grad_norm is not None:
+                assert_close(
+                    torch.as_tensor(grad_norm),
+                    torch.as_tensor(reference_grad_norm),
+                    atol=0,
+                    rtol=0.05,
+                    msg=lambda msg: f"Grad norm mismatch at step {step}: {msg}",
+                )
+
+        assert actual["fp8_names"] == reference["fp8_names"]
+        assert len(actual["parameters"]) == len(reference["parameters"])
+        for step, (parameters, reference_parameters) in enumerate(
+            zip(actual["parameters"], reference["parameters"])
+        ):
+            assert parameters.keys() == reference_parameters.keys()
+            for name in parameters:
+                if name in actual["fp8_names"]:
+                    continue
+                assert_close(
+                    parameters[name],
+                    reference_parameters[name],
+                    **case["parameter_tolerance"],
+                    msg=lambda msg: f"Parameter {name!r} mismatch at step {step}: {msg}",
+                )
+
     @pytest.mark.skipif(
         not HAVE_TE_MXFP8TENSOR
         or torch.cuda.get_device_capability()[0] < 10,
@@ -276,40 +329,52 @@ class TestMegatronFSDPE2EMxfp8:
         if torch.distributed.get_rank() == 0:
             print(f"[{case['name']}] MFSDP v2 run completed successfully.", flush=True)
 
-        assert len(actual["losses"]) == len(reference["losses"])
-        for step, (loss, reference_loss) in enumerate(zip(actual["losses"], reference["losses"])):
-            assert_close(
-                loss,
-                reference_loss,
-                **case["loss_tolerance"],
-                msg=lambda msg: f"Loss mismatch at step {step}: {msg}",
-            )
+        self._assert_training_parity(actual, reference, case)
 
-        assert len(actual["grad_norms"]) == len(reference["grad_norms"])
-        for step, (grad_norm, reference_grad_norm) in enumerate(
-            zip(actual["grad_norms"], reference["grad_norms"])
-        ):
-            if grad_norm is not None and reference_grad_norm is not None:
-                assert_close(
-                    torch.as_tensor(grad_norm),
-                    torch.as_tensor(reference_grad_norm),
-                    atol=0,
-                    rtol=0.05,
-                    msg=lambda msg: f"Grad norm mismatch at step {step}: {msg}",
-                )
+    @pytest.mark.skipif(
+        not HAVE_TE_MXFP8TENSOR or torch.cuda.get_device_capability()[0] < 10,
+        reason="Requires a Blackwell GPU with Transformer Engine MXFP8Tensor support.",
+    )
+    def test_fused_wgrad_with_1f1b_ep_overlap(self):
+        """Delayed 1F1B preserves MXFP8 fused-wgrad training results."""
+        case = {
+            "name": "EP2 MXFP8 delayed 1F1B fused wgrad",
+            "model_parallel_config": {"expert_model_parallel_size": 2},
+            "model_config": {
+                "data_parallel_sharding_strategy": "optim_grads_params",
+                "megatron_fsdp_main_grads_dtype": torch.float32,
+                "moe_token_dispatcher_type": "alltoall",
+                "overlap_moe_expert_parallel_comm": True,
+                "delay_wgrad_compute": True,
+            },
+            "loss_tolerance": {"atol": 0, "rtol": 0.05},
+            "parameter_tolerance": {"atol": 5e-3, "rtol": 1e-3},
+        }
+        # Keep fusion and MXFP8 enabled on both sides so this comparison isolates
+        # the fine-grained delayed-1F1B lifecycle from TE fused-GEMM numerics.
+        # Instantiating the reference also verifies that MXFP8 parameter gather
+        # composes with MFSDP fused wgrad outside the overlap schedule.
+        reference_case = {
+            **case,
+            "name": "EP2 MXFP8 fused wgrad",
+            "model_config": {
+                key: value
+                for key, value in case["model_config"].items()
+                if key not in ("overlap_moe_expert_parallel_comm", "delay_wgrad_compute")
+            },
+        }
+        reference = self._run_training(
+            use_mfsdp_v2=True,
+            case=reference_case,
+            gradient_accumulation_fusion=True,
+            num_steps=3,
+        )
+        actual = self._run_training(
+            use_mfsdp_v2=True,
+            case=case,
+            initial_parameters=reference["initial_parameters"],
+            gradient_accumulation_fusion=True,
+            num_steps=3,
+        )
 
-        assert actual["fp8_names"] == reference["fp8_names"]
-        assert len(actual["parameters"]) == len(reference["parameters"])
-        for step, (parameters, reference_parameters) in enumerate(
-            zip(actual["parameters"], reference["parameters"])
-        ):
-            assert parameters.keys() == reference_parameters.keys()
-            for name in parameters:
-                if name in actual["fp8_names"]:
-                    continue
-                assert_close(
-                    parameters[name],
-                    reference_parameters[name],
-                    **case["parameter_tolerance"],
-                    msg=lambda msg: f"Parameter {name!r} mismatch at step {step}: {msg}",
-                )
+        self._assert_training_parity(actual, reference, case)
