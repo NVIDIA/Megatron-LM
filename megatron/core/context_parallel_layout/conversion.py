@@ -9,16 +9,16 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, Union, cast
 
 import torch
 
-from megatron.core.context_parallel_layout.metadata import (
-    get_packed_seq_params_cp_partition_cu_seqlens,
-)
 from megatron.core.context_parallel_layout.routes import (
-    _cp_layout_nvtx_range,
     build_thd_cp_partition_route,
     get_thd_cp_partition_route,
 )
 from megatron.core.context_parallel_layout.types import CpPartitionMode, ThdCpRoute
+from megatron.core.context_parallel_layout.utils import (
+    get_packed_seq_params_cp_partition_cu_seqlens,
+)
 from megatron.core.tensor_parallel.mappings import all_to_all
+from megatron.core.utils import nvtx_range
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -344,7 +344,7 @@ def _redistribute_thd_layout(
     assert cp_group is not None
     cp_rank = cp_group.rank()
     conversion_name = f"{source_partition_mode}_to_{target_partition_mode}"
-    with _cp_layout_nvtx_range(f"cp_layout/thd/swap/{conversion_name}"):
+    with nvtx_range(f"cp_layout/thd/swap/{conversion_name}"):
         if seq_dim != 0:
             x = x.movedim(seq_dim, 0)
         x = x.contiguous()
@@ -388,12 +388,12 @@ def _redistribute_thd_layout(
                 f"target_layout={target_partition_mode!r}."
             )
 
-        with _cp_layout_nvtx_range(f"cp_layout/thd/pack/{conversion_name}"):
+        with nvtx_range(f"cp_layout/thd/pack/{conversion_name}"):
             send_buf = _pack_thd_cp_route_send_buffer(x=x, send_index=send_index)
             if not send_buf.is_contiguous():
                 send_buf = send_buf.contiguous()
 
-        with _cp_layout_nvtx_range(f"cp_layout/thd/all_to_all/{conversion_name}"):
+        with nvtx_range(f"cp_layout/thd/all_to_all/{conversion_name}"):
             recv_buf = all_to_all(
                 group=cp_group,
                 input_=send_buf,
@@ -401,7 +401,7 @@ def _redistribute_thd_layout(
                 input_split_sizes=input_split_sizes,
             )
 
-        with _cp_layout_nvtx_range(f"cp_layout/thd/scatter/{conversion_name}"):
+        with nvtx_range(f"cp_layout/thd/scatter/{conversion_name}"):
             out_shape = (local_target_length,) + tuple(x.shape[1:])
             out = _scatter_thd_cp_route_recv_buffer(
                 recv_buf=recv_buf, recv_index=recv_index, out_shape=out_shape
@@ -653,12 +653,14 @@ def _redistribute_sbhd_layout(
         send_buffer = segments.flip(0).reshape(input_contiguous.shape)
     input_split_sizes = [count * segment_len for count in plan.input_segment_counts]
     output_split_sizes = [count * segment_len for count in plan.output_segment_counts]
-    received = all_to_all(
-        group=communication_group,
-        input_=send_buffer,
-        output_split_sizes_=output_split_sizes,
-        input_split_sizes=input_split_sizes,
-    )
+    conversion_name = f"{source_layout}_to_{target_layout}"
+    with nvtx_range(f"cp_layout/sbhd/all_to_all/{conversion_name}"):
+        received = all_to_all(
+            group=communication_group,
+            input_=send_buffer,
+            output_split_sizes_=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+        )
 
     received_segments = received.reshape(segment_shape)
     if plan.receive_permutation == tuple(range(local_segment_count)):
