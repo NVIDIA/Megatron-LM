@@ -267,8 +267,10 @@ products:
   # noticing they broke this example. Running its suite as a unit-test bucket
   # makes that breakage visible in the same pipeline as the change.
   # Note that GitHub CI ignores the environment/tag matrix below and always
-  # runs dev+latest (see .github/actions/action.yml); the restriction is only
-  # load-bearing for the GitLab pipeline, which does expand it.
+  # runs dev+latest (see .github/actions/action.yml for the hardcoded
+  # --environment dev, and the `tag: latest` call sites in
+  # .github/workflows/cicd-main.yml); the restriction is only load-bearing for
+  # the GitLab pipeline, which does expand it.
   # tag: [latest] only — the legacy ref pins an older mcore *and* an older copy
   # of this example, so the pairing this bucket is meant to guard doesn't exist
   # there. environment: [dev] only — the suite has been validated against the

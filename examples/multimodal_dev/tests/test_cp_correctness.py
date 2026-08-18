@@ -6,7 +6,9 @@ Verifies that CP>1 produces the same (or numerically close) loss as CP=1
 for the Qwen3.5-VL multimodal model by running forward passes with
 deterministic data and comparing the per-rank reduced losses.
 
-Launch with torchrun (N must be >= 2*max_cp_size for zigzag splitting):
+Launch with torchrun (N must be a multiple of the CP size under test; the
+2*cp_size divisibility that zigzag splitting needs is a constraint on the
+sequence length, not on N, and is handled by ``aligned_seq_len``):
 
     # As a pytest module (this is what CI runs; CP sizes that do not
     # divide the world size are skipped):
@@ -31,6 +33,7 @@ Exit code 0 = PASS, 1 = FAIL.
 """
 
 import argparse
+import math
 import os
 import sys
 
@@ -47,7 +50,20 @@ from tests.unit_tests.test_utilities import Utils  # noqa: E402
 
 # Proxy-model / data sizes and tolerances. Shared by the pytest tests below
 # and by the CLI defaults in ``main`` so the two entry points cannot drift.
-DEFAULTS = dict(seq_len=128, seed=42, vocab_size=1024, atol=1e-4, rtol=5e-2)
+# ``rtol`` is deliberately tight: CP only redistributes the same tokens, so the
+# reduced loss should barely move.  Measured on 8xH100 (bf16, 2-layer proxy):
+# CP=2 differs from CP=1 by 2.9e-6 relative and CP=4 by 1.6e-5, so 1e-3 keeps
+# ~60x headroom while still failing on a real CP regression.  Grad-level
+# sensitivity for the same ``_cp_split_tensor`` helper is covered by
+# ``test_cp_thd_correctness.py``, which compares grad norms as well as loss
+# (its band is looser -- 2e-3 relative -- sized by its worst case, BSHD
+# grad_norm at 3.4e-4; its THD grad_norm is tighter than its loss, so this is
+# not a general "grads diverge more" rule. See its TOLERANCES).
+DEFAULTS = dict(seq_len=128, seed=42, vocab_size=1024)
+
+# Comparison band, kept out of DEFAULTS because ``run_cp`` never reads it -- only
+# the assertion and the CLI do (mirrors ``test_cp_thd_correctness.TOLERANCES``).
+TOLERANCES = dict(atol=1e-4, rtol=1e-3)
 
 # CP sizes the pytest entry point compares against the CP=1 baseline. Sizes
 # that do not divide the world size are skipped at runtime.
@@ -62,15 +78,15 @@ def _parse_args():
     )
     parser.add_argument(
         "--seq-len", type=int, default=DEFAULTS["seq_len"],
-        help="Sequence length (must be divisible by 2*max(cp_size, tp_size*cp_size))",
+        help="Sequence length; rounded up to a multiple of 2*cp_size if needed",
     )
     parser.add_argument(
-        "--atol", type=float, default=DEFAULTS["atol"],
+        "--atol", type=float, default=TOLERANCES["atol"],
         help="Absolute tolerance for loss comparison",
     )
     parser.add_argument(
-        "--rtol", type=float, default=DEFAULTS["rtol"],
-        help="Relative tolerance for loss comparison (default 5%%)",
+        "--rtol", type=float, default=TOLERANCES["rtol"],
+        help="Relative tolerance for loss comparison (default %(default)s)",
     )
     parser.add_argument(
         "--seed", type=int, default=DEFAULTS["seed"],
@@ -130,7 +146,7 @@ def _make_deterministic_batch(seed, batch_size, seq_len, vocab_size, device):
     }
 
 
-def _build_tiny_model(cp_size, device):
+def _build_tiny_model(cp_size, device, vocab_size=DEFAULTS["vocab_size"]):
     """Build a minimal GPTModel for testing (no vision, no MoE)."""
     from megatron.core.models.gpt import GPTModel
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -162,7 +178,7 @@ def _build_tiny_model(cp_size, device):
     model = GPTModel(
         config=config,
         transformer_layer_spec=spec,
-        vocab_size=1024,
+        vocab_size=vocab_size,
         max_sequence_length=4096,
         pre_process=True,
         post_process=True,
@@ -234,9 +250,10 @@ def aligned_seq_len(seq_len, cp_sizes):
 
     Zigzag CP splitting needs the sequence to divide into ``2*cp_size``
     chunks, so a baseline that is to be reused across several CP sizes must
-    satisfy all of them at once.
+    satisfy all of them at once.  That is the LCM, not the max: ``max`` only
+    happens to work when every size divides the largest one.
     """
-    align = 2 * max(cp_sizes)
+    align = 2 * math.lcm(*cp_sizes)
     return ((seq_len + align - 1) // align) * align
 
 
@@ -280,7 +297,7 @@ def run_cp(
     # Set deterministic seed for model init
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    model, _ = _build_tiny_model(cp_size=cp_size, device=device)
+    model, _ = _build_tiny_model(cp_size=cp_size, device=device, vocab_size=vocab_size)
     if state_dict is None:
         state_dict = model.state_dict()
     else:
@@ -326,7 +343,7 @@ def test_cp_matches_cp1_baseline(request, cp_size):
     loss_cp1, state_dict = request.getfixturevalue("cp1_baseline")
     loss_cpN, _ = run_cp(cp_size, TEST_SEQ_LEN, state_dict=state_dict)
 
-    atol, rtol = DEFAULTS["atol"], DEFAULTS["rtol"]
+    atol, rtol = TOLERANCES["atol"], TOLERANCES["rtol"]
     diff = abs(loss_cpN - loss_cp1)
     assert diff <= atol + rtol * abs(loss_cp1), (
         f"CP={cp_size} loss {loss_cpN:.6f} differs from CP=1 loss {loss_cp1:.6f} "
