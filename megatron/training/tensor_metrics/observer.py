@@ -251,7 +251,8 @@ class TrainingTensorMetricObserver:
     unsupported.
 
     Args:
-        scheduled_metrics: Metrics paired with independent iteration intervals.
+        scheduled_metrics: Metrics paired with independent iteration intervals. Every metric must
+            explicitly declare at least one source kind supported by this observer.
         result_sink: Optional result consumer receiving the one-based reporting iteration. The
             default writes TensorBoard or WandB and falls back to stdout on the last rank.
     """
@@ -263,6 +264,7 @@ class TrainingTensorMetricObserver:
     ) -> None:
         self.scheduled_metrics = tuple(scheduled_metrics)
         self._result_sink = _write_scalar_results if result_sink is None else result_sink
+        self._validate_metric_sources(self.scheduled_metrics)
         self._parameter_names: CanonicalParameterNameMap | None = None
         self._parameter_names_key: tuple[tuple[int, ...], int, int] | None = None
         self._optimizer_parameter_manifest: tuple[_OptimizerParameterManifestEntry, ...] | None = (
@@ -271,10 +273,7 @@ class TrainingTensorMetricObserver:
         self._optimizer_parameter_manifest_key: tuple[int, int] | None = None
         self._module_names: dict[int, str] | None = None
         self._module_names_key: tuple[int, ...] | None = None
-        self._active_forward_metrics: tuple[ScheduledMetric, ...] = ()
-        self._active_forward_executor: TensorMetricExecutor | None = None
-        self._active_pg_collection: ProcessGroupCollection | None = None
-        self._active_module_names: dict[int, str] | None = None
+        self._forward_observation_active = False
         self._prepared_forward_values: dict[int, list[MetricTensor]] | None = None
         self._prepared_forward_iteration: int | None = None
 
@@ -297,21 +296,20 @@ class TrainingTensorMetricObserver:
             raise ValueError("Configured tensor metrics require a training iteration.")
         _validate_supported_topology(pg_collection)
         due_metrics = self._due_metrics(iteration)
-        self._validate_metric_sources(due_metrics)
         forward_metrics = tuple(
             scheduled
             for scheduled in due_metrics
-            if _metric_source_kinds(scheduled.metric) & _FORWARD_SOURCE_KINDS
+            if scheduled.metric.source_kinds & _FORWARD_SOURCE_KINDS
         )
         if not forward_metrics:
             yield
             return
-        if self._active_forward_metrics:
+        if self._forward_observation_active:
             raise RuntimeError("Tensor metric forward observation scopes must not be nested.")
 
         source_kinds = frozenset().union(
             *(
-                _metric_source_kinds(scheduled.metric) & _FORWARD_SOURCE_KINDS
+                scheduled.metric.source_kinds & _FORWARD_SOURCE_KINDS
                 for scheduled in forward_metrics
             )
         )
@@ -328,65 +326,52 @@ class TrainingTensorMetricObserver:
                     f"size one; unsupported axes: {unsupported_router_axes}."
                 )
         _validate_forward_observation_model(model, source_kinds)
-        self._active_forward_metrics = forward_metrics
-        self._active_forward_executor = TensorMetricExecutor(
-            _tensor_metric_process_groups(pg_collection)
-        )
-        self._active_pg_collection = pg_collection
-        self._active_module_names = self._get_module_names(model)
-        self._prepared_forward_values = {id(scheduled.metric): [] for scheduled in forward_metrics}
+        executor = TensorMetricExecutor(_tensor_metric_process_groups(pg_collection))
+        module_names = self._get_module_names(model)
+        prepared_values = {id(scheduled.metric): [] for scheduled in forward_metrics}
+        self._prepared_forward_values = prepared_values
         self._prepared_forward_iteration = iteration
+        self._forward_observation_active = True
+
+        def observe_forward_tensor(
+            owner: object,
+            name: str,
+            source_kind: str,
+            tensor: torch.Tensor,
+            tp_shard_dim: int | None,
+        ) -> None:
+            """Prepare one forward tensor for every active metric."""
+            owner_name = module_names.get(id(owner))
+            if owner_name is None:
+                raise ValueError(
+                    f"Cannot resolve a canonical tensor metric name for {type(owner).__name__}."
+                )
+            site_name = f"{owner_name}.{name}" if owner_name else name
+            site = MetricSite(site_name, source_kind)
+            value = MetricTensor(
+                tensor=tensor,
+                sites=(site,),
+                rank_relations=_forward_rank_relations(tp_shard_dim, pg_collection),
+            )
+            # Deliberately untimed: Megatron timers synchronize the device when they start and
+            # stop, which would serialize the forward-backward pass once per observed tensor. The
+            # commit in __call__ owns the "tensor-metrics" timer, where one synchronization is
+            # affordable.
+            with get_nvtx_range()("tensor-metrics"):
+                for scheduled in forward_metrics:
+                    prepared_values[id(scheduled.metric)].extend(
+                        executor.prepare(scheduled.metric, (value,))
+                    )
 
         try:
-            with capture_tensor_observations(self._observe_forward_tensor, source_kinds):
+            with capture_tensor_observations(observe_forward_tensor, source_kinds):
                 yield
         except BaseException:
             self._prepared_forward_values = None
             self._prepared_forward_iteration = None
             raise
         finally:
-            self._active_forward_metrics = ()
-            self._active_forward_executor = None
-            self._active_pg_collection = None
-            self._active_module_names = None
-
-    def _observe_forward_tensor(
-        self,
-        owner: object,
-        name: str,
-        source_kind: str,
-        tensor: torch.Tensor,
-        tp_shard_dim: int | None,
-    ) -> None:
-        """Prepare one forward tensor for every active metric accepting its site."""
-        if (
-            self._active_forward_executor is None
-            or self._active_pg_collection is None
-            or self._active_module_names is None
-            or self._prepared_forward_values is None
-        ):
-            raise RuntimeError("A tensor observation arrived outside an active metric scope.")
-        owner_name = self._active_module_names.get(id(owner))
-        if owner_name is None:
-            raise ValueError(
-                f"Cannot resolve a canonical tensor metric name for {type(owner).__name__}."
-            )
-        site_name = f"{owner_name}.{name}" if owner_name else name
-        site = MetricSite(site_name, source_kind)
-        value = MetricTensor(
-            tensor=tensor,
-            sites=(site,),
-            rank_relations=_forward_rank_relations(tp_shard_dim, self._active_pg_collection),
-        )
-        # Deliberately untimed: Megatron timers synchronize the device when they start and stop,
-        # which would serialize the forward-backward pass once per observed tensor. The commit in
-        # __call__ owns the "tensor-metrics" timer, where one synchronization is affordable.
-        with get_nvtx_range()("tensor-metrics"):
-            for scheduled in self._active_forward_metrics:
-                if scheduled.metric.accepts(site):
-                    self._prepared_forward_values[id(scheduled.metric)].extend(
-                        self._active_forward_executor.prepare(scheduled.metric, (value,))
-                    )
+            self._forward_observation_active = False
 
     @torch.no_grad()
     def __call__(
@@ -415,11 +400,10 @@ class TrainingTensorMetricObserver:
         due_metrics = self._due_metrics(iteration)
         if not due_metrics:
             return
-        self._validate_metric_sources(due_metrics)
         forward_metrics = tuple(
             scheduled
             for scheduled in due_metrics
-            if _metric_source_kinds(scheduled.metric) & _FORWARD_SOURCE_KINDS
+            if scheduled.metric.source_kinds & _FORWARD_SOURCE_KINDS
         )
         if forward_metrics and self._prepared_forward_iteration != iteration:
             raise RuntimeError(
@@ -432,7 +416,7 @@ class TrainingTensorMetricObserver:
                 optimizer_metrics = tuple(
                     scheduled
                     for scheduled in due_metrics
-                    if _metric_source_kinds(scheduled.metric) & _OPTIMIZER_SOURCE_KINDS
+                    if scheduled.metric.source_kinds & _OPTIMIZER_SOURCE_KINDS
                 )
                 optimizer_values = []
                 if optimizer_metrics:
@@ -468,6 +452,16 @@ class TrainingTensorMetricObserver:
 
     @staticmethod
     def _validate_metric_sources(scheduled_metrics: Sequence[ScheduledMetric]) -> None:
+        undeclared_sources = {
+            scheduled.metric.name or type(scheduled.metric).__name__
+            for scheduled in scheduled_metrics
+            if not scheduled.metric.source_kinds
+        }
+        if undeclared_sources:
+            raise ValueError(
+                "Metrics configured with the training tensor metric observer must explicitly "
+                f"declare source_kinds; missing declarations: {sorted(undeclared_sources)}."
+            )
         unsupported_sources = {
             source_kind
             for scheduled in scheduled_metrics
@@ -527,11 +521,6 @@ class TrainingTensorMetricObserver:
             )
             self._optimizer_parameter_manifest_key = key
         return self._optimizer_parameter_manifest
-
-
-def _metric_source_kinds(metric: TensorMetric) -> frozenset[str]:
-    """Return declared sources, treating an empty declaration as accepting every source."""
-    return metric.source_kinds or _SUPPORTED_SOURCE_KINDS
 
 
 def _forward_rank_relations(

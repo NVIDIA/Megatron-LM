@@ -168,6 +168,22 @@ def test_scheduled_metric_keeps_interval_outside_metric_definition():
         ScheduledMetric(LayerL2NormMetric(), interval=0)
 
 
+def test_training_observer_requires_explicit_metric_sources():
+    class UndeclaredSourceMetric(LayerL2NormMetric):
+        source_kinds = frozenset()
+
+    with pytest.raises(ValueError, match="must explicitly declare source_kinds"):
+        TrainingTensorMetricObserver([ScheduledMetric(UndeclaredSourceMetric(), interval=1)])
+
+
+def test_training_observer_validates_metric_sources_at_construction():
+    class UnsupportedSourceMetric(LayerL2NormMetric):
+        source_kinds = frozenset({"future-source"})
+
+    with pytest.raises(NotImplementedError, match="future-source"):
+        TrainingTensorMetricObserver([ScheduledMetric(UnsupportedSourceMetric(), interval=1)])
+
+
 @pytest.mark.parametrize(
     ("specifications", "message"),
     (
@@ -459,6 +475,60 @@ def test_observer_prepares_and_accumulates_forward_sources_until_commit():
         for result in results_by_label.values():
             torch.testing.assert_close(result, torch.tensor(value))
     assert observer._prepared_forward_values is None
+
+
+def test_forward_observer_delegates_site_filtering_to_executor():
+    class ResidualMetric(LayerL2NormMetric):
+        source_kinds = frozenset({"residual_accumulator"})
+
+    metric = ResidualMetric()
+    metric.accepts = mock.Mock(wraps=metric.accepts)
+    observer = TrainingTensorMetricObserver(
+        [ScheduledMetric(metric, interval=1)], result_sink=lambda *args: None
+    )
+    model = _forward_model()
+    layer = model.decoder.layers[0]
+    pg_collection = _pg_collection()
+
+    with observer.observe_forward_backward(model=[model], iteration=0, pg_collection=pg_collection):
+        observe_tensor(
+            layer,
+            "residual_accumulator",
+            "residual_accumulator",
+            torch.tensor([3.0, 4.0]),
+        )
+
+    assert metric.accepts.call_count == 1
+
+
+def test_repeated_forward_attempt_replaces_prepared_values_before_commit():
+    captured = []
+    observer = build_tensor_metric_observer(
+        ["global-output-logits-l2:1"],
+        result_sink=lambda metric, results, iteration: captured.extend(results),
+    )
+    assert observer is not None
+    model = _forward_model()
+    pg_collection = _pg_collection()
+
+    with observer.observe_forward_backward(model=[model], iteration=0, pg_collection=pg_collection):
+        observe_tensor(
+            model.output_layer, "output_logits", "output_logits", torch.tensor([3.0, 4.0])
+        )
+    with observer.observe_forward_backward(model=[model], iteration=0, pg_collection=pg_collection):
+        observe_tensor(
+            model.output_layer, "output_logits", "output_logits", torch.tensor([5.0, 12.0])
+        )
+
+    observer(
+        model=[model],
+        optimizer=_fp32_optimizer(model),
+        iteration=0,
+        pg_collection=pg_collection,
+    )
+
+    assert len(captured) == 1
+    torch.testing.assert_close(captured[0].tensor, torch.tensor(13.0))
 
 
 def test_observer_runs_router_diagnostic_metric_families():
