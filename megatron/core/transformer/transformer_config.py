@@ -1682,6 +1682,12 @@ class TransformerConfig(ModelParallelConfig):
             )
         elif self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+            if self.dsa_indexer_topk is None:
+                # DSAttention passes index_topk straight into the top-k kernels, so
+                # None cannot train; fail here rather than mid-iteration.
+                raise ValueError(
+                    "dsa_indexer_topk must be set for experimental_attention_variant='dsa'."
+                )
             if self.add_bias_linear:
                 raise ValueError(
                     "DSA uses AbsorbedMLASelfAttention, which requires add_bias_linear=False. "

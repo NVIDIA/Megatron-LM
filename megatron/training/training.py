@@ -401,6 +401,11 @@ def _topk_attended_positions_per_token(seqlen, topk, compress_ratio=1):
     The continuous form drops the ``+ topk / (2 * seqlen)`` term of the exact
     discrete sum, undercounting by a relative ``1 / (2 * seqlen - topk)``.
 
+    ``seqlen`` may be a float (the ``dsa`` caller passes the length-weighted
+    batch mean); the floor division then rounds it down to the nearest
+    selectable-entry count, leaving the ``frac ** 2 / mean ** 2`` residual
+    recorded at that caller.
+
     ``compress_ratio`` is the number of source tokens per selectable entry --
     ``1`` for DSA (top-k over the original KV) and ``4`` for the DSv4 CSA layers
     (top-k over 4x-compressed KV). Shared by both sparse-attention paths; they
@@ -993,9 +998,6 @@ def num_floating_point_operations(
                 # extra. Mirrors the ``dsa`` branch of ``transformer_flops`` so a
                 # DSA model reports the same FLOPs whether it is launched through
                 # a hybrid layer pattern or as a plain GPT model.
-                assert (
-                    dsa_indexer_topk is not None
-                ), "dsa_indexer_topk must be set for experimental_attention_variant='dsa'."
                 mla_core_term *= _dsa_sparse_core_scale(
                     total_tokens, seqlen_squared_sum, dsa_indexer_topk
                 )
@@ -1352,11 +1354,6 @@ def num_floating_point_operations(
             linear_self_attn_term = 0
             num_standard_attention_layers = num_layers
 
-            # Without top-k the core term stays dense while the indexer is still
-            # charged, which describes no real model. Matches the dsv4_hybrid asserts.
-            assert (
-                args.dsa_indexer_topk is not None
-            ), "dsa_indexer_topk must be set for experimental_attention_variant='dsa'."
             standard_self_attn_core_term *= _dsa_sparse_core_scale(
                 total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
             )
