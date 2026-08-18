@@ -853,10 +853,19 @@ class TestMHCWithCudaGraph:
         assert layer._uses_mhc_recompute_attn_cuda_graph_split()
         assert layer._is_thd_cuda_graph()
 
-    @pytest.mark.parametrize("offload_module", ["qkv_linear", "core_attn", "attn_proj"])
+    @pytest.mark.parametrize(
+        "offload_modules",
+        [
+            ["qkv_linear"],
+            ["core_attn"],
+            # attn_proj cannot be requested alone: its input is core_attn's output,
+            # and an earlier config check rejects that combination on its own terms.
+            ["core_attn", "attn_proj"],
+        ],
+    )
     @pytest.mark.parametrize("graph_modules", [["attn"], [CudaGraphModule.attn]])
     def test_mhc_split_config_rejects_attention_scope_offloading(
-        self, offload_module, graph_modules
+        self, offload_modules, graph_modules
     ):
         """The split must fail closed when captured attention modules are offloaded.
 
@@ -873,7 +882,7 @@ class TestMHCWithCudaGraph:
                 recompute_granularity="selective",
                 recompute_modules=["mhc"],
                 fine_grained_activation_offloading=True,
-                offload_modules=[offload_module],
+                offload_modules=offload_modules,
             )
 
     @pytest.mark.parametrize(

@@ -2533,6 +2533,16 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         cuda_graph_output = GraphableMegatronModule._te_cuda_graph_replay(
             self, aggregated, **graph_kwargs
         )
+
+        # Flush delayed offload groups from previous layers after graph replay, as
+        # TransformerLayer._te_cuda_graph_replay_impl does. The split returns out of
+        # that method before reaching its flush and exit_replay() only clears the
+        # _in_replay flag, so without this the queued groups never run and reset()
+        # drops them at the end of the iteration. This is the shared head of both
+        # split variants, so one call covers them.
+        if self.config.delay_offload_until_cuda_graph:
+            self.off_interface.flush_delayed_groups()
+
         if isinstance(cuda_graph_output, torch.Tensor):
             cuda_graph_output = (cuda_graph_output,)
         else:
