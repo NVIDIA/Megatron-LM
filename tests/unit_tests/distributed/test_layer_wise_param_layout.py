@@ -13,7 +13,12 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+from megatron.core.optimizer.emerging_optimizers import _is_muon_excluded
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    is_managed_by_layer_wise_optimizer,
+    tag_params_for_buffer_routing,
+)
 from megatron.core.optimizer.param_layout import BufferKey, pad_param_start, pad_to_divisor
 
 # ---------------------------------------------------------------------------
@@ -35,6 +40,25 @@ def _make_ddp_config(pad_for_high_busbw=False, grad_reduce_in_fp32=True):
     cfg.pad_buckets_for_high_nccl_busbw = pad_for_high_busbw
     cfg.grad_reduce_in_fp32 = grad_reduce_in_fp32
     return cfg
+
+
+class TestLayerwiseParameterRouting:
+
+    def test_explicit_muon_exclusion_matches_optimizer_routing(self):
+        param = _make_param((16, 8), use_muon=False)
+
+        assert _is_muon_excluded(param)
+        assert not is_managed_by_layer_wise_optimizer(param)
+
+    def test_tags_excluded_matrix_separately_from_muon_matrix(self):
+        model = torch.nn.Module()
+        model.muon_weight = _make_param((16, 8))
+        model.scalar_weight = _make_param((16, 8), use_muon=False)
+
+        tag_params_for_buffer_routing([model])
+
+        assert model.muon_weight.is_managed_by_layer_wise_optimizer
+        assert not model.scalar_weight.is_managed_by_layer_wise_optimizer
 
 
 # ---------------------------------------------------------------------------
