@@ -198,6 +198,58 @@ class OwnerGatherPlan:
     shard-holding ranks and reconstructs each owned matrix by concatenating shards in rank order
     (own shard at the owner's rank rows).
 
+    Example:
+
+    ```
+    # We are also using some pseudocode here for brevity.
+
+    # Assume:
+    torch.distributed.get_world_size() == 2
+    torch.distributed.get_rank() == 0  # We're observing from rank 0
+    param_0: torch.Tensor
+    param_1: torch.Tensor
+    # Params are in this order as observed by MFSDP.
+    model.param_groups == [{"params": [param_0, param_1]}]
+    # Both params are owned by rank 1 (was previously determined using `ShardPlan`s).
+    param_0.owner == 1
+    param_1.owner == 1
+
+    param_0.shape == (6, 4)  # Global shape.
+    param_1.shape == (4, 4)  # Global shape.
+    param_0.local_shard.shape == (3, 4)  # Rank 0 has shard indexed by `[0:3, ...]`.
+    param_1.local_shard.shape == (2, 4)  # Rank 0 has shard indexed by `[0:2, ...]`.
+    param_0.local_shard.numel == 12
+    param_1.local_shard.numel == 8
+
+    owner_gather_plan.send_buffers == {1: tensor(20)}  # 12 + 8 = 20 elements
+    # `owner_gather_plan.send_buffers[1]` represents the following in its packed flat buffer:
+    #   +--------------------+-------------------+
+    #   | param_0 (12 elems) | param_1 (8 elems) |
+    #   +--------------------+-------------------+
+    #                 byte order: -->
+
+    # Rank 0 owns nothing
+    owner_gather_plan.recv_sizes == {}
+    owner_gather_plan.own_shards == {}
+    owner_gather_plan.recv_offsets == {}
+
+    # ---
+
+    # Same settings as above, now observing from rank 1 (the owner):
+    torch.distributed.get_rank() == 1
+
+    param_0.local_shard.shape == (3, 4)  # Rank 1 has shard indexed by `[3:6, ...]`.
+    param_1.local_shard.shape == (2, 4)  # Rank 1 has shard indexed by `[2:4, ...]`.
+
+    send_buffers = {}  # Rank 1 owns everything.
+    recv_sizes = {0: 20}  # 12 + 8 = 20 elements from rank 0
+    own_shards = {0: param_0.local_shard, 1: param_1.local_shard}  # rank 1's own shards
+    recv_offsets = {
+        (0, 0): (0, 12, 3),  # `param_0` from rank 0: offset 0, 12 elems, 3 rows
+        (1, 0): (12, 8, 2),  # `param_1` from rank 0: offset 12, 8 elems, 2 rows
+    }
+    ```
+
     Attributes:
         send_buffers: Per-destination-owner flat send buffer (this rank's shards for that owner's
             params, in param order). Only owners other than this rank appear.
