@@ -279,6 +279,47 @@ def _worker_partial_pgs_fall_back_to_mpu(rank, world_size, port):
     ps.initialize_model_parallel()
 
 
+def _worker_seed_custom_gtp_groups_without_mpu(rank, world_size, port):
+    """Explicit GTP groups must seed their trackers without MPU groups."""
+    from megatron.core import parallel_state as ps
+    from megatron.core.tensor_parallel.random import (
+        get_cuda_rng_tracker,
+        get_gtp_remat_rng_tracker_name,
+    )
+    from megatron.training.initialize import _set_random_seed
+
+    singleton_group = None
+    for group_rank in range(world_size):
+        group = dist.new_group([group_rank])
+        if rank == group_rank:
+            singleton_group = group
+
+    pairing_groups = {}
+    for name, pairs in _PAIRINGS.items():
+        for pair in pairs:
+            group = dist.new_group(pair)
+            if rank in pair:
+                pairing_groups[name] = group
+
+    ps.destroy_model_parallel()
+    try:
+        _set_random_seed(
+            42,
+            pp_group=singleton_group,
+            dp_group=singleton_group,
+            tp_group=singleton_group,
+            ep_group=singleton_group,
+            etp_group=singleton_group,
+            gtp_remat_group=pairing_groups["adjacent"],
+            egtp_remat_group=pairing_groups["strided"],
+        )
+        states = get_cuda_rng_tracker().get_states()
+        assert get_gtp_remat_rng_tracker_name() in states
+        assert get_gtp_remat_rng_tracker_name(is_expert=True) in states
+    finally:
+        ps.initialize_model_parallel()
+
+
 class TestGTPCustomProcessGroups:
     def test_custom_gtp_pg_collection_matches_mpu(self):
         """A permuted-but-equivalent gtp_remat group must give identical fwd/bwd results."""
@@ -289,3 +330,8 @@ class TestGTPCustomProcessGroups:
         """Omitting gtp_remat must fall back to the MPU group, not silently disable sharding."""
         _requires_multi_gpu(WORLD)
         _run_distributed(_worker_partial_pgs_fall_back_to_mpu, WORLD)
+
+    def test_custom_gtp_groups_seed_without_mpu(self):
+        """Explicit GTP groups must not depend on MPU rank or world-size state."""
+        _requires_multi_gpu(WORLD)
+        _run_distributed(_worker_seed_custom_gtp_groups_without_mpu, WORLD)
