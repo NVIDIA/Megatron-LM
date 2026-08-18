@@ -6,7 +6,7 @@ Pure shard-planning and owner-compute packing logic for MFSDP v2's all-`Flat` l
 The central data structure is `ShardPlan`, which describes how a single 2D parameter's full matrix
 is split across the DP group under MFSDP v2's all-`Flat` layout. Given shard plans,
 `assign_owner_work` balances owner-compute work across owner ranks using a caller-supplied cost
-function. `ShardPlan.from_flat_layout` builds a plan from DBuffer layout metadata,
+function. `ShardPlan.from_layout_params` builds a plan from DBuffer layout metadata,
 `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` build the flat P2P send/recv buffers,
 `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full matrix on the owner,
 and `OwnerScatterPlan.unpack` extracts received result shards.
@@ -54,7 +54,7 @@ class ShardPlan:
             )
 
     @classmethod
-    def from_flat_layout(
+    def from_layout_params(
         cls,
         full_shape: torch.Size,
         tensor_flat_offset: int,
@@ -72,11 +72,11 @@ class ShardPlan:
             world_size: DP group size.
         """
         if len(full_shape) != 2:
-            raise ValueError(f"ShardPlan.from_flat_layout requires a 2D shape, got {full_shape}.")
+            raise ValueError(f"ShardPlan.from_layout_params requires a 2D shape, got {full_shape}.")
         row_size = non_leading_numel(full_shape)
         if row_size <= 0:
             raise ValueError(
-                f"ShardPlan.from_flat_layout requires non-empty rows, got shape {full_shape}."
+                f"ShardPlan.from_layout_params requires non-empty rows, got shape {full_shape}."
             )
         tensor_end = tensor_flat_offset + full_shape.numel()
 

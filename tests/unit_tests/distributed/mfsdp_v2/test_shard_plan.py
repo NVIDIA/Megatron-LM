@@ -3,7 +3,7 @@
 """
 Pure CPU tests for the shard-planning and owner-compute packing logic.
 
-These tests exercise `ShardPlan.from_flat_layout`, `assign_owner_work`, `OwnerGatherPlan.pack`,
+These tests exercise `ShardPlan.from_layout_params`, `assign_owner_work`, `OwnerGatherPlan.pack`,
 `OwnerGatherPlan.reconstruct_full`, `OwnerScatterPlan.pack`, and `OwnerScatterPlan.unpack` without a
 process group or any `torch.distributed` dependency. P2P communication is simulated in-process by
 `_simulate_p2p`.
@@ -43,7 +43,7 @@ def _ns_cost(num_ns_steps: int) -> Callable[[ShardPlan], int]:
 
 def test_compute_shard_plan_even_split():
     """A matrix exactly divisible by world_size splits evenly across ranks."""
-    plan = ShardPlan.from_flat_layout(
+    plan = ShardPlan.from_layout_params(
         torch.Size((8, 4)), tensor_flat_offset=0, rank_flat_shard_size=16, world_size=2
     )
     assert plan.full_shape == torch.Size((8, 4))
@@ -57,7 +57,7 @@ def test_compute_shard_plan_boundary_param_split_across_ranks():
     """A small matrix landing across a rank boundary is split unevenly."""
     # 6 rows, 3 cols; each rank's flat shard is 9 elements (= 3 rows). rank0 owns flat [0,9), rank1
     # owns [9,18). Tensor occupies [0,18) fully.
-    plan = ShardPlan.from_flat_layout(
+    plan = ShardPlan.from_layout_params(
         torch.Size((6, 3)), tensor_flat_offset=0, rank_flat_shard_size=9, world_size=2
     )
     assert plan.rank_rows == ((0, 3), (3, 3))
@@ -68,7 +68,7 @@ def test_compute_shard_plan_fully_local_param_on_one_rank():
     """A matrix fully contained in one rank's flat shard is fully local."""
     # 4 rows, 2 cols = 8 elements. rank0 shard = [0,12), rank1 = [12,24). Tensor at offset 0 with 8
     # elements fits entirely in rank0.
-    plan = ShardPlan.from_flat_layout(
+    plan = ShardPlan.from_layout_params(
         torch.Size((4, 2)), tensor_flat_offset=0, rank_flat_shard_size=12, world_size=2
     )
     assert plan.rank_rows == ((0, 4), (0, 0))
@@ -79,7 +79,7 @@ def test_compute_shard_plan_fully_local_param_on_one_rank():
 def test_compute_shard_plan_empty_rank_has_zero_rows():
     """A rank whose flat shard does not overlap the tensor owns zero rows."""
     # Tensor offset 12 (entirely in rank1). rank0 gets (0,0).
-    plan = ShardPlan.from_flat_layout(
+    plan = ShardPlan.from_layout_params(
         torch.Size((4, 3)), tensor_flat_offset=12, rank_flat_shard_size=12, world_size=2
     )
     assert plan.rank_rows == ((0, 0), (0, 4))
@@ -146,8 +146,8 @@ def test_pack_and_reconstruct_round_trip():
     torch.manual_seed(0)
     world_size = 2
     # Two params, both boundary, shapes (6,3) and (4,2). Owners: param0->rank0, param1->rank1.
-    plan0 = ShardPlan.from_flat_layout(torch.Size((6, 3)), 0, 9, world_size)
-    plan1 = ShardPlan.from_flat_layout(torch.Size((4, 2)), 0, 4, world_size)
+    plan0 = ShardPlan.from_layout_params(torch.Size((6, 3)), 0, 9, world_size)
+    plan1 = ShardPlan.from_layout_params(torch.Size((4, 2)), 0, 4, world_size)
     plans = [plan0, plan1]
     owners = {0: 0, 1: 1}
 
@@ -189,8 +189,8 @@ def test_pack_and_unpack_result_round_trip():
     """Scattered result shards match the owner's full result sliced per rank."""
     torch.manual_seed(1)
     world_size = 2
-    plan0 = ShardPlan.from_flat_layout(torch.Size((6, 3)), 0, 9, world_size)
-    plan1 = ShardPlan.from_flat_layout(torch.Size((4, 2)), 0, 4, world_size)
+    plan0 = ShardPlan.from_layout_params(torch.Size((6, 3)), 0, 9, world_size)
+    plan1 = ShardPlan.from_layout_params(torch.Size((4, 2)), 0, 4, world_size)
     plans = [plan0, plan1]
     owners = {0: 0, 1: 1}
 
@@ -225,14 +225,14 @@ def test_pack_and_unpack_result_round_trip():
         torch.testing.assert_close(received[other], expected, atol=0, rtol=0)
 
 
-def test_from_flat_layout_per_rank_data_not_uniform():
+def test_from_layout_params_per_rank_data_not_uniform():
     """Flat sharding with uniform buffer size but non-uniform per-rank tensor data.
 
     `GlobalLayout.build` pads the total size to a multiple of `chunk_size * dp_size` so every rank's
     flat buffer is the same size. However, the actual tensor data per rank is not necessarily
     uniform.
 
-    This test verifies `from_flat_layout` correctly computes the non-uniform per-rank row counts
+    This test verifies `from_layout_params` correctly computes the non-uniform per-rank row counts
     from a uniform `rank_flat_shard_size`.
     """
     # 5 rows, 4 cols = 20 elements. dp_size = 3.
@@ -242,7 +242,7 @@ def test_from_flat_layout_per_rank_data_not_uniform():
     #   rank 0: [0, 8)   -> 8 elements -> 2 rows
     #   rank 1: [8, 16)  -> 8 elements -> 2 rows
     #   rank 2: [16, 24) -> 4 elements -> 1 row  (4 elements of padding)
-    plan = ShardPlan.from_flat_layout(torch.Size((5, 4)), 0, 8, 3)
+    plan = ShardPlan.from_layout_params(torch.Size((5, 4)), 0, 8, 3)
     assert plan.rank_rows == ((0, 2), (2, 2), (4, 1))
     assert plan.shard_numel(0) == 8
     assert plan.shard_numel(1) == 8
