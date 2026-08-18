@@ -59,9 +59,7 @@ def _token_group(batch_id=0, *, empty=False):
 
 
 def _text_group():
-    return RolloutGroup(
-        rollouts=[Rollout(trajectory=["hello world"], reward=0.5, env_id="text")]
-    )
+    return RolloutGroup(rollouts=[Rollout(trajectory=["hello world"], reward=0.5, env_id="text")])
 
 
 def _empty_group():
@@ -80,9 +78,7 @@ def _active_generation(bank_dir):
 def _assert_group_matches(actual, expected):
     assert actual.batch_id == expected.batch_id
     assert len(actual.rollouts) == len(expected.rollouts)
-    for actual_rollout, expected_rollout in zip(
-        actual.rollouts, expected.rollouts, strict=True
-    ):
+    for actual_rollout, expected_rollout in zip(actual.rollouts, expected.rollouts, strict=True):
         assert type(actual_rollout) is type(expected_rollout)
         assert actual_rollout.trajectory == expected_rollout.trajectory
         assert actual_rollout.reward == expected_rollout.reward
@@ -145,9 +141,7 @@ def test_rollout_bank_round_trip(tmp_path, group_factory):
         pytest.param(1, True, id="consumed-after-checkpoint"),
     ],
 )
-def test_checkpoint_compacts_at_consumption_boundary(
-    tmp_path, consumed_offset, should_restore
-):
+def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, should_restore):
     """Checkpoint compaction prunes trained groups and preserves future markers."""
     checkpoint_iteration = 10
     bank = RolloutBank(str(tmp_path))
@@ -170,9 +164,7 @@ def test_checkpoint_compacts_at_consumption_boundary(
     restarted = RolloutBank(str(tmp_path))
     restored = restarted.restore(checkpoint_iteration)
     restored_uids = {group.uid for group in restored}
-    assert restored_uids == (
-        {consumed, never_consumed} if should_restore else {never_consumed}
-    )
+    assert restored_uids == ({consumed, never_consumed} if should_restore else {never_consumed})
     for group in restored:
         _assert_group_matches(group, _token_group())
 
@@ -194,23 +186,14 @@ def test_checkpoint_compacts_at_consumption_boundary(
 
 def _env_group(env_id, problem_id):
     return RolloutGroup(
-        rollouts=[
-            Rollout(
-                trajectory=["cached"],
-                reward=1.0,
-                env_id=env_id,
-                problem_id=problem_id,
-            )
-        ]
+        rollouts=[Rollout(trajectory=["cached"], reward=1.0, env_id=env_id, problem_id=problem_id)]
     )
 
 
 def _weighted_agent(env_weights):
     return WeightedMultiTask(
         [
-            AgentConfig(
-                agent_type=MockGenerator, agent_args={"env_id": env_id}, weight=weight
-            )
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": env_id}, weight=weight)
             for env_id, weight in env_weights
         ]
     )
@@ -244,26 +227,10 @@ def _weighted_agent(env_weights):
             id="streaming-backlog-drains-before-fresh",
         ),
         pytest.param(
-            [("", 1.0)],
-            "",
-            1,
-            2,
-            2,
-            {"": 2},
-            [1],
-            False,
-            id="single-environment-without-env-id",
+            [("", 1.0)], "", 1, 2, 2, {"": 2}, [1], False, id="single-environment-without-env-id"
         ),
         pytest.param(
-            [("a", 1.0)],
-            "a",
-            0,
-            4,
-            4,
-            {"a": 4},
-            [4],
-            True,
-            id="fresh-groups-write-through",
+            [("a", 1.0)], "a", 0, 4, 4, {"a": 4}, [4], True, id="fresh-groups-write-through"
         ),
     ],
 )
@@ -281,8 +248,7 @@ async def test_pipeline_uses_restored_groups_before_fresh_generation(
     """Restored groups retain weighted routing; fresh groups remain durable."""
     agent = _weighted_agent(env_weights)
     restored = [
-        _env_group(restored_env, problem_id=f"cached-{index}")
-        for index in range(restored_count)
+        _env_group(restored_env, problem_id=f"cached-{index}") for index in range(restored_count)
     ]
     assert agent.set_restored_groups(restored) == restored_count
 
@@ -300,17 +266,11 @@ async def test_pipeline_uses_restored_groups_before_fresh_generation(
         inference_interface=MockInferenceInterface(),
     )
     pipeline = RolloutPipeline(
-        agent,
-        request,
-        parallel_generation_tasks=1,
-        initial_batch_id=20,
-        bank=bank,
+        agent, request, parallel_generation_tasks=1, initial_batch_id=20, bank=bank
     )
 
     async with aclosing(pipeline.run()) as groups:
-        produced = [
-            await asyncio.wait_for(anext(groups), timeout=10) for _ in range(take_count)
-        ]
+        produced = [await asyncio.wait_for(anext(groups), timeout=10) for _ in range(take_count)]
 
     assert len(produced) == take_count
     assert Counter(group[0].env_id for group in produced) == expected_envs
