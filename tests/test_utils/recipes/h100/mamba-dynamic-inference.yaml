@@ -86,5 +86,5 @@ products:
   - test_case: [hybrid_gdp_dynamic_inference_tp1_pp1_dp8_800m]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
