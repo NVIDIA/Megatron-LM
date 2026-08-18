@@ -1194,3 +1194,134 @@ class TestDSA:
         assert flops == _dsa_golden_flops(args, total_tokens, sum_sq)
         # A frozen indexer must cost strictly less than a trained one.
         assert flops < num_floating_point_operations(_make_dsa_args(0.01), batch_size)
+
+
+def _make_dsa_pair(*, num_layers, moe):
+    """Build (standard_args, hybrid_args) for the SAME DSA model.
+
+    The standard-model path expresses it as ``num_layers`` fused layers
+    (MLA attention + FFN, ``experimental_attention_variant`` = ``dsa``); the
+    hybrid-model path expresses the identical model as a ``D<ffn>`` pattern with
+    one attention layer and one FFN layer each.
+
+    Both use ``dsa_indexer_topk_freq=1``. With cross-layer index sharing the two
+    expressions are genuinely different models rather than two spellings of one:
+    ``is_dsa_skip_topk_layer`` keys off the layer's global position, and the
+    hybrid pattern gives its DSA layers the odd positions (1, 3, 5, ...) because
+    the FFN layers are counted separately. Sharing therefore lands on a different
+    subset of layers and the FLOPs are legitimately allowed to differ.
+    """
+    ffn_symbol = "E" if moe else "-"
+
+    def _configure(args):
+        args.multi_latent_attention = True
+        args.group_query_attention = False
+        args.q_lora_rank = 128
+        args.kv_lora_rank = 64
+        args.qk_head_dim = 48
+        args.qk_pos_emb_head_dim = 16
+        args.v_head_dim = 64
+        args.experimental_attention_variant = "dsa"
+        args.dsa_indexer_n_heads = 4
+        args.dsa_indexer_head_dim = 32
+        args.dsa_indexer_topk = 16
+        args.dsa_indexer_topk_freq = 1
+        args.dsa_indexer_skip_topk_offset = 0
+        args.dsa_indexer_loss_coeff = 0.01
+        if moe:
+            args.num_experts = 256
+            args.moe_layer_freq = 1
+            args.moe_router_topk = 6
+            args.moe_ffn_hidden_size = 2048
+            args.moe_shared_expert_intermediate_size = 2048
+
+    standard = _make_gpt_args(
+        num_layers=num_layers,
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
+    )
+    _configure(standard)
+
+    hybrid = _make_gpt_args(
+        num_layers=num_layers,
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
+    )
+    _configure(hybrid)
+    hybrid.mamba_state_dim = 128
+    hybrid.mamba_head_dim = 64
+    hybrid.mamba_num_groups = 8
+    hybrid.mamba_num_heads = 128
+    hybrid.hybrid_layer_pattern = "D" + ffn_symbol
+    hybrid.hybrid_layer_pattern *= num_layers
+    return standard, hybrid
+
+
+class TestDSAHybridMatchesStandard:
+    """The hybrid-model path and the standard-model path must agree for DSA.
+
+    A ``--hybrid-layer-pattern`` containing ``D`` builds a real ``DSAttention``
+    (``arguments.py`` sets ``experimental_attention_variant='dsa'`` for it), but
+    ``hybrid_flops`` used to fall through to the plain full-MLA helper: dense
+    ``O(L^2)`` core attention with no top-k scaling, and no indexer cost at all.
+    The same model therefore reported very different FLOPs depending only on
+    whether it was launched with a layer pattern.
+    """
+
+    @staticmethod
+    def _assert_match(*, num_layers, moe):
+        standard, hybrid = _make_dsa_pair(num_layers=num_layers, moe=moe)
+        batch_size = 2
+
+        # BSHD (closed-form defaults).
+        assert num_floating_point_operations(standard, batch_size) == num_floating_point_operations(
+            hybrid, batch_size
+        )
+
+        # THD: both paths must consume the ragged stats identically.
+        s = standard.seq_length
+        thd_sum_sq = batch_size * 4 * (s // 4) ** 2
+        thd_tokens = batch_size * s * 3 // 4
+        assert num_floating_point_operations(
+            standard,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=thd_tokens,
+        ) == num_floating_point_operations(
+            hybrid,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=thd_tokens,
+        )
+
+    def test_dense(self):
+        """Dense FFN: the two paths must agree."""
+        self._assert_match(num_layers=4, moe=False)
+
+    def test_moe(self):
+        """MoE FFN: the two paths must agree."""
+        self._assert_match(num_layers=4, moe=True)
+
+    def test_hybrid_overcount_is_gone(self):
+        """Pin the bug: a long sequence must not be charged dense ``L^2 / 2``.
+
+        With ``seq_length`` well past ``dsa_indexer_topk`` the old hybrid path
+        (dense MLA core, no indexer) was strictly more expensive than the
+        corrected estimate.
+        """
+        _, hybrid = _make_dsa_pair(num_layers=4, moe=False)
+        hybrid.seq_length = 8192
+        batch_size = 1
+
+        corrected = num_floating_point_operations(hybrid, batch_size)
+
+        # Same model with the sparse correction disabled == the old behaviour.
+        dense = SimpleNamespace(**vars(hybrid))
+        dense.experimental_attention_variant = None
+        assert corrected < num_floating_point_operations(dense, batch_size)
