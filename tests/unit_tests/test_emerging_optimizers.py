@@ -10,6 +10,8 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
@@ -23,6 +25,7 @@ from megatron.core.optimizer.emerging_optimizers import (
 )
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -511,6 +514,88 @@ class TestMuonOptimizerMultiRankTP:
 
         return model, optimizer
 
+    def test_optimizer_factory_tags_qkv_when_tp_exceeds_query_groups(self):
+        """The public optimizer factory tags query groups fragmented across TP ranks."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tp_size = pg_collection.tp.size()
+        assert tp_size == 2
+        model_parallel_cuda_manual_seed(123)
+        transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            num_query_groups=1,
+            kv_channels=4,
+            tensor_model_parallel_size=tp_size,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+        )
+        model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_local_spec(),
+            vocab_size=32,
+            max_sequence_length=8,
+            pre_process=False,
+            post_process=False,
+            pg_collection=pg_collection,
+        )
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            use_distributed_optimizer=False,
+            muon_split_qkv=True,
+            muon_tp_mode="blockwise",
+        )
+
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=False,
+            pg_collection=pg_collection,
+        )
+
+        qkv_weight = model.decoder.layers[0].self_attention.linear_qkv.weight
+        assert optimizer is not None
+        assert qkv_weight.shape[0] == 8
+        assert qkv_weight.is_qkv
+        assert qkv_weight.qkv_split_shapes == [8, 4, 4]
+        assert qkv_weight.qkv_split_shapes_global == [8, 4, 4]
+        assert not qkv_weight.qkv_split_groups_are_complete
+
+    def test_optimizer_factory_skips_mismatched_qkv_layout(self):
+        """A QKV layout mismatch falls back to whole-matrix Muon orthogonalization."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tp_size = pg_collection.tp.size()
+        transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            num_query_groups=1,
+            kv_channels=4,
+            tensor_model_parallel_size=tp_size,
+        )
+        model = torch.nn.Module()
+        model.config = transformer_config
+        model.linear_qkv = torch.nn.Linear(8, 7, bias=False, dtype=torch.float32, device='cuda')
+        model.linear_qkv.weight.tensor_model_parallel = True
+        model.linear_qkv.weight.partition_dim = 0
+        optimizer_config = OptimizerConfig(
+            optimizer='muon', lr=0.01, use_distributed_optimizer=False, muon_split_qkv=True
+        )
+
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=False,
+            pg_collection=pg_collection,
+        )
+
+        qkv_weight = model.linear_qkv.weight
+        assert optimizer is not None
+        assert not qkv_weight.is_qkv
+        assert qkv_weight.qkv_split_shapes is None
+        assert qkv_weight.qkv_split_shapes_global is None
+
     @pytest.mark.parametrize("mode", ["duplicated", "distributed"])
     def test_muon_optimizer_modes_multirank_same_result(self, mode):
         """Test that duplicated and distributed modes produce same results with TP > 1."""
@@ -907,29 +992,12 @@ def test_muon_optimizer_qkv_split_per_head_requires_split_qkv():
         )
 
 
-def test_muon_optimizer_batched_ns_requires_emerging_optimizers_0_3(monkeypatch):
-    """Uniform per-head splits require Emerging-Optimizers batched NS support."""
+def test_muon_optimizer_uniform_per_head_splits_fall_back_without_batched_ns(monkeypatch):
+    """Uniform per-head splits use individual 2D calls before Emerging-Optimizers 0.3."""
     monkeypatch.setattr(
         "megatron.core.optimizer.emerging_optimizers.EMERGING_OPTIMIZERS_VERSION", Version("0.2.0")
     )
-    param = torch.nn.Parameter(torch.zeros(4, 4, dtype=torch.float32, device='cuda'))
-
-    with pytest.raises(RuntimeError, match="Batched Newton-Schulz requires.*>=0.3.0"):
-        TensorParallelMuon(
-            params=[param],
-            split_qkv=True,
-            split_qkv_per_head=True,
-            qkv_split_shapes=[2, 2],
-            pg_collection=None,
-        )
-
-
-def test_muon_optimizer_runtime_batched_ns_version_guard(monkeypatch):
-    """Per-parameter uniform splits are guarded when constructor shapes are unavailable."""
-    monkeypatch.setattr(
-        "megatron.core.optimizer.emerging_optimizers.EMERGING_OPTIMIZERS_VERSION", Version("0.2.0")
-    )
-    grad = torch.zeros(4, 4, dtype=torch.float32, device='cuda')
+    grad = torch.arange(16, dtype=torch.float32, device='cuda').view(4, 4)
     param = torch.nn.Parameter(torch.zeros_like(grad))
     param.is_qkv = True
     param.qkv_split_shapes = [2, 2]
@@ -938,12 +1006,23 @@ def test_muon_optimizer_runtime_batched_ns_version_guard(monkeypatch):
         split_qkv=True,
         split_qkv_per_head=True,
         is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
-        qkv_split_shapes=None,
+        qkv_split_shapes=[2, 2],
         pg_collection=None,
     )
+    call_shapes = []
 
-    with pytest.raises(RuntimeError, match="Batched Newton-Schulz requires.*>=0.3.0"):
-        optimizer.orthogonalize(param, grad)
+    def center_rows(x, tp_group=None, partition_dim=None):
+        del tp_group, partition_dim
+        call_shapes.append(tuple(x.shape))
+        return x - x.mean(dim=-2, keepdim=True)
+
+    optimizer.scaled_orthogonalize_fn = center_rows
+    actual = optimizer.orthogonalize(param, grad)
+    assert call_shapes == [(2, 4), (2, 4)]
+    expected = torch.cat(
+        [head - head.mean(dim=-2, keepdim=True) for head in torch.split(grad, [2, 2])]
+    )
+    torch.testing.assert_close(actual, expected)
 
 
 def test_muon_optimizer_nonuniform_per_head_splits_do_not_require_batched_ns(monkeypatch):

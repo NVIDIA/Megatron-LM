@@ -795,13 +795,11 @@ def _get_megatron_emerging_optimizer(
                     qkv_split_shapes = _get_qkv_split_shapes(
                         model_chunk.config, split_qkv_per_head=config.muon_split_qkv_per_head
                     )
-                param.is_qkv = True
                 global_split_shapes = (
                     qkv_split_shapes
                     if config.muon_split_qkv_per_head
                     else qkv_split_shapes * model_chunk.config.num_query_groups
                 )
-                param.qkv_split_shapes_global = global_split_shapes
 
                 tp_group = (
                     pg_collection.expt_tp
@@ -834,17 +832,29 @@ def _get_megatron_emerging_optimizer(
                         f"pad_length={qkv_gtp_pad_length}, "
                         f"physical_tp_local_rows={physical_tp_local_rows}"
                     )
-                param.qkv_gtp_pad_length = qkv_gtp_pad_length
                 logical_tp_local_rows = physical_tp_local_rows - qkv_gtp_pad_length
                 expected_global_rows = logical_tp_local_rows * tp_size
                 if expected_global_rows != sum(global_split_shapes):
-                    raise RuntimeError(
-                        f"Muon QKV layout mismatch for {name}: "
+                    log_single_rank(
+                        logger,
+                        logging.DEBUG,
+                        f"Emerging optimizer QKV split skipped for {name}: "
                         f"global_rows={sum(global_split_shapes)}, "
                         f"local_rows={param.shape[0]}, tp_size={tp_size}, "
                         f"gtp_remat_size={gtp_size}, "
-                        f"gtp_pad_length={qkv_gtp_pad_length}"
+                        f"gtp_pad_length={qkv_gtp_pad_length}",
                     )
+                    param.is_qkv = False
+                    param.qkv_split_shapes = None
+                    param.qkv_split_shapes_global = None
+                    param.qkv_gtp_pad_length = 0
+                    param.qkv_split_groups_are_complete = False
+                    param.qkv_split_heads_are_complete = False
+                    continue
+
+                param.is_qkv = True
+                param.qkv_split_shapes_global = global_split_shapes
+                param.qkv_gtp_pad_length = qkv_gtp_pad_length
                 local_start = tp_rank * logical_tp_local_rows + gtp_rank * param.shape[0]
                 if config.muon_split_qkv_per_head:
                     if qkv_gtp_pad_length > 0:

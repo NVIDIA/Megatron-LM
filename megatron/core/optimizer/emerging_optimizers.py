@@ -54,14 +54,9 @@ except PackageNotFoundError:
 _BATCHED_NEWTON_SCHULZ_MIN_VERSION = Version("0.3.0")
 
 
-def _require_batched_newton_schulz_support() -> None:
-    """Ensure the installed Emerging-Optimizers supports batched Newton-Schulz."""
-    if EMERGING_OPTIMIZERS_VERSION < _BATCHED_NEWTON_SCHULZ_MIN_VERSION:
-        raise RuntimeError(
-            "Batched Newton-Schulz requires emerging-optimizers>=0.3.0; "
-            f"found {EMERGING_OPTIMIZERS_VERSION}. Disable muon_split_qkv_per_head or "
-            "upgrade emerging-optimizers."
-        )
+def _supports_batched_newton_schulz() -> bool:
+    """Return whether Emerging-Optimizers supports batched Newton-Schulz."""
+    return EMERGING_OPTIMIZERS_VERSION >= _BATCHED_NEWTON_SCHULZ_MIN_VERSION
 
 
 def get_supported_coefficient_types() -> tuple[str, ...]:
@@ -257,8 +252,6 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
         if split_qkv_per_head and not split_qkv:
             raise ValueError("split_qkv_per_head requires split_qkv=True")
-        if split_qkv_per_head and qkv_split_shapes and len(set(qkv_split_shapes)) == 1:
-            _require_batched_newton_schulz_support()
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -408,9 +401,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                     f"Muon per-head QKV split shape mismatch: grad_shape={tuple(grad.shape)}, "
                     f"split_shapes={split_shapes}"
                 )
-            if len(set(split_shapes)) == 1:
+            if len(set(split_shapes)) == 1 and _supports_batched_newton_schulz():
                 # A 3D input selects Emerging-Optimizers' batched Newton-Schulz path.
-                _require_batched_newton_schulz_support()
                 head_rows = split_shapes[0]
                 return orthogonalize_fn(grad.view(len(split_shapes), head_rows, -1)).view_as(grad)
             return torch.cat(
