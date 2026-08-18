@@ -371,7 +371,7 @@ def _get_param_groups(
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
     # Sort keys, None first.
-    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
+    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0], x[1])):
         param_override_tuple, is_expert_parallel = key
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
