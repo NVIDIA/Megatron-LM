@@ -36,6 +36,7 @@ def test_internal_backend_forwards_fla_compatible_arguments(monkeypatch):
         output_final_state=True,
         transpose_state_layout=True,
         custom_option="value",
+        recompute_h=True,
     )
 
     assert result is expected
@@ -45,6 +46,7 @@ def test_internal_backend_forwards_fla_compatible_arguments(monkeypatch):
     assert calls[0]["state_v_first"] is True
     assert "transpose_state_layout" not in calls[0]
     assert calls[0]["custom_option"] == "value"
+    assert calls[0]["recompute_h"] is True
 
 
 @pytest.mark.parametrize("option", ["use_beta_sigmoid_in_kernel", "allow_neg_eigval"])
@@ -110,8 +112,11 @@ def test_cute_mode_rejects_unsupported_inputs(monkeypatch):
         implementation.chunk_gated_delta_rule(**_inputs())
 
 
+@pytest.mark.parametrize("recompute_h", [False, True])
 @pytest.mark.parametrize("scale, expected_scale", [(None, 0.5), (0.0, 0.0)])
-def test_cute_mode_dispatches_to_local_autograd_function(monkeypatch, scale, expected_scale):
+def test_cute_mode_dispatches_to_local_autograd_function(
+    monkeypatch, scale, expected_scale, recompute_h
+):
     implementation = _implementation()
     inputs = _inputs()
     expected = (torch.empty(1), None)
@@ -127,8 +132,134 @@ def test_cute_mode_dispatches_to_local_autograd_function(monkeypatch, scale, exp
         implementation, "InternalChunkGatedDeltaRuleFunction", SimpleNamespace(apply=apply)
     )
 
-    assert implementation.chunk_gated_delta_rule(**inputs, scale=scale) is expected
+    result = implementation.chunk_gated_delta_rule(**inputs, scale=scale, recompute_h=recompute_h)
+    assert result is expected
+
     assert calls[0][5] == expected_scale
+    assert calls[0][8] is recompute_h
+
+
+@pytest.mark.parametrize("mode", ["auto", "cute"])
+@pytest.mark.parametrize("recompute_h", [False, True])
+def test_forward_save_h_policy_is_shared_by_fla_and_cute(monkeypatch, mode, recompute_h):
+    implementation = _implementation()
+    inputs = _inputs()
+    q = inputs["q"]
+    saved_h = torch.empty(1)
+    seen = []
+
+    def fla_forward(**kwargs):
+        seen.append(kwargs["save_fused_bwd_state"])
+        h = saved_h if kwargs["save_fused_bwd_state"] else None
+        return kwargs["g"], q, torch.empty(1), h, None
+
+    def cute_forward(**kwargs):
+        seen.append(kwargs["save_fused_bwd_state"])
+        h = saved_h if kwargs["save_fused_bwd_state"] else None
+        return kwargs["g"], q, torch.empty(1), h
+
+    context = SimpleNamespace()
+    context.save_for_backward = lambda *args: setattr(context, "saved_tensors", args)
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", mode)
+    monkeypatch.setattr(implementation, "_can_use_fused_bwd_forward", lambda *_args: True)
+    monkeypatch.setattr(implementation, "_fla_forward_for_fused_bwd", fla_forward)
+    monkeypatch.setattr(implementation, "_cutedsl_forward", cute_forward)
+
+    forward = implementation.InternalChunkGatedDeltaRuleFunction.forward
+    while hasattr(forward, "__wrapped__"):
+        forward = forward.__wrapped__
+    output, final_state = forward(
+        context,
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["g"],
+        inputs["beta"],
+        0.5,
+        None,
+        None,
+        recompute_h,
+    )
+
+    assert output is q and final_state is None
+    assert seen == [not recompute_h]
+    assert (context.saved_tensors[6] is None) is recompute_h
+
+
+@pytest.mark.parametrize("save_fused_bwd_state", [False, True])
+def test_fla_forward_can_save_fused_backward_h(monkeypatch, save_fused_bwd_state):
+    implementation = _implementation()
+    shape = (1, 64, 3, 4)
+    inputs = {
+        "q": torch.empty(shape),
+        "k": torch.empty(shape),
+        "v": torch.empty(shape),
+        "g": torch.empty(shape[:-1]),
+        "beta": torch.empty(shape[:-1]),
+    }
+    raw_h = torch.randn(1, 1, 3, 4, 4, dtype=torch.float32)
+    monkeypatch.setattr(implementation, "chunk_local_cumsum", lambda g, **_kwargs: g)
+    monkeypatch.setattr(
+        implementation,
+        "chunk_gated_delta_rule_fwd_intra",
+        lambda **kwargs: (kwargs["k"], kwargs["v"], torch.empty(1)),
+    )
+    monkeypatch.setattr(
+        implementation, "chunk_gated_delta_rule_fwd_h", lambda **kwargs: (raw_h, kwargs["u"], None)
+    )
+    monkeypatch.setattr(implementation, "chunk_fwd_o", lambda **kwargs: kwargs["q"])
+
+    _g, output, _A, saved_h, _chunk_indices = implementation._fla_forward_for_fused_bwd(
+        **inputs,
+        scale=0.5,
+        cu_seqlens=None,
+        cu_seqlens_cpu=None,
+        save_fused_bwd_state=save_fused_bwd_state,
+    )
+
+    assert output is inputs["q"]
+    if save_fused_bwd_state:
+        assert saved_h.shape == (1, 3, 4, 4)
+        assert saved_h.dtype == torch.bfloat16
+        assert saved_h.is_contiguous()
+        torch.testing.assert_close(saved_h, raw_h.reshape_as(saved_h).to(torch.bfloat16))
+    else:
+        assert saved_h is None
+
+
+@pytest.mark.parametrize("save_fused_bwd_state", [False, True])
+def test_cutedsl_forward_controls_fused_backward_h(monkeypatch, save_fused_bwd_state):
+    implementation = _implementation()
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_fwd_cute
+
+    shape = (1, 64, 3, 4)
+    q = torch.empty(shape)
+    inputs = {
+        "q": q,
+        "k": torch.empty_like(q),
+        "v": torch.empty_like(q),
+        "g": torch.empty(shape[:-1]),
+        "beta": torch.empty(shape[:-1]),
+    }
+    seen = {}
+
+    def launcher(**kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(implementation, "chunk_local_cumsum", lambda g, **_kwargs: g)
+    monkeypatch.setattr(fused_gdr_fwd_cute, "chunk_gated_delta_rule_prefill_cute", launcher)
+
+    _g, _output, _A, saved_h = implementation._cutedsl_forward(
+        **inputs,
+        scale=0.5,
+        cu_seqlens=None,
+        cu_seqlens_cpu=None,
+        save_fused_bwd_state=save_fused_bwd_state,
+    )
+
+    assert seen["output_h"] is saved_h
+    assert seen["checkpoint_every_n_tokens"] == (64 if save_fused_bwd_state else 0)
+    assert (saved_h is None) is not save_fused_bwd_state
 
 
 def test_cutedsl_backward_routes_supported_batch_to_fused_kernel(monkeypatch):
@@ -174,7 +305,8 @@ def test_cutedsl_backward_routes_supported_batch_to_fused_kernel(monkeypatch):
     assert seen["dht"] is None
 
 
-def test_fused_backward_adapter_packs_dense_batch(monkeypatch):
+@pytest.mark.parametrize("use_saved_h", [False, True])
+def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
     batch_size = 3
     implementation = _implementation()
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_bwd_cute
@@ -188,7 +320,7 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch):
     beta = torch.empty_like(g)
     A = torch.empty((*scalar_shape, 64), dtype=torch.bfloat16)
     do = torch.empty_like(q)
-    h = torch.empty((batch_size, 1, 64, 128, 128), dtype=torch.bfloat16)
+    h = torch.empty((batch_size, 64, 128, 128), dtype=torch.bfloat16)
     total_tokens = batch_size * 64
     packed = q.reshape(1, total_tokens, 64, 128)
     packed_scalar = g.reshape(1, total_tokens, 64)
@@ -202,11 +334,17 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch):
     )
     seen = {}
 
+    recompute_calls = []
+
     def fused(**kwargs):
         seen.update(kwargs)
         return fused_outputs
 
-    monkeypatch.setattr(implementation, "_recompute_fused_bwd_h", lambda **_kwargs: h)
+    def recompute(**_kwargs):
+        recompute_calls.append(True)
+        return h
+
+    monkeypatch.setattr(implementation, "_recompute_fused_bwd_h", recompute)
     monkeypatch.setattr(fused_gdr_bwd_cute, "fused_gdr_bwd", fused)
 
     dq, dk, dv, db, dg = implementation._call_fused_gdr_bwd_cute(
@@ -221,9 +359,11 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch):
         scale=128**-0.5,
         cu_seqlens=None,
         chunk_indices=None,
+        h=h if use_saved_h else None,
     )
 
     assert seen["q"].shape == (1, total_tokens, 64, 128)
+    assert recompute_calls == ([] if use_saved_h else [True])
     assert seen["g"].dtype == torch.float32
     assert seen["beta"].dtype == torch.float32
     assert seen["a"].shape == (1, total_tokens, 64, 64)

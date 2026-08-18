@@ -9,7 +9,11 @@ chunk-local and recurrent-state gradient work into one CuTe DSL launch.
 Model code should select the internal backend through `TransformerConfig`:
 
 ```python
-config = TransformerConfig(..., gdn_gdr_backend="internal")
+config = TransformerConfig(
+    ...,
+    gdn_gdr_backend="internal",
+    gdn_gdr_recompute_h=False,
+)
 ```
 
 Runtime dispatch is controlled by `MCORE_GDN_INTERNAL_BACKEND`:
@@ -32,10 +36,18 @@ implementation.InternalChunkGatedDeltaRuleFunction.backward
 The low-level wrapper is an internal interface. Callers outside this package
 should use the configured GDN layer so that packing, dtype conversion,
 metadata creation, fallback, and autograd wiring remain consistent.
-For shapes supported by this fused backward, the current autograd forward path
-uses FLA to prepare the exact saved `A` and recurrent-state tensors consumed by
-the CuTe backward. The E2E performance test therefore measures this production
-combination, not the standalone CuTe forward kernel.
+For supported fused-backward shapes, `gdn_gdr_recompute_h` controls the
+activation-memory/compute tradeoff for both forward implementations:
+
+- `False` (default): the FLA forward in `auto` mode or the fused forward in
+  explicit `cute` mode saves each chunk's input recurrent state `h`. Autograd
+  passes it directly to the fused backward.
+- `True`: forward drops `h`; backward reconstructs it from saved `A`, K, V,
+  gates, and beta before launching the fused backward.
+
+The standalone `gdn_gdr_backend="fla"` backend bypasses this internal autograd
+path, so the flag has no effect there. The GB200 E2E test asserts that both
+fused kernels run and compares the full forward-plus-backward path with FLA.
 
 ## Package structure
 
@@ -129,7 +141,7 @@ and the arbitrary packed-batch contract. They do not duplicate a large shape
 sweep.
 
 `tests/unit_tests/ssm/test_internal_gdn_backend_e2e.py` is marked
-`launch_on_gb200` and runs one production-path E2E case (`B=2`, `T=8192`,
+`launch_on_gb200` and runs one explicit-`cute` full-fused E2E case (`B=2`, `T=8192`,
 `H=64`, `D=128`, BF16). Deterministic Q/K/V inputs use standard deviation 0.1
 to keep the long recurrence finite, and backward uses a fixed BF16 random
 `grad_output` without normalization by tensor size. It compares output and all

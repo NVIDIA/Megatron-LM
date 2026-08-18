@@ -417,6 +417,11 @@ class TransformerConfig(ModelParallelConfig):
     implementation, "fla" selects Flash Linear Attention, and "internal" selects the internal
     chunked implementation."""
 
+    gdn_gdr_recompute_h: bool = False
+    """Whether the internal fused GDR backward should recompute recurrent chunk states instead
+    of saving them during forward. This trades additional backward compute for lower activation
+    memory. It has no effect when ``gdn_gdr_backend`` is not ``"internal"``."""
+
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
 

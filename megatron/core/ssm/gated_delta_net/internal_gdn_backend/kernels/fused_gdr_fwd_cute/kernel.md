@@ -10,8 +10,18 @@ tensors needed by training.
 Select the internal backend through `TransformerConfig`:
 
 ```python
-config = TransformerConfig(..., gdn_gdr_backend="internal")
+config = TransformerConfig(
+    ...,
+    gdn_gdr_backend="internal",
+    gdn_gdr_recompute_h=False,
+)
 ```
+
+`gdn_gdr_recompute_h=False` (default) saves each chunk's input recurrent state
+for the fused backward. Set it to `True` to omit that activation and recompute
+it during backward. The flag applies to both the FLA forward used by `auto`
+mode and the fused forward used by explicit `cute` mode; it does not affect the
+standalone `gdn_gdr_backend="fla"` backend.
 
 `MCORE_GDN_INTERNAL_BACKEND` controls dispatch inside the internal backend:
 
@@ -48,7 +58,12 @@ launcher directly.
 
 The wrapper returns the output tensor, or `(output, final_state)` when
 `output_final_state=True`. It also accepts preallocated output, `A`, final
-state, and checkpoint buffers for the training path.
+state, per-chunk input state `h`, and checkpoint buffers for the training
+path.
+When `output_h` is provided, it stores every 64-token chunk's input state and
+therefore requires `checkpoint_every_n_tokens=64`. The wrapper initializes the
+first saved state of each packed sequence to zero before launch.
+
 
 ## Algorithm
 
@@ -91,8 +106,10 @@ chunk can be prefetched while the current chunk is processed.
 - The token dimension is dynamic, while head counts, dtypes, and optional
   output features are part of the CuTe DSL compilation-cache key.
 - Dense BTHD inputs are flattened to packed THD layout by the Megatron adapter.
-- The adapter supplies chunk-local cumulative log2 gates to the kernel and
-  requests `A` for the backward path.
+- The adapter supplies chunk-local cumulative log2 gates to the kernel. With
+  `gdn_gdr_recompute_h=False`, it requests both `A` and per-chunk input state
+  `h` and passes them directly to the fused backward kernel. With the flag set,
+  it requests only `A` and drops `h` after producing the forward output.
 - Native partial chunk tails are not enabled by the public wrapper; supported
   sequence lengths are 64-token aligned.
 - This document does not record performance numbers. Benchmark results should

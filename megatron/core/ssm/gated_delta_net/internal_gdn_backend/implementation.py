@@ -248,6 +248,18 @@ def _fused_bwd_zero_dht(device: torch.device, num_sequences: int) -> torch.Tenso
     return cached
 
 
+def _prepare_fused_bwd_h(
+    h: torch.Tensor, *, total_chunks: int, num_heads: int, head_size: int
+) -> torch.Tensor:
+    """Normalize saved or recomputed chunk states to the fused-backward layout."""
+    return (
+        h.detach()
+        .reshape(total_chunks, num_heads, head_size, head_size)
+        .to(torch.bfloat16)
+        .contiguous()
+    )
+
+
 def _call_fused_gdr_bwd_cute(
     *,
     q: torch.Tensor,
@@ -261,6 +273,7 @@ def _call_fused_gdr_bwd_cute(
     scale: float,
     cu_seqlens: torch.Tensor | None,
     chunk_indices: torch.Tensor | None,
+    h: torch.Tensor | None = None,
 ):
     from .kernels.fused_gdr_bwd_cute import fused_gdr_bwd
 
@@ -270,11 +283,13 @@ def _call_fused_gdr_bwd_cute(
         _dense_cu_seqlens(batch_size, seqlen, q.device) if cu_seqlens is None else cu_seqlens
     )
     num_sequences = launch_cu_seqlens.numel() - 1
-    h = _recompute_fused_bwd_h(
-        k=k, v=v, g=g, beta=beta, A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
-    )
-    launch_h = h.detach().reshape(1, total_tokens // _CHUNK_SIZE, num_heads, head_size, head_size)
-    launch_h = launch_h.to(torch.bfloat16).contiguous()
+    if h is None:
+        h = _recompute_fused_bwd_h(
+            k=k, v=v, g=g, beta=beta, A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
+        )
+    launch_h = _prepare_fused_bwd_h(
+        h, total_chunks=total_tokens // _CHUNK_SIZE, num_heads=num_heads, head_size=head_size
+    ).unsqueeze(0)
     launch_g = g.detach().reshape(1, total_tokens, num_heads).to(torch.float32).contiguous()
     launch_beta = beta.detach().reshape(1, total_tokens, num_heads).to(torch.float32).contiguous()
     launch_dht = (
@@ -457,7 +472,8 @@ def _fla_forward_for_fused_bwd(
     scale: float,
     cu_seqlens: torch.Tensor | None,
     cu_seqlens_cpu: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    save_fused_bwd_state: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Prepare the exact FLA state consumed by latest-main's fused backward."""
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, _CHUNK_SIZE, cu_seqlens_cpu=cu_seqlens_cpu)
@@ -526,7 +542,15 @@ def _fla_forward_for_fused_bwd(
         use_exp2=True,
         transpose_state_layout=False,
     )
-    return g, output, A, chunk_indices
+    saved_h = None
+    if save_fused_bwd_state:
+        saved_h = _prepare_fused_bwd_h(
+            h,
+            total_chunks=q.shape[0] * q.shape[1] // _CHUNK_SIZE,
+            num_heads=q.shape[2],
+            head_size=q.shape[3],
+        )
+    return g, output, A, saved_h, chunk_indices
 
 
 def _cutedsl_forward(
@@ -539,7 +563,8 @@ def _cutedsl_forward(
     scale: float,
     cu_seqlens: torch.Tensor | None,
     cu_seqlens_cpu: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    save_fused_bwd_state: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     from .kernels.fused_gdr_fwd_cute import chunk_gated_delta_rule_prefill_cute
 
     batch_size, seqlen, num_heads, head_size = q.shape
@@ -567,6 +592,15 @@ def _cutedsl_forward(
     output = torch.empty(
         (batch_size * seqlen, num_heads, head_size), dtype=q.dtype, device=q.device
     )
+    flat_h = None
+    checkpoint_cu_starts = None
+    if save_fused_bwd_state:
+        flat_h = torch.empty(
+            (batch_size * seqlen // _CHUNK_SIZE, num_heads, head_size, head_size),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        checkpoint_cu_starts = launch_cu_seqlens // _CHUNK_SIZE
     chunk_gated_delta_rule_prefill_cute(
         q=flat_q,
         k=flat_k,
@@ -578,12 +612,16 @@ def _cutedsl_forward(
         output=output,
         output_A=flat_A,
         assume_valid_cu_seqlens=cu_seqlens is None,
+        output_h=flat_h,
+        checkpoint_every_n_tokens=_CHUNK_SIZE if save_fused_bwd_state else 0,
+        checkpoint_cu_starts=checkpoint_cu_starts,
         gate_is_log_cumsum=True,
     )
     return (
         g,
         output.reshape(batch_size, seqlen, num_heads, head_size),
         flat_A.reshape(batch_size, seqlen, num_heads, _CHUNK_SIZE),
+        flat_h,
     )
 
 
@@ -600,6 +638,7 @@ def _cutedsl_backward(
     dht: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
     chunk_indices: torch.Tensor | None,
+    h: torch.Tensor | None = None,
 ):
     reason = _fused_bwd_support_reason(
         q=q, k=k, v=v, g=g, beta=beta, A=A, do=do, dht=dht, cu_seqlens=cu_seqlens
@@ -617,6 +656,7 @@ def _cutedsl_backward(
             scale=scale,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            h=h,
         )
     if _backend_mode() == "cute":
         raise RuntimeError(f"Internal fused CuTe DSL GDR backward is unavailable: {reason}")
@@ -650,9 +690,13 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
         scale: float,
         cu_seqlens: torch.LongTensor | None,
         cu_seqlens_cpu: torch.LongTensor | None,
+        recompute_h: bool,
     ):
-        if _can_use_fused_bwd_forward(q, k, v, g, beta, cu_seqlens, cu_seqlens_cpu):
-            g, output, A, chunk_indices = _fla_forward_for_fused_bwd(
+        use_fused_bwd = _can_use_fused_bwd_forward(q, k, v, g, beta, cu_seqlens, cu_seqlens_cpu)
+        save_fused_bwd_state = use_fused_bwd and not recompute_h
+        saved_h = None
+        if _backend_mode() != "cute" and use_fused_bwd:
+            g, output, A, saved_h, chunk_indices = _fla_forward_for_fused_bwd(
                 q=q,
                 k=k,
                 v=v,
@@ -661,9 +705,10 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
                 scale=scale,
                 cu_seqlens=cu_seqlens,
                 cu_seqlens_cpu=cu_seqlens_cpu,
+                save_fused_bwd_state=save_fused_bwd_state,
             )
         else:
-            g, output, A = _cutedsl_forward(
+            g, output, A, saved_h = _cutedsl_forward(
                 q=q,
                 k=k,
                 v=v,
@@ -672,13 +717,14 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
                 scale=scale,
                 cu_seqlens=cu_seqlens,
                 cu_seqlens_cpu=cu_seqlens_cpu,
+                save_fused_bwd_state=save_fused_bwd_state,
             )
             chunk_indices = (
                 prepare_chunk_indices(cu_seqlens, _CHUNK_SIZE, cu_seqlens_cpu=cu_seqlens_cpu)
                 if cu_seqlens is not None
                 else None
             )
-        ctx.save_for_backward(q, k, v, g, beta, A, cu_seqlens, chunk_indices)
+        ctx.save_for_backward(q, k, v, g, beta, A, saved_h, cu_seqlens, chunk_indices)
         ctx.scale = scale
         return output.to(q.dtype), None
 
@@ -686,7 +732,7 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
     @input_guard
     @autocast_custom_bwd
     def backward(ctx, do: torch.Tensor, dht: torch.Tensor | None):
-        q, k, v, g, beta, A, cu_seqlens, chunk_indices = ctx.saved_tensors
+        q, k, v, g, beta, A, saved_h, cu_seqlens, chunk_indices = ctx.saved_tensors
         dq, dk, dv, db, dg = _cutedsl_backward(
             q=q,
             k=k,
@@ -699,8 +745,9 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
             dht=dht,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            h=saved_h,
         )
-        return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, None, None
+        return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, None, None, None
 
 
 @torch.compiler.disable
@@ -720,6 +767,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: torch.LongTensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
     cp_context: object | None = None,
+    recompute_h: bool = False,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Dispatch supported SM100 inputs to CuTe DSL and otherwise use FLA."""
@@ -792,5 +840,5 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
     return InternalChunkGatedDeltaRuleFunction.apply(
-        q, k, v, g, beta, scale, cu_seqlens, cu_seqlens_cpu
+        q, k, v, g, beta, scale, cu_seqlens, cu_seqlens_cpu, recompute_h
     )

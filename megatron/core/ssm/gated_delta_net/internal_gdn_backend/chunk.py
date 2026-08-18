@@ -9,9 +9,9 @@ import torch
 
 
 @lru_cache(maxsize=1)
-def _load_internal_chunk_gated_delta_rule() -> Callable[
-    ..., tuple[torch.Tensor, torch.Tensor | None]
-]:
+def _load_internal_chunk_gated_delta_rule() -> (
+    Callable[..., tuple[torch.Tensor, torch.Tensor | None]]
+):
     """Load FLA and the in-tree orchestration only when this backend is used."""
     try:
         from .implementation import chunk_gated_delta_rule
@@ -39,6 +39,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: torch.LongTensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
     cp_context: object | None = None,
+    recompute_h: bool = False,
     **kwargs: object,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the in-tree CuTe DSL GDR path with FLA fallback."""
@@ -70,5 +71,6 @@ def chunk_gated_delta_rule(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
         cp_context=cp_context,
+        recompute_h=recompute_h,
         **kwargs,
     )

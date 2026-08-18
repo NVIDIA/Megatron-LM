@@ -56,11 +56,7 @@ def _validate_cu_seqlens(cu_seqlens: torch.Tensor, total_tokens: int) -> torch.T
 
 
 def _prepare_cu_seqlens_for_launch(
-    cu_seqlens: torch.Tensor,
-    total_tokens: int,
-    *,
-    device: torch.device,
-    assume_valid: bool = False,
+    cu_seqlens: torch.Tensor, total_tokens: int, *, device: torch.device, assume_valid: bool = False
 ) -> torch.Tensor:
     if assume_valid:
         if cu_seqlens.ndim != 1:
@@ -89,6 +85,7 @@ def chunk_gated_delta_rule_prefill_cute(
     output_state: Optional[torch.Tensor] = None,
     state_checkpoints: Optional[torch.Tensor] = None,
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
+    output_h: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     assume_valid_cu_seqlens: bool = False,
     gate_is_log_cumsum: bool = False,
@@ -126,10 +123,7 @@ def chunk_gated_delta_rule_prefill_cute(
     if cu_seqlens is None:
         raise ValueError("cu_seqlens is required for the local mcore GDN prefill path")
     cu_i32 = _prepare_cu_seqlens_for_launch(
-        cu_seqlens,
-        total_tokens,
-        device=q.device,
-        assume_valid=assume_valid_cu_seqlens,
+        cu_seqlens, total_tokens, device=q.device, assume_valid=assume_valid_cu_seqlens
     )
 
     if output is None:
@@ -144,22 +138,43 @@ def chunk_gated_delta_rule_prefill_cute(
     if output_A is not None:
         expected_A_shape = (total_tokens, num_o_heads, _BT)
         if tuple(output_A.shape) != expected_A_shape:
-            raise ValueError(f"output_A shape mismatch: expected {expected_A_shape}, got {tuple(output_A.shape)}")
+            raise ValueError(
+                f"output_A shape mismatch: expected {expected_A_shape}, got {tuple(output_A.shape)}"
+            )
         if output_A.dtype != q.dtype:
             raise ValueError("output_A dtype must match q dtype")
         output_A = _require_contiguous("output_A", output_A)
 
+    if output_h is not None:
+        expected_h_shape = (total_tokens // _BT, num_o_heads, head_size, head_size)
+        if tuple(output_h.shape) != expected_h_shape:
+            raise ValueError(
+                f"output_h shape mismatch: expected {expected_h_shape}, got {tuple(output_h.shape)}"
+            )
+        if output_h.dtype != q.dtype:
+            raise ValueError("output_h dtype must match q dtype")
+        output_h = _require_contiguous("output_h", output_h)
+
     if checkpoint_every_n_tokens < 0:
         raise ValueError("checkpoint_every_n_tokens must be non-negative")
+    if output_h is not None and checkpoint_every_n_tokens != _BT:
+        raise ValueError(
+            "output_h requires checkpoint_every_n_tokens=64 because it stores every chunk state"
+        )
     if checkpoint_every_n_tokens > 0:
         if checkpoint_every_n_tokens % _BT != 0:
             raise ValueError("checkpoint_every_n_tokens must be a multiple of 64")
-        if state_checkpoints is None or checkpoint_cu_starts is None:
+        if checkpoint_cu_starts is None:
+            raise ValueError("checkpoint_cu_starts is required when checkpointing is enabled")
+        if state_checkpoints is None and output_h is None:
             raise ValueError(
-                "state_checkpoints and checkpoint_cu_starts are required when checkpointing is enabled"
+                "state_checkpoints or output_h is required when checkpointing is enabled"
             )
-    elif state_checkpoints is not None or checkpoint_cu_starts is not None:
+    elif state_checkpoints is not None or checkpoint_cu_starts is not None or output_h is not None:
         raise ValueError("checkpoint tensors must be None when checkpoint_every_n_tokens is 0")
+
+    if output_h is not None:
+        output_h.index_fill_(0, (cu_i32[:-1] // _BT).to(torch.long), 0)
 
     if output_final_state and output_state is None:
         output_state = torch.empty(
@@ -211,6 +226,7 @@ def chunk_gated_delta_rule_prefill_cute(
         cu_checkpoints=cu_checkpoints,
         output_checkpoints=state_checkpoints,
         output_A=output_A,
+        output_h=output_h,
         gate_is_log_cumsum=gate_is_log_cumsum,
     )
     return (output, output_state) if output_final_state else output
