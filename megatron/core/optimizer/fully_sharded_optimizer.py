@@ -158,7 +158,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
         Raises:
             NotImplementedError: If the parameters do not all share one device mesh, which
-                is what expert parallelism produces.
+                is what expert parallelism produces. Not yet supported rather than refused
+                on principle; training under expert parallelism is unaffected.
         """
         sharded_parameters = [
             param for param in self._trainable_parameters() if isinstance(param, DTensor)
@@ -168,9 +169,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
             # over the DP mesh (see FullyShardedDataParallelV2). Expert parallelism also gives
             # each rank a different set of expert FQNs, so the DTensor keyspace this method
             # exists to equalize is rank-dependent for a reason no gather can repair.
+            # TODO: not a contract, just unimplemented -- describing an expert-parallel model
+            # needs a keyspace built per mesh instead of one gather over one mesh.
             raise NotImplementedError(
-                "MFSDP v2 optimizer checkpointing does not support expert parallelism: its "
-                "parameters span more than one device mesh."
+                "MFSDP v2 optimizer checkpointing does not support expert parallelism yet: "
+                "its parameters span more than one device mesh."
             )
         if not sharded_parameters:
             return []
@@ -191,6 +194,12 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         non-empty shard of it, which is what lets every rank synthesize a placeholder with
         exactly the owning rank's keys. A parameter that has no state anywhere (nothing has
         stepped yet) is simply absent.
+
+        Which key set a parameter has is a property of the base optimizer, not of the shard,
+        so ranks that both describe an FQN describe it identically and the merge below can
+        let any of them win. Sorting is what makes that hold as stated rather than by luck:
+        it turns each entry into a canonical list, so two ranks whose state dicts happened to
+        insert the keys in different orders still produce equal values.
         """
         state_keys_by_fqn = {
             self._param_to_fqn[param]: sorted(
@@ -330,6 +339,13 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                 # rank owning a non-empty shard saves the real state; this placeholder has the
                 # same global shape and dtype but no local rows, so it contributes no data and
                 # only keeps the DTensor keyspace identical on every rank.
+                # TODO: delete this branch, together with _gather_state_keys_by_fqn and the
+                # owned_fqns filter in load_state_dict, once the empty-shard filter in
+                # get_megatron_optimizer goes away. That filter works around
+                # https://github.com/NVIDIA/TransformerEngine/issues/3207, fixed by
+                # https://github.com/NVIDIA/TransformerEngine/pull/3212, which has not yet
+                # propagated to the LTS container the MFSDP v2 tests also run in. With the
+                # filter gone the keyspace is rank-invariant by construction.
                 packed_state[fqn] = {
                     key: torch.zeros_like(param) for key in state_keys_by_fqn.get(fqn, ())
                 }

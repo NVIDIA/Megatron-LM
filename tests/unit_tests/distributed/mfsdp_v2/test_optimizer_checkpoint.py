@@ -31,9 +31,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
-SOURCE_STEPS = 3
-DESTINATION_STEPS = 1
-
 
 def _transformer_config() -> TransformerConfig:
     """Return the small bf16 configuration both round-trip tests are built on."""
@@ -97,15 +94,13 @@ def _shard_and_build_optimizer(
     )
     optimizer = get_megatron_optimizer(optimizer_config, [model], use_gloo_process_groups=False)
     assert isinstance(optimizer, FullyShardedOptimizer)
-    optimizer.reload_model_params()
     return model, optimizer
 
 
 def _zero_parameters(module: torch.nn.Module) -> None:
     """Zero every weight so a correct load has to overwrite them."""
-    with torch.no_grad():
-        for parameter in module.parameters():
-            parameter.zero_()
+    for parameter in module.parameters():
+        torch.nn.init.zeros_(parameter)
 
 
 def _build_model_and_optimizer(
@@ -278,22 +273,24 @@ class TestOptimizerCheckpoint:
         """
         config = _transformer_config()
         world_size = torch.distributed.get_world_size()
+        source_steps, destination_steps = 3, 1
 
         source_model, source_optimizer = _build_model_and_optimizer(
             config, self.pg_collection, zero_init=False
         )
-        for _ in range(SOURCE_STEPS):
+        for _ in range(source_steps):
             _train_step(config, source_model, source_optimizer)
 
         model_snapshot = _snapshot_model_state(source_model)
         state_snapshot = _snapshot_optimizer_state(source_optimizer)
         param_group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
-        assert {group["step"] for group in param_group_snapshot} == {SOURCE_STEPS}
+        assert {group["step"] for group in param_group_snapshot} == {source_steps}
 
         if world_size > 1:
             # Confirm the placeholder path is not vacuous: at least one rank must have had an
             # empty-local shard filtered out of its optimizer. Count empty local shards
-            # directly, which is the exact condition the filter tests.
+            # directly, which is the exact condition the filter tests, over the trainable
+            # parameters, which are the only ones the optimizer is given in the first place.
             empty_local = sum(
                 1
                 for param in source_model.parameters()
@@ -319,7 +316,7 @@ class TestOptimizerCheckpoint:
             destination_model, destination_optimizer = _build_model_and_optimizer(
                 config, self.pg_collection, zero_init=True
             )
-            for _ in range(DESTINATION_STEPS):
+            for _ in range(destination_steps):
                 _train_step(config, destination_model, destination_optimizer)
 
             load_state_dict = {
@@ -347,18 +344,19 @@ class TestOptimizerCheckpoint:
         """A tied weight is saved once, under one of its FQNs, and restored bit-exactly.
 
         Two Linears sharing one ``nn.Parameter`` give the model state dict two keys but the
-        optimizer exactly one state entry. ``_param_fqn`` keys by parameter identity, so the
+        optimizer exactly one state entry. ``_param_to_fqn`` keys by parameter identity, so the
         tie resolves to a single name -- the same one on save and on load, and the same one
         :class:`DistributedOptimizer`'s ``param_to_name`` picks for v1. This asserts the
         optimizer subtree really is singular while the model subtree carries both names, and
         that the shared weight and its momentum survive the round trip.
         """
         config = _transformer_config()
+        source_steps, destination_steps = 3, 1
 
         source_model, source_optimizer = _build_tied_model_and_optimizer(
             config, self.pg_collection, zero_init=False
         )
-        for _ in range(SOURCE_STEPS):
+        for _ in range(source_steps):
             _train_step(config, source_model, source_optimizer)
 
         model_snapshot = _snapshot_model_state(source_model)
@@ -390,7 +388,7 @@ class TestOptimizerCheckpoint:
             destination_model, destination_optimizer = _build_tied_model_and_optimizer(
                 config, self.pg_collection, zero_init=True
             )
-            for _ in range(DESTINATION_STEPS):
+            for _ in range(destination_steps):
                 _train_step(config, destination_model, destination_optimizer)
 
             load_state_dict = {
@@ -408,7 +406,7 @@ class TestOptimizerCheckpoint:
 
 
 class TestOptimizerCheckpointExpertParallel:
-    """Expert parallelism is refused rather than silently mis-checkpointed."""
+    """Expert parallelism is refused, until implemented, rather than mis-checkpointed."""
 
     def setup_method(self):
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
