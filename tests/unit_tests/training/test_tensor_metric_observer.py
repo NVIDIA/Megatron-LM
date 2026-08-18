@@ -804,21 +804,17 @@ def test_router_metrics_reject_cuda_graphs_that_capture_router(specification):
             pass
 
 
-@pytest.mark.parametrize(("axis", "sizes"), (("tensor", {"tp": 2}), ("context", {"cp": 2})))
-def test_router_diagnostic_metrics_reject_unsupported_sharded_axes(axis, sizes):
-    observer = build_tensor_metric_observer(
-        ["layer-router-health:1"], result_sink=lambda *args: None
-    )
-    assert observer is not None
-
-    with pytest.raises(NotImplementedError, match=rf"unsupported axes: .*{axis}"):
-        with observer.observe_forward_backward(
-            model=[_forward_model()], iteration=0, pg_collection=_pg_collection(**sizes)
-        ):
-            pass
-
-
-def test_router_diagnostic_metrics_reduce_over_gtp_population_shards():
+@pytest.mark.parametrize(
+    ("sizes", "tp_shard_dim", "expected_axis"),
+    (
+        ({"gtp_remat": 2}, None, "gtp"),
+        ({"tp": 2}, 0, "tp"),
+        ({"cp": 2, "dp": 2}, None, "dp"),
+    ),
+)
+def test_router_diagnostic_metrics_do_not_encode_parallel_axis_policy(
+    sizes, tp_shard_dim, expected_axis
+):
     observer = build_tensor_metric_observer(
         ["layer-router-health:1"], result_sink=lambda *args: None
     )
@@ -827,20 +823,21 @@ def test_router_diagnostic_metrics_reduce_over_gtp_population_shards():
     diagnostics = torch.zeros(1, ROUTER_DIAGNOSTIC_CHANNEL_COUNT, 2)
 
     with observer.observe_forward_backward(
-        model=[model], iteration=0, pg_collection=_pg_collection(gtp_remat=2)
+        model=[model], iteration=0, pg_collection=_pg_collection(**sizes)
     ):
         observe_tensor(
             model.decoder.layers[0].router,
             "router_diagnostics",
             "router_diagnostics",
             diagnostics,
+            tp_shard_dim=tp_shard_dim,
         )
 
     assert observer._prepared_forward_values is not None
     scheduled = observer.scheduled_metrics[0]
     steps = scheduled.metric.start(observer._prepared_forward_values[id(scheduled.metric)])
     assert steps
-    assert {request.axis for step in steps for request in step.requests} == {"gtp"}
+    assert {request.axis for step in steps for request in step.requests} == {expected_axis}
 
 
 def test_forward_metrics_reject_full_iteration_cuda_graphs():

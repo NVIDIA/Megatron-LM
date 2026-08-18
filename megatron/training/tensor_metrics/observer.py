@@ -313,18 +313,6 @@ class TrainingTensorMetricObserver:
                 for scheduled in forward_metrics
             )
         )
-        if "router_diagnostics" in source_kinds:
-            unsupported_router_axes = tuple(
-                axis
-                for axis, attribute in (("tensor", "tp"), ("context", "cp"))
-                if (group := getattr(pg_collection, attribute, None)) is not None
-                and group.size() > 1
-            )
-            if unsupported_router_axes:
-                raise NotImplementedError(
-                    "Router diagnostic metrics currently require tensor and context parallel "
-                    f"size one; unsupported axes: {unsupported_router_axes}."
-                )
         _validate_forward_observation_model(model, source_kinds)
         executor = TensorMetricExecutor(_tensor_metric_process_groups(pg_collection))
         module_names = self._get_module_names(model)

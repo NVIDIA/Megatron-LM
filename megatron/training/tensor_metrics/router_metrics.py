@@ -168,12 +168,11 @@ class _LayerRouterDiagnosticMetric(TensorMetric):
             relation.axis
             for relation in relations
             if isinstance(relation.placement, (FlatShard, Owned))
-            or (isinstance(relation.placement, Shard) and relation.axis not in {"gtp", "dp"})
         )
         if unsupported:
-            raise NotImplementedError(
-                "Router diagnostic metrics do not yet support sharded model-parallel "
-                f"observations; unsupported axes: {unsupported}."
+            raise ValueError(
+                "Router diagnostic metrics do not support FlatShard or Owned placements; "
+                f"unsupported axes: {unsupported}."
             )
 
         contribution = self._result_contribution(values, layer, operation)

@@ -758,6 +758,22 @@ class TopKRouter(Router):
                 with shape [num_tokens, num_experts].
         """
         seq_length, bsz = logits.shape[:2]
+        observe_router_diagnostics = is_observing_tensor("router_diagnostics")
+        if self.training and torch.is_grad_enabled() and observe_router_diagnostics:
+            # The compact summaries normalize within each sequence and cannot reconstruct a
+            # complete sequence after it has been partitioned across ranks.
+            partitioned_sequence_axes = []
+            if self.config.sequence_parallel and self.tp_group.size() > 1:
+                partitioned_sequence_axes.append("tensor")
+            if self.cp_group.size() > 1:
+                partitioned_sequence_axes.append("context")
+            if partitioned_sequence_axes:
+                raise NotImplementedError(
+                    "Router diagnostic observations require complete local sequences and do not "
+                    "yet support sequence partitioning across "
+                    + " and ".join(partitioned_sequence_axes)
+                    + " parallel ranks."
+                )
         logits = logits.view(-1, self.config.num_moe_experts)
 
         # Flatten padding_mask to [num_tokens] if provided
@@ -801,7 +817,6 @@ class TopKRouter(Router):
             )
 
         # Reuse the unbiased aux-loss routing calculation for due router diagnostics.
-        observe_router_diagnostics = is_observing_tensor("router_diagnostics")
         aux_loss_enabled = self.is_aux_loss_enabled()
         if (
             self.training
