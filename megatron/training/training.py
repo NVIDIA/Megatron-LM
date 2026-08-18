@@ -572,10 +572,7 @@ def _num_hybrid_dsa_indexer_layers(hybrid_layer_pattern, skip_topk_offset, topk_
     by ``DSAttention.__init__``, which is reproduced here by offsetting each MTP
     depth past the main pattern.
     """
-    from megatron.core.models.hybrid.hybrid_layer_allocation import (
-        Symbols,
-        parse_hybrid_pattern,
-    )
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
 
     parsed = parse_hybrid_pattern(hybrid_layer_pattern)
     main = (parsed.main_pattern or "").replace(Symbols.PIPE, "")
