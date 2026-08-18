@@ -37,6 +37,7 @@ if HAVE_TE:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_qb,
         fused_unpermute,
         te_general_gemm,
     )
@@ -50,9 +51,10 @@ else:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_topk_with_score_function,
+        fused_topk_with_score_function_supports_qb,
         fused_unpermute,
         te_general_gemm,
-    ) = (None, None, None, None, None, None, None, None, None, None)
+    ) = (None, None, None, None, None, None, None, None, False, None, None)
 
 
 def switch_load_balancing_loss_func(
@@ -692,6 +694,8 @@ def topk_routing_with_score_function(
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
+    qb_histogram: Optional[torch.Tensor] = None,
+    qb_bin_bounds: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -716,6 +720,10 @@ def topk_routing_with_score_function(
                                               Defaults to None.
         dense_output (bool, optional): If True, return dense tensors [num_tokens, topk] instead of
                                        sparse tensors [num_tokens, num_experts]. Defaults to False.
+        qb_histogram (torch.Tensor, optional): Caller-owned int32 K3 Quantile Balancing histogram
+                                               with shape [num_experts, num_bins].
+        qb_bin_bounds (torch.Tensor, optional): FP32 CUDA tensor containing the lower and upper
+                                                K3 Quantile Balancing histogram bounds.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -734,6 +742,31 @@ def topk_routing_with_score_function(
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
+    use_quantile_balancing = qb_histogram is not None or qb_bin_bounds is not None
+    if use_quantile_balancing and (qb_histogram is None or qb_bin_bounds is None):
+        raise ValueError("qb_histogram and qb_bin_bounds must be provided together.")
+    if use_quantile_balancing:
+        if expert_bias is None:
+            raise ValueError("Quantile Balancing requires an expert bias.")
+        if score_function != "sigmoid":
+            raise ValueError("Quantile Balancing currently requires score_function='sigmoid'.")
+        if use_pre_softmax:
+            raise ValueError("Quantile Balancing does not use pre-softmax routing.")
+        if topk >= num_experts:
+            raise ValueError("Quantile Balancing requires topk < num_experts.")
+        if num_groups is not None or group_topk is not None:
+            raise ValueError("Quantile Balancing does not support group-limited routing.")
+        if router_replay is not None:
+            raise ValueError("Quantile Balancing does not support router replay.")
+        if qb_histogram.dim() != 2 or qb_histogram.shape[0] != num_experts:
+            raise ValueError(
+                "qb_histogram must have shape [num_experts, num_bins], got "
+                f"{tuple(qb_histogram.shape)}."
+            )
+        if qb_histogram.dtype != torch.int32:
+            raise ValueError("qb_histogram must have dtype torch.int32.")
+        if qb_bin_bounds.shape != (2,) or qb_bin_bounds.dtype != torch.float32:
+            raise ValueError("qb_bin_bounds must be an FP32 tensor with shape [2].")
     if fused:
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
@@ -744,16 +777,28 @@ def topk_routing_with_score_function(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
                 "Please upgrade Transformer Engine or disable moe_router_fusion."
             )
-        return fused_topk_with_score_function(
-            logits=logits,
-            topk=topk,
-            use_pre_softmax=use_pre_softmax,
-            num_groups=num_groups,
-            group_topk=group_topk,
-            scaling_factor=scaling_factor,
-            score_function=score_function,
-            expert_bias=expert_bias,
-        )
+        kwargs = {
+            "logits": logits,
+            "topk": topk,
+            "use_pre_softmax": use_pre_softmax,
+            "num_groups": num_groups,
+            "group_topk": group_topk,
+            "scaling_factor": scaling_factor,
+            "score_function": score_function,
+            "expert_bias": expert_bias,
+        }
+        if use_quantile_balancing:
+            if not fused_topk_with_score_function_supports_qb:
+                raise ValueError(
+                    "The installed Transformer Engine fused router does not expose the "
+                    "Quantile Balancing histogram API from TransformerEngine PR #3395."
+                )
+            kwargs.update(
+                qb_histogram=qb_histogram,
+                qb_bin_bounds=qb_bin_bounds,
+                qb_histogram_mode="fused_atomic",
+            )
+        return fused_topk_with_score_function(**kwargs)
 
     def _compute_topk(
         scores: torch.Tensor,
@@ -815,7 +860,27 @@ def topk_routing_with_score_function(
             scores = torch.nn.functional.softplus(logits.float()).sqrt()
         if expert_bias is not None:
             scores_for_routing = scores + expert_bias.float()
-            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            if use_quantile_balancing:
+                topk_result = torch.topk(scores_for_routing, topk + 1, dim=1, sorted=True)
+                cutoff = topk_result.values[:, -1:]
+                top_indices = topk_result.indices[:, :-1]
+                with torch.no_grad():
+                    num_bins = qb_histogram.shape[1]
+                    lower, upper = qb_bin_bounds.unbind()
+                    bin_indices = torch.floor(
+                        (cutoff - scores.detach() - lower) * (num_bins / (upper - lower))
+                    ).to(torch.int64)
+                    bin_indices.clamp_(0, num_bins - 1)
+                    expert_offsets = (
+                        torch.arange(num_experts, device=logits.device, dtype=torch.int64)
+                        * num_bins
+                    )
+                    flat_indices = (bin_indices + expert_offsets).reshape(-1)
+                    qb_histogram.view(-1).scatter_add_(
+                        0, flat_indices, torch.ones_like(flat_indices, dtype=torch.int32)
+                    )
+            else:
+                _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
             scores = torch.gather(scores, dim=1, index=top_indices)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
@@ -1194,6 +1259,71 @@ def get_updated_expert_bias(
         offset = average_tokens - tokens_per_expert
         updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
         return updated_expert_bias
+
+
+def get_updated_expert_bias_with_quantile(
+    histogram: torch.Tensor, bin_bounds: torch.Tensor, expert_bias: torch.Tensor, topk: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Recover Kimi K3 Quantile Balancing biases from a pooled global-batch histogram.
+
+    Each expert histogram contains the required additive bias
+    ``r[i, j] = alpha[i] - score[i, j]`` for every token. Leading dimensions
+    identify independent routers, followed by ``[num_experts, num_bins]``.
+
+    Returns the mean-centered next-step expert bias and the persistent bounds for
+    the next global batch.
+    """
+    if histogram.dim() < 2:
+        raise ValueError("QB histogram must have shape [..., num_experts, num_bins].")
+    num_experts, num_bins = histogram.shape[-2:]
+    if num_experts <= 0 or num_bins <= 0:
+        raise ValueError("QB histogram dimensions must be positive.")
+    if expert_bias.shape != histogram.shape[:-1]:
+        raise ValueError(
+            f"QB expert_bias shape {expert_bias.shape} does not match "
+            f"histogram shape {histogram.shape}."
+        )
+    if bin_bounds.shape != histogram.shape[:-2] + (2,):
+        raise ValueError(
+            f"QB bin_bounds shape {bin_bounds.shape} does not match "
+            f"histogram shape {histogram.shape}."
+        )
+    if not 0 < topk < num_experts:
+        raise ValueError(f"QB topk must be in [1, {num_experts}), got {topk}.")
+
+    with torch.no_grad():
+        cumulative_counts = torch.cumsum(histogram, dim=-1, dtype=torch.int64)
+        tokens_per_expert = cumulative_counts[..., -1]
+        total_tokens = tokens_per_expert[..., 0]
+        target_quantile = total_tokens.to(torch.float32) * (topk / num_experts)
+        target_rank = torch.ceil(target_quantile).to(torch.int64).clamp_min_(1)
+
+        selected_bins = (
+            (cumulative_counts >= target_rank[..., None, None]).to(torch.int64).argmax(dim=-1)
+        )
+        selected_counts = torch.gather(histogram, -1, selected_bins.unsqueeze(-1)).squeeze(-1)
+        previous_bins = (selected_bins - 1).clamp_min(0)
+        counts_before = torch.gather(cumulative_counts, -1, previous_bins.unsqueeze(-1)).squeeze(-1)
+        counts_before = torch.where(
+            selected_bins == 0, torch.zeros_like(counts_before), counts_before
+        )
+
+        interpolation = (
+            (target_quantile[..., None] - counts_before.to(torch.float32))
+            / selected_counts.clamp_min(1).to(torch.float32)
+        ).clamp_(0.0, 1.0)
+        lower = bin_bounds[..., 0, None]
+        upper = bin_bounds[..., 1, None]
+        bin_width = (upper - lower) / num_bins
+        updated_expert_bias = lower + (selected_bins.to(torch.float32) + interpolation) * bin_width
+        updated_expert_bias -= updated_expert_bias.mean(dim=-1, keepdim=True)
+
+        has_tokens = total_tokens > 0
+        updated_expert_bias = torch.where(has_tokens[..., None], updated_expert_bias, expert_bias)
+        bias_min, bias_max = torch.aminmax(updated_expert_bias, dim=-1)
+        updated_bin_bounds = torch.stack((bias_min - 1.0, bias_max + 1.0), dim=-1)
+        updated_bin_bounds = torch.where(has_tokens[..., None], updated_bin_bounds, bin_bounds)
+        return updated_expert_bias, updated_bin_bounds
 
 
 def maybe_move_tensor_to_cpu(
