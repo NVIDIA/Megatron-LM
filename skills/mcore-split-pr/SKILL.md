@@ -35,6 +35,11 @@ workflow:
   the base branch: merging while mirror-based writes the commits into the
   bot's scratch ref (which gets force-pushed away), lands nothing on `main`,
   and leaves an unreopenable MERGED PR. Retarget to `main` first, then merge.
+- **Un-stack children the moment their parent is approved.** copy-pr-bot
+  deletes `pull-request/<N>` when PR N merges or closes, and GitHub then
+  auto-closes (unreopenably) every PR based on that ref — one merge can
+  domino-close the rest of the stack. Retarget the child to `main` as soon as
+  the parent is approved, before the parent becomes mergeable.
 - Wait for user approval before execution.
 - Execution creates draft PRs, applies file-scoped diffs with
   `git diff upstream/main..<source-branch> -- <paths> | git apply`, pushes
@@ -128,17 +133,34 @@ For each new PR:
 
 ### 5. Merge (bottom-up through the dependency DAG)
 
-Reviews are parallel; merges are strictly parents-before-children. For each
-PR whose dependencies have all merged:
+Reviews are parallel; merges are strictly parents-before-children.
 
-1. **Retarget to `main`:** `gh pr edit <N> --base main`. Never click merge
-   while the header says "into `pull-request/...`".
+**Un-stack on approval, not at merge time.** When copy-pr-bot's mirror ref
+`pull-request/<N>` is deleted — which the bot does automatically the moment
+PR N merges *or* closes — GitHub instantly auto-closes every PR based on
+that ref, and a PR closed by base-branch deletion cannot be reopened while
+the ref is gone. One merge can therefore domino-close the entire remaining
+stack before you can react. The only safe window to leave the mirror is
+*before* the parent becomes mergeable:
+
+- The moment a parent PR is **approved**, retarget its direct child to
+  `main` (`gh pr edit <child> --base main`). The child's diff temporarily
+  shows the parent's layer too; that is cosmetic and resolves when the
+  parent merges and the child is rebased.
+- Never let any PR merge or close while another PR still bases on its
+  mirror.
+
+For each PR whose dependencies have all merged:
+
+1. **Retarget to `main`:** `gh pr edit <N> --base main` (already done if the
+   approval rule above was followed). Never click merge while the header
+   says "into `pull-request/...`".
 2. Rebase the branch onto latest `origin/main` if needed; push; re-vet for CI.
 3. Squash-merge into `main`.
 4. Immediately rebase every descendant onto the new `main` and force-push
    (the merged parent's commits drop out as already-applied).
-5. The next child's diff has now collapsed to its own layer; retarget it to
-   `main` when its turn comes, and repeat.
+5. The next child's diff has now collapsed to its own layer; re-vet its
+   descendants' mirrors and re-stack them on the refreshed refs.
 
 Independent roots can merge at any time, in any order — the ordering
 constraint is the dependency DAG, not the PR-number sequence.
@@ -151,6 +173,8 @@ constraint is the dependency DAG, not the PR-number sequence.
 - Prefer a single clean commit per split PR over replaying the original commit history.
 - If a file is hard to categorize (e.g., it touches two groups), ask the user which PR it should go in.
 - If the current GitHub user is not the author of the original PR, each new PR's description must explicitly credit the original author (e.g., "Original changes by @<author> in #<number>").
-- Consider a watchdog for the two stacking failure modes: a PR reaching
-  approved state while still mirror-based (merge hazard), and a parent merging
-  (a rebase cascade is now due).
+- Consider a watchdog for the three stacking failure modes: a PR reaching
+  approved state while still mirror-based (merge hazard), a *parent* reaching
+  approved state while a child still bases on its mirror (auto-close hazard —
+  retarget the child to `main` now), and a parent merging (a rebase cascade
+  is now due).
