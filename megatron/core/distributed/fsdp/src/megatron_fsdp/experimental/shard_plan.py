@@ -1,10 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
-Pure shard-planning and owner-compute packing logic for M-FSDPv2's all-`Flat` layout.
+Pure shard-planning and owner-compute packing logic for MFSDP v2's all-`Flat` layout.
 
 The central data structure is `ShardPlan`, which describes how a single 2D parameter's full matrix
-is split across the DP group under M-FSDPv2's all-`Flat` layout. Given shard plans,
+is split across the DP group under MFSDP v2's all-`Flat` layout. Given shard plans,
 `assign_owner_work` balances owner-compute work across owner ranks using a caller-supplied cost
 function. `ShardPlan.from_flat_layout` builds a plan from DBuffer layout metadata,
 `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` build the flat P2P send/recv buffers,
@@ -27,7 +27,7 @@ from .layout import non_leading_numel
 class ShardPlan:
     """How a single 2D parameter's full matrix is split across the DP group.
 
-    M-FSDPv2's all-`Flat` layout shards dim-0 rows contiguously in rank order, so rank `r` owns the
+    MFSDP v2's all-`Flat` layout shards dim-0 rows contiguously in rank order, so rank `r` owns the
     contiguous global row range `[start, start + count)` where `start`/`count` come from the flat
     DBuffer layout. A rank with `count == 0` holds no shard of this parameter.
 
