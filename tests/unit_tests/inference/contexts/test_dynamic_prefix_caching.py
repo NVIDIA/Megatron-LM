@@ -14,6 +14,9 @@ from megatron.core.inference.contexts.mamba_slot_allocator import (
     MambaSlotAllocator,
     MambaSlotCapacityError,
 )
+from megatron.core.inference.disaggregation.inference_state_handoff import (
+    InferenceStateHandoffMixin,
+)
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -959,18 +962,29 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             self._mctx(prefix_caching_mamba_gb=1e-5)
 
     @pytest.mark.internal
-    def test_hybrid_admission_requires_free_live_state_slot(self):
+    def test_hybrid_admission_resumes_after_handoff_releases_live_slot(self):
         ctx = self._mctx(max_requests=1, rounder=1)
         ctx.kv_block_allocator.enable_handoff_pinning = True
         slot = ctx.mamba_metadata.allocate_slot()
+        assert slot is not None
         ctx.mamba_metadata.request_to_mamba_state_idx[0] = slot
         ctx.mamba_metadata.detach_state_slot(0)
+        request = self._req(ctx, self._prompt(ctx.block_size_tokens))
 
-        request_available, _, _ = ctx.check_availability(
-            self._req(ctx, self._prompt(ctx.block_size_tokens))
-        )
+        request_available, _, _ = ctx.check_availability(request)
 
         assert not request_available
+
+        engine = InferenceStateHandoffMixin()
+        engine.context = ctx
+        engine._initialize_disaggregation_state()
+        engine._pinned_handoff_ssm_slots[7] = slot
+        engine.release_handoff_blocks(7)
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert request_available
+        assert ctx.mamba_metadata.mamba_state_free_slot_count == 1
 
     @pytest.mark.internal
     def test_mamba_prefill_skip_and_zero_prefill(self):
