@@ -7,6 +7,7 @@ import awkward as ak
 import gigatoken as gt
 import time
 
+import numpy as np
 import multiprocessing
 from multiprocessing import Pool
 
@@ -67,7 +68,9 @@ def process_key(args, key, level):
     # Append EOD token
     if args.append_eod:
         print("Appending EOD token...")
-        eod_column = ak.singletons(ak.Array(numpy.full(len(encoded_docs), tokenizer.eod, dtype=encoded_docs.type)))
+        eod_column = ak.singletons(
+            ak.Array(np.full(len(encoded_docs), tokenizer.eod, dtype=encoded_docs.layout.content.dtype))
+        )
         encoded_docs = ak.concatenate([encoded_docs, eod_column], axis=1)
 
     # Add encoded documents to the IndexedDataset

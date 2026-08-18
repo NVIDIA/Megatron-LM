@@ -596,16 +596,6 @@ class _MultiStorageClientBinReader(_BinReader):
 OBJECT_STORAGE_BIN_READERS = {"s3": _S3BinReader, "msc": _MultiStorageClientBinReader}
 
 
-def _prepare_chunk(
-    args: Tuple[ak.Array, Type[numpy.number]]
-) -> Tuple[numpy.ndarray, numpy.ndarray]:
-    """Worker: flatten one chunk of documents and compute per-document lengths"""
-    doc_chunk, dtype = args
-    flat = numpy.asarray(ak.flatten(doc_chunk), dtype=dtype)
-    lengths = numpy.asarray(ak.num(doc_chunk, axis=1))
-    return flat, lengths
-
-
 class IndexedDataset(torch.utils.data.Dataset):
     """The low-level interface dataset class
 

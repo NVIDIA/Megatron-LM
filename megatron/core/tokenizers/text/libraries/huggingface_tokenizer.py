@@ -283,6 +283,9 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
 
     def text_to_ids(self, text: str) -> List[int]:
         """Converts text to tokens ids."""
+        # if self.use_gigatoken:
+        #     ids = self.tokenizer.tokenizer.encode(text)
+        #     return ids.tolist()
         if self.include_special_tokens:
             return self.tokenizer(text).input_ids
         tokens = self.text_to_tokens(text)
@@ -294,6 +297,9 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
 
         When remove_special_tokens is None, uses not self.include_special_tokens.
         """
+        # if self.use_gigatoken:
+        #     text = self.tokenizer.tokenizer.decode(ids)
+        #     return str(text, encoding="utf-8")
         if remove_special_tokens is None:
             remove_special_tokens = not self.include_special_tokens
         tokens = self.ids_to_tokens(ids)
