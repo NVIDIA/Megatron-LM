@@ -38,7 +38,7 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
-from megatron.core.context_parallel_layout import prebuild_thd_cp_partition_routes
+from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
@@ -91,16 +91,6 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
-
-
-def _finalize_packed_seq_params(packed_seq_params):
-    """Resolve CP group metadata and prebuild THD CP layout routes."""
-    if packed_seq_params is None:
-        return None
-    cp_group = packed_seq_params.cp_group or mpu.get_context_parallel_group()
-    packed_seq_params.cp_group = cp_group
-    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
-    return packed_seq_params
 
 
 # Canonical, ordered schema of the fields ``get_batch`` returns. Kept alphabetical
@@ -358,7 +348,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             cp_group=hybrid_cp_group,
             tokens_per_sample=args.seq_length,
         )
-        _finalize_packed_seq_params(packed_seq_params)
+        finalize_packed_seq_params(packed_seq_params)
 
     timers('batch-generator').stop()
 

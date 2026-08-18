@@ -2897,6 +2897,16 @@ def nvtx_range_pop(msg=None, suffix=None) -> None:
     torch.cuda.nvtx.range_pop()
 
 
+@contextmanager
+def nvtx_range(msg=None, suffix=None):
+    """Create an NVTX range controlled by ``configure_nvtx_profiling``."""
+    nvtx_range_push(msg, suffix)
+    try:
+        yield
+    finally:
+        nvtx_range_pop(msg, suffix)
+
+
 @lru_cache(maxsize=None)
 def _nvtx_decorator_get_func_path(func):
     """Get the path of a function.
