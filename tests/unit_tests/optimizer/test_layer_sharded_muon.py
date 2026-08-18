@@ -216,60 +216,22 @@ def test_layer_sharded_matches_duplicated(P, Q, N, momentum, nesterov):
 
     torch.manual_seed(_SEED + 10)
 
-    # Full data (same on all ranks so we can check every rank's shard)
+    # Full data (same on all ranks so we can check every rank's shard). Two
+    # steps with fresh gradients: the second step exercises momentum-buffer
+    # continuity, not just the zero-initialized first update.
+    NUM_STEPS = 2
     full_weights = [torch.randn(P, Q) for _ in range(N)]
-    full_grads = [torch.randn(P, Q) for _ in range(N)]
-    full_momentums = [torch.zeros(P, Q) for _ in range(N)]  # start from zero
+    step_grads = [[torch.randn(P, Q) for _ in range(N)] for _ in range(NUM_STEPS)]
 
     # Each rank's local GTP shard
     def _shard(t):
         return t[r * P_shard : (r + 1) * P_shard, :].clone()
 
-    local_weights = [_shard(w) for w in full_weights]
-    local_grads = [_shard(g) for g in full_grads]
-    local_momentums = [_shard(m) for m in full_momentums]
+    # Reference state: duplicated mode, tracked across steps.
+    ref_weights = [_shard(w) for w in full_weights]
+    ref_momentums = [torch.zeros_like(w) for w in ref_weights]
 
-    # ---------------------------------------------------------------
-    # Reference: duplicated mode
-    #   For each param: all_gather momentum shards -> NS on full (P, Q) -> take my shard
-    # ---------------------------------------------------------------
-    ref_updated_weights = []
-    for i in range(N):
-        # Momentum update (local, per rank)
-        m_shard = local_momentums[i].clone()
-        g_shard = local_grads[i]
-        m_shard.lerp_(g_shard, 1 - momentum)
-        if nesterov:
-            eff_grad = g_shard.lerp(m_shard, momentum)
-        else:
-            eff_grad = m_shard
-
-        # All-gather to get full (P, Q) momentum across GTP group
-        shards = [torch.zeros_like(eff_grad) for _ in range(S)]
-        dist.all_gather(shards, eff_grad.contiguous(), group=_world())
-        full_eff_grad = torch.cat(shards, dim=0)  # (P, Q)
-
-        # NS on full matrix
-        full_orth = newton_schulz(full_eff_grad.float(), steps=5, coefficient_type="quintic")
-        # Scale: max(P, Q)^0.5 (spectral mode)
-        scale = max(P, Q) ** 0.5
-        full_orth = full_orth * scale
-
-        # Take my shard and update weight
-        my_orth_shard = full_orth[r * P_shard : (r + 1) * P_shard, :]
-        w_updated = local_weights[i].clone()
-        w_updated.add_(my_orth_shard, alpha=-lr)
-        ref_updated_weights.append(w_updated)
-
-    # ---------------------------------------------------------------
-    # Test: LayerShardedMuon
-    # ---------------------------------------------------------------
-    # Create params and set grad
-    params = []
-    for i in range(N):
-        p = _gtp_param(local_weights[i].clone())
-        p.grad = local_grads[i].clone()
-        params.append(p)
+    params = [_gtp_param(_shard(w)) for w in full_weights]
 
     optimizer = LayerShardedMuon(
         params,
@@ -289,22 +251,42 @@ def test_layer_sharded_matches_duplicated(P, Q, N, momentum, nesterov):
     assignment = {id(p): (i % S, 0) for i, p in enumerate(params)}
     optimizer.set_param_ns_homes(assignment)
 
-    optimizer.step()
+    for step in range(NUM_STEPS):
+        for i, p in enumerate(params):
+            p.grad = _shard(step_grads[step][i])
+        optimizer.step()
 
-    # ---------------------------------------------------------------
-    # Compare
-    # ---------------------------------------------------------------
-    for i, (p, ref_w) in enumerate(zip(params, ref_updated_weights)):
-        torch.testing.assert_close(
-            p.data,
-            ref_w,
-            atol=1e-4,
-            rtol=1e-4,
-            msg=lambda m, i=i, p=p, ref_w=ref_w: (
-                f"Weight mismatch for param {i} on rank {r}: "
-                f"max_diff={(p.data - ref_w).abs().max().item():.2e}\n\n{m}"
-            ),
-        )
+        # -----------------------------------------------------------
+        # Reference: duplicated mode for the same step.
+        #   Momentum update on the local shard -> all_gather -> NS on the full
+        #   (P, Q) matrix -> scale -> take my shard -> weight update.
+        # Bitwise comparison: layer sharding assembles the identical NS input
+        # in the identical order, runs the identical newton_schulz, and applies
+        # the scale with the same multiply order (extra_scale_factor=1.0 is an
+        # exact multiply) — so every bit must match, not just 1e-4 of them.
+        # -----------------------------------------------------------
+        for i in range(N):
+            g_shard = _shard(step_grads[step][i])
+            ref_momentums[i].lerp_(g_shard, 1 - momentum)
+            if nesterov:
+                eff_grad = g_shard.lerp(ref_momentums[i], momentum)
+            else:
+                eff_grad = ref_momentums[i]
+
+            shards = [torch.zeros_like(eff_grad) for _ in range(S)]
+            dist.all_gather(shards, eff_grad.contiguous(), group=_world())
+            full_eff_grad = torch.cat(shards, dim=0)  # (P, Q)
+
+            full_orth = newton_schulz(full_eff_grad.float(), steps=5, coefficient_type="quintic")
+            scale = max(P, Q) ** 0.5  # spectral mode
+            full_orth = full_orth * scale
+
+            ref_weights[i].add_(full_orth[r * P_shard : (r + 1) * P_shard, :], alpha=-lr)
+
+            assert torch.equal(params[i].data, ref_weights[i]), (
+                f"Bitwise mismatch for param {i} on rank {r} at step {step}: "
+                f"max_diff={(params[i].data - ref_weights[i]).abs().max().item():.2e}"
+            )
 
 
 def test_unequal_assignment_still_correct():
