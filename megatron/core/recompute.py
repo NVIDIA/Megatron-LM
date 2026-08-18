@@ -11,6 +11,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -86,6 +87,8 @@ def checkpointed_forward(
                     hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                         index, hidden_states
                     )
+                # Compare residuals in the layer's layout, before any CP conversion.
+                residual_accumulator = hidden_states
 
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
@@ -137,6 +140,7 @@ def checkpointed_forward(
                 # Some layer paths may still return a tuple (defensive).
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+                observe_layer_residuals(layer, residual_accumulator, hidden_states)
                 if cp_layout_state is not None:
                     hidden_states = cp_layout_state.finalize_layer(index, hidden_states)
             return hidden_states, context

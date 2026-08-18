@@ -29,6 +29,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_loggin
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
+from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
@@ -368,13 +369,24 @@ class TestHybridModel:
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         ).cuda()
 
-        logits = self.model.forward(
-            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
-        )
+        observed = []
+        with capture_tensor_observations(
+            lambda *args: observed.append(args),
+            frozenset({"residual_accumulator", "residual_contribution", "output_logits"}),
+        ):
+            logits = self.model.forward(
+                input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+            )
 
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.model.vocab_size
+        kinds = [observation[2] for observation in observed]
+        assert kinds.count("residual_accumulator") == 3
+        assert kinds.count("residual_contribution") == 3
+        assert kinds.count("output_logits") == 1
+        assert observed[-1][0] is self.model.output_layer
+        torch.testing.assert_close(observed[-1][3].transpose(0, 1), logits)
 
     def test_forward_packed_sequence(self):
         os.environ.pop('NVTE_FUSED_ATTN', None)
