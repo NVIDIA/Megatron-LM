@@ -247,6 +247,12 @@ class LoggerConfig:
     log_interval: int = 100
     """Report loss and timing interval."""
 
+    tensor_metrics: list[str] = field(default_factory=list)
+    """Tensor metric specifications in ``NAME:INTERVAL`` form, such as
+    ``layer-param-l2:10``. Multiple specifications may be supplied after one
+    ``--tensor-metrics`` flag.
+    """
+
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
