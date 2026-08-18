@@ -655,7 +655,9 @@ class CheckpointFunction(torch.autograd.Function):
 
             # Compute the forward pass.
             detached_inputs = detach_variable(inputs)
-            with torch.enable_grad():
+            from megatron.core.tensor_observation import suspend_tensor_observations
+
+            with torch.enable_grad(), suspend_tensor_observations():
                 outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
@@ -948,7 +950,9 @@ class CheckpointWithoutOutput(object):
 
             # Reconstruct full args list from saved ctx
             inputs = _load_args_from_ctx(self.ctx)
-            with torch.enable_grad(), fp8_ctx, recompute_ctx:
+            from megatron.core.tensor_observation import suspend_tensor_observations
+
+            with torch.enable_grad(), fp8_ctx, recompute_ctx, suspend_tensor_observations():
                 outputs = self.run_function(*inputs)
 
         self.run_function = None

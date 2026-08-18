@@ -19,6 +19,7 @@ import torch
 from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.optimizer_param_scheduler import combine_param_group_overrides
+from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, mup_scaled_init_method_normal
@@ -634,6 +635,7 @@ class TestMuPMTPLossScaling:
         labels = torch.ones(1, 4, dtype=torch.long)
         loss_mask = torch.ones_like(labels, dtype=torch.float32)
         observed_logits_mean = {'value': None}
+        observed_metric_logits = []
 
         def output_layer(hidden, weight=None, runtime_gather_output=None):
             return hidden.clone(), None
@@ -645,19 +647,25 @@ class TestMuPMTPLossScaling:
             observed_logits_mean['value'] = mtp_logits.mean().item()
             return torch.ones_like(mtp_labels, dtype=mtp_logits.dtype)
 
-        process_mtp_loss(
-            hidden_states=hidden_states,
-            labels=labels,
-            loss_mask=loss_mask,
-            output_layer=output_layer,
-            output_weight=None,
-            runtime_gather_output=None,
-            is_training=False,
-            compute_language_model_loss=compute_language_model_loss,
-            config=config,
-            cp_group=None,
-            packed_seq_params=None,
-            scale_logits_fn=scale_logits_fn,
-        )
+        with capture_tensor_observations(
+            lambda *args: observed_metric_logits.append(args), frozenset({"mtp_logits"})
+        ):
+            process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_layer=output_layer,
+                output_weight=None,
+                runtime_gather_output=None,
+                is_training=False,
+                compute_language_model_loss=compute_language_model_loss,
+                config=config,
+                cp_group=None,
+                packed_seq_params=None,
+                scale_logits_fn=scale_logits_fn,
+            )
 
         assert observed_logits_mean['value'] == pytest.approx(3.0)
+        assert len(observed_metric_logits) == 1
+        assert observed_metric_logits[0][1:3] == ("mtp_logits.0", "mtp_logits")
+        assert observed_metric_logits[0][3].mean().item() == pytest.approx(3.0)

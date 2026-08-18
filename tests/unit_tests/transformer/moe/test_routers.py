@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import (
     get_updated_expert_bias,
@@ -14,6 +15,10 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_routing_with_score_function,
 )
 from megatron.core.transformer.moe.router import Router
+from megatron.core.transformer.moe.router_diagnostics import (
+    ROUTER_DIAGNOSTIC_CHANNEL_COUNT,
+    RouterDiagnosticChannel,
+)
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -28,6 +33,14 @@ try:
     HAVE_ROUTER_FUSION = _fused_topk_with_score_function is not None
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+class _ProcessGroup:
+    def __init__(self, size):
+        self._size = size
+
+    def size(self):
+        return self._size
 
 
 class TestTop2Router:
@@ -79,6 +92,75 @@ class TestTop2Router:
             hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
             hidden_states = hidden_states.cuda().bfloat16()
             scores, indices = self.router(hidden_states)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_router_forward_observes_compact_diagnostics_when_aux_loss_is_disabled(self):
+        self.router = self.router.cuda()
+        # A complete sequence may still be marked sequence-parallel when TP has only one rank.
+        # The compact diagnostics have batch as dimension zero and therefore remain replicated.
+        self.router.config.sequence_parallel = True
+        self.router.tp_group = _ProcessGroup(1)
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
+        observed = []
+
+        with capture_tensor_observations(
+            lambda *args: observed.append(args), frozenset({"router_diagnostics"})
+        ):
+            self.router(hidden_states)
+
+        assert len(observed) == 1
+        owner, name, source_kind, diagnostics, tp_shard_dim = observed[0]
+        assert owner is self.router
+        assert name == source_kind == "router_diagnostics"
+        assert diagnostics.shape == (2, ROUTER_DIAGNOSTIC_CHANNEL_COUNT, 4)
+        torch.testing.assert_close(
+            diagnostics[:, RouterDiagnosticChannel.VALID_TOKEN_COUNT, 0],
+            torch.full((2,), 32.0, device="cuda"),
+        )
+        torch.testing.assert_close(
+            diagnostics[:, RouterDiagnosticChannel.AUX_ACTUAL_OVERLAP, 0],
+            torch.ones(2, device="cuda"),
+        )
+        assert tp_shard_dim is None
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        ("sequence_parallel", "tp_size", "cp_size", "unsupported_axis"),
+        ((True, 2, 1, "tensor"), (False, 1, 2, "context")),
+    )
+    def test_router_forward_rejects_diagnostics_for_partitioned_sequences(
+        self, sequence_parallel, tp_size, cp_size, unsupported_axis
+    ):
+        self.router = self.router.cuda()
+        self.router.config.sequence_parallel = sequence_parallel
+        self.router.tp_group = _ProcessGroup(tp_size)
+        self.router.cp_group = _ProcessGroup(cp_size)
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
+
+        with capture_tensor_observations(lambda *args: None, frozenset({"router_diagnostics"})):
+            with pytest.raises(
+                NotImplementedError,
+                match=rf"complete local sequences.*{unsupported_axis} parallel ranks",
+            ):
+                self.router(hidden_states)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_router_forward_validates_diagnostics_during_no_grad_forward(self):
+        self.router = self.router.cuda()
+        self.router.config.sequence_parallel = True
+        self.router.tp_group = _ProcessGroup(2)
+        self.router.cp_group = _ProcessGroup(2)
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
+
+        with (
+            capture_tensor_observations(lambda *args: None, frozenset({"router_diagnostics"})),
+            torch.no_grad(),
+            pytest.raises(NotImplementedError, match="complete local sequences"),
+        ):
+            self.router(hidden_states)
 
     @pytest.mark.internal
     @pytest.mark.skipif(
