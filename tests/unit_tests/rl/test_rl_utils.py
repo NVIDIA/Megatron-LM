@@ -254,9 +254,6 @@ class TestRLUtils:
             reward=0.0,
             env_id="cap-test",
             generation_cap=cap,
-            policy_epoch=[[(0, 0)]],
-            kv_cache_epoch=[[(0, 0)]],
-            num_evictions=[0],
         )
         assert rl_utils.single_turn_termination_ok(rollout, traj, seq_len, eod) is ok
 
@@ -841,9 +838,10 @@ class TestRLUtils:
         [pytest.param((1, 1), id="tp1-pp1")],
         indirect=["initialize_model_parallel"],
     )
-    @pytest.mark.parametrize("scenario", ["fallback_and_pad", "oversampling"])
+    @pytest.mark.parametrize("scenario", ["fallback_and_pad", "oversampling", "empty_rollout"])
     def test_prepare_data_for_update_row_accounting(self, initialize_model_parallel, scenario):
-        """Rows = one per rollout, except non-prefix rollouts fall back to one row per turn.
+        """Rows = one per rollout, except non-prefix rollouts fall back to one row per turn
+        and zero-turn placeholders (failed episodes) contribute no row at all.
         The (padded) row count -- not the rollout count -- sizes the microbatch calculator, and
         oversampling (ratio < 1) consumes a fraction of the rows per step."""
         world_size, dp, tp, pp = initialize_model_parallel
@@ -885,6 +883,26 @@ class TestRLUtils:
 
             rollouts = [[single("a", 1.0), non_prefix()] for _ in range(dp)]
             expected_microbatches = 2
+        elif scenario == "empty_rollout":
+            # group = [2 single-turn, 1 zero-turn placeholder (failed episode)] -> 2 rows/group:
+            # the placeholder is skipped (keeping it would crash indexing trajectory[-1], and
+            # counting it would pad 3*dp rows up to 4*dp -> 2 microbatches).
+            # 2*dp rows (already a multiple of micro_batch_size*dp) -> 1 microbatch.
+            self.create_test_args(
+                micro_batch_size=2,
+                seq_length=4,
+                curr_iteration=1,
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                global_batch_size=dp * 3,
+                grpo_prompts_per_step=dp,
+                grpo_group_size=3,
+            )
+            rollouts = [
+                [single("a", 1.0), single("b", 0.0), make_token_rollout([], [], [], reward=0.0)]
+                for _ in range(dp)
+            ]
+            expected_microbatches = 1
         else:  # oversampling: ratio = global_batch_size/(prompts*group) = 2*dp/(dp*4) = 0.5.
             # 4*dp single-turn rows (already a multiple of 2*dp); ceil(0.5 * 4*dp) = 2*dp;
             # 2*dp / (2 * dp) = 1 microbatch.
@@ -1002,20 +1020,66 @@ class TestRLUtils:
                 torch.testing.assert_close(got, exp_t, rtol=0, atol=0)
 
     @pytest.mark.parametrize(
-        "trajectory, collapsible",
+        "trajectory, logprobs, generation_mask, collapsible",
         [
-            pytest.param([[1, 2, 3]], True, id="single_turn"),
-            pytest.param([[1, 2], [1, 2, 3, 4]], True, id="prefix_chain"),
-            pytest.param([[1, 2, 3, 4], [5, 6, 7, 8]], False, id="non_prefix"),
-            pytest.param([[1, 2, 3], [1, 2]], False, id="later_turn_shorter"),
+            pytest.param([[1, 2, 3]], [[0.1, 0.2]], [[False, True, True]], True, id="single_turn"),
+            pytest.param(
+                [[1, 2], [1, 2, 3, 4]],
+                [[0.1], [0.2, 0.3]],
+                [[False, True], [False, False, True, True]],
+                True,
+                id="prefix_chain",
+            ),
+            pytest.param(
+                [[1, 2, 3, 4], [5, 6, 7, 8]],
+                [[0.1, 0.2, 0.3], [0.1, 0.2, 0.3]],
+                [[False, True, True, True], [False, True, True, True]],
+                False,
+                id="non_prefix",
+            ),
+            pytest.param(
+                [[1, 2, 3], [1, 2]],
+                [[0.1, 0.2], [0.1]],
+                [[False, True, True], [False, True]],
+                False,
+                id="later_turn_shorter",
+            ),
+            pytest.param(
+                [[1, 2], [1, 2, 3, 4]],
+                [[0.1], [0.2]],
+                [[False, True], [False, False, True, True]],
+                True,
+                id="final_turn_short_one_eod",
+            ),
+            pytest.param(
+                [[1, 2], [1, 2, 3, 4]],
+                [[0.1], [0.2, 0.3]],
+                [[True, True], [False, False, True, True]],
+                False,
+                id="nonfinal_turn_short_one",
+            ),
+            pytest.param(
+                [[1, 2], [1, 2, 3, 4]],
+                [[0.1], [0.2]],
+                [[False, True], [False, True, True, True]],
+                False,
+                id="final_turn_short_two",
+            ),
+            pytest.param(
+                [[1, 2], [1, 2, 3, 4]],
+                [[0.1], [0.2, 0.3]],
+                [[False, True], [False, False, False, True]],
+                False,
+                id="extra_logprobs",
+            ),
         ],
     )
-    def test_is_collapsible_rollout(self, trajectory, collapsible):
+    def test_is_collapsible_rollout(self, trajectory, logprobs, generation_mask, collapsible):
         """A rollout collapses to one combined row only when each turn's token_ids is an exact
-        prefix of the next; otherwise it must fall back to one row per turn."""
-        rollout = make_token_rollout(
-            trajectory, [[0.0] for _ in trajectory], [[False] * len(t) for t in trajectory]
-        )
+        prefix of the next AND each turn's logprob count matches its generated-token count
+        (the final turn may be short one: train-side-appended eod); otherwise it must fall
+        back to one row per turn."""
+        rollout = make_token_rollout(trajectory, logprobs, generation_mask)
         assert rl_utils._is_collapsible_rollout(rollout) is collapsible
 
     @pytest.mark.parametrize(

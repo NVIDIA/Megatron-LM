@@ -1107,7 +1107,7 @@ def calculate_grpo_advantages(
 
     Args:
         rewards: One inner list per group, one entry per rollout in that group:
-            `rewards[g][i]`` is the reward of rollout `i` in group `g`.
+            `rewards[g][i]` is the reward of rollout `i` in group `g`.
             All groups are assumed to be the same size. Shape: (num_groups, group_size).
             e.g. rewards = [[-1, 1], [4, 4]]  # 2 groups, 2 rollouts each
 
@@ -1898,19 +1898,26 @@ def _to_list(x):
 
 
 def _is_collapsible_rollout(rollout) -> bool:
-    """Whether a rollout can be trained as ONE combined sequence.
+    """Whether a rollout can be trained as one combined sequence.
 
     A multi-turn rollout collapses only if each turn's token_ids is an exact token-prefix of
-    the next, so the per-turn generated regions are disjoint in the final frame and the
-    concatenated inference logprobs line up with the union mask. Single-turn and raw rollouts
-    are trivially collapsible. Non-prefix rollouts must fall back to one row per turn so that
-    logprobs are never misaligned.
+    the next (so the per-turn generated regions are disjoint in the final frame) and the
+    per-turn logprob counts match the generated-token counts (so the concatenated inference
+    logprobs line up with the union mask).
+    Single-turn and raw rollouts are trivially collapsible.
+    Non-collapsible rollouts must fall back to one row per turn so that logprobs are not misaligned.
     """
     if not isinstance(rollout, TokenRollout) or len(rollout.trajectory) == 1:
         return True
     turns = [_to_list(t) for t in rollout.trajectory]
     for prev, cur in zip(turns, turns[1:]):
         if len(prev) > len(cur) or cur[: len(prev)] != prev:
+            return False
+    # Make sure that every turn's logprobs count matches the generated token count exactly.
+    # (the final turn may be short by one: the EOD)
+    for k, (mask, lps) in enumerate(zip(rollout.generation_mask, rollout.logprobs)):
+        short = int(sum(_to_list(mask))) - len(_to_list(lps))
+        if short != 0 and not (k == len(rollout.logprobs) - 1 and short == 1):
             return False
     return True
 
@@ -1920,22 +1927,19 @@ def prepare_trajectories(
 ):
     """Pad trajectories and extract the generation masks.
 
-    Each (possibly multi-turn) rollout becomes ONE training row: the last turn's token_ids
+    Each (possibly multi-turn) rollout becomes one training row: the last turn's token_ids
     already contain the whole conversation, so we train it once with a multi-region
     generation mask (the union of every turn's generated span) rather than re-encoding the
     prefix once per turn.
 
     Args:
-        rows: one entry per training row -- a rollout, or PAD_ROW (None) for inert padding.
+        rows: one entry per training row: a rollout, or PAD_ROW (None) for inert padding.
         tokenizer: Tokenizer to get the padding token and potentially tokenize.
         seq_length:  Maximum sequence length to pad to.
 
     Returns:
         Trajectories, their generation masks, and per-row inference logprobs
         (unpadded tensor per real row, None per PAD row).
-
-    Raises:
-        ValueError:
     """
     # Track counts for each environment ID
     env_id_counts = Counter()
@@ -2027,7 +2031,9 @@ def prepare_trajectories(
         generation_masks.append(generation_mask)
         inference_logprobs.append(torch.Tensor(inf_logprobs) if inf_logprobs else None)
 
-        env_id_counts[rollout.env_id] += 1
+        # A non-prefix rollout expands to one tuple row per turn; count the rollout once.
+        if not isinstance(row, tuple) or row[1] == 0:
+            env_id_counts[rollout.env_id] += 1
 
     if torch.distributed.is_initialized():
         logger.info(f"[{dist.get_rank()}] Rollout counts:")
@@ -2208,13 +2214,16 @@ def prepare_data_for_update(
         samples_ratio_per_step = args.global_batch_size / (args.grpo_prompts_per_step * args.grpo_group_size)
         assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
 
-        # Build training rows. A rollout collapses to ONE combined row when its turns form a
+        # Build training rows. A rollout collapses to one combined row when its turns form a
         # prefix chain (the common case: each turn re-encodes the prior conversation); if not,
         # it falls back to one row per turn so logprobs are never misaligned. group_stats.advantages
         # has one entry per rollout (group-major, matching `rollouts`); expand it to one per row.
         rows = []
         row_advantages = []
         for rollout, adv in zip(rollouts, group_stats.advantages):
+            if not rollout.trajectory:
+                # Zero-turn placeholder (failed episode): nothing to train.
+                continue
             if _is_collapsible_rollout(rollout):
                 rows.append(rollout)
                 row_advantages.append(adv)

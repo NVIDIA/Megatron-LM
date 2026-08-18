@@ -584,10 +584,9 @@ def pack_inference_logprobs(
             continue  # Skip if no inference logprobs
         seq_inf_logprobs = inference_logprobs[seq_idx].to(device)
 
-        # Scatter logprobs to their generated token slots. Generation can span MULTIPLE regions
-        # for multi-turn rollouts (generation interleaved with observations), so place each
-        # logprob at the slot for its token: a token at local position `p` occupies packed slot
-        # `seq_start + (p - 1)` (`get_logprobs()` shifts by one).
+        # Scatter logprobs to their generated token slots.
+        # Generation can span multiple regions for multi-turn rollouts; place each logprob at the
+        # slot for its token: a token at position `p` occupies packed slot `seq_start + (p - 1)`.
         gen_positions = generation_masks[seq_idx].nonzero(as_tuple=True)[0].to(device)
         if gen_positions.numel() == 0:
             continue
