@@ -60,10 +60,15 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
-def _get_default_fsdp_unit_modules() -> List[torch.nn.Module]:
+def _get_default_fsdp_unit_modules(overlap_moe_expert_parallel_comm: bool) -> List[torch.nn.Module]:
+    fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+
+    if overlap_moe_expert_parallel_comm:
+        return fsdp_unit_modules
+
     from megatron.core.models.bagel.transformer_mot_layer import MoTTransformerLayer
 
-    return [TransformerLayer, MoTTransformerLayer]
+    return [*fsdp_unit_modules, MoTTransformerLayer]
 
 
 class FullyShardedDataParallel(_BaseDataParallel):
@@ -166,7 +171,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = _get_default_fsdp_unit_modules()
+                self.fsdp_unit_modules = _get_default_fsdp_unit_modules(
+                    config.overlap_moe_expert_parallel_comm
+                )
             else:
                 self.fsdp_unit_modules = []
 
