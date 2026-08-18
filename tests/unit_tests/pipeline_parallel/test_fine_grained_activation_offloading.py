@@ -166,70 +166,78 @@ def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+@pytest.mark.skipif(
+    Utils.world_size < 2, reason="Rank-0 duplicate aggregation requires at least two ranks."
+)
 def test_post_warmup_callback_warns_on_duplicated_storage_offload(caplog, monkeypatch):
     from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
 
-    if torch.distributed.get_world_size() < 2:
-        pytest.skip("This test requires a nonzero rank.")
+    # post_warmup_callback gathers the per-rank duplicate summaries, so this test needs a
+    # live process group. The skipif above reads the launcher's world size rather than
+    # torch.distributed.get_world_size(), which raises when no group exists yet.
+    Utils.initialize_model_parallel()
 
-    rank = safe_get_rank()
-    duplicate_rank = 1
-    base = torch.randn(1024, 512, device="cuda")
-    storage_bytes = base.numel() * base.element_size()
-    # Two strided views that each cover >50% of the shared storage, so both take
-    # the whole-storage offload path and copy the same bytes to CPU twice. Only
-    # rank 1 creates this duplication, exercising the rank-0 aggregation path.
-    views = (base[:, :400], base[:, 112:]) if rank == duplicate_rank else (base[:, :400],)
-    assert all(not view.is_contiguous() for view in views)
+    try:
+        rank = safe_get_rank()
+        duplicate_rank = 1
+        base = torch.randn(1024, 512, device="cuda")
+        storage_bytes = base.numel() * base.element_size()
+        # Two strided views that each cover >50% of the shared storage, so both take
+        # the whole-storage offload path and copy the same bytes to CPU twice. Only
+        # rank 1 creates this duplication, exercising the rank-0 aggregation path.
+        views = (base[:, :400], base[:, 112:]) if rank == duplicate_rank else (base[:, :400],)
+        assert all(not view.is_contiguous() for view in views)
 
-    # post_warmup_callback disables the last group of each name (offload margin),
-    # so build two same-named groups and assert on the surviving one.
-    groups = []
-    for group_idx in range(2):
-        group = OffloadTensorGroup("core_attn")
-        for tensor_idx, view in enumerate(views):
-            group.push_tensor((group_idx, tensor_idx), view)
-        groups.append(group)
+        # post_warmup_callback disables the last group of each name (offload margin),
+        # so build two same-named groups and assert on the surviving one.
+        groups = []
+        for group_idx in range(2):
+            group = OffloadTensorGroup("core_attn")
+            for tensor_idx, view in enumerate(views):
+                group.push_tensor((group_idx, tensor_idx), view)
+            groups.append(group)
 
-    chunk = _make_warmup_chunk(groups)
-    for group in groups:
-        chunk.bulk_offload_group(group)
-    torch.cuda.synchronize()
+        chunk = _make_warmup_chunk(groups)
+        for group in groups:
+            chunk.bulk_offload_group(group)
+        torch.cuda.synchronize()
 
-    # The second view of each group on rank 1 is redundant; other ranks have no
-    # local duplication to report.
-    for group in groups:
-        assert group.duplicate_storage_tensor_count == int(rank == duplicate_rank)
-        assert group.duplicate_storage_bytes == (storage_bytes if rank == duplicate_rank else 0)
+        # The second view of each group on rank 1 is redundant; other ranks have no
+        # local duplication to report.
+        for group in groups:
+            assert group.duplicate_storage_tensor_count == int(rank == duplicate_rank)
+            assert group.duplicate_storage_bytes == (storage_bytes if rank == duplicate_rank else 0)
 
-    real_all_gather_object = torch.distributed.all_gather_object
-    all_gather_object_calls = 0
+        real_all_gather_object = torch.distributed.all_gather_object
+        all_gather_object_calls = 0
 
-    def counting_all_gather_object(*args, **kwargs):
-        nonlocal all_gather_object_calls
-        all_gather_object_calls += 1
-        return real_all_gather_object(*args, **kwargs)
+        def counting_all_gather_object(*args, **kwargs):
+            nonlocal all_gather_object_calls
+            all_gather_object_calls += 1
+            return real_all_gather_object(*args, **kwargs)
 
-    monkeypatch.setattr(torch.distributed, "all_gather_object", counting_all_gather_object)
-    with caplog.at_level(logging.WARNING, logger=off_module.__name__):
-        _run_post_warmup_callback(chunk)
+        monkeypatch.setattr(torch.distributed, "all_gather_object", counting_all_gather_object)
+        with caplog.at_level(logging.WARNING, logger=off_module.__name__):
+            _run_post_warmup_callback(chunk)
 
-    assert all_gather_object_calls == 1
+        assert all_gather_object_calls == 1
 
-    # The margin rule keeps only the first group offloaded. Rank 0 gathers and
-    # reports the duplication even though it occurred only on rank 1.
-    if rank == 0:
-        assert "copying the same tensor storage to CPU more than once" in caplog.text
-        assert (
-            f"rank {duplicate_rank}, core_attn: 1 redundant copies, "
-            f"{storage_bytes / (1024 * 1024):.2f} MB" in caplog.text
-        )
-        assert "Offloading proceeds with the duplicated copies." in caplog.text
-    else:
-        assert "copying the same tensor storage to CPU more than once" not in caplog.text
-    # The duplicated offloading is diagnosed, not suppressed.
-    assert groups[0].offload
-    assert groups[0].total_tensor_count == len(views)
+        # The margin rule keeps only the first group offloaded. Rank 0 gathers and
+        # reports the duplication even though it occurred only on rank 1.
+        if rank == 0:
+            assert "copying the same tensor storage to CPU more than once" in caplog.text
+            assert (
+                f"rank {duplicate_rank}, core_attn: 1 redundant copies, "
+                f"{storage_bytes / (1024 * 1024):.2f} MB" in caplog.text
+            )
+            assert "Offloading proceeds with the duplicated copies." in caplog.text
+        else:
+            assert "copying the same tensor storage to CPU more than once" not in caplog.text
+        # The duplicated offloading is diagnosed, not suppressed.
+        assert groups[0].offload
+        assert groups[0].total_tensor_count == len(views)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
