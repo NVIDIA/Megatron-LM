@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for ``selective_state_update`` (megatron/core/ssm/ops/mamba2/mamba_ssm.py)."""
+# Unit tests for `selective_state_update` (megatron/core/ssm/ops/mamba2/mamba_ssm.py).
 
 import pytest
 import torch
@@ -17,14 +17,14 @@ def _requires_cuda():
 class TestSelectiveStateUpdateInputPurity:
     """Regression tests: selective_state_update must never mutate its inputs.
 
-    When called WITHOUT ``intermediate_ssm_states``, the launcher used to
-    substitute ``x`` as a dummy pointer with all-zero strides. The
-    ``HAS_INT_STATE`` heuristic (``int_state_ptr is not None``) then saw a
+    When called WITHOUT `intermediate_ssm_states`, the launcher used to
+    substitute `x` as a dummy pointer with all-zero strides. The
+    `HAS_INT_STATE` heuristic (`int_state_ptr is not None`) then saw a
     non-None pointer and enabled the intermediate-state dump, which collapsed
-    its whole store grid onto ``x[0, 0, 0, 0]`` — corrupting ``x`` after the
-    call and racing other programs' loads of ``x`` (nondeterministic
+    its whole store grid onto `x[0, 0, 0, 0]` — corrupting `x` after the
+    call and racing other programs' loads of `x` (nondeterministic
     head-0/dim-0 output errors). This hit every hybrid non-spec decode step.
-    The fix passes ``None`` instead of a dummy.
+    The fix passes `None` instead of a dummy.
     """
 
     def setup_method(self, method):
