@@ -44,11 +44,26 @@ def _make_ddp_config(pad_for_high_busbw=False, grad_reduce_in_fp32=True):
 
 class TestLayerwiseParameterRouting:
 
-    def test_explicit_muon_exclusion_matches_optimizer_routing(self):
-        param = _make_param((16, 8), use_muon=False)
+    @pytest.mark.parametrize(
+        ("shape", "attrs"),
+        [
+            pytest.param((16, 8), {}, id="matrix"),
+            pytest.param((16, 8), {"use_muon": False}, id="explicit-exclusion"),
+            pytest.param((16, 8), {"use_muon": True}, id="explicit-opt-in"),
+            pytest.param(
+                (16, 8),
+                {"is_embedding_or_output_parameter": True},
+                id="embedding-or-output",
+            ),
+            pytest.param((16,), {}, id="vector"),
+            pytest.param((16,), {"use_muon": False}, id="excluded-vector"),
+            pytest.param((4, 4, 4), {}, id="non-matrix"),
+        ],
+    )
+    def test_layer_wise_ownership_matches_muon_routing(self, shape, attrs):
+        param = _make_param(shape, **attrs)
 
-        assert _is_muon_excluded(param)
-        assert not is_managed_by_layer_wise_optimizer(param)
+        assert is_managed_by_layer_wise_optimizer(param) == (not _is_muon_excluded(param))
 
     def test_tags_excluded_matrix_separately_from_muon_matrix(self):
         model = torch.nn.Module()
