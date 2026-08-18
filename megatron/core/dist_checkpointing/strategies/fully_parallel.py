@@ -76,6 +76,8 @@ class FullyParallelSaveStrategyWrapper:
         backend: str = "torch_dist",
         version: int = 1,
         validate_access_integrity: bool = True,
+        pg_cache_path: Optional[str] = None,
+        pg_cache_create: bool = False,
     ):
         """ """
         self.base_strategy = strategy
@@ -91,6 +93,11 @@ class FullyParallelSaveStrategyWrapper:
         # --no-ckpt-load-validate-sharding-integrity skips *both* save-side
         # validation collectives, not just the one in save_preprocess.
         self.validate_access_integrity = validate_access_integrity
+        # PG-collective caching (see determine_main_replica_uniform_distribution).
+        # When pg_cache_path is set and pg_cache_create is False, the save
+        # distribution is read from disk and the all_gather_object is skipped.
+        self.pg_cache_path = pg_cache_path
+        self.pg_cache_create = pg_cache_create
 
         self.cached_distribution: Optional[ShardDistribution] = None
 
@@ -131,13 +138,25 @@ class FullyParallelSaveStrategyWrapper:
         else:
             logger.debug(f'Apply save parallelization')
             precomputed_distribution = determine_main_replica_uniform_distribution(
-                sharded_state_dict, self.parallelization_group
+                sharded_state_dict,
+                self.parallelization_group,
+                pg_cache_path=self.pg_cache_path,
+                pg_cache_create=self.pg_cache_create,
             )
 
         distribute_main_replicas_with_precomputed_distribution(
             sharded_state_dict, self.parallelization_group, precomputed_distribution
         )
-        if self.cached_distribution is None and self.validate_access_integrity:
+        # In cache-read mode the user vouches for a matching config/world size,
+        # so we also skip this first-save integrity check — it triggers its own
+        # collective (determine_global_metadata), which would defeat the purpose
+        # of skipping the distribution all_gather.
+        pg_cache_read = self.pg_cache_path is not None and not self.pg_cache_create
+        if (
+            self.cached_distribution is None
+            and not pg_cache_read
+            and self.validate_access_integrity
+        ):
             # First time applying the parallelization
             validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
         if self.do_cache_distribution:
@@ -179,6 +198,8 @@ class FullyParallelLoadStrategyWrapper:
         do_cache_distribution: bool = False,
         exchange_algo: str = 'broadcast',
         per_rank_object_load: bool = False,
+        pg_cache_path: Optional[str] = None,
+        pg_cache_create: bool = False,
     ):
         self.base_strategy = strategy
         if parallelization_group is None:
@@ -193,6 +214,11 @@ class FullyParallelLoadStrategyWrapper:
         # with a WORLD-wide `all_gather_object`. Opt-in; defaults to the legacy
         # gather-based exchange. See `load` for correctness rationale.
         self.per_rank_object_load = per_rank_object_load
+        # PG-collective caching (see determine_main_replica_uniform_distribution).
+        # When pg_cache_path is set and pg_cache_create is False, the load
+        # distribution is read from disk and the all_gather_object is skipped.
+        self.pg_cache_path = pg_cache_path
+        self.pg_cache_create = pg_cache_create
 
         self.cached_distribution: Optional[ShardDistribution] = None
         self.cached_global_metadata: Optional[Metadata] = None
@@ -433,7 +459,11 @@ class FullyParallelLoadStrategyWrapper:
         else:
             logger.debug(f'Apply load parallelization')
             precomputed_distribution = determine_main_replica_uniform_distribution(
-                sharded_state_dict, self.parallelization_group, True
+                sharded_state_dict,
+                self.parallelization_group,
+                True,
+                pg_cache_path=self.pg_cache_path,
+                pg_cache_create=self.pg_cache_create,
             )
 
         distribute_main_replicas_with_precomputed_distribution(

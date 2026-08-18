@@ -80,7 +80,6 @@ except ImportError:
 try:
     from fla.modules.l2norm import l2_norm
     from fla.ops.gated_delta_product import chunk_gated_delta_product
-    from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
@@ -93,6 +92,14 @@ try:
 except ImportError:
     HAVE_CUTEDSL_GDP = False
 
+# Dynamic-batching inference runs the in-tree fork of these kernels rather than
+# the pip `flash-linear-attention` ones. The fork is forward-only, so training
+# and the static-batching path (which shares the training body) keep calling
+# upstream, which owns the backward pass.
+from megatron.core.ssm.ops.gdp import (
+    chunk_gated_delta_product_varlen,
+    fused_recurrent_gated_delta_rule_update,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -559,12 +566,21 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 # in the backward pass to save memory.
                 qkv_checkpoint = tensor_parallel.CheckpointWithoutOutput()
                 query, key, value = qkv_checkpoint.checkpoint(
-                    partial(self._prepare_qkv, conv_state=conv_state, seq_idx=seq_idx_packed), VKQ
+                    partial(
+                        self._prepare_qkv,
+                        conv_state=conv_state,
+                        seq_idx=seq_idx_packed,
+                        l2_norm_in_kernel=self.config.gdp_cutedsl_kernel,
+                    ),
+                    VKQ,
                 )
             else:
                 # _prepare_qkv also seeds conv_state during prefill
                 query, key, value = self._prepare_qkv(
-                    VKQ, conv_state=conv_state, seq_idx=seq_idx_packed
+                    VKQ,
+                    conv_state=conv_state,
+                    seq_idx=seq_idx_packed,
+                    l2_norm_in_kernel=self.config.gdp_cutedsl_kernel,
                 )
 
         beta, g = self._compute_gating(ba)
@@ -669,7 +685,13 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         )
 
     def _prepare_qkv(
-        self, x, conv_state=None, seq_idx=None, is_decode=False, conv_state_indices=None
+        self,
+        x,
+        conv_state=None,
+        seq_idx=None,
+        is_decode=False,
+        conv_state_indices=None,
+        l2_norm_in_kernel=False,
     ):
         """Run the causal conv on the VKQ slice and split/reshape it into query, key,
         and value.
@@ -681,6 +703,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         Decode passes ``is_decode`` to step the cached conv state one token at a time
         with ``causal_conv1d_update`` (l == 1), selecting per-request cache rows with
         ``conv_state_indices``.
+
+        ``l2_norm_in_kernel`` leaves the query/key L2 norm to the caller's kernel, which
+        every caller whose kernel normalizes internally must set: the CuTeDSL path
+        (``use_qk_l2norm_in_kernel``), ``ssm_prefill``'s varlen kernel, and decode's fused
+        recurrent kernel, which normalizes after the householder zeros are interleaved in.
         """
         if is_decode:
             # Indexed conv update: reads/writes the per-request conv state rows selected
@@ -749,11 +776,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             ).contiguous()
             query = rearrange(query, "b l (g n) -> b l g n", n=self.d_state).contiguous()
 
-        if not is_decode and not self.config.gdp_cutedsl_kernel:
-            # The CuTeDSL path applies the L2 norm inside chunk_gated_delta_product
-            # (use_qk_l2norm_in_kernel); apply it here for the FLA path so that it falls
-            # inside the QKV recompute boundary. Decode defers it to the fused recurrent
-            # kernel, which normalizes after the householder zeros are interleaved in.
+        if not l2_norm_in_kernel:
+            # Apply the L2 norm here so that it falls inside the QKV recompute boundary.
             query = l2_norm(query)
             key = l2_norm(key)
 
@@ -877,7 +901,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         z, VKQ, ba = self._preprocess(zVKQba.transpose(0, 1))
 
         query, key, value = self._prepare_qkv(
-            VKQ, conv_state=conv_state, is_decode=True, conv_state_indices=batch_indices
+            VKQ,
+            conv_state=conv_state,
+            is_decode=True,
+            conv_state_indices=batch_indices,
+            l2_norm_in_kernel=True,
         )
 
         beta, g = self._compute_gating(ba)
@@ -902,7 +930,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             # for the scatter below; the padding rows' outputs are never scattered back.
             initial_state = ssm_state[batch_indices.clamp(min=0)]
 
-        core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule(
+        core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule_update(
             query,
             key,
             value,
@@ -961,12 +989,28 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         )
         tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
 
-        query, key, value = self._prepare_qkv(VKQ, seq_idx=seq_idx)
+        query, key, value = self._prepare_qkv(VKQ, seq_idx=seq_idx, l2_norm_in_kernel=True)
 
         beta, g = self._compute_gating(ba)
 
-        core_attn_out, last_recurrent_state = self._run_gdp_kernel(
-            query, key, value, g, beta, VKQ, output_final_state=True, cu_seqlens=cu_seqlens
+        # batch = 1 packed sequence of length T; householder folded into seq. The shapes
+        # and the GQA repeat_interleave come from _prepare_qkv and _compute_gating above
+        # -- inference asserts gdp_cutedsl_kernel is off, so both take their FLA branch,
+        # which emits exactly the layout this kernel wants. The query/key L2 norm is left
+        # to the kernel (l2_norm_in_kernel above), so it is applied exactly once. This
+        # calls the in-tree fork rather than _run_gdp_kernel because dynamic batching is
+        # forward-only.
+        core_attn_out, last_recurrent_state = chunk_gated_delta_product_varlen(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            num_householder=self.num_householder,
+            cu_seqlens=cu_seqlens,
+            initial_state=None,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
         )
 
         # Write per-request final SSM states into the cache for subsequent decode.

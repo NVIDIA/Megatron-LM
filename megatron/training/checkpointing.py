@@ -24,6 +24,11 @@ import numpy as np
 import torch
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+except ImportError:
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
@@ -783,17 +788,18 @@ def save_checkpoint(
                 )
         else:
             sharded_sd_metadata = None
-        state_dict = generate_state_dict(
-            args,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            rng_state,
-            iteration=iteration,
-            optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
-            model_sd_kwargs=dict(metadata=sharded_sd_metadata),
-            rerun_state=rerun_state,
-        )
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
+            state_dict = generate_state_dict(
+                args,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                rng_state,
+                iteration=iteration,
+                optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                model_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                rerun_state=rerun_state,
+            )
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
@@ -853,6 +859,8 @@ def save_checkpoint(
                         process_group,
                         args.ckpt_assume_constant_structure,
                         validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
+                        pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+                        pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
                     )
             # Allow opting out of save-side sharding validation entirely (even on
             # the first save) via --no-ckpt-load-validate-sharding-integrity. This
@@ -866,17 +874,18 @@ def save_checkpoint(
             logger.debug(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
-            async_save_request = dist_checkpointing.save(
-                state_dict,
-                checkpoint_name,
-                save_strategy,
-                async_sharded_save=args.async_save,
-                validate_access_integrity=validate_sharding_integrity,
-                preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
-                content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
-                async_strategy=args.async_strategy,
-                verify_integrity=args.verify_integrity,
-            )
+            with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.io_write', is_goodput_span=True):
+                async_save_request = dist_checkpointing.save(
+                    state_dict,
+                    checkpoint_name,
+                    save_strategy,
+                    async_sharded_save=args.async_save,
+                    validate_access_integrity=validate_sharding_integrity,
+                    preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
+                    content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
+                    async_strategy=args.async_strategy,
+                    verify_integrity=args.verify_integrity,
+                )
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
@@ -1905,6 +1914,8 @@ def _load_global_dist_base_checkpoint(
             per_rank_object_load=getattr(
                 args, 'ckpt_fully_parallel_load_per_rank_objects', False
             ),
+            pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+            pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
@@ -2445,9 +2456,10 @@ def load_checkpoint(
     state_dict = None
     release = False
     if args.auto_detect_ckpt_format or ckpt_format in ('torch_dist', 'fsdp_dtensor'):
-        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-            load_dir, args, rank0=True, checkpointing_context=checkpointing_context
-        )
+        with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load.io_read', is_goodput_span=True):
+            state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+                load_dir, args, rank0=True, checkpointing_context=checkpointing_context
+            )
 
         ckpt_format = None
         if ckpt_type == CheckpointType.TORCH_DCP:
