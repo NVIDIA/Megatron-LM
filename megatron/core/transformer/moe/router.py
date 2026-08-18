@@ -10,6 +10,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -18,6 +19,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
+    fused_topk_with_score_function_supports_topk_indices,
     get_tokens_per_expert_and_token_count,
     router_gating_linear,
     sinkhorn,
@@ -26,6 +28,8 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+_HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,7 @@ class Router(ABC, MegatronModule):
         self.layer_number = layer_number
         self.is_mtp_layer = is_mtp_layer
         self.tp_group = pg_collection.tp
+        self.expt_tp_group = pg_collection.expt_tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
@@ -332,6 +337,32 @@ class TopKRouter(Router):
             if self.get_aux_loss_coeff(aux_loss_type) > 0:
                 return True
         return False
+
+    def _dense_route_indices_dtype(self) -> Optional[torch.dtype]:
+        """Return the route-index dtype for Flex backends that consume dense top-k indices."""
+        if not self.config.moe_router_fusion:
+            return None
+        if self.config.moe_token_dispatcher_type != "flex":
+            return None
+        if self.config.moe_expert_capacity_factor is not None:
+            return None
+        if not fused_topk_with_score_function_supports_topk_indices:
+            return None
+
+        backend = self.config.moe_flex_dispatcher_backend
+        if backend in ("deepep", "deepepv2", "ncclep"):
+            return torch.int64
+        if backend != "hybridep":
+            return None
+        if not self.config.moe_hybridep_use_dense_routing_map:
+            return None
+        if not HAVE_HYBRIDEP_DENSE_ROUTING:
+            return None
+
+        num_experts = self.expt_tp_group.size() * self.config.num_moe_experts
+        if num_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT:
+            return torch.int16
+        return None
 
     def _apply_aux_loss(
         self,
@@ -710,7 +741,10 @@ class TopKRouter(Router):
 
     @jit_fuser
     def _apply_expert_bias(
-        self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+        self,
+        routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        use_dense_indices: bool = False,
     ):
         """
         Update expert bias and tokens_per_expert
@@ -723,8 +757,21 @@ class TopKRouter(Router):
                     assert (
                         flat_mask.shape[0] == routing_map.shape[0]
                     ), f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
-                    routing_map = routing_map & (~flat_mask).unsqueeze(-1)
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+                    if use_dense_indices:
+                        routing_map = routing_map[~flat_mask]
+                    else:
+                        routing_map = routing_map & (~flat_mask).unsqueeze(-1)
+                if use_dense_indices:
+                    expert_indices = routing_map.reshape(-1).to(torch.long)
+                    token_counts = torch.ones_like(
+                        expert_indices, dtype=self.local_tokens_per_expert.dtype
+                    )
+                    if torch.are_deterministic_algorithms_enabled():
+                        self.local_tokens_per_expert.index_add_(0, expert_indices, token_counts)
+                    else:
+                        self.local_tokens_per_expert.scatter_add_(0, expert_indices, token_counts)
+                else:
+                    self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def _hash_routing(self, logits: torch.Tensor, input_ids: torch.Tensor):
         """Hash-based routing: expert indices come from the tid2eid lookup table.
@@ -807,6 +854,7 @@ class TopKRouter(Router):
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
         # Calculate probs and routing_map for token dispatching
+        topk_indices = None
         if self.is_hash_layer:
             assert input_ids is not None, (
                 "input_ids is required for hash-based routing but was None. "
@@ -816,6 +864,11 @@ class TopKRouter(Router):
         elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         else:
+            topk_indices_dtype = self._dense_route_indices_dtype()
+            if topk_indices_dtype is not None:
+                topk_indices = torch.empty(
+                    (logits.shape[0], self.topk), dtype=topk_indices_dtype, device=logits.device
+                )
             probs, routing_map = topk_routing_with_score_function(
                 logits,
                 self.topk,
@@ -827,6 +880,7 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                topk_indices=topk_indices,
             )
 
         # Dropless HybridEP consumes the sparse routing map directly, so exclude padding
@@ -841,7 +895,10 @@ class TopKRouter(Router):
         if padding_mask is not None and use_dropless_hybridep:
             valid_tokens = (~padding_mask).unsqueeze(-1)
             probs = probs * valid_tokens
-            routing_map = routing_map & valid_tokens
+            if routing_map.dtype == torch.bool:
+                routing_map = routing_map & valid_tokens
+            else:
+                routing_map = routing_map.masked_fill(padding_mask.unsqueeze(-1), -1)
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
@@ -888,7 +945,9 @@ class TopKRouter(Router):
             )
 
         # Optionally apply expert bias
-        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+        self._apply_expert_bias(
+            routing_map, padding_mask=padding_mask, use_dense_indices=topk_indices is not None
+        )
 
         return probs, routing_map
 

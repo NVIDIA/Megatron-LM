@@ -1028,6 +1028,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
+    moe_hybridep_use_dense_routing_map: bool = False
+    """Use dense top-k routing indices for HybridEP when supported. Disabled by default;
+    enable explicitly to reduce HybridEP routing metadata size. Dense-required Flex backends use
+    direct indices automatically when Transformer Engine supports them; older versions fall back
+    to the sparse bool routing-map path."""
+
     moe_ncclep_static_shape: bool = False
     """For the 'ncclep' flex dispatcher: feed the experts the full fixed-size receive buffer
     instead of narrowing to the (data-dependent) number of received tokens, removing the D2H sync
