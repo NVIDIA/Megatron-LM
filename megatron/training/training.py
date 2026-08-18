@@ -811,8 +811,7 @@ def num_floating_point_operations(
         )
 
     def mla_attn_layer_flops(
-        total_tokens,
-        seqlen_squared_sum,
+        *,
         hidden_size,
         num_heads,
         q_lora_rank,
@@ -982,15 +981,13 @@ def num_floating_point_operations(
             )
         elif multi_latent_attention:
             mla_token_term, mla_core_term = mla_attn_layer_flops(
-                total_tokens,
-                seqlen_squared_sum,
-                hidden_size,
-                num_attn_heads,
-                q_lora_rank,
-                kv_lora_rank,
-                qk_head_dim,
-                qk_pos_emb_head_dim,
-                v_head_dim,
+                hidden_size=hidden_size,
+                num_heads=num_attn_heads,
+                q_lora_rank=q_lora_rank,
+                kv_lora_rank=kv_lora_rank,
+                qk_head_dim=qk_head_dim,
+                qk_pos_emb_head_dim=qk_pos_emb_head_dim,
+                v_head_dim=v_head_dim,
             )
             if experimental_attention_variant == "dsa":
                 # DSA ('D' layers) keeps the plain MLA projections but attends
