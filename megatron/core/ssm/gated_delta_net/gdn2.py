@@ -146,7 +146,7 @@ class GatedDeltaNet2(_GDNBase):
 
         return g, {"b": b.contiguous(), "w": w.contiguous()}
 
-    def input_proj_attn(
+    def forward_pre_output_proj(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -324,7 +324,9 @@ class GatedDeltaNet2(_GDNBase):
 
         return norm_out
 
-    def output_proj(self, norm_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def forward_output_proj(
+        self, norm_out: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Apply GDN2's output projection to the normalized recurrence output."""
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
@@ -347,7 +349,7 @@ class GatedDeltaNet2(_GDNBase):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run the GDN2 recurrence followed by its output projection."""
-        norm_out = self.input_proj_attn(
+        norm_out = self.forward_pre_output_proj(
             hidden_states,
             attention_mask,
             inference_context=inference_context,
@@ -356,7 +358,7 @@ class GatedDeltaNet2(_GDNBase):
             inference_params=inference_params,
             **kwargs,
         )
-        return self.output_proj(norm_out)
+        return self.forward_output_proj(norm_out)
 
 
 ####################

@@ -35,7 +35,7 @@ from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, SplitOutputProjection
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -139,7 +139,7 @@ class MambaMixerSubmodules:
     out_proj: Union[ModuleSpec, type] = None
 
 
-class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
+class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, SplitOutputProjection):
     """
     Args:
         config: The config of the model.
@@ -466,9 +466,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             D_has_hdim=self.D_has_hdim,
         )
         self.tp_group = pg_collection.tp
-        self._supports_split_input_output = True
 
-    def input_proj_ssm(
+    def forward_pre_output_proj(
         self,
         hidden_states,
         inference_context=None,
@@ -521,7 +520,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         return y
 
-    def output_proj(self, y):
+    def forward_output_proj(self, y):
         """Apply the Mamba output projection to an SSM output tensor."""
         return self.out_proj(y)
 
@@ -535,21 +534,16 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
     ):
         """Run the input projection/SSM phase followed by the output projection."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
-        y = self.input_proj_ssm(
-            hidden_states,
-            inference_context=inference_context,
-            packed_seq_params=packed_seq_params,
+        y = self.forward_pre_output_proj(
+            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
         )
         if (
             InferenceMode.is_active()
             and inference_context is not None
-            and (
-                inference_context.is_dynamic_batching()
-                or inference_context.seqlen_offset > 0
-            )
+            and (inference_context.is_dynamic_batching() or inference_context.seqlen_offset > 0)
         ):
             return y
-        return self.output_proj(y)
+        return self.forward_output_proj(y)
 
     # ==================================================================
     # Static / eager inference

@@ -139,10 +139,10 @@ class TestGatedDeltaNet:
         attention_mask = None
 
         output, bias = gdn(hidden_states, attention_mask)
-        assert gdn._supports_split_input_output
+        assert gdn.supports_split_output_projection()
 
-        norm_out = gdn.input_proj_attn(hidden_states, attention_mask)
-        split_output, split_bias = gdn.output_proj(norm_out)
+        norm_out = gdn.forward_pre_output_proj(hidden_states, attention_mask)
+        split_output, split_bias = gdn.forward_output_proj(norm_out)
         torch.testing.assert_close(split_output, output)
         assert split_bias is bias is None
 
@@ -217,7 +217,7 @@ class TestGatedDeltaNet:
         torch.manual_seed(42)
         base_gdn = build_gdn(base_config)
         assert base_gdn.recompute_norm_out is False
-        assert base_gdn._supports_split_input_output
+        assert base_gdn.supports_split_output_projection()
         base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
         hidden_states.grad = None
         assert base_gdn.norm_out_checkpoint is None
@@ -229,7 +229,7 @@ class TestGatedDeltaNet:
         torch.manual_seed(42)
         rec_gdn = build_gdn(rec_config)
         assert rec_gdn.recompute_norm_out is True
-        assert not rec_gdn._supports_split_input_output
+        assert not rec_gdn.supports_split_output_projection()
         rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
         assert rec_gdn.norm_out_checkpoint is not None
 

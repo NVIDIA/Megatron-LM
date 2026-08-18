@@ -2,6 +2,7 @@
 
 import pytest
 
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -72,6 +73,37 @@ def test_shortcut_rejects_full_activation_recomputation():
             moe_router_topk=1,
             moe_shortcut_connection=True,
             recompute_granularity="full",
+        )
+
+
+def test_shortcut_block_cuda_graph_scope():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_shortcut_connection=True,
+        moe_shortcut_parallel=True,
+        cuda_graph_impl="local",
+        cuda_graph_modules=["shortcut_block"],
+    )
+
+    assert config.cuda_graph_modules == [CudaGraphModule.shortcut_block]
+
+
+def test_shortcut_cuda_graphs_require_shortcut_block_scope():
+    with pytest.raises(AssertionError, match="cuda_graph_modules=\\['shortcut_block'\\]"):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            moe_router_topk=1,
+            moe_shortcut_connection=True,
+            moe_shortcut_parallel=True,
+            cuda_graph_impl="local",
+            cuda_graph_modules=["attn", "moe_router"],
         )
 
 

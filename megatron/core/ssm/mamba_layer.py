@@ -19,7 +19,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, SplitOutputProjection
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -51,7 +51,7 @@ class MambaLayerSubmodules:
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
 
-class MambaLayer(GraphableMegatronModule):
+class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
     """
     A single Mamba layer.
 
@@ -90,9 +90,6 @@ class MambaLayer(GraphableMegatronModule):
             pp_layer_offset=pp_layer_offset,
             name=(name + f".mixer") if name is not None else None,
         )
-        self._supports_split_input_output = getattr(
-            self.mixer, '_supports_split_input_output', False
-        )
         self.norm = submodules.norm(
             config=self.config,
             hidden_size=self.config.hidden_size,
@@ -107,24 +104,27 @@ class MambaLayer(GraphableMegatronModule):
 
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-        should_graph = (
+        if CudaGraphModule.shortcut_block in self.config.cuda_graph_modules:
+            return
+
+        if (
             not self.config.cuda_graph_modules
             and self.config.inference_cuda_graph_scope != InferenceCudaGraphScope.block
-        ) or CudaGraphModule.mamba in self.config.cuda_graph_modules
-        if should_graph:
-            if self.config.moe_shortcut_connection:
-                # Serialized shortcut execution is intentionally eager. HybridStack creates the
-                # composite graph only for the supported overlapped schedule.
-                if self.config.moe_shortcut_parallel:
-                    self._shortcut_graph_output_proj = True
-            else:
-                self.cudagraph_manager = CudaGraphManager(config)
+        ) or CudaGraphModule.mamba in self.config.cuda_graph_modules:
+            self.cudagraph_manager = CudaGraphManager(config)
 
     def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
         """Returns the Mamba conv and ssm states shapes per request."""
         return self.mixer.mamba_state_shapes_per_request()
 
-    def input_proj_ssm(
+    def supports_split_output_projection(self) -> bool:
+        """Return whether the configured sequence mixer supports split execution."""
+        return (
+            isinstance(self.mixer, SplitOutputProjection)
+            and self.mixer.supports_split_output_projection()
+        )
+
+    def forward_pre_output_proj(
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
@@ -159,14 +159,21 @@ class MambaLayer(GraphableMegatronModule):
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.norm)(hidden_states)
 
-        ssm_output = self.mixer.input_proj_ssm(
+        ssm_output = self.mixer.forward_pre_output_proj(
             hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
         )
         return ssm_output, residual
 
-    def output_proj(self, ssm_output: Tensor, residual: Tensor):
+    def forward_output_proj(
+        self,
+        ssm_output: Tensor,
+        residual: Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        padding_mask: Optional[Tensor] = None,
+    ):
         """Apply Mamba's output projection and the original residual/BDA operation."""
-        mixer_out_with_bias = self.mixer.output_proj(ssm_output)
+        del inference_context, padding_mask
+        mixer_out_with_bias = self.mixer.forward_output_proj(ssm_output)
 
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mamba_bda(

@@ -1,8 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Module."""
+
 from functools import partial
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 from torch.autograd import Variable
@@ -20,6 +21,22 @@ from megatron.core.transformer.utils import (
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
+
+
+class SplitOutputProjection:
+    """Interface for modules whose output projection can be invoked separately."""
+
+    def supports_split_output_projection(self) -> bool:
+        """Return whether this module instance supports split execution."""
+        return True
+
+    def forward_pre_output_proj(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the module through the input to its output projection."""
+        raise NotImplementedError
+
+    def forward_output_proj(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the output projection and the remainder of the module."""
+        raise NotImplementedError
 
 
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring

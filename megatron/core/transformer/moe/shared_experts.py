@@ -96,7 +96,6 @@ class _BackwardStreamWait(torch.autograd.Function):
     def backward(ctx, grad_output):
         """backward with stream wait"""
         ctx.stream.wait_stream(torch.cuda.current_stream())
-        grad_output.record_stream(ctx.stream)
         return grad_output, None
 
 

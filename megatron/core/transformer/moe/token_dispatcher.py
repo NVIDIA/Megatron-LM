@@ -1964,11 +1964,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
-        # The dispatcher normally retains this tensor from dispatch_preprocess. An asynchronous
-        # dispatch bridge may provide an autograd-private alias instead; make the explicit argument
-        # authoritative so its backward remains inside that private graph.
-        if probs is not None:
-            self._comm_manager.token_probs = probs
         dispatched_hidden_states = self._comm_manager.dispatch(
             hidden_states, async_finish, allocate_on_comm_stream
         )
@@ -1991,11 +1986,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             A tuple of permuted tokens, token counts per expert, and permuted probabilities.
         """
-        # Rebind state to the explicit dispatch output. This is normally the same tensor, but an
-        # asynchronous autograd bridge wraps it; using stale manager state would leak the bridge's
-        # private tensor into expert compute and bypass its backward.
-        if probs is not None:
-            self._comm_manager.dispatched_probs = probs
         global_input_tokens, permuted_probs = (
             self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
         )

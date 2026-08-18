@@ -33,7 +33,7 @@ from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, SplitOutputProjection
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -106,7 +106,7 @@ class GatedDeltaProductMixerSubmodules:
     out_proj: Union[ModuleSpec, type] = None
 
 
-class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
+class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, SplitOutputProjection):
     """Gated Delta Product (GDP) sequence mixer for hybrid models.
 
     The mixer accepts hidden states with shape ``[sequence, batch, hidden]`` and returns
@@ -374,9 +374,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             D_cp1=self.D,
             D_has_hdim=self.D_has_hdim,
         )
-        self._supports_split_input_output = True
 
-    def input_proj_ssm(
+    def forward_pre_output_proj(
         self,
         hidden_states,
         inference_context=None,
@@ -535,7 +534,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         return y
 
-    def output_proj(self, y):
+    def forward_output_proj(self, y):
         """Apply GDP's output projection to a recurrence output."""
         return self.out_proj(y)
 
@@ -548,16 +547,14 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         packed_seq_params=None,
     ):
         """Run GDP's recurrence followed by its output projection."""
-        y = self.input_proj_ssm(
-            hidden_states,
-            inference_context=inference_context,
-            packed_seq_params=packed_seq_params,
+        y = self.forward_pre_output_proj(
+            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
         )
         if inference_context is not None and (
             inference_context.is_dynamic_batching() or inference_context.seqlen_offset > 0
         ):
             return y
-        return self.output_proj(y)
+        return self.forward_output_proj(y)
 
     # ==================================================================
     # Static / eager inference

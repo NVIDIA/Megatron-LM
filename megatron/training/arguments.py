@@ -1965,7 +1965,7 @@ def _add_inference_args(parser):
     group.add_argument('--cuda-graph-modules', nargs='+', type=_parse_cuda_graph_modules_arg, default=[],
                        help='Selects training capture coverage within per-layer CUDA graphs '
                        '(local and transformer_engine implementations). '
-                       'Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", and "mamba": '
+                       'Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", and "shortcut_block": '
                        '"attn": captures operations in TransformerLayer._forward_attention(). '
                        '"mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer. '
                        '"moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer. '
@@ -1973,6 +1973,8 @@ def _add_inference_args(parser):
                        'including the shared experts if they are not overlapped with EP comm. '
                        '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
                        '"mamba": captures the mamba layer. '
+                       '"shortcut_block": captures a paired shortcut compute/MoE block; it requires the local implementation '
+                       'and cannot be combined with other module scopes. '
                        'An empty list means capturing the whole Transformer layer. '
                        'This field is meaningless when --cuda-graph-impl=full_iteration and must be empty. '
                        'Backward compatibility: "full" is deprecated but kept for backward compatibility; '

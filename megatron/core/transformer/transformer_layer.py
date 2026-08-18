@@ -22,7 +22,7 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, SplitOutputProjection
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -299,7 +299,7 @@ class BaseTransformerLayer(ABC):
         pass
 
 
-class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, SplitOutputProjection):
     """A single transformer layer.
 
     Transformer layer takes input with size [s, b, h] and returns an
@@ -376,9 +376,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             layer_number=self.layer_number,
             **attention_optional_kwargs,
             name=(name + ".self_attention") if name is not None else None,
-        )
-        self._supports_split_input_output = getattr(
-            self.self_attention, '_supports_split_input_output', False
         )
 
         # [Module 3: BiasDropoutFusion]
@@ -518,7 +515,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         self._set_offload_modules()
         self.off_interface = _get_offloading_interface()
-        self.attn_norm_manager = None
         self.mlp_norm_manager = None
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -535,21 +531,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-        graph_full_layer = (
+        # If full scope (no specific sub-scope), cudagraph the entire layer.
+        # Skip only when inference uses TransformerBlock-level graphs; otherwise the layer keeps
+        # owning the empty-scope manager.
+        if (
             not self.config.cuda_graph_modules
             and self.config.inference_cuda_graph_scope != InferenceCudaGraphScope.block
-        )
-        graph_attention = (
+        ):
+            self.cudagraph_manager = CudaGraphManager(config)
+        elif (
             CudaGraphModule.attn in self.config.cuda_graph_modules
             and self.submodules_config.self_attention != IdentityOp
-        )
-
-        # Serialized shortcut execution is intentionally eager. HybridStack installs the
-        # composite graph only after the paired MoE layer is available.
-        if (graph_full_layer or graph_attention) and self.config.moe_shortcut_connection:
-            if self.config.moe_shortcut_parallel:
-                self._shortcut_graph_output_proj = True
-        elif graph_full_layer or graph_attention:
+        ):
             self.cudagraph_manager = CudaGraphManager(config)
         elif (
             CudaGraphModule.mlp in self.config.cuda_graph_modules
@@ -573,7 +566,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return get_transformer_layer_offset(config)
 
-    def input_proj_attn(
+    def supports_split_output_projection(self) -> bool:
+        """Return whether the configured self-attention supports split execution."""
+        return (
+            isinstance(self.self_attention, SplitOutputProjection)
+            and self.self_attention.supports_split_output_projection()
+        )
+
+    def forward_pre_output_proj(
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,
@@ -658,11 +658,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
-        split_attention = getattr(self.self_attention, '_supports_split_input_output', False)
+        split_attention = self.supports_split_output_projection()
         attention_fn = (
-            self.self_attention.input_proj_attn
-            if split_attention
-            else self.self_attention
+            self.self_attention.forward_pre_output_proj if split_attention else self.self_attention
         )
         attention_intermediate = attention_fn(
             input_layernorm_output,
@@ -693,8 +691,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
-        if getattr(self.self_attention, '_supports_split_input_output', False):
-            attention_output_with_bias = self.self_attention.output_proj(attention_intermediate)
+        if self.supports_split_output_projection():
+            attention_output_with_bias = self.self_attention.forward_output_proj(
+                attention_intermediate
+            )
         else:
             # Identity attention and implementations with a specialized forward retain their
             # original atomic path.
@@ -724,11 +724,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
         # because the residual is needed in the self_attn_bda.
-        if self.attn_norm_manager is not None:
-            hidden_states = self.attn_norm_manager.group_offload(
-                hidden_states, forced_released_tensors=[residual]
-            )
-            self.attn_norm_manager = None
+        hidden_states = self.attn_norm_manager.group_offload(
+            hidden_states, forced_released_tensors=[residual]
+        )
 
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = apply_module(self.pre_cross_attn_layernorm)(hidden_states)
@@ -767,7 +765,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
-    def output_proj(
+    def forward_output_proj(
         self,
         attention_intermediate: Tensor,
         residual: Tensor,
@@ -787,11 +785,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             context_mask=context_mask,
             inference_context=inference_context,
         )
-        output = self._forward_mlp(
-            hidden_states,
-            inference_context,
-            padding_mask=padding_mask,
-        )
+        output = self._forward_mlp(hidden_states, inference_context, padding_mask=padding_mask)
         return output, context
 
     def _forward_attention(
@@ -814,7 +808,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     ):
         """Run the two attention phases while preserving the original API."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
-        attention_intermediate, residual, context = self.input_proj_attn(
+        attention_intermediate, residual, context = self.forward_pre_output_proj(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             context=context,
@@ -1668,21 +1662,14 @@ class MoETransformerLayer(TransformerLayer):
                 and "moe" in self.config.recompute_modules
                 and self.config.cuda_graph_impl == "local"
             )
-            if self.config.moe_shortcut_connection:
-                if CudaGraphModule.moe_router in self.config.cuda_graph_modules:
-                    # Serialized shortcut execution is intentionally eager. HybridStack creates
-                    # both composite graph regions for the overlapped schedule.
-                    if self.config.moe_shortcut_parallel:
-                        self._shortcut_graph_shared_experts = True
-            else:
-                if not hasattr(self, 'cudagraph_manager_router'):
-                    self.cudagraph_manager_router = CudaGraphManager(
-                        self.config, self, function_name="_forward_mlp_router"
-                    )
-                if not hasattr(self, 'cudagraph_manager_postprocess'):
-                    self.cudagraph_manager_postprocess = CudaGraphManager(
-                        self.config, self, function_name="_forward_mlp_postprocess"
-                    )
+            if not hasattr(self, 'cudagraph_manager_router'):
+                self.cudagraph_manager_router = CudaGraphManager(
+                    self.config, self, function_name="_forward_mlp_router"
+                )
+            if not hasattr(self, 'cudagraph_manager_postprocess'):
+                self.cudagraph_manager_postprocess = CudaGraphManager(
+                    self.config, self, function_name="_forward_mlp_postprocess"
+                )
         elif mode == 'full':
             self.use_partial_cudagraphs = False
             self.mlp.fwd_execution_map = ["route", "expert_compute", "postprocess"]
@@ -1715,7 +1702,6 @@ class MoETransformerLayer(TransformerLayer):
         elif (
             CudaGraphModule.moe_router in self.config.cuda_graph_modules
             or CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules
-            or self.config.moe_shortcut_connection
         ):
             self.transition_cudagraph_scope('partial')
 
@@ -1743,15 +1729,6 @@ class MoETransformerLayer(TransformerLayer):
                 token_dispatcher_attr_outputs.append(attr)
 
         return tuple(attr_names), token_dispatcher_attr_outputs
-
-    def _get_local_cudagraph_attr_outputs(self):
-        """Return stable dispatcher tensor outputs for a partial CUDA-graph boundary."""
-        attr_names, attr_outputs = self._get_token_dispatcher_attrs()
-        if self._local_cudagraph_attr_names is None:
-            self._local_cudagraph_attr_names = attr_names
-        else:
-            assert attr_names == self._local_cudagraph_attr_names
-        return attr_outputs
 
     def _synchronize_router_host_outputs(self, attr_outputs):
         """Wait for partial-router graph outputs only when they reside on the host."""
@@ -1792,7 +1769,11 @@ class MoETransformerLayer(TransformerLayer):
         )
 
         if self.use_partial_cudagraphs:
-            token_dispatcher_attr_outputs = self._get_local_cudagraph_attr_outputs()
+            attr_names, token_dispatcher_attr_outputs = self._get_token_dispatcher_attrs()
+            if self._local_cudagraph_attr_names is None:
+                self._local_cudagraph_attr_names = attr_names
+            else:
+                assert attr_names == self._local_cudagraph_attr_names
         else:
             # For eager mode, no need to pass the token_dispatcher attributes
             token_dispatcher_attr_outputs = []
@@ -1910,23 +1891,3 @@ class MoETransformerLayer(TransformerLayer):
             return super()._forward_mlp(
                 hidden_states, padding_mask=padding_mask, packed_seq_params=packed_seq_params
             )
-
-    def shortcut_route_preprocess(self, shortcut_hidden, padding_mask=None):
-        """Run shortcut normalization, routing, and dispatch preprocessing."""
-        shortcut_input = apply_module(self.pre_mlp_layernorm)(shortcut_hidden)
-        if padding_mask is not None:
-            padding_mask = padding_mask.transpose(0, 1).bool()
-        probs, routing_map = self.mlp.route(shortcut_input, padding_mask)
-        permuted_input, probs = self.mlp.preprocess(
-            shortcut_input,
-            probs,
-            routing_map,
-        )
-        token_dispatcher_attr_outputs = []
-        if getattr(self, '_shortcut_graph_shared_experts', False):
-            token_dispatcher_attr_outputs = self._get_local_cudagraph_attr_outputs()
-        return permuted_input, probs, *token_dispatcher_attr_outputs
-
-    def _shortcut_shared_experts(self, hidden_states):
-        pre_mlp_output = self._forward_pre_mlp_layernorm(hidden_states)
-        return self.mlp.shared_experts_compute(pre_mlp_output)

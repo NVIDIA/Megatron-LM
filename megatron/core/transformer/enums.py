@@ -59,9 +59,9 @@ class AttnBackend(enum.Enum):
 
 
 class CudaGraphModule(enum.Enum):
-    """Named capture regions for per-layer CUDA graphs.
+    """Named capture regions for module-level CUDA graphs.
 
-    Whole-layer capture is represented outside this enum by an empty scope. Current per-layer
+    Whole-layer capture is represented outside this enum by an empty scope. Current module-level
     implementations that consume these values are `local` and `transformer_engine`.
     """
 
@@ -71,6 +71,7 @@ class CudaGraphModule(enum.Enum):
     moe_router = 4  # Captures MoE router part
     moe_preprocess = 5  # Captures MoE preprocessing part (requires moe_router)
     mamba = 6  # Captures Mamba layers
+    shortcut_block = 7  # Captures a paired shortcut compute/MoE block
 
 
 # Deprecated: use CudaGraphModule instead. Retained only for checkpoint backward compat.
