@@ -4,7 +4,6 @@ import importlib
 import json
 import logging
 import os
-from collections import OrderedDict
 from typing import Optional, Union
 
 from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase

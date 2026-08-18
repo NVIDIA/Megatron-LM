@@ -343,6 +343,7 @@ def test_bytelevel_tokenizer():
 
 def test_write_metadata_hf():
     tokenizer_path = "/opt/data/tokenizers/huggingface"
+    metadata_path = f"{tokenizer_path}/tokenizer_metadata.json"
     chat_template = "test chat template"
     tokenizer_library = "huggingface"
     MegatronTokenizer.write_metadata(
@@ -351,6 +352,11 @@ def test_write_metadata_hf():
         chat_template=chat_template,
         overwrite=True,
     )
+
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+    assert metadata['chat_template'] == chat_template
+    assert metadata['library'] == tokenizer_library
 
     # When metadata already exists
     with pytest.raises(ValueError):
@@ -365,6 +371,10 @@ def test_write_metadata_hf():
         overwrite=True,
     )
 
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+    assert metadata['class_name'] == "CustomTokenizerClass"
+
     # Save metadata to specific path
     metadata_path = f"{tokenizer_path}/test_metadata.json"
     MegatronTokenizer.write_metadata(
@@ -373,6 +383,10 @@ def test_write_metadata_hf():
         tokenizer_library=tokenizer_library,
         overwrite=True,
     )
+
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+    assert metadata['class_name'] == "MegatronTokenizerText"
 
 
 def test_write_metadata_sp():
