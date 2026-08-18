@@ -597,6 +597,11 @@ class TestLatentProjectionChainClassification:
             def named_parameters(_self):
                 return iter(zip((self.FC1, self.FC2), params))
 
+            def named_modules(_self):
+                # tag_gtp_params_with_names walks modules for gated fc1 weights; this
+                # fixture has bare params only.
+                return iter(())
+
         gtp_module.classify_gtp_remat_chains(
             _Model(), cuda_graph_modules=cuda_graph_modules, cuda_graph_impl=cuda_graph_impl
         )
@@ -837,6 +842,85 @@ class TestGTPMicrobatches:
     def test_consistent_across_microbatches(self):
         _requires_multi_gpu(4)
         _run_distributed(_worker_microbatches, 4)
+
+
+def _worker_gated_fused_microbatches(rank, world_size, port):
+    """A fused GLU weight's storage mapping is CONTIGUOUS rows of the logical [gate | up].
+
+    Regression guard for the storage re-layout that replaced the runtime de-interleave pair.
+    The checkpoint wiring (transformer/mlp.py + tensor_parallel/gtp_ckpt.py) defines a GTP
+    shard as a contiguous row slice of the logical TP-local weight, so the all-gathered
+    weight is already [all gate | all up] and the GEMM consumes it with NO permutation.
+
+    This worker simulates the loader: each rank overwrites its shard with the matching
+    contiguous slice of a known logical weight, then asserts ELEMENTWISE that
+    - every microbatch's forward equals F.linear against the logical weight (mb0 exercises
+      the on-demand gather, mb1 the prefetched path — both must see logical order), and
+    - the wgrad lands on the shard's own contiguous rows (the reduce-scatter deals out
+      contiguous dim0 chunks, which under this mapping ARE the storage rows).
+
+    Permutation-invariant probes (checksums, grad norms, lr=0 A/Bs) cannot see layout bugs;
+    only elementwise checks can, which is why every assert here is torch.equal/allclose on
+    full tensors.
+    """
+    torch.manual_seed(0)
+    batch, in_f, out_f = 8, 64, 128
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    # Two layers so the prefetch chain has links to build; one alone never takes that path.
+    layers = [_make_gtp_linear(in_f, out_f, gtp_remat_group, dtype) for _ in range(2)]
+
+    # Simulate the loader-defined mapping: shard = contiguous rows of a known logical weight.
+    shard_rows = out_f // world_size
+    logicals = []
+    for layer in layers:
+        logical = torch.randn(out_f, in_f, dtype=dtype, device="cuda")
+        dist.broadcast(logical, src=0)
+        layer.weight.data.copy_(logical[rank * shard_rows : (rank + 1) * shard_rows])
+        logicals.append(logical)
+
+    inp = torch.randn(batch, in_f, dtype=dtype, device="cuda")
+    dist.broadcast(inp, src=0)
+
+    # Both layers consume the SAME input rather than being chained: the second layer exists
+    # only so the GTP prefetch chain has links to build.
+    for mb, is_first in enumerate((True, False)):
+        for layer, logical in zip(layers, logicals):
+            got = layer(inp, is_first_microbatch=is_first)
+            want = torch.nn.functional.linear(inp, logical)
+            assert torch.equal(got, want), (
+                f"microbatch {mb}: gathered fused weight is not in logical [gate|up] order "
+                f"(max_diff={(got.float()-want.float()).abs().max():.6f}). "
+                f"Note |out|_1 agrees under a permutation -- compare elementwise."
+            )
+
+    # Backward: with contiguous storage, the RS chunk for this rank IS its storage rows.
+    grad_out = torch.randn(batch, out_f, dtype=dtype, device="cuda")
+    dist.broadcast(grad_out, src=0)
+    loss = 0
+    ref_leaves = []
+    for layer, logical in zip(layers, logicals):
+        layer.weight.main_grad = torch.zeros(layer.weight.shape, dtype=dtype, device="cuda")
+        loss = loss + (layer(inp, is_first_microbatch=False) * grad_out).sum()
+        ref_leaf = logical.detach().clone().float().requires_grad_(True)
+        (torch.nn.functional.linear(inp.float(), ref_leaf) * grad_out.float()).sum().backward()
+        ref_leaves.append(ref_leaf)
+    loss.backward()
+
+    for i, (layer, ref_leaf) in enumerate(zip(layers, ref_leaves)):
+        want = ref_leaf.grad[rank * shard_rows : (rank + 1) * shard_rows]
+        got = layer.weight.main_grad.float()
+        assert torch.allclose(got, want, atol=2e-1, rtol=2e-2), (
+            f"layer {i}: wgrad did not land on this shard's contiguous storage rows "
+            f"(max_diff={(got-want).abs().max():.4f})"
+        )
+
+
+class TestGTPGatedFusedLayout:
+    def test_gated_fused_layout_every_microbatch(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_gated_fused_microbatches, 4)
 
 
 # ---------------------------------------------------------------------------
