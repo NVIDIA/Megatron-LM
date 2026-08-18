@@ -32,8 +32,27 @@ ENCODER = "images"
 
 
 def _args(**overrides):
+    ddp_defaults = vars(DistributedDataParallelConfig())
     base = dict(
-        seed=1234, image_token_id=100, fp32=True, ddp_num_buckets=None, ddp_bucket_size=None
+        ddp_defaults,
+        seed=1234,
+        image_token_id=100,
+        fp32=True,
+        accumulate_allreduce_grads_in_fp32=ddp_defaults["grad_reduce_in_fp32"],
+        check_for_nan_in_loss_and_grad=ddp_defaults["check_for_nan_in_grad"],
+        check_for_large_grads=ddp_defaults["check_for_large_grads"],
+        ddp_num_buckets=ddp_defaults["num_buckets"],
+        ddp_bucket_size=ddp_defaults["bucket_size"],
+        ddp_pad_buckets_for_high_nccl_busbw=ddp_defaults["pad_buckets_for_high_nccl_busbw"],
+        ddp_reduce_scatter_with_fp32_accumulation=ddp_defaults[
+            "reduce_scatter_with_fp32_accumulation"
+        ],
+        ddp_param_name_patterns_for_fp32_local_accumulation=list(
+            ddp_defaults["param_name_patterns_for_fp32_local_accumulation"]
+        ),
+        ddp_average_in_collective=ddp_defaults["average_in_collective"],
+        use_precision_aware_optimizer=ddp_defaults["megatron_fsdp_use_decoupled_grad"],
+        cuda_graph_impl="none",
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -70,15 +89,32 @@ def _build_unwrapped_mimo_model(topo, bf16=False):
 
 
 def test_ddp_overlap_config_is_selected_per_module_role():
-    args = _args(overlap_grad_reduce=True, overlap_param_gather=True)
+    args = _args(
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
+        check_for_nan_in_loss_and_grad=True,
+        ddp_average_in_collective=True,
+        use_distributed_optimizer=True,
+        fp8_param_gather=True,
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+    )
 
     enabled = _ddp_config_from_args(args, enable_overlap=True)
     disabled = _ddp_config_from_args(args, enable_overlap=False)
 
     assert enabled.overlap_grad_reduce
     assert enabled.overlap_param_gather
+    assert enabled.check_for_nan_in_grad
+    assert enabled.average_in_collective
+    assert enabled.use_distributed_optimizer
     assert not disabled.overlap_grad_reduce
     assert not disabled.overlap_param_gather
+    assert disabled.check_for_nan_in_grad
+    assert disabled.average_in_collective
+    assert disabled.use_distributed_optimizer
+    assert enabled.fp8_param_gather and disabled.fp8_param_gather
+    assert enabled.reuse_grad_buf_for_mxfp8_param_ag
+    assert disabled.reuse_grad_buf_for_mxfp8_param_ag
 
 
 def test_encoder_overlap_opt_in_reaches_encoder_ddp_config(mocker):
@@ -181,6 +217,18 @@ def test_builder_encoder_role_sets_encoder_contract(mocker):
     seed.assert_called_once_with(args, encoder_pg, _ENCODER_SEED_OFFSET, False)
     assert model.pg_collection is encoder_pg
     assert model.rng_state_key_prefix == "encoder."
+
+
+@pytest.mark.parametrize("fsdp_kwarg", ["use_megatron_fsdp", "use_torch_fsdp2"])
+def test_builder_rejects_untested_fsdp_modes(mocker, fsdp_kwarg):
+    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+
+    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock()))
+
+    with pytest.raises(NotImplementedError, match="has not been tested yet"):
+        builder.build_distributed_models(
+            mocker.Mock(), ddp_config=DistributedDataParallelConfig(), **{fsdp_kwarg: True}
+        )
 
 
 def test_resolve_role_rejects_colocated_or_zero_active_roles(mocker):

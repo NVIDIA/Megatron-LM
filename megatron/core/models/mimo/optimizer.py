@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -123,6 +123,14 @@ class MimoOptimizer(MegatronOptimizer):
         """Clear gradients on all active module optimizers."""
         for opt in self._active_optimizers:
             opt.zero_grad(set_to_none)
+
+    @property
+    def chained_optimizers(self) -> List[MegatronOptimizer]:
+        """Expose direct inner optimizers to stock optimizer lifecycle hooks."""
+        optimizers = []
+        for opt in self._active_optimizers:
+            optimizers.extend(getattr(opt, 'chained_optimizers', [opt]))
+        return optimizers
 
     def prepare_model_params_for_param_sync(self) -> None:
         """Stage parameters for explicit synchronization in all active module optimizers."""
@@ -340,6 +348,22 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
 
 
+def _optimizer_config_for_module(
+    config: OptimizerConfig, module: torch.nn.Module
+) -> OptimizerConfig:
+    """Match optimizer overlap behavior to the module's DDP lifecycle."""
+    ddp_config = getattr(module, 'ddp_config', None)
+    if ddp_config is None:
+        return config
+    overlap_param_gather = ddp_config.overlap_param_gather
+    module_config = copy(config)
+    module_config.overlap_param_gather = overlap_param_gather
+    module_config.overlap_param_gather_with_optimizer_step = (
+        config.overlap_param_gather_with_optimizer_step and overlap_param_gather
+    )
+    return module_config
+
+
 def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
     """Create optimizer for MimoModel with heterogeneous parallelism."""
     from megatron.core.optimizer import get_megatron_optimizer
@@ -379,7 +403,7 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                     f"{module.ddp_config.num_distributed_optimizer_instances} instances."
                 )
                 optimizer = get_megatron_optimizer(
-                    config=config,
+                    config=_optimizer_config_for_module(config, module),
                     model_chunks=[module],
                     pg_collection=pg_collection,
                     use_gloo_process_groups=False,

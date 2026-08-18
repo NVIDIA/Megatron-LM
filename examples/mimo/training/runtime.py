@@ -81,16 +81,13 @@ def _module_config(module: torch.nn.Module):
 def _ddp_config_from_args(
     args: argparse.Namespace, enable_overlap: bool
 ) -> DistributedDataParallelConfig:
-    """Build a DDP config from CLI args; when ``enable_overlap`` is False both overlaps are off."""
-    return DistributedDataParallelConfig(
-        overlap_grad_reduce=enable_overlap and getattr(args, "overlap_grad_reduce", False),
-        overlap_param_gather=enable_overlap and getattr(args, "overlap_param_gather", False),
-        num_buckets=getattr(args, "ddp_num_buckets", None),
-        bucket_size=getattr(args, "ddp_bucket_size", None),
-        pad_buckets_for_high_nccl_busbw=getattr(args, "ddp_pad_buckets_for_high_nccl_busbw", False),
-        use_distributed_optimizer=True,
-        grad_reduce_in_fp32=getattr(args, "accumulate_allreduce_grads_in_fp32", True),
-    )
+    """Build a module-role DDP config from the global CLI arguments."""
+    from megatron.training.training import get_megatron_ddp_config
+
+    config = get_megatron_ddp_config(args)
+    config.overlap_grad_reduce &= enable_overlap
+    config.overlap_param_gather &= enable_overlap
+    return config
 
 
 def wrap_active_modules_with_ddp(
