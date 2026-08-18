@@ -11,6 +11,7 @@ import torch
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -29,16 +30,14 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
-    _CudagraphGlobalRecord,
     create_cudagraphs,
     delete_cuda_graphs,
 )
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
-from megatron.rl.agent.api import TokenRollout
+from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
 from megatron.rl.inference import ReturnsRaw
-from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -92,9 +91,16 @@ class MockTokenizer:
         return [str(tok) for tok in tokens]
 
 
-def make_token_rollout(trajectory, logprobs, generation_mask=None, reward=1.0, problem_id="p"):
-    """TokenRollout with the per-turn staleness boilerplate derived from the turn count."""
-    turns = len(trajectory)
+_NEXT_CID = itertools.count()
+
+
+def _mint_cids(num_turns):
+    return [f"cid-{next(_NEXT_CID)}" for _ in range(num_turns)]
+
+
+def make_token_rollout(
+    trajectory, logprobs, generation_mask=None, reward=1.0, problem_id="p", completion_ids=None
+):
     return TokenRollout(
         trajectory=trajectory,
         reward=reward,
@@ -102,10 +108,13 @@ def make_token_rollout(trajectory, logprobs, generation_mask=None, reward=1.0, p
         logprobs=logprobs,
         env_id='MEGAENV',
         problem_id=problem_id,
-        policy_epoch=[[(0, 0)]] * turns,
-        kv_cache_epoch=[[(0, 0)]] * turns,
-        num_evictions=[0] * turns,
+        completion_ids=_mint_cids(len(trajectory)) if completion_ids is None else completion_ids,
     )
+
+
+def _ledger_for(*rollouts, epoch=0):
+    """A uniform-epoch finished-request record per turn, keyed by completion id."""
+    return {cid: _ledger_record(epoch) for r in rollouts for cid in r.completion_ids}
 
 
 class DummyConfigModule(torch.nn.Module):
@@ -119,7 +128,7 @@ class DummyLogprobsModel(torch.nn.Module):
         super().__init__()
         self.config = config
         self.layer = DummyConfigModule(layer_config)
-        self.pg_collection = SimpleNamespace(pp=object())
+        self.pg_collection = SimpleNamespace(pp=object(), cp=None)
         self.config_values_during_forward = None
 
     def forward(self, tokens, position_ids, attention_mask, **kwargs):
@@ -154,8 +163,8 @@ class DummyMoELayer:
 def initialize_model_parallel(request, monkeypatch):
     """Fixture to initialize and destroy model parallel.
 
-    Parameters are passed via request.param as a tuple: (tp, pp)
-    Skips if world_size < tp * pp.
+    Parameters are passed via request.param as a tuple: (tp, pp) or (tp, pp, cp)
+    Skips if world_size < tp * pp * cp.
     """
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     monkeypatch.setenv("WANDB_MODE", "disabled")
@@ -163,11 +172,14 @@ def initialize_model_parallel(request, monkeypatch):
 
     initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
 
-    tp, pp = request.param
+    tp, pp = request.param[:2]
+    cp = request.param[2] if len(request.param) > 2 else 1
     world_size = Utils.world_size
-    Utils.initialize_model_parallel(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp, context_parallel_size=cp
+    )
     model_parallel_cuda_manual_seed(123)
-    dp = world_size // (tp * pp)
+    dp = world_size // (tp * pp * cp)
     yield world_size, dp, tp, pp
     Utils.destroy_model_parallel()
     destroy_global_vars()
@@ -184,6 +196,16 @@ def cleanup_global_state():
 
 class TestRLUtils:
     """Test class for RL utilities."""
+
+    def teardown_method(self, method):
+        # Runs even when a test fails: leaked capture state otherwise wedges the
+        # session-end distributed barrier into the 60-minute job timeout.
+        delete_cuda_graphs()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        CudaGraphManager.global_mempool = None
+        CudaGraphManager.fwd_mempools = None
+        CudaGraphManager.bwd_mempools = None
 
     def create_test_args(self, **kwargs):
         destroy_global_vars()
@@ -214,30 +236,6 @@ class TestRLUtils:
         assert args.rl_consumption_granularity == "B"
         assert args.rl_generation_lag == 0
         assert not hasattr(args, "rl_parallel_generation_tasks")
-        assert get_rl_parallel_generation_tasks(args) == 1
-
-    @pytest.mark.parametrize(
-        "submission_granularity, generation_lag, expected_parallel_generation_tasks",
-        [
-            pytest.param("B", 0, 1, id="batch"),
-            pytest.param("B", 2, 3, id="batch_with_lag"),
-            pytest.param("G", 0, 8, id="group"),
-            pytest.param("G", 2, 24, id="group_with_lag"),
-            pytest.param("R", 0, 32, id="rollout"),
-            pytest.param("R", 2, 96, id="rollout_with_lag"),
-        ],
-    )
-    def test_get_rl_parallel_generation_tasks(
-        self, submission_granularity, generation_lag, expected_parallel_generation_tasks
-    ):
-        args = SimpleNamespace(
-            rl_submission_granularity=submission_granularity,
-            rl_generation_lag=generation_lag,
-            grpo_prompts_per_step=8,
-            grpo_group_size=4,
-        )
-
-        assert get_rl_parallel_generation_tasks(args) == expected_parallel_generation_tasks
 
     @pytest.mark.parametrize(
         "rl_partial_rollouts, submission_granularity",
@@ -254,49 +252,53 @@ class TestRLUtils:
         """Regression for the removed ``num_groups=1`` streaming override.
 
         Previously ``get_rollout_generator`` forced ``num_groups`` to 1 whenever it
-        streamed with a non-batch submission granularity. For a multi-environment
-        agent that collapses the per-env group distribution so some environments
-        receive zero groups (and a degenerate all-zero ``agent_slots``), stalling
-        ``get_grouped_rollouts``. ``num_groups`` must stay at the trainer batch size
-        (``n_prompts``) regardless of streaming or submission granularity.
+        streamed with a non-batch submission granularity, collapsing the per-env
+        group layout so some environments received zero groups (now a loud
+        ``ValueError`` from ``rollout_allocations``). ``num_groups`` must stay at
+        the trainer batch size (``n_prompts``) regardless of streaming or
+        submission granularity.
         """
         n_prompts = 8
         captured = {}
         rollout_generator = object()
+        agent = object()
 
-        class Agent:
-            def get_grouped_rollouts(self, request):
+        class FakePipeline:
+            def __init__(self, agent, request, parallel_generation_tasks):
+                captured["agent"] = agent
                 captured["request"] = request
+                captured["parallel_generation_tasks"] = parallel_generation_tasks
+                self.gate = SimpleNamespace(capacity=parallel_generation_tasks)
+
+            def run(self):
                 return rollout_generator
 
-        def get_agent(_args, parallel_generation_tasks=None):
-            captured["parallel_generation_tasks"] = parallel_generation_tasks
-            return Agent()
-
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
-        monkeypatch.setattr(rl_utils, "get_agent", get_agent)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", None)
+        monkeypatch.setattr(rl_utils, "get_agent", lambda _env_config_path: agent)
+        monkeypatch.setattr(rl_utils, "RolloutPipeline", FakePipeline)
 
-        args = SimpleNamespace(
-            rl_partial_rollouts=rl_partial_rollouts,
-            rl_submission_granularity=submission_granularity,
-            rl_consumption_granularity="B",
-            rl_generation_lag=0,
-            grpo_prompts_per_step=n_prompts,
-            grpo_group_size=4,
-            rl_default_temperature=1.0,
-            inference_max_seq_length=128,
-            rl_default_top_p=1.0,
-            rl_default_top_k=0,
-            grpo_filter_groups_with_same_reward=False,
-        )
-
+        generation_lag = 0
         result = rl_utils.get_rollout_generator(
-            args, inference_interface=ReturnsRaw(), n_prompts=n_prompts, samples_per_group=4
+            ReturnsRaw(),
+            n_prompts,
+            4,
+            streaming=rl_partial_rollouts,
+            generation_args={'temperature': 1.0, 'max_tokens': 128, 'top_p': 1.0, 'top_k': 0},
+            filter_groups_with_same_reward=False,
+            submission_granularity=submission_granularity,
+            consumption_granularity="B",
+            generation_lag=generation_lag,
+            env_config_path="unused.yaml",
         )
 
         assert result is rollout_generator
+        assert captured["agent"] is agent
         assert captured["request"].num_groups == n_prompts
         assert captured["request"].streaming == rl_partial_rollouts
+        # The gate depth handed to the pipeline is lag + 1 trainer batches,
+        # independent of submission granularity.
+        assert captured["parallel_generation_tasks"] == generation_lag + 1
         assert captured["request"].submission_granularity == submission_granularity
 
     @pytest.mark.parametrize(
@@ -307,6 +309,26 @@ class TestRLUtils:
                 "--rl-generation-lag requires --rl-partial-rollouts",
                 id="lag_requires_partial_rollouts",
             ),
+            pytest.param({"rl_generation_lag": -2}, "must be >= -1", id="lag_below_minimum"),
+            pytest.param(
+                {
+                    "rl_generation_lag": 1,
+                    "rl_max_inflight_requests": 64,
+                    "rl_partial_rollouts": True,
+                },
+                "mutually exclusive",
+                id="lag_and_max_inflight_exclusive",
+            ),
+            pytest.param(
+                {"rl_max_inflight_requests": 128},
+                "requires --rl-partial-rollouts",
+                id="max_inflight_above_batch_requires_partial_rollouts",
+            ),
+            pytest.param(
+                {"rl_max_inflight_requests": 0, "rl_partial_rollouts": True},
+                "must be >= 1",
+                id="max_inflight_below_minimum",
+            ),
             pytest.param(
                 {"rl_submission_granularity": "R"},
                 "Rollout submission granularity requires streaming grouped rollouts",
@@ -316,11 +338,6 @@ class TestRLUtils:
                 {"rl_consumption_granularity": "R"},
                 "--rl-consumption-granularity R is not currently supported",
                 id="rollout_consumption_unsupported",
-            ),
-            pytest.param(
-                {"rl_submission_granularity": "B", "rl_consumption_granularity": "G"},
-                "--rl-submission-granularity B with --rl-consumption-granularity G",
-                id="batch_submit_group_consume_unsupported",
             ),
         ],
     )
@@ -430,6 +447,102 @@ class TestRLUtils:
             assert current_config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         lang_module.eval.assert_called_once()
         lang_module.train.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "do_train, skip_train, expect_train_branch",
+        [
+            pytest.param(True, False, True, id="training"),
+            pytest.param(True, True, True, id="inference_only"),
+            pytest.param(False, False, False, id="eval_only"),
+        ],
+    )
+    def test_evaluate_and_print_results_rl_wandb_step_handling(
+        self, monkeypatch, do_train, skip_train, expect_train_branch
+    ):
+        """Only eval-only mode (--skip-train --train-iters 0, do_train=False) takes the decoupled
+        eval_only/* wandb path. --skip-train alone still runs the RL loop with monotonically
+        advancing iteration, so its evals log against the global step (see PR #6043)."""
+        args = SimpleNamespace(
+            do_train=do_train,
+            skip_train=skip_train,
+            world_size=1,
+            cuda_graph_impl="none",
+            rl_offload_optimizer_during_inference=False,
+            langrl_env_config=None,
+            rl_prompts_per_eval=1,
+            rl_default_temperature=1.0,
+            rl_default_top_p=1.0,
+            rl_default_top_k=0,
+            seq_length=SEQ,
+        )
+        response = SimpleNamespace(env_id="env", metrics=lambda: {"reward": [1.0, 0.5]}, results=[])
+        agent = SimpleNamespace(run_evaluation=lambda request: [response])
+        wandb_writer = MagicMock()
+
+        monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(
+            rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
+        )
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
+        )
+        monkeypatch.setattr(rl_utils, "get_agent", lambda *_args: agent)
+        monkeypatch.setattr(
+            rl_utils, "get_asyncio_loop", lambda: SimpleNamespace(run_until_complete=lambda r: r)
+        )
+        monkeypatch.setattr(
+            rl_utils, "EvaluationRequest", lambda **kwargs: SimpleNamespace(**kwargs)
+        )
+        monkeypatch.setattr(rl_utils, "get_wandb_writer", lambda: wandb_writer)
+        monkeypatch.setattr(rl_utils, "lang_rl_log_dir", None)
+        monkeypatch.setattr(rl_utils.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(
+            rl_utils.dist, "gather_object", lambda obj, lst, dst=0: lst.__setitem__(0, obj)
+        )
+
+        rl_utils.evaluate_and_print_results_rl(
+            data_iterator=None,
+            model=[MagicMock()],
+            optimizer=MagicMock(),
+            iteration=7,
+            write_to_tensorboard=False,
+        )
+
+        if expect_train_branch:
+            wandb_writer.log.assert_called_once_with({"env_eval_mean_reward": 0.75}, step=7)
+            wandb_writer.define_metric.assert_not_called()
+        else:
+            wandb_writer.define_metric.assert_called_once_with(
+                "eval_only/*", step_metric="eval_checkpoint_iter"
+            )
+            wandb_writer.log.assert_called_once_with(
+                {"eval_checkpoint_iter": 7, "eval_only/env_eval_mean_reward": 0.75}
+            )
+
+    @pytest.mark.parametrize("template_dtype", [torch.float32, torch.bfloat16])
+    def test_align_unpacked_inference_logprobs_rides_in_float32(self, template_dtype):
+        """Under bf16 training old_logprobs arrives bf16 while wire inference
+        logprobs are float32; the alignment must not silently downcast them
+        into the template's dtype (the IS-correction ratio is
+        precision-sensitive), and the aligned result rides in float32 like
+        pack_inference_logprobs' packed twin."""
+        old_logprobs = torch.full((2, 6), -1.0, dtype=template_dtype)
+        # Two generated tokens at positions 3,4: the logprob of the token at
+        # position p lives at index p-1, so the filled slots are 2,3.
+        gen_masks = torch.zeros((2, 7), dtype=torch.bool)
+        gen_masks[:, 3:5] = True
+        inference_logprobs = [torch.tensor([-0.5, -0.25], dtype=torch.float32) for _ in range(2)]
+        aligned = rl_utils.align_unpacked_inference_logprobs(
+            inference_logprobs=inference_logprobs,
+            old_logprobs_for_data=old_logprobs,
+            generation_masks=gen_masks,
+            group_stats=SimpleNamespace(),
+        )
+        assert aligned.dtype == torch.float32
+        assert aligned[0, 2].item() == pytest.approx(-0.5)
+        assert aligned[0, 3].item() == pytest.approx(-0.25)
+        # Slots without inference logprobs keep the template's values.
+        assert aligned[0, 0].item() == pytest.approx(-1.0)
 
     @pytest.mark.parametrize(
         "share_config",
@@ -602,6 +715,7 @@ class TestRLUtils:
 
         # A single-turn rollout whose only turn is short and lacks eod must be rejected:
         # a single-turn completion has no tool-call boundary to justify stopping early.
+        # (The eod tripwire fires before the ledger join, so no record is needed.)
         bad = make_token_rollout(
             [[1, 2, 3]], [[0.1, 0.2, 0.3]], [[False, True, True]], reward=3.14, problem_id="2"
         )
@@ -613,6 +727,7 @@ class TestRLUtils:
                 tokenizer,
                 sequence_packing=False,
                 is_correction=False,
+                request_ledger={},
             )
 
         # Multi-turn rollouts with uneven turn counts: a turn may stop on a tool-call
@@ -620,47 +735,68 @@ class TestRLUtils:
         # = 5*dp turns, padded up to the next multiple of micro_batch_size*dp (= 2*dp)
         # -> 6*dp turns. With samples_ratio 1 the calculator is sized by total turns
         # (6*dp -> 3 microbatches), not by rollout count (the pre-fix bug gave 1).
-        mt1 = make_token_rollout(
-            [[1, 2, 3], [1, 2, 3, 4]],
-            [[-0.1, -0.2], [-0.3, -0.4]],
-            [[False, True, True], [False, False, True, True]],
-            problem_id="1",
-        )
-        mt2 = make_token_rollout(
-            [[1, 2], [1, 2, 3], [1, 2, 3, 4]],
-            [[-0.1], [-0.2], [-0.3]],
-            [[False, True], [False, False, True], [False, False, False, True]],
-            reward=0.0,
-            problem_id="3",
-        )
+        def mt1():
+            return make_token_rollout(
+                [[1, 2, 3], [1, 2, 3, 4]],
+                [[-0.1, -0.2], [-0.3, -0.4]],
+                [[False, True, True], [False, False, True, True]],
+                problem_id="1",
+            )
+
+        def mt2():
+            return make_token_rollout(
+                [[1, 2], [1, 2, 3], [1, 2, 3, 4]],
+                [[-0.1], [-0.2], [-0.3]],
+                [[False, True], [False, False, True], [False, False, False, True]],
+                reward=0.0,
+                problem_id="3",
+            )
+
+        # Every rollout is a distinct engine request with its own completion ids,
+        # so each dp group gets freshly-built rollouts and the ledger one record
+        # per turn.
+        mt_rollouts = [[mt1(), mt2()] for _ in range(dp)]
+        mt_ledger = _ledger_for(*(r for g in mt_rollouts for r in g))
         rl_utils.prepare_data_for_update(
             [model],
             {},
-            [[mt1, mt2] for _ in range(dp)],
+            mt_rollouts,
             tokenizer,
             sequence_packing=False,
             is_correction=False,
+            request_ledger=mt_ledger,
         )
         # 5*dp turns padded to 6*dp; 6*dp / (micro_batch_size 2 * dp) = 3 microbatches.
         assert get_num_microbatches() == 3
 
-        r1 = make_token_rollout(
-            torch.tensor([[1, 2, 3, tokenizer.eod]], dtype=torch.float).cuda(),
-            torch.tensor([[-0.2, -0.3, -3.2]]).cuda(),
-            torch.tensor([[False, True, True, True]], dtype=torch.float).cuda(),
-            reward=3.14,
-            problem_id="2",
-        )
-        r2 = make_token_rollout(
-            torch.tensor([[1, 2, 234, tokenizer.eod]], dtype=torch.float).cuda(),
-            torch.tensor([[-0.2, -0.3, -1.2]]),
-            torch.tensor([[False, True, True, True]], dtype=torch.float).cuda(),
-            reward=0.14,
-            problem_id="2",
-        )
-        rollouts = [[r1, r2] for _ in range(dp)]
+        def r1():
+            return make_token_rollout(
+                torch.tensor([[1, 2, 3, tokenizer.eod]], dtype=torch.float).cuda(),
+                torch.tensor([[-0.2, -0.3, -3.2]]).cuda(),
+                torch.tensor([[False, True, True, True]], dtype=torch.float).cuda(),
+                reward=3.14,
+                problem_id="2",
+            )
+
+        def r2():
+            return make_token_rollout(
+                torch.tensor([[1, 2, 234, tokenizer.eod]], dtype=torch.float).cuda(),
+                torch.tensor([[-0.2, -0.3, -1.2]]),
+                torch.tensor([[False, True, True, True]], dtype=torch.float).cuda(),
+                reward=0.14,
+                problem_id="2",
+            )
+
+        rollouts = [[r1(), r2()] for _ in range(dp)]
+        request_ledger = _ledger_for(*(r for g in rollouts for r in g))
         data_iter, _, _ = rl_utils.prepare_data_for_update(
-            [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
+            [model],
+            {},
+            rollouts,
+            tokenizer,
+            sequence_packing=False,
+            is_correction=False,
+            request_ledger=request_ledger,
         )
 
         _, _, old_logprobs, _, _, _, _ = next(data_iter)
@@ -704,8 +840,15 @@ class TestRLUtils:
             )
 
         rollouts = [[single(str(i), float(i % 2)) for i in range(4)] for _ in range(dp)]
+        request_ledger = _ledger_for(*(r for g in rollouts for r in g))
         rl_utils.prepare_data_for_update(
-            [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
+            [model],
+            {},
+            rollouts,
+            tokenizer,
+            sequence_packing=False,
+            is_correction=False,
+            request_ledger=request_ledger,
         )
         assert get_num_microbatches() == 1
 
@@ -798,6 +941,33 @@ class TestRLUtils:
         advs = rl_utils.calculate_grpo_advantages([[-1, 1], [4, 4]], num_turns)
         torch.testing.assert_close(torch.tensor(advs), torch.tensor(expected), atol=1e-4, rtol=1e-5)
 
+    def test_bounded_artifact_key(self):
+        short = "env_rollout_table"
+        assert rl_utils._bounded_artifact_key(short) == short
+        long_key = "nemo_gym:" + "x" * 120 + "_staleness_hist"
+        bounded = rl_utils._bounded_artifact_key(long_key)
+        assert len(bounded) == 100
+        assert bounded.startswith(long_key[:91])
+        # Deterministic, and distinct keys stay distinct after bounding.
+        assert bounded == rl_utils._bounded_artifact_key(long_key)
+        assert bounded != rl_utils._bounded_artifact_key(long_key + "y")
+
+    def test_placeholder_rewards_do_not_affect_advantage_normalization(self):
+        # Group of 3 with one zero-turn placeholder: the two real rollouts
+        # normalize against each other, so the placeholder's synthetic 0.0
+        # reward manufactures no advantage.
+        advs = rl_utils.calculate_grpo_advantages([[0, 1, 0]], [[0, 1, 1]])
+        torch.testing.assert_close(
+            torch.tensor(advs), torch.tensor([1.0, -1.0]), atol=3e-4, rtol=1e-5
+        )
+
+    def test_all_placeholder_group_has_no_advantages(self):
+        assert rl_utils.calculate_grpo_advantages([[0, 0]], [[0, 0]]) == []
+
+    def test_advantage_shape_mismatch_raises(self):
+        with pytest.raises(AssertionError, match="matching shape"):
+            rl_utils.calculate_grpo_advantages([[1.0, 0.0]], [[1, 1, 1]])
+
     @pytest.mark.parametrize(
         "scenario, expected_turn_lens, expected_traj_lens, expected_num_turns",
         [
@@ -824,6 +994,7 @@ class TestRLUtils:
 
         if scenario == "single_turn_only":
             group = [single([1, 2, 3, eod], 1.0), single([1, 2, eod], 0.0)]
+            request_ledger = _ledger_for(*group)
         else:
             # Cumulative per-turn lengths 4 then 7 -> turn 1 adds 3 tokens; trajectory length is
             # the full conversation (7), not 4 + 7 = 11.
@@ -834,8 +1005,11 @@ class TestRLUtils:
                 problem_id="m",
             )
             group = [multi, single([1, 2, 3, eod], 0.0)]
+            request_ledger = _ledger_for(*group)
 
-        stats = rl_utils.compute_group_stats([group], tokenizer, seq_len=8)
+        stats = rl_utils.compute_group_stats(
+            [group], tokenizer, seq_len=8, request_ledger=request_ledger
+        )
         assert stats.turn_lens == expected_turn_lens
         assert stats.traj_lens == expected_traj_lens
         assert stats.num_turns == expected_num_turns
@@ -1104,24 +1278,36 @@ class TestRLUtils:
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
-        [pytest.param((1, 1), id="tp1-pp1")],
+        [
+            pytest.param((1, 1), id="tp1-pp1"),
+            pytest.param((2, 1), id="tp2-pp1"),
+            pytest.param((1, 2), id="tp1-pp2"),
+            pytest.param(
+                (1, 1, 2),
+                id="tp1-pp1-cp2",
+                marks=pytest.mark.skip(
+                    reason="PackedSeqParams.cp_group (a ProcessGroup) is rejected by the "
+                    "CUDA-graph arg type whitelist; fixed and unskipped in a follow-up PR"
+                ),
+            ),
+        ],
         indirect=["initialize_model_parallel"],
     )
     def test_get_logprobs_cuda_graphs(self, initialize_model_parallel):
-        """Test that get_logprobs reuses CUDA graphs created during training forward pass.
+        """Training CUDA graphs recorded and reused through get_logprobs.
 
-        This test verifies that rl_utils.get_logprobs can reuse CUDA graphs by:
-        1. Running a training-style forward pass on some model to record CUDA graph runners.
-        2. Creating the CUDA graphs.
-        3. Running `get_logprobs` to verify it reuses the same forward graph from training.
+        The training-style pass goes through get_logprobs exactly like train_rl.py's
+        forward_step, so the recorded runners see the shapes production sees — under CP
+        that is the seq // cp local scatter and the explicit pad_between_seqs flag, and
+        capture includes TE's ring-P2P context-parallel attention. The reference-logprobs
+        pass must then replay those graphs without recording new runners.
         """
-
-        num_layers = 2
-
         world_size, dp, tp, pp = initialize_model_parallel
+        cp = world_size // (dp * tp * pp)
         self.create_test_args(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
+            context_parallel_size=cp,
             rl_training_cuda_graphs=True,
             cuda_graph_impl="local",
             bf16=True,
@@ -1130,12 +1316,16 @@ class TestRLUtils:
 
         # Create a model with training CUDA graphs enabled
         transformer_config = TransformerConfig(
-            num_layers=num_layers,
+            num_layers=2,
             hidden_size=64,
             num_attention_heads=4,
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            context_parallel_size=cp,
             use_cpu_initialization=True,
             cuda_graph_impl="local",
             bf16=True,
+            pipeline_dtype=torch.bfloat16,
         )
         model = GPTModel(
             config=transformer_config,
@@ -1150,37 +1340,28 @@ class TestRLUtils:
         for param in wrapped_model.parameters():
             param.main_grad = torch.zeros_like(param)
 
-        # Create test inputs (batch_size=1 required for thd format with sequence packing)
+        # batch_size=1 required for thd format with sequence packing; seq_length divisible
+        # by 2 * cp, as TE's THD partitioning requires.
         batch_size = 1
-        seq_length = 16
+        seq_length = 32
         tokens = torch.randint(0, 256, (batch_size, seq_length), dtype=torch.long).cuda()
         position_ids = torch.arange(seq_length).unsqueeze(0).expand(batch_size, -1).cuda()
 
-        # Create packed_seq_params for dummy data
-        packed_seq_params = get_default_packed_seq_params(
-            seq_length=seq_length, max_sequences_per_bin=4, device=tokens.device
-        )
-
-        # Run a single training forward pass to record cudagraphs
-        output = wrapped_model(
-            tokens,
-            position_ids,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
-            runtime_gather_output=True,
-            fp32_output=False,
+        # Training-style forward pass: like train_rl.py's forward_step it goes through
+        # get_logprobs (which scatters to seq // cp under CP), recording the runners.
+        output = rl_utils.get_logprobs(
+            wrapped_model, tokens, position_ids=position_ids, no_grad=False, sequence_packing=True
         )
 
         # Run backward to reset runner status from BWD_READY back to FWD_READY
-        # This is needed because get_logprobs runs in no_grad mode and expects FWD_READY
-        loss = output.sum()
-        loss.backward()
+        output.sum().backward()
 
         # Collect all CudaGraphManager instances and their runners
         cudagraph_managers = []
         for module in wrapped_model.modules():
             if hasattr(module, 'cudagraph_manager') and module.cudagraph_manager is not None:
                 cudagraph_managers.append(module.cudagraph_manager)
+        assert cudagraph_managers, "Expected CUDA graph managers on the transformer layers"
 
         # Record runner count before creating graphs
         runners_before = {id(mgr): len(mgr.cudagraph_runners) for mgr in cudagraph_managers}
@@ -1191,8 +1372,8 @@ class TestRLUtils:
         for mgr in cudagraph_managers:
             for runner in mgr.cudagraph_runners:
                 assert runner.fwd_graph is not None, (
-                    f"Expected runner to have fwd_graph created after create_cudagraphs(), "
-                    f"but fwd_graph is None"
+                    "Expected runner to have fwd_graph created after create_cudagraphs(), "
+                    "but fwd_graph is None"
                 )
 
         # Now test `get_logprobs`; this should reuse the existing CUDA graphs
@@ -1210,27 +1391,12 @@ class TestRLUtils:
                 f"but got {count_after}. `get_logprobs` should not create new runners."
             )
 
-        # Verify outputs are valid
+        # Verify outputs are valid; only the last pipeline stage returns logprobs.
         assert output is not None, "Training forward pass should return valid output"
-        assert logprobs is not None, "get_logprobs should return valid output"
-
-        # Destroy all captured graphs deterministically
-        for l in model.decoder.layers:
-            for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
-                # Safely delete both graphs if present
-                if hasattr(runner, "fwd_graph"):
-                    del runner.fwd_graph
-                if hasattr(runner, "bwd_graph"):
-                    del runner.bwd_graph
-
-        # Ensure all pending work is complete and graph destruction runs now
-        torch.cuda.synchronize()
-
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
-        CudaGraphManager.fwd_mempools = None
-        CudaGraphManager.bwd_mempools = None
+        if is_pp_last_stage(model.pg_collection.pp):
+            assert logprobs.shape == (batch_size, seq_length - 1)
+        else:
+            assert logprobs is not None, "get_logprobs should return valid output"
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
@@ -1254,6 +1420,9 @@ class TestRLUtils:
         # Per-turn max epoch stamps (when each turn completed)
         completed_epochs = [[5, 3], [5, 1]]
         num_evictions = [[0, 1], [0, 0]]
+        # "env/timeout" sits outside KNOWN_ROLLOUT_STATUSES and needs key sanitization.
+        rollout_statuses = [["graded", "ok"], ["env/timeout", "ok"]]
+        failure_reasons = [[None, None], [None, None]]
         current_iteration = 6
         if inject_placeholders:
             for lst, sentinel in (
@@ -1267,8 +1436,15 @@ class TestRLUtils:
                 lst.append([sentinel, sentinel])  # the fully failed extra group
             for lst in (policy_epoch, kv_cache_epoch):
                 for group in lst:
-                    group.append([0])  # sentinel epoch stamp of a placeholder
-                lst.append([[0], [0]])
+                    # Placeholders pop no ledger records, so their epoch rows are empty.
+                    group.append([])
+                lst.append([[], []])
+            for group in rollout_statuses:
+                group.append("placeholder")
+            rollout_statuses.append(["placeholder", "placeholder"])
+            for group in failure_reasons:
+                group.append("http_500")
+            failure_reasons.append(["http_500", "http_500"])
             # Placeholders contribute no turns, and compute_group_stats already
             # excludes them from completed_epochs; the failed group adds empty
             # inner lists, which the group-level stats must skip, not crash on.
@@ -1288,12 +1464,51 @@ class TestRLUtils:
             completed_epochs=completed_epochs,
             num_evictions=num_evictions,
             current_iteration=current_iteration,
+            rollout_statuses=rollout_statuses,
+            failure_reasons=failure_reasons,
         )
         assert metrics["failed_rollouts/count"] == (4 if inject_placeholders else 0)
         assert metrics["failed_rollouts/ratio"] == (0.5 if inject_placeholders else 0.0)
-        # Reward aggregates keep the placeholder zeros by design: group means
-        # become [2/3, 1/3, 0] instead of [1, 0.5].
+        assert metrics["rollout/count"] == (8 if inject_placeholders else 4)
+        assert metrics["rollout/placeholder_count"] == (4 if inject_placeholders else 0)
+        assert metrics["rollout/placeholder_rate"] == (0.5 if inject_placeholders else 0.0)
+        # Statuses in KNOWN_ROLLOUT_STATUSES always emit a series, zeros included...
+        assert metrics["rollout/ok_count"] == 2
+        assert metrics["rollout/ok_rate"] == (0.25 if inject_placeholders else 0.5)
+        assert metrics["rollout/masked_count"] == 0
+        assert metrics["rollout/masked_rate"] == 0.0
+        assert metrics["rollout/graded_count"] == 1
+        # ...and statuses beyond the vocabulary are still counted, under a
+        # wandb-safe key.
+        assert metrics["rollout/env_timeout_count"] == 1
+        assert metrics["rollout/env_timeout_rate"] == (0.125 if inject_placeholders else 0.25)
+        assert not any(k.startswith("rollout/failure_reason/") for k in metrics)
+        assert "failure_reason_table" in metrics
+        reason_table_calls = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["failure_reason", "count", "rate"]
+        ]
+        assert len(reason_table_calls) == 1
+        expected_reason_rows = [["http_500", 4, 0.5]] if inject_placeholders else []
+        assert reason_table_calls[0].kwargs["data"] == expected_reason_rows
+        # The raw delivery aggregate keeps the placeholder zeros (mean of group
+        # means becomes 1/3 instead of 0.75); the valid view masks them. The
+        # pair diverging is the infrastructure-failure signature.
         assert np.isclose(metrics["mean_reward"], 1 / 3 if inject_placeholders else 0.75)
+        assert metrics["valid_mean_reward"] == 0.75
+        # Group means/stds mirror GRPO normalization: real rollouts only, 0.0
+        # rows for all-placeholder groups.
+        group_table_calls = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["group_means", "group_stds"]
+        ]
+        assert len(group_table_calls) == 1
+        expected_group_rows = [[1.0, 0.0], [0.5, 1.5]]
+        if inject_placeholders:
+            expected_group_rows.append([0.0, 0.0])
+        assert group_table_calls[0].kwargs["data"] == expected_group_rows
         assert metrics["mean_advantage"] == 0.5
         # The rollout table lists real rollouts only, in either case.
         rollout_table_calls = [
@@ -1337,8 +1552,66 @@ class TestRLUtils:
         # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
         assert metrics["mean_completion_gap"] == 2.5
 
+        # Case where every episode has failed: the wave still reports the failure
+        # counters (now status series + reason table) and skips the rollout tables.
+        writer = MagicMock()
+        metrics = rl_utils.prep_wandb_metrics(
+            writer,
+            traj_lens=[],
+            turn_lens=[],
+            rewards=[],
+            num_turns=[],
+            advantages=[],
+            policy_epoch=[],
+            kv_cache_epoch=[],
+            completed_epochs=[],
+            num_evictions=[],
+            current_iteration=6,
+        )
+        assert metrics['rollout/count'] == 0
+        assert metrics['failed_rollouts/count'] == 0
+        assert metrics['failed_rollouts/ratio'] == 0.0
+        # Unstamped wave: the known-status series still emit, zeroed.
+        assert metrics['rollout/placeholder_count'] == 0
+        assert metrics['rollout/placeholder_rate'] == 0.0
+        assert 'rollout_table' not in metrics and 'mean_reward' not in metrics
+        assert [c.kwargs['data'] for c in writer.Table.call_args_list] == [[]]
+
+        # All-placeholder wave: rewards exist (placeholders carry 0.0) but every
+        # rollout is a zero-turn pad, so the masked stats have nothing to reduce
+        # over; the guard must still report the failure counters.
+        writer = MagicMock()
+        metrics = rl_utils.prep_wandb_metrics(
+            writer,
+            traj_lens=[[0, 0]],
+            turn_lens=[[]],
+            rewards=[[0.0, 0.0]],
+            num_turns=[[0, 0]],
+            advantages=[0.0, 0.0],
+            policy_epoch=[[[0], [0]]],
+            kv_cache_epoch=[[[0], [0]]],
+            completed_epochs=[[]],
+            num_evictions=[[0, 0]],
+            current_iteration=6,
+            rollout_statuses=[["placeholder", "placeholder"]],
+            failure_reasons=[["http_500", None]],
+        )
+        assert metrics['rollout/count'] == 2
+        assert metrics['failed_rollouts/count'] == 2
+        assert metrics['failed_rollouts/ratio'] == 1.0
+        assert metrics['rollout/placeholder_count'] == 2
+        assert metrics['rollout/placeholder_rate'] == 1.0
+        assert 'rollout_table' not in metrics and 'mean_reward' not in metrics
+        reason_calls = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["failure_reason", "count", "rate"]
+        ]
+        assert len(reason_calls) == 1
+        assert reason_calls[0].kwargs["data"] == [["http_500", 1, 0.5]]
+
     def test_compute_group_stats_excludes_placeholders_from_metric_fields(self):
-        def real_rollout(tokens, epoch, problem_id):
+        def real_rollout(tokens, problem_id):
             return TokenRollout(
                 trajectory=[tokens],
                 generation_mask=[[True] * len(tokens)],
@@ -1346,12 +1619,10 @@ class TestRLUtils:
                 logprobs=[[0.0] * len(tokens)],
                 env_id="swe",
                 problem_id=problem_id,
-                policy_epoch=[[(0, epoch)]],
-                kv_cache_epoch=[[(0, epoch)]],
-                num_evictions=[0],
+                completion_ids=_mint_cids(1),
             )
 
-        def placeholder():
+        def placeholder(rollout_status="ok", failure_reason=None):
             return TokenRollout(
                 trajectory=[],
                 generation_mask=[],
@@ -1359,37 +1630,60 @@ class TestRLUtils:
                 logprobs=[],
                 env_id="swe",
                 problem_id="placeholder",
-                policy_epoch=[[(0, 0)]],
-                kv_cache_epoch=[[(0, 0)]],
-                num_evictions=[0],
+                rollout_status=rollout_status,
+                failure_reason=failure_reason,
             )
 
         eod = MockTokenizer().eod
+        first = real_rollout([1, 2, eod], problem_id="p0")
+        second = real_rollout([1, 2, 3, eod], problem_id="p0")
         rollouts = [
+            [first, second, placeholder()],
             [
-                real_rollout([1, 2, eod], epoch=5, problem_id="p0"),
-                real_rollout([1, 2, 3, eod], epoch=6, problem_id="p0"),
+                placeholder(rollout_status="masked", failure_reason="judge_unparseable"),
+                placeholder(failure_reason="http_500"),
                 placeholder(),
             ],
-            [placeholder(), placeholder(), placeholder()],
         ]
-        stats = rl_utils.compute_group_stats(rollouts, MockTokenizer(), seq_len=16)
+        # Placeholders have no turns (and no completion ids): they pop no records.
+        ledger = {
+            first.completion_ids[0]: _ledger_record(5),
+            second.completion_ids[0]: _ledger_record(6),
+        }
+        stats = rl_utils.compute_group_stats(
+            rollouts, MockTokenizer(), seq_len=16, request_ledger=ledger
+        )
 
         # Per-rollout lists keep the placeholder entries: alignment with rewards
         # and num_turns is what lets prep_wandb_metrics mask them downstream.
+        # Placeholders join no records, so their epoch rows are empty.
         assert stats.num_turns == [[1, 1, 0], [0, 0, 0]]
-        assert stats.policy_epoch == [[[5], [6], [0]], [[0], [0], [0]]]
+        assert stats.policy_epoch == [[[5], [6], []], [[], [], []]]
         assert stats.traj_lens == [[3, 4, 0], [0, 0, 0]]
         # Per-turn lists exclude placeholders entirely: no sentinel epoch-0 stamp
         # in completed_epochs, no fake 0-length turn for all-placeholder groups.
         assert stats.completed_epochs == [[5, 6], []]
         assert stats.turn_lens == [[3, 4], []]
-        # Rewards keep the placeholder zeros (they shape the GRPO baseline).
+        # Rewards keep the placeholder zeros: the lists stay rectangular for
+        # alignment; GRPO normalization masks them by num_turns downstream.
         assert stats.rewards == [[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]]
+        # Which the advantages reflect: both real rollouts earned 1.0, so with
+        # the placeholder masked there is no contrast left in the group.
+        assert stats.advantages == [0.0, 0.0]
+        # Adapter stamps pass through; bare empties are inferred to 'placeholder'.
+        assert stats.rollout_statuses == [
+            ["ok", "ok", "placeholder"],
+            ["masked", "placeholder", "placeholder"],
+        ]
+        assert stats.failure_reasons == [
+            [None, None, None],
+            ["judge_unparseable", "http_500", None],
+        ]
 
-        # End to end: the sentinel epochs never reach the staleness metrics.
+        # End to end: the placeholder rows never reach the staleness metrics.
+        writer = MagicMock()
         metrics = rl_utils.prep_wandb_metrics(
-            MagicMock(),
+            writer,
             stats.traj_lens,
             stats.turn_lens,
             stats.rewards,
@@ -1400,10 +1694,149 @@ class TestRLUtils:
             completed_epochs=stats.completed_epochs,
             num_evictions=stats.num_evictions,
             current_iteration=7,
+            rollout_statuses=stats.rollout_statuses,
+            failure_reasons=stats.failure_reasons,
         )
-        assert metrics["max_policy_staleness"] == 2  # 7 - 5, not 7 - 0
+        assert metrics["max_policy_staleness"] == 2  # 7 - 5, not a placeholder sentinel
         assert metrics["min_traj_length"] == 3
         assert metrics["min_num_turns"] == 1
         assert metrics["mean_completion_gap"] == np.mean([2, 1])
         assert metrics["failed_rollouts/count"] == 4
         assert np.isclose(metrics["failed_rollouts/ratio"], 4 / 6)
+        # GRPO-facing reward views mask the placeholders; raw delivery keeps them.
+        assert metrics["valid_mean_reward"] == 1.0
+        assert np.isclose(metrics["mean_reward"], 1 / 3)
+        group_rows = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["group_means", "group_stds"]
+        ][0].kwargs["data"]
+        assert group_rows == [[1.0, 0.0], [0.0, 0.0]]
+        # The stamped taxonomy decomposes the structural zero-turn count.
+        assert metrics["rollout/count"] == 6
+        assert metrics["rollout/ok_count"] == 2
+        assert metrics["rollout/placeholder_count"] == 3
+        assert metrics["rollout/masked_count"] == 1
+        assert metrics["rollout/graded_count"] == 0
+        assert (
+            metrics["rollout/placeholder_count"] + metrics["rollout/masked_count"]
+            == metrics["failed_rollouts/count"]
+        )
+        reason_rows = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns") == ["failure_reason", "count", "rate"]
+        ][0].kwargs["data"]
+        assert reason_rows == [["http_500", 1, 1 / 6], ["judge_unparseable", 1, 1 / 6]]
+
+    def test_request_ledger_join(self):
+        """compute_group_stats joins finished-request records to rollouts by each
+        turn's completion id: records pop exactly once (identical token content
+        joins independently, text rollouts join nothing) and an unknown id is a
+        hard error. Downstream, prep_wandb_metrics filters staleness/eviction
+        telemetry to joined rollouts and emits none when nothing joined."""
+        eod = MockTokenizer().eod
+
+        def token_rollout(turns, masks, completion_ids=None):
+            return TokenRollout(
+                trajectory=turns,
+                reward=1.0,
+                generation_mask=masks,
+                logprobs=[[0.1] * len(t) for t in turns],
+                env_id='MEGAENV',
+                completion_ids=_mint_cids(len(turns)) if completion_ids is None else completion_ids,
+            )
+
+        # Multi-turn: each turn's stream is the full conversation prefix plus that
+        # turn's generation; the mask's False-prefix marks the prompt.
+        multi_turn = token_rollout(
+            [[1, 2, 3, eod], [1, 2, 3, eod, 4, 5, eod]],
+            [[False, True, True, True], [False] * 5 + [True, True]],
+        )
+        # Identical sampled token content: distinct requests, distinct ids,
+        # independent records.
+        twin_a = token_rollout([[8, 9, eod]], [[False, True, True]])
+        twin_b = token_rollout([[8, 9, eod]], [[False, True, True]])
+        other = token_rollout([[4, 4, eod]], [[False, True, True]])
+        # Text rollouts carry no token ids: they join nothing and need no records.
+        # (Groups are kept the same size: the advantage calculation the stats now
+        # run rejects ragged group shapes.)
+        text = Rollout(trajectory=["hello"], reward=1.0, env_id='MEGAENV')
+        text2 = Rollout(trajectory=["world"], reward=1.0, env_id='MEGAENV')
+
+        ledger = {
+            multi_turn.completion_ids[0]: _ledger_record(7, num_evictions=1),
+            multi_turn.completion_ids[1]: _ledger_record(8),
+            twin_a.completion_ids[0]: _ledger_record(5),
+            twin_b.completion_ids[0]: _ledger_record(6),
+            other.completion_ids[0]: _ledger_record(9),
+        }
+        rollouts = [
+            RolloutGroup(rollouts=[multi_turn, twin_a, text]),
+            RolloutGroup(rollouts=[twin_b, other, text2]),
+        ]
+        stats = rl_utils.compute_group_stats(rollouts, MockTokenizer(), 8, ledger)
+
+        assert stats.policy_epoch == [[[7, 8], [5], []], [[6], [9], []]]
+        assert stats.kv_cache_epoch == [[[7, 8], [5], []], [[6], [9], []]]
+        assert stats.completed_epochs == [[7, 8, 5], [6, 9]]
+        assert stats.num_evictions == [[1, 0, 0], [0, 0, 0]]
+        assert not ledger  # all records consumed
+
+        # An id matching no record raises KeyError at the join.
+        unknown = token_rollout([[6, 6, eod]], [[False, True, True]])
+        with pytest.raises(KeyError, match="cid-"):
+            rl_utils.compute_group_stats([RolloutGroup(rollouts=[unknown])], MockTokenizer(), 8, {})
+
+        # Text (non-token) rollouts join no finished-request records and yield
+        # empty epoch rows; staleness/eviction telemetry filters them out while
+        # keeping the rollout table row-aligned.
+        writer = MagicMock()
+        metrics = rl_utils.prep_wandb_metrics(
+            writer,
+            traj_lens=[[3, 7]],
+            turn_lens=[[3, 7]],
+            rewards=[[1.0, -1.0]],
+            num_turns=[[1, 1]],
+            advantages=[0.5],
+            policy_epoch=[[[4, 5], []]],
+            kv_cache_epoch=[[[4, 5], []]],
+            completed_epochs=[[5]],
+            num_evictions=[[2, 0]],
+            current_iteration=6,
+        )
+        # Only the joined rollout counts: staleness [6-4], evictions [2].
+        assert metrics["mean_policy_staleness"] == 2
+        assert metrics["max_policy_staleness"] == 2
+        assert metrics["total_eviction_count"] == 2
+        assert metrics["max_num_evictions"] == 2
+        rollout_table = next(
+            c for c in writer.Table.call_args_list if "traj_length" in c.kwargs.get("columns", [])
+        )
+        assert rollout_table.kwargs["data"] == [(1.0, 3, 2, 2, 2, 1, 1, 'ok')]
+
+        # A window where nothing joined emits no staleness/eviction metrics at all.
+        metrics = rl_utils.prep_wandb_metrics(
+            MagicMock(),
+            traj_lens=[[3]],
+            turn_lens=[[3]],
+            rewards=[[1.0]],
+            num_turns=[[1]],
+            advantages=[0.5],
+            policy_epoch=[[[]]],
+            kv_cache_epoch=[[[]]],
+            completed_epochs=[[]],
+            num_evictions=[[0]],
+            current_iteration=6,
+        )
+        assert metrics["mean_reward"] == 1.0
+        assert "mean_policy_staleness" not in metrics
+        assert "total_eviction_count" not in metrics
+        assert "rollout_table" not in metrics
+        assert "per_token_table" not in metrics
+
+
+def _ledger_record(epoch, num_evictions=0):
+    return FinishedRequestRecord(
+        policy_epoch=[(0, epoch)], kv_cache_epoch=[(0, epoch)], num_evictions=num_evictions
+    )
