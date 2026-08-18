@@ -257,7 +257,8 @@ def layer_sharded_fused_fwd(
     Functionally identical to the two-stage ``layer_sharded_all_to_all_fwd`` (over GTP)
     followed by a second stage over TP: the exact same shard blocks travel to the same
     NS home and are concatenated in the exact same order, so the assembled full matrix
-    is bit-identical. One collective replaces up to four.
+    is bit-identical. One collective replaces up to three (GTP, then TP once per
+    non-empty partition_dim).
 
     Rank convention: the caller must construct ``fused_group`` so that its group rank
     ``g * tp_size + t`` is the process with coordinates ``(g, t)`` in (gtp_group,
