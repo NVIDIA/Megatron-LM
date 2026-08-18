@@ -1110,13 +1110,14 @@ def calculate_grpo_advantages(
             `rewards[g][i]` is the reward of rollout `i` in group `g`.
             All groups are assumed to be the same size. Shape: (num_groups, group_size).
             e.g. rewards = [[-1, 1], [4, 4]]  # 2 groups, 2 rollouts each
+        num_turns: Same shape as `rewards`; turns per rollout. Zero marks a placeholder.
 
     Returns:
         A flat list with one advantage per rollout, in group-major order
         (group 0's rollouts, then group 1's, ...); aligned with `[r for g in rollouts for r in g]`.
 
     Example:
-        calculate_grpo_advantages([[-1, 1], [4, 4]]) ~= [-1.0, 1.0, 0.0, 0.0]
+        calculate_grpo_advantages([[-1, 1], [4, 4]], [[1, 1], [1, 1]]) ~= [-1.0, 1.0, 0.0, 0.0]
         # approximate: stds are damped by the +1e-4 epsilon
         # group 0 (mean 0, std 1) -> [-1, +1]; group 1 (zero variance) -> [0, 0]
     """

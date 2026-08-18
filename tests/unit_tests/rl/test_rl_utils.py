@@ -1643,7 +1643,8 @@ class TestRLUtils:
             # inner lists, which the group-level stats must skip, not crash on.
             turn_lens.append([])
             completed_epochs.append([])
-            # advantages stay [0, 1]: zero-turn rollouts emit no advantage entries.
+            # advantages stay [0, 1]: prep treats them as an opaque flat vector
+            # (production pins placeholder entries to 0.0; alignment is not prep's concern).
         writer = MagicMock()
         metrics = rl_utils.prep_wandb_metrics(
             writer,
