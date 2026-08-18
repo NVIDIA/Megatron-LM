@@ -742,9 +742,9 @@ class TransformerConfig(ModelParallelConfig):
     for each individual sample.
     - "global_aux_loss": Load balancing loss calculated at global batch level.
     - "sinkhorn": Balancing algorithm used in S-BASE.
-    - "quantile_balancing": Dual coordinate-descent quantile balancing (QB). Load balance is
-    handled entirely by an internal per-expert bias update; auxiliary losses must be disabled
-    (`moe_aux_loss_coeff` = 0) when QB is selected.
+    - "quantile_balancing": Quantile balancing (QB). ``micro_batch`` preserves the exact
+    per-microbatch estimator, while ``global_batch`` uses Kimi K3's pooled histogram estimator.
+    Load balance is handled internally and auxiliary losses must be disabled.
     - "none": No load balancing.
     A list of strings can be provided to combine multiple aux-loss load balancing types.
     The default is "aux_loss".
@@ -822,6 +822,18 @@ class TransformerConfig(ModelParallelConfig):
     `moe_router_load_balancing_type` is "quantile_balancing". At each global batch the bias is
     updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The default 0.0 means
     no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
+
+    moe_router_quantile_balancing_estimation_scope: Literal['micro_batch', 'global_batch'] = (
+        "micro_batch"
+    )
+    """Population used to estimate the Quantile Balancing bias.
+
+    ``micro_batch`` preserves the pre-existing exact estimator. ``global_batch`` accumulates
+    Kimi K3 histograms across gradient-accumulation microbatches and estimates one pooled quantile.
+    """
+
+    moe_router_qb_num_bins: int = 1000
+    """Number of persistent uniform histogram bins per expert for global-batch QB."""
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
@@ -1781,9 +1793,82 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_router_load_balancing_type"
             )
 
+        # Normalize the CLI's negative "disabled" sentinel before load-balancing
+        # compatibility checks consume the capacity setting.
+        if self.moe_expert_capacity_factor is not None and self.moe_expert_capacity_factor < 0:
+            self.moe_expert_capacity_factor = None
+
+        if (
+            isinstance(self.moe_router_load_balancing_type, list)
+            and "quantile_balancing" in self.moe_router_load_balancing_type
+        ):
+            raise ValueError("quantile_balancing must be the sole moe_router_load_balancing_type.")
+        if self.moe_router_load_balancing_type == "quantile_balancing":
+            aux_coeffs = (
+                self.moe_aux_loss_coeff
+                if isinstance(self.moe_aux_loss_coeff, list)
+                else [self.moe_aux_loss_coeff]
+            )
+            if any(float(coeff) != 0.0 for coeff in aux_coeffs):
+                raise ValueError(
+                    "quantile_balancing requires moe_aux_loss_coeff=0 because it replaces "
+                    "the auxiliary load-balancing loss."
+                )
+            scope = self.moe_router_quantile_balancing_estimation_scope
+            if scope not in ("micro_batch", "global_batch"):
+                raise ValueError(
+                    "moe_router_quantile_balancing_estimation_scope must be "
+                    "'micro_batch' or 'global_batch'."
+                )
+            if scope == "global_batch":
+                if self.moe_router_quantile_balancing_ema != 0.0:
+                    raise ValueError(
+                        "global_batch quantile_balancing derives the K3 bias directly and "
+                        "requires moe_router_quantile_balancing_ema=0."
+                    )
+                if self.moe_router_score_function != "sigmoid":
+                    raise ValueError(
+                        "global_batch quantile_balancing requires "
+                        "moe_router_score_function='sigmoid'."
+                    )
+                if self.moe_router_pre_softmax:
+                    raise ValueError(
+                        "global_batch quantile_balancing does not use pre-softmax routing."
+                    )
+                if self.moe_router_enable_expert_bias:
+                    raise ValueError(
+                        "quantile_balancing owns its per-expert bias; do not also enable "
+                        "moe_router_enable_expert_bias."
+                    )
+                if self.moe_router_num_groups is not None or self.moe_router_group_topk is not None:
+                    raise ValueError("global_batch quantile_balancing does not support groups.")
+                if self.moe_enable_routing_replay:
+                    raise ValueError(
+                        "global_batch quantile_balancing does not support routing replay."
+                    )
+                if (
+                    self.moe_expert_capacity_factor is not None
+                    and self.moe_expert_capacity_factor >= 0
+                ):
+                    raise ValueError(
+                        "global_batch quantile_balancing does not support per-expert token dropping."
+                    )
+                if self.moe_expert_rank_capacity_factor is not None and not self.moe_paged_stash:
+                    raise ValueError(
+                        "global_batch quantile_balancing with expert-rank capacity requires "
+                        "moe_paged_stash for the dropless retry."
+                    )
+                if self.num_moe_experts is None or not (
+                    0 < self.moe_router_topk < self.num_moe_experts
+                ):
+                    raise ValueError(
+                        "global_batch quantile_balancing requires "
+                        "0 < moe_router_topk < num_moe_experts."
+                    )
+                if self.moe_router_qb_num_bins <= 1:
+                    raise ValueError("moe_router_qb_num_bins must be greater than one.")
+
         if self.moe_expert_capacity_factor is not None:
-            if self.moe_expert_capacity_factor < 0:
-                self.moe_expert_capacity_factor = None
             if isinstance(self.moe_router_load_balancing_type, list):
                 for load_balancing_type in self.moe_router_load_balancing_type:
                     if load_balancing_type not in [
