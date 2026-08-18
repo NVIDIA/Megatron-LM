@@ -3673,10 +3673,20 @@ if HAVE_TE and is_te_min_version("2.7.0.dev"):
         fused_topk_with_score_function,
     )
 
+    try:
+        _fused_topk_sig = inspect.signature(fused_topk_with_score_function)
+        fused_topk_with_score_function_supports_topk_indices = (
+            "topk_indices" in _fused_topk_sig.parameters
+        )
+        del _fused_topk_sig
+    except (TypeError, ValueError):
+        fused_topk_with_score_function_supports_topk_indices = False
+
 else:
     fused_topk_with_score_function = None
     fused_compute_score_for_moe_aux_loss = None
     fused_moe_aux_loss = None
+    fused_topk_with_score_function_supports_topk_indices = False
 
 
 def set_save_original_input(module):
