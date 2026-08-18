@@ -24,9 +24,7 @@ def _ceil_div(a, b):
 def ensure_mxfp8_scale_dtype(scale: torch.Tensor) -> torch.Tensor:
     """Return the E8M0 view required by PyTorch scaled GEMM APIs.
 
-    FlashInfer exposes the same MXFP8 scale bytes as ``uint8``.  Converting
-    between these API views must be zero-copy; numerical dtype conversion would
-    corrupt the exponent encoding.
+    FlashInfer exposes the same MXFP8 scale bytes as ``uint8``.
     """
     if scale.dtype == torch.uint8:
         return scale.view(torch.float8_e8m0fnu)
@@ -50,7 +48,7 @@ def validate_mxfp8_tensor(
     expected_backend: Optional[MXFP8Backend] = None,
     tensor_name: str = "MXFP8 tensor",
 ) -> None:
-    """Validate the storage contract required by MXFP8 GEMM consumers.
+    """Thoroughly validate an MXFP8 tensor for GEMM consumers, courtesy of Codex.
 
     MXFP8 scales may be transported as raw bytes, but persistent compute
     tensors must expose the dtype required by their GEMM consumer: ``uint8``
@@ -129,7 +127,7 @@ class MXFP8Tensor:
 
     data: torch.Tensor  # [M, K] fp8_e4m3fn
     scale: torch.Tensor  # 1D swizzled or [M, K // 32] unswizzled scales
-    backend: Optional[MXFP8Backend] = None  # quantization and GEMM storage contract
+    backend: Optional[MXFP8Backend] = None  # quantization and GEMM backend
 
     def size(self, idx: Optional[int] = None):
         """Wrapper for calling self.data.size()"""
@@ -161,10 +159,8 @@ class MXFP8Tensor:
         Args:
             x: [M, K] BF16 tensor on CUDA.
             group_size: MXFP8 group size (default 32).
-            backend: ``'triton'`` selects the PyTorch scaled-GEMM storage
-                     contract and uses MCore's fused Triton quantize/swizzle
-                     kernel. ``'flashinfer'`` uses FlashInfer for both
-                     quantization and the dense GEMM.
+            backend: 'triton' (fused quantize + swizzle Triton kernel) or
+                     'flashinfer' (single fused FlashInfer CUDA kernel).
         """
         assert x.is_cuda and x.dim() == 2
         assert x.shape[-1] % group_size == 0

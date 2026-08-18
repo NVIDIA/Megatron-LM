@@ -166,8 +166,8 @@ class MXFP8ReshardTransform(ReshardTransform):
         convert_on_send: if True, convert BF16 → MXFP8 on the sender and
             transmit two tensors (data + scale).  If False (default),
             transmit BF16 and convert on the receiver in ``finalize_recv``.
-        backend: backend storage contract for sender-side conversion. It is
-            inferred from persistent buffers on the receiver.
+        backend: backend used for sender-side conversion. It is inferred from
+            persistent buffers on the receiver.
     """
 
     def __init__(
