@@ -112,12 +112,89 @@ class InferenceClient:
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
-        payload_serialized = msgpack.packb(payload, use_bin_type=True)
-        self.socket.send(payload_serialized)
-        assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
-        self.request_submission_times[request_id] = time.perf_counter()
-        return self.completion_futures[request_id]
+        return self._submit_request(payload, request_id)
+
+    def _make_kv_handoff_request(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        kv_meta: dict,
+        src_block_ids: List[int],
+    ) -> tuple[int, list]:
+        """Allocate an ID and build a decode request carrying remote KV metadata."""
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        payload = [
+            Headers.SUBMIT_REQUEST_WITH_KV.value,
+            request_id,
+            prompt,
+            sampling_params.serialize(),
+            kv_meta,
+            list(src_block_ids),
+        ]
+        return request_id, payload
+
+    def add_request_with_kv_handoff(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        kv_meta: dict,
+        src_block_ids: List[int],
+    ) -> asyncio.Future:
+        """Submit a request with remote KV metadata.
+
+        The decode engine allocates local blocks, pulls the KV from the
+        prefill peer described by ``kv_meta``, then begins generation.
+
+        Args:
+            prompt: A string or list of token IDs.
+            sampling_params: Sampling parameters for the decode request.
+            kv_meta: Metadata identifying the remote KV buffers.
+            src_block_ids: Remote block IDs containing the request's KV state.
+
+        Returns:
+            asyncio.Future: A future that resolves to the completed request.
+        """
+        request_id, payload = self._make_kv_handoff_request(
+            prompt, sampling_params, kv_meta, src_block_ids
+        )
+        return self._submit_request(payload, request_id)
+
+    def add_request_with_kv_handoff_streaming(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        kv_meta: dict,
+        src_block_ids: List[int],
+    ) -> AsyncStream[dict]:
+        """Submit a streaming request with remote KV metadata.
+
+        Returns the same per-step partial/final iterator as
+        :meth:`add_request_streaming`.
+
+        Args:
+            prompt: A string or list of token IDs.
+            sampling_params: Sampling parameters for the decode request.
+            kv_meta: Metadata identifying the remote KV buffers.
+            src_block_ids: Remote block IDs containing the request's KV state.
+
+        Returns:
+            AsyncStream[dict]: Per-step partial and final reply frames.
+        """
+        sampling_params.streaming = True
+        request_id, payload = self._make_kv_handoff_request(
+            prompt, sampling_params, kv_meta, src_block_ids
+        )
+        return self._submit_stream(payload, request_id)
+
+    def release_handoff(self, request_id: int) -> None:
+        """Tell the coordinator to release the KV blocks pinned for `request_id`.
+
+        Fire-and-forget. The coordinator broadcasts RELEASE_KV to every engine;
+        engines without that request_id ignore the message.
+        """
+        payload = [Headers.RELEASE_KV.value, int(request_id)]
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
     def abort_request(self, request_id: int) -> None:
         """Cancel an in-flight request and close its local response stream."""
@@ -162,6 +239,19 @@ class InferenceClient:
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
+        return self._submit_stream(payload, request_id)
+
+    def _submit_request(self, payload: list, request_id: int) -> asyncio.Future:
+        """Send a prepared request and register its completion future."""
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        assert request_id not in self.completion_futures
+        future = asyncio.get_running_loop().create_future()
+        self.completion_futures[request_id] = future
+        self.request_submission_times[request_id] = time.perf_counter()
+        return future
+
+    def _submit_stream(self, payload: list, request_id: int) -> AsyncStream[dict]:
+        """Send a prepared streaming request and register its response stream."""
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop

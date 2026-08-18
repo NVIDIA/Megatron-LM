@@ -13,6 +13,7 @@ from functools import partial
 from typing import Dict, List, Optional, Tuple
 from unittest import mock
 
+import msgpack
 import pytest
 import torch
 from tqdm import tqdm
@@ -757,8 +758,13 @@ def test_streaming_partials_are_sent():
     engine._partial_emit_lengths = {}
     request = types.SimpleNamespace(
         generated_tokens=[11, 12, 13],
-        generated_log_probs=None,
-        sampling_params=types.SimpleNamespace(streaming=True, return_log_probs=False),
+        generated_log_probs=[-0.1, -0.2, -0.3],
+        generated_top_n_logprobs=[{"eleven": -0.01}, {"twelve": -0.02}, {"thirteen": -0.03}],
+        prompt_log_probs=[-0.4],
+        prompt_top_n_logprobs=[{"prompt": -0.04}],
+        sampling_params=types.SimpleNamespace(
+            streaming=True, return_log_probs=True, skip_prompt_log_probs=False
+        ),
     )
     engine.requests = {7: types.SimpleNamespace(record=[request])}
     engine.socket_for_receiving_requests = mock.Mock()
@@ -767,6 +773,13 @@ def test_streaming_partials_are_sent():
 
     engine.socket_for_receiving_requests.send.assert_called_once()
     assert engine._partial_emit_lengths == {7: 3}
+    payload = msgpack.unpackb(
+        engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
+    )
+    partial = payload[1][0]
+    assert partial["new_top_n_logprobs"] == request.generated_top_n_logprobs
+    assert partial["prompt_log_probs"] == request.prompt_log_probs
+    assert partial["prompt_top_n_logprobs"] == request.prompt_top_n_logprobs
 
 
 def test_streaming_partials_buffer_until_token_interval():
@@ -3317,6 +3330,67 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         record.checkpoint()
         assert record[-1].policy_epoch == merged.policy_epoch
         assert record[-1].kv_cache_epoch is None
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_local_metadata_ledger_gated_by_engine_enable(self):
+        """Only ledger-enabled engines (RL training) index finished requests."""
+        PROMPT_LEN = 8
+        NUM_TOKENS = 4
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=PROMPT_LEN,
+            max_prompt_length=PROMPT_LEN,
+            num_tokens_to_generate=NUM_TOKENS,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        engine._generation_epoch = 3  # RL mode: requests are epoch-stamped
+        # Take the coordinator reply path so finished requests flow through the
+        # inline ledger indexing in the reply block (socket mocked out).
+        engine.use_coordinator = True
+        engine.is_mp_coordinator = True
+        engine.socket_for_receiving_requests = mock.MagicMock()
+
+        def run_request(request_id):
+            prompt_tokens = torch.full(
+                (PROMPT_LEN,), request_id + 1, dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=prompt_tokens,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=NUM_TOKENS, termination_id=-1
+                    ),
+                )
+            )
+            finished_records = []
+            while engine.has_unfinished_requests():
+                result = engine.step_modern()
+                finished_records.extend(result["finished_request_records"])
+            return finished_records
+
+        # Default (plain serving): nothing is indexed, nothing accumulates.
+        finished_records = run_request(0)
+        assert len(finished_records) == 1
+        assert engine.local_metadata_ledger == {}
+
+        # RL launch (MegatronLocal.launch) enables the ledger: every finished
+        # request is indexed, no per-request tagging involved.
+        engine.local_metadata_ledger_enabled = True
+        finished_records = run_request(1)
+        assert len(finished_records) == 1
+
+        # The ledger keys by the request's engine-minted uid — the same string the
+        # endpoints return as the OpenAI response id.
+        merged = finished_records[0].merge()
+        ledger = engine.local_metadata_ledger
+        assert list(ledger.keys()) == [merged.uid]
+        assert ledger[merged.uid].policy_epoch == [(0, 3)]
 
     @pytest.mark.internal
     @pytest.mark.skipif(
