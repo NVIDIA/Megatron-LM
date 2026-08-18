@@ -46,7 +46,10 @@ _SEED = 42
 @pytest.fixture(scope="module", autouse=True)
 def _torchrun_dist_init():
     Utils.initialize_model_parallel()
-    cuda = os.environ.get("TEST_DEVICE", "cpu") == "cuda"
+    # Default to the hardware, like test_layer_sharded_a2a.py: Utils initializes
+    # the NCCL backend on GPU machines, and CPU tensors passed to NCCL collectives
+    # fail — TEST_DEVICE stays as an explicit override only.
+    cuda = os.environ.get("TEST_DEVICE", "cuda" if torch.cuda.is_available() else "cpu") == "cuda"
     if cuda:
         # NCCL path: one GPU per rank; default device makes every torch.randn /
         # torch.zeros in the tests land on this rank's GPU without touching each test.
@@ -706,7 +709,8 @@ def test_concurrent_groups_match_serial_bitwise():
     (a group reading grads before backward retired, or the caller's stream
     observing params before a group finished), not floating point noise.
     """
-    if os.environ.get("TEST_DEVICE", "cpu") != "cuda" or dist.get_world_size() != 4:
+    cuda = os.environ.get("TEST_DEVICE", "cuda" if torch.cuda.is_available() else "cpu") == "cuda"
+    if not cuda or dist.get_world_size() != 4:
         pytest.skip("Requires exactly 4 ranks on CUDA (streams are a no-op on CPU)")
     T, G = 2, 2
     r = dist.get_rank()

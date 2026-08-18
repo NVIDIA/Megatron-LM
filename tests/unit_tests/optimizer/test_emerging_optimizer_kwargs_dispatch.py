@@ -22,13 +22,15 @@ import pytest
 pytest.importorskip("emerging_optimizers", reason="requires emerging-optimizers")
 
 from megatron.core.optimizer import emerging_optimizers as eo_mod
+from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 
-try:
-    # Module import raises on emerging-optimizers too old for the layer-sharded
-    # path (same guard as test_layer_sharded_muon.py): skip, don't error.
-    from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
-except ImportError as _e:
-    pytest.skip(str(_e), allow_module_level=True)
+# No version guard on purpose: nothing here constructs LayerShardedMuon (whose
+# __init__ raises on emerging-optimizers < 0.3.0), so these tests run — and give
+# real CI signal — even on containers pinned to older emerging-optimizers.
+# (A try/except around the import would guard nothing anyway: layer_sharded_muon
+# swallows its own emerging-optimizers import failures behind
+# HAVE_EMERGING_OPTIMIZERS, so the import always succeeds.)
 
 
 class _ModelCfg:
@@ -41,11 +43,11 @@ class _Chunk:
     config = _ModelCfg()
 
 
-class _Cfg:
-    """Minimal OptimizerConfig stand-in: only what the kwargs builders read."""
-
-    def __init__(self, use_layer_sharding_muon: bool):
-        self.use_layer_sharding_muon = use_layer_sharding_muon
+def _Cfg(use_layer_sharding_muon: bool) -> OptimizerConfig:
+    """A real OptimizerConfig, so the reflective ``_kwargs_from_config`` lookups
+    exercise the actual field surface instead of a stub that makes every
+    ``hasattr`` fail (which would shrink the test to the hardcoded keys only)."""
+    return OptimizerConfig(use_layer_sharding_muon=use_layer_sharding_muon)
 
 
 def test_shared_muon_kwargs_ignore_layer_sharding_flag():
