@@ -1687,18 +1687,11 @@ def fused_streamed_pre_gated_delta_rule(
             "Packed fused_pre_gated_delta_rule requires at least one packed sequence; "
             f"got {cu_seqlens.shape=}."
         )
-        assert cu_seqlens[0].item() == 0, (
-            "Packed fused_pre_gated_delta_rule requires cu_seqlens[0] == 0, "
-            f"got {cu_seqlens[0].item()}."
-        )
-        assert torch.all(cu_seqlens[1:] >= cu_seqlens[:-1]).item(), (
-            "Packed fused_pre_gated_delta_rule requires monotonically non-decreasing "
-            f"cu_seqlens, got {cu_seqlens}."
-        )
-        assert cu_seqlens[-1].item() == qkvzba.shape[0], (
-            "Packed fused_pre_gated_delta_rule requires cu_seqlens[-1] to match "
-            f"seq_len, got {cu_seqlens[-1].item()} vs {qkvzba.shape[0]}."
-        )
+        # Caller contract: packed boundaries start at zero, are monotonically
+        # non-decreasing, and end at the local token count. Checking those
+        # values here requires GPU reductions and D2H synchronizations, so the
+        # fused hot path trusts the packed-sequence scheduler to provide valid
+        # cu_seqlens.
         cu_seqlens = cu_seqlens.contiguous()
         seq_idx = _resolve_packed_seq_idx(cu_seqlens, seq_idx, qkvzba.shape[0])
     else:
