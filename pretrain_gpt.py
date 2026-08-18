@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain and SFT GPT."""
 
@@ -25,7 +25,7 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
-from megatron.core.context_parallel_layout import prebuild_thd_cp_partition_routes
+from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -35,7 +35,6 @@ from megatron.core.packed_seq_params import (
     PackedSeqParams,
     get_thd_padding_kwargs,
     pad_sequence_for_thd,
-    resolve_cp_group,
     resolve_thd_tail_padding_policy,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -76,16 +75,6 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
-
-
-def _finalize_packed_seq_params(packed_seq_params):
-    """Resolve CP group metadata and prebuild THD CP layout routes."""
-    if packed_seq_params is None:
-        return None
-    cp_group = resolve_cp_group(mpu.get_context_parallel_group(), packed_seq_params)
-    packed_seq_params.cp_group = cp_group
-    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
-    return packed_seq_params
 
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
@@ -152,7 +141,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
         )
-        _finalize_packed_seq_params(batch[5])
+        finalize_packed_seq_params(batch[5])
         return batch
 
     # TODO: this is pretty hacky, find a better way
@@ -195,7 +184,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             max_seqlen_kv=int(max_seqlen[0].item()),
             qkv_format='thd',
         )
-        _finalize_packed_seq_params(packed_seq_params)
+        finalize_packed_seq_params(packed_seq_params)
         return (
             None,
             None,
@@ -255,7 +244,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         if 'position_ids' in batch:
             batch['position_ids'] = position_ids
 
-    _finalize_packed_seq_params(packed_seq_params)
+    finalize_packed_seq_params(packed_seq_params)
 
     # Unpack explicitly to avoid relying on dict insertion order.
     return (

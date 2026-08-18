@@ -7,15 +7,15 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
-from megatron.core.context_parallel_layout.metadata import (
-    get_packed_seq_params_cp_partition_cu_seqlens,
-)
 from megatron.core.context_parallel_layout.routes import (
-    _cp_layout_nvtx_range,
     build_thd_cp_partition_route,
     get_thd_cp_partition_route,
 )
 from megatron.core.context_parallel_layout.types import CpPartitionMode, ThdCpRoute
+from megatron.core.context_parallel_layout.utils import (
+    get_packed_seq_params_cp_partition_cu_seqlens,
+)
+from megatron.core.utils import nvtx_range
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -393,7 +393,7 @@ def _zigzag_contiguous_thd_swap(
     from megatron.core.tensor_parallel.mappings import all_to_all
 
     conversion_name = f"{source_partition_mode}_to_{target_partition_mode}"
-    with _cp_layout_nvtx_range(f"cp_layout/thd/swap/{conversion_name}"):
+    with nvtx_range(f"cp_layout/thd/swap/{conversion_name}"):
         if seq_dim != 0:
             x = x.movedim(seq_dim, 0)
         x = x.contiguous()
@@ -435,15 +435,15 @@ def _zigzag_contiguous_thd_swap(
                 f"target_layout={target_partition_mode!r}."
             )
 
-        with _cp_layout_nvtx_range(f"cp_layout/thd/pack/{conversion_name}"):
+        with nvtx_range(f"cp_layout/thd/pack/{conversion_name}"):
             send_buf = _pack_thd_cp_route_send_buffer(x, send_index)
             if not send_buf.is_contiguous():
                 send_buf = send_buf.contiguous()
 
-        with _cp_layout_nvtx_range(f"cp_layout/thd/all_to_all/{conversion_name}"):
+        with nvtx_range(f"cp_layout/thd/all_to_all/{conversion_name}"):
             recv_buf = all_to_all(cp_group, send_buf, output_split_sizes, input_split_sizes)
 
-        with _cp_layout_nvtx_range(f"cp_layout/thd/scatter/{conversion_name}"):
+        with nvtx_range(f"cp_layout/thd/scatter/{conversion_name}"):
             out_shape = (local_target_length,) + tuple(x.shape[1:])
             out = _scatter_thd_cp_route_recv_buffer(recv_buf, recv_index, out_shape)
 
@@ -555,7 +555,7 @@ def _zigzag_contiguous_chunk_swap(
     input_split_sizes = [n * chunk_len for n in input_split_chunks]
     output_split_sizes = [n * chunk_len for n in output_split_chunks]
 
-    with _cp_layout_nvtx_range(f"cp_layout/sbhd/all_to_all/{conversion_name}"):
+    with nvtx_range(f"cp_layout/sbhd/all_to_all/{conversion_name}"):
         recv_buf = all_to_all(cp_group, send_buf, output_split_sizes, input_split_sizes)
 
     # Reassemble local chunks in target-layout slot order.
