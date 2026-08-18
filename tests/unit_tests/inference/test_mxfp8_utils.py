@@ -692,6 +692,72 @@ class TestPermuteAndQuantizeMxfp8:
         assert result.data.shape[0] == ceil_div(unaligned_rows, 128) * 128
         assert result.scale_2d().shape[0] == result.data.shape[0]
 
+    def test_unfused_fixed_buffer_rows_match_swizzled_scale_padding(self):
+        """The disable-fused-quant route preserves the same MXFP8 row invariant."""
+        from megatron.core.inference.moe.permute import permute_tokens
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        hidden, probs, routing_map = self._make_inputs(72, 2688, 6, 128)
+        permuted, _, _, _ = permute_tokens(
+            hidden,
+            probs,
+            routing_map,
+            0,
+            64,
+            _vt(72),
+            alignment=128,
+            row_alignment=128,
+        )
+        result = MXFP8Tensor.from_bf16(permuted, backend="triton")
+
+        assert result.data.shape[0] == 8704
+        assert result.scale_2d().shape[0] == result.data.shape[0]
+
+    def test_unfused_moe_accepts_non_aligned_fixed_token_capacity(self):
+        """The separate-quantization route feeds matching rows to scaled_grouped_mm."""
+        from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+        num_tokens, hidden_size, topk, num_experts = 72, 128, 2, 4
+        hidden, probs, routing_map = self._make_inputs(
+            num_tokens, hidden_size, topk, num_experts
+        )
+
+        def stack_weights() -> MXFP8Tensor:
+            per_expert = [
+                MXFP8Tensor.from_bf16(
+                    torch.randn(
+                        hidden_size,
+                        hidden_size,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    ),
+                    backend="triton",
+                )
+                for _ in range(num_experts)
+            ]
+            return MXFP8Tensor(
+                data=torch.stack([weight.data for weight in per_expert]),
+                scale=torch.stack([weight.scale for weight in per_expert]),
+                backend="triton",
+            )
+
+        output = mcore_fused_moe(
+            hidden,
+            probs,
+            stack_weights(),
+            stack_weights(),
+            ActivationType.SQUARED_RELU,
+            num_experts,
+            0,
+            _vt(num_tokens),
+            routing_map,
+            disable_fused_quant_kernels=True,
+        )
+
+        assert output.shape == hidden.shape
+        assert torch.isfinite(output).all()
+
     @pytest.mark.parametrize("alignment", [128])
     def test_offsets_aligned(self, alignment):
         """Inclusive offsets are multiples of alignment."""

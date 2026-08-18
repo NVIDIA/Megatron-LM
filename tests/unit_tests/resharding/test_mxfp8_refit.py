@@ -30,15 +30,6 @@ class TestMXFP8ReshardTransform:
     logic that avoids corrupting swizzled scales from partial updates.
     """
 
-    def _make_persistent_buffers(self, shapes):
-        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-
-        buffers = {}
-        for name, (M, K) in shapes.items():
-            x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
-            buffers[name] = MXFP8Tensor.from_bf16(x)
-        return buffers
-
     @pytest.mark.skipif(not _HAVE_FLASHINFER, reason="test requires FlashInfer")
     def test_finalize_recv_bf16_2d_scale(self):
         """Receiver-side conversion with 2D scale: immediate per-slice quantization."""
@@ -160,6 +151,56 @@ class TestMXFP8ReshardTransform:
             assert buf.backend == "triton"
             assert buf.scale.dtype == torch.float8_e8m0fnu
 
+    def test_sender_side_conversion_supports_explicit_triton_backend(self):
+        """A sender without persistent buffers can select the Triton wire format."""
+        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+
+        transform = MXFP8ReshardTransform(
+            convertible_params={"decoder.weight"},
+            persistent_buffers={},
+            convert_on_send=True,
+            backend="triton",
+        )
+        source = torch.nn.Parameter(
+            torch.randn(64, 128, dtype=torch.bfloat16, device="cuda"), requires_grad=False
+        )
+        data, scale = transform.prepare_send(
+            "decoder.weight", (slice(None), slice(None)), source
+        )
+
+        assert data.dtype == torch.float8_e4m3fn
+        assert scale.dtype == torch.float8_e8m0fnu
+
+    def test_sender_side_conversion_requires_explicit_backend(self):
+        """A sender without persistent buffers cannot infer its wire format."""
+        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+
+        with pytest.raises(AssertionError, match="backend is required for sender-side conversion"):
+            MXFP8ReshardTransform(
+                convertible_params={"decoder.weight"},
+                persistent_buffers={},
+                convert_on_send=True,
+            )
+
+    def test_mixed_persistent_buffer_backends_are_rejected(self):
+        from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+        from megatron.core.resharding.transforms import MXFP8ReshardTransform
+
+        triton_buffer = MXFP8Tensor.from_bf16(
+            torch.randn(64, 128, dtype=torch.bfloat16, device="cuda"), backend="triton"
+        )
+        flashinfer_buffer = MXFP8Tensor(
+            data=triton_buffer.data.clone(),
+            scale=triton_buffer.scale.view(torch.uint8).clone(),
+            backend="flashinfer",
+        )
+
+        with pytest.raises(ValueError, match="backend is 'flashinfer'; expected 'triton'"):
+            MXFP8ReshardTransform(
+                convertible_params={"first", "second"},
+                persistent_buffers={"first": triton_buffer, "second": flashinfer_buffer},
+            )
+
     def test_concatenated_moe_buffers_remain_refittable(self):
         """Lazy MoE stacking must not replace persistent storage with inference tensors."""
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
@@ -172,6 +213,7 @@ class TestMXFP8ReshardTransform:
         num_experts, M, K = 2, 64, 128
         grouped_mlp = Namespace()
         grouped_mlp.num_local_experts = num_experts
+        grouped_mlp.inference_grouped_gemm_backend = "torch"
         buffers = {}
         for linear_name in ("linear_fc1", "linear_fc2"):
             linear = Namespace()

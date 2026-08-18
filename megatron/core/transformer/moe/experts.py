@@ -25,9 +25,9 @@ from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.inference.quantization.mxfp8_tensor import (
     MXFP8Tensor,
-    ensure_mxfp8_scale_dtype,
     validate_mxfp8_tensor,
 )
+from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -1058,7 +1058,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return McoreActivationType.SWIGLU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
 
+    # Later refits update these buffers, so create normal tensors without tracking gradients.
     @torch.inference_mode(False)
+    @torch.no_grad()
     def _build_concatenated_mxfp8_weights(self):
         """Build stacked MXFP8 weight tensors from per-expert MXFP8Tensor attributes.
 
@@ -1075,6 +1077,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         intended for non-colocated inference.
         """
 
+        backend = resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
         for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
             linear = getattr(self, linear_name)
             q_list, s_list = [], []
@@ -1091,21 +1094,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     )
                 validate_mxfp8_tensor(
                     mxfp8,
-                    expected_backend="triton",
+                    expected_backend=backend,
                     tensor_name=f"{linear_name}.weight{i}",
                 )
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
 
             stacked_data = torch.stack(q_list, dim=0).contiguous()
-            stacked_scale = ensure_mxfp8_scale_dtype(
-                torch.stack(s_list, dim=0).contiguous()
-            )
+            stacked_scale = torch.stack(s_list, dim=0).contiguous()
 
             setattr(
                 self,
                 buf_name,
-                MXFP8Tensor(data=stacked_data, scale=stacked_scale, backend="triton"),
+                MXFP8Tensor(data=stacked_data, scale=stacked_scale, backend=backend),
             )
 
             # Redirect per-expert weight .data to views into the stacked buffer,

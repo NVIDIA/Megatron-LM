@@ -13,6 +13,11 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 from megatron.core.inference.quantization.mxfp8_quantize import (
+    MXFP8_BLOCK_SIZE,
+    MXFP8_SCALE_COL_BLOCK,
+    MXFP8_SCALE_ROW_BLOCK,
+)
+from megatron.core.inference.quantization.mxfp8_quantize import (
     mxfp8_quantize as mcore_mxfp8_quantize,
 )
 
@@ -37,9 +42,10 @@ def ensure_mxfp8_scale_dtype(scale: torch.Tensor) -> torch.Tensor:
 
 
 MXFP8Backend = Literal["flashinfer", "triton"]
-MXFP8_BLOCK_SIZE = 32
-MXFP8_SCALE_ROW_BLOCK = 128
-MXFP8_SCALE_COL_BLOCK = 4
+_MXFP8_SCALE_DTYPES: dict[MXFP8Backend, torch.dtype] = {
+    "flashinfer": torch.uint8,
+    "triton": torch.float8_e8m0fnu,
+}
 
 
 def validate_mxfp8_tensor(
@@ -48,14 +54,7 @@ def validate_mxfp8_tensor(
     expected_backend: Optional[MXFP8Backend] = None,
     tensor_name: str = "MXFP8 tensor",
 ) -> None:
-    """Thoroughly validate an MXFP8 tensor for GEMM consumers, courtesy of Codex.
-
-    MXFP8 scales may be transported as raw bytes, but persistent compute
-    tensors must expose the dtype required by their GEMM consumer: ``uint8``
-    for FlashInfer or semantic E8M0 for PyTorch. Validating this at the refit
-    boundary produces an actionable error before a scaled GEMM reports an
-    opaque implementation-selection failure.
-    """
+    """Thorough MXFP8 validation for GEMM consumers, courtesy of Codex."""
     if tensor.data.ndim != 2:
         raise ValueError(
             f"{tensor_name} data must be 2D before grouped-weight stacking; "
@@ -71,10 +70,7 @@ def validate_mxfp8_tensor(
             f"{tensor_name} backend is {tensor.backend!r}; expected "
             f"{expected_backend!r} for the configured GEMM consumer."
         )
-    expected_scale_dtype = {
-        "flashinfer": torch.uint8,
-        "triton": torch.float8_e8m0fnu,
-    }.get(backend)
+    expected_scale_dtype = _MXFP8_SCALE_DTYPES.get(backend)
     if expected_scale_dtype is None:
         raise ValueError(
             f"{tensor_name} has no valid MXFP8 backend; got {backend!r}. "
@@ -143,8 +139,8 @@ class MXFP8Tensor:
             return self.scale
         if K is None:
             K = self.data.shape[-1]
-        n_col_blocks = _ceil_div(K // 32, 4)
-        padded_cols = n_col_blocks * 4
+        n_col_blocks = _ceil_div(K // MXFP8_BLOCK_SIZE, MXFP8_SCALE_COL_BLOCK)
+        padded_cols = n_col_blocks * MXFP8_SCALE_COL_BLOCK
         return self.scale.reshape(-1, padded_cols)
 
     @classmethod
@@ -181,10 +177,8 @@ class MXFP8Tensor:
                 f"Unknown MXFP8 quantization backend: '{backend}'. "
                 "Must be 'triton' or 'flashinfer'."
             )
-        tensor = cls(
+        return cls(
             data=data,
             scale=scale,
             backend=backend,
         )
-        validate_mxfp8_tensor(tensor, expected_backend=backend)
-        return tensor

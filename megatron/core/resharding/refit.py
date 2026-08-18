@@ -17,6 +17,7 @@ from megatron.core import parallel_state
 from megatron.core.inference.quantization.utils import (
     _should_quantize_param,
     quantize_params_to_mxfp8,
+    resolve_mxfp8_backend,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.utils import unwrap_model
@@ -237,7 +238,7 @@ def _build_or_get_plan(
 
 
 def _needs_mxfp8_conversion(model) -> bool:
-    """Check if a model uses FlashInfer MXFP8 inference and needs weight conversion."""
+    """Check if a model uses optimized MXFP8 inference and needs weight conversion."""
     if model is None:
         return False
     lm = model[0] if isinstance(model, (list, tuple)) else model
@@ -279,15 +280,15 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
             convertible.add(f"decoder.{name}")
 
     # 2. Quantize decoder weights → persistent MXFP8Tensor buffers.
-    # MXFP8 inference is supported by the torch grouped-GEMM path, whose
-    # persistent buffers require the Triton quantizer's E8M0 storage contract.
-    persistent_buffers = quantize_params_to_mxfp8(decoder, backend="triton")
+    backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
+    persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
 
     # 3. Build the transform and attach it to the plan.
     plan.transform = MXFP8ReshardTransform(
         convertible_params=convertible,
         persistent_buffers=persistent_buffers,
         buffer_key_prefix="decoder.",
+        backend=backend,
     )
 
 
@@ -309,8 +310,8 @@ def prepare_swap_model_weights(
     (``config.transformer_impl == 'inference_optimized'`` and
     ``config.fp8_recipe == 'mxfp8'``), this function also:
       - computes which parameters are eligible for MXFP8 conversion,
-      - quantizes the target decoder weights to persistent FlashInfer
-        MXFP8Tensor buffers (whose addresses are later baked into CUDA graphs),
+      - quantizes the target decoder weights to persistent MXFP8Tensor buffers
+        (whose addresses are later baked into CUDA graphs),
       - creates an ``MXFP8ReshardTransform`` that subsequent
         ``swap_model_weights`` calls use automatically.
 
