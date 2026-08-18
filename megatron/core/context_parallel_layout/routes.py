@@ -3,31 +3,18 @@
 """THD context-parallel route helpers."""
 
 import warnings
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from megatron.core.context_parallel_layout.metadata import (
+from megatron.core.context_parallel_layout.types import CpPartitionMode, ThdCpRoute
+from megatron.core.context_parallel_layout.utils import (
     get_packed_seq_params_cp_partition_cu_seqlens,
 )
-from megatron.core.context_parallel_layout.types import CpPartitionMode, ThdCpRoute
+from megatron.core.utils import nvtx_range
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
-
-
-@contextmanager
-def _cp_layout_nvtx_range(message: str):
-    active = torch.cuda.is_available()
-    if active:
-        torch.cuda.nvtx.range_push(message)
-    try:
-        yield
-    finally:
-        if active:
-            torch.cuda.nvtx.range_pop()
-
 
 _ThdLayoutSegment = Tuple[int, int, int]
 
@@ -174,7 +161,7 @@ def build_thd_cp_partition_route(
     if device is None:
         device = cu_seqlens.device
 
-    with _cp_layout_nvtx_range("cp_layout/thd/route"):
+    with nvtx_range("cp_layout/thd/route"):
         cu = _compact_thd_cu_seqlens_to_list(cu_seqlens)
         _validate_thd_route_partitioning(cu, cp_size)
 

@@ -19,11 +19,13 @@ from megatron.core.context_parallel_layout.conversion import (
 )
 from megatron.core.context_parallel_layout.routes import prebuild_thd_cp_partition_routes
 from megatron.core.context_parallel_layout.types import CpPartitionMode, ThdCpRoute
+from megatron.core.context_parallel_layout.utils import finalize_packed_seq_params
 
 __all__ = [
     "CpPartitionMode",
     "CpPartitionModeConverter",
     "ThdCpRoute",
     "convert_module_input_tensors_cp_partition_mode",
+    "finalize_packed_seq_params",
     "prebuild_thd_cp_partition_routes",
 ]
