@@ -2,6 +2,8 @@
 
 """Tests for the internal GDR backend adapter."""
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -410,3 +412,76 @@ def test_fused_backward_shape_and_dtype_contract(
     )
 
     assert reason == expected_reason
+
+
+def test_fused_backward_kernel_uses_named_layout_contracts():
+    package = (
+        Path(__file__).parents[3]
+        / "megatron/core/ssm/gated_delta_net/internal_gdn_backend/kernels"
+        / "fused_gdr_bwd_cute"
+    )
+    kernel_source = (package / "kernel.py").read_text()
+    for positional_wiring in (
+        "mma_variants[",
+        "packed_layouts[",
+        "tma_inputs[",
+    ):
+        assert positional_wiring not in kernel_source
+
+    layouts_tree = ast.parse((package / "layouts.py").read_text())
+    assignments = {
+        node.targets[0].id: node.value
+        for node in layouts_tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    }
+    expected_fields = {
+        "MmaVariantBindings": 10,
+        "MmaOperationBindings": 19,
+        "TmaDescriptorBundle": 9,
+    }
+    for node in layouts_tree.body:
+        if isinstance(node, ast.ClassDef) and node.name in expected_fields:
+            fields = [item for item in node.body if isinstance(item, ast.AnnAssign)]
+            assert len(fields) == expected_fields.pop(node.name)
+    assert not expected_fields
+
+    variant_specs = assignments["MMA_VARIANT_SPECS"].elts
+    operation_specs = assignments["MMA_OPERATION_SPECS"].elts
+    variant_names = {ast.literal_eval(spec.args[0]) for spec in variant_specs}
+    operation_names = {ast.literal_eval(spec.args[0]) for spec in operation_specs}
+    canonical_sources = ast.literal_eval(assignments["_CANONICAL_LAYOUT_SOURCES"])
+    assert len(variant_names) == len(variant_specs) == 10
+    assert len(operation_names) == len(operation_specs) == 19
+    for spec in operation_specs:
+        _, _, variant, a_view, b_view = map(ast.literal_eval, spec.args)
+        assert variant in variant_names
+        assert a_view in canonical_sources
+        assert b_view in canonical_sources
+
+    storage_tree = ast.parse((package / "storage.py").read_text())
+    storage_assignments = {
+        node.targets[0].id: node.value
+        for node in storage_tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    }
+    shared_storage = next(
+        node
+        for node in storage_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SharedStorage"
+    )
+    fields = [item for item in shared_storage.body if isinstance(item, ast.AnnAssign)]
+    assert len(fields) == 79
+
+    allocations = ast.literal_eval(storage_assignments["TMEM_ALLOCATION_COLUMNS"])
+    ranges = ast.literal_eval(storage_assignments["TMEM_RANGES"])
+    assert allocations == (256, 128, 32, 64)
+    assert sum(allocations) == 480
+    for index, lhs in enumerate(ranges):
+        for rhs in ranges[index + 1 :]:
+            columns_overlap = max(lhs[1], rhs[1]) < min(lhs[2], rhs[2])
+            phases_overlap = max(lhs[3], rhs[3]) < min(lhs[4], rhs[4])
+            assert not (columns_overlap and phases_overlap), (lhs[0], rhs[0])

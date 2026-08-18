@@ -57,8 +57,14 @@ fused kernels run and compares the full forward-plus-backward path with FLA.
 - `launcher.py` owns DLPack descriptors, dynamic token-mode annotations,
   specialization keys, thread-safe compilation caching, and stream-bound
   launch preparation.
-- `kernel.py` contains the device schedule, shared/TMEM storage, pipelines,
-  MMA layouts, and the `FusedGdrBwdKernel` entry point.
+- `layouts.py` owns the ten oriented MMA variants, nineteen logical
+  operation bindings, canonical and packed SMEM layouts, accumulator-layout
+  checks, and the trace-local TMA descriptor bundle.
+- `storage.py` owns the decorated shared-memory struct, TMEM live-range
+  contract, resource budget, and named SMEM/TMEM view builders.
+- `kernel.py` contains the role schedule, pipeline ordering, tensor-bound TMA
+  descriptor construction, allocation/free ordering, and the
+  `FusedGdrBwdKernel` entry point.
 - `tcgen05_ws.py` contains the small low-level helpers needed for SM100 tensor
   memory and `tcgen05` operations.
 
@@ -119,6 +125,13 @@ not overlap. Shared storage is checked at import time against the SM100 opt-in
 limit. `get_layout_budget()` exposes the actual shared-memory, TMEM-column, and
 thread budgets for tests and diagnostics.
 
+Layout metadata is resolved by logical operation name at trace time and
+flattened into explicit arguments before the `@cute.kernel` boundary. The
+device schedule therefore does not depend on correlated tuple positions such
+as a variant or packed-layout index. Packed 64x128 operands are validated
+against their canonical physical coordinate-to-address mapping after explicit
+linear regrouping.
+
 ## Compilation and caching
 
 The token mode is marked dynamic, so one specialization can launch different
@@ -137,8 +150,8 @@ and IKET instrumentation are compilation-key fields. Consequently:
 
 CPU unit tests in `tests/unit_tests/ssm/test_internal_gdn_backend.py` keep a
 small representative matrix for BF16 support, dtype rejection, dense packing,
-and the arbitrary packed-batch contract. They do not duplicate a large shape
-sweep.
+the arbitrary packed-batch contract, and the named layout/storage structure.
+They do not duplicate a large shape sweep.
 
 `tests/unit_tests/ssm/test_internal_gdn_backend_e2e.py` is marked
 `launch_on_gb200` and runs one explicit-`cute` full-fused E2E case (`B=2`, `T=8192`,
@@ -164,4 +177,10 @@ allows 10% noise relative to FLA. JIT time is excluded.
   explicit failure.
 - Performance results are not hard-coded here. Reports should identify the
   commit, GPU, CUDA/CuTe DSL versions, shape, warmup count, sample count, and
-  whether JIT time is included.
+whether JIT time is included.
+
+For layout-only development, run the CPU contract test first, then compile the
+SM100 probe and both uniform and packed-variable specializations on GB200.
+Correctness must compare the full fused forward/backward result against FLA.
+Performance comparisons for a structural refactor use at least 20 interleaved
+baseline/candidate samples after warmup; cold JIT time is reported separately.

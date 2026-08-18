@@ -28,6 +28,17 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from . import tcgen05_ws
+from .layouts import BackwardLayoutPlan, TmaDescriptorBundle, build_backward_layout_plan
+from .storage import (
+    TMEM_ALLOCATION_COLUMNS,
+    TMEM_COLUMNS,
+    TMEM_RANGES,
+    LayoutBudget,
+    SharedStorage,
+    get_layout_budget,
+    make_shared_views,
+    make_tmem_views,
+)
 
 try:
     from cutlass.cute.experimental import iket as _cute_iket
@@ -279,11 +290,7 @@ _BT = 64
 _TMA_VECTOR_HEADS = 4
 _DK = 128
 _DV = 128
-_TMEM_COLUMNS = 480
-_TMEM_ALLOCATION_COLUMNS = (256, 128, 32, 64)
 _THREADS_PER_CTA = 384
-_BUFFER_ALIGN_BYTES = 128
-_SM100_OPTIN_SMEM_BYTES = 232_448
 _REUSE_V = 0
 _REUSE_A = 1
 _REUSE_DO = 2
@@ -415,38 +422,6 @@ class _CompletionOnlyTmaAsyncPipeline(pipeline.PipelineTmaAsync):
 
 
 @dataclass(frozen=True)
-class LayoutBudget:
-    """Physical CTA storage required by the structured kernel shell."""
-
-    smem_bytes: int
-    tmem_columns: int
-    threads: int
-
-
-@dataclass(frozen=True)
-class MmaVariantSpec:
-    """One tcgen05 orientation variant within a logical MMA family."""
-
-    name: str
-    family: str
-    tile: tuple[int, int, int]
-    a_major: str
-    b_major: str
-
-
-@dataclass(frozen=True)
-class MmaOperationSpec:
-    """Pinned stage operation mapped to one variant and physical SMEM views."""
-
-    name: str
-    stage: str
-    variant: str
-    a_view: str
-    b_view: str
-    result_transposed: bool = False
-
-
-@dataclass(frozen=True)
 class StaticTensorContract:
     """Trace-time rank plus static shape/inner-stride requirements."""
 
@@ -454,214 +429,6 @@ class StaticTensorContract:
     rank: int
     shape_modes: tuple[tuple[int, str], ...]
     stride_modes: tuple[tuple[int, str], ...]
-
-
-@dataclass(frozen=True)
-class _BuiltMmaVariant:
-    spec: MmaVariantSpec
-    tiled_mma: Any
-    smem_a: Any
-    smem_b: Any
-
-
-@dataclass(frozen=True)
-class _MmaLayoutFamily:
-    """Actual oriented MMAs and aliased physical SMEM views."""
-
-    variants: dict[str, _BuiltMmaVariant]
-    views: dict[str, Any]
-    staged_views: dict[str, Any]
-
-
-MMA_VARIANT_SPECS = (
-    MmaVariantSpec(
-        "mm_64_64_128_k_k", "mm_64_64_128", (64, 64, 128), "K", "K"
-    ),
-    MmaVariantSpec(
-        "mm_64_128_64_mn_mn",
-        "mm_64_128_64",
-        (64, 128, 64),
-        "MN",
-        "MN",
-    ),
-    MmaVariantSpec(
-        "mm_64_128_64_k_mn",
-        "mm_64_128_64",
-        (64, 128, 64),
-        "K",
-        "MN",
-    ),
-    MmaVariantSpec(
-        "mm_128_64_64_mn_mn",
-        "mm_128_64_64",
-        (128, 64, 64),
-        "MN",
-        "MN",
-    ),
-    MmaVariantSpec(
-        "mm_128_64_128_mn_k",
-        "mm_128_64_128",
-        (128, 64, 128),
-        "MN",
-        "K",
-    ),
-    MmaVariantSpec(
-        "mm_128_64_128_k_k",
-        "mm_128_64_128",
-        (128, 64, 128),
-        "K",
-        "K",
-    ),
-    MmaVariantSpec(
-        "mm_64_64_64_mn_mn",
-        "mm_64_64_64",
-        (64, 64, 64),
-        "MN",
-        "MN",
-    ),
-    MmaVariantSpec(
-        "mm_64_64_64_k_k",
-        "mm_64_64_64",
-        (64, 64, 64),
-        "K",
-        "K",
-    ),
-    MmaVariantSpec(
-        "mm_64_128_128_k_mn",
-        "mm_64_128_128",
-        (64, 128, 128),
-        "K",
-        "MN",
-    ),
-    MmaVariantSpec(
-        "mm_64_128_128_k_k",
-        "mm_64_128_128",
-        (64, 128, 128),
-        "K",
-        "K",
-    ),
-)
-
-
-MMA_OPERATION_SPECS = (
-    MmaOperationSpec(
-        "p", "00", "mm_64_64_128_k_k", "token_direct", "token_direct"
-    ),
-    MmaOperationSpec(
-        "dvprime_state",
-        "01",
-        "mm_64_128_128_k_mn",
-        "token_direct",
-        "state_transposed",
-    ),
-    MmaOperationSpec(
-        "dvprime_pg",
-        "02",
-        "mm_64_128_64_mn_mn",
-        "square_transposed",
-        "token_transposed",
-    ),
-    MmaOperationSpec(
-        "u_state",
-        "03",
-        "mm_64_128_128_k_mn",
-        "token_direct",
-        "state_transposed",
-    ),
-    MmaOperationSpec(
-        "dv",
-        "04",
-        "mm_64_128_64_mn_mn",
-        "square_transposed",
-        "token_transposed",
-    ),
-    MmaOperationSpec(
-        "vprime",
-        "05a",
-        "mm_64_128_64_k_mn",
-        "square_direct",
-        "token_transposed",
-    ),
-    MmaOperationSpec(
-        "dag", "05b", "mm_64_64_128_k_k", "token_direct", "token_direct"
-    ),
-    MmaOperationSpec(
-        "dpg", "06", "mm_64_64_128_k_k", "token_direct", "token_direct"
-    ),
-    MmaOperationSpec(
-        "dk_state",
-        "07",
-        "mm_64_128_128_k_k",
-        "token_direct",
-        "state_direct",
-    ),
-    MmaOperationSpec(
-        "dq_state",
-        "08",
-        "mm_64_128_128_k_k",
-        "token_direct",
-        "state_direct",
-    ),
-    MmaOperationSpec(
-        "dk_state_g",
-        "09",
-        "mm_64_128_128_k_k",
-        "token_direct",
-        "state_direct",
-    ),
-    MmaOperationSpec(
-        "dq_dp",
-        "10",
-        "mm_64_128_64_k_mn",
-        "square_direct",
-        "token_transposed",
-    ),
-    MmaOperationSpec(
-        "dh_k",
-        "11",
-        "mm_128_64_64_mn_mn",
-        "token_transposed",
-        "square_transposed",
-    ),
-    MmaOperationSpec(
-        "dk_dp",
-        "12",
-        "mm_64_128_64_mn_mn",
-        "square_transposed",
-        "token_transposed",
-    ),
-    MmaOperationSpec(
-        "da_left",
-        "13a",
-        "mm_64_64_64_mn_mn",
-        "square_transposed",
-        "square_transposed",
-    ),
-    MmaOperationSpec(
-        "at", "13c", "mm_64_64_64_k_k", "square_direct", "square_direct"
-    ),
-    MmaOperationSpec(
-        "da_right",
-        "13b",
-        "mm_64_64_64_k_k",
-        "square_direct",
-        "square_direct",
-    ),
-    MmaOperationSpec(
-        "dh_q",
-        "14",
-        "mm_128_64_64_mn_mn",
-        "token_transposed",
-        "square_transposed",
-    ),
-    MmaOperationSpec(
-        "dk_da",
-        "15",
-        "mm_64_128_64_k_mn",
-        "square_direct",
-        "token_transposed",
-    ),
-)
 
 
 STATIC_TENSOR_CONTRACTS = (
@@ -750,253 +517,6 @@ STATIC_TENSOR_CONTRACTS = (
 )
 
 
-_TMEM_RANGES = (
-    # name, first column, one-past-last column, first phase, last phase
-    ("p", 0, 32, 0, 7),
-    ("dk", 0, 64, 7, 16),
-    ("dv", 64, 128, 1, 6),
-    ("u", 192, 256, 3, 6),
-    ("dq", 192, 256, 8, 11),
-    ("vprime", 416, 480, 5, 6),
-    ("dog", 416, 480, 6, 14),
-    ("dh_left", 256, 320, 0, 16),
-    ("da", 128, 160, 6, 14),
-    ("a", 160, 192, 5, 6),
-    ("dp", 160, 192, 6, 8),
-    ("at", 160, 192, 13, 14),
-    ("dh_right", 320, 384, 0, 16),
-    ("mask", 384, 416, 0, 16),
-)
-
-
-def _validate_tmem_ranges() -> None:
-    """Prove that spatial aliases have disjoint completion phases."""
-
-    assert sum(_TMEM_ALLOCATION_COLUMNS) == _TMEM_COLUMNS
-    assert all(
-        columns > 0 and columns & (columns - 1) == 0
-        for columns in _TMEM_ALLOCATION_COLUMNS
-    )
-    for name, begin, end, phase_begin, phase_end in _TMEM_RANGES:
-        assert 0 <= begin < end <= _TMEM_COLUMNS, name
-        assert 0 <= phase_begin < phase_end <= 16, name
-    for index, lhs in enumerate(_TMEM_RANGES):
-        for rhs in _TMEM_RANGES[index + 1 :]:
-            lhs_name, lhs_begin, lhs_end, lhs_phase, lhs_phase_end = lhs
-            rhs_name, rhs_begin, rhs_end, rhs_phase, rhs_phase_end = rhs
-            columns_overlap = max(lhs_begin, rhs_begin) < min(
-                lhs_end, rhs_end
-            )
-            phases_overlap = max(lhs_phase, rhs_phase) < min(
-                lhs_phase_end, rhs_phase_end
-            )
-            assert not (columns_overlap and phases_overlap), (
-                f"live TMEM aliases overlap: {lhs_name} and {rhs_name}"
-            )
-    assert max(allocation[2] for allocation in _TMEM_RANGES) <= (
-        _TMEM_COLUMNS
-    )
-
-
-_validate_tmem_ranges()
-
-
-@cute.struct
-class SharedStorage:
-    """Non-overlaid live SMEM and independent one-stage pipeline storage."""
-
-    # Seven runtime load edges coordinate eight logical input tensors: q and k
-    # share one TMA transaction edge, while the other six own one edge each.
-    load_qk_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    load_v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    load_g_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    load_h_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    load_a_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    load_do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    load_beta_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-
-
-    # AQ publishes one complete shared dQ tile to the TMA warp. The TMA warp
-    # releases the empty phase only after cp.async.bulk.wait_group proves the
-    # shared source is no longer in use.
-    dq_smem_tile_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    # SK and AQ publish that all current-iteration TMEM reads are done before
-    # the MMA warp overwrites persistent accumulator ranges next iteration.
-    all_tmem_readers_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    # AQ publishes completion of the W computation after its final U and V
-    # reads. SK uses that one result before overwriting either allocation.
-    aq_w_inputs_read_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    # SK publishes the materialized dO-gamma shared tile consumed by AQ.
-    dog_smem_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    # SK publishes completion of every dK-derived sDg update before AQ
-    # merges q*dQ. The earlier write ownership has its own dedicated edge.
-    dg_rmw_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-
-    # Cross-iteration physical-buffer reuse permissions. These are deliberately
-    # independent from compute-ready stage edges: each becomes full only after
-    # the last reader of that exact SMEM allocation has completed.
-    reuse_v_tma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    reuse_a_tma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    reuse_do_tma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    reuse_beta_tma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    # SK publishes after the final stage-14 readers release sTmp21; AQ waits on
-    # the previous iteration before materializing the next dVprime tile.
-    reuse_tmp21_aq_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-
-    # One empty/full mbarrier pair per pinned-schedule MMA dependency.
-    mma_p_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dvprime_state_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dvprime_pgamma_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_u_state_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dv_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_vprime_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dag_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dpg_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dk_state_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dq_state_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dk_state_g_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dq_dp_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dh_k_left_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dh_k_right_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dk_dp_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_da_left_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_da_right_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_at_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dh_q_left_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dh_q_right_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    mma_dk_da_done_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-
-    # One empty/full mbarrier pair per semantic MMA-input readiness edge.
-    p_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    dvprime_state_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    dvprime_pgamma_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    g_smem_reuse_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    dv_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    vprime_dag_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    sdg_ownership_order_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    dpg_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    dk_state_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    u_readers_done_before_dq_state_mma_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    dk_state_g_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    dq_dp_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    dh_k_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    da_left_at_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    da_right_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    dh_q_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    dk_da_inputs_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-
-    # Four allocation-result tokens for the legal 480-column split.
-    tmem_holding_buf: cute.struct.MemRange[
-        cutlass.Int32, len(_TMEM_ALLOCATION_COLUMNS)
-    ]
-    sDvOffset: cute.struct.Align[
-        cute.struct.MemRange[cutlass.Int32, 128],
-        16,
-    ]
-
-    # Four 64x128 BF16 input tiles.
-    sDo: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _BT * _DV],
-        _BUFFER_ALIGN_BYTES,
-    ]
-    sQ: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _BT * _DK],
-        _BUFFER_ALIGN_BYTES,
-    ]
-    sK: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _BT * _DK],
-        _BUFFER_ALIGN_BYTES,
-    ]
-    sV: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _BT * _DV],
-        _BUFFER_ALIGN_BYTES,
-    ]
-
-    # Three 64x64 BF16 tiles.
-    sA: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _BT * _BT],
-        _BUFFER_ALIGN_BYTES,
-    ]
-    # P-gamma, then dP scratch across non-overlapping phases.
-    sTmp11: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _BT * _BT],
-        _BUFFER_ALIGN_BYTES,
-    ]
-    # A-gamma-beta, dAb, dA, then final dA_s scratch.
-    sTmp12: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _BT * _BT],
-        _BUFFER_ALIGN_BYTES,
-    ]
-
-    # Two 128x128 BF16 state tiles.
-    sH: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _DK * _DV],
-        _BUFFER_ALIGN_BYTES,
-    ]
-    # Raw incoming dH snapshot used by state-gradient MMAs.
-    sTmp41: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _DK * _DV],
-        _BUFFER_ALIGN_BYTES,
-    ]
-
-    # Four 64x128 BF16 scratch/output tiles.
-    # Dedicated dQ staging tile consumed by the TMA store warp.
-    sDqkv: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _BT * _DK],
-        _BUFFER_ALIGN_BYTES,
-    ]
-    # dVprime, Vprime, then dO-gamma scratch across ordered phases.
-    sTmp21: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _BT * _DK],
-        _BUFFER_ALIGN_BYTES,
-    ]
-    # W tile, then AQ reduction scratch after W readers finish.
-    sTmp22: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _BT * _DK],
-        _BUFFER_ALIGN_BYTES,
-    ]
-    # dV-gamma tile consumed by the dH and dK paths.
-    sTmp23: cute.struct.Align[
-        cute.struct.MemRange[cutlass.BFloat16, _BT * _DK],
-        _BUFFER_ALIGN_BYTES,
-    ]
-
-    # TMA needs at least 128 contiguous bits. Load four adjacent heads for
-    # each token and let the consumer select its head lane.
-    sGTma: cute.struct.Align[
-        cute.struct.MemRange[
-            cutlass.Float32, _TMA_VECTOR_HEADS * _BT
-        ],
-        16,
-    ]
-    sExpG: cute.struct.MemRange[cutlass.Float32, _BT]
-    sScaledExpG: cute.struct.MemRange[cutlass.Float32, _BT]
-    sReverseExpG: cute.struct.MemRange[cutlass.Float32, _BT]
-    sBetaTma: cute.struct.Align[
-        cute.struct.MemRange[
-            cutlass.Float32, _TMA_VECTOR_HEADS * _BT
-        ],
-        16,
-    ]
-    sDg: cute.struct.MemRange[cutlass.Float32, _BT]
-    sDb: cute.struct.MemRange[cutlass.Float32, _BT]
-    sReduce: cute.struct.MemRange[cutlass.Float32, 2 * _BT]
-    sReduce2: cute.struct.MemRange[cutlass.Float32, 2 * _BT]
-
-
-assert SharedStorage.size_in_bytes() <= _SM100_OPTIN_SMEM_BYTES
-
-
-def get_layout_budget() -> LayoutBudget:
-    """Return the real decorated-struct size and fixed SM100 CTA budgets."""
-
-    return LayoutBudget(
-        smem_bytes=SharedStorage.size_in_bytes(),
-        tmem_columns=_TMEM_COLUMNS,
-        threads=_THREADS_PER_CTA,
-    )
-
-
 class FusedGdrBwdKernel:
     """SM100 role, memory, MMA, TMA, and launch structure."""
 
@@ -1018,8 +538,8 @@ class FusedGdrBwdKernel:
     bt = _BT
     dk = _DK
     dv = _DV
-    tmem_columns = _TMEM_COLUMNS
-    tmem_allocation_columns = _TMEM_ALLOCATION_COLUMNS
+    tmem_columns = TMEM_COLUMNS
+    tmem_allocation_columns = TMEM_ALLOCATION_COLUMNS
 
     mm_64_64_128_tile = (64, 64, 128)
     mm_64_128_64_tile = (64, 128, 64)
@@ -1110,247 +630,45 @@ class FusedGdrBwdKernel:
             num_threads=128,
         )
 
-    @staticmethod
-    def _major_mode(name: str):
-        return {"K": OperandMajorMode.K, "MN": OperandMajorMode.MN}[name]
+    def _build_mma_layouts(self) -> BackwardLayoutPlan:
+        """Build named trace-time layout bindings and validate TMEM placement."""
 
-    def _make_tiled_mma(self, spec: MmaVariantSpec):
-        # A 64-row CTA occupies only half of TMEM's 128 datapaths.  Use
-        # two N atoms so tcgen05 interleaves their accumulator fragments
-        # into the complementary datapath rows.  This matches the packed
-        # 64/32-column allocation used by the upstream SM100 kernel.
-        pack_n = spec.tile[0] == 64 and spec.tile[1] == 128
-        instruction_n = spec.tile[1] // 2 if pack_n else spec.tile[1]
-        op = tcgen05.MmaF16BF16Op(
-            self.io_dtype,
-            self.acc_dtype,
-            (spec.tile[0], instruction_n, 16),
-            tcgen05.CtaGroup.ONE,
-            tcgen05.OperandSource.SMEM,
-            self._major_mode(spec.a_major),
-            self._major_mode(spec.b_major),
-        )
-        if pack_n:
-            return cute.make_tiled_mma(
-                op, permutation_mnk=spec.tile
-            )
-        return cute.make_tiled_mma(op)
+        plan = build_backward_layout_plan(self.io_dtype, self.acc_dtype)
+        self._validate_tmem_layout_plan(plan)
+        return plan
 
-    @staticmethod
-    def _mma_operand_view(staged_layout):
-        """Drop the singleton stage mode from an MMA SMEM layout."""
-
-        return cute.select(staged_layout, mode=[0, 1, 2])
-
-    def _build_mma_layouts(self) -> _MmaLayoutFamily:
-        """Build every operation orientation and its shared physical views."""
-
-        variants = {}
-        for spec in MMA_VARIANT_SPECS:
-            tiled_mma = self._make_tiled_mma(spec)
-            variants[spec.name] = _BuiltMmaVariant(
-                spec,
-                tiled_mma,
-                sm100_utils.make_smem_layout_a(
-                    tiled_mma,
-                    spec.tile,
-                    self.io_dtype,
-                    1,
-                    is_k_major=spec.a_major == "K",
-                ),
-                sm100_utils.make_smem_layout_b(
-                    tiled_mma,
-                    spec.tile,
-                    self.io_dtype,
-                    1,
-                    is_k_major=spec.b_major == "K",
-                ),
-            )
-
-        token_staged = variants["mm_64_64_128_k_k"].smem_a
-        token_transposed_staged = variants[
-            "mm_128_64_64_mn_mn"
-        ].smem_a
-        square_staged = variants["mm_64_64_64_k_k"].smem_a
-        square_transposed_staged = variants[
-            "mm_64_64_64_mn_mn"
-        ].smem_a
-        state_staged = variants["mm_128_64_128_k_k"].smem_a
-        state_transposed_staged = variants[
-            "mm_128_64_128_mn_k"
-        ].smem_a
-        staged_views = {
-            "token_direct": token_staged,
-            "token_transposed": token_transposed_staged,
-            "square_direct": square_staged,
-            "square_transposed": square_transposed_staged,
-            "state_direct": state_staged,
-            "state_transposed": state_transposed_staged,
-        }
-        family = _MmaLayoutFamily(
-            variants=variants,
-            views={
-                name: self._mma_operand_view(layout)
-                for name, layout in staged_views.items()
-            },
-            staged_views=staged_views,
-        )
-        self._validate_operation_views(family)
-        return family
-
-    def _validate_operation_views(self, family: _MmaLayoutFamily) -> None:
-        """Trace every scheduled operand to an oriented MMA and physical view."""
-
-        assert set(family.variants) == {
-            spec.name for spec in MMA_VARIANT_SPECS
-        }
-        for operation in MMA_OPERATION_SPECS:
-            variant = family.variants[operation.variant]
-            assert (
-                variant.tiled_mma.op.a_major_mode
-                == self._major_mode(variant.spec.a_major)
-            )
-            assert (
-                variant.tiled_mma.op.b_major_mode
-                == self._major_mode(variant.spec.b_major)
-            )
-            a_view = family.views[operation.a_view]
-            b_view = family.views[operation.b_view]
-            mma_a_view = cute.select(
-                variant.smem_a, mode=[0, 1, 2]
-            )
-            mma_b_view = cute.select(
-                variant.smem_b, mode=[0, 1, 2]
-            )
-            is_packed = (
-                variant.spec.tile[0] == 64
-                and variant.spec.tile[1] == 128
-            )
-            if is_packed:
-                # The N=64 instruction permutation regroups the same physical
-                # SMEM addresses into two logical N atoms. Preserve the MMA's
-                # exact grouped layout through an alias at the call site.
-                assert mma_a_view.inner == a_view.inner
-                assert mma_b_view.inner == b_view.inner
-                assert cute.size(mma_a_view) == cute.size(a_view)
-                assert cute.size(mma_b_view) == cute.size(b_view)
-            else:
-                # Full Layout equality checks shape, stride, and swizzle.
-                assert mma_a_view == a_view, (
-                    f"{operation.name}: A view {operation.a_view} is not "
-                    f"the MMA physical mapping"
-                )
-                assert mma_b_view == b_view, (
-                    f"{operation.name}: B view {operation.b_view} is not "
-                    f"the MMA physical mapping"
-                )
-
-        direct_output_variant = family.variants[
-            "mm_64_128_64_mn_mn"
-        ].tiled_mma
-        direct_output_shape = direct_output_variant.partition_shape_C(
-            (64, 128)
-        )
-        direct_output_layout = direct_output_variant.make_fragment_C(
-            cute.append(direct_output_shape, 1)
-        ).layout
-        for name in (
-            "mm_64_128_64_k_mn",
-            "mm_64_128_128_k_mn",
-            "mm_64_128_128_k_k",
-        ):
-            variant = family.variants[name].tiled_mma
-            accumulator_shape = variant.partition_shape_C((64, 128))
-            accumulator_layout = variant.make_fragment_C(
-                cute.append(accumulator_shape, 1)
-            ).layout
-            assert accumulator_layout == direct_output_layout, (
-                f"{name}: C layout must match the direct 64x128 "
-                "TMEM accumulator layout"
-            )
-
-        square_output_variant = family.variants[
-            "mm_64_64_128_k_k"
-        ].tiled_mma
-        square_output_shape = square_output_variant.partition_shape_C(
-            (64, 64)
-        )
-        square_output_layout = square_output_variant.make_fragment_C(
-            cute.append(square_output_shape, 1)
-        ).layout
-        for name in ("mm_64_64_64_mn_mn", "mm_64_64_64_k_k"):
-            variant = family.variants[name].tiled_mma
-            accumulator_shape = variant.partition_shape_C((64, 64))
-            accumulator_layout = variant.make_fragment_C(
-                cute.append(accumulator_shape, 1)
-            ).layout
-            assert accumulator_layout == square_output_layout, (
-                f"{name}: C layout must match the direct 64x64 "
-                "TMEM accumulator layout"
-            )
-
-        physical_columns_by_variant = {}
-        for spec in MMA_VARIANT_SPECS:
-            variant = family.variants[spec.name].tiled_mma
-            accumulator_shape = variant.partition_shape_C(spec.tile[:2])
-            fake = variant.make_fragment_C(
-                cute.append(accumulator_shape, 1)
-            )
-            physical_columns = tcgen05.find_tmem_tensor_col_offset(fake)
-            physical_columns_by_variant[spec.name] = physical_columns
-            expected_columns = (
-                spec.tile[1] // 2
-                if spec.tile[0] == 64 and spec.tile[1] == 128
-                else spec.tile[1]
-            )
-            assert physical_columns == expected_columns, (
-                f"{spec.name}: expected {expected_columns} TMEM columns, "
-                f"got {physical_columns}"
-            )
+    def _validate_tmem_layout_plan(self, plan: BackwardLayoutPlan) -> None:
+        """Keep the physical TMEM reservations pinned to the baseline layout."""
 
         range_by_name = {
-            name: (begin, end) for name, begin, end, _, _ in _TMEM_RANGES
+            name: (begin, end) for name, begin, end, _, _ in TMEM_RANGES
         }
-        range_bindings = (
+        bindings = (
             ("p", self.p_tmem_offset, "mm_64_64_128_k_k"),
             ("dk", self.dk_tmem_offset, "mm_64_128_64_mn_mn"),
             ("dv", self.dv_tmem_offset, "mm_64_128_64_mn_mn"),
             ("da", self.da_tmem_offset, "mm_64_64_128_k_k"),
             ("u", self.u_tmem_offset, "mm_64_128_64_mn_mn"),
-            (
-                "vprime",
-                self.vprime_tmem_offset,
-                "mm_64_128_64_mn_mn",
-            ),
+            ("vprime", self.vprime_tmem_offset, "mm_64_128_64_mn_mn"),
             ("dog", self.dog_tmem_offset, "mm_64_128_64_mn_mn"),
             ("dq", self.dq_tmem_offset, "mm_64_128_64_mn_mn"),
             ("a", self.a_tmem_offset, "mm_64_64_128_k_k"),
             ("dp", self.dp_tmem_offset, "mm_64_64_128_k_k"),
             ("at", self.a_tmem_offset, "mm_64_64_128_k_k"),
-            (
-                "dh_left",
-                self.dh_left_tmem_offset,
-                "mm_128_64_64_mn_mn",
-            ),
-            (
-                "dh_right",
-                self.dh_right_tmem_offset,
-                "mm_128_64_64_mn_mn",
-            ),
+            ("dh_left", self.dh_left_tmem_offset, "mm_128_64_64_mn_mn"),
+            ("dh_right", self.dh_right_tmem_offset, "mm_128_64_64_mn_mn"),
         )
-        assert {binding[0] for binding in range_bindings} == (
-            set(range_by_name) - {"mask"}
-        )
+        assert {binding[0] for binding in bindings} == set(range_by_name) - {
+            "mask"
+        }
         assert range_by_name["mask"] == (
             self.mask_tmem_offset,
             self.mask_tmem_offset + 32,
         )
-        for name, offset, variant_name in range_bindings:
+        for name, offset, variant_name in bindings:
             begin, end = range_by_name[name]
-            assert begin == offset, (
-                f"{name}: TMEM range offset {begin} does not match {offset}"
-            )
-            logical_columns = physical_columns_by_variant[variant_name]
+            assert begin == offset
+            logical_columns = plan.physical_columns_by_variant[variant_name]
             reservation_columns = (
                 logical_columns // 2
                 if logical_columns == 64
@@ -1359,23 +677,8 @@ class FusedGdrBwdKernel:
             )
             assert end - begin == reservation_columns, (
                 f"{name}: TMEM range span {end - begin} does not match "
-                f"{variant_name} physical reservation "
-                f"{reservation_columns}"
+                f"{variant_name} physical reservation {reservation_columns}"
             )
-
-        for name, expected in (
-            ("token_direct", 64 * 128),
-            ("token_transposed", 64 * 128),
-            ("square_direct", 64 * 64),
-            ("square_transposed", 64 * 64),
-            ("state_direct", 128 * 128),
-            ("state_transposed", 128 * 128),
-        ):
-            staged = family.staged_views[name]
-            view = family.views[name]
-            assert self._mma_operand_view(staged) == view
-            assert cute.cosize(staged) == expected
-            assert cute.cosize(view) == expected
 
     @cute.jit
     def _check_static_tensor_contracts(
@@ -1515,7 +818,7 @@ class FusedGdrBwdKernel:
 
     def _build_tma_atoms(
         self,
-        family: _MmaLayoutFamily,
+        plan: BackwardLayoutPlan,
         q,
         k,
         v,
@@ -1531,13 +834,13 @@ class FusedGdrBwdKernel:
 
         load_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
         store_op = cpasync.CopyBulkTensorTileS2GOp()
-        token = family.variants["mm_64_64_128_k_k"]
-        square = family.variants["mm_64_64_64_k_k"]
-        state = family.variants["mm_128_64_128_k_k"]
-        token_a = self._mma_operand_view(token.smem_a)
-        token_b = self._mma_operand_view(token.smem_b)
-        square_a = self._mma_operand_view(square.smem_a)
-        state_a = self._mma_operand_view(state.smem_a)
+        token = plan.variants.mm_64_64_128_k_k
+        square = plan.variants.mm_64_64_64_k_k
+        state = plan.variants.mm_128_64_128_k_k
+        token_a = token.smem_a
+        token_b = token.smem_b
+        square_a = square.smem_a
+        state_a = state.smem_a
 
         # Generic S2G TMA needs a flat top-level tile, unlike the nested
         # operand layouts accepted by the MMA-aware G2S helpers. These
@@ -1562,69 +865,68 @@ class FusedGdrBwdKernel:
             (_TMA_VECTOR_HEADS, _BT), stride=(1, _TMA_VECTOR_HEADS)
         )
 
-        tma_atoms = (
-            cute.nvgpu.make_tiled_tma_atom_A(
+        return TmaDescriptorBundle(
+            q=_wrap_tma(cute.nvgpu.make_tiled_tma_atom_A(
                 load_op,
                 q_view,
                 token_a,
                 token.spec.tile,
                 token.tiled_mma,
-            ),
-            cute.nvgpu.make_tiled_tma_atom_B(
+            )),
+            k=_wrap_tma(cute.nvgpu.make_tiled_tma_atom_B(
                 load_op,
                 k_view,
                 token_b,
                 token.spec.tile,
                 token.tiled_mma,
-            ),
-            cute.nvgpu.make_tiled_tma_atom_A(
+            )),
+            v=_wrap_tma(cute.nvgpu.make_tiled_tma_atom_A(
                 load_op,
                 v_view,
                 token_a,
                 token.spec.tile,
                 token.tiled_mma,
-            ),
-            cpasync.make_tiled_tma_atom(
+            )),
+            g=_wrap_tma(cpasync.make_tiled_tma_atom(
                 load_op,
                 g_view,
                 vector_tma_layout,
                 (_TMA_VECTOR_HEADS, _BT),
-            ),
-            cute.nvgpu.make_tiled_tma_atom_A(
+            )),
+            h=_wrap_tma(cute.nvgpu.make_tiled_tma_atom_A(
                 load_op,
                 h_view,
                 state_a,
                 state.spec.tile,
                 state.tiled_mma,
-            ),
-            cute.nvgpu.make_tiled_tma_atom_A(
+            )),
+            a=_wrap_tma(cute.nvgpu.make_tiled_tma_atom_A(
                 load_op,
                 a_view,
                 square_a,
                 square.spec.tile,
                 square.tiled_mma,
-            ),
-            cute.nvgpu.make_tiled_tma_atom_A(
+            )),
+            do=_wrap_tma(cute.nvgpu.make_tiled_tma_atom_A(
                 load_op,
                 do_view,
                 token_a,
                 token.spec.tile,
                 token.tiled_mma,
-            ),
-            cpasync.make_tiled_tma_atom(
+            )),
+            beta=_wrap_tma(cpasync.make_tiled_tma_atom(
                 load_op,
                 beta_view,
                 vector_tma_layout,
                 (_TMA_VECTOR_HEADS, _BT),
-            ),
-            cpasync.make_tiled_tma_atom(
+            )),
+            dq_store=_wrap_tma(cpasync.make_tiled_tma_atom(
                 store_op,
                 dq_view,
                 store_token,
                 (64, 128),
-            ),
+            )),
         )
-        return tuple(_wrap_tma(value) for value in tma_atoms)
 
     @cute.jit
     def layout_probe(self, stream: cuda.CUstream):
@@ -1854,7 +1156,7 @@ class FusedGdrBwdKernel:
             )
 
         # Completion edges follow the semantic _MMA_* index contract below.
-        # MMA_OPERATION_SPECS describes layout compatibility, not issue order.
+        # Operation metadata describes layout compatibility, not issue order.
         mma_done_pipelines = (
             umma_async(storage.mma_p_done_mbar_ptr, cg_aq),
             umma_async(storage.mma_dvprime_state_done_mbar_ptr, cg_sk),
@@ -2037,14 +1339,6 @@ class FusedGdrBwdKernel:
                 stored_layout.inner, stored_layout.offset, transformed
             )
         return cute.make_tensor(tensor.iterator, transformed)
-
-    @cute.jit
-    def _make_tmem_accumulator(self, tmem_ptr, tiled_mma, shape, offset):
-        accumulator_shape = tiled_mma.partition_shape_C(shape)
-        fake = tiled_mma.make_fragment_C(
-            cute.append(accumulator_shape, 1)
-        )
-        return cute.make_tensor(tmem_ptr + offset, fake.layout)
 
     @cute.jit
     def _issue_matrix_tma(
@@ -2446,7 +1740,9 @@ class FusedGdrBwdKernel:
         head,
         load_tensor_pipelines,
         mma_done_pipelines,
-        mma_variants,
+        mma_state_direct,
+        mma_square_direct,
+        mma_token_direct,
         smem_reuse_pipelines,
         s_a,
         s_beta,
@@ -2460,7 +1756,14 @@ class FusedGdrBwdKernel:
         sequence_start,
         mma_input_ready_pipelines,
         tidx,
-        tma_inputs,
+        tma_a,
+        tma_beta,
+        tma_do,
+        tma_g,
+        tma_h,
+        tma_k,
+        tma_q,
+        tma_v,
     ):
         """Run every input TMA operation from warp 9."""
 
@@ -2480,7 +1783,7 @@ class FusedGdrBwdKernel:
             )
             self._iket_push_stage(block_idx, chunk_iteration, "TMA_ISSUE_LOAD_G")
             self._issue_vector_tma(
-                tma_inputs[3], s_g, load_g_producer, token_offset, head
+                tma_g, s_g, load_g_producer, token_offset, head
             )
             self._iket_pop_stage(block_idx, chunk_iteration)
 
@@ -2497,7 +1800,7 @@ class FusedGdrBwdKernel:
             )
             self._iket_push_stage(block_idx, chunk_iteration, "TMA_ISSUE_LOAD_H")
             self._issue_matrix_tma(
-                tma_inputs[4], s_h, mma_variants[5], load_h_producer,
+                tma_h, s_h, mma_state_direct, load_h_producer,
                 (_DK, _DV), cutlass.Int32(0),
                 (cutlass.Int32(0), h_checkpoint, head), False,
             )
@@ -2542,7 +1845,7 @@ class FusedGdrBwdKernel:
                 self._iket_pop_stage(block_idx, chunk_iteration)
             self._iket_push_stage(block_idx, chunk_iteration, "TMA_ISSUE_LOAD_Q")
             self._copy_matrix_tma(
-                tma_inputs[0], s_q, mma_variants[0], qk_tma_handle,
+                tma_q, s_q, mma_token_direct, qk_tma_handle,
                 (_BT, _DK), token_offset, token_group_coord, False,
             )
             self._iket_pop_stage(block_idx, chunk_iteration)
@@ -2555,7 +1858,7 @@ class FusedGdrBwdKernel:
                 self._iket_pop_stage(block_idx, chunk_iteration)
             self._iket_push_stage(block_idx, chunk_iteration, "TMA_ISSUE_LOAD_K")
             self._copy_matrix_tma(
-                tma_inputs[1], s_k, mma_variants[0], qk_tma_handle,
+                tma_k, s_k, mma_token_direct, qk_tma_handle,
                 (_BT, _DK), token_offset, token_group_coord, True,
             )
             self._iket_pop_stage(block_idx, chunk_iteration)
@@ -2588,25 +1891,25 @@ class FusedGdrBwdKernel:
             )
             self._iket_push_stage(block_idx, chunk_iteration, "TMA_ISSUE_LOAD_A_BETA_DO_V")
             self._issue_matrix_tma(
-                tma_inputs[5], s_a, mma_variants[7], load_a_producer,
+                tma_a, s_a, mma_square_direct, load_a_producer,
                 (_BT, _BT), token_offset, token_group_coord, False,
             )
             load_beta_producer = self._producer_at(
                 load_tensor_pipelines[_LOAD_BETA], chunk_iteration
             )
             self._issue_vector_tma(
-                tma_inputs[7], s_beta, load_beta_producer,
+                tma_beta, s_beta, load_beta_producer,
                 token_offset, head,
             )
             load_do_producer = self._producer_at(
                 load_tensor_pipelines[_LOAD_DO], chunk_iteration
             )
             self._issue_matrix_tma(
-                tma_inputs[6], s_do, mma_variants[0], load_do_producer,
+                tma_do, s_do, mma_token_direct, load_do_producer,
                 (_BT, _DV), token_offset, token_group_coord, False,
             )
             self._copy_matrix_tma(
-                tma_inputs[2], s_v, mma_variants[0], v_tma_handle,
+                tma_v, s_v, mma_token_direct, v_tma_handle,
                 (_BT, _DV), token_offset, token_group_coord, False,
             )
             self._iket_pop_stage(block_idx, chunk_iteration)
@@ -4956,7 +4259,25 @@ class FusedGdrBwdKernel:
         dv_acc,
         load_tensor_pipelines,
         mma_done_pipelines,
-        mma_variants,
+        mma_p,
+        mma_dvprime_state,
+        mma_dvprime_pg,
+        mma_u_state,
+        mma_dv,
+        mma_vprime,
+        mma_dag,
+        mma_dpg,
+        mma_dk_state,
+        mma_dq_state,
+        mma_dk_state_g,
+        mma_dq_dp,
+        mma_dh_k,
+        mma_dk_dp,
+        mma_da_left,
+        mma_at,
+        mma_da_right,
+        mma_dh_q,
+        mma_dk_da,
         primary_tmem_ptr,
         da_tmem_ptr,
         s_a_p6,
@@ -5062,7 +4383,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             p_handle = p_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[0]
+            tiled_mma = mma_p
             q_operand = tiled_mma.make_fragment_A(s_q_p0)
             k_operand = tiled_mma.make_fragment_B(s_k_p0)
             num_kphases = cute.size(q_operand, mode=[2])
@@ -5093,7 +4414,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             dvprime_handle = dvprime_state_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[8]
+            tiled_mma = mma_dvprime_state
             k_operand = tiled_mma.make_fragment_A(s_k_p8)
             dh_operand = tiled_mma.make_fragment_B(s_tmp41_p8)
             num_kphases = cute.size(k_operand, mode=[2])
@@ -5123,7 +4444,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             u_handle = u_state_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[8]
+            tiled_mma = mma_u_state
             k_operand = tiled_mma.make_fragment_A(s_k_p8)
             h_operand = tiled_mma.make_fragment_B(s_h_p8)
             num_kphases = cute.size(k_operand, mode=[2])
@@ -5156,7 +4477,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             dvprime_pg_handle = dvprime_pgamma_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[1]
+            tiled_mma = mma_dvprime_pg
             pg_operand = tiled_mma.make_fragment_A(s_tmp11_p1)
             do_operand = tiled_mma.make_fragment_B(s_do_p1)
             num_kphases = cute.size(pg_operand, mode=[2])
@@ -5185,7 +4506,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             dv_handle = dv_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[1]
+            tiled_mma = mma_dv
             ag_operand = tiled_mma.make_fragment_A(s_tmp12_p1)
             dvprime_operand = tiled_mma.make_fragment_B(
                 s_tmp21_p1
@@ -5217,7 +4538,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             vprime_handle = vprime_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[2]
+            tiled_mma = mma_vprime
             ag_operand = tiled_mma.make_fragment_A(s_tmp12_p2)
             w_operand = tiled_mma.make_fragment_B(s_tmp22_p2)
             num_kphases = cute.size(ag_operand, mode=[2])
@@ -5241,7 +4562,7 @@ class FusedGdrBwdKernel:
             vprime_handle.commit()
 
             dag_handle = dag_mma_producer.acquire()
-            tiled_mma = mma_variants[0]
+            tiled_mma = mma_dag
             dvprime_operand = tiled_mma.make_fragment_A(s_tmp21_p0a)
             w_operand = tiled_mma.make_fragment_B(s_tmp22_p0b)
             num_kphases = cute.size(dvprime_operand, mode=[2])
@@ -5271,7 +4592,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             dpg_handle = dpg_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[0]
+            tiled_mma = mma_dpg
             do_operand = tiled_mma.make_fragment_A(s_do_p0)
             vprime_operand = tiled_mma.make_fragment_B(s_tmp21_p0b)
             num_kphases = cute.size(do_operand, mode=[2])
@@ -5301,7 +4622,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             dh_k_left_handle = dh_k_left_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[3]
+            tiled_mma = mma_dh_k
             k_operand = tiled_mma.make_fragment_A(s_k_transposed)
             dvg_left_operand = tiled_mma.make_fragment_B(
                 s_tmp23_left_square_transposed
@@ -5359,7 +4680,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             dq_state_handle = dq_state_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[9]
+            tiled_mma = mma_dq_state
             do_operand = tiled_mma.make_fragment_A(s_do_p9)
             h_operand = tiled_mma.make_fragment_B(s_h_p9)
             num_kphases = cute.size(do_operand, mode=[2])
@@ -5389,7 +4710,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             dk_state_handle = dk_state_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[9]
+            tiled_mma = mma_dk_state
             vprime_operand = tiled_mma.make_fragment_A(s_tmp21_p9)
             dh_operand = tiled_mma.make_fragment_B(s_tmp41_p9)
             num_kphases = cute.size(vprime_operand, mode=[2])
@@ -5419,7 +4740,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             dq_dp_handle = dq_dp_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[2]
+            tiled_mma = mma_dq_dp
             dp_operand = tiled_mma.make_fragment_A(s_tmp11_p2)
             k_operand = tiled_mma.make_fragment_B(s_k_p2)
             num_kphases = cute.size(dp_operand, mode=[2])
@@ -5447,7 +4768,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             dh_q_left_handle = dh_q_left_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[3]
+            tiled_mma = mma_dh_q
             q_operand = tiled_mma.make_fragment_A(s_q_transposed)
             dog_left_operand = tiled_mma.make_fragment_B(
                 s_tmp21_left_square_transposed
@@ -5506,7 +4827,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             dk_state_g_handle = dk_state_g_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[9]
+            tiled_mma = mma_dk_state_g
             dvg_operand = tiled_mma.make_fragment_A(s_tmp23_p9)
             h_operand = tiled_mma.make_fragment_B(s_h_p9)
             num_kphases = cute.size(dvg_operand, mode=[2])
@@ -5538,7 +4859,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             dk_dp_handle = dk_dp_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[1]
+            tiled_mma = mma_dk_dp
             dp_operand = tiled_mma.make_fragment_A(s_tmp11_p1)
             q_operand = tiled_mma.make_fragment_B(s_q_p1)
             num_kphases = cute.size(dp_operand, mode=[2])
@@ -5566,7 +4887,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             da_left_handle = da_left_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[6]
+            tiled_mma = mma_da_left
             a_operand = tiled_mma.make_fragment_A(s_a_p6)
             dar_operand = tiled_mma.make_fragment_B(s_tmp12_p6)
             num_kphases = cute.size(a_operand, mode=[2])
@@ -5590,7 +4911,7 @@ class FusedGdrBwdKernel:
             da_left_handle.commit()
 
             at_handle = at_mma_producer.acquire()
-            tiled_mma = mma_variants[7]
+            tiled_mma = mma_at
             k_left_a = tiled_mma.make_fragment_A(s_k_left_p7_a)
             k_left_b = tiled_mma.make_fragment_B(s_k_left_p7_b)
             num_kphases = cute.size(k_left_a, mode=[2])
@@ -5637,7 +4958,7 @@ class FusedGdrBwdKernel:
             self._iket_pop_stage(block_idx, chunk_iteration)
             da_right_handle = da_right_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[7]
+            tiled_mma = mma_da_right
             da_operand = tiled_mma.make_fragment_A(s_tmp12_p7)
             a_operand = tiled_mma.make_fragment_B(s_a_p7)
             num_kphases = cute.size(da_operand, mode=[2])
@@ -5666,7 +4987,7 @@ class FusedGdrBwdKernel:
             dk_da_inputs_ready_handle = dk_da_inputs_mma_consumer.wait()
             self._iket_pop_stage(block_idx, chunk_iteration)
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
-            tiled_mma = mma_variants[2]
+            tiled_mma = mma_dk_da
             das_operand = tiled_mma.make_fragment_A(s_tmp12_p2)
             k_operand = tiled_mma.make_fragment_B(s_k_p2)
             num_kphases = cute.size(das_operand, mode=[2])
@@ -5722,247 +5043,163 @@ class FusedGdrBwdKernel:
         tma_beta,
         tma_dq_store,
         scale,
-        mma_variants,
+        mma_tma_state,
+        mma_p,
+        mma_dvprime_state,
+        mma_dvprime_pg,
+        mma_u_state,
+        mma_dv,
+        mma_vprime,
+        mma_dag,
+        mma_dpg,
+        mma_dk_state,
+        mma_dq_state,
+        mma_dk_state_g,
+        mma_dq_dp,
+        mma_dh_k,
+        mma_dk_dp,
+        mma_da_left,
+        mma_at,
+        mma_da_right,
+        mma_dh_q,
+        mma_dk_da,
         token_layout,
         token_transposed_layout,
         square_layout,
         square_transposed_layout,
         state_layout,
-        packed_layouts,
+        packed_dvprime_pg_a,
+        packed_dvprime_pg_b,
+        packed_vprime_a,
+        packed_vprime_b,
+        packed_dvprime_state_a,
+        packed_dvprime_state_b,
+        packed_dq_state_a,
+        packed_dq_state_b,
+        packed_p_a,
+        packed_p_b,
+        packed_da_left_a,
+        packed_da_left_b,
+        packed_at_a,
+        packed_at_b,
     ):
         """Initialize the complete reverse packed-chunk execution topology."""
 
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        tma_inputs = (
-            tma_q,
-            tma_k,
-            tma_v,
-            tma_g,
-            tma_h,
-            tma_a,
-            tma_do,
-            tma_beta,
-        )
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        s_q = storage.sQ.get_tensor(
-            token_layout.outer, swizzle=token_layout.inner
+        shared_views = make_shared_views(
+            storage,
+            token_layout=token_layout,
+            token_transposed_layout=token_transposed_layout,
+            square_layout=square_layout,
+            square_transposed_layout=square_transposed_layout,
+            state_layout=state_layout,
+            packed_dvprime_pg_a=packed_dvprime_pg_a,
+            packed_dvprime_pg_b=packed_dvprime_pg_b,
+            packed_vprime_a=packed_vprime_a,
+            packed_vprime_b=packed_vprime_b,
+            packed_dvprime_state_a=packed_dvprime_state_a,
+            packed_dvprime_state_b=packed_dvprime_state_b,
+            packed_dq_state_a=packed_dq_state_a,
+            packed_dq_state_b=packed_dq_state_b,
+            packed_p_a=packed_p_a,
+            packed_p_b=packed_p_b,
+            packed_da_left_a=packed_da_left_a,
+            packed_da_left_b=packed_da_left_b,
+            packed_at_a=packed_at_a,
+            packed_at_b=packed_at_b,
+            io_dtype=self.io_dtype,
         )
-        s_q_transposed = storage.sQ.get_tensor(
-            token_transposed_layout.outer,
-            swizzle=token_transposed_layout.inner,
+        canonical_views = shared_views.canonical
+        s_q = canonical_views.q
+        s_q_transposed = canonical_views.q_transposed
+        s_k = canonical_views.k
+        s_k_transposed = canonical_views.k_transposed
+        s_v = canonical_views.v
+        s_do = canonical_views.do
+        s_do_padded = canonical_views.do_padded
+        s_a = canonical_views.a
+        s_h = canonical_views.h
+        s_tmp11_base_ptr = canonical_views.tmp11_base_ptr
+        s_tmp12 = canonical_views.tmp12
+        s_dqkv = canonical_views.dqkv
+        s_tmp21 = canonical_views.tmp21
+        s_tmp21_left_square_transposed = (
+            canonical_views.tmp21_left_square_transposed
         )
-        s_k = storage.sK.get_tensor(
-            token_layout.outer, swizzle=token_layout.inner
+        s_tmp21_right_square_transposed = (
+            canonical_views.tmp21_right_square_transposed
         )
-        s_k_transposed = storage.sK.get_tensor(
-            token_transposed_layout.outer,
-            swizzle=token_transposed_layout.inner,
+        s_tmp22 = canonical_views.tmp22
+        s_tmp22_padded = canonical_views.tmp22_padded
+        s_tmp23 = canonical_views.tmp23
+        s_tmp23_left_square_transposed = (
+            canonical_views.tmp23_left_square_transposed
         )
-        s_v = storage.sV.get_tensor(
-            token_layout.outer, swizzle=token_layout.inner
+        s_tmp23_right_square_transposed = (
+            canonical_views.tmp23_right_square_transposed
         )
-        s_do = storage.sDo.get_tensor(
-            token_layout.outer, swizzle=token_layout.inner
-        )
-        s_do_padded = cute.make_tensor(
-            storage.sDo.data_ptr(),
-            cute.make_layout((_BT, _BT), stride=(_BT + 2, 1)),
-        )
-        s_a = storage.sA.get_tensor(
-            square_layout.outer, swizzle=square_layout.inner
-        )
-        s_h = storage.sH.get_tensor(
-            state_layout.outer, swizzle=state_layout.inner
-        )
-        s_tmp11_base_ptr = storage.sTmp11.data_ptr()
-        s_tmp12 = storage.sTmp12.get_tensor(
-            square_layout.outer, swizzle=square_layout.inner
-        )
-        s_dqkv = storage.sDqkv.get_tensor(
-            token_layout.outer, swizzle=token_layout.inner
-        )
-        s_tmp21 = storage.sTmp21.get_tensor(
-            token_layout.outer, swizzle=token_layout.inner
-        )
-        s_tmp21_left_square_transposed = storage.sTmp21.get_tensor(
-            square_transposed_layout.outer,
-            swizzle=square_transposed_layout.inner,
-        )
-        s_tmp21_right_square_transposed = cute.make_tensor(
-            cute.recast_ptr(
-                storage.sTmp21.data_ptr() + _BT * (_DV // 2),
-                square_transposed_layout.inner,
-                dtype=self.io_dtype,
-            ),
-            square_transposed_layout.outer,
-        )
-        s_tmp22 = storage.sTmp22.get_tensor(
-            token_layout.outer, swizzle=token_layout.inner
-        )
-        s_tmp22_padded = cute.make_tensor(
-            storage.sTmp22.data_ptr(),
-            cute.make_layout((_BT, _BT), stride=(_BT + 2, 1)),
-        )
-        s_tmp23 = storage.sTmp23.get_tensor(
-            token_layout.outer, swizzle=token_layout.inner
-        )
-        s_tmp23_left_square_transposed = storage.sTmp23.get_tensor(
-            square_transposed_layout.outer,
-            swizzle=square_transposed_layout.inner,
-        )
-        s_tmp23_right_square_transposed = cute.make_tensor(
-            cute.recast_ptr(
-                storage.sTmp23.data_ptr() + _BT * (_DV // 2),
-                square_transposed_layout.inner,
-                dtype=self.io_dtype,
-            ),
-            square_transposed_layout.outer,
-        )
-        s_tmp41 = storage.sTmp41.get_tensor(
-            state_layout.outer, swizzle=state_layout.inner
-        )
-        s_tmp41_padded = cute.make_tensor(
-            storage.sTmp41.data_ptr(),
-            cute.make_layout((_BT, _BT), stride=(_BT + 2, 1)),
-        )
-        packed_v1_a, packed_v1_b = packed_layouts[0]
-        packed_v2_a, packed_v2_b = packed_layouts[1]
-        packed_v8_a, packed_v8_b = packed_layouts[2]
-        packed_v9_a, packed_v9_b = packed_layouts[3]
-        packed_v0_a, packed_v0_b = packed_layouts[4]
-        packed_v6_a, packed_v6_b = packed_layouts[5]
-        packed_v7_a, packed_v7_b = packed_layouts[6]
+        s_tmp41 = canonical_views.tmp41
+        s_tmp41_padded = canonical_views.tmp41_padded
 
-        # The permuted N=64 atoms address exactly the same bytes as the
-        # canonical TMA views, but expose the two logical N tiles explicitly.
-        s_tmp11_p1 = storage.sTmp11.get_tensor(
-            packed_v1_a.outer, swizzle=packed_v1_a.inner
-        )
-        s_tmp12_p1 = storage.sTmp12.get_tensor(
-            packed_v1_a.outer, swizzle=packed_v1_a.inner
-        )
-        s_do_p1 = storage.sDo.get_tensor(
-            packed_v1_b.outer, swizzle=packed_v1_b.inner
-        )
-        s_tmp21_p1 = storage.sTmp21.get_tensor(
-            packed_v1_b.outer, swizzle=packed_v1_b.inner
-        )
-        s_q_p1 = storage.sQ.get_tensor(
-            packed_v1_b.outer, swizzle=packed_v1_b.inner
-        )
-        s_tmp11_p2 = storage.sTmp11.get_tensor(
-            packed_v2_a.outer, swizzle=packed_v2_a.inner
-        )
-        s_tmp12_p2 = storage.sTmp12.get_tensor(
-            packed_v2_a.outer, swizzle=packed_v2_a.inner
-        )
-        s_tmp22_p2 = storage.sTmp22.get_tensor(
-            packed_v2_b.outer, swizzle=packed_v2_b.inner
-        )
-        s_k_p2 = storage.sK.get_tensor(
-            packed_v2_b.outer, swizzle=packed_v2_b.inner
-        )
-        s_k_p8 = storage.sK.get_tensor(
-            packed_v8_a.outer, swizzle=packed_v8_a.inner
-        )
-        s_tmp41_p8 = storage.sTmp41.get_tensor(
-            packed_v8_b.outer, swizzle=packed_v8_b.inner
-        )
-        s_h_p8 = storage.sH.get_tensor(
-            packed_v8_b.outer, swizzle=packed_v8_b.inner
-        )
-        s_tmp21_p9 = storage.sTmp21.get_tensor(
-            packed_v9_a.outer, swizzle=packed_v9_a.inner
-        )
-        s_do_p9 = storage.sDo.get_tensor(
-            packed_v9_a.outer, swizzle=packed_v9_a.inner
-        )
-        s_tmp23_p9 = storage.sTmp23.get_tensor(
-            packed_v9_a.outer, swizzle=packed_v9_a.inner
-        )
-        s_tmp41_p9 = storage.sTmp41.get_tensor(
-            packed_v9_b.outer, swizzle=packed_v9_b.inner
-        )
-        s_h_p9 = storage.sH.get_tensor(
-            packed_v9_b.outer, swizzle=packed_v9_b.inner
-        )
-        s_q_p0 = storage.sQ.get_tensor(
-            packed_v0_a.outer, swizzle=packed_v0_a.inner
-        )
-        s_k_p0 = storage.sK.get_tensor(
-            packed_v0_b.outer, swizzle=packed_v0_b.inner
-        )
-        s_tmp21_p0a = storage.sTmp21.get_tensor(
-            packed_v0_a.outer, swizzle=packed_v0_a.inner
-        )
-        s_tmp22_p0b = storage.sTmp22.get_tensor(
-            packed_v0_b.outer, swizzle=packed_v0_b.inner
-        )
-        s_do_p0 = storage.sDo.get_tensor(
-            packed_v0_a.outer, swizzle=packed_v0_a.inner
-        )
-        s_tmp21_p0b = storage.sTmp21.get_tensor(
-            packed_v0_b.outer, swizzle=packed_v0_b.inner
-        )
-        s_a_p6 = storage.sA.get_tensor(
-            packed_v6_a.outer, swizzle=packed_v6_a.inner
-        )
-        s_tmp12_p6 = storage.sTmp12.get_tensor(
-            packed_v6_b.outer, swizzle=packed_v6_b.inner
-        )
-        s_tmp12_p7 = storage.sTmp12.get_tensor(
-            packed_v7_a.outer, swizzle=packed_v7_a.inner
-        )
-        s_a_p7 = storage.sA.get_tensor(
-            packed_v7_b.outer, swizzle=packed_v7_b.inner
-        )
-        s_k_left_p7_a = storage.sK.get_tensor(
-            packed_v7_a.outer, swizzle=packed_v7_a.inner
-        )
-        s_k_left_p7_b = storage.sK.get_tensor(
-            packed_v7_b.outer, swizzle=packed_v7_b.inner
-        )
-        s_k_right_p7_a = cute.make_tensor(
-            cute.recast_ptr(
-                storage.sK.data_ptr() + _BT * (_DK // 2),
-                packed_v7_a.inner,
-                dtype=self.io_dtype,
-            ),
-            packed_v7_a.outer,
-        )
-        s_k_right_p7_b = cute.make_tensor(
-            cute.recast_ptr(
-                storage.sK.data_ptr() + _BT * (_DK // 2),
-                packed_v7_b.inner,
-                dtype=self.io_dtype,
-            ),
-            packed_v7_b.outer,
-        )
-        vector_layout = cute.make_layout((_BT,), stride=(1,))
-        vector_tma_staged_layout = cute.make_layout(
-            (_TMA_VECTOR_HEADS, _BT, 1),
-            stride=(1, _TMA_VECTOR_HEADS, _TMA_VECTOR_HEADS * _BT),
-        )
-        s_g = storage.sGTma.get_tensor(vector_tma_staged_layout)
-        s_exp_g = storage.sExpG.get_tensor(vector_layout)
-        s_scaled_exp_g = storage.sScaledExpG.get_tensor(vector_layout)
-        s_rev_exp_g = storage.sReverseExpG.get_tensor(vector_layout)
-        s_beta = storage.sBetaTma.get_tensor(vector_tma_staged_layout)
-        s_dg = storage.sDg.get_tensor(vector_layout)
-        s_db = storage.sDb.get_tensor(vector_layout)
-        dv_offset_layout = cute.make_layout((128,), stride=(1,))
-        s_dv_offset = storage.sDvOffset.get_tensor(dv_offset_layout)
-        reduce_layout = cute.make_layout((_BT, 2), stride=(1, _BT))
-        s_reduce = storage.sReduce.get_tensor(reduce_layout)
-        s_reduce2 = storage.sReduce2.get_tensor(reduce_layout)
+        packed_views = shared_views.packed
+        s_tmp11_p1 = packed_views.tmp11_p1
+        s_tmp12_p1 = packed_views.tmp12_p1
+        s_do_p1 = packed_views.do_p1
+        s_tmp21_p1 = packed_views.tmp21_p1
+        s_q_p1 = packed_views.q_p1
+        s_tmp11_p2 = packed_views.tmp11_p2
+        s_tmp12_p2 = packed_views.tmp12_p2
+        s_tmp22_p2 = packed_views.tmp22_p2
+        s_k_p2 = packed_views.k_p2
+        s_k_p8 = packed_views.k_p8
+        s_tmp41_p8 = packed_views.tmp41_p8
+        s_h_p8 = packed_views.h_p8
+        s_tmp21_p9 = packed_views.tmp21_p9
+        s_do_p9 = packed_views.do_p9
+        s_tmp23_p9 = packed_views.tmp23_p9
+        s_tmp41_p9 = packed_views.tmp41_p9
+        s_h_p9 = packed_views.h_p9
+        s_q_p0 = packed_views.q_p0
+        s_k_p0 = packed_views.k_p0
+        s_tmp21_p0a = packed_views.tmp21_p0a
+        s_tmp22_p0b = packed_views.tmp22_p0b
+        s_do_p0 = packed_views.do_p0
+        s_tmp21_p0b = packed_views.tmp21_p0b
+        s_a_p6 = packed_views.a_p6
+        s_tmp12_p6 = packed_views.tmp12_p6
+        s_tmp12_p7 = packed_views.tmp12_p7
+        s_a_p7 = packed_views.a_p7
+        s_k_left_p7_a = packed_views.k_left_p7_a
+        s_k_left_p7_b = packed_views.k_left_p7_b
+        s_k_right_p7_a = packed_views.k_right_p7_a
+        s_k_right_p7_b = packed_views.k_right_p7_b
+
+        vector_views = shared_views.vectors
+        s_g = vector_views.g
+        s_exp_g = vector_views.exp_g
+        s_scaled_exp_g = vector_views.scaled_exp_g
+        s_rev_exp_g = vector_views.rev_exp_g
+        s_beta = vector_views.beta
+        s_dg = vector_views.dg
+        s_db = vector_views.db
+        s_dv_offset = vector_views.dv_offset
+        s_reduce = vector_views.reduce
+        s_reduce2 = vector_views.reduce2
 
         if warp_idx == self.mma_warp_id:
-            for descriptor_idx in (0, 1, 2, 3, 4, 5, 6, 7):
-                cpasync.prefetch_descriptor(tma_inputs[descriptor_idx][0])
+            cpasync.prefetch_descriptor(tma_q[0])
+            cpasync.prefetch_descriptor(tma_k[0])
+            cpasync.prefetch_descriptor(tma_v[0])
+            cpasync.prefetch_descriptor(tma_g[0])
+            cpasync.prefetch_descriptor(tma_h[0])
+            cpasync.prefetch_descriptor(tma_a[0])
+            cpasync.prefetch_descriptor(tma_do[0])
+            cpasync.prefetch_descriptor(tma_beta[0])
         (
             load_tensor_pipelines,
             mma_done_pipelines,
@@ -5994,58 +5231,32 @@ class FusedGdrBwdKernel:
         # primary [192, 256) at disjoint phases; Vprime and dO-gamma reuse the
         # independent [416, 480) block at disjoint phases.
         tmem_holding_ptr = storage.tmem_holding_buf.data_ptr()
-        tmem_ptrs = self._allocate_tmem(tmem_holding_ptr, warp_idx)
-        primary_tmem_ptr = tmem_ptrs[0]
-        secondary_tmem_ptr = tmem_ptrs[1]
-        mask_tmem_ptr = tmem_ptrs[2]
-        vprime_tmem_ptr = tmem_ptrs[3]
-        dog_tmem_ptr = vprime_tmem_ptr
-        dq_tmem_ptr = primary_tmem_ptr
-        da_tmem_ptr = primary_tmem_ptr + 128
-        square_tmem_ptr = primary_tmem_ptr + 160
-        u_acc = self._make_tmem_accumulator(
-            primary_tmem_ptr, mma_variants[1], (64, 128), 192
+        tmem_views = make_tmem_views(
+            self._allocate_tmem(tmem_holding_ptr, warp_idx),
+            mma_dvprime_pg,
+            mma_dh_k,
         )
-        vprime_acc = self._make_tmem_accumulator(
-            vprime_tmem_ptr, mma_variants[1], (64, 128), 0
-        )
-        dog_acc = self._make_tmem_accumulator(
-            dog_tmem_ptr, mma_variants[1], (64, 128), 0
-        )
-        dq_acc = self._make_tmem_accumulator(
-            dq_tmem_ptr, mma_variants[1], (64, 128), 192
-        )
-        dk_acc = self._make_tmem_accumulator(
-            primary_tmem_ptr, mma_variants[1], (64, 128), 0
-        )
-        dv_acc = self._make_tmem_accumulator(
-            primary_tmem_ptr, mma_variants[1], (64, 128), 64
-        )
-        dh_left_acc = self._make_tmem_accumulator(
-            secondary_tmem_ptr, mma_variants[3], (128, 64), 0
-        )
-        dh_right_acc = self._make_tmem_accumulator(
-            secondary_tmem_ptr, mma_variants[3], (128, 64), 64
-        )
-        square_copy_layout = cute.make_layout(
-            ((16, 4), (32, 2)),
-            stride=((65536, 32 * 65536), (1, 16 * 65536)),
-        )
-        p_copy_acc = cute.make_tensor(
-            primary_tmem_ptr + 0, square_copy_layout
-        )
-        dp_copy_acc = cute.make_tensor(
-            square_tmem_ptr, square_copy_layout
-        )
-        a_copy_acc = cute.make_tensor(
-            square_tmem_ptr, square_copy_layout
-        )
-        da_copy_acc = cute.make_tensor(
-            da_tmem_ptr, square_copy_layout
-        )
-        mask_acc = cute.make_tensor(
-            mask_tmem_ptr + 0, square_copy_layout
-        )
+        primary_tmem_ptr = tmem_views.primary_ptr
+        secondary_tmem_ptr = tmem_views.secondary_ptr
+        mask_tmem_ptr = tmem_views.mask_ptr
+        vprime_tmem_ptr = tmem_views.vprime_ptr
+        dog_tmem_ptr = tmem_views.dog_ptr
+        dq_tmem_ptr = tmem_views.dq_ptr
+        da_tmem_ptr = tmem_views.da_ptr
+        square_tmem_ptr = tmem_views.square_ptr
+        u_acc = tmem_views.u_acc
+        vprime_acc = tmem_views.vprime_acc
+        dog_acc = tmem_views.dog_acc
+        dq_acc = tmem_views.dq_acc
+        dk_acc = tmem_views.dk_acc
+        dv_acc = tmem_views.dv_acc
+        dh_left_acc = tmem_views.dh_left_acc
+        dh_right_acc = tmem_views.dh_right_acc
+        p_copy_acc = tmem_views.p_copy_acc
+        dp_copy_acc = tmem_views.dp_copy_acc
+        a_copy_acc = tmem_views.a_copy_acc
+        da_copy_acc = tmem_views.da_copy_acc
+        mask_acc = tmem_views.mask_acc
         block_idx, _, _ = cute.arch.block_idx()
         sequence = block_idx // self.heads
         head = block_idx % self.heads
@@ -6070,7 +5281,9 @@ class FusedGdrBwdKernel:
                 head,
                 load_tensor_pipelines,
                 mma_done_pipelines,
-                mma_variants,
+                mma_tma_state,
+                mma_at,
+                mma_p,
                 smem_reuse_pipelines,
                 s_a,
                 s_beta,
@@ -6084,7 +5297,14 @@ class FusedGdrBwdKernel:
                 sequence_start,
                 mma_input_ready_pipelines,
                 tidx,
-                tma_inputs,
+                tma_a,
+                tma_beta,
+                tma_do,
+                tma_g,
+                tma_h,
+                tma_k,
+                tma_q,
+                tma_v,
             )
             if cutlass.const_expr(self.enable_iket):
                 if block_idx == 0:
@@ -6233,7 +5453,25 @@ class FusedGdrBwdKernel:
                 dv_acc,
                 load_tensor_pipelines,
                 mma_done_pipelines,
-                mma_variants,
+                mma_p,
+                mma_dvprime_state,
+                mma_dvprime_pg,
+                mma_u_state,
+                mma_dv,
+                mma_vprime,
+                mma_dag,
+                mma_dpg,
+                mma_dk_state,
+                mma_dq_state,
+                mma_dk_state_g,
+                mma_dq_dp,
+                mma_dh_k,
+                mma_dk_dp,
+                mma_da_left,
+                mma_at,
+                mma_da_right,
+                mma_dh_q,
+                mma_dk_da,
                 primary_tmem_ptr,
                 da_tmem_ptr,
                 s_a_p6,
@@ -6332,9 +5570,9 @@ class FusedGdrBwdKernel:
         dht_matrix = self._state_matrix_view(dht)
         dh0_matrix = self._state_matrix_view(dh0)
         dk_matrix = self._token_matrix_view(dk)
-        family = self._build_mma_layouts()
-        tma_atoms = self._build_tma_atoms(
-            family,
+        plan = self._build_mma_layouts()
+        tma = self._build_tma_atoms(
+            plan,
             q,
             k,
             v,
@@ -6345,18 +5583,6 @@ class FusedGdrBwdKernel:
             dht,
             h,
             dq,
-        )
-        tma_inputs = tma_atoms[:8]
-        mma_variants = tuple(
-            family.variants[spec.name].tiled_mma
-            for spec in MMA_VARIANT_SPECS
-        )
-        packed_layouts = tuple(
-            (
-                family.variants[MMA_VARIANT_SPECS[idx].name].smem_a,
-                family.variants[MMA_VARIANT_SPECS[idx].name].smem_b,
-            )
-            for idx in (1, 2, 8, 9, 0, 6, 7)
         )
         self._fused_bwd_kernel(
             q,
@@ -6379,23 +5605,55 @@ class FusedGdrBwdKernel:
             dg,
             db,
             dh0,
-            tma_inputs[0],
-            tma_inputs[1],
-            tma_inputs[2],
-            tma_inputs[3],
-            tma_inputs[4],
-            tma_inputs[5],
-            tma_inputs[6],
-            tma_inputs[7],
-            tma_atoms[8],
+            tma.q,
+            tma.k,
+            tma.v,
+            tma.g,
+            tma.h,
+            tma.a,
+            tma.do,
+            tma.beta,
+            tma.dq_store,
             scale,
-            mma_variants,
-            family.staged_views["token_direct"],
-            family.staged_views["token_transposed"],
-            family.staged_views["square_direct"],
-            family.staged_views["square_transposed"],
-            family.staged_views["state_direct"],
-            packed_layouts,
+            plan.variants.mm_128_64_128_k_k.tiled_mma,
+            plan.operations.p.tiled_mma,
+            plan.operations.dvprime_state.tiled_mma,
+            plan.operations.dvprime_pg.tiled_mma,
+            plan.operations.u_state.tiled_mma,
+            plan.operations.dv.tiled_mma,
+            plan.operations.vprime.tiled_mma,
+            plan.operations.dag.tiled_mma,
+            plan.operations.dpg.tiled_mma,
+            plan.operations.dk_state.tiled_mma,
+            plan.operations.dq_state.tiled_mma,
+            plan.operations.dk_state_g.tiled_mma,
+            plan.operations.dq_dp.tiled_mma,
+            plan.operations.dh_k.tiled_mma,
+            plan.operations.dk_dp.tiled_mma,
+            plan.operations.da_left.tiled_mma,
+            plan.operations.at.tiled_mma,
+            plan.operations.da_right.tiled_mma,
+            plan.operations.dh_q.tiled_mma,
+            plan.operations.dk_da.tiled_mma,
+            plan.canonical_staged.token_direct,
+            plan.canonical_staged.token_transposed,
+            plan.canonical_staged.square_direct,
+            plan.canonical_staged.square_transposed,
+            plan.canonical_staged.state_direct,
+            plan.operations.dvprime_pg.operands.a_staged,
+            plan.operations.dvprime_pg.operands.b_staged,
+            plan.operations.vprime.operands.a_staged,
+            plan.operations.vprime.operands.b_staged,
+            plan.operations.dvprime_state.operands.a_staged,
+            plan.operations.dvprime_state.operands.b_staged,
+            plan.operations.dq_state.operands.a_staged,
+            plan.operations.dq_state.operands.b_staged,
+            plan.operations.p.operands.a_staged,
+            plan.operations.p.operands.b_staged,
+            plan.operations.da_left.operands.a_staged,
+            plan.operations.da_left.operands.b_staged,
+            plan.operations.at.operands.a_staged,
+            plan.operations.at.operands.b_staged,
         ).launch(
             grid=(self.num_sequences * self.heads, 1, 1),
             block=(self.threads_per_cta, 1, 1),
