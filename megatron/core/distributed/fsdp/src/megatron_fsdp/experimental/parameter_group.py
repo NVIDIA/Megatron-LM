@@ -128,7 +128,7 @@ class FsdpParameterGroup:
         self._model_weight_placements = model_weight_placements
         # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
         # is finalized to main_weight's placements after the last microbatch.
-        self._accumulation_placements = main_grad_placements
+        self._main_grad_placements = main_grad_placements
 
         # Python dicts preserve insertion order, so parameter_to_fqns and
         # fsdp_parameters define the same stable DBuffer tensor order.
@@ -167,7 +167,8 @@ class FsdpParameterGroup:
         if main_weight_dtype == self.dtype:
             self.model_weight = self.main_weight
         else:
-            # Allocate model_weight on the all-gather stream to record its allocation stream.
+            # Record the all-gather stream as model_weight's allocation stream to allow
+            # its uses to be joined back to it before the buffer is deleted.
             with torch.cuda.stream(allgather_stream):
                 self.model_weight = DBuffer(
                     mesh=self.mesh,
@@ -385,15 +386,15 @@ class FsdpParameterGroup:
         # on DP-outer), so relabel it in place; HFSDP's finalize reduce-scattered
         # DP-outer to a smaller optimizer-sharded buffer, so allocate a fresh one
         # (zeroed only when we accumulate into it, i.e. sharded grads are still set).
-        if self.main_grad.placements != self._accumulation_placements:
+        if self.main_grad.placements != self._main_grad_placements:
             assert self.main_grad.allocation_stream == (
                 torch.cuda.current_stream(self.main_grad.device)
             )
-            reset_axis = changed_mesh_axis(self.main_grad.placements, self._accumulation_placements)
+            reset_axis = changed_mesh_axis(self.main_grad.placements, self._main_grad_placements)
             assert reset_axis is not None  # the placements differ, so an axis changed
             if isinstance(self.main_grad.placements[reset_axis], Replicate):
                 # HSDP: Replicate -> Partial changes only metadata and reuses the tensor.
-                self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
+                self.main_grad = self.main_grad.redistribute(self._main_grad_placements)
             else:
                 # HFSDP: main_grad was reduce-scattered to the optimizer shard, too small
                 # to hold the accumulation, so re-allocate. This runs inside the
@@ -403,7 +404,7 @@ class FsdpParameterGroup:
                 # reduction below overwrites it via out=.
                 self.main_grad = DBuffer(
                     mesh=self.mesh,
-                    placements=self._accumulation_placements,
+                    placements=self._main_grad_placements,
                     tensor_shapes=self.main_weight.layout.tensor_shapes,
                     dtype=self.main_grad.dtype,
                     device=self.main_weight.device,
