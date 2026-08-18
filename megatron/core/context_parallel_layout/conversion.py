@@ -2,8 +2,10 @@
 
 """Tensor operations for converting between CP partition modes."""
 
+import warnings
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, Union, cast
 
 import torch
 
@@ -16,6 +18,7 @@ from megatron.core.context_parallel_layout.routes import (
     get_thd_cp_partition_route,
 )
 from megatron.core.context_parallel_layout.types import CpPartitionMode, ThdCpRoute
+from megatron.core.tensor_parallel.mappings import all_to_all
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -27,12 +30,13 @@ class CpPartitionModeConverter:
     def __init__(
         self,
         *,
-        cp_group: Optional[torch.distributed.ProcessGroup],
         packed_seq_params: Optional["PackedSeqParams"],
         source_partition_mode: CpPartitionMode,
         target_partition_mode: CpPartitionMode,
         config: Any,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
         self.cp_group = cp_group
         self.packed_seq_params = packed_seq_params
@@ -40,6 +44,7 @@ class CpPartitionModeConverter:
         self.target_partition_mode = target_partition_mode
         self.config = config
         self.tp_group = tp_group
+        self.tp_cp_group = tp_cp_group
         if (
             self.conversion_needed
             and getattr(self.packed_seq_params, "qkv_format", None) == "thd"
@@ -103,14 +108,15 @@ class CpPartitionModeConverter:
 
         resolved_seq_dim = seq_dim(value) if callable(seq_dim) else seq_dim
         converted = convert_cp_partition_mode(
-            value,
-            self.cp_group,
+            x=value,
             source_partition_mode=self.source_partition_mode,
             target_partition_mode=self.target_partition_mode,
             seq_dim=resolved_seq_dim,
             cu_seqlens=get_packed_seq_params_cp_partition_cu_seqlens(self.packed_seq_params),
             sequence_parallel=sequence_parallel,
+            cp_group=self.cp_group,
             tp_group=self.tp_group,
+            tp_cp_group=self.tp_cp_group,
             thd_cp_partition_route=get_thd_cp_partition_route(
                 self.packed_seq_params, self.source_partition_mode, self.target_partition_mode
             ),
@@ -137,11 +143,12 @@ def convert_module_input_tensors_cp_partition_mode(
     *,
     hidden_states: torch.Tensor,
     packed_seq_params: Optional["PackedSeqParams"],
-    cp_group: Optional[torch.distributed.ProcessGroup],
-    tp_group: Optional[torch.distributed.ProcessGroup],
     target_partition_mode: CpPartitionMode,
     sequence_parallel: bool,
     config: Any,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     attention_mask: Optional[torch.Tensor] = None,
     attention_bias: Optional[torch.Tensor] = None,
     key_value_states: Optional[torch.Tensor] = None,
@@ -172,6 +179,7 @@ def convert_module_input_tensors_cp_partition_mode(
         target_partition_mode=target_partition_mode,
         config=config,
         tp_group=tp_group,
+        tp_cp_group=tp_cp_group,
     )
     input_to_target_converter.assert_no_dense_attention_inputs(
         attention_mask=attention_mask, attention_bias=attention_bias, hidden_states=hidden_states
@@ -182,7 +190,7 @@ def convert_module_input_tensors_cp_partition_mode(
             f"yet: source={source_partition_mode!r}, target={target_partition_mode!r}."
         )
     hidden_states = input_to_target_converter.convert(
-        hidden_states, seq_dim=0, sequence_parallel=sequence_parallel
+        value=hidden_states, seq_dim=0, sequence_parallel=sequence_parallel
     )
 
     target_to_input_converter = CpPartitionModeConverter(
@@ -192,77 +200,31 @@ def convert_module_input_tensors_cp_partition_mode(
         target_partition_mode=source_partition_mode,
         config=config,
         tp_group=tp_group,
+        tp_cp_group=tp_cp_group,
     )
     return (hidden_states, target_to_input_converter)
 
 
-def zigzag_to_contiguous_chunks(
-    x: torch.Tensor,
-    cp_group: torch.distributed.ProcessGroup,
-    seq_dim: int = 0,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    thd_cp_partition_route: Optional[ThdCpRoute] = None,
-) -> torch.Tensor:
-    """Permute CP chunks from Megatron zigzag layout to contiguous-time layout.
-
-    SBHD tensors have two equal chunks per rank along ``seq_dim`` and use a
-    chunk-level all-to-all. THD tensors pass global ``cu_seqlens`` and use one
-    packed-token all-to-all over the whole local THD tensor.
-    """
-    if cu_seqlens is not None:
-        return _zigzag_contiguous_thd_swap(
-            x,
-            cp_group,
-            seq_dim,
-            cu_seqlens,
-            source_partition_mode="zigzag",
-            target_partition_mode="contiguous",
-            thd_cp_partition_route=thd_cp_partition_route,
-        )
-    return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=True)
-
-
-def contiguous_to_zigzag_chunks(
-    x: torch.Tensor,
-    cp_group: torch.distributed.ProcessGroup,
-    seq_dim: int = 0,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    thd_cp_partition_route: Optional[ThdCpRoute] = None,
-) -> torch.Tensor:
-    """Inverse of :func:`zigzag_to_contiguous_chunks`."""
-    if cu_seqlens is not None:
-        return _zigzag_contiguous_thd_swap(
-            x,
-            cp_group,
-            seq_dim,
-            cu_seqlens,
-            source_partition_mode="contiguous",
-            target_partition_mode="zigzag",
-            thd_cp_partition_route=thd_cp_partition_route,
-        )
-    return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=False)
-
-
 def convert_cp_partition_mode(
     x: torch.Tensor,
-    cp_group: Optional[torch.distributed.ProcessGroup],
     *,
     source_partition_mode: Optional[str],
     target_partition_mode: Optional[str],
     seq_dim: int = 0,
     cu_seqlens: Optional[torch.Tensor] = None,
     sequence_parallel: bool = False,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     thd_cp_partition_route: Optional[ThdCpRoute] = None,
 ) -> torch.Tensor:
     """Convert a sequence tensor between CP zigzag and contiguous layouts.
 
-    With sequence parallel enabled, the baseline path gathers the full CP-local
-    sequence on each TP rank, performs the CP layout conversion, then scatters
-    back to the original SP sharding.
+    SBHD tensors use one unified all-to-all-v redistribution path over CP or
+    TPxCP. THD tensors use their packed-token CP route and, when sequence
+    parallelism shards the packed sequence, retain the naive TP gather/scatter
+    fallback.
     """
-    # TODO(yuzhongw): implement a direct TPxCP layout conversion path if the
-    # gather-convert-scatter fallback becomes a bottleneck.
 
     if source_partition_mode == target_partition_mode:
         return x
@@ -270,6 +232,7 @@ def convert_cp_partition_mode(
     cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size == 1:
         return x
+    assert cp_group is not None
 
     if source_partition_mode not in ("zigzag", "contiguous") or target_partition_mode not in (
         "zigzag",
@@ -281,6 +244,21 @@ def convert_cp_partition_mode(
             f"{source_partition_mode!r} -> {target_partition_mode!r}; "
             f"shape={tuple(x.shape)}, seq_dim={seq_dim}, cp_size={cp_size}, cp_rank={cp_rank}."
         )
+    source_layout = cast(CpPartitionMode, source_partition_mode)
+    target_layout = cast(CpPartitionMode, target_partition_mode)
+
+    if cu_seqlens is None:
+        moved = x.movedim(seq_dim, 0) if seq_dim != 0 else x
+        converted = _redistribute_sbhd_layout(
+            input_=moved,
+            cp_group=cp_group,
+            source_layout=source_layout,
+            target_layout=target_layout,
+            sequence_parallel=sequence_parallel,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
+        )
+        return converted.movedim(0, seq_dim).contiguous() if seq_dim != 0 else converted
 
     if sequence_parallel and tp_group is not None and tp_group.size() > 1:
         from megatron.core.tensor_parallel.mappings import (
@@ -288,67 +266,41 @@ def convert_cp_partition_mode(
             scatter_to_sequence_parallel_region,
         )
 
+        # TODO(yuzhongw): replace the naive THD TP gather -> CP all-to-all -> TP scatter
+        # fallback with a direct packed THD TPxCP redistribution path.
+        warnings.warn(
+            "THD CP layout conversion with sequence parallelism uses the naive "
+            "TP gather -> CP all-to-all -> TP scatter fallback.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         moved = x.movedim(seq_dim, 0) if seq_dim != 0 else x
         # This gather is only used to run a duplicated CP layout permutation before
         # scattering back to SP shards. Its backward must split, not reduce-scatter;
         # otherwise every TP rank contributes the same full-sequence gradient.
         gathered = gather_from_sequence_parallel_region(
-            moved, tensor_parallel_output_grad=False, group=tp_group
+            input_=moved, tensor_parallel_output_grad=False, group=tp_group
         )
-        converted = _convert_cp_partition_mode_full_sequence(
-            gathered,
-            cp_group,
-            source_partition_mode=source_partition_mode,
-            target_partition_mode=target_partition_mode,
+        converted = _redistribute_thd_layout(
+            x=gathered,
+            cp_group=cp_group,
             seq_dim=0,
             cu_seqlens=cu_seqlens,
+            source_partition_mode=source_layout,
+            target_partition_mode=target_layout,
             thd_cp_partition_route=thd_cp_partition_route,
         )
-        scattered = scatter_to_sequence_parallel_region(converted, group=tp_group)
+        scattered = scatter_to_sequence_parallel_region(input_=converted, group=tp_group)
         return scattered.movedim(0, seq_dim).contiguous() if seq_dim != 0 else scattered
 
-    return _convert_cp_partition_mode_full_sequence(
-        x,
-        cp_group,
-        source_partition_mode=source_partition_mode,
-        target_partition_mode=target_partition_mode,
+    return _redistribute_thd_layout(
+        x=x,
+        cp_group=cp_group,
         seq_dim=seq_dim,
         cu_seqlens=cu_seqlens,
+        source_partition_mode=source_layout,
+        target_partition_mode=target_layout,
         thd_cp_partition_route=thd_cp_partition_route,
-    )
-
-
-def _convert_cp_partition_mode_full_sequence(
-    x: torch.Tensor,
-    cp_group: Optional[torch.distributed.ProcessGroup],
-    *,
-    source_partition_mode: CpPartitionMode,
-    target_partition_mode: CpPartitionMode,
-    seq_dim: int,
-    cu_seqlens: Optional[torch.Tensor],
-    thd_cp_partition_route: Optional[ThdCpRoute] = None,
-) -> torch.Tensor:
-    """Convert a tensor whose sequence dim contains the full CP-local sequence."""
-    if source_partition_mode == "zigzag" and target_partition_mode == "contiguous":
-        return zigzag_to_contiguous_chunks(
-            x,
-            cp_group,
-            seq_dim=seq_dim,
-            cu_seqlens=cu_seqlens,
-            thd_cp_partition_route=thd_cp_partition_route,
-        )
-    if source_partition_mode == "contiguous" and target_partition_mode == "zigzag":
-        return contiguous_to_zigzag_chunks(
-            x,
-            cp_group,
-            seq_dim=seq_dim,
-            cu_seqlens=cu_seqlens,
-            thd_cp_partition_route=thd_cp_partition_route,
-        )
-    raise ValueError(
-        f"Unsupported CP partition mode conversion "
-        f"{source_partition_mode!r} -> {target_partition_mode!r}; "
-        f"shape={tuple(x.shape)}, seq_dim={seq_dim}."
     )
 
 
@@ -371,7 +323,7 @@ def _scatter_thd_cp_route_recv_buffer(
     return out
 
 
-def _zigzag_contiguous_thd_swap(
+def _redistribute_thd_layout(
     x: torch.Tensor,
     cp_group: Optional[torch.distributed.ProcessGroup],
     seq_dim: int,
@@ -389,9 +341,8 @@ def _zigzag_contiguous_thd_swap(
     cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size == 1:
         return x
+    assert cp_group is not None
     cp_rank = cp_group.rank()
-    from megatron.core.tensor_parallel.mappings import all_to_all
-
     conversion_name = f"{source_partition_mode}_to_{target_partition_mode}"
     with _cp_layout_nvtx_range(f"cp_layout/thd/swap/{conversion_name}"):
         if seq_dim != 0:
@@ -400,7 +351,9 @@ def _zigzag_contiguous_thd_swap(
 
         route = thd_cp_partition_route
         if route is None:
-            route = build_thd_cp_partition_route(cu_seqlens, cp_size, cp_rank, device=x.device)
+            route = build_thd_cp_partition_route(
+                cu_seqlens=cu_seqlens, cp_size=cp_size, cp_rank=cp_rank, device=x.device
+            )
 
         if source_partition_mode == "zigzag" and target_partition_mode == "contiguous":
             send_index = route.zigzag_index
@@ -436,138 +389,280 @@ def _zigzag_contiguous_thd_swap(
             )
 
         with _cp_layout_nvtx_range(f"cp_layout/thd/pack/{conversion_name}"):
-            send_buf = _pack_thd_cp_route_send_buffer(x, send_index)
+            send_buf = _pack_thd_cp_route_send_buffer(x=x, send_index=send_index)
             if not send_buf.is_contiguous():
                 send_buf = send_buf.contiguous()
 
         with _cp_layout_nvtx_range(f"cp_layout/thd/all_to_all/{conversion_name}"):
-            recv_buf = all_to_all(cp_group, send_buf, output_split_sizes, input_split_sizes)
+            recv_buf = all_to_all(
+                group=cp_group,
+                input_=send_buf,
+                output_split_sizes_=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+            )
 
         with _cp_layout_nvtx_range(f"cp_layout/thd/scatter/{conversion_name}"):
             out_shape = (local_target_length,) + tuple(x.shape[1:])
-            out = _scatter_thd_cp_route_recv_buffer(recv_buf, recv_index, out_shape)
+            out = _scatter_thd_cp_route_recv_buffer(
+                recv_buf=recv_buf, recv_index=recv_index, out_shape=out_shape
+            )
 
         if seq_dim != 0:
             out = out.movedim(0, seq_dim)
         return out.contiguous()
 
 
+@dataclass(frozen=True)
+class _SbhdLayoutRedistributionPlan:
+    """Rank-local SBHD all-to-all plan expressed in sequence-segment counts."""
+
+    send_slots: tuple[int, ...]
+    input_segment_counts: tuple[int, ...]
+    output_segment_counts: tuple[int, ...]
+    receive_permutation: tuple[int, ...]
+
+
+def _sbhd_segments_per_rank(tp_size: int) -> int:
+    """Return two SBHD segments for CP-only conversion and one for even-TP SP conversion."""
+    if tp_size == 1:
+        return 2
+    if tp_size % 2 != 0:
+        raise ValueError(
+            "Sequence-parallel SBHD CP layout conversion requires an even tensor-parallel size, "
+            f"got {tp_size}"
+        )
+    return 1
+
+
+def _local_sbhd_segment_ids(
+    layout: CpPartitionMode, cp_size: int, cp_rank: int, tp_size: int = 1, tp_rank: int = 0
+) -> tuple[int, ...]:
+    """Return the atomic SBHD sequence segments owned by one TP×CP rank."""
+    segments_per_rank = _sbhd_segments_per_rank(tp_size=tp_size)
+    if layout == "contiguous":
+        first_segment = segments_per_rank * (cp_rank * tp_size + tp_rank)
+        return tuple(range(first_segment, first_segment + segments_per_rank))
+    if layout == "zigzag":
+        segments_per_cp_half = tp_size * segments_per_rank // 2
+        front_start = cp_rank * segments_per_cp_half
+        back_start = (2 * cp_size - cp_rank - 1) * segments_per_cp_half
+        cp_segments = tuple(range(front_start, front_start + segments_per_cp_half)) + tuple(
+            range(back_start, back_start + segments_per_cp_half)
+        )
+        sp_start = segments_per_rank * tp_rank
+        return cp_segments[sp_start : sp_start + segments_per_rank]
+    raise ValueError(f"Unsupported CP layout: {layout}")
+
+
 @lru_cache(maxsize=None)
-def _zigzag_contiguous_chunk_swap_plan(
-    cp_size: int, cp_rank: int, to_contiguous: bool
-) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], Tuple[Tuple[int, ...], ...], str]:
-    """Host-side SBHD chunk swap plan for one CP rank/layout edge."""
-
-    def _rank_to_chunks(rank: int, in_zigzag: bool) -> Tuple[int, int]:
-        """Global chunk indices at (slot 0, slot 1) for this rank."""
-        if in_zigzag:
-            return (rank, 2 * cp_size - rank - 1)
-        return (2 * rank, 2 * rank + 1)
-
-    def _chunk_to_dest(chunk_idx: int, target_zigzag: bool) -> Tuple[int, int]:
-        """Destination (rank, slot) for a given global chunk index in the target layout."""
-        if target_zigzag:
-            if chunk_idx < cp_size:
-                return chunk_idx, 0
-            return 2 * cp_size - chunk_idx - 1, 1
-        return chunk_idx // 2, chunk_idx % 2
-
-    source_in_zigzag = to_contiguous
-    target_in_zigzag = not to_contiguous
-    source_partition_mode = "zigzag" if source_in_zigzag else "contiguous"
-    target_partition_mode = "zigzag" if target_in_zigzag else "contiguous"
-    conversion_name = f"{source_partition_mode}_to_{target_partition_mode}"
-
-    local_chunk_indices = _rank_to_chunks(cp_rank, source_in_zigzag)
-    local_dests = [_chunk_to_dest(c, target_in_zigzag) for c in local_chunk_indices]
-
-    # Pack the send buffer so chunks are ordered by (dst_rank, dst_slot).
-    local_slot_order = tuple(sorted(range(2), key=lambda s: local_dests[s]))
-
-    input_split_chunks = [0] * cp_size
-    for dst_rank, _ in local_dests:
-        input_split_chunks[dst_rank] += 1
-
-    # Mirror every source rank's packing logic so we know which received chunk
-    # belongs in which local target slot.
-    output_split_chunks = [0] * cp_size
-    recv_dst_slots_per_source: List[List[int]] = [[] for _ in range(cp_size)]
-    for src in range(cp_size):
-        src_chunks = _rank_to_chunks(src, source_in_zigzag)
-        src_dests = [_chunk_to_dest(c, target_in_zigzag) for c in src_chunks]
-        src_slot_order = sorted(range(2), key=lambda s: src_dests[s])
-        for s in src_slot_order:
-            dst_rank, dst_slot = src_dests[s]
-            if dst_rank == cp_rank:
-                output_split_chunks[src] += 1
-                recv_dst_slots_per_source[src].append(dst_slot)
-
-    return (
-        local_slot_order,
-        tuple(input_split_chunks),
-        tuple(output_split_chunks),
-        tuple(tuple(slots) for slots in recv_dst_slots_per_source),
-        conversion_name,
+def _sbhd_segment_owner(
+    segment_id: int, layout: CpPartitionMode, cp_size: int, tp_size: int
+) -> tuple[int, int]:
+    for cp_rank in range(cp_size):
+        for tp_rank in range(tp_size):
+            if segment_id in _local_sbhd_segment_ids(
+                layout=layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
+            ):
+                return cp_rank, tp_rank
+    raise ValueError(
+        f"SBHD segment {segment_id} is not present in the {layout} layout for "
+        f"{cp_size=} and {tp_size=}"
     )
 
 
-def _zigzag_contiguous_chunk_swap(
-    x: torch.Tensor,
-    cp_group: Optional[torch.distributed.ProcessGroup],
-    seq_dim: int,
-    to_contiguous: bool,
+@lru_cache(maxsize=None)
+def _build_sbhd_group_rank_by_logical_rank(
+    cp_global_ranks: tuple[int, ...],
+    tp_global_ranks: tuple[int, ...],
+    tp_cp_global_ranks: tuple[int, ...],
+    current_global_rank: int,
+) -> tuple[int, ...]:
+    """Map logical ``cp_rank * tp_size + tp_rank`` coordinates to group ranks for SBHD."""
+    group_rank_by_global_rank = {
+        global_rank: group_rank for group_rank, global_rank in enumerate(tp_cp_global_ranks)
+    }
+    group_rank_by_logical_rank = []
+    for cp_global_rank in cp_global_ranks:
+        for tp_global_rank in tp_global_ranks:
+            target_global_rank = cp_global_rank + tp_global_rank - current_global_rank
+            if target_global_rank not in group_rank_by_global_rank:
+                raise RuntimeError(
+                    "TP and CP process groups do not form the expected Cartesian product"
+                )
+            group_rank_by_logical_rank.append(group_rank_by_global_rank[target_global_rank])
+    return tuple(group_rank_by_logical_rank)
+
+
+def _get_sbhd_group_rank_by_logical_rank(
+    cp_group: torch.distributed.ProcessGroup,
+    tp_group: torch.distributed.ProcessGroup,
+    tp_cp_group: torch.distributed.ProcessGroup,
+) -> tuple[int, ...]:
+    return _build_sbhd_group_rank_by_logical_rank(
+        cp_global_ranks=tuple(torch.distributed.get_process_group_ranks(cp_group)),
+        tp_global_ranks=tuple(torch.distributed.get_process_group_ranks(tp_group)),
+        tp_cp_global_ranks=tuple(torch.distributed.get_process_group_ranks(tp_cp_group)),
+        current_global_rank=torch.distributed.get_rank(),
+    )
+
+
+@lru_cache(maxsize=None)
+def _build_sbhd_layout_redistribution_plan(
+    source_layout: CpPartitionMode,
+    target_layout: CpPartitionMode,
+    cp_size: int,
+    cp_rank: int,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    group_rank_by_logical_rank: tuple[int, ...] | None = None,
+) -> _SbhdLayoutRedistributionPlan:
+    """Build the SBHD all-to-all-v plan for one rank of a CP layout conversion."""
+    if cp_size < 1:
+        raise ValueError(f"cp_size must be positive, got {cp_size}")
+    if tp_size < 1:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    if not 0 <= cp_rank < cp_size:
+        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}")
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError(f"tp_rank must be in [0, {tp_size}), got {tp_rank}")
+
+    group_size = cp_size * tp_size
+    if group_rank_by_logical_rank is None:
+        group_rank_by_logical_rank = tuple(range(group_size))
+    if sorted(group_rank_by_logical_rank) != list(range(group_size)):
+        raise ValueError("group_rank_by_logical_rank must be a permutation of the group ranks")
+
+    source_ids = _local_sbhd_segment_ids(
+        layout=source_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
+    )
+    target_ids = _local_sbhd_segment_ids(
+        layout=target_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
+    )
+
+    def destination_group_rank(segment_id: int) -> int:
+        destination_cp_rank, destination_tp_rank = _sbhd_segment_owner(
+            segment_id=segment_id, layout=target_layout, cp_size=cp_size, tp_size=tp_size
+        )
+        destination_logical_rank = destination_cp_rank * tp_size + destination_tp_rank
+        return group_rank_by_logical_rank[destination_logical_rank]
+
+    send_entries = sorted(
+        (destination_group_rank(segment_id=segment_id), slot)
+        for slot, segment_id in enumerate(source_ids)
+    )
+    send_slots = tuple(slot for _, slot in send_entries)
+    input_segment_counts = tuple(
+        sum(destination == rank for destination, _ in send_entries) for rank in range(group_size)
+    )
+
+    received_ids = []
+    output_segment_counts = []
+    source_logical_ranks = sorted(
+        range(group_size), key=lambda logical_rank: group_rank_by_logical_rank[logical_rank]
+    )
+    for source_logical_rank in source_logical_ranks:
+        source_cp_rank, source_tp_rank = divmod(source_logical_rank, tp_size)
+        rank_source_ids = _local_sbhd_segment_ids(
+            layout=source_layout,
+            cp_size=cp_size,
+            cp_rank=source_cp_rank,
+            tp_size=tp_size,
+            tp_rank=source_tp_rank,
+        )
+        ids_from_source = [
+            segment_id
+            for segment_id in rank_source_ids
+            if _sbhd_segment_owner(
+                segment_id=segment_id, layout=target_layout, cp_size=cp_size, tp_size=tp_size
+            )
+            == (cp_rank, tp_rank)
+        ]
+        received_ids.extend(ids_from_source)
+        output_segment_counts.append(len(ids_from_source))
+
+    if sorted(received_ids) != sorted(target_ids):
+        raise RuntimeError(
+            f"Invalid {source_layout}-to-{target_layout} SBHD redistribution plan for "
+            f"CP rank {cp_rank}, TP rank {tp_rank}: received {received_ids}, "
+            f"expected {target_ids}"
+        )
+    receive_permutation = tuple(received_ids.index(segment_id) for segment_id in target_ids)
+
+    return _SbhdLayoutRedistributionPlan(
+        send_slots=send_slots,
+        input_segment_counts=input_segment_counts,
+        output_segment_counts=tuple(output_segment_counts),
+        receive_permutation=receive_permutation,
+    )
+
+
+def _redistribute_sbhd_layout(
+    input_: torch.Tensor,
+    cp_group: torch.distributed.ProcessGroup,
+    source_layout: CpPartitionMode,
+    target_layout: CpPartitionMode,
+    sequence_parallel: bool,
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    tp_cp_group: Optional[torch.distributed.ProcessGroup],
 ) -> torch.Tensor:
-    """Single-all-to-all chunk permutation between zigzag and contiguous layouts.
+    """Redistribute local SBHD sequence segments with a differentiable all-to-all-v."""
+    cp_size = cp_group.size()
+    if cp_size == 1 or source_layout == target_layout:
+        return input_
 
-    Each rank holds exactly two chunks along ``seq_dim``. The mapping from
-    local (rank, slot) to (rank, slot) in the target layout is deterministic
-    and depends only on ``cp_size`` and ``cp_rank``, so we pack send data in
-    destination-rank order and use one ``all_to_all_single`` with unequal
-    splits to route each chunk to its target rank.
-    """
-    cp_size = cp_group.size() if cp_group is not None else 1
-    if cp_size == 1:
-        return x
     cp_rank = cp_group.rank()
-    from megatron.core.tensor_parallel.mappings import all_to_all
+    tp_size, tp_rank = 1, 0
+    communication_group = cp_group
+    group_rank_by_logical_rank = None
+    if sequence_parallel and tp_group is not None and tp_group.size() > 1:
+        if tp_cp_group is None:
+            raise ValueError(
+                "tp_cp_group is required for direct sequence-parallel SBHD layout conversion"
+            )
+        tp_size, tp_rank = tp_group.size(), tp_group.rank()
+        communication_group = tp_cp_group
+        group_rank_by_logical_rank = _get_sbhd_group_rank_by_logical_rank(
+            cp_group=cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group
+        )
 
-    # Work with seq_dim at position 0.
-    if seq_dim != 0:
-        x = x.movedim(seq_dim, 0)
-    x = x.contiguous()
-
-    seq_len_local = x.size(0)
-    assert seq_len_local % 2 == 0, (
-        f"zigzag/contiguous chunk swap requires an even local sequence length, "
-        f"got {seq_len_local}."
+    plan = _build_sbhd_layout_redistribution_plan(
+        source_layout=source_layout,
+        target_layout=target_layout,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        group_rank_by_logical_rank=group_rank_by_logical_rank,
     )
-    chunk_len = seq_len_local // 2
-    (
-        local_slot_order,
-        input_split_chunks,
-        output_split_chunks,
-        recv_dst_slots_per_source,
-        conversion_name,
-    ) = _zigzag_contiguous_chunk_swap_plan(cp_size, cp_rank, to_contiguous)
-    local_chunks = [x[:chunk_len], x[chunk_len:]]
-    send_buf = torch.cat([local_chunks[s] for s in local_slot_order], dim=0).contiguous()
 
-    input_split_sizes = [n * chunk_len for n in input_split_chunks]
-    output_split_sizes = [n * chunk_len for n in output_split_chunks]
+    input_contiguous = input_.contiguous()
+    local_seq_len = input_contiguous.shape[0]
+    local_segment_count = _sbhd_segments_per_rank(tp_size=tp_size)
+    if local_seq_len % local_segment_count != 0:
+        raise ValueError(
+            "SBHD CP layout conversion requires the sequence length local to each TP×CP rank to "
+            f"be divisible by {local_segment_count}, got {local_seq_len}"
+        )
+    segment_len = local_seq_len // local_segment_count
+    segment_shape = (local_segment_count, segment_len, *input_contiguous.shape[1:])
+    segments = input_contiguous.reshape(segment_shape)
 
-    with _cp_layout_nvtx_range(f"cp_layout/sbhd/all_to_all/{conversion_name}"):
-        recv_buf = all_to_all(cp_group, send_buf, output_split_sizes, input_split_sizes)
+    if plan.send_slots == tuple(range(local_segment_count)):
+        send_buffer = input_contiguous
+    else:
+        send_buffer = segments.flip(0).reshape(input_contiguous.shape)
+    input_split_sizes = [count * segment_len for count in plan.input_segment_counts]
+    output_split_sizes = [count * segment_len for count in plan.output_segment_counts]
+    received = all_to_all(
+        group=communication_group,
+        input_=send_buffer,
+        output_split_sizes_=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+    )
 
-    # Reassemble local chunks in target-layout slot order.
-    target_slots: List[Optional[torch.Tensor]] = [None, None]
-    offset = 0
-    for src in range(cp_size):
-        for dst_slot in recv_dst_slots_per_source[src]:
-            target_slots[dst_slot] = recv_buf[offset : offset + chunk_len]
-            offset += chunk_len
-    assert all(t is not None for t in target_slots), "Incomplete chunk reassembly in CP swap"
-
-    out = torch.cat(target_slots, dim=0)
-    if seq_dim != 0:
-        out = out.movedim(0, seq_dim)
-    return out.contiguous()
+    received_segments = received.reshape(segment_shape)
+    if plan.receive_permutation == tuple(range(local_segment_count)):
+        output = received
+    else:
+        output = received_segments.flip(0).reshape(input_contiguous.shape)
+    return output.contiguous()

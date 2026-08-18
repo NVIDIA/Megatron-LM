@@ -119,6 +119,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             packed_seq_params=packed_seq_params,
             cp_group=cp_group,
             tp_group=self.pg_collection.tp,
+            tp_cp_group=self.pg_collection.tp_cp,
             target_partition_mode="zigzag",
             sequence_parallel=self.config.sequence_parallel,
             config=self.config,

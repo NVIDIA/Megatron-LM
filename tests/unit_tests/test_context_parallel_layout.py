@@ -96,6 +96,60 @@ def _get_test_thd_token_indices(cu_seqlens, cp_size, cp_rank, cp_partition_mode)
     ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
 )
 @pytest.mark.parametrize(
+    ("cp_size", "tp_size", "group_rank_by_logical_rank"),
+    [(3, 1, (0, 1, 2)), (2, 2, (0, 2, 1, 3)), (2, 4, tuple(range(8)))],
+)
+def test_sbhd_layout_redistribution_plan_reassembles_target_segments(
+    source_layout, target_layout, cp_size, tp_size, group_rank_by_logical_rank
+):
+    group_size = cp_size * tp_size
+    plans = [None] * group_size
+    sends = [[None] * group_size for _ in range(group_size)]
+
+    for logical_rank, group_rank in enumerate(group_rank_by_logical_rank):
+        cp_rank, tp_rank = divmod(logical_rank, tp_size)
+        source_ids = context_parallel_layout_conversion._local_sbhd_segment_ids(
+            layout=source_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
+        )
+        plan = context_parallel_layout_conversion._build_sbhd_layout_redistribution_plan(
+            source_layout=source_layout,
+            target_layout=target_layout,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            group_rank_by_logical_rank=group_rank_by_logical_rank,
+        )
+        plans[group_rank] = plan
+        packed_ids = tuple(source_ids[slot] for slot in plan.send_slots)
+        offset = 0
+        for destination, count in enumerate(plan.input_segment_counts):
+            sends[group_rank][destination] = packed_ids[offset : offset + count]
+            offset += count
+
+    for logical_rank, group_rank in enumerate(group_rank_by_logical_rank):
+        cp_rank, tp_rank = divmod(logical_rank, tp_size)
+        plan = plans[group_rank]
+        received_ids = tuple(
+            segment_id
+            for source_group_rank in range(group_size)
+            for segment_id in sends[source_group_rank][group_rank]
+        )
+        output_ids = tuple(received_ids[index] for index in plan.receive_permutation)
+        assert output_ids == context_parallel_layout_conversion._local_sbhd_segment_ids(
+            layout=target_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
+        )
+
+
+def test_sbhd_layout_redistribution_rejects_odd_tensor_parallel_size():
+    with pytest.raises(ValueError, match="even tensor-parallel size"):
+        context_parallel_layout_conversion._sbhd_segments_per_rank(tp_size=3)
+
+
+@pytest.mark.parametrize(
+    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+)
+@pytest.mark.parametrize(
     ("cu_seqlens", "cp_size"),
     [
         (torch.tensor([0, 16, 40]), 2),
@@ -226,11 +280,11 @@ def test_sbhd_convert_cp_partition_mode_matches_direct_target_shard(
         )
 
         converted = context_parallel_layout_conversion.convert_cp_partition_mode(
-            source_shard,
-            cp_group,
+            x=source_shard,
             source_partition_mode=source_layout,
             target_partition_mode=target_layout,
             seq_dim=seq_dim,
+            cp_group=cp_group,
         )
         expected = _get_sbhd_tensor_on_this_cp_rank(
             full_tensor, seq_dim, cp_group, cp_partition_mode=target_layout
@@ -249,7 +303,10 @@ def test_sbhd_convert_cp_partition_mode_matches_direct_target_shard(
         pytest.param("zigzag", "contiguous", 1, False, id="zigzag-contiguous-seq1"),
         pytest.param("contiguous", "zigzag", 0, False, id="contiguous-zigzag-seq0"),
         pytest.param("contiguous", "zigzag", 1, False, id="contiguous-zigzag-seq1"),
-        pytest.param("zigzag", "contiguous", 0, True, id="sequence-parallel"),
+        pytest.param("zigzag", "contiguous", 0, True, id="sp-zigzag-contiguous-seq0"),
+        pytest.param("zigzag", "contiguous", 1, True, id="sp-zigzag-contiguous-seq1"),
+        pytest.param("contiguous", "zigzag", 0, True, id="sp-contiguous-zigzag-seq0"),
+        pytest.param("contiguous", "zigzag", 1, True, id="sp-contiguous-zigzag-seq1"),
     ],
 )
 def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
@@ -270,6 +327,9 @@ def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
     try:
         cp_group = parallel_state.get_context_parallel_group()
         tp_group = parallel_state.get_tensor_model_parallel_group() if sequence_parallel else None
+        tp_cp_group = (
+            parallel_state.get_tensor_and_context_parallel_group() if sequence_parallel else None
+        )
         full_tensor = _make_sequence_tensor(
             total_seq_len=32,
             seq_dim=seq_dim,
@@ -284,16 +344,25 @@ def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
         source_shard = source_shard.detach().requires_grad_(True)
 
         convert_kwargs = (
-            {"sequence_parallel": True, "tp_group": tp_group} if sequence_parallel else {}
+            {"sequence_parallel": True, "tp_group": tp_group, "tp_cp_group": tp_cp_group}
+            if sequence_parallel
+            else {}
         )
         converted = context_parallel_layout_conversion.convert_cp_partition_mode(
-            source_shard,
-            cp_group,
+            x=source_shard,
             source_partition_mode=source_layout,
             target_partition_mode=target_layout,
             seq_dim=seq_dim,
+            cp_group=cp_group,
             **convert_kwargs,
         )
+        expected_target = _get_sbhd_tensor_on_this_cp_rank(
+            full_tensor, seq_dim, cp_group, cp_partition_mode=target_layout
+        )
+        if sequence_parallel:
+            expected_target = _get_sequence_parallel_shard(expected_target, seq_dim, tp_group)
+        torch.testing.assert_close(converted, expected_target, atol=0.0, rtol=0.0)
+
         target_upstream_grad = _get_sbhd_tensor_on_this_cp_rank(
             full_upstream_grad, seq_dim, cp_group, cp_partition_mode=target_layout
         )
@@ -350,14 +419,15 @@ def test_prebuild_thd_cp_partition_routes_raises_route_errors():
 def test_cp_partition_mode_converter_recurses_over_tensor_containers(monkeypatch):
     calls = []
 
-    def fake_convert(tensor, cp_group, **kwargs):
-        calls.append((tensor, cp_group, kwargs))
-        return tensor + 10
+    def fake_convert(*, x, cp_group, **kwargs):
+        calls.append((x, cp_group, kwargs))
+        return x + 10
 
     monkeypatch.setattr(
         context_parallel_layout_conversion, "convert_cp_partition_mode", fake_convert
     )
     cp_group = SimpleNamespace(size=lambda: 2)
+    tp_cp_group = object()
     config = SimpleNamespace(cuda_graph_impl=None)
     cu_seqlens = torch.tensor([0, 8])
     untouched = object()
@@ -377,8 +447,9 @@ def test_cp_partition_mode_converter_recurses_over_tensor_containers(monkeypatch
         source_partition_mode="zigzag",
         target_partition_mode="contiguous",
         config=config,
+        tp_cp_group=tp_cp_group,
     )
-    converted = converter.convert(value, seq_dim=lambda tensor: tensor.dim() - 1)
+    converted = converter.convert(value=value, seq_dim=lambda tensor: tensor.dim() - 1)
 
     assert torch.equal(converted[0], torch.tensor([11]))
     assert converted[1][0] is None
@@ -387,6 +458,7 @@ def test_cp_partition_mode_converter_recurses_over_tensor_containers(monkeypatch
     assert [call[1] for call in calls] == [cp_group, cp_group]
     assert [call[2]["seq_dim"] for call in calls] == [0, 0]
     assert all(call[2]["cu_seqlens"] is cu_seqlens for call in calls)
+    assert all(call[2]["tp_cp_group"] is tp_cp_group for call in calls)
     assert packed_seq_params.cp_partition_mode == "contiguous"
     assert packed_seq_params.cp_partition_route is route
 
@@ -417,14 +489,15 @@ def test_cp_partition_mode_converter_rejects_thd_full_iteration_cuda_graph_conve
 def test_module_input_conversion_treats_missing_packed_seq_params_as_sbhd(monkeypatch):
     calls = []
 
-    def fake_convert(tensor, cp_group, **kwargs):
-        calls.append((tensor, cp_group, kwargs))
-        return tensor + 1
+    def fake_convert(*, x, cp_group, **kwargs):
+        calls.append((x, cp_group, kwargs))
+        return x + 1
 
     monkeypatch.setattr(
         context_parallel_layout_conversion, "convert_cp_partition_mode", fake_convert
     )
     cp_group = SimpleNamespace(size=lambda: 2)
+    tp_cp_group = object()
     hidden_states = torch.ones(8, 1, 4)
 
     converted, converter = convert_module_input_tensors_cp_partition_mode(
@@ -432,6 +505,7 @@ def test_module_input_conversion_treats_missing_packed_seq_params_as_sbhd(monkey
         packed_seq_params=None,
         cp_group=cp_group,
         tp_group=None,
+        tp_cp_group=tp_cp_group,
         target_partition_mode="contiguous",
         sequence_parallel=False,
         config=SimpleNamespace(cp_partition_mode="zigzag", cuda_graph_impl=None),
@@ -442,3 +516,132 @@ def test_module_input_conversion_treats_missing_packed_seq_params_as_sbhd(monkey
     assert calls[0][2]["source_partition_mode"] == "zigzag"
     assert calls[0][2]["target_partition_mode"] == "contiguous"
     assert calls[0][2]["cu_seqlens"] is None
+    assert calls[0][2]["tp_cp_group"] is tp_cp_group
+    assert converter.tp_cp_group is tp_cp_group
+
+
+def test_public_conversion_apis_default_to_no_cp_group():
+    hidden_states = torch.ones(8, 1, 4)
+    config = SimpleNamespace(cp_partition_mode="zigzag", cuda_graph_impl=None)
+    converter = CpPartitionModeConverter(
+        packed_seq_params=None,
+        source_partition_mode="zigzag",
+        target_partition_mode="contiguous",
+        config=config,
+    )
+
+    assert converter.convert(value=hidden_states) is hidden_states
+    converted, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+        hidden_states=hidden_states,
+        packed_seq_params=None,
+        target_partition_mode="contiguous",
+        sequence_parallel=False,
+        config=config,
+    )
+    assert converted is hidden_states
+    assert back_to_input_converter is None
+    assert (
+        context_parallel_layout_conversion.convert_cp_partition_mode(
+            x=hidden_states, source_partition_mode="zigzag", target_partition_mode="contiguous"
+        )
+        is hidden_states
+    )
+
+
+@pytest.mark.parametrize(
+    ("sequence_parallel", "tp_size"),
+    [(False, None), (False, 2), (True, None), (True, 1), (True, 2)],
+)
+def test_sbhd_conversion_uses_one_redistribution_path(monkeypatch, sequence_parallel, tp_size):
+    calls = []
+    cp_group = _FakeGroup(size=2, rank=0)
+    tp_group = _FakeGroup(size=tp_size, rank=0) if tp_size is not None else None
+    tp_cp_group = _FakeGroup(size=2 * tp_size, rank=0) if tp_size is not None else None
+    x = torch.arange(24).view(2, 6, 2)
+
+    def fake_redistribute(**kwargs):
+        calls.append(kwargs)
+        return kwargs["input_"] + 1
+
+    monkeypatch.setattr(
+        context_parallel_layout_conversion, "_redistribute_sbhd_layout", fake_redistribute
+    )
+
+    converted = context_parallel_layout_conversion.convert_cp_partition_mode(
+        x=x,
+        source_partition_mode="zigzag",
+        target_partition_mode="contiguous",
+        seq_dim=1,
+        sequence_parallel=sequence_parallel,
+        cp_group=cp_group,
+        tp_group=tp_group,
+        tp_cp_group=tp_cp_group,
+    )
+
+    torch.testing.assert_close(converted, x + 1)
+    assert len(calls) == 1
+    call = calls[0]
+    assert torch.equal(call.pop("input_"), x.movedim(1, 0))
+    assert call == {
+        "cp_group": cp_group,
+        "source_layout": "zigzag",
+        "target_layout": "contiguous",
+        "sequence_parallel": sequence_parallel,
+        "tp_group": tp_group,
+        "tp_cp_group": tp_cp_group,
+    }
+
+
+def test_sequence_parallel_thd_conversion_warns_about_naive_fallback(monkeypatch):
+    from megatron.core.tensor_parallel import mappings
+
+    calls = []
+    cp_group = _FakeGroup(size=2, rank=0)
+    tp_group = _FakeGroup(size=2, rank=0)
+    cu_seqlens = torch.tensor([0, 12])
+    x = torch.arange(24).view(2, 6, 2)
+
+    def fake_gather(*, input_, tensor_parallel_output_grad, group):
+        calls.append(("gather", tensor_parallel_output_grad, group))
+        return input_
+
+    def fake_redistribute(**kwargs):
+        calls.append(("thd", kwargs))
+        return kwargs["x"]
+
+    def fake_scatter(*, input_, group):
+        calls.append(("scatter", group))
+        return input_
+
+    monkeypatch.setattr(mappings, "gather_from_sequence_parallel_region", fake_gather)
+    monkeypatch.setattr(
+        context_parallel_layout_conversion, "_redistribute_thd_layout", fake_redistribute
+    )
+    monkeypatch.setattr(mappings, "scatter_to_sequence_parallel_region", fake_scatter)
+
+    with pytest.warns(RuntimeWarning, match="naive TP gather"):
+        converted = context_parallel_layout_conversion.convert_cp_partition_mode(
+            x=x,
+            source_partition_mode="zigzag",
+            target_partition_mode="contiguous",
+            seq_dim=1,
+            cu_seqlens=cu_seqlens,
+            sequence_parallel=True,
+            cp_group=cp_group,
+            tp_group=tp_group,
+        )
+
+    assert torch.equal(converted, x)
+    assert calls[0] == ("gather", False, tp_group)
+    call_name, thd_call = calls[1]
+    assert call_name == "thd"
+    assert torch.equal(thd_call.pop("x"), x.movedim(1, 0))
+    assert thd_call.pop("cu_seqlens") is cu_seqlens
+    assert thd_call == {
+        "cp_group": cp_group,
+        "seq_dim": 0,
+        "source_partition_mode": "zigzag",
+        "target_partition_mode": "contiguous",
+        "thd_cp_partition_route": None,
+    }
+    assert calls[2] == ("scatter", tp_group)
