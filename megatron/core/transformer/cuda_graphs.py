@@ -97,7 +97,56 @@ except:
 
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
+_CUDA_GRAPH_STREAM_POOL_SIZE = 3
+_CUDA_GRAPH_STREAM_POOLS = {}
+_CUDA_GRAPH_STREAM_NEXT_SLOT = defaultdict(int)
 logger = logging.getLogger(__name__)
+
+
+def _get_cuda_graph_stream() -> torch.cuda.Stream:
+    """Assign local CUDA-graph runners across a bounded set of distinct streams.
+
+    PyTorch obtains streams from a bounded per-device pool, so repeatedly constructing
+    ``torch.cuda.Stream`` objects can eventually return the same underlying CUDA stream.
+    Assigning capture and replay streams explicitly makes that sharing intentional.
+
+    ``CUDA_DEVICE_MAX_CONNECTIONS`` controls how CUDA maps logical streams to hardware work
+    queues. It does not make PyTorch stream handles unique and cannot prevent stream aliasing.
+    """
+    device = torch.cuda.current_device()
+    pool = _CUDA_GRAPH_STREAM_POOLS.get(device)
+    if pool is None:
+        # CUDA recommends at least as many connections as independently active streams. GTP can
+        # concurrently use graph, GTP/EGTP AG and RS, EP, DDP, and activation-offload streams, so
+        # CUDA's default of eight connections can introduce false dependencies between them.
+        max_connections = os.getenv("CUDA_DEVICE_MAX_CONNECTIONS")
+        warning_reason = None
+        if max_connections is None:
+            warning_reason = "is unset (CUDA defaults to 8)"
+        else:
+            try:
+                max_connections_value = int(max_connections)
+            except ValueError:
+                warning_reason = f"must be an integer from 1 to 32, but is {max_connections!r}"
+            else:
+                if max_connections_value < 16:
+                    warning_reason = f"is {max_connections_value}"
+
+        if warning_reason is not None and GTP_CONFIG.is_active():
+            logger.warning(
+                "CUDA_DEVICE_MAX_CONNECTIONS %s. For GTP workloads, consider setting it to "
+                "16 or 32 before process startup to avoid implicit stream aliasing.",
+                warning_reason,
+            )
+
+        pool = tuple(torch.cuda.Stream(device=device) for _ in range(_CUDA_GRAPH_STREAM_POOL_SIZE))
+        if len({stream.cuda_stream for stream in pool}) != len(pool):
+            raise RuntimeError("CUDA graph stream pool contains aliased streams")
+        _CUDA_GRAPH_STREAM_POOLS[device] = pool
+
+    slot = _CUDA_GRAPH_STREAM_NEXT_SLOT[device]
+    _CUDA_GRAPH_STREAM_NEXT_SLOT[device] = (slot + 1) % len(pool)
+    return pool[slot]
 
 
 def _get_tensor_alias_chain(tensor):
@@ -953,6 +1002,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
         self.is_first_layer = getattr(base_module, "is_first_layer", True)
         self.is_last_layer = getattr(base_module, "is_last_layer", True)
+        self.capture_stream = _get_cuda_graph_stream()
 
         # We use this attribute to record the value of 'is_first_microbatch' each fwd cudagraph
         # replay so that way we only update the value of this flag in FP8GlobalStateManager when
@@ -981,7 +1031,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.num_warmup_steps = max(self.num_warmup_steps, 2)
 
                 self.use_stream = True
-                self.stream = torch.cuda.Stream()
+                self.stream = self.capture_stream
                 self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
                 self.bwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
                 # Register (chain, group) side streams before the first forward.
@@ -1336,7 +1386,10 @@ class _CudaGraphRunner(torch.nn.Module):
                     gc.freeze()
 
                 with torch.cuda.graph(
-                    self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                    self.fwd_graph,
+                    pool=self.mempool,
+                    stream=self.capture_stream,
+                    capture_error_mode="thread_local",
                 ):
 
                     self._sync_against_side_streams(self.fwd_side_streams)
@@ -1464,7 +1517,7 @@ class _CudaGraphRunner(torch.nn.Module):
         capture_comm_context = track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
         with (
             capture_comm_context as capture_comms,
-            torch.cuda.graph(self.bwd_graph, pool=self.mempool),
+            torch.cuda.graph(self.bwd_graph, pool=self.mempool, stream=self.capture_stream),
         ):
 
             grad_inputs = torch.autograd.grad(
