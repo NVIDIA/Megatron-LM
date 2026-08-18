@@ -51,9 +51,7 @@ class TestLayerwiseParameterRouting:
             pytest.param((16, 8), {"use_muon": False}, id="explicit-exclusion"),
             pytest.param((16, 8), {"use_muon": True}, id="explicit-opt-in"),
             pytest.param(
-                (16, 8),
-                {"is_embedding_or_output_parameter": True},
-                id="embedding-or-output",
+                (16, 8), {"is_embedding_or_output_parameter": True}, id="embedding-or-output"
             ),
             pytest.param((16,), {}, id="vector"),
             pytest.param((16,), {"use_muon": False}, id="excluded-vector"),
