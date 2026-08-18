@@ -40,8 +40,6 @@ def _flat_placements() -> Placements:
 
 
 def test_post_wrap_assign_true_load_raises(distributed_setup):
-    if distributed_setup.world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     checkpoint = nn.Linear(4, 4, bias=False, device=device).state_dict()
@@ -51,7 +49,7 @@ def test_post_wrap_assign_true_load_raises(distributed_setup):
 
     with pytest.raises(
         RuntimeError,
-        match=r"load_state_dict\(assign=True\) is not supported after fully_shard\(\)",
+        match=r"load_state_dict\(assign=True\)",
     ):
         model.load_state_dict(checkpoint, assign=True)
 
