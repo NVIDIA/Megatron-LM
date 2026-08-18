@@ -303,12 +303,15 @@ class OptimizerConfig:
     with a one-time warning. Same math,
     different kernel: results differ from the GEMM path by kernel-level rounding.
 
-    MEASURED: on GB300 (SM 10.3, Triton 3.4) this is a NET LOSS — NS on a
-    (12288, 10240) matrix takes 30.8 ms with SYRK vs 26.0 ms without, i.e. ~19%
-    slower despite ~32% fewer FLOPs, because cuBLAS's bf16 kernels run far enough
-    ahead of the Triton kernel to erase the saving. Re-measure per architecture
-    before enabling; the trade-off may flip on SM 9.0 where the kernel was tuned.
-    Defaults to False."""
+    MEASURED: on GB300 (SM 10.3, Triton 3.4) SYRK is a steady-state WIN — NS5 on a
+    (12288, 10240) matrix runs 17.5 ms with SYRK vs 23.4 ms without (0.75x, warm
+    median; ratio identical at NS16 and across emerging-optimizers 0.4.0/main).
+    An earlier in-training profile reported SYRK slower (30.8 vs 26.0 ms); that was
+    a measurement artifact of the first-call cost. The operational caveat is that
+    first call: each rank pays a one-time ~30 s Triton autotune+compile per distinct
+    matrix shape (measured 32-34 s on this shape), so the first optimizer step of a
+    run is minutes slower on a cold Triton cache — budget for it in step-time
+    monitoring, or persist TRITON_CACHE_DIR across runs. Defaults to False."""
 
     muon_ns_batch_size: int = 1
     """Max number of same-shape matrices fused into one batched Newton-Schulz under
