@@ -21,6 +21,9 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
+
+# Decode uses the in-repo Triton conv update, which accepts int64 slot indices.
+from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.packed_seq_helpers import (
     build_packed_seq_idx,
     check_fla_sequence_packing_support,
@@ -28,21 +31,27 @@ from megatron.core.ssm.packed_seq_helpers import (
 )
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params, make_tp_sharded_tensor_for_checkpoint
+
+if HAVE_GTP:
+    from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+else:
+    is_gtp_param = None
 
 try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d import causal_conv1d_fn
     from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 except ImportError:
     causal_conv1d_fn = None
-    causal_conv1d_update = None
     causal_conv1d_varlen_states = None
 
 try:
@@ -64,12 +73,19 @@ except ImportError:
 
 try:
     from fla.ops.gated_delta_product import chunk_gated_delta_product
-    from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
     HAVE_FLA = False
 
+# Dynamic-batching inference runs the in-tree fork of these kernels rather than
+# the pip `flash-linear-attention` ones. The fork is forward-only, so training
+# and the static-batching path (which shares the training body) keep calling
+# upstream, which owns the backward pass.
+from megatron.core.ssm.ops.gdp import (
+    chunk_gated_delta_product_varlen,
+    fused_recurrent_gated_delta_rule_update,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -604,9 +620,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             dim=-1,
         )
 
-        # Indexed conv update: reads/writes the per-request conv state rows
-        # selected by ``batch_indices``, in place. ``self.activation`` must be the
-        # activation *string* so the kernel enables SiLU (a bool would disable it).
+        # Indexed conv update into the per-request state rows (``batch_indices``
+        # is None for static batching, where the cache is already in order).
         VKQ = causal_conv1d_update(
             VKQ,
             conv_state,
@@ -662,7 +677,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             # for the scatter below; the padding rows' outputs are never scattered back.
             initial_state = ssm_state[batch_indices.clamp(min=0)]
 
-        core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule(
+        core_attn_out, last_recurrent_state = fused_recurrent_gated_delta_rule_update(
             query,
             key,
             value,
@@ -770,17 +785,17 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             query = query.repeat_interleave(rep, dim=2)
             key = key.repeat_interleave(rep, dim=2)
 
-        core_attn_out, last_recurrent_state = chunk_gated_delta_product(
+        core_attn_out, last_recurrent_state = chunk_gated_delta_product_varlen(
             query,
             key,
             value,
             g=g,
             beta=beta,
+            num_householder=M,
+            cu_seqlens=cu_seqlens,
             initial_state=None,
             output_final_state=True,
-            num_householder=M,
             use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens,
         )
 
         # Write per-request final SSM states into the cache for subsequent decode.
@@ -862,6 +877,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
+        # Guard for cases metadata is not provided
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+
         sharded_state_dict = {}
         # Parameters
         self._save_to_state_dict(sharded_state_dict, "", keep_vars=True)
@@ -898,6 +916,41 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             + (1 + self.num_householder) * self.ngroups_local_tp * self.d_state
             + self.nheads_local_tp * (1 + self.num_householder)
         )
+        # Under GTP, in_proj.weight is GTP-sliced along axis 0. The [z|V*|K*|Q|b*|a] split
+        # boundaries don't line up with GTP slice boundaries, so gather the shards back to
+        # TP-local size (strip the trailing pad rows from the gathered tail) and fall through
+        # to the same split path the non-GTP run uses — saved ckpt matches a non-GTP run.
+        in_proj_gtp_remat_size = getattr(self.in_proj.weight, "gtp_remat_size", 1)
+        in_proj_is_gtp = (
+            in_proj_gtp_remat_size > 1 and HAVE_GTP and is_gtp_param(self.in_proj.weight)
+        )
+        if in_proj_is_gtp:
+            gtp_remat_group = self.in_proj.weight.group
+            # in_proj.weight was already built at the sharded size by the submodule
+            # sharded_state_dict above — and, for native-FP8 GTP, dequantized to BF16 there
+            # (make_tp_sharded_tensor_for_checkpoint). Gather those (BF16) shards back to the
+            # full TP-local size so the [z|V*|K*|Q|b*|a] split below matches a non-GTP run.
+            local = sharded_state_dict[f"{prefix}in_proj.weight"].data.contiguous()
+            gathered = torch.empty(
+                (local.shape[0] * in_proj_gtp_remat_size,) + local.shape[1:],
+                dtype=local.dtype,
+                device=local.device,
+            )
+            torch.distributed.all_gather_into_tensor(gathered, local, group=gtp_remat_group)
+            if gathered.shape[0] != in_proj_dim:
+                gathered = gathered[:in_proj_dim].contiguous()
+            # Gathered weight is replicated across full dp_cp; replica_id needs only the DP slot.
+            dp_cp_rank = torch.distributed.get_rank(metadata["dp_cp_group"])
+            sharded_state_dict[f"{prefix}in_proj.weight"] = make_tp_sharded_tensor_for_checkpoint(
+                gathered,
+                f"{prefix}in_proj.weight",
+                tp_axis=0,
+                replica_id=(0, 0, dp_cp_rank),
+                prepend_offsets=sharded_offsets,
+                tp_group=self.pg_collection.tp,
+                dp_cp_group=metadata["dp_cp_group"],
+            )
+
         assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
             in_proj_dim,
             sharded_state_dict[f"{prefix}in_proj.weight"],
@@ -928,6 +981,40 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 sharded_state_dict[key] = _split_tensor_factory(
                     sharded_state_dict[key], in_proj_split_sections, in_proj_split_names, 0
                 )
+
+        # GTP load-side inverse of the save-time all-gather (see
+        # docs/api-guide/core/generalized_tensor_parallel.md §3.3, in_proj note): the checkpoint
+        # stores the FULL TP-local in_proj.weight (pad stripped) under the per-householder split
+        # keys, so the default merge_fn cats them back to ``in_proj_dim`` rows with no
+        # padding. To reload into the live GTP param we must mirror init
+        # (``_gtp_slice_one_param``): F.pad the merged tensor with zeros up to
+        # ``gtp_remat_local_size * gtp_remat_size``, then slice by ``gtp_remat_local_rank``.
+        # gtp_remat_size=1 has no pad/slice.
+        if in_proj_is_gtp:
+            factory = sharded_state_dict[f"{prefix}in_proj.weight"]
+            gtp_remat_local_rank = torch.distributed.get_rank(self.in_proj.weight.group)
+            gtp_remat_local_size = self.in_proj.weight.data.size(0)
+            original_merge_fn = factory.merge_fn
+
+            @torch.no_grad()
+            def _gtp_slice_after_cat(
+                sub_state_dict,
+                _orig=original_merge_fn,
+                _rank=gtp_remat_local_rank,
+                _size=gtp_remat_local_size,
+                _gtp_remat_size=in_proj_gtp_remat_size,
+            ):
+                full = _orig(sub_state_dict)
+                aligned_total = _size * _gtp_remat_size
+                pad_rows = aligned_total - full.shape[0]
+                if pad_rows > 0:
+                    full = torch.nn.functional.pad(full, (0, 0, 0, pad_rows))
+                start = _rank * _size
+                return full[start : start + _size].contiguous()
+
+            sharded_state_dict[f"{prefix}in_proj.weight"] = replace(
+                factory, merge_fn=_gtp_slice_after_cat
+            )
 
         conv_dim = (
             self.d_inner_local_tp * self.num_householder

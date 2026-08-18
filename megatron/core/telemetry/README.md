@@ -29,10 +29,11 @@ context managers, `span_groups` falls back to a local `SpanGroup` stub, and
 `record_training_metrics()` returns immediately. Call sites can therefore import
 from this module unconditionally.
 
-To pull in the real implementations, install
-[`nemo-lens`](https://github.com/NVIDIA-NeMo/Lens) alongside Megatron. A
-`megatron-core[otel]` extra that does this for you arrives with the
-call-site instrumentation.
+Install the real implementations with the `otel` extra:
+
+```bash
+pip install megatron-core[otel]
+```
 
 ## Documentation
 
@@ -50,11 +51,3 @@ call-site instrumentation.
 For the generic `nemo-lens` documentation (configuration model, instrumentation
 primitives, custom exporters, design decisions), see the lens docs at
 <https://github.com/NVIDIA-NeMo/Lens/tree/main/docs>.
-
-## Status
-
-This module is the base layer. The call-site instrumentation (training loop,
-checkpointing, pipeline schedules, inference server), the `otel` install extra,
-the `--otel-*` CLI flags, the `MEGATRON_OTEL_*` environment variables, and the
-`docs/index.md` toctree entry that publishes the guide above land separately;
-see <https://github.com/NVIDIA/Megatron-LM/pull/6385>.

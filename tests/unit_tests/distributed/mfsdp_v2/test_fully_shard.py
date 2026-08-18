@@ -162,6 +162,19 @@ def _hsdp_placements() -> Placements:
     )
 
 
+def _hfsdp_placements() -> Placements:
+    """HFSDP: params replicated across DP-outer (axis 0) for compute but the
+    optimizer sharded across it, all sharded within DP-inner (axis 1). main_grad
+    rests [Partial, Flat] between microbatches and is reduce-scattered to
+    [Flat, Flat] (the optimizer placement) on the last microbatch."""
+    return Placements(
+        dp_axes=[0, 1],
+        parameter=[Replicate(), Flat()],
+        gradient=[Partial(dist.ReduceOp.AVG), Flat()],
+        optimizer=[Flat(), Flat()],
+    )
+
+
 def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
 
@@ -348,6 +361,90 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
     )
 
 
+@pytest.mark.parametrize("set_to_none", [True, False])
+@pytest.mark.parametrize("num_microbatches", [1, 3])
+def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
+    """HFSDP (optimizer sharded across DP-outer too) training should match single-rank SGD.
+
+    Like HSDP, gradients reduce-scatter within DP-inner every backward and
+    accumulate into main_grad. Unlike HSDP, the last-microbatch DP-outer reduction
+    is a reduce-scatter (not an all-reduce) that finalizes main_grad to the
+    optimizer's [Flat, Flat] placement, shrinking the buffer; the next step's reset
+    therefore allocates a fresh [Partial, Flat] accumulation buffer. Every rank
+    sees identical data, so the averaged gradient equals the single-rank gradient
+    and losses must match. Both ``zero_grad`` modes are covered.
+    """
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    # world_size=2 gives a 2x1 mesh: DP-inner is trivial but the DP-outer
+    # reduce-scatter finalize and the fresh-buffer reset still run and converge.
+    if world_size % 2 != 0:
+        pytest.skip("This test requires an even number of ranks for a 2-D DP mesh.")
+
+    outer_size = 2
+    inner_size = world_size // outer_size
+    mesh = init_device_mesh(
+        device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    torch.manual_seed(1234)
+    dim = 8
+    baseline = MultiChildModel(dim=dim, num_children=2).to(device)
+    model = MultiChildModel(dim=dim, num_children=2).to(device)
+    model.load_state_dict(baseline.state_dict())
+
+    # Shard the child layers, then the model, so the children share a root context
+    # and reduce through the overlap path instead of as independent roots.
+    with fully_shard_context(device=device) as context:
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_hfsdp_placements())
+        fully_shard(model, mesh=mesh, placements=_hfsdp_placements())
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    # HFSDP's optimizer placement [Flat, Flat] differs from the parameter placement
+    # [Replicate, Flat], so main_weight and model_weight are distinct buffers and the
+    # compute weight is stale until the step post-hook registered here refreshes it.
+    # HSDP needs no wrapper: its two placements match, so the buffers alias.
+    fully_shard_optimizer(optimizer)
+
+    micro_batch_size = 2
+    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    microbatches = tuple(zip(x.unbind(), target.unbind()))
+
+    def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
+        losses = []
+        for step in range(5):
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+                is_last = microbatch_index == num_microbatches - 1
+                with microbatch(context, is_last=is_last):
+                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                    (loss / num_microbatches).backward()
+                losses.append(loss.detach())
+                logger.debug(
+                    "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
+                    log_prefix,
+                    rank,
+                    step,
+                    microbatch_index,
+                    loss,
+                )
+
+            optimizer.step()
+        return losses
+
+    baseline_losses = train(baseline, baseline_optimizer, "Baseline")
+    sharded_losses = train(model, optimizer, "HFSDP")
+
+    torch.testing.assert_close(
+        torch.stack(sharded_losses),
+        torch.stack(baseline_losses),
+        msg="HFSDP losses did not match baseline losses.",
+    )
+
+
 def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     """HSDP reduce-scatters DP-inner every microbatch but all-reduces DP-outer once.
 
@@ -411,6 +508,70 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
     )
 
 
+def test_hfsdp_reduce_scatters_dp_outer_on_last_microbatch(distributed_setup):
+    """HFSDP finalizes with a reduce-scatter, not an all-reduce, on the last microbatch.
+
+    Because the optimizer is sharded across DP-outer, the DP-outer finalize is a
+    reduce-scatter like the per-microbatch DP-inner reduction -- so there are no
+    all-reduces at all, and the reduce-scatter count is (num_microbatches + 1) per
+    parameter group: one DP-inner reduce-scatter every microbatch plus one DP-outer
+    reduce-scatter on the last. This asserts on kernel counts only, not numerics.
+    """
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("This test requires an even number of at least 4 ranks for a 2-D DP mesh.")
+
+    outer_size = 2
+    inner_size = world_size // outer_size
+    mesh = init_device_mesh(
+        device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    torch.manual_seed(1234)
+    dim = 8
+    num_children = 2
+    model = MultiChildModel(dim=dim, num_children=num_children).to(device)
+    with fully_shard_context(device=device) as context:
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_hfsdp_placements())
+        fully_shard(model, mesh=mesh, placements=_hfsdp_placements())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+
+    num_microbatches = 3
+    micro_batch_size = 2
+    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
+    microbatches = tuple(zip(x.unbind(), target.unbind()))
+
+    def train_one_step() -> None:
+        optimizer.zero_grad(set_to_none=True)
+        for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
+            is_last = microbatch_index == num_microbatches - 1
+            with microbatch(context, is_last=is_last):
+                loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
+                (loss / num_microbatches).backward()
+        optimizer.step()
+
+    train_one_step()
+    torch.cuda.synchronize(device)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        train_one_step()
+        torch.cuda.synchronize(device)
+
+    reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
+    allreduce_kernels = collect_linked_kernels(prof, _ALLREDUCE_OP_NAME_SUBSTRING)
+    # HFSDP reduce-scatters the DP-outer axis, so it never all-reduces.
+    assert not allreduce_kernels, [event.name for event in prof.events()]
+    # Per group (each child layer plus the root bias): one DP-inner reduce-scatter
+    # every microbatch plus one DP-outer reduce-scatter on the last microbatch.
+    expected = (num_microbatches + 1) * (num_children + 1)
+    assert len(reduce_scatter_kernels) == expected, (
+        f"Expected {expected} reduce-scatters ((num_microbatches + 1) x (num_children + 1)), "
+        f"got {len(reduce_scatter_kernels)}."
+    )
+
+
 def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     """An outer FsdpModule owns direct parameters but not nested child FsdpModule parameters."""
     world_size = distributed_setup.world_size
@@ -447,8 +608,9 @@ def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
     assert len(list(model.parameters())) == 1
 
 
-def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setup):
-    """Forward peak memory should stay below three live child all-gathers."""
+@pytest.mark.parametrize("main_params_dtype", [torch.bfloat16, torch.float32])
+def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
+    """FSDP should retain only its sharded weights and gradients at rest."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -458,38 +620,88 @@ def test_forward_peak_memory_bounds_in_flight_child_all_gathers(distributed_setu
     mesh = init_device_mesh(device.type, (world_size,))
     dim = 4096
     dtype = torch.bfloat16
-    model = MultiChildModel(dim=dim, num_children=4).to(dtype=dtype, device=device)
+    model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
+    placements = _flat_placements()
+    policy = MixedPrecisionPolicy(main_params_dtype=main_params_dtype)
+    allocated_before = torch.cuda.memory_allocated(device)
+    with fully_shard_context(device=device):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+
+    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+    persistent_allocated = torch.cuda.memory_allocated(device) - allocated_before
+    if main_params_dtype == dtype:
+        # Model and main weights alias, leaving only one BF16 weight buffer and one
+        # BF16 main-gradient buffer per child.
+        assert all(
+            group.model_weight is group.main_weight
+            for layer in model.layers
+            for group in layer.parameter_groups
+        )
+        expected_per_child_nbytes = 2 * child_weight_nbytes
+    else:
+        # FP32 main weights require a distinct buffer in addition to the BF16 model
+        # weight and BF16 main-gradient buffers.
+        main_weight_nbytes = dim * dim * torch.empty((), dtype=main_params_dtype).element_size()
+        expected_per_child_nbytes = 2 * child_weight_nbytes + main_weight_nbytes
+
+    # All persistent buffers are sharded over the data-parallel group. Small bookkeeping
+    # allocations stay below 1 MiB.
+    expected_persistent_nbytes = len(model.layers) * expected_per_child_nbytes // world_size
+    assert (
+        expected_persistent_nbytes <= persistent_allocated < expected_persistent_nbytes + 1024**2
+    ), (
+        "FSDP persistent memory does not match its sharded weight and gradient storage: "
+        f"rank={rank}, persistent_allocated={_mb(persistent_allocated)}, "
+        f"expected={_mb(expected_persistent_nbytes)}"
+    )
+
+
+def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
+    """A training step should stay below five full-size child buffers."""
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    dim = 4096
+    dtype = torch.bfloat16
+    model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
     with fully_shard_context(device=device):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer)
     x = torch.randn(2, dim, device=device, dtype=dtype)
-    with torch.no_grad():
-        model(x)
-    torch.cuda.synchronize(device)
-    torch.cuda.empty_cache()
 
-    resting_allocated = torch.cuda.memory_allocated(device)
-    torch.cuda.reset_peak_memory_stats(device)
-    with torch.no_grad():
-        model(x)
-    torch.cuda.synchronize(device)
-    peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
+    def train_step() -> None:
+        optimizer.zero_grad(set_to_none=True)
+        model(x).float().sum().backward()
+        optimizer.step()
 
     child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-    bound_nbytes = 3 * child_weight_nbytes
+    resting_allocated = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    train_step()
+    peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
 
-    # A parent forward should keep one previous child unsharded until its compute
-    # stream consumer is safe, plus the current child being unsharded. The bound
-    # is looser than two child weights to avoid coupling this test to CUDA
-    # allocator granularity and small temporary buffers, while still catching
-    # delayed releases piling up across the four child layers.
+    # Backward keeps the current child and one prefetched child unsharded. The current
+    # child also has a full wgrad until it is copied into a full reduce-scatter input,
+    # for a four-full-child-buffer peak. Allow one additional buffer for cuBLAS
+    # workspace, allocator granularity, and small temporaries.
+    bound_nbytes = (4 + 1) * child_weight_nbytes
+
     assert peak_delta < bound_nbytes, (
-        "FSDP forward peak memory exceeded the in-flight all-gather bound: "
+        "FSDP training-step peak memory exceeded the full-size-buffer bound: "
         f"rank={rank}, peak_delta={_mb(peak_delta)}, "
-        f"three_child_weights={_mb(bound_nbytes)}"
+        f"five_full_child_buffers={_mb(bound_nbytes)}"
     )
 
 
@@ -510,13 +722,12 @@ def test_deleted_model_releases_fsdp_storage(distributed_setup):
     x = torch.ones(1, 8192, dtype=torch.bfloat16, device=device)
     output = model(x)
     del output, x, model
-    torch.cuda.synchronize(device)
 
     assert torch.cuda.memory_allocated(device) - allocated_before < 1024**2
 
 
-def test_root_forward_returns_to_resting_memory(distributed_setup):
-    """Root forward should release child all-gather storage before returning."""
+def test_fully_shard_returns_to_resting_memory(distributed_setup):
+    """Fully-sharded temporary storage should be released after forward and backward."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -535,63 +746,32 @@ def test_root_forward_returns_to_resting_memory(distributed_setup):
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
 
     x = torch.randn(2, dim, device=device, dtype=dtype)
-    torch.cuda.synchronize(device)
-    torch.cuda.empty_cache()
-    resting_allocated = torch.cuda.memory_allocated(device)
 
-    with torch.no_grad():
-        output = model(x)
-    del output
-    torch.cuda.synchronize(device)
-    allocated_after_forward = torch.cuda.memory_allocated(device)
-    extra_allocated = allocated_after_forward - resting_allocated
-    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+    def clear_cublas_workspaces_and_get_allocated_memory() -> int:
+        # PyTorch retains a cuBLAS workspace for each handle/stream pair. Clear those
+        # library caches so this measurement isolates FSDP-managed storage.
+        torch._C._cuda_clearCublasWorkspaces()
+        return torch.cuda.memory_allocated(device)
 
-    assert extra_allocated < child_weight_nbytes, (
-        "Root forward did not return to resting memory after draining child releases: "
-        f"rank={rank}, extra_allocated={_mb(extra_allocated)}, "
-        f"one_child_weight={_mb(child_weight_nbytes)}"
-    )
+    resting_allocated = clear_cublas_workspaces_and_get_allocated_memory()
 
+    def assert_returns_to_resting_memory(phase: str) -> None:
+        extra_allocated = clear_cublas_workspaces_and_get_allocated_memory() - resting_allocated
+        # The live output, activations, and root-owned bias gradient are small; unsharded
+        # parameter storage must be released.
+        assert extra_allocated < 1024**2, (
+            f"Fully-sharded storage did not return to resting memory after {phase}: "
+            f"rank={rank}, extra_allocated={_mb(extra_allocated)}, "
+            "max_extra_allocated=1.00 MB"
+        )
 
-def test_root_backward_returns_to_resting_memory(distributed_setup):
-    """Root backward should release child all-gather storage before returning."""
-    rank = distributed_setup.rank
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    dim = 4096
-    dtype = torch.bfloat16
-    model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
-    placements = _flat_placements()
-    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device):
-        for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-        fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-
-    x = torch.randn(2, dim, device=device, dtype=dtype, requires_grad=True)
     output = model(x)
-    loss = output.float().square().mean()
-    torch.cuda.synchronize(device)
-    torch.cuda.empty_cache()
-    allocated_before_backward = torch.cuda.memory_allocated(device)
+    assert_returns_to_resting_memory("forward")
 
+    loss = output.float().square().mean()
     loss.backward()
     del loss, output
-    torch.cuda.synchronize(device)
-    allocated_after_backward = torch.cuda.memory_allocated(device)
-    extra_allocated = allocated_after_backward - allocated_before_backward
-    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-
-    assert extra_allocated < child_weight_nbytes, (
-        "Root backward did not return to resting memory after draining child releases: "
-        f"rank={rank}, extra_allocated={_mb(extra_allocated)}, "
-        f"one_child_weight={_mb(child_weight_nbytes)}"
-    )
+    assert_returns_to_resting_memory("backward")
 
 
 @pytest.mark.parametrize(
@@ -787,8 +967,7 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = nn.Linear(1, world_size, bias=False).to(device)
-    with torch.no_grad():
-        model.weight.fill_(1.0)
+    nn.init.constant_(model.weight, 1.0)
 
     with fully_shard_context(device=device):
         fully_shard(model, mesh=mesh, placements=_flat_placements())
@@ -812,8 +991,7 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = nn.Linear(1, world_size, bias=False, dtype=torch.bfloat16).to(device)
-    with torch.no_grad():
-        model.weight.fill_(1.0)
+    nn.init.constant_(model.weight, 1.0)
 
     with fully_shard_context(device=device):
         fully_shard(
@@ -945,9 +1123,8 @@ def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False))
-    with torch.no_grad():
-        model[0].weight.fill_(2.0)
-        model[1].weight.fill_(3.0)
+    nn.init.constant_(model[0].weight, 2.0)
+    nn.init.constant_(model[1].weight, 3.0)
     x = torch.ones(1, 4)
     expected_output = model(x).to(device)
 
@@ -980,9 +1157,8 @@ def test_meta_parameters_shard_to_mesh_device(distributed_setup):
     with fully_shard_context(device=device):
         fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    with torch.no_grad():
-        model[0].weight.fill_(2.0)
-        model[1].weight.fill_(3.0)
+    nn.init.constant_(model[0].weight, 2.0)
+    nn.init.constant_(model[1].weight, 3.0)
     # The exposed parameters update FP32 main weights, while forward uses separate BF16
     # model weights. This simulates load_checkpoint() until
     # https://github.com/NVIDIA/Megatron-LM/pull/6024 lands and syncs after loading.
@@ -1045,13 +1221,11 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
     x = torch.randn(batch, dim, device=device, dtype=dtype)
     torch.cuda.reset_peak_memory_stats(device)
     train_steps(baseline, baseline_optimizer, x)
-    torch.cuda.synchronize(device)
     baseline_peak = torch.cuda.max_memory_allocated(device)
 
     del baseline_optimizer
     del baseline
     del x
-    torch.cuda.empty_cache()
 
     torch.manual_seed(4321)
     model = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(device)
@@ -1066,12 +1240,10 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup):
                 ),
             )
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
-    torch.cuda.empty_cache()
 
     x = torch.randn(batch, dim, device=device, dtype=dtype)
     torch.cuda.reset_peak_memory_stats(device)
     train_steps(model, optimizer, x)
-    torch.cuda.synchronize(device)
     sharded_peak = torch.cuda.max_memory_allocated(device)
     logger.info(
         "FSDP peak memory: rank=%s, baseline=%s, sharded=%s",
