@@ -40,6 +40,9 @@ class GroupedRolloutRequest(Request):
     consumption_granularity: ConsumptionGranularity = "B"
 
 
+KNOWN_ROLLOUT_STATUSES = ('ok', 'placeholder', 'masked', 'graded')
+
+
 class Rollout(AgentBaseModel):
     """Data for language-based Rollout."""
 
@@ -48,6 +51,8 @@ class Rollout(AgentBaseModel):
     reward: float = None
     env_id: str = ''
     problem_id: str | None = None
+    rollout_status: str = 'ok'
+    failure_reason: str | None = None
 
 
 class TokenRollout(AgentBaseModel):
@@ -60,6 +65,8 @@ class TokenRollout(AgentBaseModel):
     env_id: str = ''
     problem_id: str | None = None
     completion_ids: list[str] = []
+    rollout_status: str = 'ok'
+    failure_reason: str | None = None
 
 
 Rollouts = list[TokenRollout | Rollout]
