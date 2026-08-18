@@ -1644,6 +1644,7 @@ def _resolve_packed_seq_idx(
         seq_idx = torch.repeat_interleave(
             torch.arange(seq_lengths.numel(), device=cu_seqlens.device, dtype=torch.int32),
             seq_lengths,
+            output_size=total_tokens,
         )
         seq_idx = seq_idx.unsqueeze(0)
     elif seq_idx.dim() == 1:
