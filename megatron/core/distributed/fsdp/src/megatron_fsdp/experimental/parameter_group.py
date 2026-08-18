@@ -516,6 +516,9 @@ class FsdpParameterGroup:
             dtype=self._partial_grad_dtype,
             device=self.main_weight.device,
         )
+        # Grouped expert kernels may leave zero-token or otherwise skipped regions
+        # unwritten. Clear the complete staging buffer before TE writes into its views.
+        self._fused_wgrad_buffer.local_buffer.zero_()
         for fsdp_parameter in self.fsdp_parameters:
             parameter = fsdp_parameter.unsharded
             parameter.grad_added_to_main_grad = False
@@ -593,12 +596,7 @@ class FsdpParameterGroup:
                 destinations.append(partial_grad.get_local_tensor(index))
                 sources.append(parameter.grad)
                 parameter.grad = None
-            elif self.fuse_wgrad_accumulation:
-                # TE overwrites every fused view and ordinary autograd gradients
-                # overwrite their views below. Initialize only an exceptional view
-                # that neither path produced instead of clearing the whole buffer.
-                partial_grad.get_local_tensor(index).zero_()
-            else:
+            elif not self.fuse_wgrad_accumulation:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
 
             if hasattr(parameter, "grad_added_to_main_grad"):
