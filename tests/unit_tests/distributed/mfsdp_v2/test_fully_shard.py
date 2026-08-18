@@ -20,7 +20,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_optimizer,
     microbatch,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
+    FsdpModule,
+    _fine_grained_pre_backward_hook,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_event_groups
 
@@ -341,6 +344,77 @@ def test_fused_wgrad_mixed_group_matches_baseline(distributed_setup, mixed_wgrad
             assert not fsdp_parameter.unsharded.grad_added_to_main_grad
 
     torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
+
+
+def test_fine_grained_fused_wgrad_matches_baseline(distributed_setup):
+    """A submodule-driven 1F1B backward must prepare fused-wgrad storage."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    baseline = nn.Linear(8, 4).to(device)
+    fused_linear = FusedWgradLinear(8, 4).to(device)
+    fused_linear.load_state_dict(baseline.state_dict())
+    model = nn.Sequential(fused_linear)
+
+    with fully_shard_context(device=device):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            fine_grained=True,
+            skip_backward_callback=True,
+            fuse_wgrad_accumulation=True,
+        )
+
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    inputs = [torch.randn(3, 8, device=device) for _ in range(3)]
+    targets = [torch.randn(3, 4, device=device) for _ in range(3)]
+    baseline_losses = []
+    losses = []
+
+    for x, target in zip(inputs, targets):
+        baseline_optimizer.zero_grad()
+        baseline_loss = torch.nn.functional.mse_loss(baseline(x), target)
+        baseline_loss.backward()
+        baseline_optimizer.step()
+        baseline_losses.append(baseline_loss.detach())
+
+        optimizer.zero_grad()
+        # The combined 1F1B schedule calls fine-grained nodes directly instead
+        # of invoking the containing FsdpModule's forward method.
+        loss = torch.nn.functional.mse_loss(model[0](x), target)
+        loss.backward()
+        model.post_backward()
+        # The production manual schedule waits for gradient synchronization
+        # before the optimizer consumes the sharded gradients. This test uses
+        # raw torch.optim directly, so reproduce that final stream dependency.
+        model.context.current_stream().wait_stream(model.context.reduce_scatter_stream)
+        optimizer.step()
+        losses.append(loss.detach())
+
+        assert model.phase is FsdpModule.Phase.RESTING
+        assert model.parameter_groups[0]._fused_wgrad_buffer is None
+
+    torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
+
+
+def test_fine_grained_pre_backward_rejects_forward_phase(distributed_setup):
+    """A backward hook must not silently unshard a target still in forward."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Sequential(nn.Linear(8, 4)).to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    model.phase = FsdpModule.Phase.FORWARD
+    with pytest.raises(RuntimeError, match="expected its FSDP target to be RESTING or BACKWARD"):
+        _fine_grained_pre_backward_hook(model[0], ())
 
 
 def test_fused_wgrad_zero_token_expert_overwrites_staging_buffer(distributed_setup):
