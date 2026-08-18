@@ -20,7 +20,7 @@ from collections.abc import Callable, Sequence
 
 import torch
 
-from .layout import non_leading_numel
+from .layout import GlobalLayout, non_leading_numel
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,6 +104,25 @@ class ShardPlan:
             row_count = overlap_numel // row_size
             rank_rows.append((row_start, row_count))
         return cls(full_shape=torch.Size(full_shape), rank_rows=tuple(rank_rows), row_size=row_size)
+
+    @classmethod
+    def from_layout(cls, layout: GlobalLayout, tensor_index: int, world_size: int) -> ShardPlan:
+        """Build a shard plan for one parameter from a `GlobalLayout`.
+
+        Extracts the parameter's shape, flat offset, and per-rank shard size from `layout` and
+        delegates to `from_layout_params`.
+
+        Args:
+            layout: The DBuffer global layout that contains the parameter.
+            tensor_index: Index of the parameter within `layout`.
+            world_size: DP group size.
+        """
+        return cls.from_layout_params(
+            layout.tensor_shapes[tensor_index],
+            layout.tensor_to_offset[tensor_index],
+            layout.size // world_size,
+            world_size,
+        )
 
     @property
     def world_size(self) -> int:
