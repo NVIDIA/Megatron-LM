@@ -169,12 +169,11 @@ def _make_psp() -> MoTPackedSeqParams:
 
 
 def test_mot_ep():
-    rank = torch.distributed.get_rank()
-
     # Initialize with EP=2
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, expert_model_parallel_size=2
     )
+    rank = torch.distributed.get_rank()
 
     model_parallel_cuda_manual_seed(42)
     config = _make_config()

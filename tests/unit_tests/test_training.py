@@ -159,7 +159,9 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
     monkeypatch.setattr(training_module, "get_energy_monitor", lambda: None)
     monkeypatch.setattr(training_module, "get_num_microbatches", lambda: 1)
     monkeypatch.setattr(
-        training_module, "reduce_max_stat_across_model_parallel_group", lambda value: value
+        training_module,
+        "reduce_max_stat_across_model_parallel_group",
+        lambda value, group=None: value,
     )
     monkeypatch.setattr(training_module, "num_floating_point_operations", lambda *a, **k: 0.0)
     monkeypatch.setattr(training_module.one_logger_utils, "track_app_tag", lambda *a, **k: None)
