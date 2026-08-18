@@ -59,7 +59,13 @@ _FLAT_SHARD = Placements(
 
 
 def _transformer_config(
-    num_layers: int, num_experts: int, ep_size: int, hidden: int, ffn_hidden: int
+    num_layers: int,
+    num_experts: int,
+    ep_size: int,
+    hidden: int,
+    ffn_hidden: int,
+    *,
+    gradient_accumulation_fusion: bool = False,
 ) -> TransformerConfig:
     return TransformerConfig(
         num_layers=num_layers,
@@ -73,7 +79,7 @@ def _transformer_config(
         moe_grouped_gemm=True,
         moe_ffn_hidden_size=ffn_hidden,
         add_bias_linear=False,
-        gradient_accumulation_fusion=False,
+        gradient_accumulation_fusion=gradient_accumulation_fusion,
         use_cpu_initialization=True,
         params_dtype=torch.float32,
         hidden_dropout=0.0,
@@ -163,8 +169,11 @@ def _train(
     [_NO_SHARD, _ZERO1_SHARD, _ZERO2_SHARD, _FLAT_SHARD],
     ids=["no-shard", "zero1", "zero2", "zero3"],
 )
-def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements, moe_placements):
-    """All dense/MoE ZeRO combinations reproduce sequential no-shard training."""
+@pytest.mark.parametrize("fuse_wgrad_accumulation", [False, True], ids=["unfused", "fused"])
+def test_ep_fsdp_matches_fullbatch_reference(
+    distributed_setup, dense_placements, moe_placements, fuse_wgrad_accumulation
+):
+    """All dense/MoE ZeRO combinations reproduce no-shard training with either wgrad path."""
     device = distributed_setup.device
     world_size, rank = distributed_setup.world_size, distributed_setup.rank
 
@@ -204,7 +213,14 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements
         layer_pattern,
     )
     model = _build_hybrid_model(
-        _transformer_config(num_layers, num_experts, ep_size, hidden, ffn_hidden),
+        _transformer_config(
+            num_layers,
+            num_experts,
+            ep_size,
+            hidden,
+            ffn_hidden,
+            gradient_accumulation_fusion=fuse_wgrad_accumulation,
+        ),
         _build_process_group_collection(one, dp=world, ep=ep_group, expert_dp=expert_dp_group),
         vocab,
         seq,
@@ -236,8 +252,14 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements
                     mesh=moe_mesh["edp"],
                     placements=moe_placements,
                     grad_divisor=ep_size,
+                    fuse_wgrad_accumulation=fuse_wgrad_accumulation,
                 )
-        fully_shard(model, mesh=world_mesh, placements=dense_placements)
+        fully_shard(
+            model,
+            mesh=world_mesh,
+            placements=dense_placements,
+            fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+        )
 
     # One global batch, identical on every rank; the reference sees all of it, the model its shard.
     torch.manual_seed(4321)
@@ -261,9 +283,13 @@ def test_ep_fsdp_matches_fullbatch_reference(distributed_setup, dense_placements
         msg="EP=4 mFSDP model did not reproduce full-batch EP=1 training.",
     )
 
-    # Destroy the groups this test created; leave the default (world) group for later tests.
-    # A mesh dim that spans every rank is backed by the default group rather than a fresh one
-    # (e.g. "ep" here when edp_size == 1).
+    # DeviceMesh may reuse an existing singleton group when EDP=1, so destroy
+    # each non-world process-group object at most once.
+    destroyed_groups = set()
     for group in (one, ep_group, expert_dp_group):
-        if group is not dist.group.WORLD:
-            dist.destroy_process_group(group)
+        if group is world or group is dist.group.WORLD:
+            continue
+        if id(group) in destroyed_groups:
+            continue
+        destroyed_groups.add(id(group))
+        dist.destroy_process_group(group)

@@ -195,6 +195,7 @@ class FsdpModule:
         use_symmetric_memory: bool = False,
         fine_grained: bool = False,
         skip_backward_callback: bool = False,
+        fuse_wgrad_accumulation: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -237,6 +238,7 @@ class FsdpModule:
                     reduce_scatter_stream=context.reduce_scatter_stream,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
+                    fuse_wgrad_accumulation=fuse_wgrad_accumulation,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
@@ -482,6 +484,8 @@ class FsdpModule:
             context.reduce_scatter_stream.wait_stream(current_stream)
 
         self._unshard_and_prefetch("colwise")
+        for group in self._parameter_groups:
+            group.prepare_fused_wgrad_buffer()
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state.
@@ -517,10 +521,16 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
 
-            with torch.cuda.stream(reduce_scatter_stream):
-                partial_grad = group.allocate_partial_grad_buffer()
-
-            current_stream.wait_stream(reduce_scatter_stream)
+            if group.fuse_wgrad_accumulation:
+                partial_grad = group.take_fused_wgrad_buffer()
+                # This buffer was allocated and written on the compute stream.
+                # Keep its storage unavailable to that stream's allocator until
+                # the reduce-scatter stream has finished consuming it.
+                partial_grad.local_buffer.record_stream(reduce_scatter_stream)
+            else:
+                with torch.cuda.stream(reduce_scatter_stream):
+                    partial_grad = group.allocate_partial_grad_buffer()
+                current_stream.wait_stream(reduce_scatter_stream)
             group.copy_gradients_to_partial_buffer(partial_grad)
 
             reduce_scatter_stream.wait_stream(current_stream)
