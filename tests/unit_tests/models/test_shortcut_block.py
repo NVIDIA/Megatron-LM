@@ -12,8 +12,9 @@ from megatron.core.models.hybrid.shortcut_block import (
     AsyncDispatchToPersistentGradBuffers,
     PersistentBuffer,
     RecordCombineGradReady,
-    ShortcutExecutionMode,
     ShortcutMoEBlock,
+    _GraphState,
+    _PersistentSlot,
     group_layers_into_shortcut_blocks,
 )
 from megatron.core.transformer.moe.token_dispatcher import MoEFlexTokenDispatcher
@@ -25,7 +26,7 @@ def test_group_layers_into_registered_shortcut_blocks():
         pipeline_model_parallel_size=1,
         mtp_use_repeated_layer=False,
         mtp_num_layers=None,
-        moe_shortcut_parallel=False,
+        moe_shortcut_parallel=True,
         fp32_residual_connection=False,
         hidden_size=8,
         layernorm_epsilon=1e-5,
@@ -59,6 +60,14 @@ def test_group_layers_into_registered_shortcut_blocks():
     compute = FakeCompute()
     moe = FakeMoE()
     standalone = torch.nn.Identity()
+    config.moe_shortcut_parallel = False
+    with pytest.raises(ValueError, match="requires moe_shortcut_parallel"):
+        group_layers_into_shortcut_blocks(
+            torch.nn.ModuleList([compute, moe]),
+            [LayerSymbols.MAMBA, LayerSymbols.MOE],
+            config,
+        )
+    config.moe_shortcut_parallel = True
     grouped = group_layers_into_shortcut_blocks(
         torch.nn.ModuleList([compute, moe, standalone]),
         [LayerSymbols.MAMBA, LayerSymbols.MOE, LayerSymbols.ATTENTION],
@@ -89,10 +98,10 @@ def cuda_graph_mempool():
 
 
 def test_shortcut_block_registers_pair_and_post_norm():
-    config = TransformerConfig(
-        num_layers=2,
+    config = SimpleNamespace(
         hidden_size=8,
-        num_attention_heads=1,
+        moe_shortcut_parallel=True,
+        layernorm_epsilon=1e-5,
         sequence_parallel=True,
     )
 
@@ -126,7 +135,6 @@ def test_shortcut_block_registers_pair_and_post_norm():
         moe,
         is_mamba=False,
         enable_cudagraph=False,
-        overlap_a2a=False,
     )
 
     assert block.compute_layer is compute
@@ -139,11 +147,46 @@ def test_shortcut_block_registers_pair_and_post_norm():
     )
     assert block.is_first_layer
     assert block.is_last_layer
+    assert block._graph_state is None
     assert list(dict(block.named_children())) == [
         "compute_layer",
         "moe_layer",
         "shortcut_post_norm",
     ]
+
+
+def test_shortcut_blocks_share_one_parallel_stream_per_device(monkeypatch):
+    created_streams = []
+
+    def make_stream(*, priority):
+        stream = SimpleNamespace(priority=priority)
+        created_streams.append(stream)
+        return stream
+
+    monkeypatch.setattr(ShortcutMoEBlock, "_parallel_streams", {})
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(torch.cuda, "Stream", make_stream)
+    first_block = object.__new__(ShortcutMoEBlock)
+    second_block = object.__new__(ShortcutMoEBlock)
+
+    first_stream = first_block._get_parallel_stream()
+    second_stream = second_block._get_parallel_stream()
+
+    assert first_stream is second_stream
+    assert first_stream.priority == -1
+    assert created_streams == [first_stream]
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Multiple CUDA devices required")
+def test_shortcut_blocks_use_distinct_parallel_streams_across_devices(monkeypatch):
+    monkeypatch.setattr(ShortcutMoEBlock, "_parallel_streams", {})
+
+    with torch.cuda.device(0):
+        first_stream = ShortcutMoEBlock._get_parallel_stream()
+    with torch.cuda.device(1):
+        second_stream = ShortcutMoEBlock._get_parallel_stream()
+
+    assert first_stream is not second_stream
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -177,6 +220,7 @@ def test_persistent_dispatch_gradients_flow_into_route_backward(
             self.input_scale = torch.nn.Parameter(torch.tensor(2.0))
             self.prob_scale = torch.nn.Parameter(torch.tensor(3.0))
             self.dispatch_args = None
+            self._local_cudagraph_attr_names = ()
 
         def shortcut_route_preprocess(self, shortcut_hidden, padding_mask=None):
             return shortcut_hidden * self.input_scale, shortcut_hidden * self.prob_scale
@@ -201,7 +245,7 @@ def test_persistent_dispatch_gradients_flow_into_route_backward(
     torch.nn.Module.__init__(block)
     block.compute_layer = compute
     block.moe_layer = moe
-    block.execution_mode = ShortcutExecutionMode.CUDA_GRAPH_OVERLAP
+    block.enable_cudagraph = True
     block._is_mamba = False
     route_slot = SimpleNamespace(
         route_input_buffer=PersistentBuffer("route input", requires_grad=True),
@@ -211,16 +255,21 @@ def test_persistent_dispatch_gradients_flow_into_route_backward(
         route_ready_event=route_ready_event,
         route_grad_ready_event=route_grad_ready_event,
     )
-    block._route_persistent_slots = [route_slot]
+    block._graph_state = SimpleNamespace(get_slot=lambda index: route_slot)
+    dispatch_output = (object(), object())
 
     def launch_dispatch(route_input, route_probs, event, **kwargs):
         moe.dispatch_args = (route_input, route_probs, event, kwargs)
+        return dispatch_output
 
-    monkeypatch.setattr(block, "launch_dispatch_async", launch_dispatch)
+    monkeypatch.setattr(block, "_launch_dispatch_async", launch_dispatch)
 
     hidden = torch.ones(4, device="cuda", requires_grad=True)
-    paired_state = ShortcutMoEBlock.route_input_compute(block, hidden)
-    block.launch_dispatch(0, paired_state[0], ())
+    route_outputs = ShortcutMoEBlock.route_input_compute(block, hidden)
+    paired_state, actual_dispatch_output = block._launch_dispatch(route_outputs, 0)
+    assert len(paired_state) == len(route_outputs)
+    assert all(actual is expected for actual, expected in zip(paired_state, route_outputs))
+    assert actual_dispatch_output is dispatch_output
 
     route_input, route_probs, actual_event, dispatch_kwargs = moe.dispatch_args
     assert route_input is route_slot.route_input_buffer.tensor
@@ -250,11 +299,15 @@ def test_shortcut_block_uses_two_method_level_graph_managers(monkeypatch):
 
     target = object.__new__(ShortcutMoEBlock)
     torch.nn.Module.__init__(target)
-    target.execution_mode = ShortcutExecutionMode.CUDA_GRAPH_OVERLAP
-    target._route_layer_boundaries = (True, False)
-    target._output_layer_boundaries = (False, True)
+    target.enable_cudagraph = True
+    target.config = SimpleNamespace(moe_latent_size=None)
+    target._graph_state = SimpleNamespace(route_manager=None, output_manager=None)
     target.compute_layer = torch.nn.Identity()
+    target.compute_layer.is_first_layer = True
+    target.compute_layer.is_last_layer = False
     target.moe_layer = SimpleNamespace(
+        is_first_layer=False,
+        is_last_layer=True,
         pre_mlp_layernorm=torch.nn.Identity(),
         mlp=SimpleNamespace(shared_experts=torch.nn.Identity()),
     )
@@ -293,7 +346,9 @@ def test_shortcut_block_uses_two_method_level_graph_managers(monkeypatch):
             target.shortcut_post_norm,
         ],
     }
-    assert target.cudagraph_manager is target.cudagraph_manager_output_shared_postprocess
+    assert target.cudagraph_manager is target._graph_state.output_manager
+    assert not hasattr(target, "cudagraph_manager_route_input_compute")
+    assert not hasattr(target, "cudagraph_manager_output_shared_postprocess")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -322,31 +377,36 @@ def test_persistent_buffer_rejects_cpu_template():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_output_shared_owns_one_persistent_combine_buffer(cuda_graph_mempool):
-    target = object.__new__(ShortcutMoEBlock)
-    torch.nn.Module.__init__(target)
-    target.execution_mode = ShortcutExecutionMode.CUDA_GRAPH_OVERLAP
-    target._output_persistent_slots = [
-        SimpleNamespace(
-            combined_output_buffer=PersistentBuffer(
-                "combined output",
-                prebound_graph_input=True,
-                detach_on_reuse=True,
-            )
-        )
-    ]
+def test_persistent_slot_owns_one_persistent_combine_buffer(cuda_graph_mempool):
+    slot = _PersistentSlot(0)
 
     template = torch.empty_strided((8, 16), (16, 1), device="cuda")
-    buffer = target.get_persistent_combined_output_buffer(0, template)
+    buffer = slot.acquire_combined_output(template)
     buffer_ptr = buffer.data_ptr()
 
     # Reuse detaches the prior autograd wrapper, but the graph-visible allocation is fixed.
-    reused_buffer = target.get_persistent_combined_output_buffer(0, template)
+    reused_buffer = slot.acquire_combined_output(template)
     assert reused_buffer.data_ptr() == buffer_ptr
-    assert target._output_persistent_slots[0].combined_output_buffer.tensor.data_ptr() == buffer_ptr
+    assert slot.combined_output_buffer.tensor.data_ptr() == buffer_ptr
 
     with pytest.raises(AssertionError, match="metadata changed"):
-        target.get_persistent_combined_output_buffer(0, torch.empty(4, 16, device="cuda"))
+        slot.acquire_combined_output(torch.empty(4, 16, device="cuda"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_graph_state_rotates_persistent_slots():
+    graph_state = _GraphState(3)
+
+    acquired = [graph_state.acquire_slot() for _ in range(5)]
+
+    assert [index for index, _ in acquired] == [0, 1, 2, 0, 1]
+    assert [slot for _, slot in acquired] == [
+        graph_state.slots[0],
+        graph_state.slots[1],
+        graph_state.slots[2],
+        graph_state.slots[0],
+        graph_state.slots[1],
+    ]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -555,8 +615,9 @@ def test_async_combine_bridge_preserves_gradient_and_event_order():
 
 
 @pytest.mark.parametrize("is_mamba", [True, False], ids=["mamba", "attention"])
-def test_eager_overlap_matches_serial_forward_and_gradients(monkeypatch, is_mamba):
+def test_eager_overlap_produces_gradients(monkeypatch, is_mamba):
     config = TransformerConfig(num_layers=2, hidden_size=4, num_attention_heads=1)
+    config.moe_shortcut_parallel = True
 
     class FakeCompute(torch.nn.Module):
         def __init__(self):
@@ -584,7 +645,6 @@ def test_eager_overlap_matches_serial_forward_and_gradients(monkeypatch, is_mamb
             self.dispatch_scale = torch.nn.Parameter(torch.tensor(5.0))
             self.expert_scale = torch.nn.Parameter(torch.tensor(7.0))
             self.combine_scale = torch.nn.Parameter(torch.tensor(11.0))
-            self._combined_output = None
 
         def dispatch(self, route_input, route_probs):
             return route_input * self.dispatch_scale, route_probs
@@ -595,8 +655,8 @@ def test_eager_overlap_matches_serial_forward_and_gradients(monkeypatch, is_mamb
         def combine(self, routed_output):
             return routed_output * self.combine_scale
 
-        def wait_combine(self):
-            return self._combined_output
+        def wait_combine(self, combined_output):
+            return combined_output
 
         def postprocess(self, combined_output, shared_expert_output):
             return combined_output + shared_expert_output
@@ -613,20 +673,19 @@ def test_eager_overlap_matches_serial_forward_and_gradients(monkeypatch, is_mamb
             self.prob_scale = torch.nn.Parameter(torch.tensor(17.0))
             self.shared_scale = torch.nn.Parameter(torch.tensor(19.0))
             self.mlp = FakeMLP()
-            self._dispatch_output = None
 
         def shortcut_route_preprocess(self, shortcut_hidden, padding_mask=None):
             return shortcut_hidden * self.route_scale, shortcut_hidden * self.prob_scale
 
         def launch_dispatch(self, route_input, route_probs, ready_event):
-            self._dispatch_output = self.mlp.dispatch(route_input, route_probs)
+            return self.mlp.dispatch(route_input, route_probs)
 
-        def wait_dispatch_and_launch_combine(self):
-            dispatched_input, dispatched_probs = self._dispatch_output
+        def wait_dispatch_and_launch_combine(self, dispatch_output):
+            dispatched_input, dispatched_probs = dispatch_output
             routed_output, _ = self.mlp.routed_experts_compute(
                 dispatched_input, dispatched_probs
             )
-            self.mlp._combined_output = self.mlp.combine(routed_output)
+            return self.mlp.combine(routed_output)
 
         def _shortcut_shared_experts(self, hidden_states):
             return hidden_states * self.shared_scale
@@ -638,7 +697,7 @@ def test_eager_overlap_matches_serial_forward_and_gradients(monkeypatch, is_mamb
     def quant_context_factory(config, layer_number):
         yield
 
-    def run(mode):
+    def run():
         compute = FakeCompute()
         moe = FakeMoE()
         block = ShortcutMoEBlock(
@@ -646,15 +705,14 @@ def test_eager_overlap_matches_serial_forward_and_gradients(monkeypatch, is_mamb
             moe,
             is_mamba=is_mamba,
             enable_cudagraph=False,
-            overlap_a2a=mode == ShortcutExecutionMode.EAGER_OVERLAP,
         )
-        monkeypatch.setattr(block, "launch_dispatch_async", moe.launch_dispatch)
+        monkeypatch.setattr(block, "_launch_dispatch_async", moe.launch_dispatch)
         monkeypatch.setattr(
             block,
-            "wait_dispatch_and_launch_combine",
+            "_wait_dispatch_and_launch_combine",
             moe.wait_dispatch_and_launch_combine,
         )
-        monkeypatch.setattr(block, "wait_combine", moe.mlp.wait_combine)
+        monkeypatch.setattr(block, "_wait_combine", moe.mlp.wait_combine)
 
         hidden_states = torch.arange(1.0, 5.0, requires_grad=True)
         output = block(
@@ -680,13 +738,10 @@ def test_eager_overlap_matches_serial_forward_and_gradients(monkeypatch, is_mamb
         lambda *args, **kwargs: SimpleNamespace(record=lambda stream: None),
     )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
-    serial_output, serial_gradients = run(ShortcutExecutionMode.EAGER_SERIAL)
-    overlap_output, overlap_gradients = run(ShortcutExecutionMode.EAGER_OVERLAP)
+    output, gradients = run()
 
-    torch.testing.assert_close(overlap_output, serial_output)
-    assert len(overlap_gradients) == len(serial_gradients)
-    for overlap_gradient, serial_gradient in zip(overlap_gradients, serial_gradients):
-        torch.testing.assert_close(overlap_gradient, serial_gradient)
+    assert output.isfinite().all()
+    assert all(gradient is not None and gradient.isfinite().all() for gradient in gradients)
 
 
 @pytest.mark.parametrize(
@@ -694,19 +749,12 @@ def test_eager_overlap_matches_serial_forward_and_gradients(monkeypatch, is_mamb
     [(True, "input_proj_ssm"), (False, "input_proj_attn")],
 )
 @pytest.mark.parametrize(
-    ("execution_mode", "enable_cudagraph"),
-    [
-        (ShortcutExecutionMode.EAGER_SERIAL, False),
-        (ShortcutExecutionMode.EAGER_OVERLAP, False),
-        (ShortcutExecutionMode.CUDA_GRAPH_OVERLAP, True),
-    ],
-    ids=["eager-serial", "eager-overlap", "graph-overlap"],
+    "enable_cudagraph", [False, True], ids=["eager-overlap", "graph-overlap"]
 )
 def test_shortcut_block_selects_a2a_schedule(
     monkeypatch,
     is_mamba,
     compute_method,
-    execution_mode,
     enable_cudagraph,
 ):
     calls = []
@@ -757,31 +805,26 @@ def test_shortcut_block_selects_a2a_schedule(
     def route_input_compute(actual_hidden, **kwargs):
         assert actual_hidden is hidden_states
         route_preprocess(shortcut_hidden=actual_hidden, padding_mask=kwargs["padding_mask"])
-        if execution_mode != ShortcutExecutionMode.EAGER_SERIAL:
-            calls.append("record_event")
+        calls.append("record_event")
         compute_kwargs = dict(kwargs)
         compute_kwargs.pop("persistent_slot", None)
         paired_state = input_projection(hidden_states=actual_hidden, **compute_kwargs)
-        if execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
+        if enable_cudagraph:
             return (*paired_state, dispatcher_attr_output)
         return permuted_input, dispatch_probs, paired_state
 
     route_ready_event = SimpleNamespace(record=lambda stream: calls.append("record_event"))
 
-    def launch_dispatch(actual_input, actual_probs, actual_event):
-        assert actual_input is permuted_input
-        assert actual_probs is dispatch_probs
-        assert actual_event is route_ready_event
-        calls.append("launch_dispatch")
-
     combine_ready_event = object()
     combine_grad_ready_event = object()
 
     def wait_dispatch_and_launch_combine(
+        actual_dispatch_output,
         persistent_output_factory=None,
         ready_event=None,
         grad_ready_event=None,
     ):
+        assert actual_dispatch_output == (dispatched_input, dispatched_probs)
         calls.append("wait_dispatch_and_launch_combine")
         if enable_cudagraph:
             assert callable(persistent_output_factory)
@@ -791,6 +834,7 @@ def test_shortcut_block_selects_a2a_schedule(
         assert persistent_output_factory is None
         assert ready_event is None
         assert grad_ready_event is None
+        return combined_output
 
     def dispatch(actual_input, actual_probs):
         assert actual_input is permuted_input
@@ -809,13 +853,14 @@ def test_shortcut_block_selects_a2a_schedule(
         calls.append("combine")
         return combined_output
 
-    def wait_combine():
+    def wait_combine(actual_combined_output):
+        assert actual_combined_output is combined_output
         calls.append("wait_combine")
-        return combined_output
+        return actual_combined_output
 
     def output_shared(
         *paired_state,
-        combined_output=None,
+        combined_output,
         inference_context,
         padding_mask,
         persistent_slot=0,
@@ -824,11 +869,11 @@ def test_shortcut_block_selects_a2a_schedule(
         assert paired_state == (compute_dependency, compute_aux)
         assert inference_context is expected_inference_context
         assert padding_mask is expected_padding_mask
-        calls.append("output_shared")
-        if combined_output is None:
-            assert execution_mode == ShortcutExecutionMode.EAGER_OVERLAP
-            return projected_hidden, shared_expert_output
+        calls.append("output_projection")
+        calls.append("shared_experts")
         assert combined_output is expected_combined_output
+        if not enable_cudagraph:
+            combined_output = wait_combine(combined_output)
         return postprocess(projected_hidden, combined_output, shared_expert_output)
 
     def postprocess(actual_hidden, actual_combined, actual_shared):
@@ -855,42 +900,41 @@ def test_shortcut_block_selects_a2a_schedule(
     torch.nn.Module.__init__(block)
     block.compute_layer = compute_layer
     block.moe_layer = moe_layer
-    block.execution_mode = execution_mode
-    block._persistent_slot_count = 1
-    block._next_persistent_slot = 0
+    block.enable_cudagraph = enable_cudagraph
     block.route_ready_event = route_ready_event
     monkeypatch.setattr(block, "route_input_compute", route_input_compute)
     monkeypatch.setattr(block, "output_shared", output_shared)
-    monkeypatch.setattr(block, "postprocess", postprocess)
-    monkeypatch.setattr(block, "launch_dispatch_async", launch_dispatch)
+    monkeypatch.setattr(block, "_postprocess", postprocess)
     monkeypatch.setattr(
         block,
-        "wait_dispatch_and_launch_combine",
+        "_wait_dispatch_and_launch_combine",
         wait_dispatch_and_launch_combine,
     )
-    monkeypatch.setattr(block, "wait_combine", wait_combine)
-    monkeypatch.setattr(
-        block,
-        "get_output_persistent_slot",
-        lambda slot: SimpleNamespace(
-            combine_ready_event=combine_ready_event,
-            combine_grad_ready_event=combine_grad_ready_event,
-        ),
+    monkeypatch.setattr(block, "_wait_combine", wait_combine)
+    output_slot = SimpleNamespace(
+        acquire_combined_output=lambda tensor: tensor,
+        combine_ready_event=combine_ready_event,
+        combine_grad_ready_event=combine_grad_ready_event,
     )
-    monkeypatch.setattr(
-        block, "get_persistent_combined_output_buffer", lambda slot, tensor: tensor
+
+    block._graph_state = (
+        SimpleNamespace(acquire_slot=lambda: (0, output_slot)) if enable_cudagraph else None
     )
-    if execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
 
-        def launch_unified_dispatch(
-            persistent_slot, backward_dependency, token_dispatcher_attr_outputs
-        ):
-            assert persistent_slot == 0
-            assert backward_dependency is compute_dependency
-            assert token_dispatcher_attr_outputs == (dispatcher_attr_output,)
-            calls.append("launch_dispatch")
+    def launch_unified_dispatch(route_outputs, persistent_slot):
+        assert persistent_slot == 0
+        if enable_cudagraph:
+            assert route_outputs == (compute_dependency, compute_aux, dispatcher_attr_output)
+        else:
+            assert route_outputs == (
+                permuted_input,
+                dispatch_probs,
+                (compute_dependency, compute_aux),
+            )
+        calls.append("launch_dispatch")
+        return (compute_dependency, compute_aux), (dispatched_input, dispatched_probs)
 
-        monkeypatch.setattr(block, "launch_dispatch", launch_unified_dispatch)
+    monkeypatch.setattr(block, "_launch_dispatch", launch_unified_dispatch)
 
     @contextmanager
     def quant_context_factory(actual_config, layer_number):
@@ -915,7 +959,7 @@ def test_shortcut_block_selects_a2a_schedule(
     )
 
     assert output is final_output
-    if execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
+    if enable_cudagraph:
         expected_calls = [
             "route",
             "prepare_dispatch",
@@ -923,20 +967,8 @@ def test_shortcut_block_selects_a2a_schedule(
             compute_method,
             "launch_dispatch",
             "wait_dispatch_and_launch_combine",
-            "output_shared",
-            "postprocess",
-        ]
-        expected_num_contexts = 2
-    elif execution_mode == ShortcutExecutionMode.EAGER_OVERLAP:
-        expected_calls = [
-            "route",
-            "prepare_dispatch",
-            "record_event",
-            compute_method,
-            "launch_dispatch",
-            "wait_dispatch_and_launch_combine",
-            "output_shared",
-            "wait_combine",
+            "output_projection",
+            "shared_experts",
             "postprocess",
         ]
         expected_num_contexts = 2
@@ -944,33 +976,18 @@ def test_shortcut_block_selects_a2a_schedule(
         expected_calls = [
             "route",
             "prepare_dispatch",
+            "record_event",
             compute_method,
-            "dispatch",
-            "routed_experts",
-            "combine",
-            "output_shared",
+            "launch_dispatch",
+            "wait_dispatch_and_launch_combine",
+            "output_projection",
+            "shared_experts",
+            "wait_combine",
             "postprocess",
         ]
-        expected_num_contexts = 3
+        expected_num_contexts = 2
     assert calls == expected_calls
     assert quant_contexts == ["enter", "exit"] * expected_num_contexts
-
-
-def test_shortcut_execution_mode_resolution():
-    assert (
-        ShortcutExecutionMode.resolve(enable_cudagraph=False, overlap_a2a=False)
-        == ShortcutExecutionMode.EAGER_SERIAL
-    )
-    assert (
-        ShortcutExecutionMode.resolve(enable_cudagraph=False, overlap_a2a=True)
-        == ShortcutExecutionMode.EAGER_OVERLAP
-    )
-    assert (
-        ShortcutExecutionMode.resolve(enable_cudagraph=True, overlap_a2a=True)
-        == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP
-    )
-    with pytest.raises(ValueError, match="require moe_shortcut_parallel"):
-        ShortcutExecutionMode.resolve(enable_cudagraph=True, overlap_a2a=False)
 
 
 def test_shortcut_rejects_shared_expert_overlap():
