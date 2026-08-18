@@ -107,8 +107,13 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
     )
 
 
-def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
-    """A training step should stay below five full-size child buffers."""
+@pytest.mark.parametrize(
+    "unify_communication_stream", [False, True], ids=["separate_streams", "unified_stream"]
+)
+def test_training_step_peak_memory_bounds_full_size_buffers(
+    distributed_setup, unify_communication_stream
+):
+    """A training step should stay within its full-size-buffer bound."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -121,7 +126,7 @@ def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
     model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
     placements = _flat_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device):
+    with fully_shard_context(device=device, unify_communication_stream=unify_communication_stream):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
@@ -142,15 +147,18 @@ def test_training_step_peak_memory_bounds_full_size_buffers(distributed_setup):
     peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
 
     # Backward keeps the current child and one prefetched child unsharded. The current
-    # child also has a full wgrad until it is copied into a full reduce-scatter input,
-    # for a four-full-child-buffer peak. Allow one additional buffer for cuBLAS
-    # workspace, allocator granularity, and small temporaries.
-    bound_nbytes = (4 + 1) * child_weight_nbytes
+    # child also has a full wgrad until it is copied into a full reduce-scatter input.
+    # With separate streams, their allocation cannot reuse the released full-weight
+    # storage, for a four-buffer peak. With a unified stream, the release precedes the
+    # allocation on that stream, reducing the peak to three. Allow one additional buffer
+    # for cuBLAS workspace, allocator granularity, and small temporaries.
+    full_buffer_bound = 4 if unify_communication_stream else 5
+    bound_nbytes = full_buffer_bound * child_weight_nbytes
 
     assert peak_delta < bound_nbytes, (
         "FSDP training-step peak memory exceeded the full-size-buffer bound: "
         f"rank={rank}, peak_delta={_mb(peak_delta)}, "
-        f"five_full_child_buffers={_mb(bound_nbytes)}"
+        f"{full_buffer_bound}_full_child_buffers={_mb(bound_nbytes)}"
     )
 
 

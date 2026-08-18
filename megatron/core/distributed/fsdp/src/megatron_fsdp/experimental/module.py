@@ -44,32 +44,43 @@ class FsdpContext:
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
     is_last_microbatch: bool
     use_symmetric_memory: bool
+    unify_communication_stream: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
     forward_order: IndexedOrder["FsdpModule"]
     backward_order: IndexedOrder["FsdpModule"]
 
-    def __init__(self, device: torch.device, use_symmetric_memory: bool = False) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        use_symmetric_memory: bool = False,
+        unify_communication_stream: bool = False,
+    ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
             device: Device on which this context schedules communication.
             use_symmetric_memory: Whether modules constructed in this context allocate
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
+            unify_communication_stream: Whether all-gathers and reduce-scatters share one
+                communication stream to reduce peak transient memory.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
+        self.unify_communication_stream = unify_communication_stream
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         # Construction-only; empty after finalization.
         self._registered_modules: list[FsdpModule] = []
         self._is_finalized = False
-        with torch.cuda.device(device):
-            self.allgather_stream = torch.cuda.Stream()
+        self.allgather_stream = torch.cuda.Stream(device)
+        if unify_communication_stream:
             # A unified stream lets an all-gather reuse the storage released by a
             # preceding reduce-scatter.
             self.reduce_scatter_stream = self.allgather_stream
+        else:
+            self.reduce_scatter_stream = torch.cuda.Stream(device)
 
     def register_module(self, module: "FsdpModule") -> None:
         """Register a module constructed in this context."""
@@ -388,8 +399,6 @@ class FsdpModule:
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
-        # Releasing the current full weight before allocating the packed gradient
-        # lets the communication stream reuse its storage for a later all-gather.
         self._reshard_parameter_groups()
         self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING
