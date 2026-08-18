@@ -765,6 +765,8 @@ def can_skip_inference() -> bool:
     if _ROLLOUT_PIPELINE is None:
         return False
     skip = False
+    if torch.distributed.get_rank() == 0:
+        skip = _ROLLOUT_PIPELINE.settle(get_asyncio_loop()) >= 1
     result = [skip]
     torch.distributed.broadcast_object_list(result, src=0)
     return result[0]
@@ -1857,6 +1859,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
         "rollout_pipeline_output_queue_size": pipeline.output_queue.qsize(),
         "rollout_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
         "rollout_pipeline_consume_pending_groups": len(pipeline._consume_pending),
+        "rollout_pipeline_ready_batches": pipeline.ready_batches,
         "rollout_pipeline_regen_pending_groups": len(pipeline._regen_tasks),
         "rollout_pipeline_gate_capacity": gate.capacity,
         "rollout_pipeline_gate_held": gate.held,
@@ -2035,6 +2038,14 @@ def maybe_log_training_metrics(
             if not isinstance(v, (int, float, bool)):
                 full_key = _bounded_artifact_key(full_key)
             metrics[full_key] = v
+
+    runtime_state = get_rl_runtime_state()
+    inference_collections = runtime_state.inference_ran + runtime_state.inference_skipped
+    metrics['rl_inference_ran'] = runtime_state.inference_ran
+    metrics['rl_inference_skipped'] = runtime_state.inference_skipped
+    metrics['rl_inference_skip_fraction'] = (
+        runtime_state.inference_skipped / inference_collections if inference_collections else 0.0
+    )
 
     # Per-pipeline instrumentation (queue sizes, gate state, per-stage
     # timings) and the multi-task work distribution, collected on rank 0
@@ -2700,7 +2711,9 @@ def get_grpo_data_iterator(
             is_correction=is_correction,
             request_ledger=runtime_state.request_ledger,
         )
-        if optimizer_is_on_cpu:
+        # The optimizer is offloaded inside colocated_inference,
+        # so there is nothing to restore when the inference context switch was skipped.
+        if optimizer_is_on_cpu and run_inference:
             nvtx_range = get_nvtx_range()
             with nvtx_range("rl/restore-optimizer-after-inference", time=True):
                 with nvtx_range("rl/restore/grad-buffers", time=True):
