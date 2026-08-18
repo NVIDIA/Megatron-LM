@@ -115,7 +115,10 @@ from megatron.core.rerun_state_machine import (
 )
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexerLossLoggingHelper,
+    is_dsa_skip_topk_layer,
+)
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -389,11 +392,14 @@ def _topk_attended_positions_per_token(seqlen, topk, compress_ratio=1):
 
     A query at position ``i`` can only choose among the ``i // compress_ratio``
     entries formed so far, so it attends to ``min(i // compress_ratio, topk)``
-    of them. Averaged over a sequence of length ``seqlen`` that is
-    ``eff * (1 - eff * compress_ratio / (2 * seqlen))`` with
+    of them. Averaged over a sequence of length ``seqlen`` this is approximated
+    as ``eff * (1 - eff * compress_ratio / (2 * seqlen))`` with
     ``eff = min(topk, seqlen // compress_ratio)``: ``topk`` once the sequence is
     long enough, corrected for the early queries that have fewer than ``topk``
     candidates available.
+
+    The continuous form drops the ``+ topk / (2 * seqlen)`` term of the exact
+    discrete sum, undercounting by a relative ``1 / (2 * seqlen - topk)``.
 
     ``compress_ratio`` is the number of source tokens per selectable entry --
     ``1`` for DSA (top-k over the original KV) and ``4`` for the DSv4 CSA layers
@@ -522,16 +528,17 @@ def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_to
     evaluated at the length-weighted mean ``sum(L^2) / sum(L)``. That is exact
     when every sequence in the batch has the same length (the usual packed-THD
     benchmark case) and, for ragged batches, weights toward the long sequences
-    that dominate attention cost. Returns ``1.0`` when the sequences are no
-    longer than ``topk``, where top-k selects everything and attention is dense.
+    that dominate attention cost. Collapses to ``1.0`` when the sequences are no
+    longer than ``topk``, where top-k selects everything and attention is dense
+    (the clamp inside ``_topk_attended_positions_per_token`` handles that case;
+    flooring a fractional mean leaves a residual of ``frac ** 2 / mean ** 2``).
     """
     if not dsa_indexer_topk or total_real_tokens <= 0 or seqlen_squared_sum <= 0:
         return 1.0
     mean_seqlen = seqlen_squared_sum / total_real_tokens
-    if mean_seqlen <= dsa_indexer_topk:
-        return 1.0
     attended = _topk_attended_positions_per_token(mean_seqlen, dsa_indexer_topk)
-    # Dense causal attention averages ``mean_seqlen / 2`` keys per query.
+    # Dense causal attention averages ~``mean_seqlen / 2`` keys per query
+    # (exactly ``(mean_seqlen + 1) / 2``; the same O(1/L) approximation as above).
     return attended / (mean_seqlen / 2)
 
 
@@ -543,8 +550,6 @@ def _num_dsa_indexer_layers(num_layers, skip_topk_offset, topk_freq):
     interleave other layer types and use
     ``_num_hybrid_dsa_indexer_layers`` instead.
     """
-    from megatron.core.transformer.experimental_attention_variant.dsa import is_dsa_skip_topk_layer
-
     return sum(
         1
         for layer_number in range(1, num_layers + 1)
@@ -566,7 +571,6 @@ def _num_hybrid_dsa_indexer_layers(hybrid_layer_pattern, skip_topk_offset, topk_
         Symbols,
         parse_hybrid_pattern,
     )
-    from megatron.core.transformer.experimental_attention_variant.dsa import is_dsa_skip_topk_layer
 
     parsed = parse_hybrid_pattern(hybrid_layer_pattern)
     main = (parsed.main_pattern or "").replace(Symbols.PIPE, "")
@@ -844,8 +848,6 @@ def num_floating_point_operations(
         core = fma * (
             num_heads * (qk_head_dim + qk_pos_emb_head_dim) / 2 + num_heads * v_head_dim / 2
         )
-        # Returned split so callers that make only the core term sparse (DSA) can
-        # scale that half on its own.
         return token_linear, core
 
     def mamba_layer_flops(
@@ -945,8 +947,7 @@ def num_floating_point_operations(
         dsa_indexer_loss_coeff=None,
     ):
         """Calculate total FLOPs for the hybrid model."""
-        # Indexer FLOPs are accumulated separately because they take their own
-        # fwd/bwd expansion rather than the global ``* 3`` applied to the rest.
+        # Kept out of the global ``* 3``: the indexer carries its own expansion.
         dsa_indexer_flops_total = 0
         # Self-attention (already summed over all attention layers, fwd-equivalent
         # with the FMA factor baked in; the global ``* 3`` below adds fwd+bwd).
@@ -992,6 +993,9 @@ def num_floating_point_operations(
                 # extra. Mirrors the ``dsa`` branch of ``transformer_flops`` so a
                 # DSA model reports the same FLOPs whether it is launched through
                 # a hybrid layer pattern or as a plain GPT model.
+                assert (
+                    dsa_indexer_topk is not None
+                ), "dsa_indexer_topk must be set for experimental_attention_variant='dsa'."
                 mla_core_term *= _dsa_sparse_core_scale(
                     total_tokens, seqlen_squared_sum, dsa_indexer_topk
                 )
@@ -1348,6 +1352,11 @@ def num_floating_point_operations(
             linear_self_attn_term = 0
             num_standard_attention_layers = num_layers
 
+            # Without top-k the core term stays dense while the indexer is still
+            # charged, which describes no real model. Matches the dsv4_hybrid asserts.
+            assert (
+                args.dsa_indexer_topk is not None
+            ), "dsa_indexer_topk must be set for experimental_attention_variant='dsa'."
             standard_self_attn_core_term *= _dsa_sparse_core_scale(
                 total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
             )

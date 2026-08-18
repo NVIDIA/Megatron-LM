@@ -1077,13 +1077,14 @@ def _make_dsa_args(dsa_indexer_loss_coeff=0.01):
     return args
 
 
-def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum):
+def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum, num_indexer_layers=None):
     """Independent golden calculator for DSA FLOPs.
 
     Reimplements the formula from ``num_floating_point_operations`` so that
-    the test does not just call the same code twice. Assumes no MoE / MTP,
-    ``dsa_indexer_topk_freq=1``, and ``dsa_indexer_skip_topk_offset=0``
-    (every layer computes its own index).
+    the test does not just call the same code twice. Assumes no MoE / MTP.
+    ``num_indexer_layers`` defaults to every layer, which is what
+    ``dsa_indexer_topk_freq=1`` / ``dsa_indexer_skip_topk_offset=0`` give;
+    cross-layer sharing cases pass the expected count explicitly.
     """
     fwd_bwd = 3
     fma = 2
@@ -1114,8 +1115,9 @@ def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum):
         sparse_scale = topk_pairs / dense_pairs
     sparse_core_per_layer = fwd_bwd * fma * raw_core * sparse_scale
 
-    # ---- DSA indexer: every layer is a computing layer (topk_freq=1, skip_offset=0) ----
-    num_indexer_layers = num_layers
+    # ---- DSA indexer: only layers that compute their own top-k index ----
+    if num_indexer_layers is None:
+        num_indexer_layers = num_layers
     idx_dim = args.dsa_indexer_n_heads * args.dsa_indexer_head_dim
     idx_token = num_indexer_layers * (
         args.q_lora_rank * idx_dim  # wq_b
@@ -1194,6 +1196,34 @@ class TestDSA:
         assert flops == _dsa_golden_flops(args, total_tokens, sum_sq)
         # A frozen indexer must cost strictly less than a trained one.
         assert flops < num_floating_point_operations(_make_dsa_args(0.01), batch_size)
+
+    def test_cross_layer_index_sharing(self):
+        """Only layers that compute their own top-k index pay for the indexer.
+
+        ``dsa_indexer_topk_freq=1`` makes ``is_dsa_skip_topk_layer``
+        unconditionally False, so the layer-counting logic is only actually
+        exercised with sharing on. Here ``freq=4, offset=1`` leaves layers 1 and
+        5 computing out of 8, and ``_num_dsa_indexer_layers`` has to stay in
+        lockstep with the predicate in megatron.core.
+        """
+        args = _make_dsa_args()
+        args.num_layers = 8
+        args.dsa_indexer_topk_freq = 4
+        args.dsa_indexer_skip_topk_offset = 1
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        # Layers 1..8 compute when (max(L - 1, 0) % 4) == 0, i.e. layers 1 and 5.
+        expected = _dsa_golden_flops(args, total_tokens, sum_sq, num_indexer_layers=2)
+        assert num_floating_point_operations(args, batch_size) == expected
+
+        # Sharing must be cheaper than every layer running its own indexer.
+        no_sharing = _make_dsa_args()
+        no_sharing.num_layers = 8
+        assert num_floating_point_operations(args, batch_size) < num_floating_point_operations(
+            no_sharing, batch_size
+        )
 
 
 def _make_dsa_pair(*, num_layers, moe):
