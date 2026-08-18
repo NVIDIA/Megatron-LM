@@ -14,8 +14,6 @@
 
 name: CICD Megatron-LM
 on:
-  schedule:
-    - cron: 0 0 * * *
   push:
     branches:
       - "pull-request/[0-9]+"
