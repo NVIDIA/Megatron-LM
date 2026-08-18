@@ -45,6 +45,7 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
@@ -506,6 +507,31 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
 class FullyShardedDataParallelV2(_BaseDataParallel):
     """MFSDP v2 wrapper for the Megatron model."""
 
+    @staticmethod
+    def _configure_te_grouped_mlp_wgrad_fusion(
+        module: torch.nn.Module, enabled: bool
+    ) -> None:
+        """Restrict fused wgrad accumulation to routed TE grouped experts.
+
+        ``gradient_accumulation_fusion`` is consumed while the model is built, so
+        every compatible linear starts with fusion enabled. MFSDP's parameter-group
+        setting must match those linear-module flags: first disable fusion throughout
+        the constructed model, then opt only ``TEGroupedMLP``'s grouped FC1/FC2 back in.
+        """
+        if not enabled:
+            return
+
+        for submodule in module.modules():
+            if hasattr(submodule, "fuse_wgrad_accumulation"):
+                submodule.fuse_wgrad_accumulation = False
+            if hasattr(submodule, "gradient_accumulation_fusion"):
+                submodule.gradient_accumulation_fusion = False
+
+        for submodule in module.modules():
+            if isinstance(submodule, TEGroupedMLP):
+                submodule.linear_fc1.fuse_wgrad_accumulation = True
+                submodule.linear_fc2.fuse_wgrad_accumulation = True
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -551,6 +577,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if fsdp_unit_modules is None:
             fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+        self._configure_te_grouped_mlp_wgrad_fusion(
+            module, enabled=config.gradient_accumulation_fusion
+        )
+
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
         )
@@ -633,6 +663,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             mixed_precision_policy=self.mp_policy,
                             fine_grained=fine_grained,
                             skip_backward_callback=skip_backward_cb,
+                            fuse_wgrad_accumulation=(
+                                config.gradient_accumulation_fusion
+                                and isinstance(submodule.experts, TEGroupedMLP)
+                            ),
                             grad_divisor=config.expert_model_parallel_size,
                         )
             for submodule in reversed(list(module.modules())):
@@ -648,6 +682,34 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         mixed_precision_policy=self.mp_policy,
                         fine_grained=fine_grained,
                         skip_backward_callback=skip_backward_cb,
+                        fuse_wgrad_accumulation=(
+                            config.gradient_accumulation_fusion
+                            and isinstance(submodule, TEGroupedMLP)
+                        ),
+                    )
+                elif isinstance(submodule, TEGroupedMLP) and not isinstance(submodule, FsdpModule):
+                    # Real MoE layers are sharded through their MoELayer owner above. Keep
+                    # this fallback for standalone TEGroupedMLP modules without wrapping an
+                    # already-owned expert module a second time.
+                    if self.moe_mesh is None:
+                        if pg_collection.expt_dp is None:
+                            raise ValueError(
+                                "MFSDP v2 MoE models require an explicit expt_dp group."
+                            )
+                        self.moe_mesh = DeviceMesh.from_group(
+                            pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("edp",)
+                        )
+                    fully_shard(
+                        submodule,
+                        mesh=self.moe_mesh,
+                        placements=expert_placements,
+                        mixed_precision_policy=self.mp_policy,
+                        fine_grained=fine_grained,
+                        skip_backward_callback=skip_backward_cb,
+                        fuse_wgrad_accumulation=(
+                            config.gradient_accumulation_fusion
+                            and isinstance(submodule, TEGroupedMLP)
+                        ),
                     )
             fully_shard(
                 module,
@@ -656,6 +718,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 mixed_precision_policy=self.mp_policy,
                 fine_grained=fine_grained,
                 skip_backward_callback=skip_backward_cb,
+                fuse_wgrad_accumulation=(
+                    config.gradient_accumulation_fusion and isinstance(module, TEGroupedMLP)
+                ),
             )
         super().__init__(config=config, module=module)
         if config.init_model_with_meta_device:
@@ -855,7 +920,27 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         "MFSDP v2 hybrid MoE sharding requires an explicit expt_dp group."
                     )
         if config.gradient_accumulation_fusion:
-            raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
+            if not is_te_min_version("2.10"):
+                raise ValueError(
+                    "MFSDP v2 gradient accumulation fusion requires Transformer Engine 2.10+."
+                )
+            unsupported_fused_wgrad_features = []
+            if config.overlap_moe_expert_parallel_comm:
+                unsupported_fused_wgrad_features.append("1F1B EP overlap")
+            if ddp_config.delay_wgrad_compute:
+                unsupported_fused_wgrad_features.append("delayed wgrad")
+            if config.use_transformer_engine_op_fuser:
+                unsupported_fused_wgrad_features.append("Transformer Engine op fuser")
+            if ddp_config.nccl_ub:
+                unsupported_fused_wgrad_features.append("symmetric-memory NCCL-UB")
+            if config.fp8 or ddp_config.fp8_param_gather:
+                unsupported_fused_wgrad_features.append("FP8 parameter gather")
+            if unsupported_fused_wgrad_features:
+                raise ValueError(
+                    "MFSDP v2 gradient accumulation fusion does not yet support: "
+                    + ", ".join(unsupported_fused_wgrad_features)
+                    + "."
+                )
         if config.calculate_per_token_loss:
             raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
         if config.fp4 or ddp_config.fp4_param_gather:
