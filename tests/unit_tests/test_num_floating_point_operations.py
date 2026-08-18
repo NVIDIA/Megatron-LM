@@ -1040,13 +1040,17 @@ class TestDSv4HybridMatchesStandard:
         assert hyb_flops == std_flops
 
 
-def _make_dsa_args():
+def _make_dsa_args(dsa_indexer_loss_coeff=0.01):
     """Minimal MLA + DSA args (GLM-5.2 style, small scale).
 
     Uses ``dsa_indexer_topk_freq=1`` and ``dsa_indexer_skip_topk_offset=0``
     so every layer computes its own top-k index -- the golden reference can
     set ``num_indexer_layers = num_layers`` without importing the skip-layer
     predicate from megatron.core.
+
+    ``dsa_indexer_loss_coeff`` drives the indexer's fwd/bwd expansion: the
+    indexer only has a backward pass when its KL loss is enabled. The default
+    here matches the in-tree functional test configs.
     """
     args = _make_gpt_args(
         num_layers=4,
@@ -1069,6 +1073,7 @@ def _make_dsa_args():
     args.dsa_indexer_topk = 16
     args.dsa_indexer_topk_freq = 1
     args.dsa_indexer_skip_topk_offset = 0
+    args.dsa_indexer_loss_coeff = dsa_indexer_loss_coeff
     return args
 
 
@@ -1118,8 +1123,14 @@ def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum):
         + args.hidden_size * args.dsa_indexer_n_heads  # weights_proj
     )
     idx_core = num_indexer_layers * idx_dim / 2
-    dsa_extra_token = fwd_bwd * fma * idx_token
-    dsa_extra_core = fwd_bwd * fma * idx_core
+    # The indexer only runs a backward pass when its KL loss is on, and its
+    # inputs are detached: projections pay fwd + wgrad, scoring pays fwd + dq + dk.
+    if (args.dsa_indexer_loss_coeff or 0.0) > 0:
+        idx_token_expansion, idx_core_expansion = 2, 3
+    else:
+        idx_token_expansion, idx_core_expansion = 1, 1
+    dsa_extra_token = idx_token_expansion * fma * idx_token
+    dsa_extra_core = idx_core_expansion * fma * idx_core
 
     # ---- Aggregation ----
     mlp = fwd_bwd * fma * args.hidden_size * (args.ffn_hidden_size * ffn_exp * num_layers)
@@ -1165,3 +1176,21 @@ class TestDSA:
         # THD must be strictly less than BSHD.
         bshd_flops = num_floating_point_operations(args, batch_size)
         assert flops < bshd_flops
+
+    @pytest.mark.parametrize("loss_coeff", [0.0, None])
+    def test_indexer_without_loss_is_forward_only(self, loss_coeff):
+        """With the indexer KL loss disabled the indexer has no backward pass.
+
+        ``DSAttention.forward`` runs it under ``torch.no_grad()`` in that case,
+        so its terms must drop from 2x/3x to 1x rather than keep the global
+        fwd+bwd factor. Everything outside the indexer is unchanged.
+        """
+        args = _make_dsa_args(dsa_indexer_loss_coeff=loss_coeff)
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        flops = num_floating_point_operations(args, batch_size)
+        assert flops == _dsa_golden_flops(args, total_tokens, sum_sq)
+        # A frozen indexer must cost strictly less than a trained one.
+        assert flops < num_floating_point_operations(_make_dsa_args(0.01), batch_size)

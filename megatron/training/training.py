@@ -1244,12 +1244,26 @@ def num_floating_point_operations(
                 key_proj_factor=1,
                 scoring_core_divisor=2,
             )
-            dsa_extra_term = (
-                forward_backward_expansion_factor * fma_expansion_factor * indexer_token_term
-            )
-            dsa_extra_core_term = (
-                forward_backward_expansion_factor * fma_expansion_factor * indexer_core_term
-            )
+            # The indexer does NOT get the global fwd+bwd factor of 3. It is
+            # trained only by its own KL loss, so ``DSAttention.forward`` runs it
+            # under ``torch.no_grad()`` unless ``dsa_indexer_loss_coeff > 0``
+            # (which defaults to None), and even then ``x`` / ``qr`` are detached
+            # so no gradient leaves the indexer:
+            #   * loss off  -> forward only, everything is 1x.
+            #   * loss on   -> the projections (wq_b / wk / weights_proj) read a
+            #     detached input, so autograd skips their dgrad and they pay
+            #     fwd + wgrad = 2x. The scoring GEMM has two activation operands
+            #     that both need gradients to reach those weights, so it pays
+            #     fwd + dq + dk = 3x.
+            # This mirrors the training procedure, not the kernel schedule, so it
+            # belongs in the model-FLOPs count. (With
+            # ``dsa_indexer_use_sparse_loss`` the scoring backward only covers the
+            # top-k entries, which the 3x does not model; it defaults to False.)
+            indexer_loss_enabled = (args.dsa_indexer_loss_coeff or 0.0) > 0
+            indexer_token_expansion = 2 if indexer_loss_enabled else 1
+            indexer_core_expansion = 3 if indexer_loss_enabled else 1
+            dsa_extra_term = indexer_token_expansion * fma_expansion_factor * indexer_token_term
+            dsa_extra_core_term = indexer_core_expansion * fma_expansion_factor * indexer_core_term
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
