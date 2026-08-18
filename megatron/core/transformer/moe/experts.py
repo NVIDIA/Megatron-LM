@@ -425,6 +425,11 @@ class TEGroupedMLP(MegatronModule):
         )
         if not (use_glu_fusion or use_srelu_fusion):
             return False
+        if getattr(self.config, "use_situ_glu", False):
+            if self.config.activation_func != F.silu:
+                return False
+            if self.config.moe_mlp_glu_interleave_size != 32:
+                return False
         if self.config.activation_func == F.silu:
             if self.config.activation_func_clamp_value is not None:
                 if not is_te_min_version("2.17.0.dev0"):
@@ -537,7 +542,22 @@ class TEGroupedMLP(MegatronModule):
         # Activation and post-multiply probs (SwiGLU, clamped GLU, or SReLU).
         glu_interleave = self.config.moe_mlp_glu_interleave_size
         activation_recompute_in_mlp = bool(getattr(self, "activation_recompute", False))
-        if self.config.activation_func == F.silu and self.config.gated_linear_unit:
+        if getattr(self.config, "use_situ_glu", False):
+            from megatron.core.fusions.cutedsl_situ_glu import make_scaled_situ_glu
+
+            situ_kwargs = {"glu_interleave_size": glu_interleave}
+            if (
+                "activation_recompute_in_mlp"
+                in inspect.signature(te.pytorch.ops.ScaledSwiGLU).parameters
+            ):
+                situ_kwargs["activation_recompute_in_mlp"] = activation_recompute_in_mlp
+            op = make_scaled_situ_glu(
+                beta1=self.config.situ_glu_beta1,
+                beta2=self.config.situ_glu_beta2,
+                install_grouped_fallback=bool(self.config.fp8 or self.config.fp4),
+                **situ_kwargs,
+            )
+        elif self.config.activation_func == F.silu and self.config.gated_linear_unit:
             clamp_value = self.config.activation_func_clamp_value
             if clamp_value is not None:
                 clamped_glu_kwargs = {

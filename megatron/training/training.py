@@ -1067,7 +1067,7 @@ def num_floating_point_operations(
         fma_expansion_factor = 2
         # - 3x (SwiGLU enabled): h->2*ffn_h GEMM and ffn_h->h GEMM are stacked.
         # - 2x (SwiGLU disabled): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
-        ffn_expansion_factor = 3 if args.swiglu else 2
+        ffn_expansion_factor = 3 if args.swiglu or getattr(args, "use_situ_glu", False) else 2
 
         # self_attn is split into a token-linear part (projections, multiplied by
         # ``batch_size * args.seq_length`` like all other token-linear work) and a
@@ -1366,7 +1366,7 @@ def num_floating_point_operations(
             gqa_groups=args.num_query_groups,
             kv_channels=args.kv_channels,
             mlp_expansion=args.ffn_hidden_size / args.hidden_size,
-            swiglu=args.swiglu,
+            swiglu=args.swiglu or getattr(args, "use_situ_glu", False),
             use_gated_delta_product=_uses_gated_delta_product_spec(args),
             moe_latent_size=args.moe_latent_size,
             moe_ffn_hidden_size=(args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None

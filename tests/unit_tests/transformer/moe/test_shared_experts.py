@@ -141,6 +141,9 @@ def _fake_shared_expert(**config_kwargs):
         fp4_recipe="nvfp4",
         fp8=True,
         fp8_recipe="mxfp8",
+        use_situ_glu=False,
+        situ_glu_beta1=4.0,
+        situ_glu_beta2=25.0,
     )
     for key, value in config_kwargs.items():
         setattr(config, key, value)
@@ -218,6 +221,7 @@ def test_validate_fused_grouped_swiglu_requires_clamped_te_support(monkeypatch, 
         ({"activation_func": F.gelu}, None, "SwiGLU activation"),
         ({"gated_linear_unit": False}, None, "SwiGLU activation"),
         ({"moe_shared_expert_glu_interleave_size": None}, None, "glu_interleave_size"),
+        ({"use_situ_glu": True, "moe_shared_expert_glu_interleave_size": 16}, None, "32-wide"),
         ({}, "linear_fc1", "FC1"),
         ({}, "linear_fc2", "FC2"),
     ],
@@ -265,6 +269,31 @@ def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch):
     assert fc2_op.kwargs["bias"] is False
     assert fc2_op.kwargs["accumulate_into_main_grad"] is False
     assert fc2_op.weight0 is shared_expert.linear_fc2.weight
+
+
+def test_make_fused_grouped_situ_glu_ops_uses_local_or_native_builder(monkeypatch):
+    from megatron.core.fusions import cutedsl_situ_glu
+
+    _patch_fake_shared_expert_te(monkeypatch)
+    shared_expert = _fake_shared_expert(use_situ_glu=True)
+    calls = []
+
+    class FakeScaledSiTUGLU(torch.nn.Module):
+        pass
+
+    def make_scaled_situ_glu(**kwargs):
+        calls.append(kwargs)
+        return FakeScaledSiTUGLU()
+
+    monkeypatch.setattr(cutedsl_situ_glu, "make_scaled_situ_glu", make_scaled_situ_glu)
+
+    ops = shared_expert._make_fused_grouped_swiglu_ops()
+
+    _, activation_op, _ = list(ops.children())
+    assert isinstance(activation_op, FakeScaledSiTUGLU)
+    assert calls == [
+        {"beta1": 4.0, "beta2": 25.0, "install_grouped_fallback": True, "glu_interleave_size": 32}
+    ]
 
 
 def test_make_fused_grouped_swiglu_ops_builds_clamped_activation(monkeypatch):

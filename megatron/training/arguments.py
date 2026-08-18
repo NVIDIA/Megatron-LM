@@ -1282,8 +1282,17 @@ def validate_args(args, defaults={}):
         _check_arg_is_not_none(args, req_arg)
 
     # Checks.
+    if args.use_situ_glu:
+        if args.swiglu or args.quick_geglu or args.squared_relu:
+            raise ValueError(
+                "--situ-glu is mutually exclusive with --swiglu, --quick-geglu, "
+                "and --squared-relu."
+            )
+        args.use_te_activation_func = True
+        args.bias_swiglu_fusion = False
+
     if args.ffn_hidden_size is None:
-        if args.swiglu:
+        if args.swiglu or args.use_situ_glu:
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
             # the same ballpark as the counterpart with 4*h size
@@ -2315,6 +2324,8 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "mamba_training_ssm_states_dtype",
+        # handled with the other model activation flags
+        "use_situ_glu",
         # internal/derived: controlled only via --tensor-parallel-num-weight-shards
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
@@ -2399,6 +2410,16 @@ def _add_network_size_args(parser):
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
+    group.add_argument(
+        '--situ-glu',
+        '--moe-use-situ-glu',
+        action='store_true',
+        dest='use_situ_glu',
+        help=(
+            'Use SiTU-GLU in all gated dense and MoE FFNs. The MCore CuTe DSL fallback '
+            'supports BF16, MXFP8, and NVFP4 execution.'
+        ),
+    )
     group.add_argument('--quick-geglu', action='store_true',
                        help='Use quick geglu activation instead of default gelu')
     group.add_argument('--onnx-safe', type=bool, required=False,

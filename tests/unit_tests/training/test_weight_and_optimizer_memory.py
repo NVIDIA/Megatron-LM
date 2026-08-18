@@ -33,12 +33,22 @@ def _make_args(**overrides):
         swiglu=False,
         tensor_model_parallel_size=2,
         untie_embeddings_and_output_weights=False,
+        use_situ_glu=False,
         use_distributed_optimizer=True,
         world_size=32,
     )
     for name, value in overrides.items():
         setattr(args, name, value)
     return args
+
+
+def test_situ_glu_counts_the_same_ffn_parameters_as_swiglu():
+    swiglu_args = _make_args(swiglu=True)
+    situ_glu_args = _make_args(use_situ_glu=True)
+
+    assert compute_weight_and_optimizer_memory(
+        situ_glu_args
+    ) == compute_weight_and_optimizer_memory(swiglu_args)
 
 
 def test_weight_and_optimizer_memory_accounts_for_expert_parallelism():
