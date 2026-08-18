@@ -407,6 +407,19 @@ def test_write_metadata_sp():
     assert metadata['class_name'] == "MegatronTokenizerText"
 
 
+def test_write_metadata_vision():
+    tokenizer_path = "/opt/data/tokenizers/multimodal"
+    metadata_path = f"{tokenizer_path}/test_metadata.json"
+    MegatronTokenizer.write_metadata(
+        tokenizer_path=tokenizer_path,
+        metadata_path=metadata_path,
+        tokenizer_library="multimodal",
+        overwrite=True,
+    )
+    with open(metadata_path, "r") as f:
+        assert json.load(f)["class_name"] == "MegatronTokenizerVision"
+
+
 def test_own_metadata_class():
     tokenizer_path = "/opt/data/tokenizers/huggingface"
     chat_template = "test chat template"
