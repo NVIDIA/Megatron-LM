@@ -1209,6 +1209,15 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
     launches (useful for debugging)."""
 
+    inference_moe_persistent_intermediate_buffers: bool = True
+    """When True (default) and inference_grouped_gemm_backend='vllm', pre-allocate the
+    fused-MoE intermediate buffers once at engine init and share them across all MoE
+    layers and CUDA graphs, instead of allocating them inside each layer's graph
+    capture. Net GPU memory is unchanged (the shared graph mempool reuses the
+    capture-time allocations via free-list reuse); persistent buffers additionally give
+    deterministic, fixed buffer addresses independent of allocator policy. Disable to
+    fall back to per-call allocations."""
+
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
     """Token dispatcher to use for MoE expert parallelism during inference.
     - 'nccl': AllGather/ReduceScatter via NCCL. Fixed token counts per rank; requires
