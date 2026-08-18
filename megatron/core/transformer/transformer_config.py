@@ -338,6 +338,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
 
+    dsa_mtp_index_kv_share: bool = False
+    """Reuse iteration-0 DSA top-k indices and latent KV across repeated MTP iterations."""
+
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
@@ -1616,6 +1619,11 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 self.dsa_kernel_backend = legacy_backend
 
+        if self.dsa_mtp_index_kv_share and self.experimental_attention_variant != "dsa":
+            raise ValueError(
+                "dsa_mtp_index_kv_share requires experimental_attention_variant='dsa'."
+            )
+
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
                 self.linear_attention_freq is not None
@@ -1696,6 +1704,11 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+            if self.dsa_mtp_index_kv_share:
+                if not self.mtp_use_repeated_layer:
+                    raise ValueError("dsa_mtp_index_kv_share requires mtp_use_repeated_layer=True.")
+                if self.mtp_num_layers is None or self.mtp_num_layers <= 1:
+                    raise ValueError("dsa_mtp_index_kv_share requires mtp_num_layers > 1.")
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if self.context_parallel_size > 1:
                 cp_comm_types = (
@@ -3018,6 +3031,18 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        if self.dsa_mtp_index_kv_share and self.cuda_graph_impl != "none":
+            captures_attention = (
+                self.cuda_graph_impl == "full_iteration"
+                or not self.cuda_graph_modules
+                or CudaGraphModule.attn in self.cuda_graph_modules
+            )
+            if captures_attention:
+                raise ValueError(
+                    "dsa_mtp_index_kv_share does not yet support CUDA graph scopes "
+                    "that capture attention. MoE-only CUDA graph scopes remain supported."
+                )
 
         if self.cuda_graph_impl != "none":
 
