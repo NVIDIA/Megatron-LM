@@ -525,19 +525,23 @@ if [ -n "$CKPT_LOAD" ]; then
 fi
 
 # --- FSDP ---
-USE_FSDP_WAS_SET=${USE_FSDP+x}
+# Probe with :+ so an empty USE_FSDP= is treated the same way the :- default
+# below treats it: not an explicit request for FSDP.
+USE_FSDP_WAS_SET=${USE_FSDP:+x}
 USE_FSDP=${USE_FSDP:-1}
 # FSDP and PP are mutually exclusive in Megatron's standard path. Auto-downgrading
-# a user's explicit USE_FSDP=1 would silently drop --ckpt-format fsdp_dtensor,
-# --init-model-with-meta-device, and --use-distributed-optimizer, producing a
-# confusing checkpoint-side error later -- fail loudly instead. The implicit
-# default (USE_FSDP unset) is still auto-downgraded so plain PP smoke runs work.
+# a user's explicit USE_FSDP=1 would silently drop --use-megatron-fsdp,
+# --data-parallel-sharding-strategy, --init-model-with-meta-device, and
+# --ckpt-format fsdp_dtensor, producing a confusing checkpoint-side error later
+# -- fail loudly instead. The implicit default (USE_FSDP unset) is still
+# auto-downgraded so plain PP smoke runs work.
 if [ "$PP" -gt 1 ] && [ "$USE_FSDP" -eq 1 ]; then
     if [ -n "$USE_FSDP_WAS_SET" ]; then
         echo "[run_qwen35_vl] ERROR: USE_FSDP=1 was explicitly requested with PP=${PP} > 1." >&2
         echo "  FSDP and PP are mutually exclusive on the standard path; forcing USE_FSDP=0" >&2
-        echo "  would silently drop --ckpt-format fsdp_dtensor, --init-model-with-meta-device," >&2
-        echo "  and --use-distributed-optimizer. Set USE_FSDP=0 (or unset it) to run with PP>1." >&2
+        echo "  would silently drop --use-megatron-fsdp, --data-parallel-sharding-strategy," >&2
+        echo "  --init-model-with-meta-device, and --ckpt-format fsdp_dtensor." >&2
+        echo "  Set USE_FSDP=0 (or unset it) to run with PP>1." >&2
         exit 1
     fi
     echo "[run_qwen35_vl] PP=${PP} > 1 -> forcing USE_FSDP=0"

@@ -364,7 +364,9 @@ class MultimodalModel(MegatronModule):
                 ``loss_mask``: only true padding, not SFT prompt tokens.
             pixel_values: Preprocessed image pixels.
             image_grid_thw: ``[num_images, 3]`` grid dimensions.
-            decoder_input: Pre-computed decoder input (skip embed).
+            decoder_input: Pre-computed decoder input (skip embed). Only
+                honored on the first pipeline stage; later stages take
+                their activation from ``set_input_tensor``.
             packed_seq_params: ``PackedSeqParams`` for THD attention.
 
         Returns:
@@ -400,7 +402,10 @@ class MultimodalModel(MegatronModule):
             # set_input_tensor on GPTModel.  Don't run vision encoder,
             # don't run embedding, and don't pass a decoder_input here
             # so the CP-split helper leaves it as None.
-            decoder_input = None
+            assert decoder_input is None, (
+                "decoder_input is only honored on the first pipeline stage; "
+                "later stages take their activation from set_input_tensor."
+            )
 
         (
             decoder_input, input_ids, labels, loss_mask,

@@ -301,7 +301,7 @@ def _remap_to_stage(ref_state, stage_model, layers_per_stage):
     ],
     ids=["fp32", "bf16"],
 )
-def test_pp2_matches_pp1_with_identical_weights(stage_flags, dtype, rtol):
+def test_pp2_matches_pp1_with_identical_weights(dtype, rtol):
     """PP=2 reproduces the PP=1 loss when both use the same weights.
 
     This is the parity check that the end-to-end mock-data run cannot
@@ -321,13 +321,13 @@ def test_pp2_matches_pp1_with_identical_weights(stage_flags, dtype, rtol):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
     try:
-        _pp_parity_body(stage_flags, dtype, rtol)
+        _pp_parity_body(dtype, rtol)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
         torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
 
 
-def _pp_parity_body(stage_flags, dtype, rtol):
+def _pp_parity_body(dtype, rtol):
     """Body of the PP=1 vs PP=2 parity check (see the test above)."""
     batch = _make_batch(seed=99, dtype=dtype)
     input_ids, labels, loss_mask, position_ids, pixel_values, image_grid_thw = batch
@@ -358,6 +358,8 @@ def _pp_parity_body(stage_flags, dtype, rtol):
 
     # --- Phase 2: PP=2, same weights, same batch. ---
     _reinit(pp_size=PP_SIZE)
+    # _reinit() rebuilt the process groups, so the stage flags must be derived
+    # here -- the module-scoped ``stage_flags`` fixture is stale after this.
     is_first, is_last = ps.is_pipeline_first_stage(), ps.is_pipeline_last_stage()
     stage = _build_model(pre_process=is_first, post_process=is_last, dtype=dtype)
     mapped = _remap_to_stage(ref_state, stage, NUM_LAYERS // PP_SIZE)

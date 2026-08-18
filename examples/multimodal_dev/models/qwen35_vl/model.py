@@ -43,6 +43,12 @@ class Qwen35VLModel(MultimodalModel):
         mtp_block_spec: Optional MTP block spec.
         parallel_output: Keep outputs split across TP.
         share_embeddings_and_output_weights: Tie embeddings.
+        pre_process: First PP stage flag — build the embedding and the
+            vision encoder here.
+        post_process: Last PP stage flag — build the output layer and
+            compute loss here.
+        vp_stage: Virtual pipeline stage index, or ``None`` when VPP is
+            disabled (selects the non-VPP ``is_pipeline_*_stage`` path).
     """
 
     def __init__(

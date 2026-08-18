@@ -172,6 +172,18 @@ def _build_packed_seq_params_from_cu_seqlens(
     )
 
 
+def seqlen_alignment_factor(tp_size: int, cp_size: int, sequence_parallel: bool) -> int:
+    """Return the factor a batched sequence length must be divisible by.
+
+    CP splits the sequence into ``2 * cp_size`` chunks (load-balanced
+    ordering), and SP splits each rank's shard across TP ranks on top of
+    that.  Without CP, only the SP split constrains the length.
+    """
+    if cp_size > 1:
+        return (tp_size * cp_size * 2) if sequence_parallel else (cp_size * 2)
+    return tp_size if sequence_parallel else 1
+
+
 def pack_or_pad_batch(
     batch: Optional[list[Dict[str, Any]]],
     use_packed_sequence: bool = False,
@@ -188,6 +200,12 @@ def pack_or_pad_batch(
     ``PackedSeqParams`` (``cu_seqlens``, ``cu_seqlens_padded``,
     ``max_seqlen``, ``total_tokens``) is broadcast alongside the data, so
     every rank can build an identical ``PackedSeqParams`` on its own.
+
+    ``include_pixel_values`` must be False on non-first pipeline stages:
+    only the first stage holds the vision encoder, so collating and
+    broadcasting ``pixel_values`` elsewhere is pure overhead.
+    ``input_ids`` and ``image_grid_thw`` are still needed on every stage
+    for MRoPE position construction.
     """
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
@@ -201,10 +219,7 @@ def pack_or_pad_batch(
     except AssertionError:
         has_sp = False
 
-    if cp_size > 1:
-        divisible_by = (tp_size * cp_size * 2) if has_sp else (cp_size * 2)
-    else:
-        divisible_by = tp_size if has_sp else 1
+    divisible_by = seqlen_alignment_factor(tp_size, cp_size, has_sp)
 
     if use_packed_sequence:
         packed_batch: Dict[str, Any] = {}
@@ -431,7 +446,6 @@ def forward_step(data_iterator, model):
     is_last_pipeline_stage = is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
 
     pixel_values = batch.get("pixel_values", None)
-    image_grid_thw = batch.get("image_grid_thw", None)
     if (
         pixel_values is not None
         and pixel_values.is_floating_point()
@@ -448,7 +462,7 @@ def forward_step(data_iterator, model):
         loss_mask=batch.get("loss_mask", None),
         padding_mask=batch.get("padding_mask", None),
         pixel_values=pixel_values,
-        image_grid_thw=image_grid_thw,
+        image_grid_thw=batch.get("image_grid_thw", None),
         packed_seq_params=batch.get("packed_seq_params", None),
     )
 
