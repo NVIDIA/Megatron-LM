@@ -51,6 +51,23 @@ class TestMambaMetadata:
         assert metadata.mamba_state_free_slot_count == 2
         assert int(metadata.allocate_slot()) == slot
 
+    def test_allocated_slots_do_not_alias_free_slot_stack(self):
+        metadata = MambaMetadata(max_requests=3, max_tokens=4, max_intermediate_count=1)
+
+        slot_to_release = metadata.allocate_slot()
+        allocated_slot = metadata.allocate_slot()
+        metadata.free_slot(slot_to_release)
+
+        assert isinstance(allocated_slot, int)
+        assert allocated_slot == 1
+
+        metadata.reset()
+        slot_to_release = metadata.allocate_slot()
+        allocated_slots = metadata.batch_allocate_slots(2)
+        metadata.free_slot(slot_to_release)
+
+        assert torch.equal(allocated_slots, torch.tensor([0, 1], dtype=torch.int32))
+
     def test_detached_live_slot_survives_request_cleanup(self):
         metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
         slot = int(metadata.allocate_slot())

@@ -747,7 +747,7 @@ class MambaMetadata:
         self.mamba_state_free_slot_count -= 1
         mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
 
-        return mamba_idx
+        return int(mamba_idx)
 
     def detach_state_slot(self, request_idx: int) -> int:
         """Detach and return a request's live state slot without freeing it."""
@@ -785,7 +785,7 @@ class MambaMetadata:
             self.mamba_state_free_slot_count : self.mamba_state_free_slot_count + num_slots
         ]
 
-        return mamba_idx
+        return mamba_idx.clone()
 
     def _return_slots(self, mamba_indices: torch.Tensor) -> None:
         """Return live state slots to the free-slot stack."""

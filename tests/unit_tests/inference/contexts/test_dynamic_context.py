@@ -2015,6 +2015,32 @@ class TestDynamicContext:
         self._restore_model_parallel()
 
     @pytest.mark.internal
+    def test_mamba_cache_error_identifies_limiting_pipeline_stage(self):
+        context = object.__new__(DynamicInferenceContext)
+        context.mamba_conv_states_shape = (1,)
+        context.mamba_ssm_states_shape = (1,)
+        context.mamba_conv_states_dtype = torch.float32
+        context.mamba_ssm_states_dtype = torch.float32
+        context.num_mamba_layers = 1
+        context.max_mamba_intermediate_states_per_step = 1
+        context.pipeline_parallel_group = object()
+
+        def reduce_to_remote_capacity(tensor, **_kwargs):
+            tensor.fill_(0)
+
+        get_pg_size = "megatron.core.inference.contexts.dynamic_context.get_pg_size"
+        with (
+            mock.patch(get_pg_size, return_value=2),
+            mock.patch.object(
+                torch.distributed, "all_reduce", side_effect=reduce_to_remote_capacity
+            ),
+            pytest.raises(ValueError, match="another stage has room for fewer than one") as error,
+        ):
+            context._allocate_mamba_cache(32 / 1024**3)
+
+        assert "room for 3 durable slots on this pipeline stage" in str(error.value)
+
+    @pytest.mark.internal
     @rounder_override(64)
     def test_uneven_decoder_pp_layer_map_matches_get_num_layers_to_build(self):
         """Uneven PP (num_layers_in_first/last): KV layer_map length matches this rank's layer count.

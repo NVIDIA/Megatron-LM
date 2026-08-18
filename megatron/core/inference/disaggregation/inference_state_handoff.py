@@ -391,6 +391,10 @@ class InferenceStateHandoffMixin:
         """
         block_ids = self._pinned_handoff_blocks.get(request_id)
         if not block_ids:
+            if self._ssm_transfer_agents and request_id in self._pinned_handoff_ssm_slots:
+                raise RuntimeError(
+                    f"Handoff request {request_id} has detached SSM state but no pinned KV blocks"
+                )
             logging.warning(
                 "SEND_KV for request %d with no pinned hand-off blocks; skipping", request_id
             )

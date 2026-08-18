@@ -1100,6 +1100,21 @@ def test_push_handoff_uses_final_pinned_blocks_ssm_slot():
     )
 
 
+def test_push_handoff_rejects_ssm_state_without_kv_blocks():
+    engine = object.__new__(InferenceStateHandoffMixin)
+    engine._initialize_disaggregation_state()
+    engine._kv_transfer_agent = mock.Mock()
+    engine._ssm_transfer_agents = {"conv": mock.Mock(), "recurrent": mock.Mock()}
+    engine._pinned_handoff_ssm_slots[7] = 3
+
+    with pytest.raises(RuntimeError, match="detached SSM state but no pinned KV blocks"):
+        engine.push_handoff_kv(7, [])
+
+    engine._kv_transfer_agent.begin_push_blocks.assert_not_called()
+    engine._ssm_transfer_agents["conv"].begin_push_blocks.assert_not_called()
+    engine._ssm_transfer_agents["recurrent"].begin_push_blocks.assert_not_called()
+
+
 def test_push_handoff_validates_ssm_metadata_before_posting_sends():
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()

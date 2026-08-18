@@ -1823,6 +1823,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         scratch_slots = self.max_mamba_intermediate_states_per_step
         scratch_bytes = scratch_slots * per_slot_bytes
         max_slots = (total_bytes - scratch_bytes) // per_slot_bytes  # durable slots
+        local_max_slots = max_slots
 
         # Prefix-cache state is replicated across pipeline stages. Use the
         # smallest stage-local capacity so identical cache operations produce
@@ -1841,6 +1842,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_slots = int(max_slots_tensor.item())
 
         if max_slots < 1:
+            if local_max_slots >= 1:
+                raise ValueError(
+                    f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
+                    f"has room for {local_max_slots} durable slots on this pipeline stage, but "
+                    f"another stage has room for fewer than one. Cache capacity is mirrored to "
+                    f"the minimum across stages; increase prefix_caching_mamba_gb, reduce "
+                    f"max_tokens, or rebalance the Mamba layers."
+                )
             raise ValueError(
                 f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
                 f"is too small. The CUDA-graph extraction scratch reserves "
@@ -3088,10 +3097,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         Check if the request can be added to the context.
         """
         # Note that for hybrid models checking the total request count is sufficient
-        # because we allocate a single set of Mamba state tensors for each request
+        # because we allocate a single set of Mamba state tensors for each request.
         request_can_be_added = (
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
+        # A handoff is the exception: it keeps its live recurrent-state slot after
+        # its request row is removed, so both capacities must be checked independently.
+        if self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning:
+            request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
 
         matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
             self._compute_prefix_match(req, req.remaining_prompt_length)

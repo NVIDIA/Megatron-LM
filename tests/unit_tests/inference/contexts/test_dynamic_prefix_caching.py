@@ -959,6 +959,20 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             self._mctx(prefix_caching_mamba_gb=1e-5)
 
     @pytest.mark.internal
+    def test_hybrid_admission_requires_free_live_state_slot(self):
+        ctx = self._mctx(max_requests=1, rounder=1)
+        ctx.kv_block_allocator.enable_handoff_pinning = True
+        slot = ctx.mamba_metadata.allocate_slot()
+        ctx.mamba_metadata.request_to_mamba_state_idx[0] = slot
+        ctx.mamba_metadata.detach_state_slot(0)
+
+        request_available, _, _ = ctx.check_availability(
+            self._req(ctx, self._prompt(ctx.block_size_tokens))
+        )
+
+        assert not request_available
+
+    @pytest.mark.internal
     def test_mamba_prefill_skip_and_zero_prefill(self):
         # mamba match limits prefill skip
         ctx = self._mctx()
