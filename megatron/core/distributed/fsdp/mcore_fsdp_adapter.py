@@ -934,16 +934,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     "MFSDP v2 gradient accumulation fusion requires Transformer Engine 2.10+."
                 )
             unsupported_fused_wgrad_features = []
-            if config.overlap_moe_expert_parallel_comm:
-                unsupported_fused_wgrad_features.append("1F1B EP overlap")
-            if ddp_config.delay_wgrad_compute:
-                unsupported_fused_wgrad_features.append("delayed wgrad")
             if config.use_transformer_engine_op_fuser:
                 unsupported_fused_wgrad_features.append("Transformer Engine op fuser")
             if ddp_config.nccl_ub:
                 unsupported_fused_wgrad_features.append("symmetric-memory NCCL-UB")
-            if config.fp8 or ddp_config.fp8_param_gather:
-                unsupported_fused_wgrad_features.append("FP8 parameter gather")
             if unsupported_fused_wgrad_features:
                 raise ValueError(
                     "MFSDP v2 gradient accumulation fusion does not yet support: "
@@ -1016,7 +1010,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """MFSDP v2 reduces gradients during backward."""
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
-        """MFSDP v2 gradient reduction is complete when backward returns."""
+        """Fence optimizer-side work against asynchronous gradient reductions.
+
+        Ordinary autograd backward installs an engine-final callback that creates
+        this stream dependency. The combined 1F1B schedule finalizes FSDP units
+        manually and deliberately skips that callback, so its reduce-scatters may
+        still be in flight when ``finalize_model_grads`` reaches this method.
+        """
+        context = self.module.context
+        context.current_stream().wait_stream(context.reduce_scatter_stream)
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""

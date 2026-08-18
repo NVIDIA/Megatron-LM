@@ -680,5 +680,17 @@ def _fine_grained_pre_backward_hook(submodule: nn.Module, grad_output) -> None:
     if target is None:
         return
     if target.phase is FsdpModule.Phase.RESTING:
-        target.phase = FsdpModule.Phase.BACKWARD
-    target._unshard_and_prefetch("colwise")
+        # The combined 1F1B schedule enters backward through individual
+        # submodules, bypassing the FsdpModule-level pre-backward hook. Enter
+        # the complete lifecycle here once so fused-wgrad groups allocate their
+        # staging buffers before TE requests ``get_main_grad()``. Subsequent
+        # fine-grained hooks in the same module only need the idempotent
+        # all-gather below.
+        target.pre_backward(register_final_callback=False)
+    elif target.phase is FsdpModule.Phase.BACKWARD:
+        target._unshard_and_prefetch("colwise")
+    else:
+        raise RuntimeError(
+            "Fine-grained pre-backward hook expected its FSDP target to be "
+            f"RESTING or BACKWARD, got {target.phase}."
+        )
