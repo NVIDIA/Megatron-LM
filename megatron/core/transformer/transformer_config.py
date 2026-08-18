@@ -1127,6 +1127,13 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
+    use_fused_mhc: bool = False
+    """Use fused kernels for mHC operations when supported.
+
+    Backend selection is operation-specific, with native torch fallbacks that
+    preserve the same public behavior when Triton or cuTile is unavailable.
+    """
+
     mhc_recompute_layer_num: Optional[int] = None
     """Number of layers per MHC recompute block.
 
@@ -1989,12 +1996,8 @@ class TransformerConfig(ModelParallelConfig):
                 "recompute_modules with selective recompute to reduce activation memory."
             )
 
-        # Validation for hyper_connections with MTP
-        if self.enable_mhc_connections and self.mtp_num_layers is not None:
-            raise ValueError(
-                "enable_mhc_connections is not compatible with Multi-Token Prediction (MTP). "
-                "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
-            )
+        if self.use_fused_mhc and not self.enable_mhc_connections:
+            raise ValueError("use_fused_mhc requires enable_mhc_connections=True.")
 
         if self.enable_mhc_connections and self.recompute_granularity == "full":
             raise NotImplementedError(

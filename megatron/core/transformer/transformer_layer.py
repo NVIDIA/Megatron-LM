@@ -599,6 +599,73 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return get_transformer_layer_offset(config)
 
+    @staticmethod
+    def _group_offload_output_with_bias(
+        output_with_bias, offload_manager, forced_released_tensors: Optional[list[Tensor]] = None
+    ):
+        """Commit a fine-grained offload group for a raw branch output tuple."""
+        if isinstance(output_with_bias, tuple):
+            output = offload_manager.group_offload(
+                output_with_bias[0], forced_released_tensors=forced_released_tensors
+            )
+            return (output, *output_with_bias[1:])
+        return offload_manager.group_offload(
+            output_with_bias, forced_released_tensors=forced_released_tensors
+        )
+
+    def _forward_self_attention_output_with_bias(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[Any] = None,
+    ):
+        """Run input norm and self-attention, returning the raw output before BDA."""
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
+        if attn_state:
+            raise RuntimeError(
+                "Raw HybridStack attention execution requires an ordinary TransformerLayer "
+                "without subclass-specific attention state."
+            )
+
+        using_fused_tp_inference_kernel = (
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
+        )
+        if using_fused_tp_inference_kernel:
+            self._set_proj_residual(residual)
+
+        nvtx_range_push(suffix="self_attention")
+        attention_output_with_bias = self.self_attention(
+            input_layernorm_output,
+            attention_mask=attention_mask,
+            inference_context=inference_context,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+        )
+        nvtx_range_pop(suffix="self_attention")
+
+        if self._input_layernorm_checkpoint_active:
+            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                attention_output_with_bias[0]
+            )
+
+        return attention_output_with_bias, self.attn_norm_manager, residual
+
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -898,6 +965,40 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             residual = residual.float()
 
         return pre_mlp_layernorm_output, residual, ()
+
+    def _forward_mlp_output_with_bias(
+        self,
+        hidden_states: Tensor,
+        inference_context: BaseInferenceContext | None = None,
+        padding_mask: Tensor | None = None,
+        packed_seq_params=None,
+    ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
+        """Run pre-MLP norm and MLP/MoE, returning the raw output before BDA."""
+        pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
+            hidden_states
+        )
+        if mlp_state:
+            raise RuntimeError(
+                "Raw HybridStack MLP execution requires an ordinary TransformerLayer "
+                "without subclass-specific MLP state."
+            )
+
+        pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
+            pre_mlp_layernorm_output, padding_mask, packed_seq_params
+        )
+
+        mlp_output_with_bias = self._run_mlp(
+            pre_mlp_layernorm_output, residual, padding_mask, inference_context
+        )
+
+        if moe_unflatten_mbs is not None:
+            mlp_output, mlp_bias = mlp_output_with_bias
+            mlp_output = self._maybe_reflatten_from_moe(
+                mlp_output, packed_seq_params, moe_unflatten_mbs
+            )
+            mlp_output_with_bias = (mlp_output, mlp_bias)
+
+        return mlp_output_with_bias, residual
 
     def _forward_mlp(
         self,
