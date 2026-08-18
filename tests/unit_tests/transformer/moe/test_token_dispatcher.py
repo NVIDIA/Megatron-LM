@@ -6,12 +6,28 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import megatron.core.transformer.moe.fused_a2a as fused_a2a
+import megatron.core.transformer.moe.token_dispatcher as token_dispatcher
 from megatron.core import config, parallel_state
+from megatron.core.extensions.transformer_engine import (
+    fused_topk_with_score_function_supports_topk_indices,
+)
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
-from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
+from megatron.core.transformer.moe.fused_a2a import (
+    HAVE_HYBRIDEP_DENSE_ROUTING,
+    HYBRIDEP_TOKEN_ALIGNMENT,
+    reset_hybrid_ep_buffer,
+)
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
-from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher, _HybridEPManager
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoEFlexTokenDispatcher,
+    MoETokenDispatcher,
+    _DeepepManager,
+    _DeepepV2Manager,
+    _HybridEPManager,
+    _NCCLEPManager,
+)
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -80,9 +96,12 @@ def test_set_cudagraph_attr_supports_nested_paths():
 
 def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     manager = object.__new__(_HybridEPManager)
-    manager.config = SimpleNamespace(moe_hybridep_pad_variable_tokens=True)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_variable_tokens=True, moe_hybridep_use_dense_routing_map=False
+    )
     manager.group = object()
     manager.num_experts = 2
+    manager.router_topk = 1
     manager.moe_expert_rank_capacity_factor = None
     manager.drop_and_pad = False
 
@@ -106,6 +125,112 @@ def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     assert manager.token_probs.shape == (expected_num_tokens, manager.num_experts)
     assert not manager.routing_map[local_num_tokens:].any()
     assert not manager.token_probs[local_num_tokens:].any()
+
+
+def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_variable_tokens=False, moe_hybridep_use_dense_routing_map=True
+    )
+    manager.group = object()
+    manager.num_experts = 2
+    manager.router_topk = 1
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+
+    routing_map = torch.tensor([[True, False], [False, False]])
+    probs = torch.tensor([[1.0, 0.0], [0.0, 0.0]])
+
+    manager.setup_metadata(routing_map, probs)
+
+    assert torch.equal(manager.topk_idx, torch.tensor([[0], [-1]], dtype=torch.int16))
+
+
+def test_hybridep_dense_input_requires_backend_support(monkeypatch):
+    monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
+    manager = object.__new__(_HybridEPManager)
+    manager.config = SimpleNamespace(
+        moe_hybridep_pad_variable_tokens=False, moe_hybridep_use_dense_routing_map=True
+    )
+    manager.group = object()
+    manager.num_experts = 4
+    manager.router_topk = 2
+    manager.moe_expert_rank_capacity_factor = None
+    manager.drop_and_pad = False
+
+    with pytest.raises(RuntimeError, match="does not support dense topk_idx metadata"):
+        manager.setup_metadata(torch.tensor([[0, 2]], dtype=torch.int16), torch.ones(1, 4))
+
+
+def test_flex_dense_metadata_preserves_invalid_routes():
+    dispatcher = object.__new__(MoEFlexTokenDispatcher)
+    dispatcher.tp_size = 2
+    dispatcher.ep_size = 2
+    dispatcher.num_local_experts = 2
+    routing_map = torch.tensor([[0, -1], [3, 1]], dtype=torch.int16)
+    probs = torch.ones((2, 4))
+
+    expanded_routes, _ = dispatcher._initialize_metadata(routing_map, probs)
+
+    expected = torch.tensor([[0, 2, -1, -1], [5, 7, 1, 3]], dtype=torch.int16)
+    assert torch.equal(expanded_routes, expected)
+
+
+@pytest.mark.parametrize("manager_cls", [_DeepepManager, _DeepepV2Manager, _NCCLEPManager])
+def test_dense_required_manager_accepts_dense_indices(monkeypatch, manager_cls):
+    manager = object.__new__(manager_cls)
+    manager.num_experts = 4
+    manager.router_topk = 2
+    if isinstance(manager, _DeepepManager):
+        manager.capacity_factor = None
+    dense_indices = torch.tensor([[0, 2], [3, 1]], dtype=torch.int16)
+    probs = torch.tensor([[0.6, 0.0, 0.4, 0.0], [0.0, 0.3, 0.0, 0.7]])
+
+    monkeypatch.setattr(
+        torch, "topk", lambda *args, **kwargs: pytest.fail("dense routing must not call torch.topk")
+    )
+    manager.setup_metadata(dense_indices, probs)
+
+    assert manager.token_indices.dtype == torch.int64
+    assert torch.equal(manager.token_indices, dense_indices.long())
+    torch.testing.assert_close(manager.token_probs, torch.tensor([[0.6, 0.4], [0.7, 0.3]]))
+
+
+@pytest.mark.parametrize("explicit_dense_routing", [False, True])
+def test_hybridep_dispatch_supports_inferred_and_explicit_dense_apis(
+    monkeypatch, explicit_dense_routing
+):
+    class FakeHybridEPBuffer:
+        def __init__(self):
+            self.kwargs = None
+
+        def dispatch_with_permute(self, **kwargs):
+            self.kwargs = kwargs
+            return (
+                kwargs["hidden"],
+                kwargs["probs"],
+                None,
+                torch.ones(2, dtype=torch.int32),
+                ("handle",),
+            )
+
+    fake_buffer = FakeHybridEPBuffer()
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", fake_buffer)
+    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
+    monkeypatch.setattr(fused_a2a, "HAVE_HYBRIDEP_EXPLICIT_DENSE_ROUTING", explicit_dense_routing)
+    hidden = torch.randn(2, 4)
+    probs = torch.randn(2, 4)
+    topk_idx = torch.tensor([[0, 1], [2, 3]], dtype=torch.int16)
+
+    fused_a2a.HybridEPDispatch.forward(
+        SimpleNamespace(), hidden, None, probs, object(), 2, topk_idx=topk_idx, num_of_experts=4
+    )
+
+    assert fake_buffer.kwargs["topk_idx"] is topk_idx
+    assert fake_buffer.kwargs["num_of_experts"] == 4
+    assert "routing_map" not in fake_buffer.kwargs
+    assert ("dense_routing" in fake_buffer.kwargs) is explicit_dense_routing
 
 
 class MoEModelTestContainer:
@@ -167,7 +292,11 @@ class MoEModelTestContainer:
             sequence_parallel=tp_size > 1,
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
+            moe_router_fusion=kwargs.get("moe_router_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
+            moe_hybridep_use_dense_routing_map=kwargs.get(
+                "moe_hybridep_use_dense_routing_map", False
+            ),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
             calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
         )
@@ -210,7 +339,7 @@ class MoEModelTestContainer:
         probs, indices = apply_module(moe_layer.router)(hidden_states)
         probs = torch.ones_like(probs) / moe_layer.router.topk
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
@@ -253,7 +382,7 @@ class MoEModelTestContainer:
         restored_hidden_states_answer = hidden_states * local_probss.sum(dim=1).unsqueeze(1)
         restored_hidden_states_answer = restored_hidden_states_answer.to(dtype=self.test_dtype)
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
@@ -304,7 +433,7 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
-        (permuted_input_1, tokens_per_expert, permuted_probs_1) = token_permutation(
+        permuted_input_1, tokens_per_expert, permuted_probs_1 = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
@@ -322,7 +451,7 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
-        (permuted_input_2, tokens_per_expert, permuted_probs_2) = token_permutation(
+        permuted_input_2, tokens_per_expert, permuted_probs_2 = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         permuted_input_2 = permuted_input_2 * permuted_probs_2.unsqueeze(-1)
@@ -375,7 +504,7 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
-        (permuted_input_1, tokens_per_expert_1, permuted_probs_1) = token_permutation(
+        permuted_input_1, tokens_per_expert_1, permuted_probs_1 = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
@@ -392,7 +521,7 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
-        (permuted_input_2, tokens_per_expert_2, permuted_probs_2) = token_permutation(
+        permuted_input_2, tokens_per_expert_2, permuted_probs_2 = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         assert (
@@ -529,6 +658,58 @@ class TestFlexDispatcher:
     def teardown_method(self, method):
         reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.parametrize("use_dense_routing", [False, True])
+    def test_hybridep_dense_routing_forward_backward(self, use_dense_routing):
+        if not is_hybrid_ep_available():
+            pytest.skip("Hybrid EP is not available")
+        if use_dense_routing and (
+            not fused_topk_with_score_function_supports_topk_indices
+            or not HAVE_HYBRIDEP_DENSE_ROUTING
+        ):
+            pytest.skip("Dense TE/HybridEP routing APIs are not available")
+
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=8,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_router_fusion=True,
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_use_dense_routing_map=use_dense_routing,
+            hidden_size=1024,
+            test_dtype=torch.bfloat16,
+        )
+        container.dispatcher_dropless_test()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.parametrize("backend", ["deepep", "deepepv2", "ncclep"])
+    def test_dense_required_backend_forward_backward(self, backend):
+        skip_if_flex_backend_unavailable(backend)
+        if not fused_topk_with_score_function_supports_topk_indices:
+            pytest.skip("Dense TE routing output is not available")
+
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=8,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_router_fusion=True,
+            moe_flex_dispatcher_backend=backend,
+            moe_expert_rank_capacity_factor=8.0 if backend == "ncclep" else None,
+            hidden_size=1024,
+            test_dtype=torch.bfloat16,
+        )
+        container.dispatcher_dropless_test()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
