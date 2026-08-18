@@ -4,7 +4,7 @@
 
 import importlib
 import weakref
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from functools import wraps
 from typing import List, Optional, Union
 
@@ -680,6 +680,14 @@ else:
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Returns dummy fp8 context manager since TE is not available."""
         return nullcontext()
+
+
+def get_fp8_backward_quantization_update_context() -> AbstractContextManager:
+    """Group TE quantization updates for one logical backward."""
+    if not HAVE_TE:
+        return nullcontext()
+    scope = getattr(transformer_engine.pytorch, "backward_quantization_update_scope", None)
+    return scope() if scope is not None else nullcontext()
 
 
 if HAVE_TE:

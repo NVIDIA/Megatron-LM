@@ -8,7 +8,7 @@ import torch
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
 from megatron.core.enums import Fp8Recipe
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import get_fp8_backward_quantization_update_context, get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     ScheduleNode,
@@ -413,62 +413,68 @@ def combined_forward_backward_step(
                     forward_fsdp_wrapper.post_backward_release_module,
                 )
 
-    # backward preprocess, the same as the backward_step()
-    unwrap_input_tensor_grad = False
-    b_schedule_plan = None
-    loss_node_inputs_to_release = None
-    if b_model is not None:
-        # Retain the grad on the input_tensor.
-        if not isinstance(b_input_tensor, list):
-            b_input_tensor = [b_input_tensor]
-            unwrap_input_tensor_grad = True
-        for x in b_input_tensor:
-            if x is not None:
-                x.retain_grad()
-
-        if not isinstance(b_output_tensor, list):
-            b_output_tensor = [b_output_tensor]
-        if not isinstance(b_output_tensor_grad, list):
-            b_output_tensor_grad = [b_output_tensor_grad]
-
-        # Get the schedule plan from the output tensor
-        b_schedule_plan = b_output_tensor[0].schedule_plan
-        b_output_tensor[0].schedule_plan = None
-        # Get the loss function from the output tensor
-        loss_node = b_output_tensor[0].loss_func
-        b_output_tensor[0].loss_func = None
-
-        if b_output_tensor_grad[0] is None:
-            if config.grad_scale_func is not None:
-                b_output_tensor[0] = config.grad_scale_func(b_output_tensor[0])
-            # Backward pass for loss function
-            torch.autograd.backward(b_output_tensor[0], grad_tensors=b_output_tensor_grad[0])
-            b_output_tensor_grad[0] = loss_node.get_grad()
-            loss_node_inputs_to_release = loss_node.inputs
-            loss_node._release_state()
-
-    # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
-    # otherwise do nothing extra at the outer level
-    # if we are using other fp8 recipes, then the context manager enter&exit are free
-    # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
-    # control which layer will be fp8 or bf16
     use_outer_fp8_context = config.fp8 and config.fp8_recipe == Fp8Recipe.delayed
-    outer_fp8_context = get_fp8_context(config) if use_outer_fp8_context else nullcontext()
+    backward_update_context = (
+        get_fp8_backward_quantization_update_context()
+        if b_model is not None and config.fp8
+        else nullcontext()
+    )
+    with backward_update_context:
+        # backward preprocess, the same as the backward_step()
+        unwrap_input_tensor_grad = False
+        b_schedule_plan = None
+        loss_node_inputs_to_release = None
+        if b_model is not None:
+            # Retain the grad on the input_tensor.
+            if not isinstance(b_input_tensor, list):
+                b_input_tensor = [b_input_tensor]
+                unwrap_input_tensor_grad = True
+            for x in b_input_tensor:
+                if x is not None:
+                    x.retain_grad()
 
-    b_grad = b_output_tensor_grad[0] if b_model else None
-    # combined forward and backward model chunk execution of two micro-batches
-    with context_manager and outer_fp8_context:  # autocast context and delayed fp8 context
-        # For GPT models, it calls common::TransformerModelChunkSchedulePlan.run(),
-        output_tensor = type(f_schedule_plan or b_schedule_plan).run(
-            f_schedule_plan,
-            b_schedule_plan,
-            b_grad=b_grad,
-            pre_forward=pre_forward,
-            pre_backward=pre_backward,
-            post_forward=post_forward,
-            post_backward=post_backward,
-        )
-    _release_tensor_storage(loss_node_inputs_to_release)
+            if not isinstance(b_output_tensor, list):
+                b_output_tensor = [b_output_tensor]
+            if not isinstance(b_output_tensor_grad, list):
+                b_output_tensor_grad = [b_output_tensor_grad]
+
+            # Get the schedule plan from the output tensor
+            b_schedule_plan = b_output_tensor[0].schedule_plan
+            b_output_tensor[0].schedule_plan = None
+            # Get the loss function from the output tensor
+            loss_node = b_output_tensor[0].loss_func
+            b_output_tensor[0].loss_func = None
+
+            if b_output_tensor_grad[0] is None:
+                if config.grad_scale_func is not None:
+                    b_output_tensor[0] = config.grad_scale_func(b_output_tensor[0])
+                # Backward pass for loss function
+                torch.autograd.backward(b_output_tensor[0], grad_tensors=b_output_tensor_grad[0])
+                b_output_tensor_grad[0] = loss_node.get_grad()
+                loss_node_inputs_to_release = loss_node.inputs
+                loss_node._release_state()
+
+        # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
+        # otherwise do nothing extra at the outer level
+        # if we are using other fp8 recipes, then the context manager enter&exit are free
+        # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
+        # control which layer will be fp8 or bf16
+        outer_fp8_context = get_fp8_context(config) if use_outer_fp8_context else nullcontext()
+
+        b_grad = b_output_tensor_grad[0] if b_model else None
+        # combined forward and backward model chunk execution of two micro-batches
+        with context_manager and outer_fp8_context:  # autocast context and delayed fp8 context
+            # For GPT models, it calls common::TransformerModelChunkSchedulePlan.run(),
+            output_tensor = type(f_schedule_plan or b_schedule_plan).run(
+                f_schedule_plan,
+                b_schedule_plan,
+                b_grad=b_grad,
+                pre_forward=pre_forward,
+                pre_backward=pre_backward,
+                post_forward=post_forward,
+                post_backward=post_backward,
+            )
+        _release_tensor_storage(loss_node_inputs_to_release)
 
     # forward post process
     num_tokens = None
