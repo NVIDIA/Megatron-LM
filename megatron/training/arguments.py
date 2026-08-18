@@ -523,9 +523,6 @@ def validate_args(args, defaults={}):
                         "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                     )
 
-        submit_rollouts_at_rollout_granularity = (
-            args.rl_submission_granularity == "R"
-        )
         if args.rl_max_inflight_requests is not None:
             requests_per_batch = args.grpo_prompts_per_step * args.grpo_group_size
             assert args.rl_generation_lag is None, \
@@ -549,10 +546,9 @@ def validate_args(args, defaults={}):
             if args.rl_generation_lag > 0:
                 assert args.rl_partial_rollouts, \
                     "--rl-generation-lag requires --rl-partial-rollouts."
-        if submit_rollouts_at_rollout_granularity:
-            assert (
-                args.rl_partial_rollouts
-            ), "Rollout submission granularity requires streaming grouped rollouts."
+        assert args.rl_submission_granularity == "B" or args.rl_partial_rollouts, \
+            f"--rl-submission-granularity {args.rl_submission_granularity} requires " \
+            "--rl-partial-rollouts."
         assert args.rl_consumption_granularity != "R", \
             "--rl-consumption-granularity R is not currently supported."
         assert not (
@@ -2528,6 +2524,33 @@ def _add_logging_args(parser):
 
     log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
     group = log_factory.build_group(parser, title="logging")
+
+    otel_group = parser.add_argument_group(title='opentelemetry')
+    otel_group.add_argument(
+        '--otel-enabled',
+        action='store_true',
+        default=False,
+        help='Enable OpenTelemetry telemetry (traces and metrics). '
+        'See MEGATRON_OTEL_ENABLED env var for the env-var equivalent.',
+    )
+    otel_group.add_argument(
+        '--otel-service-name',
+        type=str,
+        default=None,
+        help='Override OTEL_SERVICE_NAME for this training run.',
+    )
+    otel_group.add_argument(
+        '--otel-span-groups',
+        type=str,
+        default=None,
+        help='Comma-separated span-group spec controlling which OTel '
+        'instrumentation boundaries are active.  Accepts preset keywords '
+        '("default", "per_step", "full", "all") or individual group names '
+        '("job", "checkpoint", "evaluate", "model_init", "load_checkpoint", '
+        '"step", "forward_backward", "optimizer", "microbatch"), or a mix.  '
+        'Defaults to "default" (coarse job/checkpoint/evaluate spans only).  '
+        'Equivalent to MEGATRON_OTEL_SPAN_GROUPS env var.',
+    )
 
     return parser
 
