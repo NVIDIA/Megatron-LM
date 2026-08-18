@@ -887,10 +887,12 @@ class TestRLUtils:
         elif scenario == "empty_rollout":
             # group = [2 single-turn, 1 zero-turn placeholder (failed episode)] -> 2 rows/group:
             # the placeholder is skipped (keeping it would crash indexing trajectory[-1], and
-            # counting it would pad 3*dp rows up to 4*dp -> 2 microbatches).
-            # 2*dp rows (already a multiple of micro_batch_size*dp) -> 1 microbatch.
+            # counting it would give 3*dp rows -> 3 microbatches).
+            # 2*dp rows / (micro_batch_size 1 * dp) -> 2 microbatches.
+            # micro_batch_size must be 1: the microbatch calculator is first built from the
+            # raw args, and global_batch_size (3*dp) must be divisible by mbs*dp.
             self.create_test_args(
-                micro_batch_size=2,
+                micro_batch_size=1,
                 seq_length=4,
                 curr_iteration=1,
                 tensor_model_parallel_size=tp,
@@ -903,7 +905,7 @@ class TestRLUtils:
                 [single("a", 1.0), single("b", 0.0), make_token_rollout([], [], [], reward=0.0)]
                 for _ in range(dp)
             ]
-            expected_microbatches = 1
+            expected_microbatches = 2
         else:  # oversampling: ratio = global_batch_size/(prompts*group) = 2*dp/(dp*4) = 0.5.
             # 4*dp single-turn rows (already a multiple of 2*dp); ceil(0.5 * 4*dp) = 2*dp;
             # 2*dp / (2 * dp) = 1 microbatch.
@@ -1865,9 +1867,10 @@ class TestRLUtils:
         # Rewards keep the placeholder zeros: the lists stay rectangular for
         # alignment; GRPO normalization masks them by num_turns downstream.
         assert stats.rewards == [[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]]
-        # Which the advantages reflect: both real rollouts earned 1.0, so with
-        # the placeholder masked there is no contrast left in the group.
-        assert stats.advantages == [0.0, 0.0]
+        # Which the advantages reflect: one entry per rollout, placeholders pinned to 0.0;
+        # both real rollouts earned 1.0, so with the placeholders masked from the group
+        # statistics there is no contrast left anywhere.
+        assert stats.advantages == [0.0] * 6
         # Adapter stamps pass through; bare empties are inferred to 'placeholder'.
         assert stats.rollout_statuses == [
             ["ok", "ok", "placeholder"],
