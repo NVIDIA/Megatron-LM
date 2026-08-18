@@ -427,17 +427,25 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
     kw_args['fp8_param'] = args.fp8_param_gather
     kw_args['fp4_param'] = args.fp4_param_gather
-    if args.swiglu:
+    use_situ_glu = getattr(args, 'use_situ_glu', False)
+    if args.swiglu and use_situ_glu:
+        raise ValueError("--swiglu and --situ-glu select different GLU activations.")
+    if use_situ_glu:
+        kw_args['activation_func'] = F.silu
+        kw_args['gated_linear_unit'] = True
+        kw_args['use_te_activation_func'] = True
+        kw_args['bias_activation_fusion'] = False
+    elif args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
         kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
     else:
         kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
-        assert not args.swiglu
+        assert not args.swiglu and not use_situ_glu
         kw_args['activation_func'] = squared_relu
     elif args.quick_geglu:
-        assert not args.swiglu
+        assert not args.swiglu and not use_situ_glu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = quick_gelu
     if args.init_method_xavier_uniform:

@@ -1277,6 +1277,18 @@ class TransformerConfig(ModelParallelConfig):
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
 
+    use_situ_glu: bool = False
+    """Use SiTU-GLU in every gated dense, routed-expert, and shared-expert FFN."""
+
+    situ_glu_impl: Literal['cutedsl'] = "cutedsl"
+    """SiTU-GLU implementation backend. Only the MCore CuTe DSL fallback is available."""
+
+    situ_glu_beta1: float = 4.0
+    """SiTU-GLU gate tanh soft-cap."""
+
+    situ_glu_beta2: float = 25.0
+    """SiTU-GLU up-branch tanh soft-cap."""
+
     use_te_rng_tracker: bool = False
     """ Whether to use the TE or MCore version of the RNG tracker. """
 
@@ -2695,6 +2707,48 @@ class TransformerConfig(ModelParallelConfig):
                     "If you don't want to use TransformerEngine activation function, set "
                     "use_te_activation_func to False"
                 )
+
+        if self.use_situ_glu:
+            if not self.gated_linear_unit:
+                raise ValueError("use_situ_glu requires gated_linear_unit=True.")
+            if not self.use_te_activation_func:
+                raise ValueError("use_situ_glu requires use_te_activation_func=True.")
+            if self.activation_func != F.silu:
+                raise ValueError("use_situ_glu requires activation_func=F.silu.")
+            if self.activation_func_clamp_value is not None:
+                raise ValueError(
+                    "use_situ_glu is incompatible with activation_func_clamp_value; "
+                    "use situ_glu_beta1 and situ_glu_beta2 for its tanh soft caps."
+                )
+            if self.activation_func_fp8_input_store:
+                raise ValueError("use_situ_glu does not support activation_func_fp8_input_store.")
+            if self.fp8 is not None and self.fp8_recipe not in (Fp8Recipe.mxfp8, "mxfp8"):
+                raise ValueError(
+                    "The CuTe DSL SiTU-GLU implementation supports FP8 only with "
+                    "fp8_recipe='mxfp8'."
+                )
+            if self.fp4 is not None and self.fp4_recipe not in (Fp4Recipe.nvfp4, "nvfp4"):
+                raise ValueError(
+                    "The CuTe DSL SiTU-GLU implementation supports FP4 only with "
+                    "fp4_recipe='nvfp4'."
+                )
+            if (
+                self.num_moe_experts is not None
+                and self.moe_grouped_gemm
+                and self.use_transformer_engine_op_fuser
+                and (self.fp8 is not None or self.fp4 is not None)
+                and self.moe_mlp_glu_interleave_size != 32
+            ):
+                raise ValueError(
+                    "Fused block-scaled MoE SiTU-GLU requires "
+                    "moe_mlp_glu_interleave_size=32, matching TE's grouped-MLP layout."
+                )
+            if self.situ_glu_impl != "cutedsl":
+                raise ValueError(f"Unsupported SiTU-GLU implementation: {self.situ_glu_impl}.")
+            if not math.isfinite(self.situ_glu_beta1) or self.situ_glu_beta1 <= 0:
+                raise ValueError("situ_glu_beta1 must be finite and positive.")
+            if not math.isfinite(self.situ_glu_beta2) or self.situ_glu_beta2 <= 0:
+                raise ValueError("situ_glu_beta2 must be finite and positive.")
 
         if self.activation_func_fp8_input_store:
             if self.activation_func != F.silu or not self.gated_linear_unit:

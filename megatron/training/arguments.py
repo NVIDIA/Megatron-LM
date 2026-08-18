@@ -1406,8 +1406,17 @@ def validate_args(args, defaults={}):
         _check_arg_is_not_none(args, req_arg)
 
     # Checks.
+    if args.use_situ_glu:
+        if args.swiglu or args.quick_geglu or args.squared_relu:
+            raise ValueError(
+                "--situ-glu is mutually exclusive with --swiglu, --quick-geglu, "
+                "and --squared-relu."
+            )
+        args.use_te_activation_func = True
+        args.bias_swiglu_fusion = False
+
     if args.ffn_hidden_size is None:
-        if args.swiglu:
+        if args.swiglu or args.use_situ_glu:
             # reduce the dimnesion for MLP since projections happens on
             # two linear layers. this keeps the number of paramters in
             # the same ballpark as the counterpart with 4*h size
@@ -2237,17 +2246,24 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
     kw_args['fp8_param'] = args.fp8_param_gather
     kw_args['fp4_param'] = args.fp4_param_gather
-    if args.swiglu:
+    if args.swiglu and args.use_situ_glu:
+        raise ValueError("--swiglu and --situ-glu select different GLU activations.")
+    if args.use_situ_glu:
+        kw_args['activation_func'] = F.silu
+        kw_args['gated_linear_unit'] = True
+        kw_args['use_te_activation_func'] = True
+        kw_args['bias_activation_fusion'] = False
+    elif args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
         kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
     else:
         kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
-        assert not args.swiglu
+        assert not args.swiglu and not args.use_situ_glu
         kw_args['activation_func'] = squared_relu
     elif args.quick_geglu:
-        assert not args.swiglu
+        assert not args.swiglu and not args.use_situ_glu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = quick_gelu
     if args.init_method_xavier_uniform:
@@ -2821,6 +2837,8 @@ def _add_network_size_args(parser):
         "apply_dsa_kernel_fusion",
         "dsa_kernel_backend",
         "mamba_training_ssm_states_dtype",
+        # handled with the other model activation flags
+        "use_situ_glu",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2984,6 +3002,16 @@ def _add_network_size_args(parser):
         '--swiglu',
         action='store_true',
         help='Use gated linear units and SiLU activation instead of default gelu',
+    )
+    group.add_argument(
+        '--situ-glu',
+        '--moe-use-situ-glu',
+        action='store_true',
+        dest='use_situ_glu',
+        help=(
+            'Use SiTU-GLU in all gated dense and MoE FFNs. The MCore CuTe DSL fallback '
+            'supports BF16, MXFP8, and NVFP4 execution.'
+        ),
     )
     group.add_argument(
         '--quick-geglu',

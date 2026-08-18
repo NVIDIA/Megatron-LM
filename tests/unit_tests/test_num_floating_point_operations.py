@@ -99,6 +99,17 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     return args
 
 
+def test_situ_glu_counts_the_same_ffn_gemms_as_swiglu():
+    swiglu_args = _make_gpt_args(swiglu=True)
+    swiglu_args.use_situ_glu = False
+    situ_glu_args = _make_gpt_args(swiglu=False)
+    situ_glu_args.use_situ_glu = True
+
+    assert num_floating_point_operations(
+        situ_glu_args, batch_size=8
+    ) == num_floating_point_operations(swiglu_args, batch_size=8)
+
+
 class TestBSHDBackwardCompat:
     """For unpacked BSHD, the new optional arg must not change the result."""
 

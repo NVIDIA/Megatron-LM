@@ -430,6 +430,11 @@ class FusedSharedExpertMLP(SharedExpertMLP):
                 "moe_shared_expert_glu_interleave_size to be set when "
                 "use_grouped_gemm_for_shared_expert=True."
             )
+        if (
+            getattr(self.config, "use_situ_glu", False)
+            and self.config.moe_shared_expert_glu_interleave_size != 32
+        ):
+            raise ValueError("Fused shared-expert SiTU-GLU requires 32-wide GLU interleaving.")
         if not isinstance(self.linear_fc1, te.pytorch.Linear):
             raise ValueError(
                 f"{self.__class__.__name__} expects FC1 to be Transformer Engine Linear, "
@@ -483,7 +488,18 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         op._glu_interleave_size = glu_interleave_size
         ops.append(op)
 
-        ops.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size))
+        if getattr(self.config, "use_situ_glu", False):
+            from megatron.core.fusions.cutedsl_situ_glu import make_scaled_situ_glu
+
+            activation_op = make_scaled_situ_glu(
+                beta1=self.config.situ_glu_beta1,
+                beta2=self.config.situ_glu_beta2,
+                install_grouped_fallback=True,
+                glu_interleave_size=glu_interleave_size,
+            )
+        else:
+            activation_op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size)
+        ops.append(activation_op)
 
         fc2_weight = self.linear_fc2.weight
         op = te.pytorch.ops.GroupedLinear(

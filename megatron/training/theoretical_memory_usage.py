@@ -19,7 +19,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         args.num_query_groups = args.num_attention_heads
     # MoE.
     num_experts = 1 if args.num_experts is None else args.num_experts
-    gated_linear_multiplier = 3 / 2 if args.swiglu else 1
+    gated_linear_multiplier = 3 / 2 if args.swiglu or getattr(args, "use_situ_glu", False) else 1
 
     shared_expert_ffn_hidden_size = (
         0

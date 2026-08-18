@@ -1369,7 +1369,7 @@ def generate_state_dict(
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict["model"])
-    if args.swiglu:
+    if args.swiglu or getattr(args, "use_situ_glu", False):
         if "optimizer" in state_dict:
             model_state_dict, optimizer_state_dict = handle_swiglu_in_state_dict(
                 model, state_dict["model"], state_dict["optimizer"]
