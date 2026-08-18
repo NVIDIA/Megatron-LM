@@ -221,6 +221,7 @@ class TestRLUtils:
         args.wandb_project = None
 
         args.micro_batch_size = 1
+        args.eval_micro_batch_size = 1
 
         for key, value in kwargs.items():
             setattr(args, key, value)
