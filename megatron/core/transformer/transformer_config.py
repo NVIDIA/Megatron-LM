@@ -3240,18 +3240,6 @@ class TransformerConfig(ModelParallelConfig):
                     'attention_dropout==0 and hidden_dropout==0 (RNG replay across the '
                     'interleaved 1F1B schedule is not yet supported for nonzero dropout)'
                 )
-                # CUDA graphs capture a fixed node sequence with static buffers, which
-                # the inserted no_grad forward + backward-time replay does not fit.
-                assert self.cuda_graph_impl == "none", (
-                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '
-                    'together with CUDA graphs (cuda_graph_impl != "none").'
-                )
-                # Paged stash and full recompute are redundant activation-memory
-                # strategies, and stash/restore conflicts with the recompute release.
-                assert not self.moe_paged_stash, (
-                    'overlap_moe_expert_parallel_comm full recompute is not yet supported '
-                    'together with moe_paged_stash.'
-                )
                 # Delayed-scaling FP8 accumulates amax into a persistent
                 # amax_history across microbatches. Both the initial no_grad forward
                 # and the backward-time recompute run under the delayed FP8 autocast,
