@@ -24,6 +24,11 @@ import numpy as np
 import torch
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+except ImportError:
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
@@ -783,17 +788,18 @@ def save_checkpoint(
                 )
         else:
             sharded_sd_metadata = None
-        state_dict = generate_state_dict(
-            args,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            rng_state,
-            iteration=iteration,
-            optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
-            model_sd_kwargs=dict(metadata=sharded_sd_metadata),
-            rerun_state=rerun_state,
-        )
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
+            state_dict = generate_state_dict(
+                args,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                rng_state,
+                iteration=iteration,
+                optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                model_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                rerun_state=rerun_state,
+            )
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
@@ -868,17 +874,18 @@ def save_checkpoint(
             logger.debug(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
-            async_save_request = dist_checkpointing.save(
-                state_dict,
-                checkpoint_name,
-                save_strategy,
-                async_sharded_save=args.async_save,
-                validate_access_integrity=validate_sharding_integrity,
-                preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
-                content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
-                async_strategy=args.async_strategy,
-                verify_integrity=args.verify_integrity,
-            )
+            with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.io_write', is_goodput_span=True):
+                async_save_request = dist_checkpointing.save(
+                    state_dict,
+                    checkpoint_name,
+                    save_strategy,
+                    async_sharded_save=args.async_save,
+                    validate_access_integrity=validate_sharding_integrity,
+                    preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
+                    content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
+                    async_strategy=args.async_strategy,
+                    verify_integrity=args.verify_integrity,
+                )
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
@@ -2453,9 +2460,10 @@ def load_checkpoint(
     state_dict = None
     release = False
     if args.auto_detect_ckpt_format or ckpt_format in ('torch_dist', 'fsdp_dtensor'):
-        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-            load_dir, args, rank0=True, checkpointing_context=checkpointing_context
-        )
+        with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load.io_read', is_goodput_span=True):
+            state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+                load_dir, args, rank0=True, checkpointing_context=checkpointing_context
+            )
 
         ckpt_format = None
         if ckpt_type == CheckpointType.TORCH_DCP:
@@ -2944,6 +2952,47 @@ def load_checkpoint(
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+
+            # Optimizer state dict can overwrite per-group max_lr/min_lr values.
+            # If scheduler override is requested, re-apply runtime lr bounds from
+            # args so scheduler math does not stay pinned to checkpoint lr settings.
+            if getattr(args, "override_opt_param_scheduler", False):
+                if (
+                    optimizer is None
+                    or getattr(optimizer, "is_stub_optimizer", False)
+                    or opt_param_scheduler is None
+                ):
+                    print_rank_0(
+                        " > WARNING: --override-opt-param-scheduler is set, but optimizer or "
+                        "opt_param_scheduler is not available; skipping override of scheduler "
+                        "and optimizer param_group max_lr/min_lr."
+                    )
+                else:
+                    for param_group in optimizer.param_groups:
+                        if param_group.get("is_decoupled_lr", False):
+                            max_lr = getattr(args, "decoupled_lr", None)
+                            min_lr = getattr(args, "decoupled_min_lr", None)
+                        else:
+                            max_lr = args.lr
+                            min_lr = args.min_lr
+                        if max_lr is not None:
+                            param_group["max_lr"] = max_lr
+                        if min_lr is not None:
+                            param_group["min_lr"] = min_lr
+                    # Synchronize scheduler num_steps with consumed_train_samples
+                    # to ensure lr calculation is based on current training progress
+                    if opt_param_scheduler.num_steps != args.consumed_train_samples:
+                        print_rank_0(
+                            f" > WARNING: scheduler num_steps ({opt_param_scheduler.num_steps}) "
+                            f"differs from consumed_train_samples ({args.consumed_train_samples}). "
+                            f"Resetting scheduler num_steps to match consumed_train_samples."
+                        )
+                        opt_param_scheduler.num_steps = args.consumed_train_samples
+                    opt_param_scheduler.step(increment=0)
+                    print_rank_0(
+                        " > restored optimizer param_group max_lr/min_lr from runtime config "
+                        "because --override-opt-param-scheduler is set"
+                    )
         except KeyError as e:
             print_rank_0(
                 'Unable to load optimizer from checkpoint {}. '

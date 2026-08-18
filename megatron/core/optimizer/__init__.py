@@ -1247,4 +1247,11 @@ def get_megatron_optimizer(
             state_dict=param_to_param_group, checkpoint_id=dump_param_to_param_group_map
         )
 
+    for model_chunk in model_chunks:
+        for param in model_chunk.parameters():
+            getter_fn = getattr(param, 'get_high_precision_init_val', None)
+            clearer_fn = getattr(param, 'clear_high_precision_init_val', None)
+            if getter_fn is not None and clearer_fn is not None and getter_fn() is not None:
+                clearer_fn()
+
     return ChainedOptimizer(optimizers)

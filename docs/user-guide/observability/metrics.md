@@ -9,7 +9,7 @@
 
 # Metrics
 
-Megatron emits two namespaces of metrics: training metrics (`megatron.training.*`) and inference metrics (`gen_ai.*`, following OTel GenAI semantic conventions).
+Megatron emits training metrics under the `megatron.training.*` namespace.
 
 All metrics are emitted **only on the export rank** (`is_exporting = True`). Non-exporting ranks don't create metric instruments.
 
@@ -37,22 +37,6 @@ Loss, throughput, grad norm, and learning rate are **Gauges** (point-in-time val
 
 `megatron/training/training.py` calls `record_training_metrics()` from `megatron.core.telemetry.training_metrics` every `--log-interval` iterations. The instrument module caches per-Meter instruments using `WeakKeyDictionary` to avoid leaking on re-init.
 
-## Inference metrics (GenAI)
-
-Follows the [OTel GenAI metrics spec](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/). Emitted from `megatron/core/inference/text_generation_server/`.
-
-| Metric | Type | Unit | Description |
-|---|---|---|---|
-| `gen_ai.server.request.duration` | Histogram | s | End-to-end request latency |
-| `gen_ai.client.token.usage` | Histogram | `{token}` | Tokens per request, split by `gen_ai.token.type` |
-
-All data points carry the required GenAI attributes:
-- `gen_ai.operation.name = "text_completion"`
-- `gen_ai.provider.name = "megatron"`
-- `gen_ai.request.model = <model name>`
-
-`gen_ai.client.token.usage` additionally has a `gen_ai.token.type` label with values `"input"` or `"output"` — query them separately in Prometheus/Grafana.
-
 ## Prometheus metric names
 
 The OTel SDK may append a unit suffix when exporting to Prometheus.
@@ -64,8 +48,6 @@ The OTel SDK may append a unit suffix when exporting to Prometheus.
 | `megatron.training.throughput_tflops` | `megatron_training_throughput_tflops` (Gauge) |
 | `megatron.training.tokens_per_sec` | `megatron_training_tokens_per_sec` (Gauge) |
 | `megatron.training.skipped_iters` | `megatron_training_skipped_iters_total` |
-| `gen_ai.server.request.duration` | `gen_ai_server_request_duration_seconds` |
-| `gen_ai.client.token.usage` | `gen_ai_client_token_usage_bucket` (+ `gen_ai_token_type` label) |
 
 Dashboards use regex patterns (e.g. `{__name__=~"megatron_training_loss.*"}`) to match regardless of suffix. If a panel shows "No data", use **Explore → Prometheus → Metrics browser** to discover exact names on your SDK version.
 
