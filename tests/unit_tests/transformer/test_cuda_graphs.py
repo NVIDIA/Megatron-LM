@@ -928,6 +928,53 @@ class TestTECudaGraphHelper:
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_mhc_static_input_aliasing_requires_disjoint_liveness_windows(self):
+        config = _base_cuda_graph_config(
+            enable_hyper_connections=True,
+            recompute_granularity="selective",
+            recompute_modules=["mhc"],
+            mhc_recompute_layer_num=2,
+            overlap_moe_expert_parallel_comm=True,
+            expert_model_parallel_size=2,
+            num_moe_experts=4,
+            moe_token_dispatcher_type="alltoall",
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            bf16=True,
+        )
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = config
+
+        shared = torch.randn(4, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        unique = torch.randn_like(shared)
+        # Samples 0 and 2 alias one static buffer (as MCore consumed-sample
+        # reuse and TE _reuse_graph_input_output_buffers legally do); sample 1
+        # owns its own bytes.
+        sample_args = [(shared,), (unique,), (shared.detach().requires_grad_(True),)]
+
+        # Disjoint windows: sample 0 fully retires before sample 2's forward.
+        helper._mhc_sample_order_intervals = {0: [0, 3], 1: [1, 4], 2: [5, 6]}
+        helper._validate_mhc_static_hidden_inputs(sample_args)
+
+        # Overlapping windows on a shared address must fail at capture time:
+        # sample 2's forward starts before sample 0's backward retired, which
+        # is exactly the aliasing that corrupts recompute direct-write replay.
+        helper._mhc_sample_order_intervals = {0: [0, 5], 1: [1, 4], 2: [3, 6]}
+        with pytest.raises(RuntimeError, match="windows overlap"):
+            helper._validate_mhc_static_hidden_inputs(sample_args)
+
+        # An entry whose backward never retires in the order is live forever,
+        # so any aliasing against it fails.
+        helper._mhc_sample_order_intervals = {0: [0, None], 1: [1, 4], 2: [3, 6]}
+        with pytest.raises(RuntimeError, match="windows overlap"):
+            helper._validate_mhc_static_hidden_inputs(sample_args)
+
+        # A sample with no recorded window at all is rejected outright.
+        helper._mhc_sample_order_intervals = {1: [1, 4]}
+        with pytest.raises(RuntimeError, match="no recorded"):
+            helper._validate_mhc_static_hidden_inputs(sample_args)
+
     @pytest.mark.parametrize("num_microbatches", [16, 64, 256])
     @pytest.mark.parametrize("pp_size", [1, 2, 4])
     @pytest.mark.parametrize("vpp_size", [None, 2])
