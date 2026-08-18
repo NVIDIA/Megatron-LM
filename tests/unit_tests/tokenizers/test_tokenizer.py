@@ -2,12 +2,14 @@
 
 from unittest.mock import MagicMock
 
+import json
 import numpy as np
 import pytest
 import torch
 from packaging import version
 
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.tokenizers.text import MegatronTokenizerText
 from megatron.core.tokenizers.text.libraries.bytelevel_tokenizer import ByteLevelTokenizer
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 
@@ -21,6 +23,10 @@ except Exception:
     HuggingFaceTokenizer = None
 
 from megatron.training.config.training_config import TokenizerConfig
+
+
+class CustomTokenizerClass(MegatronTokenizerText):
+    pass
 
 
 def get_conversation():
@@ -69,7 +75,7 @@ def test_sp_tokenizer():
     )
 
     # Load SP tokenizer with custom metadata
-    metadata = {"library": "sentencepiece", "model_type": "gpt"}
+    metadata = {"library": "sentencepiece"}
 
     chat_template = get_chat_template()
     tokenizer = MegatronTokenizer.from_pretrained(
@@ -196,7 +202,7 @@ def test_megatron_tokenizer():
     special_tokens = {}
     special_tokens['additional_special_tokens'] = [f'<extra_id_{i}>' for i in range(100)]
 
-    metadata = {"library": "megatron", "model_type": "gpt"}
+    metadata = {"library": "megatron"}
     vocab_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
     merges_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
     tokenizer = MegatronTokenizer.from_pretrained(
@@ -224,7 +230,6 @@ def test_megatron_tokenizer():
     assert tokenizer.vocab_size == 50357
     assert tokenizer.eos_id == 50256
     assert tokenizer.eod == 50256
-    assert tokenizer.model_type == "gpt"
 
     assert tokenizer.vocab_file == vocab_file
     assert tokenizer.merges_file == merges_file
@@ -336,7 +341,7 @@ def test_bytelevel_tokenizer():
     assert tokenizer.detokenize([72, 101, 108, 108, 111]) == "Hello"
 
 
-def test_write_metadata():
+def test_write_metadata_hf():
     tokenizer_path = "/opt/data/tokenizers/huggingface"
     chat_template = "test chat template"
     tokenizer_library = "huggingface"
@@ -353,10 +358,6 @@ def test_write_metadata():
             tokenizer_path=tokenizer_path, tokenizer_library=tokenizer_library
         )
 
-    # Overwrite metadata
-    class CustomTokenizerClass:
-        pass
-
     MegatronTokenizer.write_metadata(
         tokenizer_path=tokenizer_path,
         tokenizer_library=tokenizer_library,
@@ -370,9 +371,48 @@ def test_write_metadata():
         tokenizer_path=tokenizer_path,
         metadata_path=metadata_path,
         tokenizer_library=tokenizer_library,
-        model_type="gpt",
         overwrite=True,
     )
+
+
+def test_write_metadata_sp():
+    path = "/opt/data/tokenizers/sentencepiece"
+    tokenizer_path = f"{path}/tokenizer.model"
+    metadata_path = f"{path}/test_metadata.json"
+    tokenizer_library = "sentencepiece"
+    MegatronTokenizer.write_metadata(
+        tokenizer_path=tokenizer_path,
+        metadata_path=metadata_path,
+        tokenizer_library=tokenizer_library,
+        overwrite=True,
+    )
+
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+
+    assert metadata['class_name'] == "MegatronTokenizerText"
+
+
+def test_own_metadata_class():
+    tokenizer_path = "/opt/data/tokenizers/huggingface"
+    chat_template = "test chat template"
+    tokenizer_library = "huggingface"
+
+    metadata_path = f"{tokenizer_path}/test_metadata.json"
+    MegatronTokenizer.write_metadata(
+        tokenizer_path=tokenizer_path,
+        metadata_path=metadata_path,
+        tokenizer_library=tokenizer_library,
+        tokenizer_class=CustomTokenizerClass,
+        overwrite=True,
+    )
+
+    # Load tokenizer with custom class
+    tokenizer = MegatronTokenizer.from_pretrained(
+        tokenizer_path=tokenizer_path, metadata_path=metadata_path
+    )
+
+    assert isinstance(tokenizer, CustomTokenizerClass)
 
 
 def test_multimodal_tokenizer():
@@ -557,7 +597,6 @@ class TestBuildTokenizer:
         chat_template = get_chat_template()
         metadata_path = {
             "library": "sentencepiece",
-            "model_type": "gpt",
             "chat_template": chat_template,
         }
 
