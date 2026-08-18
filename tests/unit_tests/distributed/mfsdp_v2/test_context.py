@@ -647,11 +647,6 @@ def test_complete_trace_clears_dedup_so_replay_records(distributed_setup):
     assert not runner._consumed_this_round
     assert runner._complete_trace_calls == 1
 
-    # Multiple VPP chunk adapters share one runner and can report the same
-    # optimizer boundary. With no execution between calls, it is a no-op.
-    runner.complete_trace()
-    assert runner._complete_trace_calls == 1
-
     assert _record_unshard_and_prefetch(runner, layers[0], "rowwise") == (
         layers[1],
         "rowwise",
@@ -682,10 +677,6 @@ def test_trace_pool_plans_after_first_execution_replay(distributed_setup):
     allocator.free("buffer")
     runner.record_unshard(model.layers[0], "rowwise")
     runner.record_reshard(model.layers[0])
-    context.complete_trace()
-    assert allocator.phase == "trace"
-
-    # A duplicate VPP chunk notification must not plan at the same boundary.
     context.complete_trace()
     assert allocator.phase == "trace"
 

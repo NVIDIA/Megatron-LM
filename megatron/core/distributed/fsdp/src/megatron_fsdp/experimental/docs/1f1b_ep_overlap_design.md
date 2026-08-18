@@ -234,12 +234,11 @@ path. `FsdpExecutionRunner` selects one of two modes:
   retaining storage across an immediate compatible reuse. A divergence safely
   falls back to tracing again.
 
-MFSDP v2 enables trace-replay for the combined 1F1B overlap schedule. The
-optimizer calls `complete_fsdp_trace()` after each step to mark the global
-batch boundary. Both paths share the same parameter lifecycle; only successor
-selection and the optional reshard skip differ. VPP chunk adapters share one
-runner, so duplicate boundary notifications without intervening execution are
-idempotent.
+MFSDP v2 enables trace-replay for the combined 1F1B overlap schedule. All VPP
+chunk adapters expose one shared `FsdpContext`; after each step, the optimizer
+calls `context.complete_trace()` exactly once to mark the global-batch
+boundary. Both paths share the same parameter lifecycle; only successor
+selection and the optional reshard skip differ.
 
 ---
 
@@ -311,7 +310,7 @@ which binds closures that operate on a passed `FsdpModule`:
 | `post_forward_release_module` | `(module) -> None` | Release forward-pass params (reshard only). |
 | `post_backward_release_module` | `(module) -> None` | Release backward-pass params (reshard + reduce). |
 | `no_sync()` | `() -> contextmanager` | Suppress gradient finalization for non-final microbatches. |
-| `complete_fsdp_trace()` | `() -> None` | Mark the global-batch boundary and compile/reset trace replay. |
+| `context` | `FsdpContext` | Shared runtime context; the optimizer calls `context.complete_trace()` once per global batch. |
 | `_setup_1f1b_overlap_interface()` | `() -> None` | Bind the schedule-facing callbacks above. |
 
 ### Changes to `find_megatron_fsdp()` (`megatron_fsdp/utils.py`)

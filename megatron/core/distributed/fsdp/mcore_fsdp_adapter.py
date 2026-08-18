@@ -58,7 +58,10 @@ try:
         fully_shard,
         fully_shard_context,
     )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import (
+        FsdpContext,
+        FsdpModule,
+    )
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -493,6 +496,11 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
 
 class FullyShardedDataParallelV2(_BaseDataParallel):
     """MFSDP v2 wrapper for the Megatron model."""
+
+    @property
+    def context(self) -> "FsdpContext":
+        """Return the runtime context shared by this model chunk."""
+        return self.module.context
 
     @staticmethod
     def _configure_te_grouped_mlp_wgrad_fusion(
@@ -991,10 +999,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 gradient reduction is complete when backward returns."""
-
-    def complete_fsdp_trace(self) -> None:
-        """Mark a global-batch boundary for execution replay and storage planning."""
-        self.module.context.complete_trace()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""

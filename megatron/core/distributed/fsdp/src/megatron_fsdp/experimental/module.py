@@ -148,14 +148,13 @@ class FsdpContext:
     def complete_trace(self) -> None:
         """Compile execution replay and the optional storage pool once per batch."""
         runner_was_tracing = self.runner.is_tracing
-        has_execution_events = self.runner.has_events_since_boundary
         self.runner.complete_trace()
         if self.trace_pool_allocator is not None and self.trace_pool_allocator.phase == "trace":
-            if self.runner.use_trace_replay and (runner_was_tracing or not has_execution_events):
+            if self.runner.use_trace_replay and runner_was_tracing:
                 # The first fine-grained batch learns execution order with prefetch
                 # disabled. Its lifetimes do not describe replay. Keep tracing
                 # storage through one replay batch, then plan from both sets of
-                # intervals. The no-events case is a duplicate VPP chunk boundary.
+                # intervals.
                 return
             self.trace_pool_allocator.plan()
 
