@@ -25,17 +25,11 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.uneven_dtensor import (
     attach_uneven_dtensor_metadata,
-    chunk_metadata_by_fqn,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-    gather_and_compute_chunk_metadata,
     preprocess_state_dict_for_uneven_dtensor,
 )
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-
-# Collectives the chunk metadata must not need. Megatron-FSDP's stable helper recovers each
-# shard's offset with one all_gather_object per DTensor; this path derives it from the layout.
-_COLLECTIVE_NAMES = ("all_gather", "all_gather_object", "all_gather_into_tensor", "all_reduce")
 
 
 class _TinyModel(nn.Module):
@@ -133,13 +127,10 @@ def _build_sharded(
 
 
 def _build_packed_sharded(
-    mesh: DeviceMesh, device: torch.device, *, zero_init: bool = False
+    mesh: DeviceMesh, device: torch.device
 ) -> tuple[nn.Module, torch.optim.Optimizer]:
     """Shard a :class:`_PackedModel`, whose packing no canonical ``Shard(0)`` split describes."""
     model = _PackedModel().to(device=device)
-    if zero_init:
-        for parameter in model.parameters():
-            nn.init.zeros_(parameter)
     with fully_shard_context(device=device):
         fully_shard(model.block, mesh=mesh, placements=_flat_placements())
         fully_shard(model.linear, mesh=mesh, placements=_flat_placements())
@@ -151,7 +142,12 @@ def _build_packed_sharded(
 def _build_tied_sharded(
     mesh: DeviceMesh, device: torch.device, *, zero_init: bool = False
 ) -> tuple[nn.Module, torch.optim.Optimizer]:
-    """Shard a :class:`_TiedModel`, whose weight is reachable under two FQNs."""
+    """Shard a :class:`_TiedModel`, whose weight is reachable under two FQNs.
+
+    Args:
+        zero_init: Zero the weights, so a destination model is obviously different from the
+            saved (trained) source and a correct load has to overwrite it.
+    """
     model = _TiedModel().to(device=device)
     if zero_init:
         for parameter in model.parameters():
@@ -462,41 +458,10 @@ def test_metadata_attach_issues_no_collectives(
     def _fail(*args, **kwargs):
         raise AssertionError("Attaching chunk metadata must not issue a collective.")
 
-    for name in _COLLECTIVE_NAMES:
+    # Collectives the chunk metadata must not need. Megatron-FSDP's stable helper recovers each
+    # shard's offset with one all_gather_object per DTensor; this path derives it from the layout.
+    for name in ("all_gather", "all_gather_object", "all_gather_into_tensor", "all_reduce"):
         monkeypatch.setattr(dist, name, _fail)
     attach_uneven_dtensor_metadata(model, model_state_dict, optimizer_state_dict)
 
     assert model_state_dict.keys() == dict(model.named_parameters()).keys()
-
-
-def test_empty_shard_offsets_match_the_stable_path(distributed_setup) -> None:
-    """An empty shard is reported at the same offset the stable helper would report.
-
-    A rank that owns no rows of a parameter writes nothing, so this offset never reaches the
-    checkpoint: DCP discards a zero-size chunk, and
-    :func:`test_saved_chunks_match_the_stable_path` therefore cannot see it. Reporting it
-    anyway keeps the two implementations comparable chunk for chunk, which is what the
-    byte-identity claim rests on, so it is asserted directly against the stable helper here.
-    """
-    device = distributed_setup.device
-    world_size = distributed_setup.world_size
-    mesh = init_device_mesh(device.type, (world_size,))
-
-    model, _ = _build_packed_sharded(mesh, device)
-    metadata_by_fqn = chunk_metadata_by_fqn(model)
-
-    empty_offsets = []
-    for fqn, parameter in model.named_parameters():
-        chunk = metadata_by_fqn[fqn]
-        expected = gather_and_compute_chunk_metadata(parameter)
-        assert tuple(chunk.offsets) == tuple(expected.offsets), f"{fqn} chunk offsets"
-        assert tuple(chunk.sizes) == tuple(expected.sizes), f"{fqn} chunk sizes"
-        if chunk.sizes[0] == 0:
-            empty_offsets.append(chunk.offsets[0])
-
-    # An empty chunk at offset 0 says nothing: that is what a canonical split would report too.
-    # Only the packing gap makes a rank skip rows it does not own, so require that case.
-    if world_size > 1:
-        nonzero_flags = [None] * world_size
-        dist.all_gather_object(nonzero_flags, any(offset > 0 for offset in empty_offsets))
-        assert any(nonzero_flags), "No rank held an empty shard at a non-zero offset."

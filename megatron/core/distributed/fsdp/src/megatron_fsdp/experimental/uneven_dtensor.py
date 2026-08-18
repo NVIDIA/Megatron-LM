@@ -68,15 +68,15 @@ def _dbuffer_chunk_metadata(buffer: DBuffer, index: int) -> ChunkStorageMetadata
     row_size = non_leading_numel(shape)
     owned_range = buffer._get_owned_range(index)
     if owned_range is None:
-        # Flat placements hand ranks contiguous buffer ranges in rank order, so the rows this rank
-        # does not own but that precede its range belong to lower ranks. Reporting that count keeps
-        # an empty chunk's offset equal to what a gather of all shard sizes would produce; DCP
-        # ignores it either way, because a zero-size chunk neither writes nor reads anything.
-        preceding_numel = buffer.offset - buffer.layout.tensor_to_offset[index]
-        preceding_numel = min(max(preceding_numel, 0), shape.numel())
-        return _chunk(row_offset=preceding_numel // row_size, rows=0, shape=shape)
+        # This rank's buffer range lies entirely before or entirely after the tensor, so the empty
+        # chunk sits at whichever end it fell off. DCP ignores the offset either way -- a zero-size
+        # chunk neither writes nor reads anything -- but reporting the end it fell off keeps it
+        # equal to what a gather of all shard sizes would produce.
+        rows = shape.numel() // row_size
+        row_offset = 0 if buffer.offset < buffer.layout.tensor_to_offset[index] else rows
+        return _build_chunk_metadata(row_offset=row_offset, rows=0, shape=shape)
 
-    return _chunk(
+    return _build_chunk_metadata(
         row_offset=owned_range.tensor_relative_offset // row_size,
         rows=owned_range.numel // row_size,
         shape=shape,
@@ -97,23 +97,22 @@ def chunk_metadata_by_fqn(model: nn.Module) -> dict[str, ChunkStorageMetadata]:
         Tied parameters appear once per FQN, all sharing the one chunk of the buffer entry that
         backs them.
     """
-    # Parameters key this map by identity because tensor equality is elementwise. The map is
-    # consumed below while ``model`` still holds every parameter, so the ids stay valid.
-    metadata_by_parameter: dict[int, ChunkStorageMetadata] = {}
+    # Keyed by tensor, which hashes and compares by identity, as torch.optim keys its state.
+    metadata_by_parameter: dict[torch.Tensor, ChunkStorageMetadata] = {}
     for module in model.modules():
         if not isinstance(module, FsdpModule):
             continue
         for parameter_group in module.parameter_groups:
             for index, fsdp_parameter in enumerate(parameter_group.fsdp_parameters):
-                metadata_by_parameter[id(fsdp_parameter.sharded)] = _dbuffer_chunk_metadata(
+                metadata_by_parameter[fsdp_parameter.sharded] = _dbuffer_chunk_metadata(
                     parameter_group.main_weight, index
                 )
     # Tied parameters share one nn.Parameter under several FQNs, and the state dict carries an
     # entry for each of them, so iterate without deduplicating.
     return {
-        fqn: metadata_by_parameter[id(parameter)]
+        fqn: metadata_by_parameter[parameter]
         for fqn, parameter in model.named_parameters(remove_duplicate=False)
-        if id(parameter) in metadata_by_parameter
+        if parameter in metadata_by_parameter
     }
 
 
@@ -137,7 +136,7 @@ def attach_uneven_dtensor_metadata(
     _attach_by_fqn(optimizer_state_dict[_OPTIMIZER_STATE_KEY], metadata_by_fqn)
 
 
-def _chunk(row_offset: int, rows: int, shape: torch.Size) -> ChunkStorageMetadata:
+def _build_chunk_metadata(row_offset: int, rows: int, shape: torch.Size) -> ChunkStorageMetadata:
     """Build chunk metadata for a dim-0 row range of a tensor of shape ``shape``."""
     # Flat placements only shard dim 0, so every other dimension is fully owned from offset 0.
     return ChunkStorageMetadata(
