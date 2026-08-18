@@ -43,7 +43,6 @@ class GroupedRolloutRequest(Request):
 KNOWN_ROLLOUT_STATUSES = ('ok', 'placeholder', 'masked', 'graded')
 
 
-
 class Rollout(AgentBaseModel):
     """Data for language-based Rollout."""
 

@@ -1572,8 +1572,8 @@ class TestRLUtils:
             rewards=[],
             num_turns=[],
             advantages=[],
-            policy_epoch=[],
-            kv_cache_epoch=[],
+            policy_epoch_segments=[],
+            kv_cache_epoch_segments=[],
             completed_epochs=[],
             num_evictions=[],
             current_iteration=6,
@@ -1598,8 +1598,8 @@ class TestRLUtils:
             rewards=[[0.0, 0.0]],
             num_turns=[[0, 0]],
             advantages=[0.0, 0.0],
-            policy_epoch=[[[0], [0]]],
-            kv_cache_epoch=[[[0], [0]]],
+            policy_epoch_segments=[[[], []]],
+            kv_cache_epoch_segments=[[[], []]],
             completed_epochs=[[]],
             num_evictions=[[0, 0]],
             current_iteration=6,
@@ -1941,7 +1941,9 @@ class TestRLUtils:
         # policy; kv is a single epoch, so avg 1.0 and std 0.
         rollout_tbl = next(t for t in tables if "policy_staleness_std" in t.get("columns", []))
         (rollout_row,) = rollout_tbl["data"]
-        assert dict(zip(rollout_tbl["columns"], rollout_row)) == pytest.approx(
+        row_by_col = dict(zip(rollout_tbl["columns"], rollout_row))
+        assert row_by_col.pop("rollout_status") == 'ok'
+        assert row_by_col == pytest.approx(
             {
                 "reward": 1.0,
                 "traj_length": 10,
