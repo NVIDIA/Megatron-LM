@@ -66,6 +66,7 @@ def fully_shard_context(
     use_trace_replay: bool = False,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
+    enable_trace_pool: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -88,6 +89,8 @@ def fully_shard_context(
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
+        enable_trace_pool: Trace temporary-buffer lifetimes for one global batch,
+            then reuse fixed physical slots. Incompatible with symmetric memory.
     """
     requested_device = torch.device(device) if device is not None else torch.device("cuda")
     if requested_device.type == "cuda" and requested_device.index is None:
@@ -99,6 +102,7 @@ def fully_shard_context(
             and existing.device == requested_device
             and existing.runner.use_trace_replay == use_trace_replay
             and existing.use_symmetric_memory == use_symmetric_memory
+            and (existing.trace_pool_allocator is not None) == enable_trace_pool
         ):
             yield existing
             return
@@ -112,6 +116,7 @@ def fully_shard_context(
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
         use_trace_replay=use_trace_replay,
+        enable_trace_pool=enable_trace_pool,
     )
     token = _FSDP_CONTEXT.set(context)
     try:

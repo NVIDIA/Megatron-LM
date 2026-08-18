@@ -16,12 +16,14 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import Flat, Partial
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import Replicate as FsdpReplicate
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
+from megatron.core.optimizer.optimizer import MixedPrecisionOptimizer
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -155,6 +157,63 @@ class TestMcoreAdapterDense:
         )
 
         assert fully_shard_context_calls == [True]
+
+    def test_vpp_optimizer_completes_shared_context_once(self, monkeypatch):
+        """One optimizer step should complete the context shared by all VPP chunks once."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=1,
+            ffn_hidden_size=16,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        ddp_config = DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+        )
+        with fully_shard_context(device=torch.device("cuda")) as context:
+            model_chunks = [
+                FullyShardedDataParallel(
+                    config=config,
+                    ddp_config=ddp_config,
+                    module=torch.nn.Linear(8, 8, bias=False, device="cuda", dtype=torch.bfloat16),
+                    pg_collection=self.pg_collection,
+                )
+                for _ in range(2)
+            ]
+
+        assert all(model_chunk.context is context for model_chunk in model_chunks)
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="adam",
+                lr=1.0e-3,
+                weight_decay=0.0,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                use_distributed_optimizer=False,
+                clip_grad=0.0,
+            ),
+            model_chunks,
+            use_gloo_process_groups=False,
+        )
+        assert isinstance(optimizer, FullyShardedOptimizer)
+        assert optimizer.context is context
+
+        complete_trace_calls = 0
+
+        def complete_trace():
+            nonlocal complete_trace_calls
+            complete_trace_calls += 1
+
+        monkeypatch.setattr(context, "complete_trace", complete_trace)
+        expected_result = (True, None, None)
+        monkeypatch.setattr(MixedPrecisionOptimizer, "step", lambda unused: expected_result)
+
+        assert optimizer.step() == expected_result
+        assert complete_trace_calls == 1
 
     def test_wgrad_fusion_is_scoped_to_te_grouped_mlp(self):
         """Only TEGroupedMLP linears and their expert FSDP unit should use fusion."""

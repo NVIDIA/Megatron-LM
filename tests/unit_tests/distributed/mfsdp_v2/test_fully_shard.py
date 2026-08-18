@@ -383,6 +383,51 @@ def test_fused_wgrad_zero_token_expert_overwrites_staging_buffer(distributed_set
     assert torch.count_nonzero(zero_token_grad) == 0
 
 
+def test_trace_pool_losses_match_baseline_after_planning(distributed_setup):
+    """Trace-planned storage must preserve saved weight views and optimizer parity."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    baseline = TinyModel().to(device)
+    model = TinyModel().to(device)
+    model.load_state_dict(baseline.state_dict())
+
+    with fully_shard_context(device=device, enable_trace_pool=True) as context:
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
+
+    x = torch.randn(2, 8, device=device)
+    target = torch.randn(2, 4, device=device)
+    baseline_losses = []
+    pooled_losses = []
+    for _ in range(4):
+        baseline_optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
+        baseline_loss = torch.nn.functional.mse_loss(baseline(x), target)
+        pooled_loss = torch.nn.functional.mse_loss(model(x), target)
+        baseline_loss.backward()
+        pooled_loss.backward()
+        baseline_optimizer.step()
+        optimizer.step()
+        context.complete_trace()
+        baseline_losses.append(baseline_loss.detach())
+        pooled_losses.append(pooled_loss.detach())
+
+        assert context.trace_pool_allocator is not None
+        assert not context.trace_pool_allocator.active_keys
+
+    assert context.trace_pool_allocator is not None
+    assert context.trace_pool_allocator.phase == "optimized"
+    torch.testing.assert_close(torch.stack(pooled_losses), torch.stack(baseline_losses))
+
+
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
 def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup, use_reentrant):
     """Activation recomputation should leave every FSDP module resharded.

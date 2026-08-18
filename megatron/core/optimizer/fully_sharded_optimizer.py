@@ -81,6 +81,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             if self.ddp_config != model_chunk.ddp_config:
                 raise ValueError("All MFSDP v2 model chunks must share the same ddp_config.")
+        contexts = {model_chunk.context for model_chunk in self.model_chunks}
+        if len(contexts) != 1:
+            raise ValueError("All MFSDP v2 model chunks must share one FsdpContext.")
+        self.context = contexts.pop()
         self.is_stub_optimizer = optimizer is None
         self._casted_grads = []
 
@@ -218,10 +222,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     def step(self):
         """Step the optimizer, then mark the FSDP execution-trace boundary."""
         result = super().step()
-        for model_chunk in self.model_chunks:
-            complete_fsdp_trace = getattr(model_chunk, "complete_fsdp_trace", None)
-            if complete_fsdp_trace is not None:
-                complete_fsdp_trace()
+        self.context.complete_trace()
         return result
 
     def _copy_model_grads_to_main_grads(self) -> None:
