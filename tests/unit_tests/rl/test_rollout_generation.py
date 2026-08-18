@@ -365,6 +365,10 @@ class TestGroupedRollouts:
                 groups.append(group)
                 if len(groups) >= expected_count:
                     break
+            if submission_granularity == "B" and parallel_generation_tasks == 1:
+                # lag=0: the boundary is quiescent, checked before close() drops
+                # shutdown sentinels into the queues on Python < 3.13.
+                pipeline.assert_no_inflight_rollouts()
 
         assert len(groups) == expected_count
         # Every delivered group carries reward signal.
@@ -377,9 +381,7 @@ class TestGroupedRollouts:
                 batch = groups[batch_start : batch_start + num_groups]
                 assert sorted(g.index_in_batch for g in batch) == list(range(num_groups))
         if submission_granularity == "B" and parallel_generation_tasks == 1:
-            # lag=0: the boundary is quiescent even with regenerated groups, and
-            # every dropped group cost exactly one extra prepare (no under-delivery).
-            pipeline.assert_no_inflight_rollouts()
+            # Every dropped group cost exactly one extra prepare (no under-delivery).
             assert gen.prepare_group_rollout_calls == expected_count + num_degenerate
             assert pipeline.filtered_count == num_degenerate
 
@@ -423,9 +425,15 @@ class TestGroupedRollouts:
             # the next batch's first group (pinned on the same full gate).
             assert gen.prepare_group_rollout_calls == 5
             events["t2"].set()
-            rest = [await asyncio.wait_for(anext(it), timeout=10) for _ in range(2)]
-        # The gated group (slot 2) and the regenerated replacement (slot 0) finish last.
-        assert sorted((g.batch_id, g.index_in_batch) for g in rest) == [(0, 0), (0, 2)]
+            # Completion order may interleave the perpetual stream's next-batch
+            # groups; keep pulling (bounded) until both stragglers land.
+            rest = []
+            for _ in range(5):
+                rest.append(await asyncio.wait_for(anext(it), timeout=10))
+                if {(0, 0), (0, 2)} <= {(g.batch_id, g.index_in_batch) for g in rest}:
+                    break
+        # The gated group (slot 2) and the regenerated replacement (slot 0) both deliver.
+        assert {(0, 0), (0, 2)} <= {(g.batch_id, g.index_in_batch) for g in rest}
         assert not pipeline._regen_tasks
 
     @pytest.mark.asyncio
