@@ -233,7 +233,7 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     loaded = pyt_state_dict[unique_key]
     if isinstance(loaded, io.BytesIO):
         loaded.seek(0)
-        loaded = torch.load(loaded, weights_only=False)
+        loaded = torch.load(loaded, weights_only=True)
     return loaded[0]
 
 
