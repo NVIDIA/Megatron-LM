@@ -28,6 +28,12 @@ workflow:
   separate PR just to reduce reviewer groups.
 - If PR B depends on symbols renamed in PR A, call out the dependency and put
   backward-compatible aliases, re-exports, or shims in PR A when needed.
+- [GitHub's standard stacked-PR flow](https://docs.github.com/en/pull-requests/how-tos/create-pull-requests/creating-stacked-pull-requests)
+  — push each branch to the upstream repo and base each PR on the previous
+  branch — does not work here: contributors cannot push branches to
+  `NVIDIA/Megatron-LM`, and a PR's base must be an upstream branch. The only
+  upstream refs containing a fork PR's commits are the `pull-request/<N>`
+  mirrors that copy-pr-bot creates, so stacking goes through them.
 - Create every PR with base `main`; the `pull-request/<N>` mirror refs do not
   exist until a vetter comments `/ok to test <head-sha>` (copy-pr-bot). Once
   the mirror exists, stack a dependent PR with
@@ -88,7 +94,6 @@ For each new PR:
 
 - Always create PRs as **drafts** and push to the user's fork, never directly to upstream.
 - Backward-compatible changes (aliases, re-exports, deprecation shims) should go in the first PR so subsequent PRs can depend on them.
-- Dependent PRs target `pull-request/<base PR number>` while stacked, and must be retargeted to `main` as soon as the base PR is approved — before it can merge or close and take the mirror ref (and every PR based on it) down with it.
 - Test files should go with the production code they test, not in a separate PR.
 - Prefer a single clean commit per split PR over replaying the original commit history.
 - If a file is hard to categorize (e.g., it touches two groups), ask the user which PR it should go in.
