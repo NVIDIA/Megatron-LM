@@ -246,9 +246,9 @@ class TrainingTensorMetricObserver:
     callback returns. Parameter metrics observe optimizer/master values when locally available,
     and wgrad metrics observe finalized ``main_grad`` or ``grad`` values at that commit point.
     Ordinary, Distributed, LayerWise, and Chained optimizer storage is represented explicitly
-    across tensor, expert, data, and expert-data parallel axes. Pipeline parallelism,
-    full-iteration CUDA graphs, GTP weight rematerialization, and FSDP parameter storage remain
-    unsupported.
+    across tensor, expert, data, and expert-data parallel axes. GTP-rematerialized parameter and
+    wgrad shards have physical padding removed by the optimizer source. Pipeline parallelism,
+    full-iteration CUDA graphs, and FSDP parameter storage remain unsupported.
 
     Args:
         scheduled_metrics: Metrics paired with independent iteration intervals. Every metric must
@@ -294,7 +294,6 @@ class TrainingTensorMetricObserver:
         """
         if iteration is None:
             raise ValueError("Configured tensor metrics require a training iteration.")
-        _validate_supported_topology(pg_collection)
         due_metrics = self._due_metrics(iteration)
         forward_metrics = tuple(
             scheduled
@@ -304,6 +303,7 @@ class TrainingTensorMetricObserver:
         if not forward_metrics:
             yield
             return
+        _validate_supported_topology(pg_collection)
         if self._forward_observation_active:
             raise RuntimeError("Tensor metric forward observation scopes must not be nested.")
 
@@ -396,7 +396,6 @@ class TrainingTensorMetricObserver:
         """
         if iteration is None:
             raise ValueError("Configured tensor metrics require a training iteration.")
-        _validate_supported_topology(pg_collection)
         due_metrics = self._due_metrics(iteration)
         if not due_metrics:
             return
@@ -405,6 +404,7 @@ class TrainingTensorMetricObserver:
             for scheduled in due_metrics
             if scheduled.metric.source_kinds & _FORWARD_SOURCE_KINDS
         )
+        _validate_supported_topology(pg_collection)
         if forward_metrics and self._prepared_forward_iteration != iteration:
             raise RuntimeError(
                 "Forward tensor metrics require observe_forward_backward() around the "
@@ -526,16 +526,24 @@ class TrainingTensorMetricObserver:
 def _forward_rank_relations(
     tp_shard_dim: int | None, pg_collection: ProcessGroupCollection
 ) -> tuple[RankRelation, ...]:
-    """Describe a forward tensor over tensor and data/context parallel ranks."""
+    """Describe a forward tensor over tensor, GTP, and data/context parallel ranks."""
     tp_group = getattr(pg_collection, "tp", None)
+    gtp_group = getattr(pg_collection, "gtp_remat", None)
     dp_cp_group = getattr(pg_collection, "dp_cp", None)
-    if tp_group is None or dp_cp_group is None:
-        raise ValueError("Forward tensor metrics require tp and dp_cp process groups.")
+    if tp_group is None or gtp_group is None or dp_cp_group is None:
+        raise ValueError("Forward tensor metrics require tp, gtp_remat, and dp_cp process groups.")
     tp_placement = (
         Shard(tp_shard_dim) if tp_shard_dim is not None and tp_group.size() > 1 else Replica()
     )
+    # Like DP peers, GTP peers execute distinct microbatches even though their activations are not
+    # tensor-dimension shards of one another.
+    gtp_placement = Shard(None) if gtp_group.size() > 1 else Replica()
     dp_placement = Shard(None) if dp_cp_group.size() > 1 else Replica()
-    return (RankRelation("tp", tp_placement), RankRelation("dp", dp_placement))
+    return (
+        RankRelation("tp", tp_placement),
+        RankRelation("gtp", gtp_placement),
+        RankRelation("dp", dp_placement),
+    )
 
 
 def _validate_forward_observation_model(
@@ -574,6 +582,8 @@ def _tensor_metric_process_groups(
         ("tp", "tp"),
         ("expert_tp", "expt_tp"),
         ("ep", "ep"),
+        ("gtp", "gtp_remat"),
+        ("expert_gtp", "expt_gtp_remat"),
         ("dp", "dp_cp"),
         ("expert_dp", "expt_dp"),
     ):
@@ -584,20 +594,10 @@ def _tensor_metric_process_groups(
 
 
 def _validate_supported_topology(pg_collection: ProcessGroupCollection) -> None:
-    unsupported_axes = []
-    for axis, attribute in (
-        ("pipeline parallelism", "pp"),
-        ("GTP weight rematerialization", "gtp_remat"),
-        ("expert GTP weight rematerialization", "expt_gtp_remat"),
-    ):
-        process_group = getattr(pg_collection, attribute, None)
-        if process_group is not None and process_group.size() > 1:
-            unsupported_axes.append(axis)
-    if unsupported_axes:
+    pp_group = getattr(pg_collection, "pp", None)
+    if pp_group is not None and pp_group.size() > 1:
         raise NotImplementedError(
-            "The training tensor metric observer does not yet support "
-            + ", ".join(unsupported_axes)
-            + "."
+            "The training tensor metric observer does not yet support pipeline parallelism."
         )
 
 

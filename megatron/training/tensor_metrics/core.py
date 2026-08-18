@@ -67,6 +67,10 @@ class Replica:
 class Shard:
     """A value partitioned across an axis.
 
+    Shards need not have the same size on every rank; a rank may hold a smaller or empty shard.
+    A metric must compact uneven shards into shape-compatible contributions before communicating
+    across the axis.
+
     Args:
         dim: Local tensor dimension partitioned by the axis. ``None`` represents a partition whose
             tensor dimension is not known; dimension-sensitive metrics may reject it.

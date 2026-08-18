@@ -160,7 +160,7 @@ class _LayerRouterDiagnosticMetric(TensorMetric):
     def _start_operation(
         self, values: Sequence[MetricTensor], layer: str, operation: _RouterOperation
     ) -> MetricStep:
-        """Build a compact contribution and reduce it over data-parallel ranks."""
+        """Build a compact contribution and reduce it over data-population ranks."""
         relations = values[0].rank_relations
         if any(value.rank_relations != relations for value in values[1:]):
             raise ValueError("A router diagnostic result requires identical rank relations.")
@@ -168,12 +168,12 @@ class _LayerRouterDiagnosticMetric(TensorMetric):
             relation.axis
             for relation in relations
             if isinstance(relation.placement, (FlatShard, Owned))
-            or (isinstance(relation.placement, Shard) and relation.axis != "dp")
+            or (isinstance(relation.placement, Shard) and relation.axis not in {"gtp", "dp"})
         )
         if unsupported:
             raise NotImplementedError(
-                "Router diagnostic metrics do not yet support sharded tensor or context "
-                f"parallel observations; unsupported axes: {unsupported}."
+                "Router diagnostic metrics do not yet support sharded model-parallel "
+                f"observations; unsupported axes: {unsupported}."
             )
 
         contribution = self._result_contribution(values, layer, operation)

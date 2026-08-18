@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from argparse import ArgumentParser
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -336,6 +337,118 @@ def test_observer_rejects_unsupported_parallel_topology():
             iteration=0,
             pg_collection=_pg_collection(pp=2),
         )
+
+
+def test_parameter_only_observation_scope_allows_gtp_topology():
+    observer = build_tensor_metric_observer(
+        ["global-param-l2:1"], result_sink=lambda *args: None
+    )
+    assert observer is not None
+
+    with observer.observe_forward_backward(
+        model=[_layer_model()], iteration=0, pg_collection=_pg_collection(gtp_remat=2)
+    ):
+        pass
+
+
+def test_forward_metrics_treat_gtp_as_an_activation_population_shard():
+    observer = build_tensor_metric_observer(
+        ["global-output-logits-l2:1"], result_sink=lambda *args: None
+    )
+    assert observer is not None
+    model = _forward_model()
+
+    with observer.observe_forward_backward(
+        model=[model], iteration=0, pg_collection=_pg_collection(gtp_remat=2)
+    ):
+        observe_tensor(
+            model.output_layer, "output_logits", "output_logits", torch.tensor([3.0, 4.0])
+        )
+
+    assert observer._prepared_forward_values is not None
+    (prepared_value,) = next(iter(observer._prepared_forward_values.values()))
+    assert prepared_value.relation("gtp").placement == Shard(None)
+    assert prepared_value.relation("dp").placement == Replica()
+
+
+def test_forward_metrics_reduce_gtp_and_dp_activation_populations_end_to_end():
+    launched_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if launched_world_size < 4 or launched_world_size % 2:
+        pytest.skip("This test requires an even number of at least four distributed ranks.")
+    if not torch.distributed.is_initialized():
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        torch.distributed.init_process_group(backend="nccl")
+
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    gtp_size = 2
+    dp_size = world_size // gtp_size
+    gtp_group = None
+    for dp_rank in range(dp_size):
+        ranks = list(range(dp_rank * gtp_size, (dp_rank + 1) * gtp_size))
+        group = torch.distributed.new_group(ranks)
+        if rank in ranks:
+            gtp_group = group
+    dp_group = None
+    for gtp_rank in range(gtp_size):
+        ranks = list(range(gtp_rank, world_size, gtp_size))
+        group = torch.distributed.new_group(ranks)
+        if rank in ranks:
+            dp_group = group
+    assert gtp_group is not None
+    assert dp_group is not None
+
+    captured = []
+    observer = build_tensor_metric_observer(
+        ["global-output-logits-l2:1"],
+        result_sink=lambda metric, results, iteration: captured.extend(results),
+    )
+    assert observer is not None
+    model = _forward_model()
+    pg_collection = _pg_collection()
+    pg_collection.gtp_remat = gtp_group
+    pg_collection.dp_cp = dp_group
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    with observer.observe_forward_backward(
+        model=[model], iteration=0, pg_collection=pg_collection
+    ):
+        observe_tensor(
+            model.output_layer,
+            "output_logits",
+            "output_logits",
+            torch.tensor([rank + 1.0], device=device),
+        )
+    observer(
+        model=[model],
+        optimizer=_fp32_optimizer(model),
+        iteration=0,
+        pg_collection=pg_collection,
+    )
+
+    assert len(captured) == 1
+    expected = (
+        torch.arange(1, world_size + 1, dtype=torch.float32, device=device)
+        .square()
+        .sum()
+        .sqrt()
+    )
+    torch.testing.assert_close(captured[0].tensor, expected)
+
+
+def test_gtp_topology_does_not_filter_optimizer_metrics_by_type():
+    observer = build_tensor_metric_observer(
+        ["global-param-mean-row-l2:1"], result_sink=lambda *args: None
+    )
+    assert observer is not None
+    model = _layer_model()
+
+    observer(
+        model=[model],
+        optimizer=_fp32_optimizer(model),
+        iteration=0,
+        pg_collection=_pg_collection(gtp_remat=2),
+    )
 
 
 def test_default_sink_writes_tensorboard_and_wandb():
@@ -703,6 +816,31 @@ def test_router_diagnostic_metrics_reject_unsupported_sharded_axes(axis, sizes):
             model=[_forward_model()], iteration=0, pg_collection=_pg_collection(**sizes)
         ):
             pass
+
+
+def test_router_diagnostic_metrics_reduce_over_gtp_population_shards():
+    observer = build_tensor_metric_observer(
+        ["layer-router-health:1"], result_sink=lambda *args: None
+    )
+    assert observer is not None
+    model = _forward_model()
+    diagnostics = torch.zeros(1, ROUTER_DIAGNOSTIC_CHANNEL_COUNT, 2)
+
+    with observer.observe_forward_backward(
+        model=[model], iteration=0, pg_collection=_pg_collection(gtp_remat=2)
+    ):
+        observe_tensor(
+            model.decoder.layers[0].router,
+            "router_diagnostics",
+            "router_diagnostics",
+            diagnostics,
+        )
+
+    assert observer._prepared_forward_values is not None
+    scheduled = observer.scheduled_metrics[0]
+    steps = scheduled.metric.start(observer._prepared_forward_values[id(scheduled.metric)])
+    assert steps
+    assert {request.axis for step in steps for request in step.requests} == {"gtp"}
 
 
 def test_forward_metrics_reject_full_iteration_cuda_graphs():

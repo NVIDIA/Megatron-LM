@@ -213,7 +213,7 @@ def _optimizer_parameter_manifest_entry(
     )
     return _OptimizerParameterManifestEntry(
         name=parameter_names[model_parameter],
-        logical_shape=tuple(model_parameter.shape),
+        logical_shape=_logical_local_shape(model_parameter, pg_collection),
         parameter_dtype=view.parameter.dtype,
         wgrad_dtype=wgrad_dtype,
         ep_owner=ep_owner,
@@ -246,6 +246,19 @@ def _model_parallel_relations(
             Owned(ep_group.rank()) if is_expert and ep_group.size() > 1 else Replica()
         )
         relations.append(RankRelation("ep", ep_placement))
+
+    gtp_axis = "expert_gtp" if is_expert else "gtp"
+    gtp_group_attribute = "expt_gtp_remat" if is_expert else "gtp_remat"
+    gtp_group = getattr(pg_collection, gtp_group_attribute, None)
+    is_gtp_shard = getattr(model_parameter, "is_gtp_weight_remat", False)
+    if is_gtp_shard and gtp_group is None:
+        raise ValueError(
+            f"Tensor metric observation requires the {gtp_group_attribute} process group for "
+            "a GTP-rematerialized parameter."
+        )
+    if gtp_group is not None:
+        gtp_placement = Shard(0) if is_gtp_shard else Replica()
+        relations.append(RankRelation(gtp_axis, gtp_placement))
     return tuple(relations)
 
 
@@ -260,9 +273,15 @@ def _local_optimizer_tensor_views(
     available at the observer's pre-step hook.
     """
     if isinstance(optimizer, LayerWiseDistributedOptimizer):
-        return _layerwise_optimizer_tensor_views(optimizer, pg_collection)
+        return [
+            _trim_gtp_padding(view, pg_collection)
+            for view in _layerwise_optimizer_tensor_views(optimizer, pg_collection)
+        ]
     if isinstance(optimizer, DistributedOptimizer):
-        return _distributed_optimizer_tensor_views(optimizer)
+        return [
+            _trim_gtp_padding(view, pg_collection)
+            for view in _distributed_optimizer_tensor_views(optimizer)
+        ]
     if isinstance(optimizer, ChainedOptimizer):
         views = []
         seen_parameters = set()
@@ -275,7 +294,10 @@ def _local_optimizer_tensor_views(
                 views.append(view)
         return views
     if isinstance(optimizer, (Float16OptimizerWithFloat16Params, FP32Optimizer)):
-        return _replicated_optimizer_tensor_views(optimizer)
+        return [
+            _trim_gtp_padding(view, pg_collection)
+            for view in _replicated_optimizer_tensor_views(optimizer)
+        ]
     raise NotImplementedError(
         f"Tensor metric observation does not support optimizer type {type(optimizer).__name__}."
     )
@@ -502,7 +524,7 @@ def _missing_optimizer_storage_relations(
             ),
         )
     if isinstance(optimizer, DistributedOptimizer):
-        return (_empty_flat_shard_relation(model_parameter),)
+        return (_empty_flat_shard_relation(model_parameter, pg_collection),)
     if isinstance(optimizer, ChainedOptimizer):
         layerwise_children = [
             child
@@ -530,7 +552,7 @@ def _missing_optimizer_storage_relations(
         if any(
             isinstance(child, DistributedOptimizer) for child in optimizer.chained_optimizers
         ):
-            return (_empty_flat_shard_relation(model_parameter),)
+            return (_empty_flat_shard_relation(model_parameter, pg_collection),)
         if len(layerwise_children) == 1:
             return (
                 _layerwise_storage_relation(
@@ -545,11 +567,107 @@ def _missing_optimizer_storage_relations(
     )
 
 
-def _empty_flat_shard_relation(model_parameter: torch.nn.Parameter) -> RankRelation:
+def _empty_flat_shard_relation(
+    model_parameter: torch.nn.Parameter, pg_collection: ProcessGroupCollection
+) -> RankRelation:
     return RankRelation(
         _data_parallel_axis(model_parameter),
-        FlatShard(logical_shape=tuple(model_parameter.shape), start=0, end=0),
+        FlatShard(
+            logical_shape=_logical_local_shape(model_parameter, pg_collection), start=0, end=0
+        ),
     )
+
+
+def _trim_gtp_padding(
+    view: _OptimizerTensorView, pg_collection: ProcessGroupCollection
+) -> _OptimizerTensorView:
+    """Remove this GTP rank's physical padding from optimizer-backed tensors."""
+    model_parameter = view.model_parameter
+    physical_shape = tuple(model_parameter.shape)
+    logical_shape = _logical_local_shape(model_parameter, pg_collection)
+    if logical_shape == physical_shape:
+        return view
+
+    logical_numel = 1
+    for size in logical_shape:
+        logical_numel *= size
+    flat_shard_indices = [
+        index
+        for index, relation in enumerate(view.storage_relations)
+        if isinstance(relation.placement, FlatShard)
+    ]
+    if len(flat_shard_indices) > 1:
+        raise ValueError("Tensor metric observation supports at most one optimizer FlatShard.")
+
+    if flat_shard_indices:
+        relation_index = flat_shard_indices[0]
+        relation = view.storage_relations[relation_index]
+        placement = relation.placement
+        if not isinstance(placement, FlatShard):
+            raise TypeError("A selected optimizer storage relation must contain a FlatShard.")
+        clipped_start = min(placement.start, logical_numel)
+        clipped_end = min(placement.end, logical_numel)
+        local_numel = clipped_end - clipped_start
+        parameter = view.parameter.reshape(-1)[:local_numel]
+        wgrad = None if view.wgrad is None else view.wgrad.reshape(-1)[:local_numel]
+        storage_relations = list(view.storage_relations)
+        storage_relations[relation_index] = RankRelation(
+            relation.axis, FlatShard(logical_shape, clipped_start, clipped_end)
+        )
+    else:
+        physical_numel = model_parameter.numel()
+        if view.parameter.numel() != physical_numel:
+            raise ValueError(
+                "A padded GTP optimizer parameter must match its physical model shard size."
+            )
+        parameter = view.parameter.reshape(physical_shape)[: logical_shape[0]]
+        if view.wgrad is not None:
+            if view.wgrad.numel() != physical_numel:
+                raise ValueError(
+                    "A padded GTP wgrad must match its physical model shard size."
+                )
+            wgrad = view.wgrad.reshape(physical_shape)[: logical_shape[0]]
+        else:
+            wgrad = None
+        storage_relations = list(view.storage_relations)
+
+    return _OptimizerTensorView(
+        model_parameter=model_parameter,
+        parameter=parameter,
+        wgrad=wgrad,
+        storage_relations=tuple(storage_relations),
+        is_placeholder=view.is_placeholder,
+    )
+
+
+def _logical_local_shape(
+    model_parameter: torch.nn.Parameter, pg_collection: ProcessGroupCollection
+) -> tuple[int, ...]:
+    """Return this rank's unpadded logical shape for a dim-0 GTP shard."""
+    physical_shape = tuple(model_parameter.shape)
+    if not getattr(model_parameter, "is_gtp_weight_remat", False):
+        return physical_shape
+    pad_length = getattr(model_parameter, "pad_length", 0)
+    if not pad_length:
+        return physical_shape
+    if not physical_shape:
+        raise ValueError("A padded GTP-rematerialized parameter must not be scalar.")
+
+    is_expert = not getattr(model_parameter, "allreduce", True)
+    group_attribute = "expt_gtp_remat" if is_expert else "gtp_remat"
+    group = getattr(pg_collection, group_attribute, None)
+    if group is None:
+        raise ValueError(
+            f"Tensor metric observation requires the {group_attribute} process group for "
+            "a GTP-rematerialized parameter."
+        )
+    padded_rows = physical_shape[0] * group.size()
+    logical_rows = padded_rows - pad_length
+    if logical_rows < 0:
+        raise ValueError("GTP padding exceeds the globally padded parameter dimension.")
+    local_start = group.rank() * physical_shape[0]
+    local_rows = max(0, min(physical_shape[0], logical_rows - local_start))
+    return (local_rows,) + physical_shape[1:]
 
 
 def _layerwise_storage_relation(
