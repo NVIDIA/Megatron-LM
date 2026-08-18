@@ -136,6 +136,7 @@ class GatedDeltaNet(_GDNBase):
                 packed_seq_params=packed_seq_params,
                 cp_group=cp_group_chunkwise,
                 tp_group=self.tp_group,
+                tp_cp_group=self.pg_collection.tp_cp,
                 target_partition_mode="contiguous",
                 sequence_parallel=self.config.sequence_parallel,
                 config=self.config,

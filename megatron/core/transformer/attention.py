@@ -330,7 +330,9 @@ class Attention(MegatronModule, ABC):
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'tp_cp']
+            )
         else:
             assert hasattr(
                 pg_collection, 'tp'
@@ -1368,6 +1370,7 @@ class Attention(MegatronModule, ABC):
             packed_seq_params=packed_seq_params,
             cp_group=self.pg_collection.cp,
             tp_group=self.pg_collection.tp,
+            tp_cp_group=self.pg_collection.tp_cp,
             target_partition_mode="zigzag",
             sequence_parallel=self.config.sequence_parallel,
             config=self.config,
