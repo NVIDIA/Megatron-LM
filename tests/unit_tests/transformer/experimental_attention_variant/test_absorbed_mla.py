@@ -3,6 +3,7 @@
 import random
 from typing import List, Optional, Tuple
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -26,11 +27,38 @@ from megatron.core.transformer.multi_latent_attention import (
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
-from tests.unit_tests.determinism.utils import capture_rng_state, restore_rng_state
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, reason_for_no_fp8 = check_fp8_support()
 nvfp4_available, reason_for_no_nvfp4 = check_nvfp4_support()
+
+
+# Inlined from tests.unit_tests.determinism.utils rather than imported: that module pulls
+# in torch.testing._internal.common_utils, whose import calls
+# torch.backends.disable_global_flags() and breaks later tests in this pytest session that
+# assign torch.backends.* flags (e.g. test_te_layers_batch_invariant.py).
+def capture_rng_state() -> dict:
+    """Snapshot every RNG that the framework consumes during a fwd+bwd pass."""
+    from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+
+    return {
+        "random": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state(),
+        "mpu_tracker": get_cuda_rng_tracker().get_states(),
+    }
+
+
+def restore_rng_state(state: dict) -> None:
+    """Inverse of ``capture_rng_state``."""
+    from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+
+    random.setstate(state["random"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    torch.cuda.set_rng_state(state["torch_cuda"])
+    get_cuda_rng_tracker().set_states(state["mpu_tracker"])
 
 
 class MockCoreAttention(torch.nn.Module):
