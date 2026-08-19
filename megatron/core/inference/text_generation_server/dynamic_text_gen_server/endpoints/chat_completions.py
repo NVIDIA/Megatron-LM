@@ -906,12 +906,8 @@ try:
         # --- 2. Parse Sampling Params ---
         try:
             temperature = float(_get_non_none(req, "temperature", 1.0))
-            top_p = float(
-                _get_non_none(req, "top_p", current_app.config.get('default_top_p', 1.0))
-            )
-            top_k = int(
-                _get_non_none(req, "top_k", current_app.config.get('default_top_k', 0))
-            )
+            top_p = float(_get_non_none(req, "top_p", current_app.config.get('default_top_p', 1.0)))
+            top_k = int(_get_non_none(req, "top_k", current_app.config.get('default_top_k', 0)))
             n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
 
             if temperature == 0.0:

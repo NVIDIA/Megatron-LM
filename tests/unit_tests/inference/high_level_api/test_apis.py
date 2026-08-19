@@ -180,11 +180,7 @@ class TestLifecycleGuards:
         sock = MagicMock()
         llm.serve(
             ServeConfig(
-                port=1234,
-                sock=sock,
-                default_top_p=0.95,
-                default_top_k=20,
-                serving_mode=True,
+                port=1234, sock=sock, default_top_p=0.95, default_top_k=20, serving_mode=True
             ),
             blocking=False,
         )
