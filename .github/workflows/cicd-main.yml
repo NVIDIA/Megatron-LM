@@ -1497,7 +1497,7 @@ jobs:
         with:
           app-id: ${{ vars.COMMUNITY_BOT_ID }}
           private-key: ${{ secrets.COMMUNITY_BOT_KEY }}
-          permission-issues: write
+          permission-pull-requests: write
 
       - name: Comment on PR with action run URL
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
