@@ -19,6 +19,7 @@ from megatron.core.inference.quantization.utils import (
     quantize_params_to_mxfp8,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import unwrap_model
 
 from . import build_local_reshard_plan, execute_reshard_plan
@@ -458,6 +459,15 @@ def _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=None):
         invalidate_refit_tensor_cache(tgt_core)
 
 
+def _run_post_refit_hooks(target: Optional[torch.nn.Module]) -> None:
+    """Notify destination modules after refit has updated their tensors."""
+    if target is None:
+        return
+    for module in target.modules():
+        if isinstance(module, MegatronModule):
+            module.post_refit()
+
+
 def reshard_model_weights(
     src_model: LanguageModule,
     target_model: LanguageModule,
@@ -490,3 +500,4 @@ def reshard_model_weights(
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )
+    _run_post_refit_hooks(tgt_core)
