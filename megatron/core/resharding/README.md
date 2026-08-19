@@ -1,7 +1,7 @@
 # Resharding (Refit)
 
 Transfer model weights between different parallelism configurations
-(TP, PP, EP, DP) with optional format conversion (e.g. BF16 to MXFP8).
+(TP, GTP_remat, PP, EP, DP) with optional format conversion (e.g. BF16 to MXFP8).
 Used primarily in RL loops to move weights from a training model to an
 inference model that may use a different parallelism layout.
 
@@ -12,6 +12,7 @@ refit.py            High-level API: swap_model_weights, caching, MXFP8 auto-dete
     |
 planner.py          Local plan builder (every rank all-gathers metadata, replays
                     the same deterministic schedule, keeps only its own ops)
+shard_planner.py    Logical-coordinate planner for replicated, TP, and GTP layouts
     |
 execution.py        Submits send/recv ops to a CopyService, handles writebacks
     |
@@ -88,21 +89,43 @@ through the network stack.
 
 ## How the Reshard Plan Works
 
-1. Each rank extracts parameter metadata (shape, sharding, TP/EP/PP groups).
+1. Each rank extracts parameter metadata (shape, sharding, TP/GTP_remat/EP/PP groups).
 2. Metadata is all-gathered so **every** rank has the full picture
    (`dist.all_gather_object()`) — no rank-0 bottleneck, no scatter.
 3. Every rank independently replays the **same deterministic schedule**
    (`_iter_global_transfer_ops`):
    - Iterate destination ranks, then each rank's destination params in gathered
      order; for each destination param, find the matching source param(s) by name.
-   - Route to a dimension-specific planner (LCM tiling for standard TP,
-     block-interleaved for partitioned params like Mamba `in_proj`).
+   - Map source and destination storage into logical global-weight coordinates,
+     then intersect those regions. The same algorithm handles replicated, TP,
+     packed/strided TP, GTP, and combined TP x GTP layouts.
    - Assign a monotonic `task_id` per sub-op.  Because the iteration order and
      counter are a pure function of the gathered metadata, the send op computed
      on the sender and the recv op computed on the receiver get the **same**
      `task_id` without any central authority.
 4. Each rank keeps only the ops where it is the sender or receiver.
 5. The plan is cached so repeated refits skip steps 1-4.
+
+## Generalized Tensor Parallelism
+
+See the [GTP user guide](../../../docs/api-guide/core/generalized_tensor_parallel.md)
+for the current GTP design and configuration. GTP_remat stores a contiguous
+dim-0 slice of the already TP-local weight. The shard
+planner represents every local weight as intervals in the logical, unpadded
+global weight and intersects source intervals with destination intervals.
+GTP_remat therefore uses the same algorithm as ordinary TP. This single rule covers:
+
+- column parallel weights, where TP and GTP_remat both cut dim 0;
+- row parallel weights, where TP cuts dim 1 and GTP_remat cuts dim 0;
+- strided TP weights such as gated MLP projections;
+- packed TP layouts such as Mamba `in_proj`; and
+- transitions to or from a non-GTP_remat model, or between different GTP_remat sizes.
+
+Alignment-only GTP_remat padding is excluded from transfers. Quantized destinations
+are assembled once in a zeroed BF16 buffer and requantized once, so padding
+cannot affect the scale of logical weight values. Native TransformerEngine
+MXFP8/NVFP4 GTP_remat parameters are temporarily presented as their base TE class
+while dequantizing or updating them.
 
 The deterministic schedule stays stable when a larger roster is supplied: existing
 transfers keep their `task_id`s and newly appended destination ranks receive new
@@ -134,7 +157,7 @@ across refits.
 | Cache | Key | Contents | Why |
 |-------|-----|----------|-----|
 | `_service_cache` | Backend name | `CopyService` instance | Avoid re-creating CUDA streams / NVSHMEM buffers |
-| `_plan_cache` | (rank, src_config, dst_config, num_experts) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits |
+| `_plan_cache` | (rank, src_config, dst_config, num_experts) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits; configs include dense/expert GTP_remat sizes |
 
 Call `clear_all_caches()` before destroying distributed process groups
 to avoid stale references.  This also finalizes NVSHMEM resources.
@@ -151,13 +174,16 @@ attribute with the following groups:
 | `pp` | If PP > 1 | Pipeline stage / layer index remapping |
 | `ep` | If MoE | Expert parallelism routing |
 | `expt_tp` | If expert TP | Expert-specific tensor parallelism |
+| `gtp_remat` | If dense GTP_remat | Dense weight-rematerialization shards |
+| `expt_gtp_remat` | If expert GTP_remat | Expert weight-rematerialization shards |
 
 ## File Reference
 
 | File | Role |
 |------|------|
 | `refit.py` | Public API, caching, MXFP8 auto-detection |
-| `planner.py` | Local deterministic plan builder (metadata, LCM/block-interleaved planners) |
+| `planner.py` | Local deterministic schedule builder |
+| `shard_planner.py` | Replicated/TP/GTP local-to-global mapping and intersection planner |
 | `execution.py` | Plan executor (send/recv submission, writeback, format conversion) |
 | `transforms.py` | `ReshardTransform` base class, `MXFP8ReshardTransform` |
 | `utils.py` | `TransferOp`, `ReshardPlan`, `ParameterMetadata`, `ShardingDescriptor` |
