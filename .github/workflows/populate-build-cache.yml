@@ -16,6 +16,20 @@ name: Populate CI build caches
 run-name: Populate CI build caches from main
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/_build_ci_container.yml"
+      - ".github/workflows/populate-build-cache.yml"
+      - "docker/**"
+      - "megatron/core/__init__.py"
+      - "megatron/core/package_info.py"
+      - "pyproject.toml"
+      - "tests/test_utils/python_scripts/download_unit_tests_dataset.py"
+      - "uv.lock"
+  schedule:
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 permissions:
