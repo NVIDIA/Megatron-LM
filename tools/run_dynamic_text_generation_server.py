@@ -81,7 +81,7 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         help="Default top-k sampling value when a request does not specify top_k.",
     )
     parser.add_argument(
-        "--serving-mode",
+        "--eval-mode",
         action="store_true",
         help=(
             "Optimize defaults for pure serving. In chat requests, prevent_retokenization "
@@ -195,8 +195,8 @@ async def run_text_generation_server(
         server_port (int): The network for port the frontend text generation server.
         hostname (str | None): Hostname or IP address for coordinator and HTTP traffic.
         chat_template (str | None): Inline chat template or contents loaded from a file.
-        default_top_p (float): Sampling default when a request omits ``top_p``.
-        default_top_k (int): Sampling default when a request omits ``top_k``.
+        default_top_p (float): Sampling default when a request omits `top_p`.
+        default_top_k (int): Sampling default when a request omits `top_k`.
         serving_mode (bool): Whether to use pure-serving response defaults.
     """
 
@@ -338,7 +338,7 @@ if __name__ == "__main__":
                     chat_template=chat_template,
                     default_top_p=args.default_top_p,
                     default_top_k=args.default_top_k,
-                    serving_mode=args.serving_mode,
+                    serving_mode=args.eval_mode,
                 )
             )
         except KeyboardInterrupt:

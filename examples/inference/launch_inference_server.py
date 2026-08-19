@@ -3,9 +3,9 @@
 """OpenAI-compatible inference server using the Megatron high-level API.
 
 Mirrors tools/run_dynamic_text_generation_server.py but drives the
-``DynamicInferenceEngine`` through ``MegatronAsyncLLM.serve(...)`` instead
+`DynamicInferenceEngine` through `MegatronAsyncLLM.serve(...)` instead
 of building the coordinator/engine pipeline manually. Coordinator mode is
-required (HTTP serving uses the coordinator path); ``use_coordinator=True``
+required (HTTP serving uses the coordinator path); `use_coordinator=True`
 is hardcoded in the script.
 """
 
@@ -62,7 +62,7 @@ def add_serve_args(parser: ArgumentParser) -> ArgumentParser:
         help="Default top-k sampling value when a request omits top_k.",
     )
     group.add_argument(
-        "--serving-mode",
+        "--eval-mode",
         action="store_true",
         help="Avoid returning prompt token IDs by default for pure serving.",
     )
@@ -86,7 +86,7 @@ async def _serve(args, model, tokenizer, inference_config):
             frontend_replicas=args.frontend_replicas,
             default_top_p=args.default_top_p,
             default_top_k=args.default_top_k,
-            serving_mode=args.serving_mode,
+            serving_mode=args.eval_mode,
         )
         await llm.serve(serve_config, blocking=True)
 

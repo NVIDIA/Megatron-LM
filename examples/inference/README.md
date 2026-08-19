@@ -91,7 +91,7 @@ Send requests with any OpenAI-compatible client. The dynamic server
 currently returns `"model": "EMPTY"` and does not validate the request
 `model` field — pass anything you like.
 
-For evaluation or other pure-serving workloads, pass `--serving-mode` to
+For evaluation or other pure-serving workloads, pass `--eval-mode` to
 avoid returning prompt token IDs unless a request explicitly asks for them.
 Use `--default-top-p` and `--default-top-k` to change sampling defaults for
 requests that omit those fields; request-level values always take precedence.
