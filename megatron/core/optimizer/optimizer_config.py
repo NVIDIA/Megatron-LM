@@ -321,7 +321,9 @@ class OptimizerConfig:
     kernel-level floating point rounding and bitwise parity with duplicated mode is
     lost. Only used when use_layer_sharding_muon is set. Defaults to 1 (bit-exact
     per-matrix path); raise (e.g. to 32) to trade bitwise parity for fewer kernel
-    launches on MoE expert homes."""
+    launches on MoE expert homes. Values > 1 require emerging-optimizers >= 0.3.0
+    (batched 3-D Newton-Schulz); the default runs on any version with the
+    newton_schulz API."""
 
     use_layer_sharding_muon: bool = False
     """If true, use LayerShardedMuon instead of TensorParallelMuon when optimizer is 'muon'.
