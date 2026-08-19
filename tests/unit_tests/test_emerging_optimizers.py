@@ -45,6 +45,36 @@ pytestmark = [
 ]
 
 
+def _muon_ht_process_groups() -> ProcessGroupCollection:
+    """Build the explicit shard groups used by MuonHT normalization tests."""
+    return ProcessGroupCollection(
+        tp=parallel_state.get_tensor_model_parallel_group(check_initialized=False),
+        expt_tp=parallel_state.get_expert_tensor_parallel_group(check_initialized=False),
+        gtp_remat=parallel_state.get_gtp_weight_remat_group(check_initialized=False),
+        expt_gtp_remat=parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False),
+    )
+
+
+def _optimizer_process_groups() -> ProcessGroupCollection:
+    """Build an explicit process-group collection for optimizer-factory tests."""
+    return ProcessGroupCollection(
+        tp=parallel_state.get_tensor_model_parallel_group(),
+        mp=parallel_state.get_model_parallel_group(),
+        dp=parallel_state.get_data_parallel_group(with_gtp_remat=False),
+        dp_cp=parallel_state.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=False
+        ),
+        expt_tp=parallel_state.get_expert_tensor_parallel_group(check_initialized=False),
+        expt_dp=parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
+        tp_ep_pp=parallel_state.get_expert_tensor_model_pipeline_parallel_group(),
+        tp_ep_pp_with_egtp_remat=parallel_state.get_expert_tensor_model_pipeline_parallel_group(
+            with_egtp_remat=True
+        ),
+        gtp_remat=parallel_state.get_gtp_weight_remat_group(check_initialized=False),
+        expt_gtp_remat=parallel_state.get_expert_gtp_weight_remat_group(check_initialized=False),
+    )
+
+
 class Net(nn.Module):
     def __init__(self):
         super().__init__()
@@ -158,7 +188,7 @@ def test_muon_ht_normalizes_update_and_preserves_weight_norm():
         nesterov=False,
         weight_decay=0.0,
         hyperball_radius=radius.item(),
-        pg_collection=None,
+        pg_collection=_muon_ht_process_groups(),
         tp_mode="duplicated",
     )
     update = torch.arange(12, 0, -1, dtype=torch.float32, device='cuda').reshape(3, 4)
@@ -185,7 +215,9 @@ def test_muon_ht_model_initialization_constrains_only_muon_parameters():
     embedding_before = model.embedding.detach().clone()
     excluded_before = model.excluded_weight.detach().clone()
 
-    initialize_muon_ht_parameters([model], radius=2.5, eps=1e-15, pg_collection=None)
+    initialize_muon_ht_parameters(
+        [model], radius=2.5, eps=1e-15, pg_collection=_muon_ht_process_groups()
+    )
 
     torch.testing.assert_close(model.muon_weight.norm(), torch.tensor(2.5, device='cuda'))
     torch.testing.assert_close(model.embedding, embedding_before, rtol=0.0, atol=0.0)
@@ -198,7 +230,17 @@ def test_muon_ht_model_initialization_rejects_norm_below_eps():
     model.weight.data.fill_(0.125)
 
     with pytest.raises(ValueError, match="finite, non-zero norm"):
-        initialize_muon_ht_parameters([model], radius=1.0, eps=0.25, pg_collection=None)
+        initialize_muon_ht_parameters(
+            [model], radius=1.0, eps=0.25, pg_collection=_muon_ht_process_groups()
+        )
+
+
+def test_muon_ht_model_initialization_rejects_missing_process_groups():
+    """Model initialization should require process groups even for unsharded weights."""
+    model = nn.Linear(1, 1, bias=False, device='cuda')
+
+    with pytest.raises(ValueError, match="explicit ProcessGroupCollection"):
+        initialize_muon_ht_parameters([model], radius=1.0, eps=1e-15, pg_collection=None)
 
 
 def test_muon_ht_model_initialization_scales_norm_equal_to_eps():
@@ -206,7 +248,9 @@ def test_muon_ht_model_initialization_scales_norm_equal_to_eps():
     model = nn.Linear(1, 1, bias=False, device='cuda')
     model.weight.data.fill_(0.25)
 
-    initialize_muon_ht_parameters([model], radius=1.0, eps=0.25, pg_collection=None)
+    initialize_muon_ht_parameters(
+        [model], radius=1.0, eps=0.25, pg_collection=_muon_ht_process_groups()
+    )
 
     torch.testing.assert_close(model.weight, torch.ones_like(model.weight))
 
@@ -215,7 +259,11 @@ def test_muon_ht_sets_update_below_eps_to_zero():
     """An update whose norm is below epsilon should be treated as numerical zero."""
     parameter = torch.nn.Parameter(torch.tensor([[2.0, 0.0]], device='cuda'))
     optimizer = TensorParallelMuonHT(
-        params=[parameter], weight_decay=0.0, hyperball_eps=0.25, hyperball_radius=2.0
+        params=[parameter],
+        weight_decay=0.0,
+        hyperball_eps=0.25,
+        hyperball_radius=2.0,
+        pg_collection=_muon_ht_process_groups(),
     )
     update = torch.tensor([[0.125, 0.0]], device='cuda')
 
@@ -232,7 +280,11 @@ def test_muon_ht_scales_update_equal_to_eps_to_weight_norm():
     """An update whose norm equals epsilon should remain numerically nonzero."""
     parameter = torch.nn.Parameter(torch.tensor([[2.0, 0.0]], device='cuda'))
     optimizer = TensorParallelMuonHT(
-        params=[parameter], weight_decay=0.0, hyperball_eps=0.25, hyperball_radius=2.0
+        params=[parameter],
+        weight_decay=0.0,
+        hyperball_eps=0.25,
+        hyperball_radius=2.0,
+        pg_collection=_muon_ht_process_groups(),
     )
     update = torch.tensor([[0.25, 0.0]], device='cuda')
 
@@ -247,7 +299,11 @@ def test_muon_ht_sets_weight_below_eps_to_zero():
     """A weight whose norm is below epsilon should be treated as numerical zero."""
     parameter = torch.nn.Parameter(torch.tensor([[2.0, 0.0]], device='cuda'))
     optimizer = TensorParallelMuonHT(
-        params=[parameter], weight_decay=0.0, hyperball_eps=0.25, hyperball_radius=2.0
+        params=[parameter],
+        weight_decay=0.0,
+        hyperball_eps=0.25,
+        hyperball_radius=2.0,
+        pg_collection=_muon_ht_process_groups(),
     )
     update = torch.tensor([[2.0, 0.0]], device='cuda')
 
@@ -273,7 +329,7 @@ def test_muon_ht_optimizer_step_preserves_configured_radius_without_state():
         weight_decay=0.0,
         hyperball_radius=initial_radius.item(),
         num_ns_steps=5,
-        pg_collection=None,
+        pg_collection=_muon_ht_process_groups(),
         tp_mode="duplicated",
     )
 
@@ -301,7 +357,10 @@ def test_muon_ht_fixed_radius_and_validation():
     parameter = torch.nn.Parameter(torch.ones(3, 4, dtype=torch.float32, device='cuda'))
     parameter.data.mul_(2.5 / parameter.norm())
     initial_parameter = parameter.detach().clone()
-    optimizer = TensorParallelMuonHT(params=[parameter], weight_decay=0.0, hyperball_radius=2.5)
+    pg_collection = _muon_ht_process_groups()
+    optimizer = TensorParallelMuonHT(
+        params=[parameter], weight_decay=0.0, hyperball_radius=2.5, pg_collection=pg_collection
+    )
 
     torch.testing.assert_close(parameter, initial_parameter)
     assert optimizer.hyperball_radius == 2.5
@@ -319,16 +378,29 @@ def test_muon_ht_fixed_radius_and_validation():
             params=[torch.nn.Parameter(torch.ones(2, 2, device='cuda'))],
             weight_decay=0.01,
             hyperball_radius=2.0,
+            pg_collection=pg_collection,
         )
     with pytest.raises(TypeError, match="hyperball_radius"):
-        TensorParallelMuonHT(params=[parameter], weight_decay=0.0)
+        TensorParallelMuonHT(params=[parameter], weight_decay=0.0, pg_collection=pg_collection)
+    with pytest.raises(ValueError, match="explicit ProcessGroupCollection"):
+        TensorParallelMuonHT(
+            params=[parameter], weight_decay=0.0, hyperball_radius=2.5, pg_collection=None
+        )
     with pytest.raises(ValueError, match="hyperball_eps must be finite and positive"):
         TensorParallelMuonHT(
-            params=[parameter], weight_decay=0.0, hyperball_eps=0.0, hyperball_radius=2.5
+            params=[parameter],
+            weight_decay=0.0,
+            hyperball_eps=0.0,
+            hyperball_radius=2.5,
+            pg_collection=pg_collection,
         )
     with pytest.raises(ValueError, match="hyperball_radius must be finite and at least"):
         TensorParallelMuonHT(
-            params=[parameter], weight_decay=0.0, hyperball_eps=1e-3, hyperball_radius=1e-4
+            params=[parameter],
+            weight_decay=0.0,
+            hyperball_eps=1e-3,
+            hyperball_radius=1e-4,
+            pg_collection=pg_collection,
         )
 
 
@@ -488,10 +560,7 @@ class TestMuonOptimizerMultiRank:
         """The public optimizer factory should construct and run TensorParallelMuonHT."""
         model = self.create_ddp_model(Net().bfloat16().cuda().requires_grad_(True))
         initialize_muon_ht_parameters(
-            [model],
-            radius=2.5,
-            eps=1e-15,
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            [model], radius=2.5, eps=1e-15, pg_collection=_muon_ht_process_groups()
         )
         optimizer_config = OptimizerConfig(
             optimizer='muon_ht',
@@ -506,8 +575,19 @@ class TestMuonOptimizerMultiRank:
             muon_ht_radius=2.5,
         )
 
+        with pytest.raises(ValueError, match="explicit ProcessGroupCollection"):
+            get_megatron_optimizer(
+                config=optimizer_config,
+                model_chunks=[model],
+                use_gloo_process_groups=False,
+                pg_collection=None,
+            )
+
         optimizer = get_megatron_optimizer(
-            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=False,
+            pg_collection=_optimizer_process_groups(),
         )
         raw_optimizers = [
             child.optimizer for child in optimizer.chained_optimizers if hasattr(child, "optimizer")
@@ -687,7 +767,7 @@ class TestMuonOptimizerMultiRankTP:
             tuple: (model, optimizer, pg_collection)
         """
         rank = int(os.getenv('RANK', '0'))
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection = _muon_ht_process_groups()
 
         # Create model with partition_dim for TP
         torch.manual_seed(42 + rank)
@@ -751,7 +831,7 @@ class TestMuonOptimizerMultiRankTP:
 
     def test_muon_ht_uses_global_norm_for_tp_shards(self):
         """Hyperball norms should include every unique tensor-parallel shard."""
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection = _muon_ht_process_groups()
         tp_rank = pg_collection.tp.rank()
         parameter = torch.nn.Parameter(
             torch.full((3, 4), float(tp_rank + 1), dtype=torch.float32, device='cuda')
@@ -807,7 +887,7 @@ class TestMuonOptimizerMultiRankGTP:
 
     def test_muon_ht_uses_global_norm_for_gtp_shards(self):
         """Hyperball norms should include every unique GTP-remat shard."""
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection = _muon_ht_process_groups()
         gtp_rank = pg_collection.gtp_remat.rank()
         parameter = torch.nn.Parameter(
             torch.full((3, 4), float(gtp_rank + 1), dtype=torch.float32, device='cuda')

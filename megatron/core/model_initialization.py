@@ -49,18 +49,9 @@ def _is_expert_parameter(param: torch.Tensor) -> bool:
 
 
 def _parameter_shard_groups(
-    param: torch.Tensor, pg_collection: ProcessGroupCollection | None
+    param: torch.Tensor, pg_collection: ProcessGroupCollection
 ) -> tuple[torch.distributed.ProcessGroup, ...]:
     """Return process groups spanning every unique shard of a parameter."""
-    if pg_collection is None:
-        if (
-            _is_tensor_parallel_shard(param) or getattr(param, "is_gtp_weight_remat", False)
-        ) and torch.distributed.is_initialized():
-            raise RuntimeError(
-                "TensorParallelMuonHT requires a ProcessGroupCollection for sharded weights"
-            )
-        return ()
-
     is_expert = _is_expert_parameter(param)
     groups = []
     if _is_tensor_parallel_shard(param):
@@ -81,9 +72,11 @@ def _parameter_shard_groups(
 
 
 def logical_frobenius_norm(
-    tensor: torch.Tensor, param: torch.Tensor, pg_collection: ProcessGroupCollection | None
+    tensor: torch.Tensor, param: torch.Tensor, pg_collection: ProcessGroupCollection
 ) -> torch.Tensor:
     """Compute an FP32 Frobenius norm over all unique shards of a parameter."""
+    if pg_collection is None:
+        raise ValueError("TensorParallelMuonHT requires an explicit ProcessGroupCollection")
     squared_norm = tensor.float().square().sum()
     for group in _parameter_shard_groups(param, pg_collection):
         torch.distributed.all_reduce(squared_norm, op=torch.distributed.ReduceOp.SUM, group=group)
@@ -95,9 +88,11 @@ def initialize_muon_ht_parameters(
     model_chunks: Iterable[torch.nn.Module],
     radius: float,
     eps: float,
-    pg_collection: ProcessGroupCollection | None,
+    pg_collection: ProcessGroupCollection,
 ) -> None:
     """Place every Muon-managed model parameter on the configured Hyperball sphere."""
+    if pg_collection is None:
+        raise ValueError("TensorParallelMuonHT requires an explicit ProcessGroupCollection")
     validate_hyperball_config(eps, radius)
 
     params_and_norms = []
@@ -121,9 +116,11 @@ def initialize_muon_ht_parameters(
 def maybe_initialize_muon_ht_parameters(
     model_chunks: Iterable[torch.nn.Module],
     transformer_config: "TransformerConfig",
-    pg_collection: ProcessGroupCollection | None,
+    pg_collection: ProcessGroupCollection,
 ) -> None:
     """Apply configured MuonHT initialization during Megatron model initialization."""
+    if pg_collection is None:
+        raise ValueError("TensorParallelMuonHT requires an explicit ProcessGroupCollection")
     radius = getattr(transformer_config, 'muon_ht_radius', None)
     if radius is None or not transformer_config.perform_initialization:
         return

@@ -375,6 +375,7 @@ class TensorParallelMuonHT(TensorParallelMuon):
         hyperball_eps: Minimum norm used for numerical stability.
         hyperball_radius: Fixed global Frobenius norm for every parameter. Megatron model
             initialization places Muon-managed parameters at this radius.
+        pg_collection: Explicit model-parallel process groups used for sharded norms.
         **kwargs: Arguments passed to :class:`TensorParallelMuon`.
     """
 
@@ -383,15 +384,17 @@ class TensorParallelMuonHT(TensorParallelMuon):
         params: ParamsT,
         *,
         hyperball_radius: float,
+        pg_collection: ProcessGroupCollection,
         hyperball_eps: float = 1e-15,
         **kwargs: Any,
     ) -> None:
         validate_hyperball_config(hyperball_eps, hyperball_radius)
+        if pg_collection is None:
+            raise ValueError("TensorParallelMuonHT requires an explicit ProcessGroupCollection")
 
         self.hyperball_eps = hyperball_eps
-        assert hyperball_radius is not None
         self.hyperball_radius = hyperball_radius
-        super().__init__(params, **kwargs)
+        super().__init__(params, pg_collection=pg_collection, **kwargs)
 
         for group in self.param_groups:
             if group["weight_decay"] != 0.0:
