@@ -136,6 +136,16 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
+@dataclass(frozen=True)
+class QKVLayout:
+    """Logical layout metadata for a fused QKV projection weight."""
+
+    num_attention_heads: int
+    num_query_groups: int
+    kv_channels: int
+    attention_output_gate: bool
+
+
 class LinearQkvInterface(Protocol):
     """Interface for linear_qkv modules."""
 
@@ -1692,6 +1702,12 @@ class SelfAttention(Attention):
             tp_group=self.pg_collection.tp,
             pg_collection=self.pg_collection,
             name=(name + ".linear_qkv") if name is not None else None,
+        )
+        self.linear_qkv.weight.qkv_layout = QKVLayout(
+            num_attention_heads=self.config.num_attention_heads,
+            num_query_groups=self.config.num_query_groups,
+            kv_channels=self.config.kv_channels,
+            attention_output_gate=self.config.attention_output_gate,
         )
 
         # Resolve which norm class to use for Q and K.

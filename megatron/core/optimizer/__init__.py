@@ -783,7 +783,6 @@ def _get_megatron_emerging_optimizer(
 
     # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
     for model_chunk in model_chunks:
-        qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
@@ -791,14 +790,18 @@ def _get_megatron_emerging_optimizer(
                 param.expert_tp = True
             # TODO(deyuf): support MLA
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
-                if qkv_split_shapes is None:
-                    qkv_split_shapes = _get_qkv_split_shapes(
-                        model_chunk.config, split_qkv_per_head=config.muon_split_qkv_per_head
-                    )
+                qkv_layout = getattr(param, 'qkv_layout', None)
+                if qkv_layout is None:
+                    # Backward compatibility for custom QKV modules that do not annotate
+                    # their weight with the owning attention layer's logical layout.
+                    qkv_layout = model_chunk.config
+                qkv_split_shapes = _get_qkv_split_shapes(
+                    qkv_layout, split_qkv_per_head=config.muon_split_qkv_per_head
+                )
                 global_split_shapes = (
                     qkv_split_shapes
                     if config.muon_split_qkv_per_head
-                    else qkv_split_shapes * model_chunk.config.num_query_groups
+                    else qkv_split_shapes * qkv_layout.num_query_groups
                 )
 
                 tp_group = (

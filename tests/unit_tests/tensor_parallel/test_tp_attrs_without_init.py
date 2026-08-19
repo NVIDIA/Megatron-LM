@@ -10,6 +10,7 @@ from megatron.core.tensor_parallel.layers import (
     copy_tensor_model_parallel_attributes,
     param_is_not_tensor_parallel_duplicate,
 )
+from megatron.core.transformer.attention import QKVLayout
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -91,10 +92,16 @@ class TestTPAttributesWithoutInitialization:
         assert hasattr(w, "partition_stride") and w.partition_stride == 1
 
 
-def test_copy_tensor_model_parallel_attributes_preserves_qkv_split_shapes():
+def test_copy_tensor_model_parallel_attributes_preserves_qkv_metadata():
     source = torch.empty(4, 4)
     destination = torch.empty_like(source)
     source.is_qkv = True
+    source.qkv_layout = QKVLayout(
+        num_attention_heads=8,
+        num_query_groups=2,
+        kv_channels=64,
+        attention_output_gate=False,
+    )
     source.qkv_split_shapes = [2, 2]
     source.qkv_split_shapes_global = [2] * 4
     source.qkv_gtp_pad_length = 3
@@ -104,6 +111,7 @@ def test_copy_tensor_model_parallel_attributes_preserves_qkv_split_shapes():
     copy_tensor_model_parallel_attributes(destination, source)
 
     assert destination.is_qkv is True
+    assert destination.qkv_layout == source.qkv_layout
     assert destination.qkv_split_shapes == source.qkv_split_shapes
     assert destination.qkv_split_shapes_global == source.qkv_split_shapes_global
     assert destination.qkv_gtp_pad_length == 3

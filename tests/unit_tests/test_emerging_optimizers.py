@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import json
 import os
 
 import pytest
@@ -12,6 +13,9 @@ from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
+    get_gpt_heterogeneous_layer_spec,
+)
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
@@ -27,6 +31,9 @@ from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+    HeterogeneousTransformerConfig,
+)
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
@@ -561,6 +568,97 @@ class TestMuonOptimizerMultiRankTP:
         assert qkv_weight.qkv_split_shapes == [8, 4, 4]
         assert qkv_weight.qkv_split_shapes_global == [8, 4, 4]
         assert not qkv_weight.qkv_split_groups_are_complete
+
+    @pytest.mark.parametrize("split_per_head", [False, True])
+    def test_optimizer_factory_uses_heterogeneous_layer_qkv_layout(self, split_per_head):
+        """Each heterogeneous attention layer supplies its own logical QKV layout."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tp_size = pg_collection.tp.size()
+        assert tp_size == 2
+        model_parallel_cuda_manual_seed(123)
+        block_configs = {
+            "block_configs": [
+                {
+                    "attention": {
+                        "no_op": False,
+                        "replace_with_linear": False,
+                        "num_query_groups": 2,
+                    },
+                    "mlp": {
+                        "no_op": False,
+                        "replace_with_linear": False,
+                        "ffn_hidden_size": 16,
+                    },
+                },
+                {
+                    "attention": {
+                        "no_op": False,
+                        "replace_with_linear": False,
+                        "num_query_groups": 1,
+                    },
+                    "mlp": {
+                        "no_op": False,
+                        "replace_with_linear": False,
+                        "ffn_hidden_size": 16,
+                    },
+                },
+            ]
+        }
+        transformer_config = HeterogeneousTransformerConfig(
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            kv_channels=4,
+            tensor_model_parallel_size=tp_size,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            heterogeneous_layers_config_encoded_json=json.dumps(block_configs),
+        )
+        model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_heterogeneous_layer_spec(transformer_config),
+            vocab_size=32,
+            max_sequence_length=8,
+            pre_process=False,
+            post_process=False,
+            pg_collection=pg_collection,
+        )
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            use_distributed_optimizer=False,
+            muon_split_qkv=True,
+            muon_split_qkv_per_head=split_per_head,
+            muon_tp_mode="blockwise",
+        )
+
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=False,
+            pg_collection=pg_collection,
+        )
+
+        first_qkv = model.decoder.layers[0].self_attention.linear_qkv.weight
+        second_qkv = model.decoder.layers[1].self_attention.linear_qkv.weight
+        assert optimizer is not None
+        assert transformer_config.num_query_groups == 2
+        assert first_qkv.qkv_layout.num_query_groups == 2
+        assert second_qkv.qkv_layout.num_query_groups == 1
+        assert first_qkv.shape[0] == 12
+        assert second_qkv.shape[0] == 8
+        assert first_qkv.is_qkv
+        assert second_qkv.is_qkv
+        if split_per_head:
+            assert first_qkv.qkv_split_shapes_global == [4] * 6
+            assert second_qkv.qkv_split_shapes_global == [4] * 4
+            assert first_qkv.qkv_split_heads_are_complete
+            assert second_qkv.qkv_split_heads_are_complete
+        else:
+            assert first_qkv.qkv_split_shapes_global == [4, 4, 4] * 2
+            assert second_qkv.qkv_split_shapes_global == [8, 4, 4]
+            assert first_qkv.qkv_split_groups_are_complete
+            assert not second_qkv.qkv_split_groups_are_complete
 
     def test_optimizer_factory_skips_mismatched_qkv_layout(self):
         """A QKV layout mismatch falls back to whole-matrix Muon orthogonalization."""

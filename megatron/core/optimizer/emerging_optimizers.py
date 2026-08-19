@@ -146,10 +146,12 @@ def _is_nonlinear_or_embedding(param):
 
 
 def _get_qkv_split_shapes(model_cfg, split_qkv_per_head: bool = False) -> list[int]:
-    """Compute fused QKV split shapes from a transformer model config.
+    """Compute fused QKV split shapes from logical attention layout metadata.
 
     Args:
-        model_cfg: Transformer model configuration.
+        model_cfg: Object exposing ``num_attention_heads``, ``num_query_groups``,
+            ``kv_channels``, and ``attention_output_gate``. This can be a transformer
+            config or the owning attention layer's parameter metadata.
         split_qkv_per_head: Return one split size per physical attention head. When false,
             return the per-query-group Q, gate (if present), K, and V projection widths.
     """
