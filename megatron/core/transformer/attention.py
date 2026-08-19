@@ -151,7 +151,7 @@ class QKVLayout:
     per_head_split_shapes: tuple[int, ...]
 
     @classmethod
-    def from_standard_attention_config(cls, config: TransformerConfig) -> 'QKVLayout':
+    def from_transformer_config(cls, config: TransformerConfig) -> 'QKVLayout':
         """Build the fused QKV row layout described by a transformer config."""
         assert config.num_query_groups is not None
         assert config.kv_channels is not None
@@ -170,7 +170,7 @@ class QKVLayout:
         )
 
     @classmethod
-    def from_repeated_splits(cls, num_groups: int, split_shapes: tuple[int, ...]) -> 'QKVLayout':
+    def from_splits(cls, num_groups: int, split_shapes: tuple[int, ...]) -> 'QKVLayout':
         """Build a layout whose projection slices are repeated once per attention head."""
         return cls(
             num_groups=num_groups,
@@ -1736,7 +1736,7 @@ class SelfAttention(Attention):
             pg_collection=self.pg_collection,
             name=(name + ".linear_qkv") if name is not None else None,
         )
-        self.linear_qkv.weight.qkv_layout = QKVLayout.from_standard_attention_config(self.config)
+        self.linear_qkv.weight.qkv_layout = QKVLayout.from_transformer_config(self.config)
 
         # Resolve which norm class to use for Q and K.
         # Config selects the default norm class; spec overrides if set.

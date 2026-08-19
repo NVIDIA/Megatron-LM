@@ -373,11 +373,11 @@ class AbsorbedMLASelfAttention(Attention):
         )
 
         q_up_proj = self.linear_q_proj if self.config.q_lora_rank is None else self.linear_q_up_proj
-        q_up_proj.weight.qkv_layout = QKVLayout.from_repeated_splits(
+        q_up_proj.weight.qkv_layout = QKVLayout.from_splits(
             self.config.num_attention_heads,
             (self.config.qk_head_dim, self.config.qk_pos_emb_head_dim),
         )
-        self.linear_kv_up_proj.weight.qkv_layout = QKVLayout.from_repeated_splits(
+        self.linear_kv_up_proj.weight.qkv_layout = QKVLayout.from_splits(
             self.config.num_attention_heads, (self.config.qk_head_dim, self.config.v_head_dim)
         )
 

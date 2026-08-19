@@ -418,10 +418,11 @@ def _worker_muon_qkv_padding(
     gtp_local_rows = physical_tp_rows // gtp_remat_size
     hidden_size = 4
 
-    global_grad = torch.arange(logical_rows * hidden_size, dtype=torch.float32, device="cuda").view(
-        logical_rows, hidden_size
-    )
-    tp_grad = global_grad[tp_rank * logical_tp_rows : (tp_rank + 1) * logical_tp_rows]
+    # Full logical gradient before TP/GTP sharding; physical GTP padding is not included.
+    logical_grad = torch.arange(
+        logical_rows * hidden_size, dtype=torch.float32, device="cuda"
+    ).view(logical_rows, hidden_size)
+    tp_grad = logical_grad[tp_rank * logical_tp_rows : (tp_rank + 1) * logical_tp_rows]
     # Use a sentinel so the test detects padding entering the orthogonalization.
     physical_tp_grad = F.pad(tp_grad, (0, 0, 0, pad_length), value=10_000.0)
     local_grad = physical_tp_grad[
@@ -457,21 +458,21 @@ def _worker_muon_qkv_padding(
     actual = optimizer.orthogonalize(param, local_grad)
 
     if split_per_head:
-        expected_global = torch.cat(
-            [center_rows(head) for head in torch.split(global_grad, split_shapes, dim=0)], dim=0
+        expected_logical_grad = torch.cat(
+            [center_rows(head) for head in torch.split(logical_grad, split_shapes, dim=0)], dim=0
         )
     else:
-        grouped_grad = global_grad.view(1, logical_rows, hidden_size)
+        grouped_grad = logical_grad.view(1, logical_rows, hidden_size)
         projections = torch.split(grouped_grad, split_shapes, dim=1)
-        expected_global = torch.cat(
+        expected_logical_grad = torch.cat(
             [
                 center_rows(projection.reshape(-1, hidden_size)).view_as(projection)
                 for projection in projections
             ],
             dim=1,
-        ).view_as(global_grad)
+        ).view_as(logical_grad)
 
-    expected_tp = expected_global[tp_rank * logical_tp_rows : (tp_rank + 1) * logical_tp_rows]
+    expected_tp = expected_logical_grad[tp_rank * logical_tp_rows : (tp_rank + 1) * logical_tp_rows]
     expected_tp = F.pad(expected_tp, (0, 0, 0, pad_length))
     expected = expected_tp[gtp_rank * gtp_local_rows : (gtp_rank + 1) * gtp_local_rows]
 

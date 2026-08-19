@@ -794,7 +794,7 @@ def _get_megatron_emerging_optimizer(
                     qkv_split_shapes = _get_qkv_split_shapes(
                         qkv_layout, split_qkv_per_head=config.muon_split_qkv_per_head
                     )
-                    global_split_shapes = (
+                    logical_split_shapes = (
                         qkv_split_shapes
                         if config.muon_split_qkv_per_head
                         else qkv_split_shapes * qkv_layout.num_groups
@@ -805,7 +805,7 @@ def _get_megatron_emerging_optimizer(
                     qkv_split_shapes = _get_qkv_split_shapes(
                         model_chunk.config, split_qkv_per_head=config.muon_split_qkv_per_head
                     )
-                    global_split_shapes = (
+                    logical_split_shapes = (
                         qkv_split_shapes
                         if config.muon_split_qkv_per_head
                         else qkv_split_shapes * model_chunk.config.num_query_groups
@@ -819,16 +819,16 @@ def _get_megatron_emerging_optimizer(
                 tp_size = get_pg_size(tp_group)
                 tp_rank = get_pg_rank(tp_group)
                 gtp_remat_group = (
-                    pg_collection.expt_gtp_remat
-                    if getattr(param, 'expert_tp', False)
-                    else pg_collection.gtp_remat
+                    (
+                        pg_collection.expt_gtp_remat
+                        if getattr(param, 'expert_tp', False)
+                        else pg_collection.gtp_remat
+                    )
+                    if getattr(param, 'is_gtp_weight_remat', False)
+                    else None
                 )
-                if getattr(param, 'is_gtp_weight_remat', False):
-                    gtp_size = get_pg_size(gtp_remat_group)
-                    gtp_rank = get_pg_rank(gtp_remat_group)
-                else:
-                    gtp_size = 1
-                    gtp_rank = 0
+                gtp_size = get_pg_size(gtp_remat_group)
+                gtp_rank = get_pg_rank(gtp_remat_group)
 
                 qkv_gtp_pad_length = (
                     int(getattr(param, 'pad_length', 0))
@@ -843,13 +843,13 @@ def _get_megatron_emerging_optimizer(
                         f"physical_tp_local_rows={physical_tp_local_rows}"
                     )
                 logical_tp_local_rows = physical_tp_local_rows - qkv_gtp_pad_length
-                expected_global_rows = logical_tp_local_rows * tp_size
-                if expected_global_rows != sum(global_split_shapes):
+                expected_logical_rows = logical_tp_local_rows * tp_size
+                if expected_logical_rows != sum(logical_split_shapes):
                     log_single_rank(
                         logger,
                         logging.DEBUG,
                         f"Emerging optimizer QKV split skipped for {name}: "
-                        f"global_rows={sum(global_split_shapes)}, "
+                        f"logical_rows={sum(logical_split_shapes)}, "
                         f"local_rows={param.shape[0]}, tp_size={tp_size}, "
                         f"gtp_remat_size={gtp_size}, "
                         f"gtp_pad_length={qkv_gtp_pad_length}",
@@ -863,7 +863,7 @@ def _get_megatron_emerging_optimizer(
                     continue
 
                 param.is_qkv = True
-                param.qkv_split_shapes_global = global_split_shapes
+                param.qkv_split_shapes_global = logical_split_shapes
                 param.qkv_gtp_pad_length = qkv_gtp_pad_length
                 local_start = tp_rank * logical_tp_local_rows + gtp_rank * param.shape[0]
                 if config.muon_split_qkv_per_head:

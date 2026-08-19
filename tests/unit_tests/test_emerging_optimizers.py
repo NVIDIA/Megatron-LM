@@ -96,7 +96,7 @@ def test_muon_qkv_split_shapes():
     assert _get_qkv_split_shapes(config, split_qkv_per_head=True) == [64] * 32
     assert _get_qkv_split_shapes(gated_config, split_qkv_per_head=True) == [64] * 48
 
-    mla_layout = QKVLayout.from_repeated_splits(4, (128, 64))
+    mla_layout = QKVLayout.from_splits(4, (128, 64))
     assert _get_qkv_split_shapes(mla_layout) == [128, 64]
     assert _get_qkv_split_shapes(mla_layout, split_qkv_per_head=True) == [128, 64] * 4
 
