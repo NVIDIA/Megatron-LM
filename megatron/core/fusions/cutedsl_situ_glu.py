@@ -1,14 +1,18 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""CuTe DSL SiTU-GLU activation and cuDNN grouped-MLP integration."""
+"""SiTU-GLU activation builders with an MCore-local CuTe DSL fallback."""
 
 from __future__ import annotations
 
-import inspect
 import math
+from collections.abc import Sequence
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Optional
 
 import torch
+from transformer_engine.pytorch.cpu_offload import is_cpu_offload_enabled, mark_activation_offload
+from transformer_engine.pytorch.ops._common import maybe_dequantize
+from transformer_engine.pytorch.ops.op import BasicOperation, OperationContext
+from transformer_engine.pytorch.utils import clear_tensor_data
 
 
 def situ_glu_reference(
@@ -365,347 +369,174 @@ class CuTeDSLSiTUGLU(torch.nn.Module):
         return _SiTUGLUFunction.apply(input_, self.beta1, self.beta2, self.interleave_size)
 
 
-try:
-    from transformer_engine.pytorch.ops import ScaledSwiGLU as _ScaledSwiGLU
-except ImportError:
-    _ScaledSwiGLU = torch.nn.Module
+def _get_te_situ_glu_ops() -> Optional[tuple[type[torch.nn.Module], type[torch.nn.Module]]]:
+    """Import the complete public Transformer Engine SiTU-GLU interface."""
+    try:
+        from transformer_engine.pytorch.ops import ScaledSiTUGLU, SiTUGLU
+    except ImportError:
+        return None
+    return SiTUGLU, ScaledSiTUGLU
 
 
-class ScaledSiTUGLU(_ScaledSwiGLU):
-    """TE scaled activation shell recognized by its fused grouped-MLP matcher."""
+class CuTeDSLScaledSiTUGLU(BasicOperation):
+    """MCore-local scaled SiTU-GLU fallback for TE's operation-fuser interface."""
 
-    def __init__(self, beta1: float = 4.0, beta2: float = 25.0, **kwargs) -> None:
-        super().__init__(**kwargs)
+    num_extra_inputs: int = 1
+
+    def __init__(
+        self,
+        glu_interleave_size: Optional[int] = None,
+        *,
+        activation_recompute_in_mlp: bool = False,
+        beta1: float = 4.0,
+        beta2: float = 25.0,
+    ) -> None:
+        super().__init__()
+        if activation_recompute_in_mlp:
+            raise ValueError(
+                f"{self.__class__.__name__} does not support activation recomputation "
+                "in the fused grouped MLP"
+            )
         self.beta1, self.beta2 = _validate_betas(beta1, beta2)
+        self.glu_interleave_size = glu_interleave_size
+        if self.glu_interleave_size is not None:
+            self.glu_interleave_size = int(self.glu_interleave_size)
+            if self.glu_interleave_size <= 0:
+                raise ValueError("SiTU-GLU interleave size must be positive when set.")
 
-    def _glu_forward(self, input_: torch.Tensor) -> torch.Tensor:
-        # TE's legacy _ScaledGLU API removes interleaving before this callback.
-        return _situ_glu_forward(input_, self.beta1, self.beta2)
+    def op_forward(self, *args, **kwargs) -> None:
+        """Reject direct BasicOperation execution with a hidden scale input."""
+        raise RuntimeError(
+            f"{self.__class__.__name__} expects its row scales as an operation-fuser input."
+        )
 
-    def _glu_backward(self, grad_output: torch.Tensor, input_: torch.Tensor) -> torch.Tensor:
-        # TE's legacy _ScaledGLU API restores interleaving after this callback.
-        return _situ_glu_backward(grad_output, input_, self.beta1, self.beta2)
+    def op_backward(self, *args, **kwargs) -> None:
+        """Reject direct BasicOperation backward with a hidden scale input."""
+        raise RuntimeError(
+            f"{self.__class__.__name__} expects its row scales as an operation-fuser input."
+        )
 
-    def _scaled_glu_forward(self, input_: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-        """Implement the TE 2.17+ scaled-GLU fallback API."""
+    def fuser_forward(
+        self,
+        basic_op_ctxs: list[OperationContext],
+        input_: torch.Tensor,
+        *,
+        basic_op_extra_inputs: Sequence[Sequence[Optional[torch.Tensor]]],
+        prev_op_grad_output_quantizer: Optional[Any],
+        next_op_input_quantizer: Optional[Any],
+        basic_op_kwargs: list[dict[str, Any]],
+    ) -> tuple[torch.Tensor, Sequence[Sequence[Optional[torch.Tensor]]]]:
+        """Apply local SiTU-GLU and the routed-token row scales."""
+        del prev_op_grad_output_quantizer, next_op_input_quantizer, basic_op_kwargs
+        scales = basic_op_extra_inputs[0][0]
+        if torch.is_autocast_enabled():
+            dtype = torch.get_autocast_dtype("cuda")
+        elif isinstance(input_, torch.Tensor):
+            dtype = input_.dtype
+        else:
+            dtype = scales.dtype
+        input_ = maybe_dequantize(input_, dtype)
+        scales = maybe_dequantize(scales, dtype)
         output = _situ_glu_forward(
             input_, self.beta1, self.beta2, int(self.glu_interleave_size or 0)
         )
-        return output * scales.unsqueeze(-1)
+        output = output * scales.unsqueeze(-1)
 
-    def _scaled_glu_backward(
+        ctx = basic_op_ctxs[0]
+        if ctx.requires_grad:
+            if is_cpu_offload_enabled():
+                mark_activation_offload(input_)
+            ctx.input_requires_grad = True
+            ctx.extra_input_requires_grad = scales.requires_grad
+            ctx.dtype = dtype
+            ctx.save_for_backward(input_, scales)
+        return output, [()]
+
+    def fuser_backward(
         self,
+        basic_op_ctxs: list[OperationContext],
         grad_output: torch.Tensor,
-        input_: torch.Tensor,
-        scales: torch.Tensor,
         *,
-        compute_scale_grad: bool,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Implement the TE 2.17+ scaled-dGLU fallback API."""
-        output = None
-        if compute_scale_grad:
-            output = _situ_glu_forward(
-                input_, self.beta1, self.beta2, int(self.glu_interleave_size or 0)
-            )
+        basic_op_grad_extra_outputs: Sequence[Sequence[Optional[torch.Tensor]]],
+    ) -> tuple[
+        torch.Tensor,
+        Sequence[Sequence[Optional[torch.Tensor]]],
+        Sequence[Sequence[Optional[torch.Tensor]]],
+    ]:
+        """Differentiate the local activation and optional row scales."""
+        del basic_op_grad_extra_outputs
+        ctx = basic_op_ctxs[0]
+        input_, scales = ctx.saved_tensors
+        input_ = maybe_dequantize(input_, ctx.dtype)
+        scales = maybe_dequantize(scales, ctx.dtype)
+        grad_output = maybe_dequantize(grad_output, ctx.dtype)
+        interleave_size = int(self.glu_interleave_size or 0)
         grad_input = _situ_glu_backward(
-            grad_output * scales.unsqueeze(-1),
-            input_,
-            self.beta1,
-            self.beta2,
-            int(self.glu_interleave_size or 0),
+            grad_output * scales.unsqueeze(-1), input_, self.beta1, self.beta2, interleave_size
         )
         grad_scales = None
-        if output is not None:
+        if ctx.extra_input_requires_grad:
+            output = _situ_glu_forward(input_, self.beta1, self.beta2, interleave_size)
             grad_scales = torch.linalg.vecdot(output, grad_output)
-        return grad_input, grad_scales
+        clear_tensor_data(ctx.saved_tensors[0])
+        return grad_input, [()], [(grad_scales,)]
 
 
-def make_situ_glu(beta1: float = 4.0, beta2: float = 25.0) -> torch.nn.Module:
-    """Construct native TE SiTU-GLU when available, otherwise the local CuTe fallback."""
+def make_situ_glu(
+    beta1: float = 4.0,
+    beta2: float = 25.0,
+    *,
+    cache_quantized_input: bool = False,
+    glu_interleave_size: Optional[int] = None,
+) -> torch.nn.Module:
+    """Construct native TE SiTU-GLU or the standalone MCore CuTe fallback."""
     beta1, beta2 = _validate_betas(beta1, beta2)
-    try:
-        from transformer_engine.pytorch import ops as te_ops
-    except ImportError:
-        te_ops = None
-    native_cls = getattr(te_ops, "SiTUGLU", None)
-    if native_cls is not None:
-        return native_cls(beta1=beta1, beta2=beta2)
-    return CuTeDSLSiTUGLU(beta1=beta1, beta2=beta2)
+    te_ops = _get_te_situ_glu_ops()
+    if te_ops is not None:
+        situ_glu, _ = te_ops
+        return situ_glu(
+            beta1=beta1,
+            beta2=beta2,
+            cache_quantized_input=cache_quantized_input,
+            glu_interleave_size=glu_interleave_size,
+        )
+    if cache_quantized_input:
+        raise RuntimeError(
+            "activation_func_fp8_input_store for SiTU-GLU requires "
+            "https://github.com/NVIDIA/TransformerEngine/pull/3402."
+        )
+    return CuTeDSLSiTUGLU(beta1=beta1, beta2=beta2, interleave_size=int(glu_interleave_size or 0))
 
 
 def make_scaled_situ_glu(
-    beta1: float = 4.0, beta2: float = 25.0, *, install_grouped_fallback: bool = False, **kwargs
+    beta1: float = 4.0,
+    beta2: float = 25.0,
+    *,
+    glu_interleave_size: Optional[int] = None,
+    activation_recompute_in_mlp: bool = False,
 ) -> torch.nn.Module:
-    """Construct native TE scaled SiTU-GLU or install and use the local fused fallback."""
+    """Construct native TE scaled SiTU-GLU or the MCore CuTe fuser fallback."""
     beta1, beta2 = _validate_betas(beta1, beta2)
-    try:
-        from transformer_engine.pytorch import ops as te_ops
-    except ImportError:
-        te_ops = None
-    native_cls = getattr(te_ops, "ScaledSiTUGLU", None)
-    if native_cls is not None:
-        return native_cls(beta1=beta1, beta2=beta2, **kwargs)
-    if install_grouped_fallback:
-        install_grouped_situ_glu_kernels(beta1, beta2)
-    return ScaledSiTUGLU(beta1=beta1, beta2=beta2, **kwargs)
-
-
-_GROUPED_KERNELS_INSTALLED = False
-_GROUPED_KERNEL_PARAMETERS: Optional[tuple[float, float]] = None
-
-
-def _install_operand_major_mode_compat() -> bool:
-    """Restore the nvgpu re-export expected by cuDNN Frontend 1.26.0."""
-    from cutlass.cute import nvgpu
-
-    if hasattr(nvgpu, "OperandMajorMode"):
-        return False
-    from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
-
-    nvgpu.OperandMajorMode = OperandMajorMode
-    return True
-
-
-def _install_nvvm_atomicrmw_compat() -> None:
-    """Bridge the explicit-result NVVM binding used by some CuTe DSL wheels."""
-    nvvm = cutlass._mlir.dialects.nvvm
-    atomicrmw = nvvm.atomicrmw
-    parameters = inspect.signature(atomicrmw).parameters
-    result = parameters.get("res")
-    if result is None or result.default is not inspect.Parameter.empty:
-        return
-    if getattr(atomicrmw, "_mcore_infers_result_type", False):
-        return
-
-    def atomicrmw_with_inferred_result(*args, **kwargs):
-        if not args and "res" not in kwargs:
-            return atomicrmw(kwargs["a"].type, **kwargs)
-        return atomicrmw(*args, **kwargs)
-
-    atomicrmw_with_inferred_result._mcore_infers_result_type = True
-    nvvm.atomicrmw = atomicrmw_with_inferred_result
-
-
-def _install_blockscaled_tiled_mma_compat() -> None:
-    """Adapt the CuTe DSL 4.4 helper to the 4.5 call shape used by cuDNN 1.26."""
-    from cutlass.utils import blackwell_helpers
-
-    make_tiled_mma = blackwell_helpers.make_blockscaled_trivial_tiled_mma
-    parameters = inspect.signature(make_tiled_mma).parameters
-    if "b_dtype" in parameters:
-        return
-    if getattr(make_tiled_mma, "_mcore_accepts_separate_ab_dtypes", False):
-        return
-
-    def make_tiled_mma_with_separate_ab_dtypes(*args, loc=None, ip=None, **kwargs):
-        if "b_dtype" in kwargs:
-            a_dtype = kwargs.pop("a_dtype")
-            b_dtype = kwargs.pop("b_dtype")
-            if a_dtype is not b_dtype:
-                raise TypeError("CuTe DSL 4.4 block-scaled MMA requires matching A/B dtypes.")
-            kwargs["ab_dtype"] = a_dtype
-        elif len(args) >= 2 and inspect.isclass(args[1]):
-            a_dtype, b_dtype = args[:2]
-            if a_dtype is not b_dtype:
-                raise TypeError("CuTe DSL 4.4 block-scaled MMA requires matching A/B dtypes.")
-            args = (a_dtype, *args[2:])
-        return make_tiled_mma(*args, loc=loc, ip=ip, **kwargs)
-
-    make_tiled_mma_with_separate_ab_dtypes._mcore_accepts_separate_ab_dtypes = True
-    blackwell_helpers.make_blockscaled_trivial_tiled_mma = make_tiled_mma_with_separate_ab_dtypes
-
-
-def _install_pointer_property_compat() -> None:
-    """Expose the pointer accessor expected by cuDNN 1.26 on CuTe DSL 4.4."""
-    from cutlass.cute import core
-
-    if hasattr(core._Pointer, "ptr"):
-        return
-    core._Pointer.ptr = property(lambda self: self)
-
-
-def install_grouped_situ_glu_kernels(beta1: float, beta2: float) -> None:
-    """Replace cuDNN Frontend's SwiGLU kernel classes before their first compilation."""
-    global _GROUPED_KERNEL_PARAMETERS, _GROUPED_KERNELS_INSTALLED
-    beta1, beta2 = _validate_betas(beta1, beta2)
-    if _GROUPED_KERNELS_INSTALLED:
-        if _GROUPED_KERNEL_PARAMETERS != (beta1, beta2):
-            raise RuntimeError(
-                "Grouped SiTU-GLU kernels are already installed with "
-                f"beta1={_GROUPED_KERNEL_PARAMETERS[0]}, beta2={_GROUPED_KERNEL_PARAMETERS[1]}."
-            )
-        return
-    if not _CUTE_AVAILABLE:
-        raise RuntimeError("Grouped SiTU-GLU requires nvidia-cutlass-dsl.")
-    installed_operand_major_mode_compat = _install_operand_major_mode_compat()
-    _install_blockscaled_tiled_mma_compat()
-    _install_pointer_property_compat()
-    _install_nvvm_atomicrmw_compat()
-
-    from cudnn.grouped_gemm.grouped_gemm_dglu import api as dglu_api
-    from cudnn.grouped_gemm.grouped_gemm_dglu.moe_blockscaled_grouped_gemm_dglu_dbias import (
-        BlockScaledMoEGroupedGemmDgluDbiasKernel,
-    )
-    from cudnn.grouped_gemm.grouped_gemm_glu import api as glu_api
-    from cudnn.grouped_gemm.grouped_gemm_glu.moe_blockscaled_grouped_gemm_glu_bias import (
-        BlockScaledMoEGroupedGemmGluBiasKernel,
-    )
-
-    try:
-        from cudnn.grouped_gemm.grouped_gemm_glu_hadamard import api as glu_hadamard_api
-
-        # pylint: disable-next=line-too-long
-        from cudnn.grouped_gemm.grouped_gemm_glu_hadamard.moe_blockscaled_grouped_gemm_glu_hadamard import (
-            BlockScaledMoEGroupedGemmGluHadamardKernel,
+    te_ops = _get_te_situ_glu_ops()
+    if te_ops is not None:
+        _, scaled_situ_glu = te_ops
+        return scaled_situ_glu(
+            glu_interleave_size=glu_interleave_size,
+            activation_recompute_in_mlp=activation_recompute_in_mlp,
+            beta1=beta1,
+            beta2=beta2,
         )
-    except ImportError:
-        try:
-            from cudnn.gemm.cutedsl.grouped.glu_hadamard import api as glu_hadamard_api
-
-            # pylint: disable-next=line-too-long
-            from cudnn.gemm.cutedsl.grouped.glu_hadamard.moe_blockscaled_grouped_gemm_glu_hadamard import (
-                BlockScaledMoEGroupedGemmGluHadamardKernel,
-            )
-        except ImportError:
-            glu_hadamard_api = None
-            BlockScaledMoEGroupedGemmGluHadamardKernel = None
-
-    required_forward = {"tCompute", "acc_vec_up", "acc_vec_gate", "mProb"}
-    required_backward = {
-        "acc_vec",
-        "ab1_vec_load",
-        "ab2_vec_load",
-        "mProb",
-        "beta_val",
-        "square_alpha",
-        "dprob_swiglu",
-    }
-    if set(inspect.signature(BlockScaledMoEGroupedGemmGluBiasKernel.swiglu_act).parameters) != (
-        required_forward | {"self"}
-    ):
-        raise RuntimeError("Unsupported cuDNN Frontend grouped GLU kernel signature.")
-    if set(inspect.signature(BlockScaledMoEGroupedGemmDgluDbiasKernel.dswiglu).parameters) != (
-        required_backward | {"self"}
-    ):
-        raise RuntimeError("Unsupported cuDNN Frontend grouped dGLU kernel signature.")
-    if BlockScaledMoEGroupedGemmGluHadamardKernel is not None and set(
-        inspect.signature(BlockScaledMoEGroupedGemmGluHadamardKernel.swiglu_act).parameters
-    ) != (required_forward | {"self"}):
-        raise RuntimeError("Unsupported cuDNN Frontend grouped GLU-Hadamard kernel signature.")
-
-    class _SiTUForwardKernel(BlockScaledMoEGroupedGemmGluBiasKernel):
-        @cute.jit
-        def swiglu_act(
-            self, tCompute, acc_vec_up, acc_vec_gate, mProb
-        ):  # pylint: disable=missing-function-docstring
-            inv_beta1 = cutlass.Float32(1.0 / beta1)
-            inv_beta2 = cutlass.Float32(1.0 / beta2)
-            beta_product = cutlass.Float32(beta1 * beta2)
-            for index in cutlass.range_constexpr(cute.size(tCompute)):
-                gate = acc_vec_gate[index]
-                up = acc_vec_up[index]
-                gate_tanh = cute.math.tanh(gate * inv_beta1, fastmath=True)
-                up_tanh = cute.math.tanh(up * inv_beta2, fastmath=True)
-                if cutlass.const_expr(beta1 == 4.0):
-                    reciprocal = cute.arch.rcp_approx(1.0 + gate_tanh * gate_tanh)
-                    sigmoid = 0.5 + gate_tanh * reciprocal
-                else:
-                    sigmoid = cute.arch.rcp_approx(1.0 + cute.math.exp(-gate, fastmath=True))
-                tCompute[index] = beta_product * gate_tanh * sigmoid * up_tanh * mProb
-
-    class _SiTUBackwardKernel(BlockScaledMoEGroupedGemmDgluDbiasKernel):
-        @cute.jit
-        def dswiglu(
-            self,
-            acc_vec,
-            ab1_vec_load,
-            ab2_vec_load,
-            mProb,
-            beta_val,
-            square_alpha,
-            dprob_swiglu=None,
-        ):  # pylint: disable=missing-function-docstring
-            dgate = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
-            dup = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
-            inv_beta1 = cutlass.Float32(1.0 / beta1)
-            inv_beta2 = cutlass.Float32(1.0 / beta2)
-            for index in cutlass.range_constexpr(cute.size(acc_vec)):
-                grad = acc_vec[index] * square_alpha
-                gate = ab1_vec_load[index].to(self.acc_dtype) * beta_val
-                up = ab2_vec_load[index].to(self.acc_dtype) * beta_val
-                gate_tanh = cute.math.tanh(gate * inv_beta1, fastmath=True)
-                up_tanh = cute.math.tanh(up * inv_beta2, fastmath=True)
-                if cutlass.const_expr(beta1 == 4.0):
-                    reciprocal = cute.arch.rcp_approx(1.0 + gate_tanh * gate_tanh)
-                    sigmoid = 0.5 + gate_tanh * reciprocal
-                    gate_grad = (1.0 - gate_tanh * gate_tanh) * (
-                        0.5 + 2.0 * gate_tanh * reciprocal * reciprocal
-                    )
-                else:
-                    sigmoid = cute.arch.rcp_approx(1.0 + cute.math.exp(-gate, fastmath=True))
-                    gate_grad = (1.0 - gate_tanh * gate_tanh) * sigmoid
-                    gate_grad += beta1 * gate_tanh * sigmoid * (1.0 - sigmoid)
-                gate_value = beta1 * gate_tanh * sigmoid
-                up_value = beta2 * up_tanh
-                up_grad = 1.0 - up_tanh * up_tanh
-                dgate[index] = grad * mProb * up_value * gate_grad
-                dup[index] = grad * mProb * gate_value * up_grad
-                if cutlass.const_expr(self.generate_dprob):
-                    dprob_swiglu[index] = grad * gate_value * up_value
-            dprob = None
-            if cutlass.const_expr(self.generate_dprob):
-                dprob = dprob_swiglu.load()
-            return dgate.load(), dup.load(), dprob
-
-    if BlockScaledMoEGroupedGemmGluHadamardKernel is not None:
-
-        class _SiTUForwardHadamardKernel(BlockScaledMoEGroupedGemmGluHadamardKernel):
-            @cute.jit
-            def swiglu_act(
-                self, tCompute, acc_vec_up, acc_vec_gate, mProb
-            ):  # pylint: disable=missing-function-docstring
-                inv_beta1 = cutlass.Float32(1.0 / beta1)
-                inv_beta2 = cutlass.Float32(1.0 / beta2)
-                beta_product = cutlass.Float32(beta1 * beta2)
-                for index in cutlass.range_constexpr(cute.size(tCompute)):
-                    gate = acc_vec_gate[index]
-                    up = acc_vec_up[index]
-                    gate_tanh = cute.math.tanh(gate * inv_beta1, fastmath=True)
-                    up_tanh = cute.math.tanh(up * inv_beta2, fastmath=True)
-                    if cutlass.const_expr(beta1 == 4.0):
-                        reciprocal = cute.arch.rcp_approx(1.0 + gate_tanh * gate_tanh)
-                        sigmoid = 0.5 + gate_tanh * reciprocal
-                    else:
-                        sigmoid = cute.arch.rcp_approx(1.0 + cute.math.exp(-gate, fastmath=True))
-                    tCompute[index] = beta_product * gate_tanh * sigmoid * up_tanh * mProb
-
-    glu_api.BlockScaledMoEGroupedGemmGluBiasKernel = _SiTUForwardKernel
-    dglu_api.BlockScaledMoEGroupedGemmDgluDbiasKernel = _SiTUBackwardKernel
-    glu_api._cache_of_GroupedGemmGluSm100Objects.clear()
-    dglu_api._cache_of_GroupedGemmDgluSm100Objects.clear()
-    if glu_hadamard_api is not None:
-        glu_hadamard_api.BlockScaledMoEGroupedGemmGluHadamardKernel = _SiTUForwardHadamardKernel
-        glu_hadamard_api._cache_of_GroupedGemmGluHadamardSm100Objects.clear()
-
-    # CuTe DSL 4.4.2 needs the OperandMajorMode compatibility export above. TE may
-    # have queried support before this hook ran, cached False, and skipped registering
-    # its existing grouped-MLP fusion rule. Re-evaluate and register that TE rule now.
-    if installed_operand_major_mode_compat:
-        from transformer_engine.pytorch.ops.fused import grouped_mlp as te_grouped_mlp
-
-        fused_op = te_grouped_mlp.GroupedMLP_CuTeGEMMGLU
-        fused_op.is_supported.cache_clear()
-        if fused_op.is_supported():
-            te_grouped_mlp.register_forward_backward_fusion(te_grouped_mlp.fuse_ops, prepend=True)
-
-    _GROUPED_KERNEL_PARAMETERS = (beta1, beta2)
-    _GROUPED_KERNELS_INSTALLED = True
+    return CuTeDSLScaledSiTUGLU(
+        glu_interleave_size=glu_interleave_size,
+        activation_recompute_in_mlp=activation_recompute_in_mlp,
+        beta1=beta1,
+        beta2=beta2,
+    )
 
 
 __all__ = [
     "CuTeDSLSiTUGLU",
-    "ScaledSiTUGLU",
-    "install_grouped_situ_glu_kernels",
+    "CuTeDSLScaledSiTUGLU",
     "make_scaled_situ_glu",
     "make_situ_glu",
     "situ_glu_reference",

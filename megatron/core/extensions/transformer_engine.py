@@ -594,10 +594,6 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def __new__(cls, config: TransformerConfig):
 
             layer_type = None
-            if config.use_situ_glu:
-                from megatron.core.fusions.cutedsl_situ_glu import make_situ_glu
-
-                return make_situ_glu(beta1=config.situ_glu_beta1, beta2=config.situ_glu_beta2)
             if config.gated_linear_unit:
                 if config.activation_func == F.silu:
                     layer_type = te.pytorch.ops.SwiGLU
@@ -618,7 +614,16 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             activation_func_kwargs = {}
             if config.activation_func_fp8_input_store:
                 activation_func_kwargs["cache_quantized_input"] = True
-            layer = layer_type(**activation_func_kwargs)
+            if config.use_situ_glu:
+                from megatron.core.fusions.cutedsl_situ_glu import make_situ_glu
+
+                layer = make_situ_glu(
+                    beta1=config.situ_glu_beta1,
+                    beta2=config.situ_glu_beta2,
+                    **activation_func_kwargs,
+                )
+            else:
+                layer = layer_type(**activation_func_kwargs)
             return layer
 
 else:

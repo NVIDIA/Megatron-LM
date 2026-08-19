@@ -502,7 +502,6 @@ class FusedSharedExpertMLP(SharedExpertMLP):
             activation_op = make_scaled_situ_glu(
                 beta1=self.config.situ_glu_beta1,
                 beta2=self.config.situ_glu_beta2,
-                install_grouped_fallback=True,
                 glu_interleave_size=glu_interleave_size,
             )
         elif clamp_value is None:

@@ -10,9 +10,8 @@ import torch.nn.functional as F
 
 from megatron.core.extensions.transformer_engine import TEActivationOp
 from megatron.core.fusions.cutedsl_situ_glu import (
+    CuTeDSLScaledSiTUGLU,
     CuTeDSLSiTUGLU,
-    ScaledSiTUGLU,
-    install_grouped_situ_glu_kernels,
     make_scaled_situ_glu,
     make_situ_glu,
     situ_glu_reference,
@@ -53,6 +52,7 @@ def test_situ_glu_selects_common_te_activation_builder(monkeypatch, precision_kw
     import transformer_engine.pytorch as te
 
     monkeypatch.delattr(te.ops, "SiTUGLU", raising=False)
+    monkeypatch.delattr(te.ops, "ScaledSiTUGLU", raising=False)
     config = TransformerConfig(
         num_layers=1,
         hidden_size=32,
@@ -69,33 +69,86 @@ def test_situ_glu_selects_common_te_activation_builder(monkeypatch, precision_kw
     assert isinstance(activation, CuTeDSLSiTUGLU)
 
 
-def test_situ_glu_prefers_native_te_op(monkeypatch):
+def test_situ_glu_prefers_complete_native_te_interface(monkeypatch):
     import transformer_engine.pytorch as te
 
     class NativeSiTUGLU(torch.nn.Module):
-        def __init__(self, beta1, beta2):
+        def __init__(self, *, beta1, beta2, cache_quantized_input=False, glu_interleave_size=None):
             super().__init__()
             self.beta1 = beta1
             self.beta2 = beta2
+            self.cache_quantized_input = cache_quantized_input
+            self.glu_interleave_size = glu_interleave_size
+
+    class NativeScaledSiTUGLU(torch.nn.Module):
+        def __init__(
+            self, glu_interleave_size=None, *, activation_recompute_in_mlp=False, beta1, beta2
+        ):
+            super().__init__()
+            self.beta1 = beta1
+            self.beta2 = beta2
+            self.glu_interleave_size = glu_interleave_size
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
 
     monkeypatch.setattr(te.ops, "SiTUGLU", NativeSiTUGLU, raising=False)
+    monkeypatch.setattr(te.ops, "ScaledSiTUGLU", NativeScaledSiTUGLU, raising=False)
 
     activation = make_situ_glu(beta1=4.0, beta2=25.0)
+    scaled_activation = make_scaled_situ_glu(beta1=4.0, beta2=25.0, glu_interleave_size=32)
 
     assert isinstance(activation, NativeSiTUGLU)
     assert activation.beta1 == 4.0
     assert activation.beta2 == 25.0
+    assert isinstance(scaled_activation, NativeScaledSiTUGLU)
+    assert scaled_activation.glu_interleave_size == 32
+    assert not scaled_activation.activation_recompute_in_mlp
+
+
+def test_situ_glu_falls_back_when_te_interface_is_incomplete(monkeypatch):
+    import transformer_engine.pytorch as te
+
+    monkeypatch.setattr(te.ops, "SiTUGLU", torch.nn.Identity, raising=False)
+    monkeypatch.delattr(te.ops, "ScaledSiTUGLU", raising=False)
+
+    assert isinstance(make_situ_glu(), CuTeDSLSiTUGLU)
+    assert isinstance(make_scaled_situ_glu(), CuTeDSLScaledSiTUGLU)
+
+
+def test_swiglu_keeps_existing_te_activation_path():
+    import transformer_engine.pytorch as te
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+        use_te_activation_func=True,
+        use_situ_glu=False,
+    )
+
+    assert isinstance(TEActivationOp(config), te.ops.SwiGLU)
 
 
 def test_scaled_situ_glu_bf16_fallback_does_not_require_cudnn(monkeypatch):
     import transformer_engine.pytorch as te
 
+    monkeypatch.delattr(te.ops, "SiTUGLU", raising=False)
     monkeypatch.delattr(te.ops, "ScaledSiTUGLU", raising=False)
-    activation = make_scaled_situ_glu(
-        beta1=4.0, beta2=25.0, install_grouped_fallback=False, glu_interleave_size=None
-    )
+    activation = make_scaled_situ_glu(beta1=4.0, beta2=25.0, glu_interleave_size=None)
 
-    assert isinstance(activation, ScaledSiTUGLU)
+    assert isinstance(activation, CuTeDSLScaledSiTUGLU)
+    assert not isinstance(activation, te.ops.ScaledSwiGLU)
+
+
+def test_scaled_situ_glu_fallback_rejects_activation_recompute(monkeypatch):
+    import transformer_engine.pytorch as te
+
+    monkeypatch.delattr(te.ops, "SiTUGLU", raising=False)
+    monkeypatch.delattr(te.ops, "ScaledSiTUGLU", raising=False)
+
+    with pytest.raises(ValueError, match="does not support activation recomputation"):
+        make_scaled_situ_glu(activation_recompute_in_mlp=True)
 
 
 @pytest.mark.parametrize(
@@ -174,38 +227,12 @@ def test_cutedsl_situ_glu_interleaved_forward_backward(dtype):
     )
 
 
-def test_grouped_situ_glu_installs_with_cutedsl_baseline(monkeypatch):
-    import transformer_engine.pytorch as te
-    from cudnn.grouped_gemm.grouped_gemm_dglu import api as dglu_api
-    from cudnn.grouped_gemm.grouped_gemm_glu import api as glu_api
-
-    try:
-        from cudnn.grouped_gemm.grouped_gemm_glu_hadamard import api as glu_hadamard_api
-    except ImportError:
-        try:
-            from cudnn.gemm.cutedsl.grouped.glu_hadamard import api as glu_hadamard_api
-        except ImportError:
-            glu_hadamard_api = None
-
-    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-    te.ops.fused.GroupedMLP_CuTeGEMMGLU.is_supported.cache_clear()
-    install_grouped_situ_glu_kernels(4.0, 25.0)
-
-    assert glu_api.BlockScaledMoEGroupedGemmGluBiasKernel.__name__ == "_SiTUForwardKernel"
-    assert dglu_api.BlockScaledMoEGroupedGemmDgluDbiasKernel.__name__ == "_SiTUBackwardKernel"
-    if glu_hadamard_api is not None:
-        assert (
-            glu_hadamard_api.BlockScaledMoEGroupedGemmGluHadamardKernel.__name__
-            == "_SiTUForwardHadamardKernel"
-        )
-    assert te.ops.fused.GroupedMLP_CuTeGEMMGLU.is_supported()
-
-
+@pytest.mark.parametrize("activation", ["swiglu", "situglu"])
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.internal
-def test_mcore_moe_situ_glu_forward_backward_uses_expected_backend(precision):
-    """Run a real MCore MoE and prove block-scaled cases select TE's fused op."""
+def test_mcore_moe_glu_forward_backward_uses_expected_backend(precision, activation):
+    """Run a real MCore MoE and prove SwiGLU and SiTU-GLU select the expected backend."""
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("Fused block-scaled grouped MLP requires Blackwell")
     if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
@@ -250,7 +277,7 @@ def test_mcore_moe_situ_glu_forward_backward_uses_expected_backend(precision):
         gated_linear_unit=True,
         activation_func=F.silu,
         use_te_activation_func=True,
-        use_situ_glu=True,
+        use_situ_glu=activation == "situglu",
         bias_activation_fusion=False,
         bf16=True,
         params_dtype=torch.bfloat16,
@@ -284,23 +311,22 @@ def test_mcore_moe_situ_glu_forward_backward_uses_expected_backend(precision):
     assert torch.isfinite(output).all()
     assert all(parameter.grad is not None for parameter in layer.experts.parameters())
     (ops,) = layer.experts._fused_ops
-    assert isinstance(ops[1], ScaledSiTUGLU)
+    if activation == "situglu":
+        native_scaled_situ_glu = getattr(te.ops, "ScaledSiTUGLU", None)
+        if native_scaled_situ_glu is None:
+            assert isinstance(ops[1], CuTeDSLScaledSiTUGLU)
+        else:
+            assert isinstance(ops[1], native_scaled_situ_glu)
+        expect_fused_glu = native_scaled_situ_glu is not None
+    else:
+        assert isinstance(ops[1], te.ops.ScaledSwiGLU)
+        expect_fused_glu = True
     assert ops._module_groups is not None
     fuser = ops._module_groups[0]
     fused_types = tuple(type(op) for op, _ in fuser._forward_ops)
-    if precision in ("mxfp8", "nvfp4"):
+    if expect_fused_glu and precision in ("mxfp8", "nvfp4"):
         assert te.ops.fused.GroupedMLP_CuTeGEMMGLU in fused_types
     else:
         assert te.ops.fused.GroupedMLP_CuTeGEMMGLU not in fused_types
-    if precision == "nvfp4":
-        try:
-            from cudnn.grouped_gemm.grouped_gemm_glu_hadamard import api as glu_hadamard_api
-        except ImportError:
-            from cudnn.gemm.cutedsl.grouped.glu_hadamard import api as glu_hadamard_api
-
-        assert (
-            glu_hadamard_api.BlockScaledMoEGroupedGemmGluHadamardKernel.__name__
-            == "_SiTUForwardHadamardKernel"
-        )
 
     Utils.destroy_model_parallel()
