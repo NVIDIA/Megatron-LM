@@ -363,8 +363,8 @@ def build_native_cp_attention_metadata(
             cos_sin_cache=synthetic_cos,
         )
         cp_compressor_operation = adapter.compressor_operation
-        cp_compressor_metadata = adapter._compressor_metadata(
-            synthetic_tokens,
+        cp_compressor_metadata, _ = adapter._compressor_metadata_batch(
+            [synthetic_tokens],
             head_dim=config.head_dim,
             token_bytes=adapter._MAIN_TOKEN_BYTES,
         )

@@ -155,6 +155,28 @@ def test_rope_custom_op_is_built_in_scoped_vllm_config(monkeypatch) -> None:
     assert events == ["enter", "build", "exit"]
 
 
+def test_native_cp_compressor_reuses_single_request_batch_metadata() -> None:
+    config = _config(num_hidden_layers=4)
+    positions = torch.arange(37, dtype=torch.int64)
+    packed = object()
+
+    metadata = runtime.build_native_cp_attention_metadata(
+        config,
+        layer_idx=2,
+        cos_sin_cache=torch.zeros(256, 64, dtype=torch.float32),
+        local_positions=positions,
+        packed_seq_params=packed,
+    )
+
+    compressor = metadata.cp_compressor_metadata
+    assert compressor is not None
+    assert metadata.cp_packed_seq_params is packed
+    assert metadata.cp_positions is positions
+    assert compressor.state_block_table.shape[0] == 1
+    assert compressor.token_to_req_indices.shape == (64,)
+    assert compressor.token_to_req_indices.count_nonzero().item() == 0
+
+
 def test_layer0_prefill_metadata_exact_contract(monkeypatch) -> None:
     gather = Mock()
     monkeypatch.setattr(runtime, "_symbol", lambda _module, _name: gather)
