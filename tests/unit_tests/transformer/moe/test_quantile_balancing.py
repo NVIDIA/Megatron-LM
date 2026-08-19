@@ -10,12 +10,12 @@ import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.extensions.transformer_engine import fused_topk_with_score_function_supports_qb
 from megatron.core.distributed.finalize_model_grads import (
     _update_router_qb_bias,
     finalize_model_grads,
     reset_model_temporary_tensors,
 )
+from megatron.core.extensions.transformer_engine import fused_topk_with_score_function_supports_qb
 from megatron.core.transformer.moe.moe_utils import (
     get_updated_expert_bias_with_quantile,
     topk_routing_with_score_function,
