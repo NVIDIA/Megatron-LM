@@ -178,7 +178,6 @@ class TestConsumptionRelease:
             num_groups=num_groups,
             rollouts_per_group=1,
             inference_interface=MockInferenceInterface(),
-            streaming=True,
             submission_granularity="G",
             consumption_granularity=consumption_granularity,
         )
@@ -207,7 +206,6 @@ class TestConsumptionRelease:
             num_groups=2,
             rollouts_per_group=1,
             inference_interface=MockInferenceInterface(),
-            streaming=True,
             submission_granularity="B",
             consumption_granularity="B",
         )
@@ -326,20 +324,25 @@ class TestGroupedRollouts:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "streaming, submission_granularity, consumption_granularity, num_degenerate",
+        (
+            "submission_granularity, consumption_granularity, num_degenerate, "
+            "parallel_generation_tasks"
+        ),
         [
-            pytest.param(False, "B", "B", 3, id="batch_submission"),
-            pytest.param(False, "G", "B", 3, id="group_submission"),
-            pytest.param(False, "R", "B", 3, id="rollout_submission"),
-            pytest.param(False, "G", "G", 3, id="group_consumption"),
-            pytest.param(False, "R", "G", 3, id="rollout_submission_group_consume"),
-            pytest.param(False, "B", "B", 9, id="cascading_regeneration"),
-            pytest.param(True, "B", "B", 3, id="streaming_batch_consume"),
-            pytest.param(True, "G", "G", 3, id="streaming_group_consume"),
+            pytest.param("B", "B", 3, 1, id="batch_submission"),
+            pytest.param("G", "B", 3, 8, id="group_submission"),
+            pytest.param("R", "B", 3, 8, id="rollout_submission"),
+            pytest.param("G", "G", 3, 8, id="group_consumption"),
+            pytest.param("R", "G", 3, 8, id="rollout_submission_group_consume"),
+            pytest.param("B", "B", 9, 1, id="cascading_regeneration"),
         ],
     )
     async def test_filter_groups_and_regenerate(
-        self, streaming, submission_granularity, consumption_granularity, num_degenerate
+        self,
+        submission_granularity,
+        consumption_granularity,
+        num_degenerate,
+        parallel_generation_tasks,
     ):
         num_groups = 4
         gen = FilteringMockGenerator(num_degenerate=num_degenerate)
@@ -348,20 +351,24 @@ class TestGroupedRollouts:
             rollouts_per_group=2,
             inference_interface=MockInferenceInterface(),
             filter_groups_with_same_reward=True,
-            streaming=streaming,
             submission_granularity=submission_granularity,
             consumption_granularity=consumption_granularity,
         )
-        pipeline = RolloutPipeline(gen, request, parallel_generation_tasks=8)
+        pipeline = RolloutPipeline(
+            gen, request, parallel_generation_tasks=parallel_generation_tasks
+        )
 
-        expected_count = 2 * num_groups if streaming else num_groups
-        groups, filtered_counts = [], []
+        expected_count = 2 * num_groups
+        groups = []
         async with aclosing(pipeline.run()) as it:
             async for group in it:
                 groups.append(group)
-                filtered_counts.append(pipeline.filtered_count)
-                if streaming and len(groups) >= expected_count:
+                if len(groups) >= expected_count:
                     break
+            if submission_granularity == "B" and parallel_generation_tasks == 1:
+                # lag=0: the boundary is quiescent, checked before close() drops
+                # shutdown sentinels into the queues on Python < 3.13.
+                pipeline.assert_no_inflight_rollouts()
 
         assert len(groups) == expected_count
         # Every delivered group carries reward signal.
@@ -373,10 +380,10 @@ class TestGroupedRollouts:
             for batch_start in range(0, expected_count, num_groups):
                 batch = groups[batch_start : batch_start + num_groups]
                 assert sorted(g.index_in_batch for g in batch) == list(range(num_groups))
-        if not streaming:
-            # One extra prepare per dropped group, and no under-delivery.
-            assert gen.prepare_group_rollout_calls == num_groups + num_degenerate
-            assert filtered_counts[-1] == num_degenerate
+        if submission_granularity == "B" and parallel_generation_tasks == 1:
+            # Every dropped group cost exactly one extra prepare (no under-delivery).
+            assert gen.prepare_group_rollout_calls == expected_count + num_degenerate
+            assert pipeline.filtered_count == num_degenerate
 
     @pytest.mark.asyncio
     async def test_pending_regeneration_does_not_block_delivery(self):
@@ -414,39 +421,37 @@ class TestGroupedRollouts:
             assert [rollout.trajectory[0] for rollout in group.rollouts] == ["t1", "t1"]
             assert pipeline.filtered_count == 1
             assert len(pipeline._regen_tasks) == 1
-            assert gen.prepare_group_rollout_calls == 4
+            # t0-t2 plus the pinned regeneration, plus the streaming prepare of
+            # the next batch's first group (pinned on the same full gate).
+            assert gen.prepare_group_rollout_calls == 5
             events["t2"].set()
-            rest = [await asyncio.wait_for(anext(it), timeout=10) for _ in range(2)]
-        assert sorted(g.rollouts[0].trajectory[0] for g in rest) == ["t2", "t3"]
+            # Completion order may interleave the perpetual stream's next-batch
+            # groups; keep pulling (bounded) until both stragglers land.
+            rest = []
+            for _ in range(5):
+                rest.append(await asyncio.wait_for(anext(it), timeout=10))
+                if {(0, 0), (0, 2)} <= {(g.batch_id, g.index_in_batch) for g in rest}:
+                    break
+        # The gated group (slot 2) and the regenerated replacement (slot 0) both deliver.
+        assert {(0, 0), (0, 2)} <= {(g.batch_id, g.index_in_batch) for g in rest}
         assert not pipeline._regen_tasks
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         (
-            "num_slow_calls, streaming, num_groups, submission_granularity, "
+            "num_slow_calls, num_groups, submission_granularity, "
             "consumption_granularity, expected_count, expected_batch_ids, "
             "expected_trajectories"
         ),
         [
-            pytest.param(0, False, 8, "B", "B", 8, None, None, id="non_batched"),
+            pytest.param(0, 8, "B", "B", 8, None, None, id="single_batch"),
+            pytest.param(0, 4, "B", "B", 4, None, None, id="fewer_groups_than_parallel"),
             pytest.param(
-                0, False, 4, "B", "B", 4, None, None, id="non_streaming_fewer_than_parallel"
+                4, 2, "B", "B", 8, [0, 0, 1, 1, 2, 2, 3, 3], None, id="batched_submission_order"
             ),
+            pytest.param(0, 1, "G", "B", 10, None, None, id="streaming"),
             pytest.param(
                 4,
-                True,
-                2,
-                "B",
-                "B",
-                8,
-                [0, 0, 1, 1, 2, 2, 3, 3],
-                None,
-                id="batched_submission_order",
-            ),
-            pytest.param(0, True, 1, "G", "B", 10, None, None, id="streaming"),
-            pytest.param(
-                4,
-                True,
                 1,
                 "G",
                 "G",
@@ -457,7 +462,6 @@ class TestGroupedRollouts:
             ),
             pytest.param(
                 4,
-                True,
                 1,
                 "G",
                 "B",
@@ -471,7 +475,6 @@ class TestGroupedRollouts:
     async def test_grouped_rollout_generation(
         self,
         num_slow_calls,
-        streaming,
         num_groups,
         submission_granularity,
         consumption_granularity,
@@ -484,7 +487,6 @@ class TestGroupedRollouts:
             num_groups=num_groups,
             rollouts_per_group=1,
             inference_interface=MockInferenceInterface(num_slow_calls=num_slow_calls),
-            streaming=streaming,
             submission_granularity=submission_granularity,
             consumption_granularity=consumption_granularity,
         )
@@ -492,7 +494,7 @@ class TestGroupedRollouts:
         groups = []
         async for group in RolloutPipeline(gen, request, parallel_generation_tasks=8).run():
             groups.append(group)
-            if request.streaming and len(groups) >= expected_count:
+            if len(groups) >= expected_count:
                 break
 
         assert len(groups) == expected_count
@@ -513,7 +515,6 @@ class TestGroupedRollouts:
             num_groups=2,
             rollouts_per_group=2,
             inference_interface=inference_interface,
-            streaming=True,
             submission_granularity="R",
             consumption_granularity="B",
         )
@@ -534,66 +535,96 @@ class TestGroupedRollouts:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "submission_granularity, consumption_granularity",
-        [pytest.param("B", "B", id="batch_batch"), pytest.param("G", "G", id="group_group")],
+        (
+            "submission_granularity, consumption_granularity, num_slow_calls, "
+            "parallel_generation_tasks, windows"
+        ),
+        [
+            pytest.param("B", "B", 0, 1, 2, id="batch_batch"),
+            pytest.param("G", "G", 0, 1, 2, id="group_group"),
+            # Balanced G under out-of-order completion and a depth-2 gate.
+            pytest.param("G", "G", 2, 2, 3, id="group_group_out_of_order"),
+        ],
     )
-    async def test_weighted_multi_task(self, submission_granularity, consumption_granularity):
+    async def test_weighted_multi_task(
+        self,
+        submission_granularity,
+        consumption_granularity,
+        num_slow_calls,
+        parallel_generation_tasks,
+        windows,
+    ):
+        """Routing and consumption keep every trainer-batch window at the exact env mix."""
+        mt = WeightedMultiTask(
+            [
+                AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
+                AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
+            ]
+        )
+        request = GroupedRolloutRequest(
+            num_groups=4,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(num_slow_calls=num_slow_calls),
+            submission_granularity=submission_granularity,
+            consumption_granularity=consumption_granularity,
+        )
+        pipeline = RolloutPipeline(mt, request, parallel_generation_tasks=parallel_generation_tasks)
+        gen = pipeline.run()
+        groups = [await anext(gen) for _ in range(windows * 4)]
+
+        assert [a.num_groups for a in pipeline.allocations] == [3, 1]
+        # Weights 3:1 → env "a" owns 3 of every 4 batch slots; the pipeline routes
+        # each slot to the owning sub-agent regardless of completion order.
+        env_ids = [g[0].env_id for g in groups]
+        for start in range(0, windows * 4, 4):
+            assert sorted(env_ids[start : start + 4]) == ["a", "a", "a", "b"]
+        if consumption_granularity == "B":
+            # With depth-1 gating and consumed-release, nothing is buffered or in flight.
+            pipeline.assert_no_inflight_rollouts()
+
+    @pytest.mark.asyncio
+    async def test_lag0_streaming_matches_non_streaming_boundaries(self):
+        """lag=0 (B/B, depth-1 gate): each iteration of the persistent stream is exactly
+        one batch, generated entirely after the previous boundary — the old
+        non-streaming per-iteration contract, enforced by assert_no_inflight_rollouts."""
         configs = [
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=1.0),
             AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
         ]
         mt = WeightedMultiTask(configs)
+        request = GroupedRolloutRequest(
+            num_groups=4,
+            rollouts_per_group=2,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity="B",
+            consumption_granularity="B",
+        )
+        pipeline = RolloutPipeline(mt, request, parallel_generation_tasks=1)
+        gen = pipeline.run()
+        for iteration in range(3):
+            groups = [await anext(gen) for _ in range(4)]
+            # Exactly this iteration's batch, whole and in order.
+            assert [g.batch_id for g in groups] == [iteration] * 4
+            # Nothing of the next batch has even been prepared: everything the
+            # next iteration consumes is generated after this boundary.
+            assert sum(a.prepare_group_rollout_calls for a in mt.agents) == (iteration + 1) * 4
+            pipeline.assert_no_inflight_rollouts()
 
+    @pytest.mark.asyncio
+    async def test_assert_no_inflight_rollouts_detects_run_ahead(self):
+        """With lag>0 the gate legitimately runs ahead; the boundary checker must fire."""
         request = GroupedRolloutRequest(
             num_groups=4,
             rollouts_per_group=1,
             inference_interface=MockInferenceInterface(),
-            streaming=False,
-            submission_granularity=submission_granularity,
-            consumption_granularity=consumption_granularity,
+            submission_granularity="B",
+            consumption_granularity="B",
         )
-        groups = []
-        pipeline = RolloutPipeline(mt, request, parallel_generation_tasks=1)
-        async for group in pipeline.run():
-            groups.append(group)
-
-        assert len(groups) == 4
-        # Weights 3:1 → env "a" owns 3 batch slots, env "b" owns 1; the single
-        # pipeline routes preparation and generation to the owning sub-agent.
-        env_ids = [g[0].env_id for g in groups]
-        assert sorted(env_ids) == ["a", "a", "a", "b"]
-        assert [agent.prepare_group_rollout_calls for agent in mt.agents] == [3, 1]
-        assert [agent.get_rollout_response_calls for agent in mt.agents] == [3, 1]
-        assert mt.latest_distribution["agent_groups"] == [3, 1]
-        # The pipeline drains fully: every gate slot is released at exhaustion.
-        assert pipeline.gate.held == 0
-
-    @pytest.mark.asyncio
-    async def test_group_consumption_balances_each_batch(self):
-        """Balanced G: every trainer-batch window holds each env's exact share."""
-        configs = [
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
-        ]
-        mt = WeightedMultiTask(configs)
-
-        request = GroupedRolloutRequest(
-            num_groups=4,
-            rollouts_per_group=1,
-            inference_interface=MockInferenceInterface(num_slow_calls=2),
-            streaming=True,
-            submission_granularity="G",
-            consumption_granularity="G",
-        )
-        groups = []
-        async for group in RolloutPipeline(mt, request, parallel_generation_tasks=2).run():
-            groups.append(group)
-            if len(groups) >= 12:
-                break
-
-        for start in range(0, 12, 4):
-            env_ids = [g[0].env_id for g in groups[start : start + 4]]
-            assert sorted(env_ids) == ["a", "a", "a", "b"]
+        pipeline = RolloutPipeline(MockGenerator(), request, parallel_generation_tasks=2)
+        gen = pipeline.run()
+        [await anext(gen) for _ in range(4)]
+        with pytest.raises(AssertionError, match="The rollout pipeline"):
+            pipeline.assert_no_inflight_rollouts()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -614,30 +645,54 @@ class TestGroupedRollouts:
         with pytest.raises(AssertionError, match="no finer"):
             RolloutPipeline(gen, request, parallel_generation_tasks=1)
 
-    def test_multi_env_layout_rejects_starving_batch_size(self):
-        """The layout raises rather than silently starving a weighted env."""
+    @pytest.mark.parametrize(
+        "weights, num_groups, expected_layout, warns",
+        [
+            # 8 groups cannot realize 1:2 exactly; quantized with a warning.
+            pytest.param([1.0, 2.0], 8, [3, 5], True, id="quantized"),
+            # A weight below 1/num_groups keeps one group per batch.
+            pytest.param([0.01, 0.99], 8, [1, 7], True, id="zero_share_rounded_up"),
+            pytest.param([3.0, 1.0], 8, [6, 2], False, id="exact"),
+            pytest.param([1.0, 1.0, 1.0], 3, [1, 1, 1], False, id="one_group_each"),
+            # Only an env count exceeding the batch size is infeasible.
+            pytest.param([1.0, 1.0, 1.0], 2, None, False, id="too_many_envs"),
+        ],
+    )
+    def test_multi_env_layout(self, caplog, weights, num_groups, expected_layout, warns):
+        """Weights quantize to a constant split (warned); weight-0 and eval-only envs take
+        no slot — the min-one-group bump must not revive boot-only entries."""
         configs = [
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
-            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": f"e{i}"}, weight=w)
+            for i, w in enumerate(weights)
         ]
-        mt = WeightedMultiTask(configs)
-        with pytest.raises(ValueError, match="starved"):
-            mt.rollout_allocations(1)
-        assert [a.num_groups for a in mt.rollout_allocations(8)] == [6, 2]
-
-        # Evaluation-only envs take no groups and never count as starved.
-        mt = WeightedMultiTask(
-            configs
-            + [
-                AgentConfig(
-                    agent_type=MockGenerator,
-                    agent_args={"env_id": "c"},
-                    weight=1.0,
-                    evaluation_only=True,
-                )
-            ]
+        configs.insert(
+            1, AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "boot"}, weight=0.0)
         )
-        assert [a.num_groups for a in mt.rollout_allocations(8)] == [6, 2]
+        configs.append(
+            AgentConfig(
+                agent_type=MockGenerator,
+                agent_args={"env_id": "eval"},
+                weight=1.0,
+                evaluation_only=True,
+            )
+        )
+        mt = WeightedMultiTask(configs)
+        assert mt._rollout_env_ids == [f"e{i}" for i in range(len(weights))]
+        if expected_layout is None:
+            with pytest.raises(ValueError, match="cannot fit"):
+                mt.rollout_allocations(num_groups)
+            with pytest.raises(ValueError, match="cannot fit"):
+                mt._distribute_counts(num_groups)
+            return
+        # The split is identical on every call.
+        assert [[a.num_groups for a in mt.rollout_allocations(num_groups)] for _ in range(3)] == [
+            expected_layout
+        ] * 3
+        assert warns == any("weights changed" in message for message in caplog.messages)
+        # Config-order distribution: the boot (index 1) and eval (last) slots pinned to 0.
+        assert mt._distribute_counts(num_groups) == (
+            expected_layout[:1] + [0] + expected_layout[1:] + [0]
+        )
 
 
 def make_response(
