@@ -3,14 +3,10 @@ import warnings
 from functools import partial
 from typing import Optional, Union
 
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import TEFusedMLP, TEFusedMLPWithGroupedLinear
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.backends import (
-    BackendSpecProvider,
-    InferenceSpecProvider,
-    LocalSpecProvider,
-)
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
+from megatron.core.ops import BackendSpecProvider, get_backend, get_backend_spec_provider
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -43,37 +39,14 @@ from megatron.core.transformer.transformer_layer import (
 from megatron.core.typed_torch import copy_signature, not_none
 from megatron.core.utils import is_te_min_version
 
-if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import (
-        TEFusedMLP,
-        TEFusedMLPWithGroupedLinear,
-        TENorm,
-    )
-    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-else:
-    TEFusedMLPWithGroupedLinear, TEFusedMLP, TENorm, TESpecProvider = None, None, None, None
 
-try:
-    from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
-
-except ImportError:
-    HAVE_KITCHEN = False
-
-try:
-    import apex  # type: ignore[import-untyped]  # pylint: disable=unused-import
-
-    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-
-    HAVE_APEX = True
-    LNImpl = FusedLayerNorm
-except ImportError:
-    import warnings
-
-    from megatron.core.transformer.torch_norm import WrappedTorchNorm
-
-    warnings.warn("Apex is not installed. Falling back to Torch Norm")
-    LNImpl = WrappedTorchNorm
-    HAVE_APEX = False
+def _base_backend_name(config: TransformerConfig, use_transformer_engine: bool) -> str:
+    """Which complete backend a GPT spec builds on."""
+    if use_transformer_engine:
+        return "transformer_engine"
+    if config.transformer_impl == "inference_optimized":
+        return "inference_optimized"
+    return "local"
 
 
 def get_gpt_layer_with_inference_submodules(
@@ -90,8 +63,7 @@ def get_gpt_layer_with_inference_submodules(
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
     """
-    assert HAVE_TE, "--transformer-impl inference_optimized requires transformer engine"
-    backend = InferenceSpecProvider()
+    backend = get_backend("inference_optimized")
 
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,
@@ -219,18 +191,16 @@ def get_gpt_layer_with_transformer_engine_submodules(
         )
 
     if use_kitchen:
-        assert HAVE_KITCHEN
-        backend: BackendSpecProvider = KitchenSpecProvider(
-            fallback=TESpecProvider(),
-            use_kitchen_attention=use_kitchen_attention,
-            kitchen_attention_backend=kitchen_attention_backend,
-        )
         if use_te_op_fuser:
             raise AssertionError("use_te_op_fuser not compatible with using kitchen in mlp.")
         if use_te_activation_func:
             raise AssertionError("use_te_activation_func not compatible with using kitchen.")
-    else:
-        backend = TESpecProvider()
+    backend: BackendSpecProvider = get_backend(
+        "transformer_engine",
+        use_kitchen=use_kitchen,
+        use_kitchen_attention=use_kitchen_attention,
+        kitchen_attention_backend=kitchen_attention_backend,
+    )
 
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,
@@ -383,15 +353,12 @@ def get_gpt_layer_local_submodules(
         TransformerLayerSubmodules: Megatron-Core modules to construct a TransformerLayer
     """
 
-    if use_kitchen:
-        assert HAVE_KITCHEN
-        backend = KitchenSpecProvider(
-            fallback=LocalSpecProvider(),
-            use_kitchen_attention=use_kitchen_attention,
-            kitchen_attention_backend=kitchen_attention_backend,
-        )
-    else:
-        backend = LocalSpecProvider()
+    backend = get_backend(
+        "local",
+        use_kitchen=use_kitchen,
+        use_kitchen_attention=use_kitchen_attention,
+        kitchen_attention_backend=kitchen_attention_backend,
+    )
     # Adjust for RMS norm.
     if normalization == "RMSNorm":
         layer_norm = backend.layer_norm(rms_norm=True, for_qk=False, has_residual=True)
@@ -511,7 +478,7 @@ def get_mlp_module_spec(
             )
 
     return get_mlp_module_spec_for_backend(
-        backend=TESpecProvider() if use_te else LocalSpecProvider(),
+        backend=get_backend("transformer_engine" if use_te else "local"),
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         use_te_op_fuser=use_te_op_fuser,
@@ -575,7 +542,6 @@ def get_gpt_decoder_layer_specs(
     )
 
     if use_transformer_engine:
-        layer_norm_impl = TENorm
         dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=None,
             moe_grouped_gemm=False,
@@ -601,7 +567,6 @@ def get_gpt_decoder_layer_specs(
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
         )
     elif config.transformer_impl == "inference_optimized":
-        layer_norm_impl = TENorm
         dense_layer_spec = get_gpt_layer_with_inference_spec(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
@@ -616,7 +581,6 @@ def get_gpt_decoder_layer_specs(
             moe_use_legacy_grouped_gemm=getattr(config, "moe_use_legacy_grouped_gemm", False),
         )
     else:
-        layer_norm_impl = LNImpl
         dense_layer_spec = get_gpt_layer_local_spec(
             num_experts=None,
             moe_grouped_gemm=False,
@@ -705,12 +669,14 @@ def get_gpt_decoder_block_spec(
         offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
-    if use_transformer_engine:
-        layer_norm_impl = TENorm
-    elif config.transformer_impl == "inference_optimized":
-        layer_norm_impl = TENorm
-    else:
-        layer_norm_impl = LNImpl
+    # The final norm is the same operation as every other norm in the block, so it comes
+    # from the same backend rather than from a second selection path.
+    backend = get_backend_spec_provider(
+        config, transformer_impl=_base_backend_name(config, use_transformer_engine)
+    )
+    layer_norm_impl = backend.layer_norm(
+        rms_norm=(normalization or config.normalization) == "RMSNorm"
+    )
     # Block spec.
     block_spec = TransformerBlockSubmodules(
         layer_specs=local_layer_specs, layer_norm=layer_norm_impl
@@ -727,26 +693,11 @@ def get_gpt_mtp_block_spec(
     pp_rank: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
-    if use_transformer_engine:
-        backend: BackendSpecProvider = (
-            KitchenSpecProvider(
-                fallback=TESpecProvider(),
-                use_kitchen_attention=config.use_kitchen_attention,
-                kitchen_attention_backend=config.kitchen_attention_backend,
-            )
-            if config.use_kitchen
-            else TESpecProvider()
-        )
-    else:
-        backend = (
-            KitchenSpecProvider(
-                fallback=LocalSpecProvider(),
-                use_kitchen_attention=config.use_kitchen_attention,
-                kitchen_attention_backend=config.kitchen_attention_backend,
-            )
-            if config.use_kitchen
-            else LocalSpecProvider()
-        )
+    # MTP has only ever used the Transformer Engine or the local backend, never the
+    # inference one, so it does not go through _base_backend_name().
+    backend: BackendSpecProvider = get_backend_spec_provider(
+        config, transformer_impl="transformer_engine" if use_transformer_engine else "local"
+    )
     return get_gpt_mtp_block_spec_for_backend(
         config=config, spec=spec, backend=backend, vp_stage=vp_stage, pp_rank=pp_rank
     )

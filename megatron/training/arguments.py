@@ -387,6 +387,9 @@ def tuple_type(x):
 
 def validate_args(args, defaults={}):
 
+    # Operation backend choices, so a bad name fails before the model is built.
+    _resolve_op_backend_overrides(args)
+
     # Prep for checkpoint conversion.
     if args.ckpt_convert_format is not None:
         assert args.ckpt_convert_save is not None
@@ -2225,6 +2228,53 @@ def _add_inference_args(parser):
     return parser
 
 
+def _op_backend_override(value):
+    """Parse one OPERATION=BACKEND pair from --op-backend."""
+    from megatron.core.ops import available_backends, parse_operation
+
+    operation, separator, backend = value.partition("=")
+    if not separator:
+        raise argparse.ArgumentTypeError(
+            f"expected OPERATION=BACKEND, got '{value}'"
+        )
+    try:
+        operation = str(parse_operation(operation.strip()))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    backend = backend.strip()
+    if backend not in available_backends():
+        raise argparse.ArgumentTypeError(
+            f"unknown backend '{backend}'. Available backends: "
+            f"{', '.join(available_backends())}"
+        )
+    return operation, backend
+
+
+def _load_op_backend_config(path):
+    """Read an operation-to-backend mapping from a JSON or YAML file."""
+    text = Path(path).read_text()
+    if path.endswith((".yaml", ".yml")):
+        import yaml
+
+        contents = yaml.safe_load(text)
+    else:
+        contents = json.loads(text)
+    if not isinstance(contents, dict):
+        raise ValueError(f"{path} must contain a mapping of operation name to backend name")
+    return dict(
+        _op_backend_override(f"{operation}={backend}") for operation, backend in contents.items()
+    )
+
+
+def _resolve_op_backend_overrides(args):
+    """Merge --op-backend-config and --op-backend into one mapping, command line last."""
+    overrides = {}
+    if getattr(args, "op_backend_config", None) is not None:
+        overrides.update(_load_op_backend_config(args.op_backend_config))
+    overrides.update(dict(getattr(args, "op_backend", []) or []))
+    args.op_backend_overrides = overrides
+
+
 def _add_network_size_args(parser):
     exclude = [
         # cannot provide callables over CLI
@@ -2319,9 +2369,22 @@ def _add_network_size_args(parser):
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
+        # a mapping; built from --op-backend and --op-backend-config
+        "op_backend_overrides",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
+
+    transformer_group.add_argument(
+        '--op-backend', nargs='+', type=_op_backend_override, default=[],
+        metavar='OPERATION=BACKEND',
+        help='Choose the backend for individual operations on top of --transformer-impl, '
+             'e.g. --op-backend layer_norm=apex vocab_parallel_cross_entropy=te_cross_entropy. '
+             'Run with an invalid value to list the operations and backends available.')
+    transformer_group.add_argument(
+        '--op-backend-config', type=str, default=None, metavar='FILE',
+        help='JSON or YAML file mapping operation names to backend names, applied the same '
+             'way as --op-backend. Values given on the command line win over the file.')
 
     group = parser.add_argument_group(title='network size')
 
