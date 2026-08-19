@@ -303,9 +303,6 @@ class AttentionKernelMetadata:
     kv_workspace_slot_mapping: torch.Tensor | None = None
     compressor_workspace_slot_mapping: torch.Tensor | None = None
     query_start_loc: torch.Tensor | None = None
-    attn_sink: torch.Tensor | None = None
-    softmax_scale: float | None = None
-    padded_heads: int | None = None
     prepare_flash: Any | None = None
     runtime_layout: Any | None = None
     compressor_operation: Any | None = None
@@ -377,7 +374,6 @@ def build_native_cp_attention_metadata(
         indices=empty_i32,
         topk_length=empty_i32,
         output=empty_bf16,
-        padded_heads=config.num_attention_heads,
         cp_packed_seq_params=packed_seq_params,
         cp_positions=local_positions,
         cp_compressor_operation=cp_compressor_operation,
@@ -556,7 +552,6 @@ class DS4PrefillMetadataBuilder:
                 ]
             ).contiguous(),
             query_start_loc=layout.query_start_loc,
-            padded_heads=self.config.num_attention_heads,
             prepare_flash=prepare_flash,
         )
         metadata.runtime_layout = layout
@@ -977,7 +972,6 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
                 ]
             ).contiguous(),
             query_start_loc=base.runtime_layout.query_start_loc,
-            padded_heads=self.config.num_attention_heads,
             compressor_operation=self.compressor_operation,
             compressor_metadata=main,
             indexer_operation=(

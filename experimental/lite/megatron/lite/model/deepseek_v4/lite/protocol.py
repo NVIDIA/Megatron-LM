@@ -148,10 +148,14 @@ def _infer_cp_local_seq_len(
 _nested_from_packed_tensor = nested_from_packed
 
 
-def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
+def pack_packed_batch(model, batch: PackedBatch, seq_lens=None):
     ps = parallel_state_from_model(model) or ParallelState()
-    seq_lens = batch.sizes().to(device=batch.input_ids.device)
-    packed = pack_nested_thd(
+    seq_lens = (
+        batch.sizes().to(device=batch.input_ids.device)
+        if seq_lens is None
+        else seq_lens
+    )
+    return pack_nested_thd(
         _nested_from_packed_tensor(batch.input_ids, seq_lens),
         cp_size=ps.cp_size,
         cp_rank=ps.cp_rank,
@@ -162,6 +166,10 @@ def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
         roll_labels=batch.labels is not None,
         roll_loss_mask=batch.loss_mask is not None,
     )
+
+
+def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
+    packed = pack_packed_batch(model, batch)
     kwargs: dict[str, Any] = {
         "input_ids": packed.input_ids,
         "labels": packed.labels,

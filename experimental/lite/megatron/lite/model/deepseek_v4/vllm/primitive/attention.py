@@ -327,19 +327,14 @@ class _VLLMAttentionCoreFunction(torch.autograd.Function):
         compressor_workspace_slots,
         query_start_loc,
     ):
-        visible = visible_op(q, kv)
-        if not isinstance(visible, (tuple, list)) or len(visible) < 2:
-            raise RuntimeError("FlashMLA training forward must return output and lse")
-        out, lse = visible[:2]
-        q_visible = visible[2] if len(visible) > 2 else q
-        # Some vLLM metadata is finalized inside the visible call. In
-        # particular, prepare_flash replaces the initial compressor-only
-        # indices with the combined [compressed | SWA] tensor after KV insert.
-        # Save the tensors actually consumed by FlashMLA, not the stale
-        # arguments evaluated before visible_op ran.
-        workspace_visible = visible[3] if len(visible) > 3 else workspace
-        indices_visible = visible[4] if len(visible) > 4 else indices
-        topk_length_visible = visible[5] if len(visible) > 5 else topk_length
+        (
+            out,
+            lse,
+            q_visible,
+            workspace_visible,
+            indices_visible,
+            topk_length_visible,
+        ) = visible_op(q, kv)
         ctx.save_for_backward(
             q,
             kv,

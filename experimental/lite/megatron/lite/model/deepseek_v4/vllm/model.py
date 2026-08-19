@@ -71,20 +71,6 @@ def _default_attention_ops() -> SimpleNamespace:
         kv_insert=DS4KVInsertAdapter(KVCacheLayout.FP8_DS_MLA),
         flash=FlashMLAAdapter(),
         o_project=OProjectionAdapter(),
-        compressor=lambda operation, *args, **kwargs: operation(
-            kv_score=args[0],
-            positions=args[1],
-            ape=args[2],
-            norm_weight=args[3],
-            **kwargs,
-        ),
-        indexer=lambda operation, *args, **kwargs: operation(
-            qr=args[0],
-            index_q=args[1],
-            index_weights=args[2],
-            positions=args[3],
-            **kwargs,
-        ),
     )
 
 
@@ -458,12 +444,8 @@ class _AttentionState(CompressedSparseAttention):
                 torch.full_like(indices, -1),
             )
         indices = indices.unsqueeze(1)
-        scale = metadata.softmax_scale or self.config.head_dim**-0.5
-        sink = (
-            metadata.attn_sink
-            if metadata.attn_sink is not None
-            else self.sinks.float().contiguous()
-        )
+        scale = self.config.head_dim**-0.5
+        sink = self.sinks.float().contiguous()
         output_buffer = torch.empty_like(q_visible)
 
         def visible_attention(q_value, kv_value):
@@ -566,12 +548,11 @@ class _AttentionState(CompressedSparseAttention):
                     f"layer {self.layer_idx} compressor requires explicit runtime metadata"
                 )
             assert compressor_kv_score is not None
-            self.adapters.compressor(
-                metadata.compressor_operation,
-                compressor_kv_score.detach(),
-                metadata.positions,
-                self.compressor.ape.detach().float().contiguous(),
-                self.compressor.norm.weight.detach(),
+            metadata.compressor_operation(
+                kv_score=compressor_kv_score.detach(),
+                positions=metadata.positions,
+                ape=self.compressor.ape.detach().float().contiguous(),
+                norm_weight=self.compressor.norm.weight.detach(),
                 compress_ratio=self.compress_ratio,
                 head_dim=self.config.head_dim,
                 metadata=metadata.compressor_metadata,
@@ -582,43 +563,33 @@ class _AttentionState(CompressedSparseAttention):
                     f"layer {self.layer_idx} indexer requires explicit runtime metadata"
                 )
             assert indexer_kv_score is not None and indexer_weights is not None
-            self.adapters.compressor(
-                metadata.compressor_operation,
-                indexer_kv_score.detach(),
-                metadata.positions,
-                self.indexer.compressor.ape.detach().float().contiguous(),
-                self.indexer.compressor.norm.weight.detach(),
+            metadata.compressor_operation(
+                kv_score=indexer_kv_score.detach(),
+                positions=metadata.positions,
+                ape=self.indexer.compressor.ape.detach().float().contiguous(),
+                norm_weight=self.indexer.compressor.norm.weight.detach(),
                 compress_ratio=self.compress_ratio,
                 head_dim=self.config.index_head_dim,
                 metadata=metadata.indexer_metadata,
             )
             assert index_q is not None
-            index_result = self.adapters.indexer(
-                metadata.indexer_operation,
-                qr.detach(),
-                index_q.detach(),
-                indexer_weights.detach(),
-                metadata.positions,
+            index_result = metadata.indexer_operation(
+                qr=qr.detach(),
+                index_q=index_q.detach(),
+                index_weights=indexer_weights.detach(),
+                positions=metadata.positions,
                 compress_ratio=self.compress_ratio,
                 topk=self.config.index_topk,
                 metadata=metadata.indexer_metadata,
             )
-            if isinstance(index_result, tuple):
-                metadata.indices, metadata.topk_length = index_result
-                indexer_topk = index_result[0]
-            elif isinstance(index_result, torch.Tensor):
-                metadata.indices = index_result
-                indexer_topk = index_result
+            metadata.indices = index_result
+            indexer_topk = index_result
 
         insert_cache = metadata.swa_cache
         if insert_cache.dtype == torch.uint8 and insert_cache.ndim == 3:
             insert_cache = insert_cache.view(insert_cache.shape[0], -1)
-        scale = metadata.softmax_scale or self.config.head_dim**-0.5
-        sink = (
-            metadata.attn_sink
-            if metadata.attn_sink is not None
-            else self.sinks.float().contiguous()
-        )
+        scale = self.config.head_dim**-0.5
+        sink = self.sinks.float().contiguous()
         if metadata.kv_workspace is None:
             raise NotImplementedError("FlashMLA prefill requires kv_workspace")
 
@@ -632,7 +603,7 @@ class _AttentionState(CompressedSparseAttention):
                 metadata.cos_sin_cache,
                 eps=self.config.rms_norm_eps,
                 block_size=metadata.block_size,
-                padded_heads=(metadata.padded_heads or self.config.num_attention_heads),
+                padded_heads=self.config.num_attention_heads,
             ).contiguous()
             if metadata.prepare_flash is not None:
                 metadata.prepare_flash()
@@ -645,13 +616,9 @@ class _AttentionState(CompressedSparseAttention):
                 topk_length=metadata.topk_length,
                 out=metadata.output,
             )
-            if not isinstance(flash_result, (tuple, list)) or len(flash_result) < 2:
-                raise RuntimeError("training FlashMLA prefill must return output and lse")
-            # vLLM returns (output, max_logits, lse); Lite returns (output, lse).
-            lse = flash_result[2] if len(flash_result) >= 3 else flash_result[1]
             return (
                 flash_result[0],
-                lse,
+                flash_result[2],
                 q_visible,
                 metadata.kv_workspace,
                 metadata.indices,
@@ -710,8 +677,6 @@ class _AttentionState(CompressedSparseAttention):
                 softmax_scale=scale,
                 loss_coeff=self.indexer_loss_coeff,
             )
-        if isinstance(result, (tuple, list)):
-            result = result[0]
         result = result.reshape(hidden_states.shape[0], -1, self.config.head_dim)
         result = result[:, : self.config.num_attention_heads, :]
 

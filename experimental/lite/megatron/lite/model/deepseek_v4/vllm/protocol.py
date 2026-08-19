@@ -22,6 +22,7 @@ from megatron.lite.model.deepseek_v4.lite.protocol import (
     build_model_config,
     build_training_backend,
     is_expert_param,
+    pack_packed_batch,
     pack_r3_replay_mask,
     pack_routed_experts,
     unpack_forward_output,
@@ -34,18 +35,14 @@ from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
 )
 from megatron.lite.model.protocol_utils import (
     add_loss_context_kwargs,
-    nested_from_packed,
     router_replay_roots as router_replay_roots,
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
-from megatron.lite.primitive.parallel.thd import (
-    pack_nested_thd,
-    parallel_state_from_model,
-    roll_packed_thd_left,
-)
+from megatron.lite.primitive.parallel.thd import parallel_state_from_model
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
+
 
 @dataclass(frozen=True)
 class ImplConfig(LiteImplConfig):
@@ -53,6 +50,7 @@ class ImplConfig(LiteImplConfig):
     mtp_enable: bool = False
     dsa_indexer_loss_coeff: float = 0.0
     max_tokens_per_rank: int = 8192
+
 
 def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
     if impl_cfg.dsa_indexer_loss_coeff < 0.0:
@@ -66,17 +64,14 @@ def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> Non
             f"{model_cfg.num_hidden_layers} layers."
         )
     parallel = impl_cfg.parallel
-    dimensions = {
-        "tp": parallel.tp,
-        "etp": 1 if parallel.etp is None else parallel.etp,
-        "pp": parallel.pp,
-        "vpp": parallel.vpp,
-        "cp": parallel.cp,
-    }
     unsupported = {
         name: size
-        for name, size in dimensions.items()
-        if name not in ("cp", "pp") and size > 1
+        for name, size in (
+            ("tp", parallel.tp),
+            ("etp", parallel.etp or 1),
+            ("vpp", parallel.vpp),
+        )
+        if size > 1
     }
     if unsupported:
         values = ", ".join(f"{name}={size}" for name, size in unsupported.items())
@@ -93,20 +88,19 @@ def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> Non
         )
     if impl_cfg.mtp_enable:
         raise NotImplementedError("DeepSeek V4 vLLM skeleton does not support MTP yet.")
-    disabled_features = {
-        "offload": impl_cfg.offload,
-        "use_thd": impl_cfg.use_thd,
-        # The vLLM implementation always executes its explicit FlashMLA stage.
-        # Accept the runtime/bench default spelling instead of treating the
-        # equivalent "flash" selection as an unsupported feature.
-        "attention_backend_override": (
-            impl_cfg.attention_backend_override
-            if impl_cfg.attention_backend_override not in (None, "flash")
-            else None
-        ),
-        "qat": impl_cfg.qat,
-    }
-    enabled = [name for name, value in disabled_features.items() if value]
+    enabled = [
+        name
+        for name, value in (
+            ("offload", impl_cfg.offload),
+            ("use_thd", impl_cfg.use_thd),
+            (
+                "attention_backend_override",
+                impl_cfg.attention_backend_override not in (None, "flash"),
+            ),
+            ("qat", impl_cfg.qat),
+        )
+        if value
+    ]
     if enabled:
         raise NotImplementedError(
             "DeepSeek V4 vLLM skeleton does not install training/runtime features: "
@@ -119,9 +113,11 @@ def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> Non
             f"{model_cfg.num_hidden_layers} layers."
         )
     unsupported_ratios = {
-        layer_id: model_cfg.compress_ratios[layer_id]
-        for layer_id in range(model_cfg.num_hidden_layers)
-        if max(1, model_cfg.compress_ratios[layer_id]) not in (1, 4, 128)
+        layer: ratio
+        for layer, ratio in enumerate(
+            model_cfg.compress_ratios[: model_cfg.num_hidden_layers]
+        )
+        if max(1, ratio) not in (1, 4, 128)
     }
     if unsupported_ratios:
         raise ValueError(
@@ -135,20 +131,6 @@ def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> Non
         )
 
 
-def _roll_packed_targets(
-    values: torch.Tensor | None,
-    seq_lens: torch.Tensor | None,
-) -> torch.Tensor | None:
-    if values is None or seq_lens is None:
-        return values
-    cu_seqlens = torch.cat((seq_lens.new_zeros(1), seq_lens.cumsum(0)))
-    if int(cu_seqlens[-1]) != values.numel():
-        raise ValueError("packed sequence lengths do not cover every target")
-    return roll_packed_thd_left(
-        values, cu_seqlens_padded=cu_seqlens, dims=0
-    )[0]
-
-
 def _forward_step(
     model: nn.Module,
     batch,
@@ -157,7 +139,6 @@ def _forward_step(
     moe_metadata=None,
     forward_inputs: Mapping[str, Any] | None = None,
 ) -> dict[str, torch.Tensor]:
-    seq_lens = getattr(batch, "seq_lens", None)
     kwargs = {
         "input_ids": batch.input_ids,
         "position_ids": getattr(batch, "position_ids", None),
@@ -171,8 +152,8 @@ def _forward_step(
             if moe_metadata is None
             else moe_metadata
         ),
-        "labels": _roll_packed_targets(getattr(batch, "labels", None), seq_lens),
-        "loss_mask": _roll_packed_targets(getattr(batch, "loss_mask", None), seq_lens),
+        "labels": getattr(batch, "labels", None),
+        "loss_mask": getattr(batch, "loss_mask", None),
         "temperature": getattr(batch, "temperature", 1.0),
     }
     if forward_inputs is not None:
@@ -187,27 +168,16 @@ def _prepare_cp_forward_inputs(
     """Pad then slice packed rows using DS4 lite's contiguous CP layout."""
 
     ps = parallel_state_from_model(model)
-    if ps is None or ps.cp_size <= 1:
-        return {}, [int(value) for value in batch.seq_lens.detach().cpu().tolist()], None
-    packed = pack_nested_thd(
-        nested_from_packed(batch.input_ids, batch.seq_lens),
-        tp_size=ps.tp_size,
-        cp_size=ps.cp_size,
-        cp_rank=ps.cp_rank,
-        cp_group=ps.cp_group,
-        split_cp=False,
-        labels=nested_from_packed(batch.labels, batch.seq_lens),
-        loss_mask=nested_from_packed(batch.loss_mask, batch.seq_lens),
-        roll_labels=batch.labels is not None,
-        roll_loss_mask=batch.loss_mask is not None,
-    )
+    packed = pack_packed_batch(model, batch, batch.seq_lens)
 
     def local(tensor: torch.Tensor | None) -> torch.Tensor | None:
         if tensor is None:
             return None
-        return contiguous_slice_for_cp(
-            tensor, ps.cp_rank, ps.cp_size, seq_dim=1
-        ).reshape(-1).contiguous()
+        if ps is not None and ps.cp_size > 1:
+            tensor = contiguous_slice_for_cp(
+                tensor, ps.cp_rank, ps.cp_size, seq_dim=1
+            )
+        return tensor.reshape(-1).contiguous()
 
     inputs = {
         "input_ids": local(packed.input_ids),

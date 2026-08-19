@@ -117,10 +117,18 @@ def test_cp_forward_inputs_reuse_lite_contiguous_layout() -> None:
     assert packed is not None
 
 
-def test_packed_targets_roll_inside_each_sequence() -> None:
-    values = torch.tensor([11, 12, 21, 22, 23])
-    actual = protocol._roll_packed_targets(values, torch.tensor([2, 3]))
-    assert torch.equal(actual, torch.tensor([12, 0, 22, 23, 0]))
+def test_cp1_forward_inputs_use_shared_packing_and_roll_targets() -> None:
+    model = nn.Module()
+    model.ps = ParallelState(cp_size=1, cp_rank=0, tp_size=1)
+    batch = PackedBatch(
+        input_ids=torch.arange(5),
+        labels=torch.tensor([11, 12, 21, 22, 23]),
+        loss_mask=torch.ones(5),
+        seq_lens=torch.tensor([2, 3]),
+    )
+    inputs, lengths, _ = protocol._prepare_cp_forward_inputs(model, batch)
+    assert lengths == [2, 3]
+    assert torch.equal(inputs["labels"], torch.tensor([12, 0, 22, 23, 0]))
 
 
 def test_forward_reuses_caller_owned_ephemeral_metadata(monkeypatch) -> None:

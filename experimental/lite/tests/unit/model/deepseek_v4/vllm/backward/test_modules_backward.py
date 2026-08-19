@@ -202,7 +202,14 @@ def test_attention_core_replays_visible_rope_and_workspace_vjp() -> None:
     dq = torch.randn_like(q_visible)
     dworkspace = torch.randn_like(workspace)
     output = attention_core(
-        lambda *_args: (visible_output, torch.randn(tokens, heads), q_visible),
+        lambda *_args: (
+            visible_output,
+            torch.randn(tokens, heads),
+            q_visible,
+            workspace,
+            indices,
+            lengths,
+        ),
         q, kv, workspace, indices, lengths, sink, slots, positions, cache,
         softmax_scale=0.5, eps=1e-6, rope_dim=rope_dim,
         backward_op=lambda *_args: (dq, dworkspace),
