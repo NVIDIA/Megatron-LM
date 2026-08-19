@@ -1954,8 +1954,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
             grad_norm_skip_threshold = optimizer.config.grad_norm_skip_threshold
             if (
-                not optimizer.config.optimizer_cuda_graph
-                and main_params
+                main_params
                 and math.isfinite(grad_norm_skip_threshold)
                 and grad_norm > grad_norm_skip_threshold
             ):
