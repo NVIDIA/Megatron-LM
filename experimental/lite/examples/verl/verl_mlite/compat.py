@@ -8,13 +8,8 @@ import importlib.abc
 import importlib.machinery
 import importlib.util
 import os
-import queue
 import sys
-import threading
-import time
 from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor
-from contextvars import copy_context
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -1063,7 +1058,13 @@ class _SyncBucketProducer:
 
 
 def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
-    """Overlap synchronous weight production with the receiver's bucket ACK."""
+    """Install the MLite-aware bucket packer without moving model work off-thread.
+
+    ``weights`` is not an ordinary host iterator: advancing it can enter FSDP
+    parameter materialization and PP/EP collectives.  Those operations must run
+    on the actor thread which owns the rank's CUDA device and model lifecycle.
+    Only the produced tensors may be copied into the IPC staging buffer here.
+    """
     if getattr(sender_cls, "_mlite_weight_prefetch_patch", False):
         return False
 
@@ -1075,11 +1076,6 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
         if not isinstance(weights, Iterable) or hasattr(weights, "__aiter__") or self.use_shm:
             return await original_async_send_weights(self, weights)
 
-        executor = None
-        stop = threading.Event()
-        free_slots = None
-        ready_results = None
-        held_slot = None
         try:
             self._init_socket()
             self._init_buffer()
@@ -1088,83 +1084,25 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
             ):
                 raise RuntimeError("MLite sender prefetch requires a CUDA IPC buffer")
 
-            staging_slots = [torch.empty_like(self.buffer) for _ in range(2)]
+            staging = torch.empty_like(self.buffer)
             producer = _SyncBucketProducer(weights, self.bucket_size)
-            free_slots = queue.Queue(maxsize=2)
-            ready_results = queue.Queue(maxsize=2)
-            for slot_index in range(2):
-                free_slots.put_nowait(slot_index)
-            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlite-weight-prefetch")
-
-            def put_ready(result):
-                while not stop.is_set():
-                    try:
-                        ready_results.put(result, timeout=0.05)
-                        return True
-                    except queue.Full:
-                        continue
-                return False
-
-            def produce():
-                slot_index = None
-                try:
-                    while not stop.is_set():
-                        try:
-                            slot_index = free_slots.get(timeout=0.05)
-                        except queue.Empty:
-                            continue
-                        result = producer.next_bucket(staging_slots[slot_index])
-                        if not put_ready((*result, slot_index)):
-                            return
-                        slot_index = None
-                        kind, *_, is_last = result
-                        if kind == "eof" or is_last:
-                            return
-                except BaseException as exc:
-                    put_ready(("error", exc, None, 0, None, True, slot_index))
-
-            context = copy_context()
-            worker_future = executor.submit(context.run, produce)
-            timeout_s = float(os.environ.get("MLITE_WEIGHT_SYNC_TIMEOUT_S", "300"))
-            deadline = time.monotonic() + timeout_s
             while True:
-                try:
-                    result = ready_results.get(timeout=0.1)
-                except queue.Empty:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            f"MLite weight prefetch exceeded {timeout_s:g} seconds"
-                        )
-                    if worker_future.done():
-                        worker_future.result()
-                        raise RuntimeError("MLite weight prefetch stopped without a terminal result")
-                    continue
-
-                kind, metadata_or_name, direct_weight, used_bytes, ready, is_last, held_slot = (
-                    result
+                kind, metadata_or_name, direct_weight, used_bytes, ready, is_last = (
+                    producer.next_bucket(staging)
                 )
-                if kind == "error":
-                    raise metadata_or_name
                 if kind == "eof":
-                    free_slots.put_nowait(held_slot)
-                    held_slot = None
                     self.socket.send_pyobj({"bucket_meta": {}, "is_last": True})
                     self.socket.recv()
                     break
                 if kind == "direct":
-                    free_slots.put_nowait(held_slot)
-                    held_slot = None
                     self._direct_send_large_weight(metadata_or_name, direct_weight)
                     continue
 
                 if ready is not None:
                     ready.synchronize()
-                staging = staging_slots[held_slot]
                 self.buffer[:used_bytes].copy_(staging[:used_bytes], non_blocking=True)
                 if self.buffer.device.type == "cuda":
                     torch.cuda.synchronize(self.buffer.device)
-                free_slots.put_nowait(held_slot)
-                held_slot = None
 
                 self.socket.send_pyobj(
                     {"bucket_meta": metadata_or_name, "is_last": is_last}
@@ -1173,14 +1111,6 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
                 if is_last:
                     break
         finally:
-            stop.set()
-            if held_slot is not None and free_slots is not None:
-                try:
-                    free_slots.put_nowait(held_slot)
-                except queue.Full:
-                    pass
-            if executor is not None:
-                executor.shutdown(wait=True, cancel_futures=True)
             self._cleanup()
 
     sender_cls.async_send_weights = prefetched_async_send_weights
