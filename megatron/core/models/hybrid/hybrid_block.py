@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
@@ -429,6 +429,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             inference_context=inference_context,
             padding_mask=padding_mask,
             input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
         )
         if layer.mlp_norm_manager is not None:
             output_with_bias = layer._group_offload_output_with_bias(

@@ -1569,22 +1569,51 @@ class TransformerConfig(ModelParallelConfig):
             if self.sequence_packing_scheduler is None:
                 raise ValueError(
                     "cp_partition_mode='contiguous' with context parallelism requires THD "
-                    "inputs from a sequence_packing_scheduler; BSHD inputs are not supported."
+                    "inputs from a sequence_packing_scheduler; BSHD inputs are not supported. "
+                    "The legacy non-scheduler CP batch slicing path only supports zigzag layout."
+                )
+            if (
+                (self.mtp_num_layers or 0) > 0
+                and self.tensor_model_parallel_size > 1
+                and self.sequence_parallel
+            ):
+                raise ValueError(
+                    "MTP with tensor_model_parallel_size > 1, sequence_parallel=True, and "
+                    "cp_partition_mode='contiguous' has a known token-side padding-mask layout "
+                    "bug. This combination is temporarily unsupported and will be fixed in a "
+                    "follow-up change."
                 )
 
         if self.context_parallel_size > 1:
-            if (
-                self.experimental_attention_variant == "dsv4_hybrid"
-                and self.cp_partition_mode != "contiguous"
-            ):
-                raise ValueError("DSv4 Hybrid with CP requires cp_partition_mode='contiguous'.")
-            if (
-                self.experimental_attention_variant != "dsv4_hybrid"
-                and self.cp_partition_mode != "zigzag"
-            ):
-                raise ValueError(
-                    "cp_partition_mode='contiguous' currently is only supported with dsv4_hybrid."
-                )
+            if self.cp_partition_mode == "contiguous":
+                if (
+                    self.multi_latent_attention
+                    and self.experimental_attention_variant != "dsv4_hybrid"
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is not supported with "
+                        "multi_latent_attention outside dsv4_hybrid."
+                    )
+                if self.experimental_attention_variant not in ("dsv4_hybrid", "gated_delta_net"):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' with context parallelism currently "
+                        "requires experimental_attention_variant to be either 'dsv4_hybrid' "
+                        "or 'gated_delta_net'."
+                    )
+                if (
+                    self.experimental_attention_variant == "gated_delta_net"
+                    and self.linear_cp_mode == "headwise"
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is incompatible with "
+                        "gated_delta_net linear_cp_mode='headwise'."
+                    )
+            elif self.cp_partition_mode == "zigzag":
+                if self.experimental_attention_variant == "dsv4_hybrid":
+                    raise ValueError(
+                        "DSv4 Hybrid with context parallelism requires "
+                        "cp_partition_mode='contiguous'."
+                    )
 
         # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
         # selectors have been folded into experimental_attention_variant, and immediately
@@ -3137,6 +3166,30 @@ class TransformerConfig(ModelParallelConfig):
                         "overlap_moe_expert_parallel_comm: the non-overlap VPP "
                         "path is unvalidated."
                     )
+
+        cuda_graph_captures_attention = self.cuda_graph_impl == "full_iteration" or (
+            self.cuda_graph_impl in ("local", "transformer_engine")
+            and (not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules)
+        )
+
+        cp_layout_conversion_required = self.experimental_attention_variant == "gated_delta_net"
+        # TODO: Extend this predicate as GDN2/KDA are introduced, and for DSv4 when
+        # dsa_cp_balance_indexer is introduced; those paths will also require module-local THD CP
+        # layout conversion.
+        if (
+            (self.context_parallel_size > 1 or self.dynamic_context_parallel)
+            and self.sequence_packing_scheduler is not None
+            and cuda_graph_captures_attention
+            and cp_layout_conversion_required
+        ):
+            raise ValueError(
+                "THD context parallel layout conversion is required for this model "
+                "configuration, but it is not supported by CUDA graph capture that includes "
+                "attention "
+                f"(experimental_attention_variant={self.experimental_attention_variant!r}, "
+                f"cuda_graph_impl={self.cuda_graph_impl!r}, "
+                f"cuda_graph_modules={self.cuda_graph_modules!r})."
+            )
 
         if self.cuda_graph_impl != "none":
 

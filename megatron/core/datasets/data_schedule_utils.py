@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import lru_cache
 from math import ceil, log2
@@ -82,7 +82,10 @@ def get_cp_slice_for_thd(
     if cp_partition_mode != "zigzag":
         raise ValueError(f"Unsupported CP partition mode: {cp_partition_mode}")
 
-    index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+    cu_seqlens_for_index = (
+        cu_seqlens if cu_seqlens.dtype == torch.int32 else cu_seqlens.to(dtype=torch.int32)
+    )
+    index = get_thd_partitioned_indices(cu_seqlens_for_index, total_tokens, cp_size, cp_rank)
     for key in keys:
         if key in batch and batch[key] is not None:
             batch[key] = batch[key].index_select(0, index)

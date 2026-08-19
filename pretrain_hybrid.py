@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pretrain and SFT Hybrid."""
 
 # Capture the true program start time BEFORE any heavy imports.
@@ -24,6 +24,7 @@ import torch
 
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
+from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -125,6 +126,7 @@ def get_batch(data_iterator, vp_stage=None):
             dynamic_cp=is_dynamic_cp,
             config=config,
         )
+        finalize_packed_seq_params(packed_seq_params)
         return (
             attention_mask,
             None,
@@ -328,6 +330,7 @@ def forward_step(data_iterator, model: HybridModel):
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
         )
+        finalize_packed_seq_params(packed_seq_params)
 
     timers('batch-generator').stop()
 

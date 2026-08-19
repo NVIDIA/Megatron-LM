@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -329,7 +330,9 @@ class Attention(MegatronModule, ABC):
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'tp_cp']
+            )
         else:
             assert hasattr(
                 pg_collection, 'tp'
@@ -530,7 +533,7 @@ class Attention(MegatronModule, ABC):
                 checkpoint_inputs.append(kwarg_value)
 
         def custom_forward(*inputs):
-            (query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values) = inputs
+            query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values = inputs
             attn_mask_type = AttnMaskType(attn_mask_type.item())
             extra_kwargs = dict(core_attention_extra_kwargs)
             for name, kwarg_value in zip(tensor_kwarg_names, tensor_kwarg_values):
@@ -1361,6 +1364,19 @@ class Attention(MegatronModule, ABC):
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             self.pg_collection.cp = packed_seq_params.cp_group
+        hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+            hidden_states=hidden_states,
+            key_value_states=key_value_states,
+            packed_seq_params=packed_seq_params,
+            cp_group=self.pg_collection.cp,
+            tp_group=self.pg_collection.tp,
+            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+            target_partition_mode="zigzag",
+            sequence_parallel=self.config.sequence_parallel,
+            config=self.config,
+            attention_mask=attention_mask,
+            attention_bias=attention_bias,
+        )
 
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
@@ -1507,6 +1523,10 @@ class Attention(MegatronModule, ABC):
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
             output, bias = apply_module(self.linear_proj)(context_layer)
+            if back_to_input_converter is not None:
+                output = back_to_input_converter.convert(
+                    output, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+                )
             self.pg_collection.cp = _orig_cp_group
             return output, bias
 
@@ -1699,6 +1719,11 @@ class Attention(MegatronModule, ABC):
             output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
+
+        if back_to_input_converter is not None:
+            output = back_to_input_converter.convert(
+                output, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias
@@ -2003,9 +2028,9 @@ class SelfAttention(Attention):
             ]
 
             if SplitAlongDim is not None:
-                (query, gate, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+                query, gate, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
-                (query, gate, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+                query, gate, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
         else:
             # If no output gate: [sq, b, ng, (np/ng + 2) * hn]
             # --> [sq, b, ng, np/ng * hn], None, [sq, b, ng, hn], [sq, b, ng, hn]
@@ -2020,9 +2045,9 @@ class SelfAttention(Attention):
                 return mixed_qkv, split_arg_list
 
             if SplitAlongDim is not None:
-                (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+                query, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
-                (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+                query, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
 
         # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
@@ -2354,7 +2379,7 @@ class CrossAttention(Attention):
         mixed_kv = mixed_kv.view(*new_tensor_shape)
 
         # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
-        (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
+        key, value = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
         query, _ = apply_module(self.linear_q)(hidden_states)

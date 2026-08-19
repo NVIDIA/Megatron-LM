@@ -2089,6 +2089,21 @@ class CompressedSparseAttention(MegatronModule):
         """
         nvtx_range_push("compressed_sparse_attn")
 
+        _orig_cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
+            self.pg_collection.cp = packed_seq_params.cp_group
+
+        cp_size = self.pg_collection.cp.size() if self.pg_collection.cp is not None else 1
+        qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
+        if cp_size > 1 and qkv_format != 'thd':
+            raise ValueError("CompressedSparseAttention with CP requires qkv_format='thd'.")
+        if cp_size > 1 and packed_seq_params.cp_partition_mode != "contiguous":
+            raise ValueError(
+                "CompressedSparseAttention requires cp_partition_mode='contiguous'. "
+                "CP partition conversion must be handled before entering CSA."
+            )
+
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
                 output = self._forward_thd_cp(
@@ -2096,6 +2111,7 @@ class CompressedSparseAttention(MegatronModule):
                 )
             else:
                 output = self._forward_thd(query, key, x, qr, packed_seq_params)
+            self.pg_collection.cp = _orig_cp_group
             nvtx_range_pop("compressed_sparse_attn")
             return output
 
@@ -2140,6 +2156,7 @@ class CompressedSparseAttention(MegatronModule):
         if indexer_loss is not None:
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
 
+        self.pg_collection.cp = _orig_cp_group
         nvtx_range_pop("compressed_sparse_attn")
         return output
 
@@ -2199,7 +2216,7 @@ class CompressedSparseAttention(MegatronModule):
 
                     # Physical padded offsets define the packed address space;
                     # unpadded lengths identify the real rows within each segment.
-                    (varlen_starts, varlen_ends, query_valid_rows, compressed_offsets) = (
+                    varlen_starts, varlen_ends, query_valid_rows, compressed_offsets = (
                         _build_compressed_thd_indexer_metadata(
                             cu_seqlens_q,
                             cu_seqlens_compressed_idx,
