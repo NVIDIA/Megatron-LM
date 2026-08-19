@@ -1,9 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from __future__ import annotations
+
 import weakref
-from enum import Enum, auto
 from functools import partial
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
@@ -13,6 +14,13 @@ from megatron.core.transformer.module import MegatronModule, SplitOutputProjecti
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
+
+if TYPE_CHECKING:
+    from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+
+_PairedState = tuple[torch.Tensor, ...]
+_DispatchOutput = tuple[torch.Tensor, torch.Tensor]
 
 
 class PersistentBuffer:
@@ -47,7 +55,8 @@ class PersistentBuffer:
         if not like.is_cuda:
             raise ValueError(f"Persistent {self.name} buffer requires a CUDA tensor template")
 
-        if self._tensor is None:
+        tensor = self._tensor
+        if tensor is None:
             from megatron.core.transformer.cuda_graphs import (
                 ArgMetadata,
                 alloc_tensor_from_graph_mempool,
@@ -57,20 +66,17 @@ class PersistentBuffer:
             metadata.requires_grad = self.requires_grad
             tensor = alloc_tensor_from_graph_mempool(metadata)
         else:
-            expected = self._metadata(self._tensor)
-            received = self._metadata(like)
+            expected, received = self._metadata(tensor), self._metadata(like)
             if received != expected:
                 raise AssertionError(
                     f"Persistent {self.name} buffer metadata changed: "
                     f"expected {expected}, received {received}"
                 )
             if self.detach_on_reuse:
-                is_from_global_mempool = getattr(self._tensor, "is_from_global_mempool", False)
-                tensor = self._tensor.detach().requires_grad_(self.requires_grad)
+                is_from_global_mempool = getattr(tensor, "is_from_global_mempool", False)
+                tensor = tensor.detach().requires_grad_(self.requires_grad)
                 if is_from_global_mempool:
                     tensor.is_from_global_mempool = True
-            else:
-                tensor = self._tensor
 
         if self.prebound_graph_input:
             from megatron.core.transformer.cuda_graphs import mark_cuda_graph_prebound_input
@@ -250,25 +256,6 @@ class RecordCombineGradReady(torch.autograd.Function):
         return grad_output, None
 
 
-class ShortcutExecutionMode(Enum):
-    """Supported execution schedules for a shortcut compute/MoE pair."""
-
-    EAGER_SERIAL = auto()
-    EAGER_OVERLAP = auto()
-    CUDA_GRAPH_OVERLAP = auto()
-
-    @classmethod
-    def resolve(cls, *, enable_cudagraph: bool, overlap_a2a: bool):
-        """Resolve the schedule and reject the unsupported graph/serial combination."""
-        if enable_cudagraph:
-            if not overlap_a2a:
-                raise ValueError("Shortcut MoE CUDA graphs require moe_shortcut_parallel")
-            return cls.CUDA_GRAPH_OVERLAP
-        if overlap_a2a:
-            return cls.EAGER_OVERLAP
-        return cls.EAGER_SERIAL
-
-
 def group_layers_into_shortcut_blocks(
     layers: torch.nn.ModuleList,
     layer_type_list: Sequence[str],
@@ -319,12 +306,13 @@ def group_layers_into_shortcut_blocks(
                 f"Shortcut compute layer {paired_type!r} does not support split output projection"
             )
         moe_layer = layers[physical_index + 1]
+        enable_cudagraph = CudaGraphModule.shortcut_block in config.cuda_graph_modules
         grouped_layers.append(
             ShortcutMoEBlock(
                 compute_layer,
                 moe_layer,
                 is_mtp_layer=is_mtp_layer,
-                overlap_a2a=config.moe_shortcut_parallel,
+                enable_cudagraph=enable_cudagraph,
             )
         )
         physical_index += 2
@@ -332,8 +320,8 @@ def group_layers_into_shortcut_blocks(
     return grouped_layers
 
 
-class _RoutePersistentSlot:
-    """Persistent route/gradient storage and events for one outstanding invocation."""
+class _PersistentSlot:
+    """Persistent route/combine state for one outstanding graph invocation."""
 
     def __init__(self, index: int):
         suffix = f" slot {index}"
@@ -345,55 +333,72 @@ class _RoutePersistentSlot:
         self.route_probs_grad_buffer = PersistentBuffer(f"route probability gradient{suffix}")
         self.route_ready_event = torch.cuda.Event(external=True)
         self.route_grad_ready_event = torch.cuda.Event(external=True)
-
-
-class _OutputPersistentSlot:
-    """Persistent combine storage and events for one outstanding invocation."""
-
-    def __init__(self, index: int):
         self.combined_output_buffer = PersistentBuffer(
             f"combined output slot {index}", prebound_graph_input=True, detach_on_reuse=True
         )
         self.combine_ready_event = torch.cuda.Event(external=True)
         self.combine_grad_ready_event = torch.cuda.Event(external=True)
 
+    def acquire_combined_output(self, like: torch.Tensor) -> torch.Tensor:
+        """Return the persistent combined-output allocation for this invocation slot."""
+        return self.combined_output_buffer.acquire_like(like)
+
+
+class _GraphState(torch.nn.Module):
+    """Own CUDA-graph managers and persistent state for one shortcut block."""
+
+    def __init__(self, slot_count: int):
+        super().__init__()
+        if slot_count <= 0:
+            raise ValueError("Shortcut CUDA-graph state requires at least one slot")
+        self.slots = [_PersistentSlot(index) for index in range(slot_count)]
+        self.next_slot = 0
+        self.route_manager: CudaGraphManager | None = None
+        self.output_manager: CudaGraphManager | None = None
+
+    def get_slot(self, index: int) -> _PersistentSlot:
+        """Return a persistent slot after validating its graph-visible index."""
+        if index < 0 or index >= len(self.slots):
+            raise IndexError(f"Persistent slot {index} is outside [0, {len(self.slots)})")
+        return self.slots[index]
+
+    def acquire_slot(self) -> tuple[int, _PersistentSlot]:
+        """Rotate through persistent slots in repeated-MTP forward order."""
+        if not self.slots:
+            raise RuntimeError("Shortcut CUDA-graph state has no persistent slots")
+        index = self.next_slot
+        slot = self.get_slot(index)
+        self.next_slot = (index + 1) % len(self.slots)
+        return index, slot
+
 
 class ShortcutMoEBlock(MegatronModule):
     """Own and execute one compute-layer/shortcut-MoE pair."""
 
-    _parallel_stream = None
+    _parallel_streams: dict[int, torch.cuda.Stream] = {}
 
-    def __init__(self, compute_layer, moe_layer, overlap_a2a: bool, is_mtp_layer: bool = False):
-        enable_cudagraph = CudaGraphModule.shortcut_block in compute_layer.config.cuda_graph_modules
-        execution_mode = ShortcutExecutionMode.resolve(
-            enable_cudagraph=enable_cudagraph, overlap_a2a=overlap_a2a
-        )
-        if execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
-            assert (
-                compute_layer.config.pipeline_model_parallel_size == 1
-            ), "Fused shortcut CUDA graphs currently require pipeline parallel size 1"
+    def __init__(
+        self,
+        compute_layer,
+        moe_layer,
+        enable_cudagraph: bool,
+        is_mtp_layer: bool = False,
+    ):
+        if not compute_layer.config.moe_shortcut_parallel:
+            raise ValueError("Shortcut MoE requires moe_shortcut_parallel")
+        if enable_cudagraph:
+            assert compute_layer.config.pipeline_model_parallel_size == 1, (
+                "Fused shortcut CUDA graphs currently require pipeline parallel size 1"
+            )
         persistent_slot_count = 1
-        if (
-            execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP
-            and is_mtp_layer
-            and compute_layer.config.mtp_use_repeated_layer
-        ):
+        if enable_cudagraph and is_mtp_layer and compute_layer.config.mtp_use_repeated_layer:
             if not compute_layer.config.mtp_num_layers:
                 raise ValueError("Repeated MTP shortcut CUDA graphs require mtp_num_layers > 0")
             persistent_slot_count = compute_layer.config.mtp_num_layers
 
         super().__init__(compute_layer.config)
 
-        self.execution_mode = execution_mode
-        self._persistent_slot_count = persistent_slot_count
-        self._route_layer_boundaries = (
-            getattr(compute_layer, "is_first_layer", False),
-            getattr(compute_layer, "is_last_layer", False),
-        )
-        self._output_layer_boundaries = (
-            getattr(moe_layer, "is_first_layer", False),
-            getattr(moe_layer, "is_last_layer", False),
-        )
+        self.enable_cudagraph = enable_cudagraph
         self.layer_number = compute_layer.layer_number
         self.is_first_layer = getattr(compute_layer, "is_first_layer", False)
         self.is_last_layer = getattr(moe_layer, "is_last_layer", False)
@@ -407,29 +412,29 @@ class ShortcutMoEBlock(MegatronModule):
         for parameter in self.shortcut_post_norm.parameters():
             setattr(parameter, 'sequence_parallel', self.config.sequence_parallel)
 
-        self._route_persistent_slots = []
-        self._output_persistent_slots = []
-        self._cached_dispatch_output = None
-        self._cached_combine_output = None
-        self.route_ready_event = None
-        if execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
-            self._route_persistent_slots = [
-                _RoutePersistentSlot(index) for index in range(persistent_slot_count)
-            ]
-            self._output_persistent_slots = [
-                _OutputPersistentSlot(index) for index in range(persistent_slot_count)
-            ]
-        elif execution_mode == ShortcutExecutionMode.EAGER_OVERLAP:
+        self._graph_state: _GraphState | None = None
+        if enable_cudagraph:
+            self._initialize_cudagraph_state(persistent_slot_count)
+        else:
             self.route_ready_event = torch.cuda.Event()
 
-        self._next_persistent_slot = 0
-        if execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
-            self.create_mcore_cudagraph_manager(self.config)
+    def _initialize_cudagraph_state(self, slot_count: int) -> None:
+        """Construct graph-only persistent slots and method-level graph managers."""
+        if self._graph_state is not None:
+            raise RuntimeError("Shortcut CUDA-graph state has already been initialized")
+        self._graph_state = _GraphState(slot_count)
+        self.create_mcore_cudagraph_manager(self.config)
+
+    def _require_graph_state(self) -> _GraphState:
+        """Return graph-only state or fail at an invalid graph scheduling boundary."""
+        if self._graph_state is None:
+            raise RuntimeError("Shortcut CUDA-graph state is not initialized")
+        return self._graph_state
 
     def create_mcore_cudagraph_manager(self, config):
         """Create the two method-level CUDA graphs owned by this registered pair."""
         assert config.cuda_graph_impl == "local"
-        if self.execution_mode != ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
+        if not self.enable_cudagraph:
             return
 
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
@@ -447,51 +452,20 @@ class ShortcutMoEBlock(MegatronModule):
             output_participants.append(self.moe_layer.mlp.fc2_latent_proj)
         output_participants.append(self.shortcut_post_norm)
 
-        self.cudagraph_manager_route_input_compute = CudaGraphManager(
-            config,
-            self,
+        graph_state = self._require_graph_state()
+        manager_factory = partial(CudaGraphManager, config, self)
+        graph_state.route_manager = manager_factory(
             function_name="route_input_compute",
-            is_first_layer=self._route_layer_boundaries[0],
-            is_last_layer=self._route_layer_boundaries[1],
+            is_first_layer=getattr(self.compute_layer, "is_first_layer", False),
+            is_last_layer=getattr(self.compute_layer, "is_last_layer", False),
             participant_modules=route_participants,
         )
-        self.cudagraph_manager_output_shared_postprocess = CudaGraphManager(
-            config,
-            self,
+        graph_state.output_manager = manager_factory(
             function_name="output_shared",
-            is_first_layer=self._output_layer_boundaries[0],
-            is_last_layer=self._output_layer_boundaries[1],
+            is_first_layer=getattr(self.moe_layer, "is_first_layer", False),
+            is_last_layer=getattr(self.moe_layer, "is_last_layer", False),
             participant_modules=output_participants,
         )
-
-    def get_route_persistent_slot(self, index: int) -> _RoutePersistentSlot:
-        """Return the stable routing state assigned to one graph invocation."""
-        if self.execution_mode != ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
-            raise RuntimeError("Persistent route slots require shortcut CUDA-graph mode")
-        if index < 0 or index >= len(self._route_persistent_slots):
-            raise IndexError(
-                f"Persistent route slot {index} is outside "
-                f"[0, {len(self._route_persistent_slots)})"
-            )
-        return self._route_persistent_slots[index]
-
-    def get_output_persistent_slot(self, index: int) -> _OutputPersistentSlot:
-        """Return the stable output state assigned to one graph invocation."""
-        if self.execution_mode != ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
-            raise RuntimeError("Persistent output slots require shortcut CUDA-graph mode")
-        if index < 0 or index >= len(self._output_persistent_slots):
-            raise IndexError(
-                f"Persistent output slot {index} is outside "
-                f"[0, {len(self._output_persistent_slots)})"
-            )
-        return self._output_persistent_slots[index]
-
-    def get_persistent_combined_output_buffer(
-        self, persistent_slot: int, like: torch.Tensor
-    ) -> torch.Tensor:
-        """Return the persistent combine buffer for one graph invocation."""
-        slot = self.get_output_persistent_slot(persistent_slot)
-        return slot.combined_output_buffer.acquire_like(like)
 
     def route_input_compute(
         self,
@@ -505,17 +479,15 @@ class ShortcutMoEBlock(MegatronModule):
         persistent_slot: int = 0,
     ):
         """Run shortcut routing together with paired input-side compute."""
-        slot = None
-        if self.execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
-            slot = self.get_route_persistent_slot(persistent_slot)
+        if self.enable_cudagraph:
+            slot = self._require_graph_state().get_slot(persistent_slot)
 
         route_outputs = self._shortcut_route_preprocess(
             shortcut_hidden=hidden_states, padding_mask=padding_mask
         )
         route_input, route_probs, *token_dispatcher_attr_outputs = route_outputs
 
-        route_grad_dependency = None
-        if self.execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
+        if self.enable_cudagraph:
             slot.route_input_buffer.copy_from(route_input)
             slot.route_probs_buffer.copy_from(route_probs)
             slot.route_input_grad_buffer.acquire_like(route_input)
@@ -525,7 +497,7 @@ class ShortcutMoEBlock(MegatronModule):
                 route_input, route_probs, slot
             )
             set_tensor_grad_fn_sequence_sr(route_grad_dependency, 0)
-        elif self.execution_mode == ShortcutExecutionMode.EAGER_OVERLAP:
+        else:
             self.route_ready_event.record(torch.cuda.current_stream())
 
         compute_kwargs = dict(
@@ -538,24 +510,28 @@ class ShortcutMoEBlock(MegatronModule):
             padding_mask=padding_mask,
         )
         paired_state = self.compute_layer.forward_pre_output_proj(**compute_kwargs)
+        if not paired_state:
+            raise RuntimeError("Shortcut input projection returned an empty paired state")
 
-        if self.execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
+        if self.enable_cudagraph:
             paired_state = (paired_state[0] + route_grad_dependency, *paired_state[1:])
             return (*paired_state, *token_dispatcher_attr_outputs)
+
         return route_input, route_probs, paired_state
 
     def output_shared(
         self,
         *compute_state,
-        combined_output=None,
+        combined_output: torch.Tensor,
         inference_context=None,
         padding_mask=None,
         persistent_slot: int = 0,
     ):
-        """Run output projection, shared experts, and optional shortcut postprocess."""
-        slot = None
-        if self.execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
-            slot = self.get_output_persistent_slot(persistent_slot)
+        """Run output projection and shared experts, then join the routed output."""
+        if not compute_state:
+            raise RuntimeError("Shortcut output requires a non-empty paired state")
+        if self.enable_cudagraph:
+            slot = self._require_graph_state().get_slot(persistent_slot)
             compute_state = (compute_state[0].clone(), *compute_state[1:])
 
         compute_result = self.compute_layer.forward_output_proj(
@@ -564,17 +540,17 @@ class ShortcutMoEBlock(MegatronModule):
         hidden_states = compute_result[0] if isinstance(compute_result, tuple) else compute_result
 
         shared_expert_output = self._shortcut_shared_experts(hidden_states)
-        if combined_output is None:
-            return hidden_states, shared_expert_output
-
-        if self.execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
+        if self.enable_cudagraph:
             torch.cuda.current_stream().wait_event(slot.combine_ready_event)
             combined_output = RecordCombineGradReady.apply(
                 combined_output, slot.combine_grad_ready_event
             )
             set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
+        else:
+            # Output projection and shared experts run while the eager combine is in flight.
+            combined_output = self._wait_combine(combined_output)
 
-        return self.postprocess(hidden_states, combined_output, shared_expert_output)
+        return self._postprocess(hidden_states, combined_output, shared_expert_output)
 
     def _get_local_cudagraph_attr_outputs(self):
         """Expose dispatcher state tensors at the shortcut graph boundary."""
@@ -593,7 +569,7 @@ class ShortcutMoEBlock(MegatronModule):
         probs, routing_map = self.moe_layer.mlp.route(shortcut_input, padding_mask)
         permuted_input, probs = self.moe_layer.mlp.preprocess(shortcut_input, probs, routing_map)
         token_dispatcher_attr_outputs = []
-        if self.execution_mode == ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
+        if self.enable_cudagraph:
             token_dispatcher_attr_outputs = self._get_local_cudagraph_attr_outputs()
         return permuted_input, probs, *token_dispatcher_attr_outputs
 
@@ -602,7 +578,7 @@ class ShortcutMoEBlock(MegatronModule):
         pre_mlp_output = self.moe_layer._forward_pre_mlp_layernorm(hidden_states)
         return self.moe_layer.mlp.shared_experts_compute(pre_mlp_output)
 
-    def postprocess(self, hidden_states, combined_output, shared_expert_output):
+    def _postprocess(self, hidden_states, combined_output, shared_expert_output):
         """Join routed/shared output, apply shortcut post-norm, and finish residual/BDA."""
         residual = hidden_states.float() if self.config.fp32_residual_connection else hidden_states
         output = self.moe_layer.mlp.postprocess(combined_output, shared_expert_output)
@@ -610,31 +586,33 @@ class ShortcutMoEBlock(MegatronModule):
         output = self.moe_layer._forward_post_mlp((output, None), residual)
         return output[0] if isinstance(output, tuple) else output
 
-    def _acquire_persistent_slot(self) -> int:
-        """Assign repeated MTP invocations stable slots in forward execution order."""
-        slot = self._next_persistent_slot
-        self._next_persistent_slot = (slot + 1) % self._persistent_slot_count
-        return slot
-
     @property
     def cudagraph_manager(self):
         """Return the fused phase's graph manager when capture is enabled."""
-        return getattr(self, 'cudagraph_manager_output_shared_postprocess', None)
+        graph_state = getattr(self, '_graph_state', None)
+        return None if graph_state is None else graph_state.output_manager
 
-    def launch_dispatch_async(
+    @classmethod
+    def _get_parallel_stream(cls) -> torch.cuda.Stream:
+        """Return the shared high-priority shortcut stream for the current CUDA device."""
+        device_index = torch.cuda.current_device()
+        stream = cls._parallel_streams.get(device_index)
+        if stream is None:
+            stream = torch.cuda.Stream(priority=-1)
+            cls._parallel_streams[device_index] = stream
+        return stream
+
+    def _launch_dispatch_async(
         self,
         hidden_states: torch.Tensor,
         probs: torch.Tensor,
-        ready_event: torch.cuda.Event = None,
+        ready_event: torch.cuda.Event | None = None,
         route_grad_buffers: tuple[torch.Tensor, torch.Tensor] | None = None,
         route_grad_ready_event: torch.cuda.Event | None = None,
         backward_dependency: torch.Tensor | None = None,
-    ):
+    ) -> _DispatchOutput:
         """Launch the A2A dispatch on the shortcut side stream."""
-        if ShortcutMoEBlock._parallel_stream is None:
-            ShortcutMoEBlock._parallel_stream = torch.cuda.Stream(priority=-1)
-
-        dispatch_stream = ShortcutMoEBlock._parallel_stream
+        dispatch_stream = self._get_parallel_stream()
         if ready_event is not None:
             dispatch_stream.wait_event(ready_event)
         else:
@@ -669,21 +647,20 @@ class ShortcutMoEBlock(MegatronModule):
         else:
             with torch.cuda.stream(dispatch_stream):
                 dispatched_input, dispatched_probs = moe_layer.dispatch(hidden_states, probs)
-        self._cached_dispatch_output = (dispatched_input, dispatched_probs)
+        return dispatched_input, dispatched_probs
 
-    def wait_dispatch(self):
+    def _wait_dispatch(self, dispatch_output: _DispatchOutput) -> _DispatchOutput:
         """Wait for dispatch and return its outputs on the main stream."""
-        dispatch_stream = ShortcutMoEBlock._parallel_stream
+        dispatch_stream = self._get_parallel_stream()
         torch.cuda.current_stream().wait_stream(dispatch_stream)
 
-        dispatched_input, dispatched_probs = self._cached_dispatch_output
-        self._cached_dispatch_output = None
+        dispatched_input, dispatched_probs = dispatch_output
         main_stream = torch.cuda.current_stream()
         dispatched_input.record_stream(main_stream)
         dispatched_probs.record_stream(main_stream)
         return dispatched_input, dispatched_probs
 
-    def launch_combine_async(
+    def _launch_combine_async(
         self,
         output: torch.Tensor,
         persistent_output_factory=None,
@@ -691,7 +668,7 @@ class ShortcutMoEBlock(MegatronModule):
         grad_ready_event: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         """Launch the A2A combine on the shortcut side stream."""
-        combine_stream = ShortcutMoEBlock._parallel_stream
+        combine_stream = self._get_parallel_stream()
         combine_stream.wait_stream(torch.cuda.current_stream())
         output.record_stream(combine_stream)
         moe_layer = self.moe_layer.mlp
@@ -713,64 +690,83 @@ class ShortcutMoEBlock(MegatronModule):
 
             mark_cuda_graph_prebound_input(combined)
             set_tensor_grad_fn_sequence_sr(combined, torch.iinfo(torch.int).max)
-        else:
-            with torch.cuda.stream(combine_stream):
-                combined = moe_layer.combine(output)
-                if ready_event is not None:
-                    ready_event.record(combine_stream)
+            return combined
 
-        self._cached_combine_output = combined if persistent_output_factory is None else None
+        with torch.cuda.stream(combine_stream):
+            combined = moe_layer.combine(output)
+            if ready_event is not None:
+                ready_event.record(combine_stream)
+
         return combined
 
-    def wait_combine(self):
+    def _wait_combine(self, combined_output: torch.Tensor) -> torch.Tensor:
         """Wait for combine and return its output on the main stream."""
-        combine_stream = ShortcutMoEBlock._parallel_stream
+        combine_stream = self._get_parallel_stream()
         torch.cuda.current_stream().wait_stream(combine_stream)
 
-        combined = self._cached_combine_output
-        self._cached_combine_output = None
-        combined.record_stream(torch.cuda.current_stream())
-        set_tensor_grad_fn_sequence_sr(combined, torch.iinfo(torch.int).max)
-        return combined
+        combined_output.record_stream(torch.cuda.current_stream())
+        set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
+        return combined_output
 
-    def wait_dispatch_and_launch_combine(
+    def _wait_dispatch_and_launch_combine(
         self,
+        dispatch_output: _DispatchOutput,
         persistent_output_factory=None,
         ready_event: torch.cuda.Event | None = None,
         grad_ready_event: torch.cuda.Event | None = None,
     ) -> torch.Tensor:
         """Run routed experts after dispatch and launch combine asynchronously."""
-        dispatched_input, probs = self.wait_dispatch()
+        dispatched_input, probs = self._wait_dispatch(dispatch_output)
         output, _ = self.moe_layer.mlp.routed_experts_compute(dispatched_input, probs)
-        return self.launch_combine_async(
+        return self._launch_combine_async(
             output,
             persistent_output_factory=persistent_output_factory,
             ready_event=ready_event,
             grad_ready_event=grad_ready_event,
         )
 
-    def launch_dispatch(
-        self, persistent_slot: int, backward_dependency: torch.Tensor, token_dispatcher_attr_outputs
-    ):
-        """Launch dispatch from persistent inputs after the route/input graph is queued."""
-        if self.execution_mode != ShortcutExecutionMode.CUDA_GRAPH_OVERLAP:
-            raise RuntimeError("Persistent dispatch inputs require shortcut CUDA-graph mode")
+    def _launch_dispatch(
+        self,
+        route_outputs,
+        persistent_slot: int,
+    ) -> tuple[_PairedState, _DispatchOutput]:
+        """Normalize route outputs and return paired state plus in-flight dispatch output."""
+        if self.enable_cudagraph:
+            attr_count = len(self.moe_layer._local_cudagraph_attr_names or ())
+            if len(route_outputs) <= attr_count:
+                raise RuntimeError(
+                    "Shortcut route graph did not return its paired state and registered "
+                    "dispatcher attributes"
+                )
+            paired_state = tuple(route_outputs[:-attr_count] if attr_count else route_outputs)
+            token_dispatcher_attr_outputs = (
+                tuple(route_outputs[-attr_count:]) if attr_count else ()
+            )
+            if not paired_state:
+                raise RuntimeError("Shortcut dispatch requires a non-empty paired state")
 
-        slot = self.get_route_persistent_slot(persistent_slot)
-        route_input = slot.route_input_buffer.tensor
-        route_probs = slot.route_probs_buffer.tensor
-        self.moe_layer._restore_token_dispatcher_attrs(token_dispatcher_attr_outputs)
-        self.launch_dispatch_async(
-            route_input,
-            route_probs,
-            slot.route_ready_event,
-            backward_dependency=backward_dependency,
-            route_grad_buffers=(
-                slot.route_input_grad_buffer.tensor,
-                slot.route_probs_grad_buffer.tensor,
-            ),
-            route_grad_ready_event=slot.route_grad_ready_event,
-        )
+            slot = self._require_graph_state().get_slot(persistent_slot)
+            self.moe_layer._restore_token_dispatcher_attrs(token_dispatcher_attr_outputs)
+            dispatch_output = self._launch_dispatch_async(
+                slot.route_input_buffer.tensor,
+                slot.route_probs_buffer.tensor,
+                slot.route_ready_event,
+                backward_dependency=paired_state[0],
+                route_grad_buffers=(
+                    slot.route_input_grad_buffer.tensor,
+                    slot.route_probs_grad_buffer.tensor,
+                ),
+                route_grad_ready_event=slot.route_grad_ready_event,
+            )
+        else:
+            route_input, route_probs, paired_state = route_outputs
+            if not paired_state:
+                raise RuntimeError("Shortcut dispatch requires a non-empty paired state")
+            dispatch_output = self._launch_dispatch_async(
+                route_input, route_probs, self.route_ready_event
+            )
+
+        return paired_state, dispatch_output
 
     def forward(
         self,
@@ -784,133 +780,12 @@ class ShortcutMoEBlock(MegatronModule):
         quant_context_factory,
         quant_config,
     ):
-        """Run the schedule selected when this shortcut pair was constructed."""
-        forward = {
-            ShortcutExecutionMode.EAGER_SERIAL: self._forward_eager_serial,
-            ShortcutExecutionMode.EAGER_OVERLAP: self._forward_eager_overlap,
-            ShortcutExecutionMode.CUDA_GRAPH_OVERLAP: self._forward_cudagraph_overlap,
-        }[self.execution_mode]
-        return forward(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            sequence_len_offset=sequence_len_offset,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
-            quant_context_factory=quant_context_factory,
-            quant_config=quant_config,
-        )
-
-    def _forward_eager_serial(
-        self,
-        hidden_states,
-        attention_mask,
-        inference_context,
-        rotary_pos_emb,
-        sequence_len_offset,
-        packed_seq_params,
-        padding_mask,
-        quant_context_factory,
-        quant_config,
-    ):
-        """Run the reference shortcut schedule with ordinary eager autograd."""
-        moe_layer = self.moe_layer
-        layer_number = moe_layer.layer_number - 1
-
-        with quant_context_factory(quant_config, layer_number):
-            permuted_input, dispatch_probs, paired_state = self.route_input_compute(
-                hidden_states,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
-            )
-
-        with quant_context_factory(quant_config, layer_number):
-            dispatched_input, dispatch_probs = moe_layer.mlp.dispatch(
-                permuted_input, dispatch_probs
-            )
-            routed_output, _ = moe_layer.mlp.routed_experts_compute(
-                dispatched_input, dispatch_probs
-            )
-            combined_output = moe_layer.mlp.combine(routed_output)
-            # Shared experts execute later in the shortcut forward than the routed branch.
-            # Without an explicit priority, autograd therefore walks the shared branch first.
-            # That can launch overlapped dense gradient reduction while HybridEP/expert
-            # backward is still pending. Match the eager-overlap schedule by visiting the
-            # routed combine backward first.
-            set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
-
-        with quant_context_factory(quant_config, layer_number):
-            return self.output_shared(
-                *paired_state,
-                combined_output=combined_output,
-                inference_context=inference_context,
-                padding_mask=padding_mask,
-            )
-
-    def _forward_eager_overlap(
-        self,
-        hidden_states,
-        attention_mask,
-        inference_context,
-        rotary_pos_emb,
-        sequence_len_offset,
-        packed_seq_params,
-        padding_mask,
-        quant_context_factory,
-        quant_config,
-    ):
-        """Overlap eager A2A with paired compute using ordinary eager autograd."""
-        moe_layer = self.moe_layer
-        layer_number = moe_layer.layer_number - 1
-
-        with quant_context_factory(quant_config, layer_number):
-            permuted_input, dispatch_probs, paired_state = self.route_input_compute(
-                hidden_states,
-                attention_mask=attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                sequence_len_offset=sequence_len_offset,
-                packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
-            )
-
-        self.launch_dispatch_async(permuted_input, dispatch_probs, self.route_ready_event)
-
-        with quant_context_factory(quant_config, layer_number):
-            # Eager autograd already joins the routed and paired branches at their shared
-            # inputs. Do not add the CUDA-graph-only backward scheduling dependency here:
-            # repeated MTP invocations can otherwise make multiple same-priority HybridEP
-            # collectives ready at once, with no cross-rank ordering guarantee.
-            self.wait_dispatch_and_launch_combine()
-            projected_hidden, shared_expert_output = self.output_shared(
-                *paired_state, inference_context=inference_context, padding_mask=padding_mask
-            )
-
-        with quant_context_factory(quant_config, layer_number):
-            combined_output = self.wait_combine()
-            return self.postprocess(projected_hidden, combined_output, shared_expert_output)
-
-    def _forward_cudagraph_overlap(
-        self,
-        hidden_states,
-        attention_mask,
-        inference_context,
-        rotary_pos_emb,
-        sequence_len_offset,
-        packed_seq_params,
-        padding_mask,
-        quant_context_factory,
-        quant_config,
-    ):
-        """Overlap eager A2A with the two shortcut CUDA-graph compute regions."""
-        moe_layer = self.moe_layer
-        layer_number = moe_layer.layer_number - 1
-        persistent_slot = self._acquire_persistent_slot()
+        """Overlap A2A with paired compute, optionally across two CUDA graph regions."""
+        layer_number = self.moe_layer.layer_number - 1
+        persistent_slot = 0
+        output_slot = None
+        if self.enable_cudagraph:
+            persistent_slot, output_slot = self._require_graph_state().acquire_slot()
 
         with quant_context_factory(quant_config, layer_number):
             route_outputs = self.route_input_compute(
@@ -924,29 +799,23 @@ class ShortcutMoEBlock(MegatronModule):
                 persistent_slot=persistent_slot,
             )
 
-        attr_names = self.moe_layer._local_cudagraph_attr_names or ()
-        attr_count = len(attr_names)
-        if attr_count:
-            paired_state = tuple(route_outputs[:-attr_count])
-            token_dispatcher_attr_outputs = tuple(route_outputs[-attr_count:])
-        else:
-            paired_state = tuple(route_outputs)
-            token_dispatcher_attr_outputs = ()
-
-        # The dispatch stream waits on the external event recorded immediately after routing
-        # and preprocessing, before the paired Mamba/attention input projection. Its D2H stream
-        # therefore waits only for router metadata while the CUDA graph continues independently.
-        self.launch_dispatch(persistent_slot, paired_state[0], token_dispatcher_attr_outputs)
+        # In graph mode the dispatch stream waits only for router metadata while the paired
+        # input graph continues independently.
+        paired_state, dispatch_output = self._launch_dispatch(route_outputs, persistent_slot)
 
         with quant_context_factory(quant_config, layer_number):
-            output_slot = self.get_output_persistent_slot(persistent_slot)
-            combined_output = self.wait_dispatch_and_launch_combine(
-                persistent_output_factory=partial(
-                    self.get_persistent_combined_output_buffer, persistent_slot
-                ),
-                ready_event=output_slot.combine_ready_event,
-                grad_ready_event=output_slot.combine_grad_ready_event,
+            combine_kwargs = {}
+            if output_slot is not None:
+                combine_kwargs = dict(
+                    persistent_output_factory=partial(output_slot.acquire_combined_output),
+                    ready_event=output_slot.combine_ready_event,
+                    grad_ready_event=output_slot.combine_grad_ready_event,
+                )
+            combined_output = self._wait_dispatch_and_launch_combine(
+                dispatch_output,
+                **combine_kwargs,
             )
+
             return self.output_shared(
                 *paired_state,
                 combined_output=combined_output,
