@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -17,6 +17,8 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     save_hf_weights,
 )
 from megatron.lite.model.deepseek_v4.lite.protocol import (
+    ImplConfig as LiteImplConfig,
+    MODULE_MAP,
     build_model_config,
     build_training_backend,
     is_expert_param,
@@ -44,32 +46,9 @@ from megatron.lite.primitive.parallel.thd import (
     parallel_state_from_model,
 )
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
-from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
-
-_RECOMPUTE_MODULE_MAP = {
-    "attn": lambda layer: layer.self_attn,
-    "core_attn": lambda layer: layer.self_attn,
-    "moe": lambda layer: layer.mlp,
-    "experts": lambda layer: layer.mlp.experts,
-    "router": lambda layer: layer.mlp.gate,
-    "attn_norm": lambda layer: layer.input_layernorm,
-    "ffn_norm": lambda layer: layer.post_attention_layernorm,
-}
-
 
 @dataclass(frozen=True)
-class ImplConfig:
-    parallel: ParallelConfig = field(default_factory=ParallelConfig)
-    optimizer: Any | None = None
-    optimizer_config: OptimizerConfig | None = None
-    hf_path: str = ""
-    recompute: tuple[str, ...] = ()
-    offload: tuple[str, ...] = ()
-    use_thd: bool = False
-    use_deepep: bool = False
-    attention_backend_override: str | None = None
-    deterministic: bool = True
-    qat: Any | None = None
+class ImplConfig(LiteImplConfig):
     mtp_enable: bool = False
     dsa_indexer_loss_coeff: float = 0.0
     max_tokens_per_rank: int = 8192
@@ -270,7 +249,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         apply_recompute(
             list(model.layers.values()),
             recompute_spec,
-            _RECOMPUTE_MODULE_MAP,
+            MODULE_MAP,
         )
     # The runtime loads replicated HF tensors through NCCL before the deferred
     # FSDP2 wrap.  Keep that lifecycle identical to the Lite protocol: masters
