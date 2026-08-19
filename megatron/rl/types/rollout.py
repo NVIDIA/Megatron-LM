@@ -52,6 +52,27 @@ class TokenRollout(AgentBaseModel):
         """An empty trajectory is the placeholder left by a failed episode."""
         return not self.trajectory
 
+    @classmethod
+    def placeholder(
+        cls,
+        env_id: str,
+        failure_reason: str = 'unknown',
+        rollout_status: str = 'placeholder',
+        **fields,
+    ) -> 'TokenRollout':
+        """Empty-trajectory rollout padding a failed episode."""
+        return cls(
+            trajectory=[],
+            generation_mask=[],
+            reward=0.0,
+            logprobs=[],
+            env_id=env_id,
+            problem_id='placeholder',
+            rollout_status=rollout_status,
+            failure_reason=failure_reason,
+            **fields,
+        )
+
 
 Rollouts = list[TokenRollout | Rollout]
 
