@@ -56,7 +56,7 @@ class TestMcoreAdapterDense:
     def teardown_method(self):
         Utils.destroy_model_parallel()
 
-    def test_wraps_fsdp_unit_modules_before_root(self, monkeypatch):
+    def test_wraps_fsdp_unit_modules_before_root(self):
         config = TransformerConfig(
             num_layers=1,
             hidden_size=16,
@@ -81,7 +81,7 @@ class TestMcoreAdapterDense:
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer],
-            pg_collection=ProcessGroupCollection(dp_cp=self.pg_collection.dp_cp),
+            pg_collection=self.pg_collection,
         )
 
         assert isinstance(wrapped.module, FsdpModule)
@@ -139,7 +139,7 @@ class TestMcoreAdapterDense:
         assert fully_shard_context_calls == [True]
 
     @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
-    def test_build_train_and_step(self, optimizer_cuda_graph, monkeypatch):
+    def test_build_train_and_step(self, optimizer_cuda_graph):
         config = TransformerConfig(
             num_layers=2,
             hidden_size=16,
@@ -202,23 +202,6 @@ class TestMcoreAdapterDense:
         if optimizer_cuda_graph:
             optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=1)
 
-        parameter_groups = [
-            parameter_group
-            for module in model.modules()
-            if isinstance(module, FsdpModule)
-            for parameter_group in module.parameter_groups
-        ]
-        assert parameter_groups
-        sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
-        for parameter_group in parameter_groups:
-            sync_model_weight = parameter_group.sync_model_weight_from_main_weight
-
-            def count_sync(parameter_group=parameter_group, sync_model_weight=sync_model_weight):
-                sync_counts[parameter_group] += 1
-                sync_model_weight()
-
-            monkeypatch.setattr(parameter_group, "sync_model_weight_from_main_weight", count_sync)
-
         steps = [
             [
                 torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
@@ -265,12 +248,6 @@ class TestMcoreAdapterDense:
         assert torch.isfinite(losses).all()
         assert torch.isfinite(reference_losses).all()
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
-
-        # Eager execution enters the Python callback once per step. CUDA graph mode
-        # enters it for the eager warmup and capture; subsequent steps replay the
-        # captured weight-refresh kernels without re-entering Python.
-        expected_sync_calls = 2 if optimizer_cuda_graph else len(steps)
-        assert all(count == expected_sync_calls for count in sync_counts.values())
 
 
 class TestMcoreAdapterExpertParallel:

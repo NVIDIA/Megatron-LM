@@ -130,8 +130,6 @@ def find_megatron_fsdp(model):
             and hasattr(m, "ddp_config")
         ):
             return m
-        if FsdpModule is not None and isinstance(m, FsdpModule):
-            return m
         m = wrapped_module
     return None
 
