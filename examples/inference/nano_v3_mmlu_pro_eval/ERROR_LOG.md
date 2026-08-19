@@ -508,3 +508,15 @@ under `eval_results/nano_v3_mmlu_pro/`.
   shards, refit both pools, captured all configured CUDA graphs, completed four
   KV+SSM handoffs and four HTTP requests, and exited iteration 1 normally.
   Decode reported zero computed prompt tokens throughout the run.
+
+### Chunked-prefill continuation missed strict hybrid CUDA graphs
+
+- A full MMLU-Pro run reached a real `3P + 29D` batch, but the geometric
+  mixed-graph grid had neighboring `2P + 30D` and `4P + 28D` captures. Strict
+  hybrid matching could use neither shape, and chunked-prefill continuations
+  bypassed graph-aware admission, so the step ran eagerly.
+- Chunked-prefill continuations now use the same graph-aware chunk selection as
+  new prefills. On a miss while other work is active, the continuation waits
+  for the next step, when completed prefills change the prefill/decode mix to a
+  capturable shape. An otherwise idle continuation still runs eagerly so an
+  intrinsically uncapturable input cannot deadlock the engine.
