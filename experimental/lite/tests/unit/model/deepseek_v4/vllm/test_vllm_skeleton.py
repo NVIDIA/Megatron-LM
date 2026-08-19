@@ -128,12 +128,21 @@ def test_forward_reuses_caller_owned_ephemeral_metadata(monkeypatch) -> None:
     monkeypatch.setattr(protocol, "initialize_ds4_vllm_batch_invariance", lambda: None)
     monkeypatch.setattr(protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0))
     monkeypatch.setattr(
-        protocol.DS4SparseAttentionMetadataBuilderAdapter,
+        protocol.DS4SparseIndexerCompressorMetadataAdapter,
         "from_hf",
         lambda *_args, **_kwargs: pytest.fail("rebuilt caller-owned metadata"),
     )
     monkeypatch.setattr(protocol, "ds4_vllm_forward_context", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setitem(sys.modules, "vllm.config", SimpleNamespace(VllmConfig=lambda: object()))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.worker.workspace",
+        SimpleNamespace(
+            init_workspace_manager=lambda *_args, **_kwargs: None,
+            is_workspace_manager_initialized=lambda: True,
+            reset_workspace_manager=lambda: None,
+        ),
+    )
     monkeypatch.setattr(
         protocol,
         "_forward_step",
@@ -177,6 +186,15 @@ def test_build_model_returns_dist_opt_wrapped_chunks(monkeypatch) -> None:
     monkeypatch.setattr(protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0))
     monkeypatch.setattr(protocol, "build_training_backend", fake_build_training_backend)
     monkeypatch.setitem(sys.modules, "vllm.config", SimpleNamespace(VllmConfig=lambda: object()))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.worker.workspace",
+        SimpleNamespace(
+            init_workspace_manager=lambda *_args, **_kwargs: None,
+            is_workspace_manager_initialized=lambda: True,
+            reset_workspace_manager=lambda: None,
+        ),
+    )
 
     bundle = protocol.build_model(
         _tiny_config(layers=1),

@@ -5,7 +5,6 @@ from importlib import import_module
 _EXPORTS = {
     "DeepseekV4Model": ".model",
     "ImplConfig": ".protocol",
-    "DS4SparseAttentionMetadataBuilderAdapter": ".runtime_metadata",
     "DS4SparseIndexerCompressorMetadataAdapter": ".runtime_metadata",
 }
 

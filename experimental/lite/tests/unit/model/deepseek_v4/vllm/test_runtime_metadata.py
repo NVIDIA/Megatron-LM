@@ -116,7 +116,7 @@ def test_layer0_rope_uses_official_vllm_config_loader(monkeypatch) -> None:
 
     monkeypatch.setattr(runtime, "_symbol", symbol)
     monkeypatch.setattr(runtime, "_build_rope", build)
-    metadata = runtime.DS4SparseAttentionMetadataBuilderAdapter.from_hf(
+    metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter.from_hf(
         "/model", _config(), device="cpu"
     )
 
@@ -181,7 +181,7 @@ def test_layer0_prefill_metadata_exact_contract(monkeypatch) -> None:
     gather = Mock()
     monkeypatch.setattr(runtime, "_symbol", lambda _module, _name: gather)
     cos = torch.empty(256, 128, dtype=torch.float32)
-    metadata = runtime.DS4SparseAttentionMetadataBuilderAdapter(
+    metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter(
         _config(), device="cpu", cos_sin_cache=cos
     ).build_prefill_batch([130])
 
@@ -214,7 +214,7 @@ def test_layer0_prefill_metadata_exact_contract(monkeypatch) -> None:
 def test_layer0_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> None:
     gather = Mock()
     monkeypatch.setattr(runtime, "_symbol", lambda _module, _name: gather)
-    metadata = runtime.DS4SparseAttentionMetadataBuilderAdapter(
+    metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter(
         _config(),
         device="cpu",
         cos_sin_cache=torch.empty(256, 128, dtype=torch.float32),
@@ -237,13 +237,14 @@ def test_layer0_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> Non
     assert args.args[1].shape == (2, 256, 584)
 
 
-def test_builder_rejects_non_layer0_contract() -> None:
-    with pytest.raises(ValueError, match="SWA-only"):
-        runtime.DS4SparseAttentionMetadataBuilderAdapter(
-            _config(compress_ratios=[4]),
-            device="cpu",
-            cos_sin_cache=torch.empty(16, 128),
-        )
+def test_unified_builder_uses_selected_layer_ratio() -> None:
+    builder = runtime.DS4SparseIndexerCompressorMetadataAdapter(
+        _config(num_hidden_layers=2, compress_ratios=[0, 4]),
+        layer_idx=1,
+        device="cpu",
+        cos_sin_cache=torch.empty(16, 128),
+    )
+    assert builder.compress_ratio == 4
 
 
 def test_moe_metadata_builder_uses_tp_independent_runtime_gate() -> None:
@@ -297,19 +298,19 @@ def test_extended_builder_covers_every_full_model_layer() -> None:
             device="cpu",
             cos_sin_cache=cos_sin_cache,
         )
-        for layer_idx in range(1, config.num_hidden_layers)
+        for layer_idx in range(config.num_hidden_layers)
     ]
 
     assert [builder.layer_idx for builder in builders] == list(
-        range(1, config.num_hidden_layers)
+        range(config.num_hidden_layers)
     )
     assert {builder.compress_ratio for builder in builders} == {1, 4, 128}
 
 
-@pytest.mark.parametrize("layer_idx", [0, 44])
-def test_extended_builder_rejects_layers_outside_nonzero_model_range(layer_idx) -> None:
+@pytest.mark.parametrize("layer_idx", [-1, 44])
+def test_unified_builder_rejects_layers_outside_model(layer_idx) -> None:
     ratios = [0, 0] + [4, 128] * 20 + [4, 0]
-    with pytest.raises(ValueError, match="non-zero decoder layer"):
+    with pytest.raises(ValueError, match="outside the model"):
         runtime.DS4SparseIndexerCompressorMetadataAdapter(
             _config(num_hidden_layers=len(ratios), compress_ratios=ratios),
             layer_idx=layer_idx,
@@ -480,7 +481,7 @@ def test_prefill_indices_are_bitwise_official_vllm() -> None:
 
     num_tokens = 193
     config = _config(max_position_embeddings=512)
-    builder = runtime.DS4SparseAttentionMetadataBuilderAdapter(
+    builder = runtime.DS4SparseIndexerCompressorMetadataAdapter(
         config,
         device="cuda",
         cos_sin_cache=torch.empty(512, 128, dtype=torch.float32, device="cuda"),

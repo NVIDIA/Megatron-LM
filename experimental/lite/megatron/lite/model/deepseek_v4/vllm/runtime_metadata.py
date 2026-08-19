@@ -385,22 +385,21 @@ def build_native_cp_attention_metadata(
     )
 
 
-class DS4SparseAttentionMetadataBuilderAdapter:
-    """Build production metadata for DS4's layer-0 SWA-only attention.
-
-    Layer 0 has ``compress_ratio=max(1, config.compress_ratios[0]) == 1`` in
-    the official model.  Its sparse set is therefore the causal sliding window;
-    no learned indexer or compressor output exists at this layer.
-    """
+class DS4PrefillMetadataBuilder:
+    """Build ephemeral vLLM prefill metadata for one DS4 decoder layer."""
 
     def __init__(
         self,
         config: DeepseekV4Config,
         *,
+        layer_idx: int = 0,
         device: torch.device | str,
         cos_sin_cache: torch.Tensor,
     ) -> None:
+        if not 0 <= layer_idx < config.num_hidden_layers:
+            raise ValueError(f"layer_idx is outside the model: {layer_idx}")
         self.config = config
+        self.layer_idx = layer_idx
         requested_device = torch.device(device)
         self.device = (
             cos_sin_cache.device
@@ -410,16 +409,11 @@ class DS4SparseAttentionMetadataBuilderAdapter:
             else requested_device
         )
         self.cos_sin_cache = cos_sin_cache
-        ratio = max(1, config.compress_ratios[0]) if config.compress_ratios else 1
-        if ratio != 1:
-            raise ValueError(
-                "layer-0 metadata builder only supports the official SWA-only "
-                f"contract; got compress_ratio={ratio}"
-            )
-        if config.head_dim != 512:
-            raise ValueError(
-                f"DS4 FlashMLA requires head_dim=512, got {config.head_dim}"
-            )
+        self.compress_ratio = max(1, config.compress_ratios[layer_idx])
+        if self.compress_ratio not in (1, 4, 128):
+            raise ValueError(f"unsupported compress_ratio={self.compress_ratio}")
+        if config.head_dim != 512 or config.index_head_dim != 128:
+            raise ValueError("DS4 requires head_dim=512/index_head_dim=128")
         if config.sliding_window <= 0:
             raise ValueError("sliding_window must be positive")
         if (
@@ -438,15 +432,20 @@ class DS4SparseAttentionMetadataBuilderAdapter:
         model_path: str | Path,
         config: DeepseekV4Config,
         *,
+        layer_idx: int = 0,
         device: torch.device | str,
-    ) -> "DS4SparseAttentionMetadataBuilderAdapter":
+    ) -> "DS4PrefillMetadataBuilder":
         """Create the exact RoPE cache through vLLM's public DS4 rope builder."""
 
         return cls(
             config,
+            layer_idx=layer_idx,
             device=device,
             cos_sin_cache=_cos_sin_from_hf(
-                model_path, config, compress_ratio=1, device=device
+                model_path,
+                config,
+                compress_ratio=max(1, config.compress_ratios[layer_idx]),
+                device=device,
             ),
         )
 
@@ -464,9 +463,6 @@ class DS4SparseAttentionMetadataBuilderAdapter:
         indices = starts[:, None] + offsets[None, :]
         indices.masked_fill_(offsets[None, :] >= lengths[:, None], -1)
         return indices.unsqueeze(1).contiguous(), lengths.contiguous()
-
-    def build_prefill(self, num_tokens: int):
-        return self.build_prefill_batch([num_tokens])
 
     def build_prefill_batch(self, token_counts: list[int]):
         """Build packed prefill metadata for multiple independent requests."""
@@ -566,7 +562,7 @@ class DS4SparseAttentionMetadataBuilderAdapter:
         metadata.runtime_layout = layout
         return metadata
 
-class DS4SparseIndexerCompressorMetadataAdapter:
+class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
     """Runtime metadata for any non-zero DS4 decoder layer.
 
     Parameters remain owned by the mLite model.  This adapter owns only
@@ -591,65 +587,6 @@ class DS4SparseIndexerCompressorMetadataAdapter:
             storage,
             size=(num_blocks, block_size, token_bytes),
             stride=(block_stride, token_bytes, 1),
-        )
-
-    def __init__(
-        self,
-        config: DeepseekV4Config,
-        *,
-        layer_idx: int,
-        device: torch.device | str,
-        cos_sin_cache: torch.Tensor,
-    ) -> None:
-        if not 1 <= layer_idx < config.num_hidden_layers:
-            raise ValueError(
-                f"layer_idx must select a non-zero decoder layer; got {layer_idx} "
-                f"for num_hidden_layers={config.num_hidden_layers}"
-            )
-        if layer_idx >= len(config.compress_ratios):
-            raise ValueError(
-                f"compress_ratios has {len(config.compress_ratios)} entries but "
-                f"layer {layer_idx} was selected"
-            )
-        self.config = config
-        self.layer_idx = layer_idx
-        self.device = torch.device(device)
-        self.cos_sin_cache = cos_sin_cache
-        self.compress_ratio = max(1, config.compress_ratios[layer_idx])
-        if self.compress_ratio not in (1, 4, 128):
-            raise ValueError(
-                f"unsupported layer {layer_idx} compress_ratio={self.compress_ratio}"
-            )
-        if config.head_dim != 512 or config.index_head_dim != 128:
-            raise ValueError(
-                "official DS4 metadata requires head_dim=512/index_dim=128"
-            )
-        if (
-            cos_sin_cache.ndim != 2
-            or cos_sin_cache.device != self.device
-            or cos_sin_cache.dtype != torch.float32
-        ):
-            raise ValueError(
-                "cos_sin_cache must be 2D float32 and on the runtime device"
-            )
-
-    @classmethod
-    def from_hf(
-        cls,
-        model_path: str | Path,
-        config: DeepseekV4Config,
-        *,
-        layer_idx: int,
-        device: torch.device | str,
-    ) -> "DS4SparseIndexerCompressorMetadataAdapter":
-        ratio = max(1, config.compress_ratios[layer_idx])
-        return cls(
-            config,
-            layer_idx=layer_idx,
-            device=device,
-            cos_sin_cache=_cos_sin_from_hf(
-                model_path, config, compress_ratio=ratio, device=device
-            ),
         )
 
     def _compressor_metadata_batch(
@@ -945,26 +882,15 @@ class DS4SparseIndexerCompressorMetadataAdapter:
         )
         return output
 
-    def build_prefill(self, num_tokens: int):
-        return self.build_prefill_batch([num_tokens])
-
     def build_prefill_batch(self, token_counts: list[int]):
         """Build packed, sequence-isolated metadata for extended DS4 layers."""
 
         if not token_counts or any(count <= 0 for count in token_counts):
             raise ValueError("token_counts must contain positive sequence lengths")
         if self.compress_ratio == 1:
-            return DS4SparseAttentionMetadataBuilderAdapter(
-                self.config,
-                device=self.device,
-                cos_sin_cache=self.cos_sin_cache,
-            ).build_prefill_batch(token_counts)
+            return super().build_prefill_batch(token_counts)
 
-        base = DS4SparseAttentionMetadataBuilderAdapter(
-            self.config,
-            device=self.device,
-            cos_sin_cache=self.cos_sin_cache,
-        ).build_prefill_batch(token_counts)
+        base = super().build_prefill_batch(token_counts)
         main, main_block_table = self._compressor_metadata_batch(
             token_counts,
             head_dim=self.config.head_dim,
@@ -1174,7 +1100,6 @@ __all__ = [
     "DS4RuntimeLayout",
     "DS4MoEKernelMetadataBuilderAdapter",
     "DS4SparseIndexerCompressorMetadataAdapter",
-    "DS4SparseAttentionMetadataBuilderAdapter",
     "ds4_vllm_forward_context",
     "initialize_ds4_vllm_batch_invariance",
 ]

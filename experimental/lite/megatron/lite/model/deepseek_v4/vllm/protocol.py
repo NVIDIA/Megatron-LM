@@ -28,7 +28,6 @@ from megatron.lite.model.deepseek_v4.lite.protocol import (
 )
 from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
     DS4MoEKernelMetadataBuilderAdapter,
-    DS4SparseAttentionMetadataBuilderAdapter,
     DS4SparseIndexerCompressorMetadataAdapter,
     ds4_vllm_forward_context,
     initialize_ds4_vllm_batch_invariance,
@@ -44,11 +43,13 @@ from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
 from megatron.lite.primitive.parallel.thd import (
     pack_nested_thd,
     parallel_state_from_model,
+    roll_packed_thd_left,
 )
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 
 @dataclass(frozen=True)
 class ImplConfig(LiteImplConfig):
+    optimizer: str | None = None
     mtp_enable: bool = False
     dsa_indexer_loss_coeff: float = 0.0
     max_tokens_per_rank: int = 8192
@@ -140,20 +141,12 @@ def _roll_packed_targets(
 ) -> torch.Tensor | None:
     if values is None or seq_lens is None:
         return values
-    rolled = values.clone()
-    offset = 0
-    for length_value in seq_lens.detach().cpu().tolist():
-        length = int(length_value)
-        if length > 0:
-            rolled[offset : offset + length - 1] = values[offset + 1 : offset + length]
-            rolled[offset + length - 1] = 0
-        offset += length
-    if offset != values.numel():
-        raise ValueError(
-            f"packed sequence lengths sum to {offset}, but targets contain "
-            f"{values.numel()} values"
-        )
-    return rolled
+    cu_seqlens = torch.cat((seq_lens.new_zeros(1), seq_lens.cumsum(0)))
+    if int(cu_seqlens[-1]) != values.numel():
+        raise ValueError("packed sequence lengths do not cover every target")
+    return roll_packed_thd_left(
+        values, cu_seqlens_padded=cu_seqlens, dims=0
+    )[0]
 
 
 def _forward_step(
@@ -277,19 +270,11 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             return attention_builders, moe_metadata
         device = next(model.parameters()).device
         attention_builders = {
-            layer_idx: (
-                DS4SparseAttentionMetadataBuilderAdapter.from_hf(
-                    impl_cfg.hf_path,
-                    model_cfg,
-                    device=device,
-                )
-                if layer_idx == 0
-                else DS4SparseIndexerCompressorMetadataAdapter.from_hf(
-                    impl_cfg.hf_path,
-                    model_cfg,
-                    layer_idx=layer_idx,
-                    device=device,
-                )
+            layer_idx: DS4SparseIndexerCompressorMetadataAdapter.from_hf(
+                impl_cfg.hf_path,
+                model_cfg,
+                layer_idx=layer_idx,
+                device=device,
             )
             for layer_idx in selected_layers
         }
