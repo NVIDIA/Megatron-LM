@@ -69,6 +69,8 @@ class AutotunePolicy:
         on_miss: What to do when no table entry matches. ``min_cost`` is still
             deterministic, just possibly slower; ``error`` refuses to guess.
         verify_every: Cross-rank agreement check cadence, in steps. 0 disables.
+            Honoured by the training loop through
+            :func:`megatron.core.tuning.maybe_verify_choices`.
         enumerate_autotuners: Report every multi-config autotuner reached,
             without changing what is chosen.
         chaos: Make each rank pick a different config on purpose. A positive
@@ -131,5 +133,10 @@ class AutotunePolicy:
 
     @property
     def intercepts(self) -> bool:
-        """Whether this policy needs the autotuner patched at all."""
-        return self.mode != "auto" or self.enumerate_autotuners
+        """Whether this policy needs the autotuner patched at all.
+
+        Enumeration and the agreement check both read what Triton chose, which
+        only the interception records, so either one needs the patch even in
+        ``auto`` mode — where it observes the timed choice without changing it.
+        """
+        return self.mode != "auto" or self.enumerate_autotuners or self.verify_every > 0

@@ -135,6 +135,20 @@ def verify_choices(group=None) -> bool:
     return False
 
 
+def maybe_verify_choices(iteration: int, group=None) -> bool | None:
+    """Run :func:`verify_choices` if the policy asks for a check at ``iteration``.
+
+    This is the cadence behind ``MCORE_AUTOTUNE_VERIFY``; the training loop calls
+    it once per step and the policy decides whether anything happens. Returns
+    ``None`` when no check ran, so a caller can tell "agreed" from "not asked".
+    """
+    if _policy is None or _policy.verify_every <= 0:
+        return None
+    if iteration % _policy.verify_every:
+        return None
+    return verify_choices(group=group)
+
+
 def install(policy: AutotunePolicy | None = None) -> bool:
     """Apply ``policy`` to Triton's autotuner. Idempotent.
 
@@ -216,6 +230,7 @@ __all__ = [
     "choice_log",
     "install",
     "install_from_env",
+    "maybe_verify_choices",
     "use_deterministic_mode",
     "verify_choices",
 ]

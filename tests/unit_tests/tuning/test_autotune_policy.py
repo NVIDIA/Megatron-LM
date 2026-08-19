@@ -189,6 +189,52 @@ def test_packaged_tables_are_loadable():
         assert table.provenance["arch"] == arch
 
 
+def test_verify_cadence_requires_the_interception(monkeypatch):
+    """MCORE_AUTOTUNE_VERIFY alone installs the patch: the check reads its log."""
+    for var in ("MCORE_AUTOTUNE_MODE", "MCORE_AUTOTUNE_RECORD", "MCORE_DET_TUNE_RECORD"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("MCORE_AUTOTUNE_VERIFY", "5")
+    set_deterministic_mode(False)
+    try:
+        policy = AutotunePolicy.from_env()
+        assert policy.verify_every == 5
+        # auto mode leaves the choice to Triton, but the interception is still
+        # what records it, so there is nothing to compare across ranks without it.
+        assert policy.mode == "auto"
+        assert policy.intercepts
+    finally:
+        set_deterministic_mode(None)
+
+
+def test_maybe_verify_choices_honours_the_cadence(monkeypatch):
+    """The training loop calls every step; the policy decides which ones check."""
+    from megatron.core.tuning import interception
+
+    calls = []
+
+    def fake_verify(group=None):
+        calls.append(group)
+        return True
+
+    monkeypatch.setattr(interception, "verify_choices", fake_verify)
+
+    # No policy installed, and a policy that did not ask: None means "not checked",
+    # which a caller must be able to tell apart from "checked and agreed".
+    monkeypatch.setattr(interception, "_policy", None)
+    assert interception.maybe_verify_choices(1) is None
+
+    monkeypatch.setattr(interception, "_policy", AutotunePolicy(verify_every=0))
+    assert interception.maybe_verify_choices(1) is None
+    assert calls == []
+
+    monkeypatch.setattr(interception, "_policy", AutotunePolicy(verify_every=3))
+    assert interception.maybe_verify_choices(1) is None
+    assert interception.maybe_verify_choices(2) is None
+    assert interception.maybe_verify_choices(3) is True
+    assert interception.maybe_verify_choices(6) is True
+    assert calls == [None, None]
+
+
 def test_verify_choices_sizes_the_gather_to_its_group(monkeypatch):
     """all_gather_object needs one slot per group member, not per world rank."""
     import torch
