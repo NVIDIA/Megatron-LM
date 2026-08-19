@@ -832,8 +832,7 @@ class CheckpointWithoutOutputManager:
     def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
         """Discard all checkpoint outputs to save memory and register unified recompute hook."""
         for ckpt in self.checkpoints:
-            for output in ckpt.outputs:
-                output.untyped_storage().resize_(0)
+            ckpt._discard_outputs()
 
         # Register unified recompute hook
         if hook_tensor.requires_grad:
@@ -860,7 +859,7 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False, ckpt_manager=None):
+    def __init__(self, fp8=False, ckpt_manager=None, retain_input_tensors=False):
         """
         Initialize CheckpointWithoutOutput.
 
@@ -878,9 +877,12 @@ class CheckpointWithoutOutput(object):
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
+            retain_input_tensors: Whether outputs sharing storage with checkpoint inputs
+                                  should be retained when discarding outputs.
         """
         self.fp8 = fp8 is not None
         self.ckpt_manager = ckpt_manager
+        self.retain_input_tensors = retain_input_tensors
         self.run_function = None
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None
@@ -906,6 +908,11 @@ class CheckpointWithoutOutput(object):
         self.run_function = run_function
 
         self.rng_states = _get_all_rng_states()
+
+        if self.retain_input_tensors:
+            self._saved_input_ptrs = {
+                t.untyped_storage().data_ptr() for t in args if isinstance(t, torch.Tensor)
+            }
 
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs
@@ -964,12 +971,29 @@ class CheckpointWithoutOutput(object):
         #   - No tensor version-counter bump (no autograd complaint)
         share_storage = _get_share_storage()
         for output, recomputation_output in zip(self.outputs, outputs):
-            share_storage(output, recomputation_output)
+            if (
+                output.untyped_storage().data_ptr()
+                != recomputation_output.untyped_storage().data_ptr()
+            ):
+                share_storage(output, recomputation_output)
 
         self.ctx.outputs = outputs
         self.ctx.inputs = inputs
         self.outputs = None
         self.ctx = None
+
+    def _discard_outputs(self):
+        """Release output storage, preserving outputs that alias retained inputs."""
+        if self.retain_input_tensors:
+            # Skip outputs whose storage is shared with a saved input — freeing those
+            # would destroy the data needed for recomputation (e.g. TE.ops.Sequential
+            # operations with MakeExtraOutput).
+            for output in self.outputs:
+                if output.untyped_storage().data_ptr() not in self._saved_input_ptrs:
+                    output.untyped_storage().resize_(0)
+        else:
+            for output in self.outputs:
+                output.untyped_storage().resize_(0)
 
     def discard_output_and_register_recompute(self, hook_tensor):
         """
@@ -987,10 +1011,8 @@ class CheckpointWithoutOutput(object):
         if self.ckpt_manager is not None or is_graph_warmup():
             return
 
-        # use resize to release the output tensor memory and still keep the metadata in the tensors.
-        # the metadata is still needed for backward
-        for output in self.outputs:
-            output.untyped_storage().resize_(0)
+        # Release output tensor memory while keeping metadata for backward.
+        self._discard_outputs()
 
         # register the recomputation as a backward hook, when the the gradient of the hook_tensor
         # is computed, the recomputation will be triggered. The hook_tensor should be selected
