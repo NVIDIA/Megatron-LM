@@ -43,6 +43,11 @@ class MambaInferenceStateConfig:
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
 
+    gdp_num_householder: int = 0
+    """Number of Householder copies of the Gated Delta Product layers, or 0 if the
+    model has none. Sizes the GDP chunk descriptors used by the forked prefill
+    kernels, whose Householder-expanded token stream is this many times longer."""
+
     @classmethod
     def from_model(
         cls,
@@ -56,7 +61,7 @@ class MambaInferenceStateConfig:
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
         if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
+            mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )
             if conv_states_dtype is None:
@@ -77,6 +82,20 @@ class MambaInferenceStateConfig:
                 if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
                     mamba_chunk_size = layer.mixer.chunk_size
                     break
+            # Gated Delta Product layers register as Mamba layers but carry a
+            # Householder count, which sizes their (separate) chunk descriptors.
+            gdp_num_householder = 0
+            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
+                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
+                    num_householder = getattr(layer.mixer, 'num_householder', None)
+                    if num_householder is not None:
+                        # The descriptors are shared across layers, so one count
+                        # has to cover every GDP layer.
+                        assert gdp_num_householder in (0, num_householder), (
+                            "every GDP layer must use the same num_householder; got "
+                            f"{gdp_num_householder} and {num_householder}"
+                        )
+                        gdp_num_householder = num_householder
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,
@@ -84,6 +103,7 @@ class MambaInferenceStateConfig:
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
                 mamba_chunk_size=mamba_chunk_size,
+                gdp_num_householder=gdp_num_householder,
             )
         return None
 
