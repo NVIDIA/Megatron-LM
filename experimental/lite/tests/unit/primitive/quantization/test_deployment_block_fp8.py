@@ -330,17 +330,3 @@ def test_missing_deep_gemm_entry_fails_closed(fake_vllm, monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="fp8_gemm_nt is unavailable"):
         fp8_gemm_nt(torch.randn(2, 256, dtype=torch.bfloat16), packed)
 
-
-def test_visible_forward_is_inference_only_and_backward_fails_closed(
-    fake_vllm,
-) -> None:
-    x = torch.randn(2, 256, dtype=torch.bfloat16, requires_grad=True)
-    master = _weight()
-
-    output = DeploymentBlockFP8Adapter()(x, master)
-
-    assert output.requires_grad is True
-    with pytest.raises(NotImplementedError, match="inference-only"):
-        output.sum().backward()
-    assert x.grad is None
-    assert master.grad is None

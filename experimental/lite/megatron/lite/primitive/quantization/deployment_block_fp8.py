@@ -9,8 +9,6 @@ from typing import Iterable
 import torch
 from torch import nn
 
-from megatron.lite.primitive.autograd import inference_only
-
 try:
     import triton
     import triton.language as tl
@@ -185,7 +183,7 @@ class DeploymentBlockFP8Adapter:
         return packed
 
     def __call__(self, x, weight):
-        return inference_only(fp8_gemm_nt(x, self.pack_weight(weight)), x, weight)
+        return fp8_gemm_nt(x, self.pack_weight(weight))
 
 
 class DeploymentFusedBlockFP8Adapter(DeploymentBlockFP8Adapter):
@@ -205,7 +203,7 @@ class DeploymentFusedBlockFP8Adapter(DeploymentBlockFP8Adapter):
         return packed
 
     def __call__(self, x, *weights):
-        return inference_only(fp8_gemm_nt(x, self.pack_weight(weights)), x, *weights)
+        return fp8_gemm_nt(x, self.pack_weight(weights))
 
 
 __all__ = [
