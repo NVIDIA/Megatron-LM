@@ -155,6 +155,28 @@ def test_fused_mlp_forwards_current_submodule_pre_hooks():
     assert events == [("replacement", module.linear_fc2, {})]
 
 
+def test_fused_mlp_wrapper_hooks_execute_once():
+    module = _make_fused_mlp_shell()
+    fused_impl = torch.nn.Identity()
+    module.forward = lambda inputs: fused_impl(inputs)
+
+    events = []
+    module.register_forward_pre_hook(lambda _module, _inputs: events.append("forward-pre"))
+    module.register_forward_hook(lambda _module, _inputs, _output: events.append("forward-post"))
+    module.register_full_backward_pre_hook(
+        lambda _module, _grad_output: events.append("backward-pre")
+    )
+    module.register_full_backward_hook(
+        lambda _module, _grad_input, _grad_output: events.append("backward-post")
+    )
+    module._register_hooks_on_fused_impl(fused_impl)
+
+    output = module(torch.ones(1, 2, requires_grad=True))
+    output.sum().backward()
+
+    assert events == ["forward-pre", "forward-post", "backward-pre", "backward-post"]
+
+
 def test_fused_mlp_rejects_input_modifying_submodule_hook_added_after_construction():
     module = _make_fused_mlp_shell()
     fused_impl = torch.nn.Identity()

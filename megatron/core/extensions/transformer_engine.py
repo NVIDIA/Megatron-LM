@@ -640,14 +640,19 @@ if HAVE_TE and is_te_min_version("1.13.0"):
           to use the original module hierarchy as the source of truth.
         - The fused implementation is an unregistered execution view over
           registered source modules and parameters.
-        - Forward hooks on source modules are best-effort emulated on the fused
-          implementation. Hooks that modify tensors are unsupported because TE
-          fused ops do not expose intermediate tensors.
-        - Pre-forward hooks on source modules are resolved dynamically because
-          DDP may change them after the fused implementation is cached.
-        - Post-forward hooks, config, and source module replacement after first
-          forward are not reflected in the cached fused implementation. Call
-          ``_reset_fused_impl`` before the next forward after such changes.
+        - Hooks on the wrapper itself are handled by its normal
+          ``Module.__call__``.
+        - Forward hooks on descendant source modules are best-effort emulated
+          on the fused implementation. Hooks that modify tensors are unsupported
+          because TE fused ops do not expose intermediate tensors.
+        - The descendant module set is captured when the fused implementation
+          is built. Pre-forward hooks on those descendants are resolved
+          dynamically because DDP may change them after construction;
+          post-forward hooks are captured at build time. Descendant backward
+          hooks are unsupported and validated at build time.
+        - Call ``_reset_fused_impl`` before the next forward after replacing
+          source modules, changing descendant module membership or descendant
+          post-forward hooks, or changing config that affects TE ops.
         """
 
         _fused_impl: Optional[Tuple[te.pytorch.ops.Sequential]]
@@ -678,8 +683,12 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             """Discard the cached unregistered fused implementation.
 
             This is intended for tests and for internal use after replacing
-            source modules, changing config that affects TE ops, or changing
-            post-forward hooks after the first forward.
+            source modules, changing descendant module membership, changing
+            config that affects TE ops, or changing descendant post-forward
+            hooks. Pre-forward-hook mutations on existing descendants are
+            observed dynamically and do not require a reset. Descendant
+            backward hooks remain unsupported; reset after adding one to rerun
+            validation.
             """
             self._fused_impl = None
 
