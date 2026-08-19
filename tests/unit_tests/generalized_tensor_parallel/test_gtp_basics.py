@@ -1484,9 +1484,11 @@ class TestGTPGraphWgradRing:
         assert logical_view.data_ptr() == slot_1.tensor.data_ptr()
 
         logical_view.fill_(7)
-        prepared = weights[1]._prepare_wgrad_reduce_scatter_inputs([logical_view])
+        send_bufs, release_bufs = weights[1]._prepare_wgrad_reduce_scatter_inputs([logical_view])
         assert capture_state.wgrad_ring_slots == [slot_1]
-        assert prepared[0] is slot_1.tensor
+        assert send_bufs[0] is slot_1.tensor
+        # The ring slot is sent but never released; the feeding wgrad is released instead.
+        assert release_bufs[0] is logical_view
         assert torch.count_nonzero(slot_1.tensor[4:]) == 0
 
         with pytest.raises(RuntimeError, match="increase GTP_CONFIG.graph_wgrad_ring_size"):
@@ -1540,9 +1542,11 @@ class TestGTPGraphWgradRing:
         gtp_module.initialize_graph_wgrad_rings()
 
         wgrad = torch.arange(16, dtype=torch.float32, device="cuda").reshape(4, 4)
-        rs_input = weights[1]._prepare_wgrad_reduce_scatter_inputs([wgrad])[0]
+        send_bufs, release_bufs = weights[1]._prepare_wgrad_reduce_scatter_inputs([wgrad])
+        rs_input = send_bufs[0]
 
         assert rs_input is weights[1]._gtp_graph_wgrad_ring_slot.tensor
+        assert release_bufs[0] is wgrad
         torch.testing.assert_close(rs_input[:4], wgrad)
         assert torch.count_nonzero(rs_input[4:]) == 0
 

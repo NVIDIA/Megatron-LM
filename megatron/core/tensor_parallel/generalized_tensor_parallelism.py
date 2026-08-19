@@ -1848,10 +1848,10 @@ class GTPShardedParam(torch.nn.Parameter):
                     for w in self._weights:
                         self._handle_megatron_grad_accum(w)
                     self._already_finalized = True
-        self._release_comm_scratch()
+        self._release_wgrad_scratch()
         return waited
 
-    def _release_comm_scratch(self, attrs=("_wgrad_input_bufs", "_rs_a2a_bufs")):
+    def _release_wgrad_scratch(self, attrs=("_wgrad_input_bufs", "_rs_a2a_bufs")):
         """Release the buffers a finished RS was reading.
 
         Its wgrad inputs, and the fp32-accum all-to-all scratch (input to the deferred FP32 sum,
@@ -1925,13 +1925,14 @@ class GTPShardedParam(torch.nn.Parameter):
             all_to_all_output_tensor=a2a_buf,
         )
         # Input to the deferred FP32 sum: held until the handle is waited on, then released by
-        # _release_comm_scratch (from _wait_reduce_scatter, or inline on the sync path).
+        # _release_wgrad_scratch (from _wait_reduce_scatter, or inline on the sync path).
         self._rs_a2a_bufs = (self._rs_a2a_bufs or []) + [a2a_buf]
         return out_buffer, handle
 
     def _reduce_scatter(self, wgrads, async_op, nvtx_label=None):
-        """Reduce-scatter one or more wgrads → (outputs, handle). Single tensor: plain RS;
-        multiple: coalesced RS."""
+        """Reduce-scatter one or more wgrads → (outputs, handle, release_bufs). Single
+        tensor: plain RS; multiple: coalesced RS. ``release_bufs`` are the send buffers
+        to free once the collective has been waited on."""
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
 
@@ -1943,7 +1944,7 @@ class GTPShardedParam(torch.nn.Parameter):
             for w in self._weights:
                 w._set_rs_state(new_rs_state)
 
-        wgrads = self._prepare_wgrad_reduce_scatter_inputs(wgrads)
+        wgrads, release_bufs = self._prepare_wgrad_reduce_scatter_inputs(wgrads)
 
         if async_op:
             dtypes = [w.dtype for w in wgrads]
@@ -2005,13 +2006,13 @@ class GTPShardedParam(torch.nn.Parameter):
                     outputs.append(out)
                 nvtx_range_pop(f"{nvtx_label}.gtp_rs_fp32accum")
                 if async_op:
-                    return outputs, handle
+                    return outputs, handle, release_bufs
                 # Sync RS: the FP32 sums were deferred out of the issue loop, so finish here.
                 # Only the a2a scratch is ours to release — the wgrad inputs belong to the
                 # caller on this path (recycled in wgrad_reduce_scatter).
                 handle.wait()
-                self._release_comm_scratch(("_rs_a2a_bufs",))
-                return outputs, None
+                self._release_wgrad_scratch(("_rs_a2a_bufs",))
+                return outputs, None, release_bufs
 
             if len(wgrads) == 1:
                 nvtx_range_push(f"{nvtx_label}.gtp_rs")
@@ -2019,7 +2020,7 @@ class GTPShardedParam(torch.nn.Parameter):
                     wgrads[0], self.group, async_op=async_op, output=out_buffers[0]
                 )
                 nvtx_range_pop(f"{nvtx_label}.gtp_rs")
-                return [out], handle
+                return [out], handle, release_bufs
 
             outputs = []
             nvtx_range_push(f"{nvtx_label}.batched_gtp_rs")
@@ -2031,17 +2032,20 @@ class GTPShardedParam(torch.nn.Parameter):
                     outputs.append(out)
             nvtx_range_pop(f"{nvtx_label}.batched_gtp_rs")
 
-            return outputs, cm if async_op else None
+            return outputs, cm if async_op else None, release_bufs
 
     def _prepare_wgrad_reduce_scatter_inputs(self, wgrads):
-        """Return alignment-padded RS inputs with stable ownership when ring-backed.
+        """Split each wgrad into what the reduce-scatter sends and what to free once it
+        completes -> (send_bufs, release_bufs), both index-aligned with self._weights.
 
-        A ring slot owns the full padded tensor. The wgrad GEMM writes only its logical prefix,
-        while the zero tail remains untouched. If a caller did not produce wgrad directly into
-        that prefix, copy it there before RS.
+        Ring slots are sent but never released (their addresses must stay stable across
+        graph replays); the wgrad that fed them is released instead. A symmetric send
+        buffer is both sent and released (ownership transfer). Plain wgrads are sent
+        as-is (padded by copy if needed) and released themselves.
         """
-        prepared = []
-        for index, (weight, wgrad) in enumerate(zip(self._weights, wgrads)):
+        send_bufs = []
+        release_bufs = []
+        for weight, wgrad in zip(self._weights, wgrads):
             slot = getattr(weight, "_gtp_graph_wgrad_ring_slot", None)
 
             if slot is None:
@@ -2060,14 +2064,14 @@ class GTPShardedParam(torch.nn.Parameter):
                         if not _chain_is_graphed(self.chain_id):
                             _wgrad_pool_put(wgrad)
 
-                    # Required to free the slot after the RS is waited on.
-                    wgrads[index] = symm_slot
-                    prepared.append(symm_slot)
+                    send_bufs.append(symm_slot)
+                    release_bufs.append(symm_slot)
                     continue
 
+                release_bufs.append(wgrad)
                 if weight.pad_length > 0:
                     wgrad = torch.nn.functional.pad(wgrad, (0, 0, 0, weight.pad_length))
-                prepared.append(wgrad)
+                send_bufs.append(wgrad)
                 continue
 
             register_capture_wgrad_ring_slot(slot, weight)
@@ -2079,9 +2083,10 @@ class GTPShardedParam(torch.nn.Parameter):
                 )
             if wgrad.data_ptr() != logical_view.data_ptr():
                 logical_view.copy_(wgrad)
-            prepared.append(slot.tensor)
+            send_bufs.append(slot.tensor)
+            release_bufs.append(wgrad)
 
-        return prepared
+        return send_bufs, release_bufs
 
     def wgrad_reduce_scatter(self, wgrad, nvtx_label=None):
         """Reduce-scatter wgrad(s): sync for the last weight, async+deferred for others.
@@ -2104,26 +2109,22 @@ class GTPShardedParam(torch.nn.Parameter):
             # Accounted for here, so the cascade below must not skip the next one.
             self._already_finalized = False
 
-        # UNGRAPHED wgrads recycle via the standalone pool (_wgrad_pool_put); GRAPHED wgrads
-        # cannot, since CUDA graphs require stable buffer addresses across replay.
-        poolable = not _chain_is_graphed(self.chain_id)
-
         if GTP_CONFIG.async_reduction and self.prev_w is not None:
             # Async RS (not last weight — deferred finish). Pre-RS work on caller; NCCL wrap
             # lives at the collective site inside _reduce_scatter (mirrors the AG prefetch sites).
-            _, rs_handle = self._reduce_scatter(wgrads, async_op=True, nvtx_label=nvtx_label)
+            _, rs_handle, release_bufs = self._reduce_scatter(
+                wgrads, async_op=True, nvtx_label=nvtx_label
+            )
             self._wgrad_rs_handle = GTPShardHandle(rs_handle, weights, reduce_scatter=True)
-            # Stash wgrad input buffers — cannot recycle yet because the async RS
-            # kernel is still reading them on rs_stream.
-            self._wgrad_input_bufs = wgrads
+            # Cannot recycle yet: the async RS is still reading these on rs_stream.
+            self._wgrad_input_bufs = release_bufs
             ret = tuple([None] * len(wgrads)) if batched else None
         else:
-            # Sync reduce-scatter — reached as the natural chain-head case, recycle immediately.
-            # Keep a handle on the RS inputs: the name is rebound to the outputs below, and
-            # symm LIFO scratch among the inputs must go back to the LIFO (not leak to the
-            # allocator, which would starve the free list the CG capture guard relies on).
-            rs_inputs = wgrads
-            wgrads, _ = self._reduce_scatter(wgrads, async_op=False, nvtx_label=nvtx_label)
+            # Sync reduce-scatter — reached as the natural chain-head case; the RS is
+            # complete on return, so the send buffers recycle immediately.
+            wgrads, _, release_bufs = self._reduce_scatter(
+                wgrads, async_op=False, nvtx_label=nvtx_label
+            )
             nvtx_range_push(f"{nvtx_label}.gtp_wgrad_accum")
             if len(weights) == 1:
                 weights[0].main_grad.add_(wgrads[0])
@@ -2131,16 +2132,9 @@ class GTPShardedParam(torch.nn.Parameter):
                 torch._foreach_add_([p.main_grad for p in weights], wgrads)
             nvtx_range_pop(f"{nvtx_label}.gtp_wgrad_accum")
             result = [self._handle_megatron_grad_accum(p) for p in weights]
-
-            if poolable:
-                for buf in wgrads:
-                    _wgrad_pool_put(buf)
-            for buf in rs_inputs:
-                # Dual release, mirroring _release_comm_scratch: each free is tag-gated
-                # and takes only its own pool's buffers.
-                if poolable:
-                    _wgrad_pool_put(buf)
-                symmetric_wgrad_pool.free(buf)
+            # The sync RS is complete: hand the inputs to the shared release path.
+            self._wgrad_input_bufs = release_bufs
+            self._release_wgrad_scratch()
             ret = result if batched else result[0]
 
         # Wait for last reduce scatter if it was async

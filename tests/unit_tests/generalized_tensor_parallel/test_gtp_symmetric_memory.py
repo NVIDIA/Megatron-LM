@@ -199,6 +199,21 @@ def _worker_sync_plain_recycle(rank, world_size, port):
     ptr = scratch.data_ptr()
     scratch.normal_()
 
+    # Plain unpadded branch: sent as-is, released as itself.
+    send_bufs, release_bufs = w._prepare_wgrad_reduce_scatter_inputs([scratch])
+    assert send_bufs[0] is scratch and release_bufs[0] is scratch
+
+    # Plain padded branch: a padded copy is sent, the original is released.
+    padded_layer = _make_gtp_linear(64, 100, group, dtype)
+    wp = padded_layer.weight
+    wp.main_grad = torch.zeros(wp.shape, dtype=dtype, device="cuda")
+    p_scratch = wp.get_wgrad_tensor()
+    send_bufs, release_bufs = wp._prepare_wgrad_reduce_scatter_inputs([p_scratch])
+    assert send_bufs[0] is not p_scratch
+    assert tuple(send_bufs[0].shape) == tuple(wp._unsharded_shape_padded)
+    assert release_bufs[0] is p_scratch
+    gtp_module._wgrad_pool_put(p_scratch)
+
     # Chain head -> synchronous reduce-scatter; the release path must return the
     # scratch to the plain pool (regression test for the sync-path dual release).
     w.wgrad_reduce_scatter(scratch)
@@ -240,17 +255,18 @@ def _worker_wgrad_split(rank, world_size, port):
         # pool was created by this alloc.
         assert group.group_name in gtp_symm._pools
         # _prepare sends the parent whole, consuming the slot — zero-copy (alias hit) —
-        # and transfers ownership into the caller's wgrads list.
+        # and returns it in both lists (ownership transfer); the input list is untouched.
         bufs = [t]
-        prepared = wa._prepare_wgrad_reduce_scatter_inputs(bufs)
-        assert prepared[0] is parent
-        assert bufs[0] is parent
+        send_bufs, release_bufs = wa._prepare_wgrad_reduce_scatter_inputs(bufs)
+        assert send_bufs[0] is parent
+        assert release_bufs[0] is parent
+        assert bufs[0] is t
         assert wa._wgrad_symm_slot is None
 
-        # Release (the existing RS-input path) recycles it through the registered LIFO.
+        # Release (the RS-input path) recycles it through the registered LIFO.
         ptr = parent.data_ptr()
-        wa._wgrad_input_bufs = bufs
-        wa._release_comm_scratch()
+        wa._wgrad_input_bufs = release_bufs
+        wa._release_wgrad_scratch()
         assert wa._wgrad_input_bufs is None
         t2 = symmetric_wgrad_pool.alloc(
             tuple(wa._unsharded_shape_padded), dtype, parent.device, group
@@ -270,9 +286,10 @@ def _worker_wgrad_split(rank, world_size, port):
         n = wp._unsharded_shape[0]
         assert torch.count_nonzero(pparent[n:]) == 0
         pbufs = [g]
-        prepared = wp._prepare_wgrad_reduce_scatter_inputs(pbufs)
-        assert prepared[0] is pparent
-        assert pbufs[0] is pparent
+        send_bufs, release_bufs = wp._prepare_wgrad_reduce_scatter_inputs(pbufs)
+        assert send_bufs[0] is pparent
+        assert release_bufs[0] is pparent
+        assert pbufs[0] is g
         assert torch.equal(pparent[:n], g)
         assert torch.count_nonzero(pparent[n:]) == 0
         symmetric_wgrad_pool.free(pparent)
@@ -282,12 +299,13 @@ def _worker_wgrad_split(rank, world_size, port):
         assert wa._wgrad_symm_slot is None
         f = torch.randn(tuple(wa._unsharded_shape), dtype=dtype, device="cuda")
         fbufs = [f]
-        prepared = wa._prepare_wgrad_reduce_scatter_inputs(fbufs)
-        assert prepared[0] is not f
-        assert fbufs[0] is prepared[0]  # ownership transferred over the foreign tensor
-        assert getattr(prepared[0], "_gtp_symm_group", None) is group
-        assert torch.equal(prepared[0][: wa._unsharded_shape[0]], f)
-        symmetric_wgrad_pool.free(prepared[0])
+        send_bufs, release_bufs = wa._prepare_wgrad_reduce_scatter_inputs(fbufs)
+        assert send_bufs[0] is not f
+        assert release_bufs[0] is send_bufs[0]  # the allocated parent is what gets freed
+        assert fbufs[0] is f
+        assert getattr(send_bufs[0], "_gtp_symm_group", None) is group
+        assert torch.equal(send_bufs[0][: wa._unsharded_shape[0]], f)
+        symmetric_wgrad_pool.free(send_bufs[0])
 
         # Calling get_wgrad_tensor again before _prepare consumed the slot is an
         # invariant violation (recycled storage would alias two live views).
