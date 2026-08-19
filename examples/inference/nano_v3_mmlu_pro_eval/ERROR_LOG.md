@@ -520,3 +520,11 @@ under `eval_results/nano_v3_mmlu_pro/`.
   for the next step, when completed prefills change the prefill/decode mix to a
   capturable shape. An otherwise idle continuation still runs eagerly so an
   intrinsically uncapturable input cannot deadlock the engine.
+- Verification: run `73f34663b-full` completed all 1,203 MMLU-Pro examples in
+  all four modes at the production 32-request limit. Scores were 0.60848 for
+  no disaggregation, 0.62427 for Dynamo, 0.62261 for native NCCL, and 0.62344
+  for native NIXL, all with standard error about 0.014. Every rank captured all
+  72 configured graphs. There were no eager fallbacks, transfer failures, UCX
+  CUDA-support errors, capacity failures, quarantines, or segmentation faults.
+  Both native modes completed and released all 1,536 padded handoffs, and their
+  decode ranks computed zero prompt tokens.
