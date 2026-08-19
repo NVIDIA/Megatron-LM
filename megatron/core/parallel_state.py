@@ -1760,7 +1760,9 @@ def get_gtp_weight_remat_group(check_initialized=True):
     return _GTP_WEIGHT_REMAT_GROUP
 
 
-def get_tp_gtp_weight_remat_group(check_initialized=True):
+def get_tp_gtp_weight_remat_group(
+    check_initialized: bool = True,
+) -> "torch.distributed.ProcessGroup | None":
     """Get the fused (tp x gtp_remat) group for layer-sharded Muon.
 
     None when either axis is trivial — callers fall back to the single
@@ -1771,7 +1773,9 @@ def get_tp_gtp_weight_remat_group(check_initialized=True):
     return _TP_GTP_WEIGHT_REMAT_GROUP
 
 
-def get_expert_tp_gtp_weight_remat_group(check_initialized=True):
+def get_expert_tp_gtp_weight_remat_group(
+    check_initialized: bool = True,
+) -> "torch.distributed.ProcessGroup | None":
     """Get the fused (expt_tp x egtp_remat) group for layer-sharded Muon."""
     if check_initialized:
         assert (
