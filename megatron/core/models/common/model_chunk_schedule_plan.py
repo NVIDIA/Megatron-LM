@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, Callable, List, Optional
 
 import torch
@@ -171,7 +172,12 @@ class TransformerLayerSchedulePlan:
     ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
-    ├── moe_combine (TransformerLayerNode): combine All2All (incl. MLP-side mHC post-processing)
+    ├── moe_combine (TransformerLayerNode): combine All2All
+    ├── mhc_post (TransformerLayerNode): MLP-side mHC post-processing, on the
+    │   compute stream. It belongs here rather than folded into moe_combine:
+    │   running it in that communication-stream node let a recompute subgraph be
+    │   allocated on one stream and read from another, which the caching
+    │   allocator cannot track.
     ├── mhc_recompute (ScheduleNode): optional explicit replay before mHC backward
     └── mtp_post_process (PostProcessNode): mtp post process
 
@@ -186,6 +192,7 @@ class TransformerLayerSchedulePlan:
     moe_dispatch = None
     mlp = None
     moe_combine = None
+    mhc_post = None
     mhc_recompute = None
     mtp_post_process = None
 
@@ -236,6 +243,9 @@ class TransformerLayerSchedulePlan:
         if hasattr(self, 'moe_combine') and self.moe_combine is not None:
             del self.moe_combine
             self.moe_combine = None
+        if hasattr(self, 'mhc_post') and self.mhc_post is not None:
+            del self.mhc_post
+            self.mhc_post = None
         if hasattr(self, 'mhc_recompute') and self.mhc_recompute is not None:
             del self.mhc_recompute
             self.mhc_recompute = None
@@ -246,6 +256,23 @@ class TransformerLayerSchedulePlan:
             del self.layer_state
             self.layer_state = None
         if hasattr(self, 'layer'):
+            # The schedule installs _mhc_recompute_manager on the layer directly,
+            # bypassing TransformerLayer.__call__, which is what would otherwise
+            # refresh or clear it each forward. Left in place it pins this
+            # iteration's MHCCheckpointManager -- and every saved tensor it still
+            # holds -- on the module, and a later replay that arrives without a
+            # fresh assignment would bind arena slots against an already
+            # recomputed checkpoint set.
+            #
+            # Clear it on the object it was installed on: build_mtp_layer_callables
+            # builds over layer.mtp_model_layer, so for an MTP plan the manager
+            # lives on the inner transformer layer, not on the wrapper.
+            from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+
+            if isinstance(self.layer, MultiTokenPredictionLayer):
+                self.layer.mtp_model_layer._mhc_recompute_manager = None
+            else:
+                self.layer._mhc_recompute_manager = None
             del self.layer
 
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
@@ -295,6 +322,7 @@ class TransformerLayerSchedulePlan:
             mlp_module,
             moe_combine_module,
             mtp_post_process_module,
+            mhc_post_module,
         ) = fwd_callables
 
         # Create nodes for different operations in the layer
@@ -308,16 +336,29 @@ class TransformerLayerSchedulePlan:
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
 
+        # mHC post-processing is compute and belongs on the compute stream: keeping
+        # it inside the communication-stream combine node made the recompute's
+        # tensors cross-stream (allocated on compute, read on comm, then freed),
+        # which the caching allocator cannot track.
+        if mhc_post_module is not None:
+            self.mhc_post = create_node(comp_stream, mhc_post_module, "mhc_post")
+        else:
+            self.mhc_post = NoopScheduleNode()
+
         mhc_recompute_manager = extra_args.get("mhc_recompute_manager")
         if mhc_recompute_manager is not None and extra_args.get(
             "is_last_layer_in_mhc_recompute_group", False
         ):
+            from megatron.core.transformer.mhc_recompute import MHCRecomputePhase
+
             group_index = extra_args["mhc_recompute_group_index"]
             # The group counter restarts per module (decoder / mtp), so fold the
             # module tag into the NVTX label to keep profiles unambiguous.
             module_tag = extra_args.get("mhc_recompute_module_tag", "decoder")
             self.mhc_recompute = ScheduleNode(
-                mhc_recompute_manager.recompute_now,
+                partial(
+                    mhc_recompute_manager.recompute_until, MHCRecomputePhase.BEFORE_COMBINE_BWD
+                ),
                 comp_stream,
                 event,
                 name="mhc_recompute",
@@ -364,8 +405,12 @@ class TransformerLayerSchedulePlan:
         # After the last backward op (attn), release backward-pass params.
         self.attn.set_post_backward_hook(lambda: post_backward_hook(hook_module))
 
-        # Determine the last node in forward order.
-        if isinstance(self.moe_combine, NoopScheduleNode):
+        # Determine the last node in forward order. mHC post-processing runs after
+        # the combine, so releasing forward-pass params at the combine would pull
+        # them out from under it.
+        if not isinstance(self.mhc_post, NoopScheduleNode):
+            last_fwd_node = self.mhc_post
+        elif isinstance(self.moe_combine, NoopScheduleNode):
             last_fwd_node = self.mlp
         else:
             last_fwd_node = self.moe_combine
@@ -388,6 +433,7 @@ class TransformerLayerSchedulePlan:
         yield self.moe_dispatch
         yield self.mlp
         yield self.moe_combine
+        yield self.mhc_post
         yield self.mtp_post_process
 
     def _iter_recomputed_nodes(self):
@@ -466,7 +512,9 @@ class TransformerLayerSchedulePlan:
         When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
         comm_stream: combine_bwd | dispatch_fwd->dispatch_bwd  | combine_fwd
         comp_stream: attn_fwd    | mlp_bwd->mlp_bwd_dw->mlp_fwd| attn_bwd
-        MLP-side mHC post-processing runs inside the combine node on the communication stream.
+        MLP-side mHC post-processing runs in its own compute-stream node right after
+        combine, so the communication stream carries only communication and the
+        recompute's tensors are produced and consumed on the same stream.
         Group recompute runs on the normal compute stream immediately before the node containing
         mHC post-processing backward.
         For MTP, mtp_post_process_fwd is executed after the combine_fwd in the comp_stream,
@@ -491,6 +539,7 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             if b_layer.mhc_recompute is not None:
                 b_layer.mhc_recompute.forward()
+            b_grad = b_layer.mhc_post.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
@@ -521,6 +570,10 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.moe_combine.forward(f_input)
+
+        if f_layer is not None:
+            with f_layer.get_fp8_context():
+                f_input = f_layer.mhc_post.forward(f_input)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
             b_grad = b_layer.attn.backward(b_grad)
@@ -673,7 +726,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         if module is None:
             return
 
-        from megatron.core.tensor_parallel.random import CheckpointManager
+        from megatron.core.tensor_parallel.random import MHCCheckpointManager
 
         num_layers = len(module.layers)
         config = module.config
@@ -686,7 +739,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         )
         group_size = config.mhc_recompute_layer_num or num_layers
         mhc_recompute_manager = (
-            CheckpointManager() if use_mhc_recompute and num_layers > 0 else None
+            MHCCheckpointManager() if use_mhc_recompute and num_layers > 0 else None
         )
         group_index = 0
 
@@ -715,7 +768,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
             if is_group_end and layer_idx != num_layers - 1:
                 group_index += 1
-                mhc_recompute_manager = CheckpointManager()
+                mhc_recompute_manager = MHCCheckpointManager()
 
     def _build_recompute_segments(self, config):
         """Split this chunk's layers into full-recompute segments.

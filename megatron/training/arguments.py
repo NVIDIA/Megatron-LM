@@ -1859,6 +1859,17 @@ def validate_args(args, defaults={}):
             args.use_layer_wise_distributed_optimizer = True
             args.use_distributed_optimizer = False
 
+        if (
+            args.optimizer == 'muon'
+            and (args.chunked_optimizer_state_offload or args.offload_optimizer_states)
+            and args.optimizer_state_offload_fraction > 0.0
+        ):
+            assert args.use_layer_wise_distributed_optimizer, (
+                "Muon optimizer state offload requires the LayerWise distributed optimizer "
+                "(--use-distributed-optimizer) so non-Muon parameter groups are routed through "
+                "a sibling DistributedOptimizer"
+            )
+
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
         assert (
             not args.use_megatron_fsdp
@@ -2025,16 +2036,44 @@ def validate_args(args, defaults={}):
             "must be used in conjunction with `--fp8-recipe delayed`."
         )
 
-    if args.offload_optimizer_states:
-        assert (
-            args.use_distributed_optimizer
-        ), "offload_optimizer_states is only supported with distributed optimizer"
-        assert (
-            args.optimizer == 'adam'
-        ), "offload_optimizer_states is only supported with adam optimizer"
+    # Optimizer configuration normalizes the deprecated spelling. Include it here so
+    # cross-config validation still runs before that configuration is constructed.
+    if (
+        args.chunked_optimizer_state_offload or args.offload_optimizer_states
+    ) and args.optimizer_state_offload_fraction > 0.0:
+        if args.optimizer_state_offload_chunk_size_mb == 0:
+            warn_rank_0(
+                "optimizer state offload is enabled with chunk size 0, so all "
+                "selected optimizer tensor state is temporarily restored together. Set "
+                "--optimizer-state-offload-chunk-size-mb to a positive value to bound the "
+                "tensor-state GPU window. Selected master weights always use one full "
+                "restore window regardless of chunk size."
+            )
         assert (
             not args.use_megatron_fsdp
-        ), "offload_optimizer_states does not support Megatron-FSDP for now."
+        ), "chunked optimizer state offload does not support Megatron-FSDP"
+        if not args.no_save_optim or not args.no_load_optim:
+            assert args.ckpt_format == 'torch_dist', (
+                "chunked optimizer state offload requires --ckpt-format torch_dist when "
+                "optimizer state is saved or loaded because its sharded load hooks preserve "
+                "CPU canonical storage"
+            )
+        if not args.no_save_optim:
+            assert not args.async_save, (
+                "chunked optimizer state offload does not support --async-save when optimizer "
+                "state is saved because the background writer can retain tensors backed by "
+                "reusable pinned CPU buffers"
+            )
+        assert (
+            args.cuda_graph_impl != 'full_iteration'
+        ), "chunked optimizer state offload does not support full-iteration CUDA graphs"
+        if args.optimizer == 'muon' and args.fp8_param_gather and args.overlap_param_gather:
+            warn_rank_0(
+                "Muon compact FP8 parameter gather with chunked optimizer state offload "
+                "forces LayerWise-owned pre-forward parameter buckets to complete before "
+                "masters are offloaded; sibling DistributedOptimizer gathers and "
+                "optimizer-state transfers remain overlapped."
+            )
 
     if args.non_persistent_ckpt_type == "local":
         assert (
@@ -3714,7 +3753,8 @@ def _add_training_args(parser):
         '--optimizer-offload-fraction',
         type=float,
         default=1.0,
-        help='Ratio of optimizer state to offload to CPU',
+        help='Fraction used by --optimizer-cpu-offload. This is distinct from '
+        '--optimizer-state-offload-fraction, and the two offload modes are mutually exclusive.',
     )
     group.add_argument(
         '--use-torch-optimizer-for-cpu-offload',
@@ -3748,14 +3788,42 @@ def _add_training_args(parser):
         help='Disable pinning of CPU memory for parameters.',
     )
     group.add_argument(
+        '--chunked-optimizer-state-offload',
+        action='store_true',
+        help='Keep selected optimizer tensor states and master weights in CPU memory between '
+        'updates. GPU tensor-state updates run in bounded chunks, while selected master '
+        'weights use one full restore window.',
+    )
+    group.add_argument(
+        '--optimizer-state-offload-chunk-size-mb',
+        type=int,
+        default=0,
+        help='Target size of each optimizer tensor-state staging buffer in MiB. Two buffers '
+        'can be live for overlap (roughly 2x this value per active offload manager). Zero '
+        'temporarily restores all selected tensor state for one full GPU update. A single '
+        'atomic parameter state may exceed this soft target and is reported at runtime. This '
+        'value does not bound the selected master-weight window, which is always restored in '
+        'full.',
+    )
+    group.add_argument(
+        '--optimizer-state-offload-fraction',
+        type=float,
+        default=1.0,
+        help='Fraction of optimizer parameter bundles to offload. Selected bundles always '
+        'include both tensor state and any separate master weight. This is distinct from '
+        '--optimizer-offload-fraction, which belongs to --optimizer-cpu-offload; the modes are '
+        'mutually exclusive. Zero disables optimizer state offload even when its flag is set.',
+    )
+    group.add_argument(
         '--offload-optimizer-states',
         action='store_true',
         dest='offload_optimizer_states',
-        help='Offload optimizer states to CPU after each optimizer step and '
-        'reload them before the next optimizer step. '
-        'Only support TE FusedAdam optimizer.'
-        'Note that this still uses pure GPU optimizer instead of '
-        'HybridDeviceOptimizer for --optimizer-cpu-offload.',
+        help='Deprecated spelling for --chunked-optimizer-state-offload. It automatically '
+        'enables the replacement; the legacy-equivalent settings are chunk size 0 and offload '
+        'fraction 1.0 unless new tuning arguments are supplied. '
+        'With a nonzero fraction, optimizer-state checkpoint I/O requires --ckpt-format '
+        'torch_dist, optimizer-state saves must be synchronous, and optimizer or full-iteration '
+        'CUDA graphs are unsupported.',
     )
     group.add_argument(
         '--dataloader-type',

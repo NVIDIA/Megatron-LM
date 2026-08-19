@@ -608,7 +608,7 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "mhc": recompute HyperConnection intermediate activations via
-            CheckpointWithoutOutput + CheckpointManager. Requires
+            CheckpointWithoutOutput + MHCCheckpointManager. Requires
             enable_hyper_connections=True. Cannot be used with "mlp".
     "gdn": recompute the entire GatedDeltaNet module (in_proj, conv1d, gated delta rule,
             gated norm, CP all-to-all and out_proj). Requires
@@ -1239,7 +1239,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of layers in each mHC recompute group.
 
     Layers are grouped in their local transformer-block order. The last layer in each group leaves
-    its final MLP BDA output uncheckpointed and closes the current ``CheckpointManager``; a new
+    its final MLP BDA output uncheckpointed and closes the current ``MHCCheckpointManager``; a new
     manager is created for the next group.
 
     In the standard forward path, the group-ending layer registers a unified recompute hook on its
@@ -2289,7 +2289,11 @@ class TransformerConfig(ModelParallelConfig):
                 # the backward chunk, so tensor_pop hits a None chunk for these modules.
                 # Other offload modules (qkv_linear, core_attn, attn_proj, expert_fc1,
                 # moe_act) live inside self_attention/MLP which are NOT wrapped by mHC
-                # checkpoints, so they are safe to use with mHC recompute.
+                # checkpoints, so they are safe to use with mHC recompute -- except
+                # under the attention-only CUDA Graph split, which narrows the three
+                # attention-scope modules further down in __post_init__ (the split
+                # predicate needs normalized cuda_graph_modules, which are not
+                # available yet here).
                 _MHC_CONFLICTING_OFFLOAD_MODULES = {"attn_norm", "mlp_norm"}
                 conflicting = _MHC_CONFLICTING_OFFLOAD_MODULES & set(self.offload_modules)
                 if conflicting:
@@ -2302,22 +2306,60 @@ class TransformerConfig(ModelParallelConfig):
                         f"recompute_modules."
                     )
 
+        use_mhc_recompute = (
+            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
+        )
+        # NOTE: the mHC-recompute/CUDA-graph capability gate lives further down in
+        # __post_init__, after cuda_graph_modules normalization and the deprecated
+        # enable_cuda_graph/external_cuda_graph migration, so that string module
+        # forms and legacy flags reach the same gate.
+
+        # The attention-only Transformer Engine split keeps the mHC producer and
+        # its checkpoint registration eager per microbatch (only input-layernorm
+        # + self-attention are captured), so it composes with EP a2a overlap:
+        # the captured attention backward reads the fixed arena slot that the
+        # group-end recompute node repopulates by direct kernel output.
+        # Full-iteration capture is also valid because it records the explicit
+        # schedule barrier and its fixed-address recompute kernels as part of
+        # the iteration graph. Other per-layer graph forms remain rejected.
+        # Normalize locally: cuda_graph_modules is only normalized in bulk further
+        # down in __post_init__, so a config built directly (rather than through
+        # megatron/training/arguments.py) still holds string forms like ["attn"]
+        # here. Comparing them raw would reject a combination the later gate
+        # accepts, and the string form is part of this field's declared type.
+        normalized_graph_modules, _, _ = normalize_cuda_graph_modules(self.cuda_graph_modules)
+        is_te_attn_split = (
+            self.cuda_graph_impl == "transformer_engine"
+            and not self.enable_cuda_graph
+            and not self.external_cuda_graph
+            and list(normalized_graph_modules or []) == [CudaGraphModule.attn]
+            and list(self.recompute_modules) == ["mhc"]
+        )
+        is_full_iteration = (
+            self.cuda_graph_impl == "full_iteration"
+            and not self.enable_cuda_graph
+            and not self.external_cuda_graph
+        )
         if (
             self.overlap_moe_expert_parallel_comm
-            and self.recompute_granularity == "selective"
-            and "mhc" in self.recompute_modules
+            and use_mhc_recompute
+            and not is_te_attn_split
+            and not is_full_iteration
             and (
                 self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
             )
         ):
             raise ValueError(
                 "mHC recompute with overlap_moe_expert_parallel_comm requires CUDA graphs "
-                "to be disabled because explicit group replay is eager-only."
+                "to be disabled, except for the attention-only Transformer Engine split "
+                "(cuda_graph_impl='transformer_engine', cuda_graph_modules=[attn], "
+                "recompute_modules=[mhc]) or full-iteration capture "
+                "(cuda_graph_impl='full_iteration', hidden_dropout=0, "
+                "attention_dropout=0), because other graph scopes cannot represent the "
+                "explicit schedule-owned recompute barrier."
             )
 
-        if self.enable_hyper_connections and not (
-            self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
-        ):
+        if self.enable_hyper_connections and not use_mhc_recompute:
             warnings.warn(
                 "HyperConnections are enabled but 'mhc' is not in "
                 "recompute_modules with selective recompute. Consider adding 'mhc' to "
@@ -3006,6 +3048,95 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        # mHC selective recompute couples with CUDA graphs only through the guarded
+        # attention-only Transformer Engine split. This gate must stay below the
+        # cuda_graph_modules normalization and the deprecated flag migration above:
+        # earlier placement would compare unnormalized string module forms and let
+        # enable_cuda_graph/external_cuda_graph bypass the gate entirely.
+        if use_mhc_recompute and self.cuda_graph_impl != "none":
+            if self.cuda_graph_impl == "local":
+                # Intentionally fail-closed even for inference-only local-graph
+                # configs that carry leftover training recompute args: mHC
+                # recompute is inert outside training, but silently accepting
+                # the combination would mask misconfigured training runs.
+                raise ValueError(
+                    "mHC recompute is not supported with cuda_graph_impl='local': "
+                    "eager mHC recompute and its per-microbatch checkpoint "
+                    "registration need host execution between captured segments, "
+                    "which the local per-layer implementation does not provide. Use "
+                    "cuda_graph_impl='transformer_engine' with "
+                    "cuda_graph_modules=['attn'], cuda_graph_impl='full_iteration' "
+                    "with dropout disabled, or disable CUDA graphs."
+                )
+            if self.cuda_graph_impl == "full_iteration":
+                # Full-iteration capture records the whole eager iteration —
+                # including mHC checkpoint registration, recompute kernels, and
+                # storage rebinding — into one graph, so replays re-execute the
+                # recompute at fixed addresses by construction (no partial-graph
+                # bridge involved). The one mechanical hazard is RNG-consuming
+                # ops inside a checkpointed region: the recompute-time RNG rewind
+                # cannot run under stream capture, so a captured recompute would
+                # replay a different dropout mask than its captured forward.
+                if self.hidden_dropout != 0.0 or self.attention_dropout != 0.0:
+                    raise ValueError(
+                        "mHC recompute with cuda_graph_impl='full_iteration' requires "
+                        "hidden_dropout=0 and attention_dropout=0: RNG state cannot be "
+                        "rewound inside CUDA graph capture, so a captured recompute "
+                        "would replay a different dropout mask than its forward pass."
+                    )
+            elif list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
+                self.recompute_modules
+            ) != ["mhc"]:
+                raise ValueError(
+                    "mHC recompute with Transformer Engine CUDA Graphs currently supports "
+                    "only the initial attention-only split: cuda_graph_modules=[attn] and "
+                    "recompute_modules=[mhc]. The eager mHC producer must remain outside "
+                    "the captured consumer."
+                )
+            if (
+                self.cuda_graph_impl == "transformer_engine"
+                and self.fine_grained_activation_offloading
+            ):
+                # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces
+                # TransformerLayer's implementation rather than extending it, so it
+                # never plants the offload synchronization edges the full-layer
+                # capture plants -- backward_record() on the graph input and
+                # forward_record() after capture. _set_offload_modules plants those
+                # exactly for the attention-scope modules under an attn-scope graph,
+                # so without them the offload copies race the captured attention.
+                attn_scope_offload = {"qkv_linear", "core_attn", "attn_proj"} & set(
+                    self.offload_modules or []
+                )
+                if attn_scope_offload:
+                    raise ValueError(
+                        f"mHC recompute with attention-only TE CUDA Graphs is incompatible "
+                        f"with offload_modules {sorted(attn_scope_offload)}. The split "
+                        f"capture path omits the offload stream synchronization the "
+                        f"full-layer capture path performs, so the offload copies can race "
+                        f"the captured attention. Remove {sorted(attn_scope_offload)} from "
+                        f"offload_modules, or drop 'attn' from cuda_graph_modules."
+                    )
+                # The replay half of the same gap is fixed, not rejected: see
+                # _replay_mhc_attention_consumer.
+            if self.virtual_pipeline_model_parallel_size is not None:
+                # VPP is admitted only together with EP overlap. Interleaving used
+                # to diverge here (grad norms ~1e8 from the first iteration) on a
+                # caching-allocator use-after-free: mHC post-processing ran inside
+                # the communication-stream combine node, so the recompute subgraph
+                # was allocated on the compute stream and read from another, a
+                # window the allocator cannot track. The fix -- the post node owning
+                # a compute-stream schedule node -- lives in the overlap schedule,
+                # so the non-overlap VPP path has never carried it and stays
+                # unvalidated. StaticBufferLoader itself is VPP-safe, since only the
+                # pre_process chunk carries a data iterator.
+                if not self.overlap_moe_expert_parallel_comm:
+                    raise ValueError(
+                        "mHC recompute supports interleaved pipeline (VPP) "
+                        "schedules only together with "
+                        "overlap_moe_expert_parallel_comm: the non-overlap VPP "
+                        "path is unvalidated."
+                    )
 
         if self.cuda_graph_impl != "none":
 

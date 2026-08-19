@@ -1760,6 +1760,62 @@ class TECudaGraphHelper:
         #   layers found)
         self._capture_finished = False
         self._graphs_created = False
+        # [fwd, bwd] positions of every sample input in the capture ``_order``,
+        # keyed like sample_args. Static inputs may share an address only when
+        # their liveness windows are disjoint; capture validates this for the
+        # mHC direct-write arena.
+        self._mhc_sample_order_intervals = {}
+
+    def _uses_mhc_direct_write_arena(self):
+        """Whether attention-only graphs consume eager mHC recompute outputs."""
+        from megatron.core.transformer.mhc_recompute import uses_mhc_recompute_attn_cuda_graph_split
+
+        return uses_mhc_recompute_attn_cuda_graph_split(self.config)
+
+    def _validate_mhc_static_hidden_inputs(self, sample_args):
+        """Ensure aliased static inputs have disjoint [fwd, bwd] liveness windows.
+
+        Static hidden inputs may legally share an address: MCore's
+        consumed-sample reuse and TE's ``_reuse_graph_input_output_buffers``
+        both alias entries whose backward retired before the next
+        same-signature forward in ``_order``. Every mHC access to a slot —
+        forward direct-write, forward replay read, barrier recompute write,
+        attention-backward read — falls inside the owning entry's own
+        [forward, backward] window, so pairwise-disjoint windows are exactly
+        the safety condition. Overlapping windows on one address would let one
+        graph's eager aggregate write clobber a value another graph's captured
+        backward still reads, so that must fail at capture time rather than
+        corrupt replay numerics.
+        """
+        if not self._uses_mhc_direct_write_arena():
+            return
+        indices_by_ptr = {}
+        for index, args in enumerate(sample_args):
+            indices_by_ptr.setdefault(args[0].data_ptr(), []).append(index)
+        for ptr, indices in indices_by_ptr.items():
+            if len(indices) == 1:
+                continue
+            spans = []
+            for index in indices:
+                interval = self._mhc_sample_order_intervals.get(index)
+                if interval is None:
+                    raise RuntimeError(
+                        f"mHC CUDA Graph static input {index} has no recorded "
+                        "liveness window in the capture order"
+                    )
+                fwd_pos, bwd_pos = interval
+                spans.append((fwd_pos, math.inf if bwd_pos is None else bwd_pos, index))
+            spans.sort()
+            for (_prev_start, prev_end, prev_index), (next_start, _next_end, next_index) in zip(
+                spans, spans[1:]
+            ):
+                if next_start < prev_end:
+                    raise RuntimeError(
+                        f"mHC CUDA Graph static inputs {prev_index} and {next_index} "
+                        f"share address {ptr:#x} but their [fwd, bwd] liveness "
+                        "windows overlap in the capture order; aliasing them would "
+                        "corrupt the recompute direct-write replay"
+                    )
 
     def _discover_layers(self):
         """Discover captureable layers from the model and populate internal data structures."""
@@ -2000,6 +2056,12 @@ class TECudaGraphHelper:
         fwd_sample_queues = {}
         consumed_sample_queue = {}
         layer_sample_keys_cache = {}
+        last_retired_samples = {}
+        # Only _validate_mhc_static_hidden_inputs reads these, and it early-returns
+        # off the same predicate; recording them for every TE capture would be
+        # bookkeeping no one consumes.
+        track_mhc_intervals = self._uses_mhc_direct_write_arena()
+        self._mhc_sample_order_intervals = {}
         fwd_idx = [0] * self.num_model_chunks
         for idx, chunk_id in enumerate(order):
             model_chunk_idx = abs(ceil(chunk_id)) - 1
@@ -2085,23 +2147,35 @@ class TECudaGraphHelper:
                             )
                         )
                         model_chunk_idx = abs(chunk_id) - 1
+                    if track_mhc_intervals:
+                        self._mhc_sample_order_intervals[per_callable_fwd_idx] = [idx, None]
                 fwd_idx[model_chunk_idx] += 1
             elif ceil(chunk_id) == chunk_id:
                 num_consumed_samples = min(
                     len(fwd_sample_queues[model_chunk_idx]),
                     self.num_layers_per_chunk[model_chunk_idx],
                 )
+                last_retired_samples[model_chunk_idx] = []
                 for sample_keys, per_callable_fwd_idx in fwd_sample_queues[model_chunk_idx][
                     :num_consumed_samples
                 ]:
                     if sample_keys not in consumed_sample_queue:
                         consumed_sample_queue[sample_keys] = []
                     consumed_sample_queue[sample_keys].append(per_callable_fwd_idx)
+                    if track_mhc_intervals:
+                        self._mhc_sample_order_intervals[per_callable_fwd_idx][1] = idx
+                    last_retired_samples[model_chunk_idx].append(per_callable_fwd_idx)
                 fwd_sample_queues[model_chunk_idx] = fwd_sample_queues[model_chunk_idx][
                     num_consumed_samples:
                 ]
             else:
-                # skip register static inputs for wgrad backward graphs
+                # Wgrad backward entries do not register static inputs, but they DO
+                # extend the liveness window of the samples whose dgrad just
+                # retired: a delayed wgrad graph replays after the dgrad graph and
+                # still reads the static input, so the window must end here.
+                if track_mhc_intervals:
+                    for per_callable_fwd_idx in last_retired_samples.get(model_chunk_idx, ()):
+                        self._mhc_sample_order_intervals[per_callable_fwd_idx][1] = idx
                 continue
 
         return sample_args, sample_kwargs
@@ -2445,8 +2519,16 @@ class TECudaGraphHelper:
                 # of layers per chunk.
                 kwargs['_num_layers_per_chunk'] = self.num_layers_per_chunk
             if is_te_min_version("2.7.0"):
-                # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory usage
-                # by reusing input/output data buffers between graphs.
+                # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory
+                # usage by reusing input/output data buffers between graphs. The reuse pass
+                # rebinds ``sample_args`` entries in place, aliasing entries whose backward
+                # retired before the next same-signature forward in ``_order`` — the same
+                # [fwd, bwd]-window liveness model as MCore's consumed-sample reuse. All
+                # mHC direct-write accesses (forward write, replay read, barrier recompute
+                # write, attention-backward read) fall inside the owning entry's own
+                # window, so the reuse is safe with the arena;
+                # _validate_mhc_static_hidden_inputs() enforces the window-disjointness
+                # invariant after capture.
                 kwargs['_reuse_graph_input_output_buffers'] = True
 
             if sample_kwargs:
@@ -2588,12 +2670,18 @@ class TECudaGraphHelper:
                 graphs = make_graphed_callables(
                     tuple(self.flattened_callables), sample_args, **kwargs
                 )
+            self._validate_mhc_static_hidden_inputs(sample_args)
 
             # Push the captured graphs to the corresponding TransformerBlock.
+            # Only the direct-write arena consumes these handles. Every other
+            # configuration would retain num_microbatches static input tensors
+            # per layer for nothing. Config-level, so hoisted out of both loops.
+            retain_static_inputs = self._uses_mhc_direct_write_arena()
             num_layers_accumulated = 0
             for layers in self.callables_per_chunk:
                 for layer_number, layer in enumerate(layers):
                     layer.cuda_graphs = []
+                    static_hidden_inputs = []
                     for batch_number in range(self.num_microbatches):
                         if self.config.overlap_moe_expert_parallel_comm:
                             graph_idx = (
@@ -2606,6 +2694,17 @@ class TECudaGraphHelper:
                                 + layer_number
                             )
                         layer.cuda_graphs.append(graphs[graph_idx])
+                        # TE may rebind sample inputs while optimizing
+                        # graph-buffer reuse, so retain the final fixed-address
+                        # surface only after make_graphed_callables() has
+                        # returned; the exact graph index keeps graph and input
+                        # slot in lockstep. _validate_mhc_static_hidden_inputs()
+                        # has asserted that aliased entries have disjoint
+                        # [fwd, bwd] liveness windows.
+                        if retain_static_inputs:
+                            static_hidden_inputs.append(sample_args[graph_idx][0])
+                    if retain_static_inputs:
+                        layer.set_te_cuda_graph_static_hidden_inputs(static_hidden_inputs)
                 num_layers_accumulated += len(layers)
 
             self._graphs_created = True
@@ -2640,6 +2739,7 @@ class TECudaGraphHelper:
                         graphs_not_reset += 1
                 layer.cuda_graphs = []
                 layer.cuda_graph_manual_hooks = []
+                layer.clear_te_cuda_graph_static_hidden_inputs()
 
         log_on_each_pipeline_stage(
             logger=logger,

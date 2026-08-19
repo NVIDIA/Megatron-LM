@@ -707,8 +707,13 @@ class AbsorbedMLASelfAttention(Attention):
             return q_absorbed, kv_compressed
 
         if self.recompute_up_proj:
+            # Quantized replay is safe here for the same reason as in MLASelfAttention:
+            # CheckpointWithoutOutput records the forward recipe/amax state and replays
+            # under the recorded fp8_autocast, and the only quantized op inside
+            # qkv_up_proj_and_rope_apply is the Q up projection. The absorption einsum
+            # reads the K up-projection weight directly, which is a persistent parameter
+            # and therefore identical between the forward pass and the replay.
             quantization = self.config.fp8 or self.config.fp4
-            assert not quantization, "FP8/FP4 is not supported for AbsorbedMLA"
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             q_absorbed, kv_compressed = self.qkv_up_checkpoint.checkpoint(
                 qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
