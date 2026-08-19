@@ -5,17 +5,33 @@
 Layout under test: encoder grid tp=2,dp=2 at ranks 0-3, language grid tp=2,pp=2 at ranks 4-7.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
 
-from examples.mimo.training.topology import ModuleGridSpec, _validate_grid_layout, create_topology
+from examples.mimo.training.topology import (
+    ModuleGridSpec,
+    _get_pg_options,
+    _validate_grid_layout,
+    create_topology,
+)
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.parallel_state import default_embedding_ranks
 from tests.unit_tests.test_utilities import Utils
 
 ENCODER = "images"
+
+
+@pytest.fixture
+def mock_nccl_options(monkeypatch):
+    monkeypatch.setattr(
+        dist,
+        "ProcessGroupNCCL",
+        SimpleNamespace(Options=lambda **kwargs: SimpleNamespace(**kwargs)),
+    )
 
 
 def _specs():
@@ -61,6 +77,66 @@ class TestModuleGridSpecResolution:
     def test_indivisible_expert_raises(self):
         with pytest.raises(ValueError):
             ModuleGridSpec(name=ENCODER, num_ranks=4, tp=2, ep=3, expt_tp=2)
+
+
+@pytest.mark.parametrize(
+    ("group_name", "requested", "enabled"),
+    [
+        ("tp", ["tp"], True),
+        ("gtp_remat", ["gtp_remat"], True),
+        ("ep", ["ep"], True),
+        ("expt_gtp_remat", ["expt_gtp_remat"], True),
+        ("mp", ["tp"], False),
+        ("cp", ["cp"], True),
+        ("tp", None, False),
+    ],
+)
+def test_high_priority_pg_options(mock_nccl_options, group_name, requested, enabled):
+    options = _get_pg_options(group_name, requested)
+
+    assert (options is not None) is enabled
+    if options is not None:
+        assert options.is_high_priority_stream
+
+
+def test_high_priority_options_are_wired_to_each_module_grid(monkeypatch, mock_nccl_options):
+    class FakeGrid:
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            self.calls = []
+            self.instances.append(self)
+
+        def register_view(self, *args, **kwargs):
+            pass
+
+        def create_pg(self, dims, view=None, pg_options=None):
+            self.calls.append((tuple(dims), view, pg_options))
+
+    monkeypatch.setattr("examples.mimo.training.topology.HyperCommGrid", FakeGrid)
+    monkeypatch.setattr("examples.mimo.training.topology._validate_grid_layout", lambda grids: None)
+    monkeypatch.setattr(
+        "examples.mimo.training.topology.pg_collection_from_grid",
+        lambda grid, is_language, high_priority_stream_groups: object(),
+    )
+    monkeypatch.setattr(
+        "examples.mimo.training.topology.build_schedule_pg_collection",
+        lambda grids, module_pgs, language_name: object(),
+    )
+
+    create_topology(_specs(), ["tp", "gtp_remat_dp_cp", "ep_tp", "tp_ep_gtp_remat_pp"])
+
+    expected = {
+        (("tp",), None),
+        (("gtp_remat", "dp", "cp"), None),
+        (("expt_tp",), "expert"),
+        (("expt_tp", "ep", "expt_gtp_remat", "pp"), "expert"),
+    }
+    assert len(FakeGrid.instances) == 2
+    for grid in FakeGrid.instances:
+        enabled = {(dims, view) for dims, view, options in grid.calls if options is not None}
+        assert enabled == expected
+        assert all(options.is_high_priority_stream for _, _, options in grid.calls if options)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")
