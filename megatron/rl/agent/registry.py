@@ -15,6 +15,7 @@ AGENT_REGISTRY: dict[str, str] = {
     "DAPOAgent": "examples.rl.environments.math.dapo_agent:DAPOAgent",
     "GSM8KAgent": "examples.rl.environments.math.gsm8k_agent:GSM8KAgent",
     "AIMEAgent": "examples.rl.environments.math.aime_agent:AIMEAgent",
+    "ResponsesEnvAgent": "megatron.rl.agent.responses_env_agent:ResponsesEnvAgent",
     "NemoGymAgent": "nemogym2mrl.nemo_gym_agent:NemoGymAgent",
     "AceMathAgent": "environments.acemath_agent:AceMathAgent",
 }
