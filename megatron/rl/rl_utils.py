@@ -16,7 +16,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
+from typing import Any, AsyncIterator, Dict, Iterator, List, NamedTuple, Optional, TypeAlias
 
 import numpy as np
 import torch
@@ -73,6 +73,7 @@ from megatron.core.utils import (
     unwrap_model,
 )
 from megatron.rl.agent.api import (
+    KNOWN_ROLLOUT_STATUSES,
     EvaluationRequest,
     EvaluationResponse,
     GroupedRolloutRequest,
@@ -286,6 +287,38 @@ def verify_model_weights_swap(
             inf_core.train()
 
 
+class EpochBoundary(NamedTuple):
+    """RLE boundary: `epoch` applies from `start_token_index` until the next boundary."""
+
+    start_token_index: int
+    epoch: int
+
+
+RolloutEpochBoundaries: TypeAlias = list[list[EpochBoundary]]
+"""Per-turn lists of epoch boundaries over the turn's cumulative token sequence."""
+
+
+class EpochSegment(NamedTuple):
+    """A run of `token_count` consecutive tokens sharing one epoch."""
+
+    epoch: int
+    token_count: int
+
+
+class AlignedEpochSegment(NamedTuple):
+    """A run of `token_count` tokens whose policy and KV-cache epochs are both constant."""
+
+    policy_epoch: int
+    kv_cache_epoch: int
+    token_count: int
+
+
+RolloutEpochSegments: TypeAlias = list[EpochSegment]
+"""One rollout's (epoch, token_count) segments, covering its trajectory in order."""
+
+GroupedEpochSegments: TypeAlias = list[list[RolloutEpochSegments]]
+"""Per-group, per-rollout epoch segments."""
+
 
 @dataclass(slots=True)
 class RolloutStats:
@@ -304,10 +337,12 @@ class RolloutStats:
     min_inf_prob: None | float
     max_inf_prob: None | float
     mean_inf_prob: None | float
-    policy_epoch: list[list[int]]
-    kv_cache_epoch: list[list[int]]
+    policy_epoch_segments: GroupedEpochSegments
+    kv_cache_epoch_segments: GroupedEpochSegments
     completed_epochs: list[list[int]]
     num_evictions: list[list[int]]
+    rollout_statuses: list[list[str]]
+    failure_reasons: list[list[str | None]]
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -625,7 +660,6 @@ def get_rollout_generator(
     n_prompts: int,
     samples_per_group: int,
     *,
-    streaming: bool,
     generation_args: dict[str, Any],
     filter_groups_with_same_reward: bool,
     submission_granularity: SubmissionGranularity,
@@ -639,10 +673,9 @@ def get_rollout_generator(
         The async iterator produced by RolloutPipeline.run().
     """
     global _ROLLOUT_GENERATOR, _ROLLOUT_PIPELINE
-    if not streaming or _ROLLOUT_GENERATOR is None:
+    if _ROLLOUT_GENERATOR is None:
         request = GroupedRolloutRequest(
             num_groups=n_prompts,
-            streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
             generation_args=generation_args,
@@ -733,7 +766,6 @@ def get_environment_rollouts(
                     inference_interface,
                     n_prompts,
                     samples_per_group,
-                    streaming=args.rl_partial_rollouts,
                     generation_args={
                         'temperature': args.rl_default_temperature,
                         'max_tokens': args.inference_max_seq_length,
@@ -764,12 +796,7 @@ def get_environment_rollouts(
                     if torch.are_deterministic_algorithms_enabled():
                         rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
                     if not args.rl_partial_rollouts:
-                        while True:
-                            try:
-                                loop.run_until_complete(anext(rollout_generator))
-                                assert False, "Unexpected group left in generator."
-                            except StopAsyncIteration:
-                                break
+                        _ROLLOUT_PIPELINE.assert_no_inflight_rollouts()
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
@@ -1069,15 +1096,25 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     # get [a,b] with 1.0 and [c,d,e] with 1.0 when doing updates.
     """
 
-    rewards = np.array(rewards)
+    rewards = np.asarray(rewards, dtype=np.float64)
+    num_turns = np.asarray(num_turns, dtype=np.int64)
+    assert rewards.shape == num_turns.shape, (
+        f"rewards and num_turns must have matching shape, got {rewards.shape} and {num_turns.shape}"
+    )
 
-    num_turns = np.array(num_turns)
     # Each outer dimension of num_turns is a group. Sum of those gives total num_turns per group.
     # Let's use this to calculate advantage.
     # mean/std should be repeated based on group lens
     group_turns = num_turns.sum(axis=-1)
-    reward_means = rewards.mean(axis=1, keepdims=True).repeat(group_turns)
-    reward_stds = rewards.std(axis=1, keepdims=True).repeat(group_turns)
+    # Zero-turn rollouts are empty-trajectory placeholders for failed episodes and are masked out.
+    real_mask = num_turns > 0
+    # Clamping to 1 avoids 0/0 for all-placeholder groups.
+    real_counts = np.maximum(real_mask.sum(axis=-1), 1)
+    group_means = np.where(real_mask, rewards, 0.0).sum(axis=-1) / real_counts
+    group_deviations = np.where(real_mask, rewards - group_means[:, np.newaxis], 0.0)
+    group_stds = np.sqrt((group_deviations**2).sum(axis=-1) / real_counts)
+    reward_means = group_means.repeat(group_turns)
+    reward_stds = group_stds.repeat(group_turns)
 
     # rewards are originally [g, group_size]
     # Making an assumption that all groups are of the same size!
@@ -1085,6 +1122,49 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     rewards = rewards.flatten().repeat(num_turns.flatten())
 
     return ((rewards - reward_means) / (1e-4 + reward_stds)).tolist()
+
+
+def expand_epoch_segments(
+    per_turn_boundaries: RolloutEpochBoundaries,
+    per_turn_token_counts: list[int],
+) -> RolloutEpochSegments:
+    """Expand RLE (start_token_index, epoch) boundaries into (epoch, token_count) segments."""
+    segments: RolloutEpochSegments = []
+    for boundaries, total_len in zip(per_turn_boundaries, per_turn_token_counts, strict=True):
+        if not boundaries:
+            continue
+        for idx, (start, epoch) in enumerate(boundaries):
+            end = boundaries[idx + 1][0] if idx + 1 < len(boundaries) else total_len
+            count = end - start
+            if count > 0:
+                segments.append(EpochSegment(epoch=epoch, token_count=count))
+    return segments
+
+
+def merge_epoch_segments(
+    policy_segments: RolloutEpochSegments, kv_segments: RolloutEpochSegments
+) -> Iterator[AlignedEpochSegment]:
+    """Yield (policy_epoch, kv_cache_epoch, token_count) runs over shared token positions."""
+    pol_idx = kv_idx = 0
+    pol_left = policy_segments[0].token_count if policy_segments else 0
+    kv_left = kv_segments[0].token_count if kv_segments else 0
+    while pol_idx < len(policy_segments) and kv_idx < len(kv_segments):
+        take = min(pol_left, kv_left)
+        yield AlignedEpochSegment(
+            policy_epoch=policy_segments[pol_idx].epoch,
+            kv_cache_epoch=kv_segments[kv_idx].epoch,
+            token_count=take,
+        )
+        pol_left -= take
+        kv_left -= take
+        if pol_left == 0:
+            pol_idx += 1
+            if pol_idx < len(policy_segments):
+                pol_left = policy_segments[pol_idx].token_count
+        if kv_left == 0:
+            kv_idx += 1
+            if kv_idx < len(kv_segments):
+                kv_left = kv_segments[kv_idx].token_count
 
 
 def compute_group_stats(
@@ -1113,19 +1193,23 @@ def compute_group_stats(
     env_ids = []
     group_reward_ids = []
     num_turns = [] # num_turns per traj
-    all_policy_epoch = []
-    all_kv_cache_epoch = []
+    all_policy_epoch_segments = []
+    all_kv_cache_epoch_segments = []
     all_completed_epochs = []
     all_num_evictions = []
+    all_rollout_statuses = []
+    all_failure_reasons = []
     for group in rollouts:
         group_rewards = []
         group_traj_lengths = []
         group_turn_lengths = []
         group_num_turns = []
-        group_policy_epoch = []
-        group_kv_epoch = []
+        group_policy_epoch_segments = []
+        group_kv_epoch_segments = []
         group_completed_epochs = []
         group_num_evictions = []
+        group_rollout_statuses = []
+        group_failure_reasons = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
                 for turn_traj in rollout.trajectory:
@@ -1169,18 +1253,39 @@ def compute_group_stats(
                 if isinstance(rollout, TokenRollout)
                 else []
             )
-            group_policy_epoch.append(
-                [epoch for record in turn_records for _, epoch in record.policy_epoch]
-            )
-            group_kv_epoch.append(
-                [epoch for record in turn_records for _, epoch in record.kv_cache_epoch]
-            )
+            for record in turn_records:
+                assert record.policy_epoch, "Request record has no policy_epoch data"
+                assert record.kv_cache_epoch, "Request record has no kv_cache_epoch data"
+            if turn_records:
+                cumulative_turn_lens = [len(t) for t in rollout.trajectory]
+                group_policy_epoch_segments.append(
+                    expand_epoch_segments(
+                        [record.policy_epoch for record in turn_records], cumulative_turn_lens
+                    )
+                )
+                group_kv_epoch_segments.append(
+                    expand_epoch_segments(
+                        [record.kv_cache_epoch for record in turn_records], cumulative_turn_lens
+                    )
+                )
+            else:
+                # Unjoined rollouts (placeholders, text rollouts) pop no records: empty rows.
+                group_policy_epoch_segments.append([])
+                group_kv_epoch_segments.append([])
             group_completed_epochs.extend(record.policy_epoch[-1][1] for record in turn_records)
             group_num_evictions.append(sum(record.num_evictions for record in turn_records))
-        all_policy_epoch.append(group_policy_epoch)
-        all_kv_cache_epoch.append(group_kv_epoch)
+            rollout_status = rollout.rollout_status
+            # All empty-trajectory rollouts are placeholders.
+            if not rollout.trajectory and rollout_status == 'ok':
+                rollout_status = 'placeholder'
+            group_rollout_statuses.append(rollout_status)
+            group_failure_reasons.append(rollout.failure_reason)
+        all_policy_epoch_segments.append(group_policy_epoch_segments)
+        all_kv_cache_epoch_segments.append(group_kv_epoch_segments)
         all_completed_epochs.append(group_completed_epochs)
         all_num_evictions.append(group_num_evictions)
+        all_rollout_statuses.append(group_rollout_statuses)
+        all_failure_reasons.append(group_failure_reasons)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
@@ -1208,10 +1313,12 @@ def compute_group_stats(
         min_inf_prob=None,
         max_inf_prob=None,
         mean_inf_prob=None,
-        policy_epoch=all_policy_epoch,
-        kv_cache_epoch=all_kv_cache_epoch,
+        policy_epoch_segments=all_policy_epoch_segments,
+        kv_cache_epoch_segments=all_kv_cache_epoch_segments,
         completed_epochs=all_completed_epochs,
         num_evictions=all_num_evictions,
+        rollout_statuses=all_rollout_statuses,
+        failure_reasons=all_failure_reasons,
     )
     return stats
 
@@ -1246,21 +1353,21 @@ def prep_wandb_metrics(
         rewards: List[List[float]],
         num_turns: List[List[int]],
         advantages: List[float],
-        policy_epoch: List[List[List[int]]],
-        kv_cache_epoch: List[List[List[int]]],
+        policy_epoch_segments: GroupedEpochSegments,
+        kv_cache_epoch_segments: GroupedEpochSegments,
         completed_epochs: List[List[int]],
         num_evictions: List[List[int]],
         current_iteration: int,
+        rollout_statuses: List[List[str]] | None = None,
+        failure_reasons: List[List[str | None]] | None = None,
         example_group: list[TokenRollout | Rollout] | None = None,
         tokenizer: MegatronTokenizer | None = None,
     ):
 
     """Make a wandb-parseable dictionary of metrics for logging.
 
-    Zero-turn rollouts are a mark of placeholders (empty-trajectory pads for failed episodes).
-    Their 0.0 reward deliberately stays in the reward and group-mean/std aggregates:
-    it does affect training dynamics.
-    All other per-rollout field of theirs is masked out of stats.
+    Zero-turn rollouts are empty-trajectory placeholders for failed episodes.
+    Their rewards are excluded from GRPO group normalization; the stats reflect this.
 
     Args:
         wandb_writer: Wandb run to log to.
@@ -1269,11 +1376,13 @@ def prep_wandb_metrics(
         rewards: Grouped list of rewards.
         num_turns: Grouped list of number of turns in the trajectories. Zero means failure.
         advantages: Flattened list of advantages.
-        policy_epoch: Grouped list of per-token policy epoch stamps.
-        kv_cache_epoch: Grouped list of per-token KV cache epoch stamps.
+        policy_epoch_segments: Grouped list of per-rollout (epoch, token_count) segments.
+        kv_cache_epoch_segments: Grouped list of per-rollout (epoch, token_count) segments.
         completed_epochs: Grouped list of per-turn max policy epoch stamps.
         num_evictions: Grouped list of per-rollout number of evictions.
         current_iteration: Current training iteration.
+        rollout_statuses: Grouped adapter-stamped statuses; None means all 'ok'.
+        failure_reasons: Grouped failure-cause labels; None means all None.
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
     """
@@ -1281,12 +1390,38 @@ def prep_wandb_metrics(
     real_mask = [[nt > 0 for nt in g] for g in num_turns]
     total_rollouts = sum(len(g) for g in num_turns)
     failed_rollouts = sum(not keep for g in real_mask for keep in g)
-    failure_metrics = {
+    rollout_metrics = {
+        'rollout/count': total_rollouts,
         'failed_rollouts/count': failed_rollouts,
         'failed_rollouts/ratio': (
             failed_rollouts / total_rollouts if total_rollouts else 0.0
         ),
     }
+
+    def _safe_key(label):
+        """Sanitize a free-form label for use inside a wandb metric key."""
+        return ''.join(c if c.isalnum() or c in ('_', '-') else '_' for c in label)
+
+    if rollout_statuses is None:
+        rollout_statuses = [['ok'] * len(g) for g in rewards]
+    if failure_reasons is None:
+        failure_reasons = [[None] * len(g) for g in rewards]
+    status_counts = Counter(s for g in rollout_statuses for s in g)
+    status_counts.update({status: 0 for status in KNOWN_ROLLOUT_STATUSES})
+    for status, count in sorted(status_counts.items()):
+        safe_status = _safe_key(status)
+        rollout_metrics[f'rollout/{safe_status}_count'] = count
+        rollout_metrics[f'rollout/{safe_status}_rate'] = (
+            count / total_rollouts if total_rollouts else 0.0
+        )
+    reason_counts = Counter(r for g in failure_reasons for r in g if r)
+    rollout_metrics['failure_reason_table'] = wandb_writer.Table(
+        columns=['failure_reason', 'count', 'rate'],
+        data=[
+            [reason, count, count / total_rollouts if total_rollouts else 0.0]
+            for reason, count in sorted(reason_counts.items())
+        ],
+    )
 
     # All-empty wave: every episode failed and was dropped (nothing to aggregate),
     # or every surviving rollout is a zero-turn placeholder (rewards exist but the
@@ -1301,7 +1436,7 @@ def prep_wandb_metrics(
             "prep_wandb_metrics: empty wave (0 usable rollouts); "
             "skipping rollout metrics this iteration."
         )
-        return failure_metrics
+        return rollout_metrics
 
     def _real(grouped):
         """Grouped per-rollout entries with placeholder (zero-turn) rollouts removed."""
@@ -1309,37 +1444,85 @@ def prep_wandb_metrics(
             [x for x, keep in zip(g, m) if keep] for g, m in zip(grouped, real_mask)
         ]
 
-    # Reward metrics include failures. All other metrics do not. Staleness and
-    # eviction telemetry filters through `joined` instead: placeholders pop no
-    # ledger records, so they have no epoch rows and never join.
+    # Raw delivery aggregates (mean_reward, rewards_hist) keep failures. All other metrics do
+    # not. Staleness and eviction telemetry filters through `joined` instead: placeholders pop
+    # no ledger records, so they have no epoch rows and never join.
+    rewards_real = _real(rewards)
+    table_rewards = [r for g in rewards_real for r in g]
     traj_lens_real = _real(traj_lens)
     num_turns_real = _real(num_turns)
 
+    # Mirror calculate_grpo_advantages: group means/stds over real rollouts only.
     group_table = wandb_writer.Table(
         columns=['group_means', 'group_stds'],
-        data=[[np.mean(g), np.std(g)] for g in rewards],
+        data=[[np.mean(g) if g else 0.0, np.std(g) if g else 0.0] for g in rewards_real],
     )
 
     flat_rewards = [r for g in rewards for r in g]
     flat_traj_lens = [l for g in traj_lens for l in g]
     flat_num_evictions = [e for g in num_evictions for e in g]
-    flat_policy_epochs = [r for g in policy_epoch for r in g]
-    flat_kv_epochs = [r for g in kv_cache_epoch for r in g]
+    flat_statuses = [s for g in rollout_statuses for s in g]
+    flat_policy_epochs = [r for g in policy_epoch_segments for r in g]
+    flat_kv_epochs = [r for g in kv_cache_epoch_segments for r in g]
     joined = [i for i, row in enumerate(flat_policy_epochs) if row]
     joined_rewards = [flat_rewards[i] for i in joined]
     joined_traj_lens = [flat_traj_lens[i] for i in joined]
     joined_num_evictions = [flat_num_evictions[i] for i in joined]
+    joined_statuses = [flat_statuses[i] for i in joined]
     per_rollout_policy_epochs = [flat_policy_epochs[i] for i in joined]
     per_rollout_kv_epochs = [flat_kv_epochs[i] for i in joined]
-    # Per-rollout staleness (oldest token)
-    rollout_policy_staleness = [current_iteration - r[0] for r in per_rollout_policy_epochs]
-    rollout_kv_staleness = [current_iteration - r[0] for r in per_rollout_kv_epochs]
+    # Per-rollout staleness (oldest token). Epoch rows are (epoch, token_count) segments;
+    # a segment's first/last epoch is its first/last token's epoch.
+    rollout_policy_staleness = [current_iteration - r[0].epoch for r in per_rollout_policy_epochs]
+    rollout_kv_staleness = [current_iteration - r[0].epoch for r in per_rollout_kv_epochs]
     # Per-rollout staleness (newest token)
-    rollout_policy_last_token_staleness = [current_iteration - r[-1] for r in per_rollout_policy_epochs]
-    rollout_kv_last_token_staleness = [current_iteration - r[-1] for r in per_rollout_kv_epochs]
-    # Per-token staleness
-    per_token_policy_staleness = [current_iteration - e for r in per_rollout_policy_epochs for e in r]
-    per_token_kv_staleness = [current_iteration - e for r in per_rollout_kv_epochs for e in r]
+    rollout_policy_last_token_staleness = [
+        current_iteration - r[-1].epoch for r in per_rollout_policy_epochs
+    ]
+    rollout_kv_last_token_staleness = [
+        current_iteration - r[-1].epoch for r in per_rollout_kv_epochs
+    ]
+    # Exact token-weighted per-rollout average staleness.
+    rollout_policy_avg_staleness = [
+        current_iteration
+        - sum(s.epoch * s.token_count for s in r) / sum(s.token_count for s in r)
+        for r in per_rollout_policy_epochs
+    ]
+    rollout_kv_avg_staleness = [
+        current_iteration
+        - sum(s.epoch * s.token_count for s in r) / sum(s.token_count for s in r)
+        for r in per_rollout_kv_epochs
+    ]
+    # Token-weighted within-rollout staleness dispersion.
+    rollout_policy_staleness_std = [
+        (
+            sum(s.token_count * (current_iteration - s.epoch - m) ** 2 for s in r)
+            / sum(s.token_count for s in r)
+        )
+        ** 0.5
+        for r, m in zip(per_rollout_policy_epochs, rollout_policy_avg_staleness)
+    ]
+    rollout_kv_staleness_std = [
+        (
+            sum(s.token_count * (current_iteration - s.epoch - m) ** 2 for s in r)
+            / sum(s.token_count for s in r)
+        )
+        ** 0.5
+        for r, m in zip(per_rollout_kv_epochs, rollout_kv_avg_staleness)
+    ]
+    # Per-token staleness as (rollout, policy, kv, token_count) rows.
+    per_token_staleness_rows = [
+        (
+            rollout_idx,
+            current_iteration - aligned.policy_epoch,
+            current_iteration - aligned.kv_cache_epoch,
+            aligned.token_count,
+        )
+        for rollout_idx, (pol_row, kv_row) in enumerate(
+            zip(per_rollout_policy_epochs, per_rollout_kv_epochs, strict=True)
+        )
+        for aligned in merge_epoch_segments(pol_row, kv_row)
+    ]
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -1373,10 +1556,11 @@ def prep_wandb_metrics(
             'max_num_turns': max(max(g) for g in num_turns_real if g),
             'min_num_turns': min(min(g) for g in num_turns_real if g),
             'mean_reward': np.mean([np.mean(g) for g in rewards]),
+            'valid_mean_reward': np.mean(table_rewards) if table_rewards else 0.0,
             'mean_advantage': np.mean(advantages),
             'nonzero_groups_ratio': np.count_nonzero(advantages)
             / len(advantages),
-            **failure_metrics,
+            **rollout_metrics,
     }
 
     # Staleness/eviction telemetry: joined rollouts only; skip when nothing joined.
@@ -1387,6 +1571,9 @@ def prep_wandb_metrics(
                     'reward', 'traj_length', 'num_evictions',
                     'policy_staleness', 'kv_staleness',
                     'policy_last_token_staleness', 'kv_last_token_staleness',
+                    'policy_avg_staleness', 'kv_avg_staleness',
+                    'policy_staleness_std', 'kv_staleness_std',
+                    'rollout_status',
                 ],
                 data=list(zip(
                     joined_rewards,
@@ -1396,12 +1583,18 @@ def prep_wandb_metrics(
                     rollout_kv_staleness,
                     rollout_policy_last_token_staleness,
                     rollout_kv_last_token_staleness,
+                    rollout_policy_avg_staleness,
+                    rollout_kv_avg_staleness,
+                    rollout_policy_staleness_std,
+                    rollout_kv_staleness_std,
+                    joined_statuses,
                 )),
             ),
-            # NOTE: This table can get very large (one row per token across all rollouts).
+            # NOTE: rows are not individual tokens, but instead compressed data.
+            # The same information is contained, but it takes less space.
             'per_token_table': wandb_writer.Table(
-                columns=['policy_staleness', 'kv_staleness'],
-                data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
+                columns=['rollout', 'policy_staleness', 'kv_staleness', 'token_count'],
+                data=per_token_staleness_rows,
             ),
             'mean_policy_staleness': np.mean(rollout_policy_staleness),
             'max_policy_staleness': max(rollout_policy_staleness),
@@ -1418,15 +1611,20 @@ def prep_wandb_metrics(
             'total_eviction_count': sum(joined_num_evictions),
             'max_num_evictions': max(joined_num_evictions),
             'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
-            'per_token_policy_staleness_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_policy_staleness]),
-                'staleness', 'Per-Token Policy Staleness'
+            'rollout_avg_policy_staleness_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(
+                    columns=['staleness'], data=[[s] for s in rollout_policy_avg_staleness]
+                ),
+                'staleness', 'Per-Rollout Token-Weighted Avg Policy Staleness'
             ),
-            'per_token_kv_staleness_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_kv_staleness]),
-                'staleness', 'Per-Token KV Cache Staleness'
+            'rollout_avg_kv_staleness_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(
+                    columns=['staleness'], data=[[s] for s in rollout_kv_avg_staleness]
+                ),
+                'staleness', 'Per-Rollout Token-Weighted Avg KV Cache Staleness'
             ),
         }
+
 
 
     if example_group:
@@ -1454,7 +1652,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
     """Snapshot pipeline instrumentation into wandb-loggable scalars.
 
     Reads the RolloutPipeline held by get_rollout_generator: queue sizes, gate state,
-    per-stage dwell times, and rate counters, plus per-env group counters for multi-env agents.
+    per-stage dwell times, and rate counters, plus per-env group counters.
 
     Returns:
         Metric name -> value dict; empty when no pipeline exists yet.
@@ -1462,7 +1660,6 @@ def _collect_rollout_pipeline_metrics() -> dict:
     if _ROLLOUT_PIPELINE is None:
         return {}
     pipeline = _ROLLOUT_PIPELINE
-    dist = getattr(pipeline.agent, "latest_distribution", None)
     metrics: dict = {}
     gate = pipeline.gate
     metrics.update({
@@ -1500,23 +1697,23 @@ def _collect_rollout_pipeline_metrics() -> dict:
             metrics[f"rollout_pipeline_max_{name}_s"] = float(arr.max())
             metrics[f"rollout_pipeline_p50_{name}_s"] = float(np.percentile(arr, 50))
             metrics[f"rollout_pipeline_p99_{name}_s"] = float(np.percentile(arr, 99))
-    # Per-env group counters, mapped from env_index to env_id via the multi-env layout.
-    if dist:
-        active_env_ids = [
-            env_id
-            for env_id, groups in zip(dist["env_ids"], dist["agent_groups"])
-            if groups > 0
-        ]
-        for env_index, env_id in enumerate(active_env_ids):
-            metrics[f"{env_id}_prepared_groups"] = (
-                pipeline.prepared_groups_per_env[env_index]
-            )
-            metrics[f"{env_id}_assembled_groups"] = (
-                pipeline.assembled_groups_per_env[env_index]
-            )
-            metrics[f"{env_id}_yielded_groups"] = (
-                pipeline.yielded_groups_per_env[env_index]
-            )
+    # Per-env metrics, in env layout order (the pipeline arrays are env-indexed;
+    # weighted env_ids are unique by construction).
+    for env_index, allocation in enumerate(pipeline.allocations):
+        metrics[f"{allocation.env_id}_prepared_groups"] = (
+            pipeline.prepared_groups_per_env[env_index]
+        )
+        metrics[f"{allocation.env_id}_assembled_groups"] = (
+            pipeline.assembled_groups_per_env[env_index]
+        )
+        metrics[f"{allocation.env_id}_yielded_groups"] = (
+            pipeline.yielded_groups_per_env[env_index]
+        )
+        metrics[f"{allocation.env_id}_agent_groups"] = allocation.num_groups
+        # The realized weight: the constant share of each batch the env actually owns.
+        metrics[f"{allocation.env_id}_weight"] = (
+            allocation.num_groups / pipeline.request.num_groups
+        )
     # Reset accumulators; queue sizes and gate held are point-in-time.
     pipeline.infer_queue_dwell = []
     pipeline.engine_dwell = []
@@ -1527,23 +1724,14 @@ def _collect_rollout_pipeline_metrics() -> dict:
     pipeline.assembled_count = 0
     pipeline.filtered_count = 0
     pipeline.yielded_count = 0
-    pipeline.prepared_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
-    pipeline.assembled_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
-    pipeline.yielded_groups_per_env = [0] * len(pipeline.gran_policy.num_groups_per_env)
+    num_envs = len(pipeline.gran_policy.num_groups_per_env)
+    pipeline.prepared_groups_per_env = [0] * num_envs
+    pipeline.assembled_groups_per_env = [0] * num_envs
+    pipeline.yielded_groups_per_env = [0] * num_envs
     gate.prepare_blocked_seconds = 0.0
     gate.acquire_calls = 0
     gate.release_calls = 0
 
-    # WeightedMultiTask per-batch group distribution.
-    if dist:
-        # An env_id can appear more than once in the config (e.g. an active
-        # entry plus an evaluation-only twin with zero weight). Sum per
-        # env_id so the zero twin does not overwrite the active entry.
-        per_env: dict = {}
-        for env_id, groups in zip(dist["env_ids"], dist["agent_groups"]):
-            per_env[env_id] = per_env.get(env_id, 0) + groups
-        for env_id, groups in per_env.items():
-            metrics[f"{env_id}_agent_groups"] = groups
     return metrics
 
 
@@ -1598,15 +1786,20 @@ def maybe_log_training_metrics(
     rewards = group_stats.rewards
     num_turns = group_stats.num_turns
     advantages = group_stats.advantages
-    policy_epoch = group_stats.policy_epoch
-    kv_cache_epoch = group_stats.kv_cache_epoch
+    policy_epoch_segments = group_stats.policy_epoch_segments
+    kv_cache_epoch_segments = group_stats.kv_cache_epoch_segments
     completed_epochs = group_stats.completed_epochs
     num_evictions = group_stats.num_evictions
+    rollout_statuses = group_stats.rollout_statuses
+    failure_reasons = group_stats.failure_reasons
 
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
-        policy_epoch=policy_epoch, kv_cache_epoch=kv_cache_epoch, completed_epochs=completed_epochs,
-        num_evictions=num_evictions, current_iteration=current_iteration)
+        policy_epoch_segments=policy_epoch_segments,
+        kv_cache_epoch_segments=kv_cache_epoch_segments, completed_epochs=completed_epochs,
+        num_evictions=num_evictions, current_iteration=current_iteration,
+        rollout_statuses=rollout_statuses, failure_reasons=failure_reasons)
+
 
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
@@ -1626,11 +1819,13 @@ def maybe_log_training_metrics(
             rewards=env_stats(rewards, env_idx),
             num_turns=env_stats(num_turns, env_idx),
             advantages=env_advantages,
-            policy_epoch=env_stats(policy_epoch, env_idx),
-            kv_cache_epoch=env_stats(kv_cache_epoch, env_idx),
+            policy_epoch_segments=env_stats(policy_epoch_segments, env_idx),
+            kv_cache_epoch_segments=env_stats(kv_cache_epoch_segments, env_idx),
             completed_epochs=env_stats(completed_epochs, env_idx),
             num_evictions=env_stats(num_evictions, env_idx),
             current_iteration=current_iteration,
+            rollout_statuses=env_stats(rollout_statuses, env_idx),
+            failure_reasons=env_stats(failure_reasons, env_idx),
             example_group=example_groups[env_id],
             tokenizer=tokenizer,
         )
