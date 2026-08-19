@@ -7,12 +7,31 @@ from types import SimpleNamespace
 import pytest
 
 from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import _add_inference_args
 from megatron.training.config.inference_config import InferenceSetupConfig
 
 
 class TestInferenceConfig:
+    @pytest.mark.parametrize(
+        ("grouped_gemm_backend", "expected_backend"),
+        [
+            ("torch", "triton"),
+            (InferenceGroupedGemmBackend.TORCH, "triton"),
+            ("flashinfer", "flashinfer"),
+            (InferenceGroupedGemmBackend.FLASHINFER, "flashinfer"),
+        ],
+    )
+    def test_resolve_mxfp8_backend(self, grouped_gemm_backend, expected_backend):
+        assert resolve_mxfp8_backend(grouped_gemm_backend) == expected_backend
+
+    @pytest.mark.parametrize("grouped_gemm_backend", ["vllm", InferenceGroupedGemmBackend.VLLM])
+    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self, grouped_gemm_backend):
+        with pytest.raises(ValueError, match="does not support inference_grouped_gemm_backend"):
+            resolve_mxfp8_backend(grouped_gemm_backend)
+
     def test_mutual_exclusivity_with_transformer_config(self):
         """
         Ensure mutual exclusivity between fields in `InferenceConfig` and
