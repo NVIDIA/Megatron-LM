@@ -100,9 +100,7 @@ def validate_mxfp8_tensor(
             )
     elif tensor.scale.ndim == 1:
         padded_rows = _ceil_div(rows, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
-        padded_scale_cols = (
-            _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK) * MXFP8_SCALE_COL_BLOCK
-        )
+        padded_scale_cols = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK) * MXFP8_SCALE_COL_BLOCK
         expected_scale_elements = padded_rows * padded_scale_cols
         if tensor.scale.numel() != expected_scale_elements:
             raise ValueError(
@@ -144,12 +142,7 @@ class MXFP8Tensor:
         return self.scale.reshape(-1, padded_cols)
 
     @classmethod
-    def from_bf16(
-        cls,
-        x: torch.Tensor,
-        group_size: int = 32,
-        backend: MXFP8Backend = "flashinfer",
-    ):
+    def from_bf16(cls, x: torch.Tensor, group_size: int = 32, backend: MXFP8Backend = "flashinfer"):
         """Quantize BF16 tensor to MXFP8.
 
         Args:
@@ -166,9 +159,7 @@ class MXFP8Tensor:
             if scale.dtype == torch.float8_e8m0fnu:
                 scale = scale.view(torch.uint8)
             elif scale.dtype != torch.uint8:
-                raise TypeError(
-                    f"FlashInfer MXFP8 scales must be uint8 bytes, got {scale.dtype}."
-                )
+                raise TypeError(f"FlashInfer MXFP8 scales must be uint8 bytes, got {scale.dtype}.")
         elif backend == "triton":
             data, scale = mcore_mxfp8_quantize(x)
             scale = ensure_mxfp8_scale_dtype(scale)
@@ -177,8 +168,4 @@ class MXFP8Tensor:
                 f"Unknown MXFP8 quantization backend: '{backend}'. "
                 "Must be 'triton' or 'flashinfer'."
             )
-        return cls(
-            data=data,
-            scale=scale,
-            backend=backend,
-        )
+        return cls(data=data, scale=scale, backend=backend)

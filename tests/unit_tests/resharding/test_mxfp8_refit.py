@@ -164,9 +164,7 @@ class TestMXFP8ReshardTransform:
         source = torch.nn.Parameter(
             torch.randn(64, 128, dtype=torch.bfloat16, device="cuda"), requires_grad=False
         )
-        data, scale = transform.prepare_send(
-            "decoder.weight", (slice(None), slice(None)), source
-        )
+        data, scale = transform.prepare_send("decoder.weight", (slice(None), slice(None)), source)
 
         assert data.dtype == torch.float8_e4m3fn
         assert scale.dtype == torch.float8_e8m0fnu
@@ -177,9 +175,7 @@ class TestMXFP8ReshardTransform:
 
         with pytest.raises(AssertionError, match="backend is required for sender-side conversion"):
             MXFP8ReshardTransform(
-                convertible_params={"decoder.weight"},
-                persistent_buffers={},
-                convert_on_send=True,
+                convertible_params={"decoder.weight"}, persistent_buffers={}, convert_on_send=True
             )
 
     def test_mixed_persistent_buffer_backends_are_rejected(self):
@@ -220,8 +216,7 @@ class TestMXFP8ReshardTransform:
             setattr(grouped_mlp, linear_name, linear)
             for expert_idx in range(num_experts):
                 tensor = MXFP8Tensor.from_bf16(
-                    torch.randn(M, K, dtype=torch.bfloat16, device="cuda"),
-                    backend="triton",
+                    torch.randn(M, K, dtype=torch.bfloat16, device="cuda"), backend="triton"
                 )
                 setattr(linear, f"weight{expert_idx}", tensor)
                 buffers[f"{linear_name}.weight{expert_idx}"] = tensor

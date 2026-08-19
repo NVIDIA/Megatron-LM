@@ -23,10 +23,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.inference.quantization.mxfp8_tensor import (
-    MXFP8Tensor,
-    validate_mxfp8_tensor,
-)
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, validate_mxfp8_tensor
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -1093,9 +1090,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                         f"got {type(w).__name__}. Was quantize_model_to_mxfp8 called?"
                     )
                 validate_mxfp8_tensor(
-                    mxfp8,
-                    expected_backend=backend,
-                    tensor_name=f"{linear_name}.weight{i}",
+                    mxfp8, expected_backend=backend, tensor_name=f"{linear_name}.weight{i}"
                 )
                 q_list.append(mxfp8.data)
                 s_list.append(mxfp8.scale)
@@ -1104,9 +1099,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             stacked_scale = torch.stack(s_list, dim=0).contiguous()
 
             setattr(
-                self,
-                buf_name,
-                MXFP8Tensor(data=stacked_data, scale=stacked_scale, backend=backend),
+                self, buf_name, MXFP8Tensor(data=stacked_data, scale=stacked_scale, backend=backend)
             )
 
             # Redirect per-expert weight .data to views into the stacked buffer,

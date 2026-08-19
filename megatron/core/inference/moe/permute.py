@@ -688,16 +688,12 @@ def permute_and_quantize_mxfp8(
         max_tokens * min(topk, num_local_experts) + alignment * num_local_experts
     )
     # Keep data rows consistent with the swizzled scale layout's fixed row block.
-    output_size = (
-        _ceil_div(unaligned_output_size, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
-    )
+    output_size = _ceil_div(unaligned_output_size, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
 
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(output_size, MXFP8_SCALE_ROW_BLOCK)
     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
-    total_scale_bytes = (
-        n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
-    )
+    total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
 
     out_fp8 = torch.empty(output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device)
     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=hidden_states.device)

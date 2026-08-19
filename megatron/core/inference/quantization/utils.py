@@ -87,9 +87,7 @@ def resolve_mxfp8_backend(
     )
 
 
-def quantize_model_to_mxfp8(
-    model: torch.nn.Module, backend: MXFP8Backend = "flashinfer"
-) -> None:
+def quantize_model_to_mxfp8(model: torch.nn.Module, backend: MXFP8Backend = "flashinfer") -> None:
     """Convert TE MXFP8 weights to mcore MXFP8Tensor format.
 
     Recursively walks the model and replaces each TEMXFP8Tensor parameter
@@ -245,9 +243,7 @@ def quantize_params_to_mxfp8(
                 )
                 new_tensor = MXFP8Tensor.from_bf16(bf16_data, backend=backend)
                 persistent_tensor.data.copy_(new_tensor.data)
-                persistent_tensor.scale.view(torch.uint8).copy_(
-                    new_tensor.scale.view(torch.uint8)
-                )
+                persistent_tensor.scale.view(torch.uint8).copy_(new_tensor.scale.view(torch.uint8))
                 mcore_tensor = persistent_tensor
             else:
                 # First call: create new MXFP8Tensor

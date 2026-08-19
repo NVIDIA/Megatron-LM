@@ -294,9 +294,7 @@ def squared_relu_and_quantize_mxfp8(
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
-    total_scale_bytes = (
-        n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
-    )
+    total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
 
     out_fp8 = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=x.device)

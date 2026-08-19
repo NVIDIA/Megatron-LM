@@ -175,16 +175,12 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.is_cuda and x.dim() == 2
     assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
     M, K = x.shape
-    assert K % MXFP8_BLOCK_SIZE == 0, (
-        f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
-    )
+    assert K % MXFP8_BLOCK_SIZE == 0, f"K ({K}) must be divisible by {MXFP8_BLOCK_SIZE}"
 
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(M, MXFP8_SCALE_ROW_BLOCK)
     n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
-    total_scale_bytes = (
-        n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
-    )
+    total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
 
     out_data = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=x.device)

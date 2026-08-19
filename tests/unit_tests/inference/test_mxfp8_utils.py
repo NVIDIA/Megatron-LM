@@ -261,9 +261,7 @@ class TestMxfp8Quantize:
 class TestMXFP8Tensor:
 
     def test_restore_uint8_scale_dtype_after_resharding(self):
-        from megatron.core.inference.quantization.mxfp8_tensor import (
-            ensure_mxfp8_scale_dtype,
-        )
+        from megatron.core.inference.quantization.mxfp8_tensor import ensure_mxfp8_scale_dtype
 
         scale_bytes = torch.arange(16, dtype=torch.uint8)
         scale = ensure_mxfp8_scale_dtype(scale_bytes)
@@ -272,9 +270,7 @@ class TestMXFP8Tensor:
         torch.testing.assert_close(scale.view(torch.uint8), scale_bytes)
 
     def test_reject_invalid_scale_dtype(self):
-        from megatron.core.inference.quantization.mxfp8_tensor import (
-            ensure_mxfp8_scale_dtype,
-        )
+        from megatron.core.inference.quantization.mxfp8_tensor import ensure_mxfp8_scale_dtype
 
         with pytest.raises(TypeError, match="MXFP8 scales must use"):
             ensure_mxfp8_scale_dtype(torch.ones(16, dtype=torch.bfloat16))
@@ -699,14 +695,7 @@ class TestPermuteAndQuantizeMxfp8:
 
         hidden, probs, routing_map = self._make_inputs(72, 2688, 6, 128)
         permuted, _, _, _ = permute_tokens(
-            hidden,
-            probs,
-            routing_map,
-            0,
-            64,
-            _vt(72),
-            alignment=128,
-            row_alignment=128,
+            hidden, probs, routing_map, 0, 64, _vt(72), alignment=128, row_alignment=128
         )
         result = MXFP8Tensor.from_bf16(permuted, backend="triton")
 
@@ -719,19 +708,12 @@ class TestPermuteAndQuantizeMxfp8:
         from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
         num_tokens, hidden_size, topk, num_experts = 72, 128, 2, 4
-        hidden, probs, routing_map = self._make_inputs(
-            num_tokens, hidden_size, topk, num_experts
-        )
+        hidden, probs, routing_map = self._make_inputs(num_tokens, hidden_size, topk, num_experts)
 
         def stack_weights() -> MXFP8Tensor:
             per_expert = [
                 MXFP8Tensor.from_bf16(
-                    torch.randn(
-                        hidden_size,
-                        hidden_size,
-                        device="cuda",
-                        dtype=torch.bfloat16,
-                    ),
+                    torch.randn(hidden_size, hidden_size, device="cuda", dtype=torch.bfloat16),
                     backend="triton",
                 )
                 for _ in range(num_experts)
