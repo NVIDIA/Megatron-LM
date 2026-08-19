@@ -110,9 +110,7 @@ def _hsm_mix(
     invalid_locations = stacked.eq(0).all(dim=-1, keepdim=True)
     selected_is_invalid = torch.gather(invalid_locations, dim=0, index=indices)
     indices = indices.masked_fill(selected_is_invalid, num_states - 1)
-    return torch.gather(
-        stacked, dim=0, index=indices.expand(-1, -1, -1, hidden_size)
-    ).squeeze(0)
+    return torch.gather(stacked, dim=0, index=indices.expand(-1, -1, -1, hidden_size)).squeeze(0)
 
 
 def tie_word_embeddings_state_dict(
@@ -1907,9 +1905,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
 
-        hsm_enabled = (
-            self.config.mtp_hsm and self.training and self.config.mtp_num_layers >= 2
-        )
+        hsm_enabled = self.config.mtp_hsm and self.training and self.config.mtp_num_layers >= 2
         if hsm_enabled:
             hsm_history = [hidden_states]
 

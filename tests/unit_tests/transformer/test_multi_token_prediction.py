@@ -158,12 +158,7 @@ class TestMultiTokenPredictionLayer:
             torch.full((64, 2, 4), value, dtype=torch.float32, device="cuda")
             for value in range(1, 8)
         ]
-        mixed = _hsm_mix(
-            history,
-            sequence_parallel=True,
-            tp_group=tp_group,
-            cp_group=cp_group,
-        )
+        mixed = _hsm_mix(history, sequence_parallel=True, tp_group=tp_group, cp_group=cp_group)
         selections = mixed[..., 0].to(torch.long)
         gathered = [torch.empty_like(selections) for _ in range(tp * cp)]
         torch.distributed.all_gather(gathered, selections, group=tp_cp_group)
@@ -177,19 +172,13 @@ class TestMultiTokenPredictionLayer:
         model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
         tp_group = get_tensor_model_parallel_group()
         history = [
-            torch.full(
-                (32, 2, 4), value, dtype=torch.float32, device="cuda", requires_grad=True
-            )
+            torch.full((32, 2, 4), value, dtype=torch.float32, device="cuda", requires_grad=True)
             for value in (1.0, 2.0, 3.0)
         ]
         selections = []
 
         def mix_with_recording(*states):
-            mixed = _hsm_mix(
-                list(states),
-                sequence_parallel=True,
-                tp_group=tp_group,
-            )
+            mixed = _hsm_mix(list(states), sequence_parallel=True, tp_group=tp_group)
             selections.append(mixed.detach().clone())
             return mixed
 
@@ -230,19 +219,12 @@ class TestMultiTokenPredictionLayer:
         torch.testing.assert_close(output[2:], torch.ones_like(hidden_states))
 
     @pytest.mark.parametrize(
-        ("training", "expected_second_input"), [
-            (True, [1.0, 2.0]),
-            (False, [2.0, 2.0]),
-        ]
+        ("training", "expected_second_input"), [(True, [1.0, 2.0]), (False, [2.0, 2.0])]
     )
     def test_hsm_runs_only_during_training(self, monkeypatch, training, expected_second_input):
         """The block applies HSM in training and leaves evaluation deterministic."""
         config = TransformerConfig(
-            num_layers=2,
-            hidden_size=4,
-            num_attention_heads=1,
-            mtp_num_layers=2,
-            mtp_hsm=True,
+            num_layers=2, hidden_size=4, num_attention_heads=1, mtp_num_layers=2, mtp_hsm=True
         )
         seen_inputs = []
 
@@ -284,11 +266,7 @@ class TestMultiTokenPredictionLayer:
     def test_hsm_aligns_history_with_target_tokens(self, monkeypatch, packed):
         """Each reuse of an older HSM state advances it by one target token."""
         config = TransformerConfig(
-            num_layers=3,
-            hidden_size=1,
-            num_attention_heads=1,
-            mtp_num_layers=3,
-            mtp_hsm=True,
+            num_layers=3, hidden_size=1, num_attention_heads=1, mtp_num_layers=3, mtp_hsm=True
         )
         seen_inputs = []
 
