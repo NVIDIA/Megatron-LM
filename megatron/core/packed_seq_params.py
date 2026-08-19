@@ -67,3 +67,12 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
+
+
+def resolve_cp_group(
+    static_cp_group: dist.ProcessGroup | None, packed_seq_params: PackedSeqParams = None
+) -> dist.ProcessGroup | None:
+    """Return the dynamic CP group from packed_seq_params when available, else the static one."""
+    if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+        return packed_seq_params.cp_group
+    return static_cp_group

@@ -167,6 +167,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "linear_key_head_dim": 128,
     "linear_num_key_heads": 16,
     "linear_num_value_heads": 32,
+    "gdn_conv_pad_alignment": None,
+    "linear_cp_mode": "chunkwise",
     "linear_value_head_dim": 128,
     "log_max_attention_logit": False,
     "mamba_head_dim": 64,
