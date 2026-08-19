@@ -46,11 +46,13 @@ logger = logging.getLogger(__name__)
 
 
 def _check_eo_version() -> None:
-    """LayerShardedMuon requires emerging-optimizers >= 0.3.0.
+    """The batched-NS path (ns_batch_size > 1) requires emerging-optimizers >= 0.3.0.
 
     0.3.0 added batched (3-D) Newton-Schulz -- the ns_batch_size path stacks
     same-shape matrices and older releases fail inside torch.addmm with
-    "mat1 must be a matrix, got 3-D tensor" -- and the Triton SYRK kernels.
+    "mat1 must be a matrix, got 3-D tensor". Only called when batching is
+    requested: the per-matrix baseline uses the 2-D newton_schulz API (including
+    the use_syrk kwarg) that 0.2.0 already ships, verified signature-identical.
     """
     import emerging_optimizers
 
@@ -222,7 +224,12 @@ class LayerShardedMuon(Muon):
         use_syrk: bool = False,
         concurrent_groups: bool = True,
     ) -> None:
-        _check_eo_version()
+        if ns_batch_size > 1:
+            # Only the batched (3-D) Newton-Schulz path needs emerging-optimizers
+            # >= 0.3.0. The per-matrix baseline (ns_batch_size=1, the default) uses
+            # the same newton_schulz API that 0.2.0 already ships, so it must not
+            # raise on older installs.
+            _check_eo_version()
         super().__init__(
             params,
             lr=lr,
