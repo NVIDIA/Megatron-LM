@@ -347,11 +347,9 @@ def _get_custom_recipe(quantizer_factory_python_path: str) -> Union[Fp8Recipe, F
     try:
         custom_recipe = transformer_engine.common.recipe.CustomRecipe(qfactory=quantizer_factory)
     except AttributeError:
-        raise ValueError(
-            """CustomRecipe recipe is not available in this version of 
+        raise ValueError("""CustomRecipe recipe is not available in this version of 
             Transformer Engine. Please make sure you are using TE version 
-            >= 2.9.0.dev0."""
-        )
+            >= 2.9.0.dev0.""")
     return custom_recipe
 
 
