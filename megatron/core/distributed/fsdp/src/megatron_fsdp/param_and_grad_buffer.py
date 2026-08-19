@@ -1954,9 +1954,13 @@ def _get_parameter_groups(
                 ):
                     same_factor_params.append(param)
                 else:
-                    lcm_chunk_size_factor = math.lcm(chunk_size_factor, param_shape[1:].numel())
-                    chunk_size_factor = lcm_chunk_size_factor
-                    same_factor_params.append(param)
+                    # Defer to a later group rather than widening this group's factor to the LCM.
+                    # Buckets are padded to a multiple of data_parallel_world_size *
+                    # chunk_size_factor, so folding incompatible row sizes into one group makes the
+                    # factor grow multiplicatively and the padding grow with it. For DeepSeek-V3
+                    # row sizes 18432, 16384 and 7168 the LCM is 1032192, which at 512-way data
+                    # parallelism pads a single bucket by up to 528M elements.
+                    remaining_params.append(param)
             # Create a new parameter group with the same chunk size factor.
             new_bucket_groups.append(
                 ParameterGroup(
