@@ -354,7 +354,7 @@ class TopKRouter(Router):
             return torch.int64
         if backend != "hybridep":
             return None
-        if not self.config.moe_hybridep_use_dense_routing_map:
+        if self.config.moe_hybridep_routing_map_mode != "indices":
             return None
         if not HAVE_HYBRIDEP_DENSE_ROUTING:
             return None
