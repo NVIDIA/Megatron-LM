@@ -9,7 +9,6 @@ ShardedTensor class (mostly with the ShardedTensor.from_rank_offsets classmethod
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from itertools import chain
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
