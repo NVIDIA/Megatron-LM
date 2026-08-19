@@ -702,6 +702,10 @@ class TestPermuteAndQuantizeMxfp8:
         assert result.data.shape[0] == 8704
         assert result.scale_2d().shape[0] == result.data.shape[0]
 
+    @pytest.mark.skipif(
+        torch.cuda.get_device_capability()[0] < 10,
+        reason="MXFP8 scaled_grouped_mm requires Blackwell (SM 100+)",
+    )
     def test_unfused_moe_accepts_non_aligned_fixed_token_capacity(self):
         """The separate-quantization route feeds matching rows to scaled_grouped_mm."""
         from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
