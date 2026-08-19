@@ -13,6 +13,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
 class NestedModel(nn.Module):
@@ -137,6 +138,22 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     assert list(context.backward_order) == [model.layers[1], model.layers[0]]
 
 
+def test_fine_grained_hooks_preserve_registered_module_hierarchy(distributed_setup):
+    """Fine-grained parent references must not become registered child modules."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(device)
+    module_names = tuple(name for name, _ in model.named_modules())
+    layer_keys = tuple(model.layers._modules)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), fine_grained=True)
+
+    assert tuple(name for name, _ in model.named_modules()) == module_names
+    assert tuple(model.layers._modules) == layer_keys
+
+
 def test_nested_prefetch_orders_use_dfs(distributed_setup):
     """Nested FsdpModules should use DFS orders for one-step prefetch."""
     device = distributed_setup.device
@@ -234,3 +251,41 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
             fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     assert model.inner.context is first_context
+
+
+def test_post_backward_release_processes_nested_fsdp_modules_once(distributed_setup, monkeypatch):
+    """Manual 1F1B release should include nested units still in the backward phase."""
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedModel().to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(
+            model.inner, mesh=mesh, placements=_flat_placements(), skip_backward_callback=True
+        )
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), skip_backward_callback=True)
+
+    calls = []
+    for name, module in (("root", model), ("inner", model.inner)):
+        monkeypatch.setattr(
+            module, "_reshard_parameter_groups", lambda name=name: calls.append((name, "reshard"))
+        )
+        monkeypatch.setattr(
+            module, "_reduce_gradient_groups", lambda name=name: calls.append((name, "reduce"))
+        )
+
+    # The schedule skipped the inner unit's per-module release; its post_backward
+    # should still finalize it because it remains in the BACKWARD phase.
+    model.phase = FsdpModule.Phase.BACKWARD
+    model.inner.phase = FsdpModule.Phase.BACKWARD
+    model.post_backward()
+
+    # The root post_backward finalizes itself and any nested unit still in the
+    # BACKWARD phase; the relative order of the two operations is not a contract.
+    assert sorted(calls) == [
+        ("inner", "reduce"),
+        ("inner", "reshard"),
+        ("root", "reduce"),
+        ("root", "reshard"),
+    ]
