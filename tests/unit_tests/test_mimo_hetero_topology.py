@@ -25,6 +25,21 @@ def _specs():
     ]
 
 
+def _gtp_specs():
+    return [
+        ModuleGridSpec(name=ENCODER, num_ranks=4, tp=2, rank_offset=0),
+        ModuleGridSpec(
+            name=MIMO_LANGUAGE_MODULE_KEY,
+            num_ranks=4,
+            tp=2,
+            gtp_remat=2,
+            ep=2,
+            expt_gtp_remat=2,
+            rank_offset=4,
+        ),
+    ]
+
+
 class TestModuleGridSpecResolution:
     def test_derived_dims_resolve_to_concrete_ints(self):
         # num_ranks=4,tp=2 with default expt_tp=1: dp=2, expt_dp=4.
@@ -84,6 +99,31 @@ class TestHeteroTopology:
                 assert pgc.pp.size() == 2
                 assert pgc.dp.size() == 1
                 assert pgc.dp_cp.size() == 1
+        finally:
+            topo.destroy()
+
+    def test_gtp_pgc_group_sizes(self):
+        topo = create_topology(_gtp_specs())
+        try:
+            rank = dist.get_rank()
+            pgc = (
+                topo.module_pgs[ENCODER] if rank < 4 else topo.module_pgs[MIMO_LANGUAGE_MODULE_KEY]
+            )
+            if rank < 4:
+                assert pgc.gtp_remat.size() == 1
+                assert pgc.expt_gtp_remat.size() == 1
+            else:
+                assert pgc.tp.size() == 2
+                assert pgc.gtp_remat.size() == 2
+                assert pgc.dp.size() == 1
+                assert pgc.dp_cp_gtp_remat.size() == 2
+                assert pgc.mp.size() == 4
+                assert pgc.expt_tp.size() == 1
+                assert pgc.ep.size() == 2
+                assert pgc.expt_gtp_remat.size() == 2
+                assert pgc.expt_dp.size() == 1
+                assert pgc.expt_dp_gtp_remat.size() == 2
+                assert pgc.tp_ep_pp_with_egtp_remat.size() == 4
         finally:
             topo.destroy()
 
