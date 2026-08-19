@@ -17,6 +17,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive import (
 from megatron.lite.primitive.alignment.vllm_grouped_moe import (
     VLLMGroupedMoEWithBF16Backward,
 )
+from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.quantization.deployment_block_fp8 import (
     DeploymentBlockFP8Adapter,
@@ -60,6 +61,42 @@ def _hash_route(logits, token_ids, tid2eid, *, topk, renormalize, scale):
     return weights, ids
 
 
+class _VLLMVisibleExperts(Experts):
+    """Lite expert parameters behind the vLLM-visible grouped compute boundary."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor | None = None,
+        tokens_per_expert_list: list[int] | None = None,
+    ) -> torch.Tensor:
+        if tokens_per_expert_list is not None:
+            tokens_per_expert = torch.tensor(
+                tokens_per_expert_list,
+                device=tokens_per_expert.device,
+                dtype=tokens_per_expert.dtype,
+            )
+        if permuted_probs is None:
+            permuted_probs = hidden_states.new_zeros(
+                hidden_states.shape[0], dtype=torch.float32
+            )
+        w13 = tuple(
+            getattr(self.fc1, f"weight{i}") for i in range(self.num_local_experts)
+        )
+        w2 = tuple(
+            getattr(self.fc2, f"weight{i}") for i in range(self.num_local_experts)
+        )
+        return VLLMGroupedMoEWithBF16Backward.apply(
+            hidden_states,
+            tokens_per_expert,
+            permuted_probs,
+            0.0,
+            *w13,
+            *w2,
+        )
+
+
 class DeepseekV4MoE(LiteDeepseekV4MoE):
 
     def __init__(
@@ -84,34 +121,8 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         self.shared_gate_up_fp8 = DeploymentBlockFP8Adapter(cache_weight=True)
         self.shared_down_fp8 = DeploymentBlockFP8Adapter(cache_weight=True)
 
-    def _visible_experts(
-        self,
-        hidden_states: torch.Tensor,
-        tokens_per_expert: torch.Tensor,
-        permuted_probs: torch.Tensor | None,
-    ) -> torch.Tensor:
-        local_counts = getattr(self.dispatcher, "_local_tpe_list", None)
-        if local_counts is not None:
-            tokens_per_expert = torch.tensor(
-                local_counts,
-                device=tokens_per_expert.device,
-                dtype=tokens_per_expert.dtype,
-            )
-        if permuted_probs is None:
-            permuted_probs = hidden_states.new_zeros(
-                hidden_states.shape[0], dtype=torch.float32
-            )
-        count = self.experts.num_local_experts
-        w13 = tuple(getattr(self.experts.fc1, f"weight{i}") for i in range(count))
-        w2 = tuple(getattr(self.experts.fc2, f"weight{i}") for i in range(count))
-        return VLLMGroupedMoEWithBF16Backward.apply(
-            hidden_states,
-            tokens_per_expert,
-            permuted_probs,
-            0.0,
-            *w13,
-            *w2,
-        )
+    def _build_experts(self, config: DeepseekV4Config, ps: ParallelState) -> nn.Module:
+        return _VLLMVisibleExperts(config, ps)
 
     def _visible_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_up = block_fp8_linear(
@@ -216,10 +227,11 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
             topk_ids.to(dtype=torch.int64),
         )
         self.dispatcher.wait_dispatch_event()
-        output = self._visible_experts(
+        output = self.experts(
             dispatched,
             tokens_per_expert,
             permuted_probs,
+            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
         )
         output = self.dispatcher.combine(output)
         if self.shared_experts is not None:

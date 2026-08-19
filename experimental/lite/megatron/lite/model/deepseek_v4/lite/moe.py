@@ -40,7 +40,7 @@ class DeepseekV4MoE(nn.Module):
             )
         else:
             self.gate._non_persistent_buffers_set.discard("expert_bias")
-        self.experts = Experts(config, ps)
+        self.experts = self._build_experts(config, ps)
         shared_intermediate = config.n_shared_experts * config.moe_intermediate_size
         self.shared_experts = (
             SwiGLUMLP(
@@ -58,6 +58,9 @@ class DeepseekV4MoE(nn.Module):
             use_deepep=use_deepep,
             deepep_align_to_low_latency=deepep_align_to_low_latency,
         )
+
+    def _build_experts(self, config: DeepseekV4Config, ps: ParallelState) -> nn.Module:
+        return Experts(config, ps)
 
     def _hash_route(
         self,
