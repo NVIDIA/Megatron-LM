@@ -177,11 +177,15 @@ def load_model_to_gpu(model_list: list, load_grad: bool = True) -> None:
 
 def offload_optimizer(optimizer) -> None:
     """Offload optimizer states to CPU."""
-    from megatron.core.optimizer import ChainedOptimizer
+    try:
+        from megatron.core.optimizer import ChainedOptimizer
+    except ImportError:
+        ChainedOptimizer = ()
 
     for _opt in _iter_opts(optimizer, ChainedOptimizer):
-        if _opt.optimizer is not None:
-            hdo = _opt.optimizer
+        state_owner = getattr(_opt, "optimizer", _opt)
+        if state_owner is not None:
+            hdo = state_owner
             if all(
                 hasattr(hdo, a) for a in ("sub_optimizers", "inner_param_to_orig_param", "state")
             ):
@@ -193,11 +197,10 @@ def offload_optimizer(optimizer) -> None:
                             orig_param = hdo.inner_param_to_orig_param.get(param, param)
                             hdo.state[orig_param][k] = state[k] = v.to("cpu")
             else:
-                for v in _opt.optimizer.state.values():
-                    if "exp_avg" in v:
-                        v["exp_avg"] = v["exp_avg"].to("cpu", non_blocking=True)
-                    if "exp_avg_sq" in v:
-                        v["exp_avg_sq"] = v["exp_avg_sq"].to("cpu", non_blocking=True)
+                for state in hdo.state.values():
+                    for key, value in state.items():
+                        if isinstance(value, torch.Tensor):
+                            state[key] = value.to("cpu", non_blocking=True)
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -205,18 +208,21 @@ def offload_optimizer(optimizer) -> None:
 
 def load_optimizer(optimizer) -> None:
     """Load optimizer states back to GPU."""
-    from megatron.core.optimizer import ChainedOptimizer
+    try:
+        from megatron.core.optimizer import ChainedOptimizer
+    except ImportError:
+        ChainedOptimizer = ()
 
     for _opt in _iter_opts(optimizer, ChainedOptimizer):
-        if _opt.optimizer is not None:
-            if hasattr(_opt.optimizer, "_move_new_state_to_right_device"):
-                _opt.optimizer._move_new_state_to_right_device()
+        state_owner = getattr(_opt, "optimizer", _opt)
+        if state_owner is not None:
+            if hasattr(state_owner, "_move_new_state_to_right_device"):
+                state_owner._move_new_state_to_right_device()
             else:
-                for v in _opt.optimizer.state.values():
-                    if "exp_avg" in v:
-                        v["exp_avg"] = v["exp_avg"].to("cuda", non_blocking=True)
-                    if "exp_avg_sq" in v:
-                        v["exp_avg_sq"] = v["exp_avg_sq"].to("cuda", non_blocking=True)
+                for state in state_owner.state.values():
+                    for key, value in state.items():
+                        if isinstance(value, torch.Tensor):
+                            state[key] = value.to("cuda", non_blocking=True)
 
     gc.collect()
     torch.cuda.empty_cache()

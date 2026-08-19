@@ -60,6 +60,7 @@ class ImplConfig:
     use_thd: bool = False
     use_deepep: bool = False
     attention_backend_override: str | None = None
+    apply_dsa_kernel_fusion: bool = True
     deterministic: bool = True
     mtp_enable: bool = True
     mtp_enable_train: bool = False
@@ -338,6 +339,21 @@ def _configure_attention_backend(chunks: list[nn.Module], *, backend: str | None
                 module.attention_backend = backend_name
 
 
+def _configure_dsa_kernel_fusion(chunks: list[nn.Module], *, enabled: bool) -> None:
+    """Select CSA's documented fused production path or reference fallback.
+
+    The pinned report-23 runtime carries cudnn-frontend 1.25, whose DSA
+    indexer cannot represent the per-sequence causal offsets required by
+    native CP.  MCore's CSA module already owns a complete non-fused fallback
+    for this case; expose that existing implementation choice through the
+    runtime config instead of silently dropping offsets or replacing wheels.
+    """
+    for chunk in chunks:
+        for module in chunk.modules():
+            if hasattr(module, "apply_dsa_kernel_fusion"):
+                module.apply_dsa_kernel_fusion = bool(enabled)
+
+
 def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
     # Native DS4 chunks are DeepseekV4Model instances themselves. Keep support
     # for wrapper-style chunks, but do not require a `.model` indirection or
@@ -367,8 +383,77 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
         )
 
 
+def build_training_backend(
+    chunks: list[nn.Module],
+    model_cfg: DeepseekV4Config,
+    impl_cfg,
+    ps: ParallelState,
+    *,
+    unit_modules: tuple[type[nn.Module], ...],
+    use_fp32_shards: bool,
+    cast_forward_inputs: bool = True,
+):
+    """Build the shared DS4 runtime-owned optimizer backend."""
+
+    optimizer_name = _optimizer_backend_name(impl_cfg.optimizer)
+    if optimizer_name == "dist_opt":
+        from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
+        from megatron.lite.primitive.optimizers.megatron_wrap import (
+            build_dist_opt_training_optimizer,
+        )
+        from megatron.lite.runtime.megatron_utils import register_training_hooks
+
+        optimizer, finalize_grads = build_dist_opt_training_optimizer(
+            chunks,
+            model_cfg=model_cfg,
+            impl_cfg=impl_cfg,
+            ps=ps,
+            model_name="deepseek_v4",
+            is_expert=is_expert_param,
+            deterministic=impl_cfg.deterministic,
+        )
+        attach_model_sharded_state_dict(
+            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
+        )
+        register_training_hooks(chunks, optimizer)
+        return optimizer, finalize_grads, None, "dist_opt"
+    if optimizer_name == "fsdp2":
+        config = impl_cfg.optimizer_config or OptimizerConfig()
+
+        def post_model_load_hook():
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
+
+            return {
+                "optimizer": build_fsdp2_training_optimizer(
+                    chunks,
+                    config,
+                    ps,
+                    unit_modules=unit_modules,
+                    expert_classifier=is_expert_param,
+                    deterministic=impl_cfg.deterministic,
+                    vpp=impl_cfg.parallel.vpp,
+                    leaf_module_names=(),
+                    use_fp32_shards=use_fp32_shards,
+                    cast_forward_inputs=cast_forward_inputs,
+                )
+            }
+
+        return None, None, post_model_load_hook, "fsdp2"
+    if optimizer_name is None:
+        return None, None, None, "none"
+    raise ValueError(
+        "DeepSeek V4 optimizer must be runtime-owned dist_opt or fsdp2; "
+        f"got {optimizer_name!r}"
+    )
+
+
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Model
+    from megatron.lite.model.deepseek_v4.lite.model import (
+        DeepseekV4Layer,
+        DeepseekV4Model,
+    )
 
     p = impl_cfg.parallel
     _validate_parallel_scope(p)
@@ -409,6 +494,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
     chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
     _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
+    _configure_dsa_kernel_fusion(chunks, enabled=impl_cfg.apply_dsa_kernel_fusion)
 
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
     if recompute_spec:
@@ -424,58 +510,16 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     # Parametrize before optimizer construction so it captures the BF16 master.
     apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
 
-    optimizer = None
-    finalize_grads = None
-    post_model_load_hook = None
-    optimizer_backend = "none"
-    optimizer_name = _optimizer_backend_name(impl_cfg.optimizer)
-    if optimizer_name == "dist_opt":
-        from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
-        from megatron.lite.primitive.optimizers.megatron_wrap import (
-            build_dist_opt_training_optimizer,
-        )
-        from megatron.lite.runtime.megatron_utils import register_training_hooks
-
-        optimizer, finalize_grads = build_dist_opt_training_optimizer(
+    optimizer, finalize_grads, post_model_load_hook, optimizer_backend = (
+        build_training_backend(
             chunks,
-            model_cfg=model_cfg,
-            impl_cfg=impl_cfg,
-            ps=ps,
-            model_name="deepseek_v4",
-            is_expert=is_expert_param,
-            deterministic=impl_cfg.deterministic,
+            model_cfg,
+            impl_cfg,
+            ps,
+            unit_modules=(DeepseekV4Layer,),
+            use_fp32_shards=False,
         )
-        attach_model_sharded_state_dict(
-            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
-        )
-        register_training_hooks(chunks, optimizer)
-        optimizer_backend = "dist_opt"
-    elif optimizer_name == "fsdp2":
-        optimizer_backend = "fsdp2"
-
-        def _post_model_load_hook():
-            from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
-
-            return {
-                "optimizer": build_fsdp2_training_optimizer(
-                    chunks,
-                    impl_cfg.optimizer_config,
-                    ps,
-                    unit_modules=(DeepseekV4Layer,),
-                    expert_classifier=is_expert_param,
-                    deterministic=impl_cfg.deterministic,
-                    vpp=impl_cfg.parallel.vpp,
-                    leaf_module_names=(),
-                    use_fp32_shards=False,
-                )
-            }
-
-        post_model_load_hook = _post_model_load_hook
-    elif optimizer_name is None:
-        optimizer_backend = "none"
-    else:
-        raise ValueError(f"Unknown DeepSeek V4 lite optimizer: {impl_cfg.optimizer!r}.")
+    )
 
     return ModelBundle(
         chunks=chunks,

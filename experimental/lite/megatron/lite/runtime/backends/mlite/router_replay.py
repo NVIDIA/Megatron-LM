@@ -18,7 +18,14 @@ from megatron.lite.primitive.modules.router_replay import (
 from megatron.lite.primitive.parallel.thd import parallel_state_from_model
 
 R3_SUPPORTED_MODELS = frozenset(
-    {"qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2"}
+    {
+        "qwen3_moe",
+        "qwen3_5",
+        "deepseek_v4",
+        "deepseek_v4_vllm",
+        "glm5",
+        "kimi_k2",
+    }
 )
 
 
@@ -164,6 +171,7 @@ class RouterReplayDriver:
             print(
                 f"R3_REPLAY_EVIDENCE calls={stats['calls']} rows={stats['rows']} "
                 f"changed={stats['changed']} changed_frac={frac:.6f} "
+                f"sets_changed={stats['sets_changed']} "
                 f"routers={self._num_routers}",
                 flush=True,
             )

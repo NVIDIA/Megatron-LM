@@ -18,6 +18,7 @@ nothing, and leaves the params untouched.
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -156,6 +157,46 @@ def test_ds4_load_hf_canonicalizes_qat_state_before_dynamic_mapping(tmp_path):
     ckpt.load_hf_weights(model, str(tmp_path), cfg, ps)
 
     torch.testing.assert_close(master, expected)
+
+
+def test_ds4_shared_checkpoint_preserves_reversible_fp8_source_scale(tmp_path):
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+    from safetensors.torch import save_file
+
+    ckpt = _checkpoint_module()
+    model = _QATStage([0], 128)
+    qweight = torch.randn(128, 128).clamp(-4, 4).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.25]], dtype=torch.float32)
+    shard = "model-00001-of-00001.safetensors"
+    weight_name = "layers.0.attn.wq_a.weight"
+    scale_name = "layers.0.attn.wq_a.scale"
+    save_file({weight_name: qweight, scale_name: scale}, str(tmp_path / shard))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {weight_name: shard, scale_name: shard}})
+    )
+
+    cfg = DeepseekV4Config(num_hidden_layers=1, n_routed_experts=8)
+    ps = SimpleNamespace(
+        tp_size=1,
+        etp_size=1,
+        ep_size=1,
+        ep_rank=0,
+        dp_cp_group=None,
+    )
+    ckpt.load_hf_weights(model, str(tmp_path), cfg, ps)
+
+    master = model.layers["0"].self_attn.self_attn.wq_a.weight
+    restored = ckpt.requantize_block_fp8_weight(
+        master.detach().to(torch.bfloat16), master._fp8_source_scales
+    )
+    assert torch.equal(restored.qweight, qweight)
+    assert master._fp8_source_scale_version == master._version
+    assert torch.equal(
+        model._fp8_source_scales_by_name[
+            "layers.0.self_attn.self_attn.wq_a.weight"
+        ],
+        scale,
+    )
 
 
 def test_ds4_export_streams_router_buffers_from_every_pp_stage(monkeypatch):

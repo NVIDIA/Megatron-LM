@@ -6,26 +6,47 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.primitive import transformer_engine as te
-# Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core.
-# The development branch groups them under the csa_utils package.
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-    cp_layout_kernels as csa_cp_layout_kernels,
-)
-from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+# Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core. The
+# lite CSA module reuses Core's differentiable kernels, CP row-mapping utilities,
+# and CuTeDSL layout kernels rather than vendoring them; see the module docstring
+# of ``csa_cp_utils`` / ``csa_cp_layout_kernels`` for the exact contracts.
+try:
+    from megatron.core.transformer.experimental_attention_variant import (
+        csa_cp_layout_kernels,
+        csa_cp_utils as cp_utils,
+    )
+except ImportError:
+    # MCore dev moved the CP helpers under csa_utils.  Keep Lite compatible
+    # with both the preview layout and the current upstream package layout.
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        cp_layout_kernels as csa_cp_layout_kernels,
+        cp_utils,
+    )
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
-    FusedCSAIndexerSparseAttnFromTopkFunc,
-    csa_sparse_attn,
-)
+# MCore moved the fused CSA entry points in the development branch. Keep the
+# Lite adapter compatible with both layouts while downstream snapshots migrate.
+try:
+    from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+        FusedCSAIndexerSparseAttnFromTopkFunc,
+        csa_sparse_attn,
+    )
+except ImportError:
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
+        FusedCSAIndexerSparseAttnFromTopkFunc,
+        csa_sparse_attn,
+    )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
 from megatron.lite.primitive.modules.attention.dsa import rotate_activation
+from megatron.lite.primitive.modules.attention.cp_geometry import (
+    gather_cp_compressed_rows,
+    prepare_cp_compression_geometry,
+)
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils.rotary import (
     _yarn_find_correction_range,
@@ -872,26 +893,18 @@ class CompressedSparseAttention(nn.Module):
         calculate_per_token_loss = self.calculate_per_token_loss
 
         if self.compressor is not None and ratio > 1:
-            compressed_lens = torch.div(
-                cu_seqlens[1:] - cu_seqlens[:-1], ratio, rounding_mode="floor"
+            compression_geometry = prepare_cp_compression_geometry(
+                x,
+                boundary_hidden,
+                cu_seqlens,
+                global_start=global_start,
+                cp_size=cp_size,
+                ratio=ratio,
             )
-            cu_seqlens_compressed = torch.cat(
-                (
-                    torch.zeros_like(cu_seqlens[:1]),
-                    torch.cumsum(compressed_lens, dim=0, dtype=torch.int32),
-                )
-            )
-            hidden_compact, compressed_group_ids, seq_to_rank_row = (
-                cp_utils.prepare_cp_compressor_input(
-                    x,
-                    boundary_hidden,
-                    cu_seqlens,
-                    cu_seqlens_compressed,
-                    global_start,
-                    cp_size,
-                    ratio,
-                )
-            )
+            cu_seqlens_compressed = compression_geometry.cu_seqlens_compressed
+            hidden_compact = compression_geometry.hidden_compact
+            compressed_group_ids = compression_geometry.compressed_group_ids
+            seq_to_rank_row = compression_geometry.seq_to_rank_row
 
             if indexer is not None:
                 indexer_x, indexer_qr = x.detach(), qr.detach()
@@ -927,11 +940,10 @@ class CompressedSparseAttention(nn.Module):
                     max_seqlen_q=max_seqlen_q,
                     compressed_group_ids=compressed_group_ids,
                 )
-                k_indexer_rank_major = gather_from_sequence_parallel_region(
-                    indexer_compressed_local.squeeze(1), group=cp_group
-                )
-                k_indexer_seq_major = torch.index_select(
-                    k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
+                k_indexer_rank_major, k_indexer_seq_major = gather_cp_compressed_rows(
+                    indexer_compressed_local.squeeze(1),
+                    seq_to_rank_row,
+                    cp_group=cp_group,
                 )
                 compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
                     q_indexer_cp,
@@ -953,8 +965,10 @@ class CompressedSparseAttention(nn.Module):
                 max_seqlen_q=max_seqlen_q,
                 compressed_group_ids=compressed_group_ids,
             )
-            compressed_kv_rank_major = gather_from_sequence_parallel_region(
-                compressed_kv_local.squeeze(1), group=cp_group
+            compressed_kv_rank_major, _ = gather_cp_compressed_rows(
+                compressed_kv_local.squeeze(1),
+                seq_to_rank_row,
+                cp_group=cp_group,
             )
 
         kv_full_thd = torch.cat((boundary_kv, kv_local, compressed_kv_rank_major), dim=0)

@@ -234,19 +234,41 @@ class SigmoidTopKRouter(nn.Module):
                 "num_groups": self.num_groups,
                 "group_topk": self.group_topk,
             }
-        probs_dense, routing_map = topk_routing_with_score_function(
-            logits,
-            self.topk,
-            use_pre_softmax=self.use_pre_softmax,
-            score_function=self.score_function,
-            expert_bias=self.expert_bias.to(logits.dtype),
-            scaling_factor=(self.scaling_factor or None),
-            fused=self.moe_router_fusion,
-            **routing_kwargs,
-        )
-        topk_scores, topk_indices = _ordered_topk_from_routing_map(
-            probs_dense, routing_map, self.topk
-        )
+        # DeepSeek-V4's rollout kernel exposes top-k slots in descending
+        # (score + expert_bias) order.  Reconstructing indices from the dense
+        # routing map sorts by expert id and loses that observable slot order,
+        # so an otherwise identical R3 target ceases to be a no-op.  Preserve
+        # the selector's original indices for the DS4 score function.  Other
+        # sigmoid-family models retain their established expert-id order.
+        if self.score_function == "sqrtsoftplus" and not self.moe_router_fusion:
+            topk_scores, topk_indices = topk_routing_with_score_function(
+                logits,
+                self.topk,
+                use_pre_softmax=self.use_pre_softmax,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias.to(logits.dtype),
+                scaling_factor=(self.scaling_factor or None),
+                fused=False,
+                dense_output=True,
+                **routing_kwargs,
+            )
+            routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(
+                1, topk_indices, True
+            )
+        else:
+            probs_dense, routing_map = topk_routing_with_score_function(
+                logits,
+                self.topk,
+                use_pre_softmax=self.use_pre_softmax,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias.to(logits.dtype),
+                scaling_factor=(self.scaling_factor or None),
+                fused=self.moe_router_fusion,
+                **routing_kwargs,
+            )
+            topk_scores, topk_indices = _ordered_topk_from_routing_map(
+                probs_dense, routing_map, self.topk
+            )
         if self.router_replay is not None:
             selected_indices = self.router_replay.select_indices(topk_indices)
             if selected_indices is not topk_indices:

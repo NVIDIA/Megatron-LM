@@ -362,6 +362,7 @@ def build_fsdp2_training_optimizer(
     backward_prefetch_depth: int = _DEFAULT_BACKWARD_PREFETCH_DEPTH,
     param_dtype: str | torch.dtype | None = _DEFAULT_PARAM_DTYPE,
     reduce_dtype: str | torch.dtype | None = _DEFAULT_REDUCE_DTYPE,
+    cast_forward_inputs: bool | None = True,
     use_fp32_shards: bool | None = None,
     use_fp32_master: bool | None = None,
     adamw_foreach: bool | str = _DEFAULT_ADAMW_FOREACH,
@@ -417,6 +418,7 @@ def build_fsdp2_training_optimizer(
         backward_prefetch_depth=_fsdp2_prefetch_depth(ps, default_depth=backward_prefetch_depth),
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
+        cast_forward_inputs=cast_forward_inputs,
     )
     if effective_use_fp32_shards:
         model_param_dtypes = _collect_model_param_dtypes(model_chunks)

@@ -8,7 +8,13 @@ from typing import Any
 
 import torch
 
+from megatron.lite.model.deepseek_v4.quantization import (
+    is_release_unquantized_weight,
+)
 from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+from megatron.lite.primitive.quantization.deployment_block_fp8 import (
+    requantize_block_fp8_weight,
+)
 from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
 
 _EXPERT_DTYPES = {"fp4", "fp8"}
@@ -24,19 +30,6 @@ def _matches_prefix(name: str, prefix: str) -> bool:
 
 def is_routed_expert(name: str) -> bool:
     return ".ffn.experts." in name and ".shared_experts." not in name
-
-
-def is_release_unquantized_weight(name: str) -> bool:
-    """Match the unscaled families in the official V4 Flash checkpoint index."""
-    if name in {"embed.weight", "head.weight", "norm.weight"}:
-        return True
-    if name.endswith("norm.weight") or name.endswith(".ffn.gate.weight"):
-        return True
-    if ".attn.compressor." in name:
-        return True
-    if ".attn.indexer." in name and not name.endswith(".attn.indexer.wq_b.weight"):
-        return True
-    return False
 
 
 def _quantization_contract(
@@ -78,6 +71,7 @@ def export_resync_weights(
     config: Any,
     *,
     resync_config: Mapping[str, Any] | None = None,
+    source_scales: Mapping[str, torch.Tensor] | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Convert gathered DS4 BF16 weights to original checkpoint representation."""
     expert_dtype, block_shape, ignored = _quantization_contract(config, resync_config)
@@ -86,11 +80,6 @@ def export_resync_weights(
     # representation; serializing them as UE8M0 causes a large online-reload
     # regression even though W4/MXFP4 legitimately uses UE8M0 scales.
     fp8_scale_format = "e8m0" if expert_dtype == "fp4" else "float32"
-    # Run MXFP4 / block-FP8 on the GPU when it is available: SFT save
-    # gathers on CPU (rank0_only, cpu=True) and CPU quantization is
-    # Python/torch-op bound (~30x slower than the write). RL online resync
-    # already runs on GPU tensors, so the H2D/D2H copies are skipped.
-    quant_on_gpu = torch.cuda.is_available()
 
     for name, tensor in weights:
         if (
@@ -103,17 +92,27 @@ def export_resync_weights(
             yield name, tensor
             continue
 
-        needs_move_to_gpu = quant_on_gpu and tensor.device.type != "cuda"
-        source = tensor.cuda(non_blocking=True) if needs_move_to_gpu else tensor
-        if is_routed_expert(name) and expert_dtype == "fp4":
-            quantized, scale = quantize_mxfp4(source)
+        fixed_scale = None if source_scales is None else source_scales.get(name)
+        if fixed_scale is not None and is_routed_expert(name):
+            raise RuntimeError("routed MXFP4 weights cannot carry block-FP8 source scales")
+        if fixed_scale is not None:
+            canonical = requantize_block_fp8_weight(
+                tensor.to(torch.bfloat16),
+                fixed_scale.to(tensor.device, dtype=torch.float32).contiguous(),
+            )
+            quantized, scale = canonical.qweight, canonical.scales
+            if fp8_scale_format == "e8m0":
+                scale = (
+                    (scale.view(torch.int32) >> 23)
+                    .to(torch.uint8)
+                    .view(torch.float8_e8m0fnu)
+                )
+        elif is_routed_expert(name) and expert_dtype == "fp4":
+            quantized, scale = quantize_mxfp4(tensor)
         else:
             quantized, scale = quantize_block_fp8(
-                source, block_shape, scale_format=fp8_scale_format
+                tensor, block_shape, scale_format=fp8_scale_format
             )
-        if needs_move_to_gpu:
-            quantized = quantized.to(tensor.device)
-            scale = scale.to(tensor.device)
         yield name, quantized
         yield _scale_name(name), scale
 

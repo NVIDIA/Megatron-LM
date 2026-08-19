@@ -63,6 +63,7 @@ class RouterReplay:
     # no-op is indistinguishable from a working one without these counters.
     replay_rows_total: int = 0
     replay_rows_changed: int = 0
+    replay_sets_changed: int = 0
     replay_calls: int = 0
 
     def __init__(self) -> None:
@@ -78,6 +79,7 @@ class RouterReplay:
     def reset_replay_stats() -> None:
         RouterReplay.replay_rows_total = 0
         RouterReplay.replay_rows_changed = 0
+        RouterReplay.replay_sets_changed = 0
         RouterReplay.replay_calls = 0
 
     @staticmethod
@@ -86,6 +88,7 @@ class RouterReplay:
             "calls": RouterReplay.replay_calls,
             "rows": RouterReplay.replay_rows_total,
             "changed": RouterReplay.replay_rows_changed,
+            "sets_changed": RouterReplay.replay_sets_changed,
         }
 
     @staticmethod
@@ -174,6 +177,13 @@ class RouterReplay:
                 "router replay target shape does not match live routing: "
                 f"target={tuple(target.shape)} live={tuple(native_indices.shape)}."
             )
+        # R3 replays the rollout tensor exactly, including its top-k slot order.
+        # The order is observable to deterministic dispatch/combine kernels and
+        # therefore belongs to the replay contract, even when the expert set is
+        # unchanged.  ``same_set`` is diagnostic evidence only.
+        same_set = torch.eq(
+            target.sort(dim=-1).values, native_indices.sort(dim=-1).values
+        ).all(dim=-1, keepdim=True)
         if mask is None:
             selected = target
         else:
@@ -185,11 +195,16 @@ class RouterReplay:
                     f"router replay mask length does not match routing rows: mask={mask.size(0)} rows={target.size(0)}."
                 )
             selected = torch.where(mask, target, native_indices)
-        self._record_replay_stats(native_indices, selected)
+        self._record_replay_stats(native_indices, selected, same_set, mask)
         return selected
 
     @staticmethod
-    def _record_replay_stats(native: torch.Tensor, selected: torch.Tensor) -> None:
+    def _record_replay_stats(
+        native: torch.Tensor,
+        selected: torch.Tensor,
+        same_set: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> None:
         """Accumulate how many routing rows replay actually changed.
 
         Counted per (token, top-k slot) row so the number is comparable across
@@ -200,6 +215,10 @@ class RouterReplay:
             RouterReplay.replay_calls += 1
             RouterReplay.replay_rows_total += int(native.numel())
             RouterReplay.replay_rows_changed += int((selected != native).sum().item())
+            set_changed = ~same_set.squeeze(-1)
+            if mask is not None:
+                set_changed &= mask.squeeze(-1)
+            RouterReplay.replay_sets_changed += int(set_changed.sum().item())
 
 
 def attach_router_replay(model: nn.Module, *, reset: bool = True) -> int:

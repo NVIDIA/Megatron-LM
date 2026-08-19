@@ -30,7 +30,7 @@ def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:
     fp8_utils.load_quanted_weights = (
         lambda weights, runner: captured_weights.extend(weights) or "loaded"
     )
-    dsv4_utils = ModuleType("verl.utils.vllm.vllm_dsv4_fp8_utils")
+    dsv4_utils = ModuleType("verl.utils.vllm.vllm_fp4_utils")
     dsv4_utils.is_deepseek_v4_model = lambda model: model.is_ds4
     vllm_config = ModuleType("vllm.config")
     reload_api = ModuleType("vllm.model_executor.model_loader.reload")
@@ -113,7 +113,7 @@ def test_non_ds4_keeps_verl_reload_path(monkeypatch) -> None:
         lambda runner, state: events.append(state)
     )
     fp8_utils.load_quanted_weights = lambda weights, runner: list(weights)
-    dsv4_utils = ModuleType("verl.utils.vllm.vllm_dsv4_fp8_utils")
+    dsv4_utils = ModuleType("verl.utils.vllm.vllm_fp4_utils")
     dsv4_utils.is_deepseek_v4_model = lambda model: False
     rollout_utils = ModuleType("verl.workers.rollout.vllm_rollout.utils")
     rollout_utils.load_quanted_weights = fp8_utils.load_quanted_weights

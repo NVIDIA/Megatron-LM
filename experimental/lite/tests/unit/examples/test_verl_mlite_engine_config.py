@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -150,6 +151,38 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
     assert config.attention_backend_override == "flash"
     assert config.impl_cfg["use_thd"] is True
     assert config.impl_cfg["deterministic"] is False
+
+
+def test_mlite_config_preserves_protocol_owned_non_thd_layout() -> None:
+    engine = _engine(
+        engine_config=_engine_config(
+            model_name="deepseek_v4",
+            impl="vllm",
+            impl_cfg={"use_thd": False, "use_deepep": True},
+        )
+    )
+
+    config = engine._build_mlite_config()
+
+    assert config.impl == "vllm"
+    assert config.impl_cfg["use_thd"] is False
+    assert config.impl_cfg["use_deepep"] is True
+
+
+def test_parameter_snapshot_records_step_change(monkeypatch, tmp_path) -> None:
+    from verl_mlite.engine.mlite_engine import _write_parameter_snapshot
+
+    module = torch.nn.Linear(2, 2, bias=False)
+    monkeypatch.setenv("VERL_MLITE_PARAM_SNAPSHOT_DIR", str(tmp_path))
+    _write_parameter_snapshot(module, phase="pre_step", rank=0)
+    with torch.no_grad():
+        module.weight.add_(1)
+    _write_parameter_snapshot(module, phase="post_step", rank=0)
+
+    before = json.loads((tmp_path / "rank00000.pre_step.json").read_text())
+    after = json.loads((tmp_path / "rank00000.post_step.json").read_text())
+    assert before["sampled_sha256"] != after["sampled_sha256"]
+    assert before["parameter_count"] == after["parameter_count"] == 4
 
 
 def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:

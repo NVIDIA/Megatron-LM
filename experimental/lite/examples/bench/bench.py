@@ -52,6 +52,7 @@ class BenchCliConfig:
     use_thd: bool = False
     same_data_across_dp: bool = False
     no_optimizer: bool = False
+    forward_only: bool = False
     skip_load_hf_weights: bool = False
     skip_optimizer_build: bool = False
     keep_experts: int | None = None
@@ -316,6 +317,7 @@ def build_session_config(cfg: BenchCliConfig) -> PretrainSessionConfig:
         use_thd=cfg.use_thd,
         same_data_across_dp=cfg.same_data_across_dp,
         no_optimizer=cfg.no_optimizer,
+        forward_only=cfg.forward_only,
     )
 
 
@@ -378,10 +380,52 @@ def run(cfg: BenchCliConfig) -> dict[str, Any]:
     rt_cfg = build_runtime_config(cfg)
     rt = create_runtime(rt_cfg)
     handle = rt.build_model()
+    grad_details: list[dict[str, Any]] = []
+
+    def capture_grad_details(step: int, model_handle, _result) -> None:
+        rows = []
+        chunks = model_handle._extras.get("model_chunks", [model_handle._model])
+        for chunk_idx, chunk in enumerate(chunks):
+            for name, parameter in sorted(chunk.named_parameters(), key=lambda item: item[0]):
+                grad = parameter.grad
+                if grad is None:
+                    grad = getattr(parameter, "main_grad", None)
+                if grad is None:
+                    continue
+                if hasattr(grad, "to_local"):
+                    grad = grad.to_local()
+                flat = grad.detach().float().reshape(-1)
+                rows.append(
+                    {
+                        "name": f"{chunk_idx}:{name}",
+                        "shape": list(grad.shape),
+                        "l2": float(flat.norm().item()) if flat.numel() else 0.0,
+                        "max_abs": (
+                            float(flat.abs().max().item()) if flat.numel() else 0.0
+                        ),
+                        "first8": [float(x) for x in flat[:8].cpu().tolist()],
+                    }
+                )
+        grad_details.append({"step": step, "rows": rows})
+
+    grad_details_path = os.environ.get("MLITE_BENCH_GRAD_DETAILS_PATH")
     result = run_pretrain_session(
-        rt, handle, build_session_config(cfg), step_reporter=_step_reporter
+        rt,
+        handle,
+        build_session_config(cfg),
+        step_reporter=_step_reporter,
+        post_backward_observer=capture_grad_details if grad_details_path else None,
     )
-    return result.to_dict()
+    artifact = result.to_dict()
+    rt.close(handle)
+    if grad_details_path and _distributed_rank() == 0:
+        details_path = Path(grad_details_path)
+        details_path.parent.mkdir(parents=True, exist_ok=True)
+        details_path.write_text(
+            json.dumps({"steps": grad_details}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    return artifact
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -405,6 +449,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-thd", action="store_true")
     parser.add_argument("--same-data-across-dp", action="store_true")
     parser.add_argument("--no-optimizer", action="store_true")
+    parser.add_argument(
+        "--forward-only",
+        action="store_true",
+        help="Run the public runtime's eval/no-grad forward-only schedule.",
+    )
     parser.add_argument("--skip-load-hf-weights", action="store_true")
     parser.add_argument("--skip-optimizer-build", action="store_true")
     parser.add_argument("--keep-experts", type=int, default=None)

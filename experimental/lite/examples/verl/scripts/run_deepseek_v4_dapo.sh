@@ -55,6 +55,7 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-6144}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}"
+ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 
 PARAM_OFFLOAD="${PARAM_OFFLOAD:-True}"
 OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-True}"
@@ -101,13 +102,13 @@ case "${ROLLOUT_WEIGHT_BITS}" in
   4)
     ROLLOUT_RESYNC_FORMAT=mxfp4
     ROLLOUT_EXPERT_DTYPE=fp4
-    ROLLOUT_MOE_BACKEND=marlin
+    ROLLOUT_MOE_BACKEND="${ROLLOUT_MOE_BACKEND:-marlin}"
     ROLLOUT_SCALE_FMT=ue8m0
     ;;
   8)
     ROLLOUT_RESYNC_FORMAT=block_fp8
     ROLLOUT_EXPERT_DTYPE=fp8
-    ROLLOUT_MOE_BACKEND=flashinfer_cutlass
+    ROLLOUT_MOE_BACKEND="${ROLLOUT_MOE_BACKEND:-flashinfer_cutlass}"
     ROLLOUT_SCALE_FMT=float32
     ;;
   *)
@@ -298,7 +299,8 @@ ROLLOUT=(
   "actor_rollout_ref.rollout.response_length=${MAX_RESPONSE_LENGTH}"
   "actor_rollout_ref.rollout.max_model_len=${MAX_SEQ_LEN}"
   "actor_rollout_ref.rollout.max_num_seqs=32"
-  "actor_rollout_ref.rollout.max_num_batched_tokens=${MAX_SEQ_LEN}"
+  "actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
+  "actor_rollout_ref.rollout.enable_chunked_prefill=True"
   "actor_rollout_ref.rollout.temperature=1.0"
   "actor_rollout_ref.rollout.top_p=1.0"
   "actor_rollout_ref.rollout.top_k=-1"
@@ -375,7 +377,9 @@ if [[ "${COMPOSE_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
-python3 "${VALIDATOR}" environment
+if [[ "${VALIDATE_DS4_ENVIRONMENT:-1}" == "1" ]]; then
+  python3 "${VALIDATOR}" environment
+fi
 
 echo "[ds4-dapo] weights=expert-w${ROLLOUT_WEIGHT_BITS}/dense-w8 qat=${ENABLE_QAT} r3=${ENABLE_R3}"
 echo "[ds4-dapo] train=${TRAIN_FILES} val=${VAL_FILES} cmd=${CMD_FILE}"

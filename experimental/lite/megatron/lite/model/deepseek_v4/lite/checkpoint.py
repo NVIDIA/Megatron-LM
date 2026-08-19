@@ -24,14 +24,28 @@ CSA is not TP-capable: DS4 runs TP=ETP=1 (only EP shards experts), like GLM-5.
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+from megatron.lite.model.deepseek_v4.quantization import (
+    is_release_unquantized_weight,
+)
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.runtime.contracts.weights import ResyncFormat
+from megatron.lite.primitive.quantization.checkpoint_block_fp8 import (
+    BLOCK_SHAPE,
+    BlockFP8CheckpointDequantAdapter,
+)
+from megatron.lite.primitive.quantization.deployment_block_fp8 import (
+    requantize_block_fp8_weight,
+)
+from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 
 from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
     parse_expert_idx,
@@ -39,6 +53,14 @@ from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
 )
 
 _QUANTIZED_RESYNC_TARGETS = {ResyncFormat.BLOCK_FP8.value, ResyncFormat.MXFP4.value}
+
+
+def _scale_to_float32(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype == torch.float32:
+        return scale
+    if scale.dtype in {torch.uint8, torch.float8_e8m0fnu}:
+        return (scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+    raise TypeError(f"unsupported checkpoint block scale dtype {scale.dtype}")
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -204,7 +226,17 @@ def load_hf_weights(
         load_hf_weights as _load,
     )
 
-    _load(model, path, DeepseekV4WeightSpec(config), ps, vocab_size=config.vocab_size)
+    index_path = Path(path) / "model.safetensors.index.json"
+    source_block_fp8 = False
+    if index_path.is_file():
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+        weight_map = payload.get("weight_map", {})
+        source_block_fp8 = any(str(name).endswith(".scale") for name in weight_map)
+    spec = DeepseekV4WeightSpec(
+        config, source_block_fp8=source_block_fp8
+    )
+    _load(model, path, spec, ps, vocab_size=config.vocab_size)
+    spec.bind_source_scales(model)
 
 
 def _to_global_expert_name(
@@ -240,30 +272,30 @@ class DeepseekV4WeightSpec:
     ``weight<local>`` ids to global before calling ``native_to_hf``.
     """
 
-    # HF names whose released dtype is fp32.  These tensors are declared fp32
-    # at construction (see ``mhc.py`` / attention sinks / compressor.ape) but
-    # the protocol's module-wide ``.to(bfloat16)`` downcasts them; the export
-    # path re-materializes them as fp32 so the saved checkpoint matches the
-    # DeepSeek-V4-Flash release byte-for-byte in dtype.
-    _FP32_HF_SUFFIXES: tuple[str, ...] = (
-        ".attn_sink",
-        ".compressor.ape",
-        ".indexer.compressor.ape",
-        ".ffn.gate.bias",
-    )
-    _FP32_HF_INFIXES: tuple[str, ...] = ("hc_head_", ".hc_attn_", ".hc_ffn_")
-
-    def __init__(self, config: DeepseekV4Config):
+    def __init__(
+        self, config: DeepseekV4Config, *, source_block_fp8: bool = False
+    ):
         self.config = config
+        self.source_block_fp8 = source_block_fp8
+        self.source_block_scales: dict[str, torch.Tensor] = {}
 
-    def hf_export_dtype_override(self, hf_name: str) -> torch.dtype | None:
-        """Return an explicit export dtype for ``hf_name``, or ``None`` when
-        the shared exporter's default (usually the training dtype) is fine."""
-        if hf_name.endswith(self._FP32_HF_SUFFIXES):
-            return torch.float32
-        if any(marker in hf_name for marker in self._FP32_HF_INFIXES):
-            return torch.float32
-        return None
+    def _source_is_quantized(self, native_name: str) -> bool:
+        if not self.source_block_fp8:
+            return False
+        names = _hf_names_for_state_key(native_name, self.config)
+        return bool(names) and all(
+            name.endswith(".weight") and not is_release_unquantized_weight(name)
+            for name in names
+        )
+
+    def _load_names(self, native_name: str) -> list[str]:
+        names = _hf_names_for_state_key(native_name, self.config)
+        if not self._source_is_quantized(native_name):
+            return names
+        paired: list[str] = []
+        for name in names:
+            paired.extend((name, name.removesuffix(".weight") + ".scale"))
+        return paired
 
     @property
     def num_experts(self) -> int:
@@ -298,7 +330,7 @@ class DeepseekV4WeightSpec:
                 continue
             global_name = to_global_layer_name(name, layer_map)
             mapped_name = _to_global_expert_name(global_name, self.config, ps)
-            hf_names = _hf_names_for_state_key(mapped_name, self.config)
+            hf_names = self._load_names(mapped_name)
             if hf_names:
                 weight_map[mapped_name] = hf_names
         return weight_map
@@ -306,20 +338,87 @@ class DeepseekV4WeightSpec:
     def hf_to_native(
         self, native_name: str, hf_tensors: list[torch.Tensor]
     ) -> torch.Tensor:
-        del native_name
+        if self._source_is_quantized(native_name):
+            names = _hf_names_for_state_key(native_name, self.config)
+            if len(hf_tensors) != 2 * len(names):
+                raise ValueError(
+                    f"{native_name} requires weight/scale pairs for {len(names)} weights"
+                )
+            dequant = BlockFP8CheckpointDequantAdapter()
+            masters: list[torch.Tensor] = []
+            scales: list[torch.Tensor] = []
+            for name, weight, scale in zip(
+                names, hf_tensors[::2], hf_tensors[1::2], strict=True
+            ):
+                if weight.dtype == torch.float8_e4m3fn:
+                    fp32_scale = _scale_to_float32(scale)
+                    master = dequant(weight, scale)
+                    restored = requantize_block_fp8_weight(master, fp32_scale)
+                    if not torch.equal(restored.qweight, weight):
+                        changed = int((restored.qweight != weight).sum().item())
+                        raise RuntimeError(
+                            f"{name} is not reversible through BF16: "
+                            f"{changed}/{weight.numel()} FP8 bytes changed"
+                        )
+                    scales.append(fp32_scale)
+                elif weight.dtype == torch.int8:
+                    master = dequantize_mxfp4(weight, scale).to(torch.bfloat16)
+                else:
+                    raise TypeError(
+                        f"unsupported quantized checkpoint dtype {weight.dtype} for {name}"
+                    )
+                masters.append(master)
+            if scales:
+                if len(scales) != len(names):
+                    raise RuntimeError(
+                        f"{native_name} mixes FP8 and MXFP4 source tensors"
+                    )
+                self.source_block_scales[native_name] = (
+                    torch.cat(scales, dim=0) if len(scales) > 1 else scales[0]
+                )
+            return torch.cat(masters, dim=0) if len(masters) > 1 else masters[0]
         return torch.cat(hf_tensors, dim=0) if len(hf_tensors) == 2 else hf_tensors[0]
 
     def hf_target_shape(
         self, native_name: str, source_index: int, target_shape: torch.Size
     ) -> torch.Size:
-        del source_index
+        paired = self._source_is_quantized(native_name)
+        is_scale = paired and source_index % 2 == 1
+        source_index = source_index // 2 if paired else source_index
         if (
             len(_hf_names_for_state_key(native_name, self.config)) == 2
             and target_shape
             and target_shape[0] % 2 == 0
         ):
-            return torch.Size((target_shape[0] // 2, *target_shape[1:]))
-        return target_shape
+            weight_shape = torch.Size((target_shape[0] // 2, *target_shape[1:]))
+        else:
+            weight_shape = target_shape
+        if is_scale:
+            return torch.Size(
+                tuple(
+                    (size + block - 1) // block
+                    for size, block in zip(weight_shape, BLOCK_SHAPE, strict=True)
+                )
+            )
+        return weight_shape
+
+    def read_hf_source_raw(
+        self, native_name: str, source_index: int, source_name: str
+    ) -> bool:
+        del source_index, source_name
+        return self._source_is_quantized(native_name)
+
+    def bind_source_scales(self, model: nn.Module) -> None:
+        parameters = dict(model.named_parameters())
+        registry: dict[str, torch.Tensor] = {}
+        for name, scale in self.source_block_scales.items():
+            parameter = parameters[name]
+            value = scale.to(parameter.device, dtype=torch.float32).contiguous()
+            parameter._fp8_source_scales = value
+            parameter._fp8_source_scale_version = parameter._version
+            registry[name] = scale.detach().cpu().float().contiguous()
+        model._fp8_source_scales_by_name = registry
+        model._fp8_source_scales_valid = True
 
     @staticmethod
     def replica_group_for_load(native_name: str, ps: ParallelState):
@@ -404,14 +503,61 @@ def _export_unquantized_weights(
     )
 
     spec = DeepseekV4WeightSpec(config)
-    for name, tensor in _export(
-        model, spec, ps, vocab_size=config.vocab_size, **kwargs
-    ):
-        if tensor.is_floating_point():
-            override = spec.hf_export_dtype_override(name)
-            if override is not None and tensor.dtype != override:
-                tensor = tensor.to(override)
-        yield name, tensor
+    yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
+
+
+def invalidate_bound_source_scales(model: nn.Module) -> None:
+    """Invalidate checkpoint scales after the first optimizer update."""
+
+    model._fp8_source_scales_valid = False
+    model._fp8_source_scales_by_name = {}
+
+
+def _export_source_scales(
+    model, config: DeepseekV4Config, ps: ParallelState
+) -> dict[str, torch.Tensor]:
+    """Collect initial checkpoint scales under their exported HF names."""
+
+    chunks = list(model) if isinstance(model, (list, nn.ModuleList)) else [model]
+    local: dict[str, torch.Tensor] = {}
+    for chunk in chunks:
+        if not bool(getattr(chunk, "_fp8_source_scales_valid", False)):
+            continue
+        layer_map = {
+            local_idx: chunk.layer_indices[local_idx]
+            for local_idx in range(len(getattr(chunk, "layer_indices", ())))
+        }
+        for native_name, scale in getattr(
+            chunk, "_fp8_source_scales_by_name", {}
+        ).items():
+            global_name = to_global_layer_name(native_name, layer_map)
+            names = _hf_names_for_state_key(global_name, config)
+            values = (
+                scale.chunk(2, dim=0) if len(names) == 2 else (scale,)
+            )
+            for name, value in zip(names, values, strict=True):
+                value = value.detach().cpu().float().contiguous()
+                previous = local.get(name)
+                if previous is not None and not torch.equal(previous, value):
+                    raise RuntimeError(f"conflicting source scales for {name}")
+                local[name] = value
+
+    if ps.pp_size <= 1:
+        return local
+    if not dist.is_initialized() or ps.pp_group is None:
+        raise RuntimeError("PP source-scale export requires an initialized PP group")
+    gathered: list[dict[str, torch.Tensor] | None] = [None] * ps.pp_size
+    dist.all_gather_object(gathered, local, group=ps.pp_group)
+    combined: dict[str, torch.Tensor] = {}
+    for registry in gathered:
+        if registry is None:
+            raise RuntimeError("PP source-scale gather returned an empty stage")
+        for name, value in registry.items():
+            previous = combined.get(name)
+            if previous is not None and not torch.equal(previous, value):
+                raise RuntimeError(f"conflicting PP source scales for {name}")
+            combined[name] = value
+    return combined
 
 
 def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwargs):
@@ -426,6 +572,11 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
     resync_config = kwargs.pop("resync_config", None)
     if target not in {"hf", ResyncFormat.BF16.value, *_QUANTIZED_RESYNC_TARGETS}:
         raise ValueError(f"Unsupported DeepSeek-V4 export target: {target!r}")
+    source_scales = (
+        _export_source_scales(model, config, ps)
+        if target in _QUANTIZED_RESYNC_TARGETS
+        else {}
+    )
     weights = _export_unquantized_weights(model, config, ps, **kwargs)
     if target in _QUANTIZED_RESYNC_TARGETS:
         from megatron.lite.model.deepseek_v4.lite.resync import (  # isort: skip
@@ -441,7 +592,12 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
                     f"got {configured_dtype!r}"
                 )
             resync_config["expert_dtype"] = "fp4"
-        yield from export_resync_weights(weights, config, resync_config=resync_config)
+        yield from export_resync_weights(
+            weights,
+            config,
+            resync_config=resync_config,
+            source_scales=source_scales,
+        )
     else:
         if resync_config:
             raise ValueError(
@@ -470,6 +626,7 @@ __all__ = [
     "DeepseekV4WeightSpec",
     "PLACEMENT_FN",
     "export_hf_weights",
+    "invalidate_bound_source_scales",
     "load_hf_weights",
     "save_hf_weights",
 ]

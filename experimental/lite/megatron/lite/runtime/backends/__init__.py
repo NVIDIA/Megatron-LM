@@ -60,6 +60,16 @@ class Runtime(ABC):
     @abstractmethod
     def load_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> int: ...
 
+    def close(self, handle: ModelHandle) -> None:
+        """Release runtime-owned resources associated with ``handle``.
+
+        Backends without explicit-lifecycle resources may keep the default
+        no-op.  Callers should invoke this collectively for distributed
+        handles before process-group teardown.
+        """
+
+        return None
+
     # Mode switching
 
     @abstractmethod

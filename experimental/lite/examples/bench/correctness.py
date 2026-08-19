@@ -63,6 +63,8 @@ def _scalar(value: float | int | torch.Tensor | None) -> dict[str, Any]:
 def _hash_tensor(tensor: torch.Tensor | None) -> dict[str, Any] | None:
     if tensor is None:
         return None
+    if hasattr(tensor, "to_local"):
+        tensor = tensor.to_local()
     t = tensor.detach().contiguous().cpu()
     raw = t.view(torch.uint8).numpy().tobytes()
     as_bf16 = t.to(torch.bfloat16).contiguous() if t.is_floating_point() else None
@@ -84,6 +86,7 @@ def _hash_tensor(tensor: torch.Tensor | None) -> dict[str, Any] | None:
             "min": float(flat.min().item()) if flat.numel() else 0.0,
             "max": float(flat.max().item()) if flat.numel() else 0.0,
             "mean": float(flat.mean().item()) if flat.numel() else 0.0,
+            "l2": float(flat.norm().item()) if flat.numel() else 0.0,
             "first8": [float(x) for x in flat[:8].tolist()],
         }
     return result
@@ -378,7 +381,7 @@ def run_backend(
                 }
             )
 
-    return {
+    artifact = {
         "kind": "mlite_bench_correctness",
         "backend": cfg.backend,
         "model_name": cfg.model_name,
@@ -395,6 +398,8 @@ def run_backend(
             "use_thd": cfg.use_thd,
         },
     }
+    rt.close(handle)
+    return artifact
 
 
 def _add_run_args(parser: argparse.ArgumentParser) -> None:

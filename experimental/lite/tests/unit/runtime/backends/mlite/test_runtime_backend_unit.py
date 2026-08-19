@@ -623,6 +623,45 @@ def test_model_handle_dp_defaults():
     assert handle.dp_group is None
 
 
+def test_runtime_close_destroys_deepep_buffers_once_in_stable_order(monkeypatch):
+    events = []
+
+    class FakeDeepEPBuffer:
+        def __init__(self, name):
+            self.name = name
+            self.runtime = object()
+
+        def destroy(self):
+            events.append(self.name)
+            self.runtime = None
+
+    FakeDeepEPBuffer.__module__ = "deep_ep.buffer"
+
+    class Owner(nn.Module):
+        def __init__(self, buffer, route_buffer=None):
+            super().__init__()
+            self.buffer = buffer
+            self.route_buffer = route_buffer
+
+    root = nn.Module()
+    shared = FakeDeepEPBuffer("shared")
+    root.add_module("z", Owner(FakeDeepEPBuffer("z")))
+    root.add_module("a", Owner(shared, shared))
+    handle = ModelHandle(
+        model=root,
+        _extras={"model_chunks": [root], "close_hook": lambda: events.append("hook")},
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).close(handle)
+
+    assert events == ["shared", "z", "hook"]
+    assert "close_hook" not in handle._extras
+    assert root.a.buffer is None
+    assert root.a.route_buffer is None
+    assert root.z.buffer is None
+
+
 def test_model_handle_dp_from_parallel_state():
     ps = MagicMock()
     ps.dp_rank = 3

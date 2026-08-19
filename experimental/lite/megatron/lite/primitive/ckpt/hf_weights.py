@@ -287,6 +287,16 @@ class SafeTensorReader:
                 tensor = f.get_tensor(name)
         return tensor if device.type == "cpu" else tensor.to(device)
 
+    def get_raw_tensor(
+        self,
+        name: str,
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Read a serialized tensor without implicit quantized-weight conversion."""
+        target_device = torch.device(self.device if device is None else device)
+        return self._get_raw_tensor(name, target_device)
+
     def _get_groupwise_int4(self, name: str, device: torch.device) -> torch.Tensor:
         packed = self._get_raw_tensor(f"{name}_packed", device)
         scale = self._get_raw_tensor(f"{name}_scale", device)
@@ -854,6 +864,25 @@ def set_expert_idx(name: str, idx: int) -> str:
     return re.sub(r"weight\d+$", f"weight{idx}", name)
 
 
+def _export_expert_local_idx(name: str, spec: HFWeights) -> int:
+    """Return the stage-local expert suffix used by an export source tensor.
+
+    Most Lite models use ``weight<N>`` names, but model implementations are
+    allowed to use a different native naming scheme.  In particular DS4-vLLM
+    stores experts as ``...experts.w13.<N>`` / ``...w2.<N>``.  Falling back to
+    the legacy parser keeps existing specs unchanged while letting such models
+    define the export boundary explicitly.
+    """
+    resolver = getattr(spec, "export_expert_local_id", None)
+    return int(resolver(name)) if callable(resolver) else parse_expert_idx(name)
+
+
+def _export_expert_name(name: str, idx: int, spec: HFWeights) -> str:
+    """Rewrite an export source tensor name with ``idx`` as its expert ID."""
+    resolver = getattr(spec, "export_expert_name", None)
+    return resolver(name, idx) if callable(resolver) else set_expert_idx(name, idx)
+
+
 def to_global_layer_name(name: str, layer_map: dict[int, int]) -> str:
     if not layer_map:
         return name
@@ -1255,6 +1284,7 @@ def _read_hf_tensors(
 ) -> list[torch.Tensor]:
     candidate_hook = getattr(spec, "hf_name_candidates", None)
     shape_hook = getattr(spec, "hf_target_shape", None)
+    raw_source_hook = getattr(spec, "read_hf_source_raw", None)
     tensors: list[torch.Tensor] = []
     for index, hf_name in enumerate(hf_names):
         candidates = (
@@ -1276,12 +1306,21 @@ def _read_hf_tensors(
             )
         else:
             target_shape = None
-        tensor = reader.get_tensor(
-            resolved,
-            device="cpu" if isinstance(target, DTensor) else target.device,
-            target_shape=target_shape,
-            target_dtype=target.dtype,
+        read_raw = (
+            raw_source_hook(native_name, index, resolved)
+            if callable(raw_source_hook)
+            else False
         )
+        read_device = "cpu" if isinstance(target, DTensor) else target.device
+        if read_raw:
+            tensor = reader.get_raw_tensor(resolved, device=read_device)
+        else:
+            tensor = reader.get_tensor(
+                resolved,
+                device=read_device,
+                target_shape=target_shape,
+                target_dtype=target.dtype,
+            )
         transform_source = getattr(spec, "transform_hf_source", None)
         if callable(transform_source):
             tensor = transform_source(native_name, index, resolved, tensor)
@@ -1480,7 +1519,7 @@ def export_hf_weights(
             expert_bucket_bytes = 0
             experts_per_rank = spec.num_experts // ps.ep_size
             for native_name, _, shards in gathered_bucket:
-                local_idx = parse_expert_idx(native_name)
+                local_idx = _export_expert_local_idx(native_name, spec)
                 packed_group_name = getattr(spec, "packed_expert_group_name", None)
                 packed_name = (
                     packed_group_name(native_name)
@@ -1489,7 +1528,7 @@ def export_hf_weights(
                 )
                 for ep_rank, shard in enumerate(shards):
                     global_idx = ep_rank * experts_per_rank + local_idx
-                    global_name = set_expert_idx(native_name, global_idx)
+                    global_name = _export_expert_name(native_name, global_idx, spec)
                     export_shard = _maybe_cpu(shard, cpu=cpu)
                     if packed_name is None:
                         yield from _iter_mapped({global_name: export_shard})
@@ -1696,14 +1735,16 @@ def _gather_expert(
     tensor = _gather_expert_etp(name, tensor, spec, ps)
 
     # EP gather: global_id = ep_rank * n_local + local_id.
-    local_idx = parse_expert_idx(name)
+    local_idx = _export_expert_local_idx(name, spec)
     if ps.ep_size > 1 and ps.ep_group is not None:
         n_local = spec.num_experts // ps.ep_size
         ep_gathered = [torch.empty_like(tensor) for _ in range(ps.ep_size)]
         _ep_all_gather(ep_gathered, tensor.contiguous(), ps.ep_group)
         for ep_rank, ep_tensor in enumerate(ep_gathered):
             global_idx = ep_rank * n_local + local_idx
-            out[set_expert_idx(name, global_idx)] = _maybe_cpu(ep_tensor, cpu=cpu)
+            out[_export_expert_name(name, global_idx, spec)] = _maybe_cpu(
+                ep_tensor, cpu=cpu
+            )
     else:
         out[name] = _maybe_cpu(tensor, cpu=cpu)
 

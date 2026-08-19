@@ -128,6 +128,7 @@ def test_recompute_parser_and_wrapper_replays_forward_on_backward():
     assert parse_recompute_spec("full") == ["full"]
     assert parse_recompute_spec("attn,mlp") == ["attn", "mlp"]
     assert parse_recompute_spec(["attn"]) == ["attn"]
+    assert parse_recompute_spec(("attn", "mlp")) == ["attn", "mlp"]
 
     class CountingModule(nn.Module):
         def __init__(self):

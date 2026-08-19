@@ -284,7 +284,15 @@ def _1f1b_schedule(
         else:
             if hid_t is not None and hid_t.requires_grad:
                 torch.autograd.backward(hid_t, grad_t)
-        return inp_t.grad if inp_t is not None else None
+        input_grad = inp_t.grad if inp_t is not None else None
+        if not ps.pp_is_first and inp_t is not None and input_grad is None:
+            raise RuntimeError(
+                "pipeline stage produced no input gradient; refusing to omit the "
+                "backward P2P send and deadlock the preceding stage "
+                f"(pp_rank={ps.pp_rank}, input_requires_grad={inp_t.requires_grad}, "
+                f"loss_present={loss_t is not None}, hidden_present={hid_t is not None})"
+            )
+        return input_grad
 
     def _p2p(send_fwd=None, send_bwd=None, recv_fwd=False, recv_bwd=False):
         # Megatron dynamic shape exchange: the recv buffer is sized from the shape
