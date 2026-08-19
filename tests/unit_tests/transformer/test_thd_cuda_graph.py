@@ -1072,6 +1072,113 @@ class TestDynamicMicrobatchSlots:
         assert layer.cuda_graphs is bank[4]
 
     @pytest.mark.internal
+    def test_thd_capture_rope_and_dummy_boundaries_share_sample_limit(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            max_seqlen_per_dp_cp_rank=4096,
+            pad_packed_seq_alignment=4096,
+            thd_max_packed_sequences=32,
+        )
+        helper.seq_length = 16384
+        helper.thd_sequence_length_upper_bound = None
+
+        rope_len, boundaries = helper._get_thd_capture_rotary_layout(4)
+        assert rope_len == 16384
+        assert boundaries[:3] == (0, 16384, 16384)
+
+        rope_len, boundaries = helper._get_thd_capture_rotary_layout(8)
+        assert rope_len == 16384
+        assert boundaries[:4] == (0, 16384, 32768, 32768)
+
+        helper.thd_sequence_length_upper_bound = 12288
+        rope_len, boundaries = helper._get_thd_capture_rotary_layout(8)
+        assert rope_len == 12288
+        assert boundaries[:5] == (0, 12288, 24576, 32768, 32768)
+
+        # Do not exceed the token capacity when the configured sample upper bound
+        # is larger than this capture variant can hold.
+        helper.seq_length = 65536
+        helper.thd_sequence_length_upper_bound = None
+        rope_len, boundaries = helper._get_thd_capture_rotary_layout(8)
+        assert rope_len == 32768
+        assert boundaries[:3] == (0, 32768, 32768)
+
+        # Correctness fallback: one boundary slot cannot represent two bounded
+        # sequences, so retain the original full-capacity RoPE table.
+        helper.seq_length = 16384
+        helper.config.thd_max_packed_sequences = 1
+        rope_len, boundaries = helper._get_thd_capture_rotary_layout(8)
+        assert rope_len == 32768
+        assert boundaries == (0, 32768)
+
+    @pytest.mark.internal
+    def test_thd_capture_rope_limits_reach_every_vpp_chunk(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace()
+        chunk_configs = [SimpleNamespace(), SimpleNamespace()]
+        helper.model = [
+            SimpleNamespace(config=helper.config, module=SimpleNamespace(config=config))
+            for config in chunk_configs
+        ]
+        helper.chunks_with_decoder = [model.module for model in helper.model]
+        rotary_seq_lens = {4: 16384, 8: 16384}
+
+        helper._publish_thd_rotary_seq_lens(rotary_seq_lens)
+
+        for config in (helper.config, *chunk_configs):
+            assert config._cuda_graph_thd_rotary_seq_lens is rotary_seq_lens
+
+    @pytest.mark.internal
+    def test_thd_graph_runtime_rope_uses_capture_sample_limit(self):
+        from megatron.core.models.gpt.gpt_model import GPTModel
+
+        model = GPTModel.__new__(GPTModel)
+        object.__setattr__(
+            model,
+            'config',
+            SimpleNamespace(
+                context_parallel_size=4,
+                _cuda_graph_thd_rotary_seq_lens={4: 16384, 8: 16384},
+            ),
+        )
+
+        assert model._bound_thd_rotary_seq_len(
+            32768, SimpleNamespace(qkv_format='thd', local_cp_size=8)
+        ) == 16384
+        assert model._bound_thd_rotary_seq_len(
+            32768, SimpleNamespace(qkv_format='thd', local_cp_size=None)
+        ) == 16384
+        assert model._bound_thd_rotary_seq_len(
+            32768, SimpleNamespace(qkv_format='sbhd', local_cp_size=8)
+        ) == 32768
+        assert model._bound_thd_rotary_seq_len(32768, None) == 32768
+
+    @pytest.mark.internal
+    def test_thd_capture_dummy_boundaries_are_seeded_in_place(self):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        original = torch.zeros(5, dtype=torch.int32)
+        static_inputs = {
+            name: original.clone()
+            for name in (
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
+            )
+        }
+        boundaries = (0, 16384, 32768, 32768, 32768)
+
+        TECudaGraphHelper._seed_thd_capture_cu_seqlens(static_inputs, boundaries)
+
+        for value in static_inputs.values():
+            assert value.tolist() == list(boundaries)
+
+    @pytest.mark.internal
     def test_mla_rope_tensor_follows_te_graph_lifetime(self, monkeypatch):
         from megatron.core.transformer import cuda_graphs
         from megatron.core.transformer.cuda_graphs import TECudaGraphHelper

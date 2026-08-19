@@ -1768,6 +1768,17 @@ class TECudaGraphHelper:
         self.dp_group = self.pg_collection.dp
         self.dp_cp_group = self.pg_collection.dp_cp
         self.pp_group = self.pg_collection.pp
+        thd_rotary_seq_lens = {}
+        if self.config.max_seqlen_per_dp_cp_rank is not None:
+            capture_cp_sizes = (
+                self._get_dynamic_cp_capture_sizes()
+                if self.config.dynamic_context_parallel
+                else (int(self.config.context_parallel_size),)
+            )
+            thd_rotary_seq_lens = {
+                cp_size: self._get_thd_capture_rotary_layout(cp_size)[0]
+                for cp_size in capture_cp_sizes
+            }
         from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 
         self.p2p_communicator = P2PCommunicator(pp_group=self.pp_group, config=self.config)
@@ -1779,6 +1790,7 @@ class TECudaGraphHelper:
         self._dynamic_slot_liveness_limit = None
 
         self._discover_layers()
+        self._publish_thd_rotary_seq_lens(thd_rotary_seq_lens)
 
         # Flags to track CUDA Graph state:
         # - _capture_finished: Whether create_cudagraphs() has been called (used by training loop)
@@ -1957,6 +1969,59 @@ class TECudaGraphHelper:
         """
         return self._graphs_created
 
+    def _publish_thd_rotary_seq_lens(self, rotary_seq_lens):
+        """Publish capture RoPE limits to every independently built VPP chunk."""
+        self.config._cuda_graph_thd_rotary_seq_lens = rotary_seq_lens
+        for model_chunk in self.chunks_with_decoder:
+            if model_chunk is not None:
+                model_chunk.config._cuda_graph_thd_rotary_seq_lens = rotary_seq_lens
+
+    def _get_thd_capture_rotary_layout(self, capture_cp_size):
+        """Return the RoPE length and packed boundaries used for THD capture."""
+        token_capacity = int(self.config.max_seqlen_per_dp_cp_rank) * int(capture_cp_size)
+        sample_length_upper_bound = (
+            self.thd_sequence_length_upper_bound
+            if self.thd_sequence_length_upper_bound is not None
+            else self.seq_length
+        )
+        rotary_seq_len = min(token_capacity, int(sample_length_upper_bound))
+        max_num_seqs = int(self.config.thd_max_packed_sequences or 1)
+
+        alignment = self.config.pad_packed_seq_alignment
+        if not isinstance(alignment, int) or alignment < 1:
+            alignment = 2 * int(capture_cp_size)
+        capture_seq_len = (rotary_seq_len // alignment) * alignment
+        num_capture_seqs = (
+            math.ceil(token_capacity / capture_seq_len) if capture_seq_len > 0 else max_num_seqs + 1
+        )
+
+        # The fused THD RoPE kernel indexes by cu_seqlens during warmup/capture.
+        # Fall back to one full-capacity sequence if the fixed cu_seqlens surface
+        # cannot describe enough bounded sequences safely.
+        if num_capture_seqs > max_num_seqs:
+            rotary_seq_len = token_capacity
+            capture_seq_len = token_capacity
+
+        boundaries = tuple(
+            min(index * capture_seq_len, token_capacity) for index in range(max_num_seqs + 1)
+        )
+        return rotary_seq_len, boundaries
+
+    @staticmethod
+    def _seed_thd_capture_cu_seqlens(static_inputs, boundaries):
+        """Seed capture-only THD boundaries without changing their static shapes."""
+        for name in (
+            "cu_seqlens_q",
+            "cu_seqlens_kv",
+            "cu_seqlens_q_padded",
+            "cu_seqlens_kv_padded",
+        ):
+            if name not in static_inputs:
+                continue
+            target = static_inputs[name]
+            assert target.numel() == len(boundaries)
+            target.copy_(torch.tensor(boundaries, dtype=target.dtype, device=target.device))
+
     def _get_sample_arguments(self, order, chunk_id_list=None):
         """
         Generate sample arguments and keyword arguments for CUDA Graph capturing with
@@ -2039,7 +2104,9 @@ class TECudaGraphHelper:
                     capture_cp_group = None
                     if packed_seq:
                         capture_cp_size, capture_cp_group = layer._get_thd_cuda_graph_capture_cp()
-                        rotary_seq_len = self.config.max_seqlen_per_dp_cp_rank * capture_cp_size
+                        rotary_seq_len, _ = self._get_thd_capture_rotary_layout(
+                            capture_cp_size
+                        )
                     else:
                         rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                             None, transformer_module.decoder, transformer_input, self.config, None
@@ -2071,6 +2138,15 @@ class TECudaGraphHelper:
                     or CudaGraphModule.attn in self.config.cuda_graph_modules
                 )
             )
+
+            if (
+                contains_self_attn
+                and hasattr(layer, "_is_thd_cuda_graph")
+                and layer._is_thd_cuda_graph()
+            ):
+                capture_cp_size, _ = layer._get_thd_cuda_graph_capture_cp()
+                _, boundaries = self._get_thd_capture_rotary_layout(capture_cp_size)
+                self._seed_thd_capture_cu_seqlens(static_inputs, boundaries)
 
             _sample_kwargs = {}
             if is_te_min_version("1.10.0"):
@@ -2793,11 +2869,8 @@ class TECudaGraphHelper:
                 for attr_name in dispatcher.cudagraph_attrs:
                     dispatcher.set_cudagraph_attr(attr_name, None)
 
-    def _get_dynamic_cp_capture_contexts(self):
-        """Return ``(local_cp_size, process_group)`` contexts to capture eagerly."""
-        if not self.config.dynamic_context_parallel:
-            return [(None, None)]
-
+    def _get_dynamic_cp_capture_sizes(self):
+        """Return dynamic CP sizes in capture order."""
         max_size = self.dp_cp_group.size()
         min_size = self.config.min_dynamic_context_parallel_size
         if min_size > max_size or any(
@@ -2805,9 +2878,16 @@ class TECudaGraphHelper:
         ):
             raise ValueError("Dynamic CP graph sizes must be powers of two with min <= max.")
         largest, smallest = (int(math.log2(size)) for size in (max_size, min_size))
+        return tuple(2**exponent for exponent in range(largest, smallest - 1, -1))
+
+    def _get_dynamic_cp_capture_contexts(self):
+        """Return ``(local_cp_size, process_group)`` contexts to capture eagerly."""
+        if not self.config.dynamic_context_parallel:
+            return [(None, None)]
+
         return [
             (size, parallel_state.get_dynamic_data_context_parallel_groups(group_size=size))
-            for size in (2**exponent for exponent in range(largest, smallest - 1, -1))
+            for size in self._get_dynamic_cp_capture_sizes()
         ]
 
     @staticmethod
