@@ -227,6 +227,8 @@ class MockSFTLowLevelDataset:
 
     Args:
         mode (str): One of 'file', 'distribution', or 'verification'.
+        vocab_size (Optional[int]): Tokenizer vocabulary size. Required for the generated
+            'file' and 'distribution' modes and ignored by 'verification' mode.
         **kwargs: Additional arguments depending on mode.
             For mode='file': path (str) - path to a CSV file with sequence lengths.
             For mode='distribution': type (str), min_seq_len (int), max_seq_len (int),
@@ -245,9 +247,15 @@ class MockSFTLowLevelDataset:
     size: int = 1000000
     """The hard-coded number of sequence to generate"""
 
-    def __init__(self, mode: str, **kwargs) -> None:
+    def __init__(self, mode: str, vocab_size: Optional[int] = None, **kwargs) -> None:
         np.random.seed(self.seed)
         self.format = kwargs.get("format", "thd")
+        self.vocab_size = vocab_size
+
+        if mode in ("file", "distribution") and (vocab_size is None or vocab_size <= 0):
+            raise ValueError(
+                f"vocab_size must be a positive integer for generated mock data, got {vocab_size}"
+            )
 
         if mode == "file":
             import pandas as pd
@@ -317,7 +325,11 @@ class MockSFTLowLevelDataset:
             assert len(sample) == target
             return sample.astype(np.int64)
         else:
-            return np.arange(1, length, dtype=np.int64)
+            if self.vocab_size is None:
+                raise RuntimeError("Generated mock data requires a configured vocabulary size")
+            sample = np.arange(1, length, dtype=np.int64)
+            sample %= self.vocab_size
+            return sample
 
 
 class MockSFTDataset(SFTDataset):
@@ -347,6 +359,7 @@ class MockSFTDataset(SFTDataset):
             }
         else:
             mock_config = load_json_arg(config.sft_mock_dataset_config_json)
+        mock_config["vocab_size"] = config.tokenizer.vocab_size
         return MockSFTLowLevelDataset(**mock_config)
 
     def __len__(self) -> int:
