@@ -50,22 +50,12 @@ class _CapturingClient:
     [
         (False, {}, 0.95, 20, True),
         (True, {}, 0.95, 20, False),
-        (
-            True,
-            {"top_p": 0.8, "top_k": 5, "prevent_retokenization": True},
-            0.8,
-            5,
-            True,
-        ),
+        (True, {"top_p": 0.8, "top_k": 5, "prevent_retokenization": True}, 0.8, 5, True),
         (True, {"return_tokenized_data": True}, 0.95, 20, True),
     ],
 )
 async def test_chat_request_uses_server_defaults(
-    serving_mode,
-    request_overrides,
-    expected_top_p,
-    expected_top_k,
-    expected_prompt_tokens,
+    serving_mode, request_overrides, expected_top_p, expected_top_k, expected_prompt_tokens
 ):
     app = Quart(__name__)
     inference_client = _CapturingClient()
