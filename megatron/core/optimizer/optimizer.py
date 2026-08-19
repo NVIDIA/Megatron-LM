@@ -228,6 +228,30 @@ class MegatronOptimizer(ABC):
         """Stage optimizer-owned model params before an explicit DDP param sync."""
         return
 
+    def _stage_model_params_from_main_params(self) -> None:
+        """Re-derive this optimizer's model params from its FP32 main params.
+
+        Does not zero any shared buffer and does not all-gather; both are the caller's
+        responsibility so that optimizers sharing a DDP model chunk can be staged together.
+        See :meth:`refresh_model_params_from_main_params`.
+        """
+        return
+
+    @torch.no_grad()
+    def refresh_model_params_from_main_params(self) -> None:
+        """Re-derive the model params from the FP32 main params.
+
+        This is the same main-to-model copy the optimizer performs at the end of every step,
+        exposed so it can be run after the main params are restored from a checkpoint.
+
+        Quantized model params (MXFP8, NVFP4) are stored dequantized and carry no block
+        scales, so loading them re-quantizes a value that has already been through one
+        quantization round trip, which need not land on the same block scales the saving job
+        chose from its FP32 masters. Re-deriving the model params from those masters
+        reproduces the saved weights exactly.
+        """
+        self._stage_model_params_from_main_params()
+
     def _filter_grads_for_norm(
         self,
         params: List[torch.nn.Parameter],
@@ -709,6 +733,12 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     def reload_model_params(self, state_dict=None):
         if self.param_groups:
             self._copy_model_params_to_main_params(state_dict=state_dict)
+
+    @override
+    def _stage_model_params_from_main_params(self) -> None:
+        if getattr(self, 'is_stub_optimizer', False):
+            return
+        self._copy_main_params_to_model_params()
 
     def _unscale_main_grads_and_check_for_nan(self):
 
@@ -1563,6 +1593,38 @@ class ChainedOptimizer(MegatronOptimizer):
         state_dicts = self._split_state_dict(state_dict)
         for idx, optimizer in enumerate(self.chained_optimizers):
             optimizer.reload_model_params(state_dict=state_dicts[idx])
+
+    def _unique_model_chunks(self) -> List[torch.nn.Module]:
+        """Model chunks owned by the chained optimizers, each listed once.
+
+        Chained optimizers (e.g. a dense and an expert optimizer) commonly share the same
+        DDP model chunk, so per-chunk work must not be repeated per optimizer.
+        """
+        model_chunks = []
+        seen = set()
+        for optimizer in self.chained_optimizers:
+            if getattr(optimizer, 'is_stub_optimizer', False):
+                continue
+            for model_chunk in getattr(optimizer, 'model_chunks', []):
+                if id(model_chunk) not in seen:
+                    seen.add(id(model_chunk))
+                    model_chunks.append(model_chunk)
+        return model_chunks
+
+    @override
+    @torch.no_grad()
+    def refresh_model_params_from_main_params(self) -> None:
+        """Re-derive the model params from the FP32 main params (see MegatronOptimizer)."""
+        model_chunks = self._unique_model_chunks()
+        if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+            # The param buffer aliases the grad buffer and is shared by every chained
+            # optimizer, so it must be zeroed once, before any of them stages into it.
+            for model_chunk in model_chunks:
+                model_chunk.zero_grad_buffer()
+        for optimizer in self.chained_optimizers:
+            optimizer._stage_model_params_from_main_params()
+        for model_chunk in model_chunks:
+            model_chunk.start_param_sync(force_sync=True)
 
     def state_dict(self):
         if len(self.chained_optimizers) == 1:
