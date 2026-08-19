@@ -486,6 +486,7 @@ class TEGroupedMLP(MegatronModule):
         # FP8 dispatch: the FC1 input arrives as an opaque MXFP8 carrier tensor (TE EP dispatch
         # packs E4M3 data + scales into a plain tensor's storage); tell TE to rebuild the
         # grouped view at the op boundary.
+        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
         # TODO: remove after TE support the grouped tensor path
         op.ep_mxfp8_carrier_input = self.config.moe_dispatch_fwd_dtype == 'mxfp8'
         ops.append(op)
@@ -592,6 +593,7 @@ class TEGroupedMLP(MegatronModule):
         # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
         # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
         # view at the op boundary.
+        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
         # TODO: remove after TE support the grouped tensor path
         op.ep_mxfp8_carrier_grad = self.config.moe_combine_bwd_dtype == 'mxfp8'
         ops.append(op)

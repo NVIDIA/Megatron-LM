@@ -1700,13 +1700,6 @@ class TransformerConfig(ModelParallelConfig):
                     "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
                     "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
                 )
-            if self.overlap_moe_expert_parallel_comm:
-                raise ValueError(
-                    "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' are not "
-                    "supported with overlap_moe_expert_parallel_comm: the 1F1B overlap "
-                    "schedule frees and stages node-boundary tensors assuming plain storage, "
-                    "which does not hold for the MXFP8 GroupedTensor payload."
-                )
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
         # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit
