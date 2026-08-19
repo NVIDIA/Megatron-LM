@@ -33,8 +33,8 @@ from megatron.core.optimizer.optimizer_config import OptimizerConfig
 # HAVE_EMERGING_OPTIMIZERS, so the import always succeeds.)
 # INVARIANT for future additions: tests in this file must stay signature/registry
 # level (inspect, kwargs dicts) and never instantiate an optimizer — the moment
-# one does, this file needs the _check_eo_version module-level skip guard and
-# loses its below-floor CI coverage.
+# one does, it inherits LayerShardedMuon's version-conditional construction
+# behavior and needs explicit skip/bypass handling to keep below-floor CI coverage.
 
 
 class _ModelCfg:
