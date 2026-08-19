@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import time
+import uuid
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
@@ -142,6 +143,10 @@ class InferenceRequest:
     sampling_params: Optional[SamplingParams] = None
     inference_parameters: Optional[SamplingParams] = None
     prompt_tokens: Optional[List[int]] = None
+    # Prompt token count. Always populated when serializing a finished request so the
+    # API can report usage.prompt_tokens even when the prompt_tokens tensor itself is
+    # dropped from the payload (see SamplingParams.return_prompt_tokens).
+    prompt_length: Optional[int] = None
     arrival_time: Optional[float] = None
     status: Optional[Status] = None
     encoder_prompt: Optional[str] = None
@@ -362,6 +367,9 @@ class DynamicInferenceRequest(InferenceRequest):
     """
 
     request_id: int
+    # `request_id` is per-engine, do not cross DP, and do not persist.
+    # A uuid is globally unique and can be used to track down individual requests.
+    uid: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
@@ -384,6 +392,12 @@ class DynamicInferenceRequest(InferenceRequest):
 
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
+
+    # KV handoff metadata describing this request's pinned prefill state.
+    # Used by decode-side pulls and prefill-side pushes.
+    # Shape: {"request_id", "block_ids", "kv_meta"}.
+    # Hybrid models may add kv_meta["ssm"] for recurrent state.
+    disaggregated_params: Optional[dict] = None
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
@@ -441,19 +455,40 @@ class DynamicInferenceRequest(InferenceRequest):
                 serialization.
         """
         nvtx_range_push("DynamicInferenceRequest.serialize")
+
+        # The prompt length is always reported (needed for usage.prompt_tokens),
+        # but the prompt_tokens tensor is dropped from the wire payload unless the
+        # client asked for it back (return_prompt_tokens). This keeps the large
+        # prompt tensor off the engine->coordinator->API path. Null it around
+        # super() so the tensor is never serialized, then restore local state.
+        prompt_len = len(self.prompt_tokens) if self.prompt_tokens is not None else None
+        drop_prompt = (
+            self.prompt_tokens is not None
+            and self.sampling_params is not None
+            and not getattr(self.sampling_params, "return_prompt_tokens", False)
+        )
+        saved_prompt_tokens = None
+        if drop_prompt:
+            saved_prompt_tokens = self.prompt_tokens
+            self.prompt_tokens = None
+
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
+        obj["prompt_length"] = prompt_len
 
         # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:
-            total_tokens = len(self.prompt_tokens) + len(self.generated_tokens)
+            total_tokens = prompt_len + len(self.generated_tokens)
             # the last generated token does not undergo a forward pass
             # hence we expect routing indices for total_tokens - 1
             assert self.routing_indices.shape[0] == total_tokens - 1, (
                 f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
                 f"total tokens {total_tokens-1}."
             )
+
+        if drop_prompt:
+            self.prompt_tokens = saved_prompt_tokens
 
         nvtx_range_pop("DynamicInferenceRequest.serialize")
         return obj
@@ -670,13 +705,16 @@ class DynamicInferenceRequestRecord:
             }
         )
 
-        # New request.
+        # Preserve prefix-cache configuration and let __post_init__ recompute hashes for the
+        # expanded prompt. The previous hash list may not include newly completed blocks.
         new_request = DynamicInferenceRequest(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
+            block_size_tokens=old_request.block_size_tokens,
+            enable_prefix_caching=old_request.enable_prefix_caching,
         )
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
@@ -716,10 +754,13 @@ class DynamicInferenceRequestRecord:
 
         policy_epoch = self.requests[-1].policy_epoch
         kv_cache_epoch = self.requests[-1].kv_cache_epoch
+        # Preserve KV handoff metadata when merging request segments.
+        disaggregated_params = self.requests[-1].disaggregated_params
 
         # Merged request.
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
+            uid=self.requests[0].uid,
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
             prompt_log_probs=self.requests[0].prompt_log_probs,
@@ -742,6 +783,7 @@ class DynamicInferenceRequestRecord:
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
             num_cached_tokens=self.requests[0].num_cached_tokens,
+            disaggregated_params=disaggregated_params,
         )
 
         return request
@@ -772,6 +814,34 @@ class DynamicInferenceRequestRecord:
         request = cls(**obj)
         request.requests = [DynamicInferenceRequest.deserialize(r) for r in obj["requests"]]
         return request
+
+
+@dataclass
+class FinishedRequestRecord:
+    """Stores per-request metadata that is not meant to be passed through the RESTful server."""
+
+    policy_epoch: Optional[list[tuple[int, int]]]
+    kv_cache_epoch: Optional[list[tuple[int, int]]]
+    num_evictions: int
+
+    @classmethod
+    def from_request(cls, request: "DynamicInferenceRequest") -> "FinishedRequestRecord":
+        """Build the request's non-RESTful metadata from a finished request."""
+        # Epoch stamps exist only while the engine has a generation epoch set.
+        record = cls(
+            policy_epoch=(
+                None if request.policy_epoch is None else [tuple(b) for b in request.policy_epoch]
+            ),
+            kv_cache_epoch=(
+                None
+                if request.kv_cache_epoch is None
+                else [tuple(b) for b in request.kv_cache_epoch]
+            ),
+            num_evictions=sum(
+                1 for event in request.events if event.type is DynamicInferenceEventType.EVICT
+            ),
+        )
+        return record
 
 
 @dataclass(kw_only=True)

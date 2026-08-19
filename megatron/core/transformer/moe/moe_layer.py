@@ -10,8 +10,9 @@ import torch
 
 from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -270,6 +271,11 @@ class MoELayer(BaseMoELayer):
                 linear_cls = InferenceLinear
             else:
                 linear_cls = TELinear
+            gtp_remat_group = (
+                resolve_gtp_remat_group(pg_collection, is_expert=False)
+                if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
+                else None
+            )
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -281,6 +287,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc1_latent_proj") if name is not None else None,
+                gtp_remat_group=gtp_remat_group,
             )
             self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
@@ -293,6 +300,7 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
+                gtp_remat_group=gtp_remat_group,
             )
 
         # Initialize token dispatcher
@@ -346,12 +354,11 @@ class MoELayer(BaseMoELayer):
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
-            if config.inference_grouped_gemm_backend == 'auto':
+            if config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
                 assert HAVE_FLASHINFER, (
-                    "inference_grouped_gemm_backend='auto'"
-                    "requires flashinfer-python. "
+                    "inference_grouped_gemm_backend='flashinfer' requires flashinfer-python. "
                     "Install flashinfer-python or set "
-                    "inference_grouped_gemm_backend to 'torch' or 'te'."
+                    "inference_grouped_gemm_backend to 'torch' or 'vllm'."
                 )
 
                 # Verify that pre-compiled FlashInfer CUTLASS kernels are available
@@ -361,14 +368,14 @@ class MoELayer(BaseMoELayer):
                 from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
 
                 check_flashinfer_jit_cache_installed()
-            elif config.inference_grouped_gemm_backend == 'torch':
+            elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
                 assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
                     torch, '_grouped_mm'
                 ), (
                     "inference_grouped_gemm_backend='torch' requires "
                     "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
                 )
-            elif config.inference_grouped_gemm_backend == 'vllm':
+            elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
                 assert HAVE_TRITON, (
                     "inference_grouped_gemm_backend='vllm' requires Triton. "
                     "Install triton (pip install triton)."
@@ -546,8 +553,17 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
         else:
+            # NCCL-EP zero-copy: experts write fc2 output and fc1 dgrad straight into the combine /
+            # dispatch symm buffers. Passed only when set (non-TEGroupedMLP experts don't accept
+            # these kwargs).
+            output_buffer, grad_input_buffer = self.token_dispatcher.get_expert_zero_copy_buffers()
+            expert_kwargs = {}
+            if output_buffer is not None:
+                expert_kwargs["output_buffer"] = output_buffer
+            if grad_input_buffer is not None:
+                expert_kwargs["grad_input_buffer"] = grad_input_buffer
             expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs
+                dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)

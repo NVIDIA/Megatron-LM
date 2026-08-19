@@ -7,6 +7,7 @@ from collections.abc import Iterable
 import pytest
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import init_device_mesh
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import (
@@ -178,6 +179,29 @@ def test_cast_preserves_layout_and_casts_values(distributed_setup):
     )
 
 
+def test_cast_with_out_reuses_destination_and_casts_values(distributed_setup):
+    """DBuffer.cast writes casted values into an existing destination buffer."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
+    destination = DBuffer(
+        mesh=mesh,
+        placements=[Replicate()],
+        tensor_shapes=buffer.layout.tensor_shapes,
+        dtype=torch.bfloat16,
+        device=distributed_setup.device,
+    )
+    destination_data_ptr = destination.local_buffer.data_ptr()
+
+    result = buffer.cast(torch.bfloat16, out=destination)
+
+    assert result is destination
+    assert destination.local_buffer.data_ptr() == destination_data_ptr
+    _assert_dbuffer_local_tensors_close(
+        destination, [tensor.to(dtype=torch.bfloat16) for tensor in tensors]
+    )
+
+
 def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup):
     """DBuffer storage can be released and reallocated without replacing existing views."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -216,7 +240,11 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
     local_buffer = replicated_buffer.local_buffer.narrow(0, offset, local_numel)
 
     sharded_buffer = DBuffer.from_local(
-        local_buffer, mesh, iter([Flat()]), replicated_buffer.layout.tensor_shapes
+        local_buffer,
+        mesh,
+        iter([Flat()]),
+        replicated_buffer.layout.tensor_shapes,
+        allocation_stream=replicated_buffer.allocation_stream,
     )
 
     assert sharded_buffer.placements == (Flat(),)
@@ -446,6 +474,82 @@ def test_partial_reduce_scatter_to_flat_average(distributed_setup):
     expected_tensors = [
         torch.full((5, 3), scale_average, dtype=torch.float32, device=distributed_setup.device),
         torch.full((4,), scale_average * 10, dtype=torch.float32, device=distributed_setup.device),
+    ]
+    _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)
+
+
+def test_partial_reduce_scatter_to_flat_average_without_symm_mem_detector(
+    distributed_setup, monkeypatch
+):
+    """Ordinary AVG remains available when PyTorch lacks the symmetric-memory detector."""
+    device, world_size = distributed_setup.device, distributed_setup.world_size
+    mesh = init_device_mesh(device.type, (world_size,))
+    monkeypatch.delattr(symm_mem, "is_symm_mem_tensor")
+    rank_scale = float(distributed_setup.rank + 1)
+    partial_buffer = DBuffer.distribute_tensors(
+        [torch.full((5, 3), rank_scale, dtype=torch.float32, device=device)],
+        mesh,
+        [Partial(reduce_op=dist.ReduceOp.AVG)],
+    )
+
+    replicated_buffer = partial_buffer.reduce_scatter(0, Flat()).allgather(0)
+
+    expected = torch.full((5, 3), (world_size + 1) / 2.0, dtype=torch.float32, device=device)
+    _assert_dbuffer_local_tensors_close(replicated_buffer, [expected])
+
+
+def test_symmetric_memory_partial_reduce_scatter_to_flat_average(distributed_setup):
+    """Symmetric-memory reduce-scatter preserves AVG semantics."""
+    device, world_size = distributed_setup.device, distributed_setup.world_size
+    mesh = init_device_mesh(device.type, (world_size,))
+    dist.barrier(device_ids=[device.index])
+    rank_scale = float(distributed_setup.rank + 1)
+    tensors = [
+        torch.full((5, 3), rank_scale, dtype=torch.float32, device=device),
+        torch.full((4,), rank_scale * 10, dtype=torch.float32, device=device),
+    ]
+    pool = symm_mem.get_mem_pool(device)
+    with torch.cuda.use_mem_pool(pool):
+        partial_buffer = DBuffer.distribute_tensors(
+            tensors, mesh, [Partial(reduce_op=dist.ReduceOp.AVG)]
+        )
+    assert symm_mem.is_symm_mem_tensor(partial_buffer.local_buffer)
+
+    sharded_buffer = partial_buffer.reduce_scatter(0, Flat())
+    replicated_buffer = sharded_buffer.allgather(0)
+
+    scale_average = (world_size + 1) / 2.0
+    expected_tensors = [
+        torch.full((5, 3), scale_average, dtype=torch.float32, device=device),
+        torch.full((4,), scale_average * 10, dtype=torch.float32, device=device),
+    ]
+    _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)
+
+
+def test_symmetric_memory_partial_reduce_scatter_to_flat_sum(distributed_setup):
+    """Symmetric-memory reduce-scatter preserves explicit SUM semantics."""
+    device, world_size = distributed_setup.device, distributed_setup.world_size
+    mesh = init_device_mesh(device.type, (world_size,))
+    dist.barrier(device_ids=[device.index])
+    rank_scale = float(distributed_setup.rank + 1)
+    tensors = [
+        torch.full((5, 3), rank_scale, dtype=torch.float32, device=device),
+        torch.full((4,), rank_scale * 10, dtype=torch.float32, device=device),
+    ]
+    pool = symm_mem.get_mem_pool(device)
+    with torch.cuda.use_mem_pool(pool):
+        partial_buffer = DBuffer.distribute_tensors(
+            tensors, mesh, [Partial(reduce_op=dist.ReduceOp.SUM)]
+        )
+    assert symm_mem.is_symm_mem_tensor(partial_buffer.local_buffer)
+
+    sharded_buffer = partial_buffer.reduce_scatter(0, Flat())
+    replicated_buffer = sharded_buffer.allgather(0)
+
+    scale_sum = float(world_size * (world_size + 1) // 2)
+    expected_tensors = [
+        torch.full((5, 3), scale_sum, dtype=torch.float32, device=device),
+        torch.full((4,), scale_sum * 10, dtype=torch.float32, device=device),
     ]
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected_tensors)
 

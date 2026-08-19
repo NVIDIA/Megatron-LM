@@ -1,4 +1,8 @@
+# Files directly in the repository root without a more specific owner.
+/* @NVIDIA/core-nemo
+
 megatron/core/ @NVIDIA/core-adlr @NVIDIA/core-nemo
+megatron/core/tensor_parallel/generalized_tensor_parallelism.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gtp
 
 megatron/core/models/bert/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/gpt
 
@@ -20,7 +24,7 @@ megatron/core/datasets/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/datasets
 megatron/core/tokenizers/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/tokenizers
 
 megatron/core/distributed/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/data-parallelism
-megatron/core/distributed/fsdp/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/megatron-fsdp
+megatron/core/distributed/fsdp/ @NVIDIA/megatron-fsdp
 
 megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/megatron-fsdp
 

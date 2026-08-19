@@ -3,16 +3,18 @@
 import asyncio
 import logging
 import time
-import uuid
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
+
+from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
+from ..openai_streaming import openai_stream
 
 logger = logging.getLogger(__name__)
 
 
 try:
-    from quart import Blueprint, current_app, jsonify, request
+    from quart import Blueprint, Response, current_app, jsonify, request
 
     bp = Blueprint('completions_api', __name__)
 
@@ -105,11 +107,24 @@ try:
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
                 stop_words=stop,
                 termination_id=-1 if ignore_eos else None,
+                streaming_interval=int(req.get("streaming_interval", 1)),
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
 
         # --- 3. Send Requests to Engine ---
+        stream_requested = bool(req.get("stream", False))
+        incremental_detokenizers = []
+        if stream_requested:
+            # Streaming currently supports only Hugging Face fast tokenizers.
+            try:
+                incremental_detokenizers = [
+                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    for prompt_tokens in prompts_as_tokens
+                ]
+            except ValueError as error:
+                return str(error), 400
+
         tasks = []
         for prompt_tokens in prompts_as_tokens:
             per_req_params = SamplingParams(
@@ -122,8 +137,33 @@ try:
                 num_tokens_to_generate=sampling_params.num_tokens_to_generate,
                 stop_words=sampling_params.stop_words,
                 termination_id=sampling_params.termination_id,
+                # This endpoint always echoes prompt_token_ids in its response, so
+                # keep the prompt tokens on the payload (default is now to drop them).
+                return_prompt_tokens=True,
+                streaming_interval=sampling_params.streaming_interval,
             )
-            tasks.append(client.add_request(prompt_tokens, per_req_params))
+            if stream_requested:
+                tasks.append(client.add_request_streaming(prompt_tokens, per_req_params))
+            else:
+                tasks.append(client.add_request(prompt_tokens, per_req_params))
+
+        if stream_requested:
+            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
+            response = Response(
+                openai_stream(
+                    tasks,
+                    tokenizer,
+                    incremental_detokenizers,
+                    chat=False,
+                    return_log_probs=return_log_probs,
+                    include_usage=include_usage,
+                    echo_prompts=prompts_as_strings if echo else None,
+                    prompt_token_ids=prompts_as_tokens if echo else None,
+                ),
+                content_type="text/event-stream",
+            )
+            response.timeout = None
+            return response
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
@@ -169,8 +209,11 @@ try:
         prompt_tokens_counts = []
 
         request_idx = 0
+        response_uid = None
         for completed_request in batch_results:
             result = unwrap_serialized_tensors(completed_request)
+            if response_uid is None:
+                response_uid = result["uid"]
             full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
 
@@ -257,11 +300,6 @@ try:
                 "generation_token_ids": result["generated_tokens"],
                 "generation_log_probs": result.get("generated_log_probs", []),
             }
-            choice_data["policy_epoch"] = result["policy_epoch"]
-            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
-            choice_data["num_evictions"] = sum(
-                1 for e in result["events"] if e.get("type") == "EVICT"
-            )
 
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
@@ -279,7 +317,7 @@ try:
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         return jsonify(
             {
-                "id": str(uuid.uuid4()),
+                "id": response_uid,
                 "object": "text_completion",  # as per the openAI spec
                 "created": int(time.time()),
                 "model": "EMPTY",

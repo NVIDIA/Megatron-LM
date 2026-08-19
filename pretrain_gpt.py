@@ -17,6 +17,19 @@ rank = int(os.environ.get('RANK', 0))
 if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+    # Some libraries (e.g., CUTLASS DSL) use warnings.catch_warnings() with
+    # simplefilter("always"), which overrides the filters above. Override
+    # showwarning as a fallback to suppress warnings that slip through.
+    _original_showwarning = warnings.showwarning
+
+    def _rank0_only_showwarning(message, category, filename, lineno, file=None, line=None):
+        if issubclass(category, (UserWarning, FutureWarning, DeprecationWarning)):
+            return
+        _original_showwarning(message, category, filename, lineno, file, line)
+
+    warnings.showwarning = _rank0_only_showwarning
 
 from functools import lru_cache, partial
 from typing import Any, List, Optional, Tuple
@@ -28,6 +41,7 @@ from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -46,6 +60,8 @@ from megatron.core.utils import (
     get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
+    get_te_version,
+    get_torch_version,
 )
 from megatron.training import (
     get_args,
@@ -492,6 +508,10 @@ def get_embedding_ranks(pp_ranks: List[int]):
 if __name__ == "__main__":
     # Timestamp right after entering __main__ block (after all imports/library setup)
     _MAIN_ENTRY_TIME = time.time()
+
+    print_rank_0(f'> PyTorch version ................ {get_torch_version()}')
+    print_rank_0(f'> Megatron-Core version .......... {mcore_version}')
+    print_rank_0(f'> Transformer Engine version ... {get_te_version()}')
 
     # Register startup timestamps for timing report in pretrain()
     set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)

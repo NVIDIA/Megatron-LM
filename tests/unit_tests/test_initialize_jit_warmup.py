@@ -156,9 +156,7 @@ def test_calls_bias_swiglu_when_fusion_enabled(
 @mock.patch("megatron.training.initialize.torch.rand", side_effect=_fake_rand)
 @mock.patch("megatron.training.initialize.bias_dropout_add_fused_train")
 @mock.patch("megatron.training.initialize.get_args")
-def test_dropout_warmup_and_geglu_cat(
-    mock_get_args, mock_dropout, mock_rand, _cache, mock_geglu
-):
+def test_dropout_warmup_and_geglu_cat(mock_get_args, mock_dropout, mock_rand, _cache, mock_geglu):
     """Gated GEGLU warmup uses torch.cat (RNG-free) to get 2x-ffn tensors, and
     the fused dropout warmup runs even when bias_dropout_fusion is False so
     RNG consumption stays identical to the historical behavior."""
