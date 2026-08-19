@@ -6,11 +6,21 @@ from megatron.inference.integrations.dynamo.telemetry import (
 )
 
 
+class _DynamoHelper:
+    def add_kv_event_listener(self, listener):
+        self.listener = listener
+
+
+class _Context:
+    def __init__(self):
+        self.dynamo_helper = _DynamoHelper()
+
+
 class _Engine:
     rank = 0
 
-    def add_kv_event_listener(self, listener):
-        self.listener = listener
+    def __init__(self):
+        self.context = _Context()
 
 
 def test_kv_events_bypass_request_coordinator():
@@ -29,7 +39,7 @@ def test_kv_events_bypass_request_coordinator():
     reporter.start()
     try:
         reporter.observe("ready", {"version": 3})
-        engine.listener("stored", {"block_hashes": [101]})
+        engine.context.dynamo_helper.listener("stored", {"block_hashes": [101]})
         assert ready.wait(timeout=2.0)
         assert received == [("ready", {"version": 3}), ("stored", {"block_hashes": [101]})]
     finally:

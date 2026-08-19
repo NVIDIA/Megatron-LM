@@ -40,6 +40,9 @@ class MambaMetadata:
             decode_indices_dtype (torch.dtype): Dtype for decode state-slot indices.
         """
         self.max_requests = max_requests
+        # EP dummy forwards always use one request and must remain runnable when
+        # every request slot is retained by an in-flight state handoff.
+        self.dummy_state_idx = max_requests
         self.max_tokens = max_tokens
         self.mamba_chunk_size = mamba_chunk_size
         self.d_conv = d_conv
@@ -148,15 +151,19 @@ class MambaMetadata:
         self._gpu_view = gpu_view
 
     def reset(self) -> None:
-        """
-        Resets all Mamba states and frees all allocated slots.
-        """
-        self.request_to_mamba_state_idx.fill_(-1)
+        """Release request-owned slots and reset per-batch metadata.
 
+        Unbound slots can be owned by an in-flight state handoff and remain
+        allocated until that owner explicitly releases them.
+        """
+
+        request_slots = self.request_to_mamba_state_idx
+        owned_request_slots = request_slots[
+            (request_slots >= 0) & (request_slots < self.max_requests)
+        ]
+        self._return_slots(owned_request_slots)
+        request_slots.fill_(-1)
         self.reset_varlen_metadata()
-
-        torch.arange(self.max_requests, out=self.mamba_state_free_slots)
-        self.mamba_state_free_slot_count = self.max_requests
 
     def reset_varlen_metadata(self) -> None:
         """Resets varlen metadata."""

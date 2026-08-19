@@ -47,6 +47,7 @@ from wandb import wandb_run
 from megatron.core import mpu
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
+from megatron.core.inference.disaggregation.coordinator_setup import disagg_refit_pools
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
@@ -745,8 +746,17 @@ def get_environment_rollouts(
         with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-        swap_model_weights(model, inference_model, args.refit_method)
-        if args.rl_verify_model_weights_swap:
+        num_dst_pools, dst_pool_index = disagg_refit_pools(
+            args.inference_shards, args.world_size
+        )
+        swap_model_weights(
+            model,
+            inference_model,
+            args.refit_method,
+            num_dst_pools=num_dst_pools,
+            dst_pool_index=dst_pool_index,
+        )
+        if args.rl_verify_model_weights_swap and num_dst_pools == 1:
             verify_model_weights_swap(
                 train_model=model,
                 inference_model=inference_model,

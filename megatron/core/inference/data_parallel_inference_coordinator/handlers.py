@@ -154,69 +154,6 @@ def handle_submit_request(coordinator, sender_identity, payload):
         )
 
 
-@message_handler(Headers.SUBMIT_REQUEST_WITH_KV)
-def handle_submit_request_with_kv(coordinator, sender_identity, payload):
-    """Route a client-supplied KV handoff to a decode engine."""
-
-    if sender_identity not in coordinator.known_clients:
-        logging.info(
-            "Received SUBMIT_REQUEST_WITH_KV from unknown client %s; ignoring.", sender_identity
-        )
-        return
-    if len(payload) != 6:
-        logging.error(
-            "Coordinator: malformed SUBMIT_REQUEST_WITH_KV payload with %d fields", len(payload) - 1
-        )
-        return
-
-    client_request_id, prompt, sampling_params, kv_meta, src_block_ids = payload[1:]
-    request_id = coordinator.next_request_id
-    coordinator.next_request_id += 1
-    coordinator.request_id_to_client_id[request_id] = sender_identity
-    coordinator.request_id_to_client_request_id[request_id] = client_request_id
-    coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
-
-    if isinstance(prompt, torch.Tensor):
-        prompt = prompt.tolist()
-    elif not isinstance(prompt, (str, list)):
-        raise TypeError(f"unsupported prompt type {type(prompt).__name__}")
-    engine_payload = msgpack.packb(
-        [
-            Headers.SUBMIT_REQUEST_WITH_KV.value,
-            request_id,
-            prompt,
-            sampling_params,
-            kv_meta,
-            src_block_ids,
-        ],
-        use_bin_type=True,
-    )
-
-    for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
-        next_identity = coordinator.get_least_loaded_data_parallel_rank()
-        if coordinator._send_to_engine(next_identity, engine_payload):
-            break
-    else:
-        logging.error("Coordinator: no reachable engines for handoff request %d", request_id)
-        del coordinator.request_id_to_client_id[request_id]
-        del coordinator.request_id_to_client_request_id[request_id]
-        del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
-        return True
-
-    coordinator.request_id_to_rank[request_id] = next_identity
-    coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
-
-
-@message_handler(Headers.RELEASE_KV)
-def handle_release_kv(coordinator, sender_identity, payload):
-    """Broadcast release of prefill blocks retained for a completed handoff."""
-
-    if sender_identity not in coordinator.known_clients:
-        logging.warning("Coordinator: ignoring RELEASE_KV from unknown client.")
-        return
-    coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, int(payload[1])])
-
-
 @message_handler(
     Headers.PAUSE,
     Headers.UNPAUSE,
@@ -282,6 +219,13 @@ def handle_engine_reply(coordinator, sender_identity, payload):
             coordinator.disagg.handle_prefill_done(fid, finished_request)
             continue
 
+        if fid not in coordinator.request_id_to_client_id:
+            logging.warning(
+                "Coordinator: ignoring duplicate or late ENGINE_REPLY for request %d from %r",
+                fid,
+                sender_identity,
+            )
+            continue
         coordinator.detokenize(finished_request)
         client_identity = coordinator.request_id_to_client_id[fid]
         client_request_id = coordinator.request_id_to_client_request_id[fid]
@@ -343,6 +287,8 @@ def handle_submit_request_with_kv(coordinator, sender_identity, payload):
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
     if isinstance(prompt, torch.Tensor):
         prompt = prompt.tolist()
+    elif not isinstance(prompt, (str, list)):
+        raise TypeError(f"unsupported prompt type {type(prompt).__name__}")
     engine_payload = msgpack.packb(
         make_submit_request_with_kv_message(
             Headers.SUBMIT_REQUEST_WITH_KV.value,

@@ -59,6 +59,7 @@ from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.inference.disaggregation.coordinator_setup import disagg_refit_pools
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
@@ -1859,7 +1860,12 @@ def pretrain(
             # Disaggregated rollouts: build this rank's prefill/decode shard
             # model on its shard groups; the per-pool refit keeps it fresh.
             inference_model = build_disagg_inference_model(
-                args, model_provider, model_type, model_cfg, get_model,
+                args,
+                model_provider,
+                model_type,
+                model_cfg,
+                get_model,
+                cfg_container=cfg_container,
                 model_alloc_ctx=_rl_inference_model_alloc_ctx(args),
             )
         elif (
@@ -2082,7 +2088,16 @@ def pretrain(
                 # If separate inference and training models, swap training weights
                 # back to the inference model for RL evaluation.
                 rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-                swap_model_weights(model, inference_model, args.refit_method)
+                num_dst_pools, dst_pool_index = disagg_refit_pools(
+                    args.inference_shards, args.world_size
+                )
+                swap_model_weights(
+                    model,
+                    inference_model,
+                    args.refit_method,
+                    num_dst_pools=num_dst_pools,
+                    dst_pool_index=dst_pool_index,
+                )
                 rl_eval_model = inference_model
                 rl_training_model = model
             rl_utils.evaluate_and_print_results_rl(
@@ -4892,7 +4907,16 @@ def train(
                     rl_utils._maybe_prefetch_separate_inference_model_weights(
                         inf_core, to_cpu=False
                     )
-                    swap_model_weights(model, inference_model, args.refit_method)
+                    num_dst_pools, dst_pool_index = disagg_refit_pools(
+                        args.inference_shards, args.world_size
+                    )
+                    swap_model_weights(
+                        model,
+                        inference_model,
+                        args.refit_method,
+                        num_dst_pools=num_dst_pools,
+                        dst_pool_index=dst_pool_index,
+                    )
                     rl_eval_model = inference_model
                     rl_training_model = model
                 rl_utils.evaluate_and_print_results_rl(

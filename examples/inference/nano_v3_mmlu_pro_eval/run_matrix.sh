@@ -276,7 +276,6 @@ COMMON_MODEL_ARGS=(
     --enable-chunked-prefill
     --inference-dynamic-batching-prefix-caching
     --inference-dynamic-batching-prefix-caching-eviction-policy lru
-    --inference-dynamic-batching-prefix-caching-mamba-gb "${MAMBA_PREFIX_CACHE_GB}"
     --inference-logging-step-interval "${INFERENCE_LOGGING_STEP_INTERVAL}"
     --inference-dynamic-batching-num-cuda-graphs "${INFERENCE_NUM_CUDA_GRAPHS}"
     --inference-cuda-graph-all-prefills
@@ -331,6 +330,7 @@ launch_no_disagg() {
         -m tools.run_dynamic_text_generation_server \
         "${COMMON_MODEL_ARGS[@]}" \
         --expert-model-parallel-size 4 \
+        --inference-dynamic-batching-prefix-caching-mamba-gb "${MAMBA_PREFIX_CACHE_GB}" \
         --port "${SERVER_PORT}"
     wait_for_url "http://127.0.0.1:${SERVER_PORT}/health" "aggregated Megatron server"
 }
@@ -382,6 +382,7 @@ launch_dynamo() {
         -- \
         "${COMMON_MODEL_ARGS[@]}" \
         --expert-model-parallel-size 2 \
+        --inference-dynamic-batching-prefix-caching-mamba-gb "${MAMBA_PREFIX_CACHE_GB}" \
         --inference-dynamic-batching-prefix-caching-eviction-policy \
         "${DYNAMO_PREFILL_EVICTION_POLICY:-lru}"
 

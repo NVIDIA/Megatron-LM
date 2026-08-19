@@ -60,6 +60,7 @@ class _PreparedHandoffMetadata:
     kv_meta: Any
     ssm_meta: Any
     resume_tokens: list[int]
+    resume_log_probs: list[float]
 
 
 class InferenceStateHandoffMixin:
@@ -296,7 +297,13 @@ class InferenceStateHandoffMixin:
         if self.context.is_hybrid_model:
             conv_states = self.context.mamba_conv_states
             recurrent_states = self.context.mamba_ssm_states
-            state_slot_count = self.context.max_requests
+            state_slot_count = int(conv_states.shape[1])
+            if recurrent_states.shape[1] != state_slot_count:
+                raise ValueError("SSM conv and recurrent state buffers have different slot counts")
+            if state_slot_count < self.context.max_requests:
+                raise ValueError(
+                    "SSM state buffers have fewer slots than the configured request capacity"
+                )
 
             conv_shape = conv_states.shape
             ssm_shape = recurrent_states.shape
@@ -456,6 +463,7 @@ class InferenceStateHandoffMixin:
         self,
         requests_and_state: list[tuple["DynamicInferenceRequest", list[int], int | None]],
         decode_tokens_by_request: Dict[int, list[int]],
+        decode_log_probs_by_request: Dict[int, list[float]],
     ) -> dict[int, _PreparedHandoffMetadata]:
         """Assemble metadata for all handoffs completed by one engine step.
 
@@ -494,12 +502,18 @@ class InferenceStateHandoffMixin:
             prepared = {}
             for request, candidate_blocks, ssm_slot in handoffs:
                 resume_tokens = list(decode_tokens_by_request.get(request.request_id, []))
+                resume_log_probs = list(decode_log_probs_by_request.get(request.request_id, []))
                 expected_resume_tokens = self.context.num_speculative_tokens + 1
                 if len(resume_tokens) != expected_resume_tokens:
                     raise RuntimeError(
                         "Cannot create a decode-only handoff without one sampled token plus "
                         f"the configured MTP proposals: expected {expected_resume_tokens}, "
                         f"got {len(resume_tokens)}"
+                    )
+                if request.sampling_params.return_log_probs and len(resume_log_probs) != 1:
+                    raise RuntimeError(
+                        "Cannot create a decode-only handoff without the first sampled "
+                        f"token log probability: expected 1, got {len(resume_log_probs)}"
                     )
                 if not candidate_blocks:
                     raise RuntimeError(
@@ -550,6 +564,7 @@ class InferenceStateHandoffMixin:
                     kv_meta=kv_meta,
                     ssm_meta=ssm_meta,
                     resume_tokens=resume_tokens,
+                    resume_log_probs=resume_log_probs,
                 )
             return prepared
         except Exception:
@@ -608,6 +623,8 @@ class InferenceStateHandoffMixin:
             # request-specific SSM metadata out of that shared object.
             kv_meta = dict(kv_meta)
         kv_meta["resume_tokens"] = prepared.resume_tokens
+        if prepared.resume_log_probs:
+            kv_meta["resume_log_probs"] = prepared.resume_log_probs
         if ssm_meta is not None:
             kv_meta["ssm"] = ssm_meta
         if (
@@ -719,9 +736,13 @@ class InferenceStateHandoffMixin:
                 "Decode-only handoff requires one sampled token plus the configured "
                 f"MTP proposals: expected {expected_resume_tokens}, got {len(resume_tokens)}"
             )
-        if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
+        if sampling_params.top_n_logprobs > 0:
             raise NotImplementedError(
-                "Decode-only handoff does not yet transfer prompt or first-token log probabilities"
+                "Decode-only handoff does not yet transfer top-token log probabilities"
+            )
+        if sampling_params.return_log_probs and not sampling_params.skip_prompt_log_probs:
+            raise NotImplementedError(
+                "Decode-only handoff does not transfer prompt log probabilities"
             )
 
         prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
@@ -782,6 +803,11 @@ class InferenceStateHandoffMixin:
         num_blocks_to_import = handoff.num_blocks - len(cached_blocks)
         resume_tokens = (
             [int(token) for token in handoff.kv_meta.get("resume_tokens", [])]
+            if isinstance(handoff.kv_meta, dict)
+            else []
+        )
+        resume_log_probs = (
+            [float(log_prob) for log_prob in handoff.kv_meta.get("resume_log_probs", [])]
             if isinstance(handoff.kv_meta, dict)
             else []
         )
@@ -851,6 +877,7 @@ class InferenceStateHandoffMixin:
             future=handoff.future,
             ssm=ssm_import,
             resume_tokens=resume_tokens,
+            resume_log_probs=resume_log_probs,
             continuation_blocks=continuation_blocks,
             local_error=start_error,
             destinations_safe=(
@@ -947,6 +974,12 @@ class InferenceStateHandoffMixin:
         if self.context.is_hybrid_model:
             if pending.ssm is None:
                 raise RuntimeError("Hybrid decode-only handoff is missing transferred SSM state")
+        expected_log_probs = 1 if pending.sampling_params.return_log_probs else 0
+        if len(pending.resume_log_probs) != expected_log_probs:
+            raise RuntimeError(
+                "Decode-only handoff has an invalid first-token log probability count: "
+                f"expected {expected_log_probs}, got {len(pending.resume_log_probs)}"
+            )
 
     def _finalize_kv_handoff_import(self, pending: PendingKvImport) -> None:
         """Register transferred blocks and admit the decode request.
@@ -1009,6 +1042,8 @@ class InferenceStateHandoffMixin:
             first_token = pending.resume_tokens[0]
             if request.sampling_params.num_tokens_to_generate > 0:
                 request.generated_tokens.append(first_token)
+                if pending.resume_log_probs:
+                    request.generated_log_probs = list(pending.resume_log_probs)
                 if self.track_generated_token_events:
                     first_token_event = request.add_event_generated_token(first_token)
                 else:

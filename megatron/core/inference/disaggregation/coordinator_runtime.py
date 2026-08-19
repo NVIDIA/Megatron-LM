@@ -100,7 +100,7 @@ class DisaggCoordinatorRuntime:
         prefill_params = dict(sampling_params)
         prefill_params["do_kv_handoff"] = True
         prefill_params["num_tokens_to_generate"] = 0
-        prefill_params["return_log_probs"] = False
+        prefill_params["skip_prompt_log_probs"] = True
         if "num_tokens_total" in prefill_params:
             prefill_params["num_tokens_total"] = None
         self._send(prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, prefill_params)

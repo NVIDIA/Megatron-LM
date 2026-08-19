@@ -115,6 +115,7 @@ class DummyEngine(DynamicInferenceEngine):
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()
+        self._disagg_config = None
         self.pending_microbatch = deque()
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.rank = torch.distributed.get_rank()
@@ -904,3 +905,10 @@ class TestRoutingPolicies:
         assert "removed engine" in caplog.text
         assert coord.router_socket.send_multipart.call_args[0][0][0] == b"client-A"
         assert 11 not in coord.request_id_to_client_id
+
+        # A duplicated or delayed completion cannot be routed after the first
+        # reply releases its client mapping, but it must not kill the coordinator.
+        with caplog.at_level(logging.WARNING):
+            handle_engine_reply(coord, b"rank-0", reply(11))
+        assert "duplicate or late ENGINE_REPLY" in caplog.text
+        assert coord.router_socket.send_multipart.call_count == 1

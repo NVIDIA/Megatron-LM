@@ -11,8 +11,10 @@ the same four OCI-HSG GPUs:
 | `native_nixl` | EP=2 prefill + EP=2 decode | native coordinator + NIXL handoff |
 
 All modes use the same Nano checkpoint, tokenizer, MMLU-Pro task
-(`mmlu_pro_cot_mini_5_shot_base`, five-shot), cache sizing, and inference
-limits. Servers are launched and evaluated sequentially so they can reuse a
+(`mmlu_pro_cot_mini_5_shot_base`, five-shot), KV-cache sizing, and inference
+limits. Decode-only hybrid engines do not allocate a durable Mamba prefix
+cache; the final prefill state is transferred directly into a live decode
+slot. Servers are launched and evaluated sequentially so they can reuse a
 single four-GPU allocation. The Megatron endpoints retain the harness's
 default batch size of 512. Dynamo uses `DYNAMO_BATCH_SIZE=128` because its
 OpenAI frontend accepts at most 128 choices in one completion request.

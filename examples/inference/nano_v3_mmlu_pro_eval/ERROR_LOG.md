@@ -487,3 +487,24 @@ under `eval_results/nano_v3_mmlu_pro/`.
   a nonzero periodic fallback instead. The delay experiment remains outside
   the Megatron production branch until NIXL exposes it through its public
   Python agent configuration.
+
+### Megatron-RL disaggregated hybrid rollout validation
+
+- Generated-token log probabilities were unavailable after handoff because
+  prefill had disabled all log-probability production. Prefill now skips only
+  prompt log probabilities and transfers the sampled continuation token's log
+  probability with its token. Prompt and top-N log probabilities remain
+  explicitly unsupported by decode-only handoff.
+- With two live state slots and two simultaneous handoffs, an idle EP rank
+  failed its required dummy forward with `can't assign a NoneType to a
+  torch.IntTensor`. Both slots were correctly retained by in-flight transfers,
+  leaving none for the dummy request. Hybrid contexts now budget one reserved
+  EP dummy state slot outside request admission and transfer ownership.
+- Registering the enlarged SSM buffers initially failed with `does not have
+  expected_num_blocks=2 on slot axis 1`. Transfer geometry now describes the
+  physical state-buffer slot count; handoff allocation remains restricted to
+  the configured request slots, so the reserved dummy slot is never sent.
+- Verification: a four-GPU Nano rollout built EP=2 prefill and EP=2 decode
+  shards, refit both pools, captured all configured CUDA graphs, completed four
+  KV+SSM handoffs and four HTTP requests, and exited iteration 1 normally.
+  Decode reported zero computed prompt tokens throughout the run.

@@ -435,13 +435,13 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
         _Backend.instances.clear()
         engine.context.mamba_slot_allocator = None
         engine.context.max_requests = 8
-        engine.context.mamba_conv_states = torch.empty(1, 8, 18, 3)
-        engine.context.mamba_ssm_states = torch.empty(1, 8, 2, 4, 5)
+        engine.context.mamba_conv_states = torch.empty(1, 9, 18, 3)
+        engine.context.mamba_ssm_states = torch.empty(1, 9, 2, 4, 5)
         engine.setup_kv_transfer("decode")
 
     assert _Backend.instances[1].kwargs["memory_buffer"] is engine.context.mamba_conv_states
     assert _Backend.instances[2].kwargs["memory_buffer"] is engine.context.mamba_ssm_states
-    assert [backend.kwargs["expected_num_blocks"] for backend in _Backend.instances[1:]] == [8, 8]
+    assert [backend.kwargs["expected_num_blocks"] for backend in _Backend.instances[1:]] == [9, 9]
 
     _Backend.instances.clear()
     engine.context.mamba_slot_allocator = object()
@@ -454,7 +454,7 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
 
     assert _Backend.instances[1].kwargs["memory_buffer"] is engine.context.mamba_conv_states
     assert _Backend.instances[2].kwargs["memory_buffer"] is engine.context.mamba_ssm_states
-    assert [backend.kwargs["expected_num_blocks"] for backend in _Backend.instances[1:]] == [8, 8]
+    assert [backend.kwargs["expected_num_blocks"] for backend in _Backend.instances[1:]] == [9, 9]
 
 
 def test_capacity_miss_defers_before_any_transfer(handoff_loop):
@@ -821,6 +821,7 @@ def test_handoff_metadata_batches_completed_requests_across_pipeline(monkeypatch
         prepared = engine._prepare_handoff_metadata_batch(
             [(request, blocks, None) for request, blocks in zip(requests, local_blocks)],
             {7: [71], 8: [81]},
+            {},
         )
         for request in requests:
             engine._capture_handoff_meta(request, prepared[request.request_id])
@@ -864,7 +865,9 @@ def test_handoff_metadata_error_releases_all_finished_state():
         pytest.raises(RuntimeError, match="transfer setup"),
     ):
         engine._prepare_handoff_metadata_batch(
-            [(regular, [10], 3), (handoff, [11], 4)], decode_tokens_by_request={}
+            [(regular, [10], 3), (handoff, [11], 4)],
+            decode_tokens_by_request={},
+            decode_log_probs_by_request={},
         )
 
     assert engine._release_pinned_handoff_blocks.call_args_list == [
@@ -893,7 +896,9 @@ def test_hybrid_handoff_keeps_partial_block_for_exact_decode_resume():
     with mock.patch(
         "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_size", return_value=1
     ):
-        prepared = engine._prepare_handoff_metadata_batch([(request, [10, 11, 12], 9)], {7: [99]})
+        prepared = engine._prepare_handoff_metadata_batch(
+            [(request, [10, 11, 12], 9)], {7: [99]}, {}
+        )
         engine._capture_handoff_meta(request, prepared[7])
 
     assert request.disaggregated_params["block_ids"] == [10, 11, 12]
@@ -924,9 +929,13 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     engine.context.kv_block_allocator.release_memory_blocks(cached)
     engine.context.kv_block_allocator.kv_hash_to_block_id.update(zip(hashes[:2], cached.tolist()))
 
-    kv_meta = {"request_id": 5, "resume_tokens": [99]}
+    kv_meta = {"request_id": 5, "resume_tokens": [99], "resume_log_probs": [-0.25]}
     engine.add_request_with_kv_handoff(
-        5, prompt, SamplingParams(num_tokens_to_generate=2), kv_meta, [100, 101, 102]
+        5,
+        prompt,
+        SamplingParams(num_tokens_to_generate=2, return_log_probs=True, skip_prompt_log_probs=True),
+        kv_meta,
+        [100, 101, 102],
     )
     _drain_loop(handoff_loop)
 
@@ -941,6 +950,7 @@ def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
     assert engine.precomputed_hashes[5] == hashes
     assert engine.context.kv_block_allocator.registered_parent_hashes == [hashes[1]]
     assert engine.get_request(5).generated_tokens == [99]
+    assert engine.get_request(5).generated_log_probs == [-0.25]
     assert 5 not in engine.waiting_request_ids
     admit.assert_called_once_with(
         engine.context, engine.get_request(5), [10, 11, 12], [13], [99], ssm_state_idx=None
@@ -1181,6 +1191,7 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
                 for request, blocks, slot in zip(requests, local_blocks, live_slots)
             ],
             {2: [90], 3: [91]},
+            {},
         )
         for request in requests:
             engine._capture_handoff_meta(request, prepared[request.request_id])

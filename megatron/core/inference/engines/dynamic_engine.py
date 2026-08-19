@@ -348,6 +348,8 @@ class DynamicInferenceEngine(AbstractEngine):
     def _initialize_disaggregation_state(self) -> None:
         """Hook overridden by the KV-handoff engine composition."""
 
+        self._disagg_config = None
+
     def _reset_pending_kv_imports(self) -> None:
         """Hook overridden by the KV-handoff engine composition."""
 
@@ -379,7 +381,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self._raise_kv_handoff_not_enabled("KV handoff completion notification")
 
     def _prepare_handoff_metadata_batch(
-        self, requests_and_state: list[tuple], decode_tokens_by_request: Dict[int, list[int]]
+        self,
+        requests_and_state: list[tuple],
+        decode_tokens_by_request: Dict[int, list[int]],
+        decode_log_probs_by_request: Dict[int, list[float]],
     ) -> dict:
         """Hook overridden by the KV-handoff engine composition."""
         if any(request.sampling_params.do_kv_handoff for request, *_ in requests_and_state):
@@ -752,9 +757,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
         local_ip = hostname or socket.gethostname()
+        disagg_config = self._disagg_config
 
         # Spawn a DP coordinator process and get the connection info.
-        if launch_inference_coordinator and self.is_dp_coordinator:
+        if disagg_config is not None:
+            spawn_coordinator = disagg_config["spawn_coordinator"] and self.is_mp_coordinator
+        else:
+            spawn_coordinator = launch_inference_coordinator and self.is_dp_coordinator
+        if spawn_coordinator:
             spawn_context = multiprocessing.get_context('spawn')
             deterministic_mode = torch.are_deterministic_algorithms_enabled()
             dp_pipe, dp_process_pipe = spawn_context.Pipe()
@@ -764,7 +774,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 kwargs={
                     "pipe_connection": dp_process_pipe,
                     "ready_event": coordinator_ready_event,
-                    "data_parallel_size": get_pg_size(self.pg_collection.dp),
+                    # Disaggregated engines register dynamically with their role.
+                    "data_parallel_size": (
+                        0 if disagg_config is not None else get_pg_size(self.pg_collection.dp)
+                    ),
                     "tokenizer": self.controller.tokenizer,
                     "max_requests": self.context.max_requests,
                     "inference_coordinator_port": inference_coordinator_port,
@@ -775,6 +788,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
+                    "disaggregated": disagg_config is not None,
+                    "disagg_router": (
+                        disagg_config["disagg_router"]
+                        if disagg_config is not None
+                        else "round_robin"
+                    ),
                 },
             )
             self.inference_coordinator_process.start()
@@ -795,6 +814,13 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             dp_addr = None
 
+        if disagg_config is not None and launch_inference_coordinator:
+            # Shards have disjoint process groups, so share the one coordinator
+            # address across the world before each shard broadcasts it locally.
+            bcast = [dp_addr]
+            torch.distributed.broadcast_object_list(bcast, src=0)
+            [dp_addr] = bcast
+
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
             mp_req_sock = self.zmq_context.socket(zmq.PUB)
@@ -812,7 +838,7 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
 
-        identity = f'mp-coord-{dp_rank}'
+        identity = disagg_config["identity"] if disagg_config is not None else f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -821,8 +847,21 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
             self.socket_for_receiving_requests.connect(dp_addr)
 
-            # send empty string. this is used to register with the coordinator.
-            self.socket_for_receiving_requests.send(b"")
+            if disagg_config is not None:
+                self.socket_for_receiving_requests.send(
+                    msgpack.packb(
+                        [
+                            Headers.REGISTER_ROLE.value,
+                            disagg_config["role"],
+                            disagg_config["kv_transport_backend"],
+                            self._instance_transfer_meta,
+                        ],
+                        use_bin_type=True,
+                    )
+                )
+            else:
+                # Empty registration is the aggregated coordinator protocol.
+                self.socket_for_receiving_requests.send(b"")
 
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group
@@ -863,7 +902,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.zmq_context, process_group=None, hostname=hostname
             )
 
-        if launch_inference_coordinator and self.is_dp_coordinator:
+        if spawn_coordinator:
             await await_process_call(
                 coordinator_ready_event.wait, self.inference_coordinator_process
             )
@@ -1438,6 +1477,11 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id_list = request_ids.tolist()
         handoff_blocks_by_request = finished_handoff_block_ids or {}
         handoff_ssm_slots_by_request = finished_handoff_ssm_slots or {}
+        handoff_log_probs_by_request = {}
+        if log_probs:
+            for request_id, request_log_probs in zip(request_id_list, log_probs):
+                if request_id in finished_request_ids and request_log_probs:
+                    handoff_log_probs_by_request[request_id] = [float(request_log_probs[-1])]
         prepared_handoff_metadata = self._prepare_handoff_metadata_batch(
             [
                 (
@@ -1449,6 +1493,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if request_id in finished_request_ids
             ],
             finished_handoff_decode_tokens or {},
+            handoff_log_probs_by_request,
         )
 
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
@@ -1630,10 +1675,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Skip for requests being finished due to stop words — tokens are not
             # appended for these requests, so log probs must also be skipped to keep
             # the two lists in sync.
-            if (
-                request_log_probs is not None
-                and request_id not in self.stop_word_being_finished_ids
-            ):
+            if request_log_probs and request_id not in self.stop_word_being_finished_ids:
                 # Initialize lists if they don't exist
                 if not request.prompt_log_probs:
                     request.prompt_log_probs = []

@@ -2380,6 +2380,38 @@ class TestDynamicContext:
             assert fast_mamba.unique().numel() == N, "fast path mamba slots must be unique"
 
     @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_ep_dummy_uses_reserved_state_when_request_slots_are_retained(self):
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            num_cuda_graphs=16,
+            is_hybrid_model=True,
+            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP, Symbols.ATTENTION],
+        )
+        metadata = ctx.mamba_metadata
+        retained_slots = metadata.batch_allocate_slots(ctx.max_requests)
+        assert retained_slots is not None
+        assert metadata.mamba_state_free_slot_count == 0
+
+        dummy_dimensions = min(
+            dimensions
+            for dimensions in ctx.cuda_graph_batch_dimensions_list
+            if dimensions.prefill_req_count == 0
+        )
+        ctx.add_dummy_requests_for_expert_parallel_step(dummy_dimensions)
+
+        assert metadata.request_to_mamba_state_idx[0] == metadata.dummy_state_idx
+        ctx.reset()
+        assert metadata.mamba_state_free_slot_count == 0
+
+    @pytest.mark.internal
     def test_gqa_high_tp_partition_heads(self):
         """Tests that TP > GQA results in 1 attention head per partition."""
         tp_size = 8

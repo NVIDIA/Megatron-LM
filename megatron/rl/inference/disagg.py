@@ -45,7 +45,14 @@ def _iter_shard_windows(specs, rank):
 
 
 def build_disagg_inference_model(
-    args, model_provider, model_type, base_config, get_model, *, model_alloc_ctx=None
+    args,
+    model_provider,
+    model_type,
+    base_config,
+    get_model,
+    *,
+    cfg_container=None,
+    model_alloc_ctx=None,
 ):
     """Build this rank's prefill/decode shard inference model (or ``None`` if
     ``--inference-shards`` doesn't declare disaggregation).
@@ -99,9 +106,16 @@ def build_disagg_inference_model(
         cfg.expert_tensor_parallel_size = my_spec.expt_tp
 
     with model_alloc_ctx or nullcontext():
-        model = get_model(
-            model_provider, model_type, wrap_with_ddp=False, pg_collection=my_pg, config=cfg
-        )
+        if cfg_container is not None:
+            model_config = copy.deepcopy(cfg_container.model)
+            model_config.transformer = cfg
+            model = model_config.get_builder_cls()(model_config).build_distributed_models(
+                pg_collection=my_pg, wrap_with_ddp=False, model_type=model_type
+            )
+        else:
+            model = get_model(
+                model_provider, model_type, wrap_with_ddp=False, pg_collection=my_pg, config=cfg
+            )
     model[0].eval()
     return model
 

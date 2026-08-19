@@ -47,6 +47,7 @@ class PendingKvImport:
     future: asyncio.Future
     ssm: PendingSSMImport | None = None
     resume_tokens: List[int] = field(default_factory=list)  # Sampled token, then MTP proposals.
+    resume_log_probs: List[float] = field(default_factory=list)  # First sampled token only.
     continuation_blocks: List[int] = field(default_factory=list)  # Empty KV for resume writes.
     local_error: Exception | None = None  # Exact local error, if this rank failed.
     destinations_safe: bool = True  # Whether allocated blocks may return to the pool.

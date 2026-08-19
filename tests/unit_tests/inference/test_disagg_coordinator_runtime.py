@@ -37,13 +37,16 @@ def _runtime(*, max_outstanding=32, backend="nixl", ssm_capacity=None):
 
 def test_request_routes_prefill_then_decode():
     runtime, sent = _runtime()
-    runtime.route_submit(5, [1, 2, 3], {"temperature": 0.0})
+    sampling_params = {"temperature": 0.0, "return_log_probs": True, "skip_prompt_log_probs": True}
+    runtime.route_submit(5, [1, 2, 3], sampling_params)
 
     identity, message = sent.pop()
     assert identity == b"prefill"
     assert Headers(message[0]) == Headers.SUBMIT_REQUEST
     assert message[3]["do_kv_handoff"] is True
     assert message[3]["num_tokens_to_generate"] == 0
+    assert message[3]["return_log_probs"] is True
+    assert message[3]["skip_prompt_log_probs"] is True
 
     handoff = {"kv_meta": {"agent": "prefill"}, "block_ids": [4, 5], "request_id": 5}
     runtime.handle_prefill_done(5, {"request_id": 5, "disaggregated_params": handoff})
@@ -51,7 +54,7 @@ def test_request_routes_prefill_then_decode():
     identity, message = sent.pop()
     assert identity == b"decode"
     assert Headers(message[0]) == Headers.SUBMIT_REQUEST_WITH_KV
-    assert message[1:4] == [5, [1, 2, 3], {"temperature": 0.0}]
+    assert message[1:4] == [5, [1, 2, 3], sampling_params]
     assert message[4:] == [handoff["kv_meta"], handoff["block_ids"]]
 
 
