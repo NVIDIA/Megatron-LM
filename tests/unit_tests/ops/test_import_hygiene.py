@@ -9,7 +9,14 @@ import textwrap
 
 import pytest
 
-_MIGRATED_MODULES = ("megatron.core.ops",)
+_MIGRATED_MODULES = (
+    "megatron.core.ops",
+    "megatron.core.models.gpt.gpt_layer_specs",
+    "megatron.core.models.gpt.moe_module_specs",
+    "megatron.core.models.gpt.experimental_attention_variant_module_specs",
+    "megatron.core.transformer.multi_token_prediction",
+    "megatron.core.models.common.language_module.language_module",
+)
 
 
 def test_importing_ops_does_not_import_an_optional_backend():
