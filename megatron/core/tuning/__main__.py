@@ -2,6 +2,8 @@
 
 """Command line for building and inspecting tuned tables.
 
+Usage::
+
     python -m megatron.core.tuning merge  rec.rank*.json -o tables/sm103.json
     python -m megatron.core.tuning report rec.rank*.json
 """
