@@ -235,6 +235,21 @@ def _build_rope(
     return rotary.to(device=target_device)
 
 
+def _cos_sin_from_hf(
+    model_path: str | Path,
+    config: DeepseekV4Config,
+    *,
+    compress_ratio: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    hf_config = _symbol("vllm.transformers_utils.config", "get_config")(
+        str(model_path), trust_remote_code=True
+    )
+    return _build_rope(
+        hf_config, config, compress_ratio=compress_ratio, device=device
+    ).cos_sin_cache.to(device=device, dtype=torch.float32)
+
+
 @dataclass(frozen=True)
 class DS4RuntimeLayout:
     """Minimal contiguous page ABI required by vLLM's prefill cache kernels."""
@@ -427,23 +442,11 @@ class DS4SparseAttentionMetadataBuilderAdapter:
     ) -> "DS4SparseAttentionMetadataBuilderAdapter":
         """Create the exact RoPE cache through vLLM's public DS4 rope builder."""
 
-        get_config = _symbol("vllm.transformers_utils.config", "get_config")
-        hf_config = get_config(
-            str(model_path),
-            trust_remote_code=True,
-        )
-        rotary = _build_rope(
-            hf_config,
-            config,
-            compress_ratio=1,
-            device=device,
-        )
         return cls(
             config,
             device=device,
-            cos_sin_cache=rotary.cos_sin_cache.to(
-                device=device,
-                dtype=torch.float32,
+            cos_sin_cache=_cos_sin_from_hf(
+                model_path, config, compress_ratio=1, device=device
             ),
         )
 
@@ -461,10 +464,6 @@ class DS4SparseAttentionMetadataBuilderAdapter:
         indices = starts[:, None] + offsets[None, :]
         indices.masked_fill_(offsets[None, :] >= lengths[:, None], -1)
         return indices.unsqueeze(1).contiguous(), lengths.contiguous()
-
-    def build_prefill(self, num_tokens: int):
-        """Build the one-request specialization of packed training prefill."""
-        return self.build_prefill_batch([num_tokens])
 
     def build_prefill_batch(self, token_counts: list[int]):
         """Build packed prefill metadata for multiple independent requests."""
@@ -640,25 +639,13 @@ class DS4SparseIndexerCompressorMetadataAdapter:
         layer_idx: int,
         device: torch.device | str,
     ) -> "DS4SparseIndexerCompressorMetadataAdapter":
-        get_config = _symbol("vllm.transformers_utils.config", "get_config")
-        hf_config = get_config(
-            str(model_path),
-            trust_remote_code=True,
-        )
         ratio = max(1, config.compress_ratios[layer_idx])
-        rotary = _build_rope(
-            hf_config,
-            config,
-            compress_ratio=ratio,
-            device=device,
-        )
         return cls(
             config,
             layer_idx=layer_idx,
             device=device,
-            cos_sin_cache=rotary.cos_sin_cache.to(
-                device=device,
-                dtype=torch.float32,
+            cos_sin_cache=_cos_sin_from_hf(
+                model_path, config, compress_ratio=ratio, device=device
             ),
         )
 
@@ -955,10 +942,6 @@ class DS4SparseIndexerCompressorMetadataAdapter:
         )
         return output
 
-    def build_prefill(self, num_tokens: int):
-        """Build the one-request specialization of packed training prefill."""
-        return self.build_prefill_batch([num_tokens])
-
     def build_prefill_batch(self, token_counts: list[int]):
         """Build packed, sequence-isolated metadata for extended DS4 layers."""
 
@@ -1178,16 +1161,11 @@ class DS4MoEKernelMetadataBuilderAdapter:
         return MoEKernelMetadata(gate_linear=self.gate_linear)
 
 
-# Compatibility for existing layer-0 callers.
-DS4HashMoEKernelMetadataBuilderAdapter = DS4MoEKernelMetadataBuilderAdapter
-
-
 __all__ = [
     "DS4_FLASHMLA_INDEX_ALIGNMENT",
     "DS4_FP8_MLA_TOKEN_BYTES",
     "DS4_SWA_BLOCK_SIZE",
     "DS4RuntimeLayout",
-    "DS4HashMoEKernelMetadataBuilderAdapter",
     "DS4MoEKernelMetadataBuilderAdapter",
     "DS4SparseIndexerCompressorMetadataAdapter",
     "DS4SparseAttentionMetadataBuilderAdapter",

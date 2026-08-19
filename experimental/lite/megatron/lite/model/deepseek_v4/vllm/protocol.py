@@ -401,11 +401,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 }
             else:
                 attention_metadata = {
-                    layer_idx: (
-                        current_attention_builders[layer_idx].build_prefill(token_counts[0])
-                        if len(token_counts) == 1
-                        else current_attention_builders[layer_idx].build_prefill_batch(token_counts)
-                    )
+                    layer_idx: current_attention_builders[
+                        layer_idx
+                    ].build_prefill_batch(token_counts)
                     for layer_idx in selected_layers
                 }
         if moe_metadata is None:

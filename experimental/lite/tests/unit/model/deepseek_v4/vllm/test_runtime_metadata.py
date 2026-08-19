@@ -161,7 +161,7 @@ def test_layer0_prefill_metadata_exact_contract(monkeypatch) -> None:
     cos = torch.empty(256, 128, dtype=torch.float32)
     metadata = runtime.DS4SparseAttentionMetadataBuilderAdapter(
         _config(), device="cpu", cos_sin_cache=cos
-    ).build_prefill(130)
+    ).build_prefill_batch([130])
 
     assert torch.equal(metadata.positions, torch.arange(130, dtype=torch.int64))
     assert torch.equal(metadata.slot_mapping, metadata.positions)
@@ -253,7 +253,7 @@ def test_layer1_extended_builder_reuses_swa_only_contract(monkeypatch) -> None:
         device="cpu",
         cos_sin_cache=torch.empty(256, 128),
     )
-    metadata = builder.build_prefill(5)
+    metadata = builder.build_prefill_batch([5])
     assert metadata.compressor_operation is None
     assert metadata.indexer_operation is None
     assert metadata.indices.shape == (5, 1, 128)
@@ -463,7 +463,7 @@ def test_prefill_indices_are_bitwise_official_vllm() -> None:
         device="cuda",
         cos_sin_cache=torch.empty(512, 128, dtype=torch.float32, device="cuda"),
     )
-    candidate = builder.build_prefill(num_tokens)
+    candidate = builder.build_prefill_batch([num_tokens])
     reference_indices, reference_lens = combine_topk_swa_indices(
         torch.empty(num_tokens, config.index_topk, dtype=torch.int32, device="cuda"),
         torch.tensor([0, num_tokens], dtype=torch.int32, device="cuda"),
