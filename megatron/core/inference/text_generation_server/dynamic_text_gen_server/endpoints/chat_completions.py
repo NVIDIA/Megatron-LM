@@ -721,7 +721,7 @@ try:
 
         req = await request.get_json()
         prevent_retokenization = req.get(
-            "prevent_retokenization", not current_app.config.get('serving_mode', False)
+            "prevent_retokenization", not current_app.config.get('eval_mode', False)
         )
         tools = req.get("tools", None)
         tool_choice = req.get("tool_choice", None)

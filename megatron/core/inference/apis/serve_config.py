@@ -56,10 +56,10 @@ class ServeConfig:
     default_top_k: int = 0
     """Default top-k value when an HTTP request omits `top_k`."""
 
-    serving_mode: bool = False
-    """Use pure-serving defaults instead of RL-oriented response behavior.
+    eval_mode: bool = False
+    """Use evaluation defaults instead of RL-oriented response behavior.
 
-    In serving mode, chat requests default `prevent_retokenization` to false,
+    In evaluation mode, chat requests default `prevent_retokenization` to false,
     avoiding transmission of prompt token IDs. Individual requests can still
     opt in by setting `prevent_retokenization` or `return_tokenized_data`.
     """

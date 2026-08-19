@@ -41,7 +41,7 @@ class _CapturingClient:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     (
-        "serving_mode",
+        "eval_mode",
         "request_overrides",
         "expected_top_p",
         "expected_top_k",
@@ -55,7 +55,7 @@ class _CapturingClient:
     ],
 )
 async def test_chat_request_uses_server_defaults(
-    serving_mode, request_overrides, expected_top_p, expected_top_k, expected_prompt_tokens
+    eval_mode, request_overrides, expected_top_p, expected_top_k, expected_prompt_tokens
 ):
     app = Quart(__name__)
     inference_client = _CapturingClient()
@@ -66,7 +66,7 @@ async def test_chat_request_uses_server_defaults(
         verbose=False,
         default_top_p=0.95,
         default_top_k=20,
-        serving_mode=serving_mode,
+        eval_mode=eval_mode,
     )
     app.register_blueprint(chat_completions_blueprint)
 
