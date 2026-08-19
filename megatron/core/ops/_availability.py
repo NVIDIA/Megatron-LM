@@ -44,13 +44,17 @@ def is_installed(module_name: str) -> bool:
     raise ImportError(f"Optional dependency '{module_name}' is installed but failed to import.")
 
 
-def require(module_name: str, *, backend: str) -> ModuleType:
-    """Return a selected backend's dependency, or explain what to install."""
+def require(module_name: str) -> ModuleType:
+    """Return a selected dependency, or explain what is wrong with it.
+
+    Callers that know which backend asked should catch this and add that context;
+    :mod:`megatron.core.ops.resolve` does exactly that, from its backend table.
+    """
     module, error, absent = _import_outcome(module_name)
     if module is not None:
         return module
     reason = "is not installed" if absent else "failed to import"
-    raise ImportError(f"Backend '{backend}' requires '{module_name}', which {reason}.") from error
+    raise ImportError(f"'{module_name}' {reason}.") from error
 
 
 def reset_cache() -> None:

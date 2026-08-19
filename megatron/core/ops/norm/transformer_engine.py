@@ -4,17 +4,13 @@
 
 from __future__ import annotations
 
-from megatron.core.ops import _availability
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 
-__all__ = ["TENormBackend", "TENormWithResidual", "te_norm"]
-
-_BACKEND_NAME = "transformer_engine"
+__all__ = ["InferenceNorm", "Norm", "TENormWithResidual", "te_norm"]
 
 
 def te_norm() -> type:
     """Return Transformer Engine's norm target, importing it only when selected."""
-    _availability.require("transformer_engine", backend=_BACKEND_NAME)
     from megatron.core.extensions.transformer_engine import TENorm
 
     return TENorm
@@ -31,16 +27,15 @@ class TENormWithResidual:
         return te_norm()(*args, has_residual=True, **kwargs)
 
 
-class TENormBackend:
+class Norm:
     """Owns ``layer_norm`` using Transformer Engine.
 
     Two backend-internal details stay here rather than at the call site: TE below 1.9 harms
     convergence for query/key norm, and residual fusion needs a distinct target.
     """
 
-    def __init__(self, *, fuse_residual: bool = True) -> None:
-        _availability.require("transformer_engine", backend=_BACKEND_NAME)
-        self._fuse_residual = fuse_residual
+    REQUIRES = "transformer_engine"
+    FUSES_RESIDUAL = True
 
     def layer_norm(
         self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
@@ -55,6 +50,12 @@ class TENormBackend:
             from megatron.core.ops.norm.apex import apex_layer_norm
 
             return apex_layer_norm()
-        if has_residual and self._fuse_residual:
+        if has_residual and self.FUSES_RESIDUAL:
             return TENormWithResidual
         return te_norm()
+
+
+class InferenceNorm(Norm):
+    """The same norm, minus residual fusion: inference layers manage the residual themselves."""
+
+    FUSES_RESIDUAL = False

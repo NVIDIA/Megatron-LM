@@ -2230,24 +2230,17 @@ def _add_inference_args(parser):
 
 def _op_backend_override(value):
     """Parse one OPERATION=BACKEND pair from --op-backend."""
-    from megatron.core.ops import available_backends, parse_operation
+    from megatron.core.ops import find_operation, validate_backend
 
-    operation, separator, backend = value.partition("=")
+    name, separator, backend = value.partition("=")
     if not separator:
-        raise argparse.ArgumentTypeError(
-            f"expected OPERATION=BACKEND, got '{value}'"
-        )
+        raise argparse.ArgumentTypeError(f"expected OPERATION=BACKEND, got '{value}'")
     try:
-        operation = str(parse_operation(operation.strip()))
+        operation = find_operation(name.strip())
+        validate_backend(operation, backend.strip())
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from error
-    backend = backend.strip()
-    if backend not in available_backends():
-        raise argparse.ArgumentTypeError(
-            f"unknown backend '{backend}'. Available backends: "
-            f"{', '.join(available_backends())}"
-        )
-    return operation, backend
+    return operation.method, backend.strip()
 
 
 def _load_op_backend_config(path):

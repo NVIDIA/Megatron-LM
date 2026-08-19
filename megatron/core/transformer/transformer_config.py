@@ -1291,10 +1291,11 @@ class TransformerConfig(ModelParallelConfig):
     op_backend_overrides: dict[str, str] = field(default_factory=dict)
     """Per-operation backend choices layered on top of ``transformer_impl``.
 
-    Maps an operation name from ``megatron.core.ops.Operation`` to a backend name from
-    ``megatron.core.ops.available_backends()``, for example
-    ``{"layer_norm": "apex", "vocab_parallel_cross_entropy": "te_cross_entropy"}``.
-    Selecting the same operation both here and through an older setting is an error."""
+    Maps an operation name to a backend name, for example
+    ``{"layer_norm": "apex", "vocab_parallel_cross_entropy": "te_fused"}``. Backend names are
+    scoped to the operation's family, so ``megatron.core.ops.backends_for(operation)`` lists
+    the valid choices. Selecting the same operation both here and through an older setting is
+    an error."""
 
     #####################################
     # Fine-grained Activation Offloading

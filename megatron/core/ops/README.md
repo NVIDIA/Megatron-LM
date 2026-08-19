@@ -11,65 +11,69 @@ self.input_layernorm = norm_cls(config=config, hidden_size=..., eps=...)
 
 There is no registry lookup, no resolver, and no dispatch in the forward path.
 
-## The pieces
+## Two layers
 
-| File | Holds |
-| --- | --- |
-| `operations.py` | `Operation`: the set of methods a backend can own. Each value *is* the method name. |
-| `spec_provider.py` | `BackendSpecProvider`, the protocol, and `compose()`, the only way backends combine. |
-| `options.py` | `BackendOptions`: every setting that can change which implementation you get. |
-| `resolve.py` | The backend name table and the single construction path. |
-| `<operation>/<backend>.py` | The implementations for one operation, plus the backend that owns it. |
-| `<operation>/__init__.py` | The contract that family's implementations have to meet. |
-| `providers/` | Backends that implement the whole protocol and can serve as a base. |
+**Central, and it stops changing.** `operations.py` defines what an operation *is*.
+`spec_provider.py` defines `BackendSpecProvider`, the one type model code ever holds.
+`options.py` lists every setting that can change which implementation you get. `resolve.py`
+builds a provider and names no individual backend.
+
+**Per family, and it grows.** Each `megatron/core/ops/<family>/` declares its own operations,
+its contract, its backend table, and its default. Adding a backend touches one family;
+adding a family is a milestone.
+
+```
+megatron/core/ops/norm/
+  contract.py               # the contract, the Operation constants, and the slot methods
+  __init__.py               # BACKENDS, DEFAULT
+  reference.py apex.py megatron.py transformer_engine.py
+```
+
+Every backend module exposes one class named for its family — `reference.Norm`,
+`transformer_engine.Norm`, `megatron.Linear`, `inference.Moe` — so a table reads as
+"this name, that vendor's implementation" and nothing collides with the targets themselves.
+
+A family can split into sub-folders when its operations have disjoint backend sets, which is
+how `attention.dsa` will work: `FAMILY = "attention.dsa"` is the module path, so the resolver
+finds it with no extra machinery, and DSA can offer `tilelang` without offering it for
+`core_attention`.
 
 ## How selection works
 
-Exactly three steps, in this order:
+Three steps, in this order:
 
-1. `--transformer-impl` picks the base backend, which answers every operation.
-2. Settings that predate `--op-backend` (today, the cross entropy fusion flags) take over the
-   operations they name.
+1. `--transformer-impl` names a preset. Each family uses its entry for that name, or its own
+   `DEFAULT` if it has none.
+2. Settings that predate `--op-backend` take over the operations they name.
 3. `--op-backend` takes over last.
 
 Two settings claiming the same operation is an error, not a silent win for one of them.
 
-## Combining backends
-
-A backend is any object implementing one or more provider methods. A backend that implements
-all of them can be a base; one that implements a subset can take over just those operations:
+Backend names are scoped to the operation, so the same word means "that vendor's
+implementation of whatever you named":
 
 ```bash
-# Transformer Engine everywhere, except normalization, which comes from Apex
---transformer-impl transformer_engine --op-backend layer_norm=apex
+--op-backend layer_norm=transformer_engine core_attention=transformer_engine
+--op-backend layer_norm=apex                       # Apex norm on a Transformer Engine model
+--op-backend-config backends.yaml                  # same thing from a file
 ```
 
-or from a file, which is the same thing:
-
-```yaml
-# backends.yaml, passed as --op-backend-config backends.yaml
-layer_norm: apex
-vocab_parallel_cross_entropy: te_cross_entropy
-```
-
-`compose()` attaches the owning backend's bound method to the provider, so combining backends
-costs one attribute lookup while the model is built and nothing at all afterwards.
+`BackendSpecProvider` binds the owning backend's method onto itself while the model is being
+built, so combining backends costs one attribute lookup then and nothing afterwards. A slot no
+backend owns raises and says how to select one.
 
 ## Adding a backend
 
 Say you want Liger's RMSNorm.
 
-1. Write `megatron/core/ops/norm/liger.py`. Meet the contract in `norm/__init__.py`, keep the
+1. Write `megatron/core/ops/norm/liger.py`. Meet the contract in `norm/contract.py`, keep the
    import lazy, and let `_availability.require` produce the error when it is missing:
 
    ```python
-   from megatron.core.ops import _availability
-
-   class LigerNormBackend:
+   class Norm:
        """Owns ``layer_norm`` using Liger's fused RMSNorm."""
 
-       def __init__(self) -> None:
-           _availability.require("liger_kernel", backend="liger")
+       REQUIRES = "liger_kernel"
 
        def layer_norm(self, rms_norm=False, for_qk=False, has_residual=False):
            if not rms_norm:
@@ -79,23 +83,34 @@ Say you want Liger's RMSNorm.
            return LigerRMSNorm
    ```
 
-2. Add one entry to `_BACKENDS` in `resolve.py`:
+   `REQUIRES` is the whole dependency story. The resolver checks it once, in one place, while
+   arguments are parsed — so `--op-backend layer_norm=liger` on a machine without Liger fails
+   before anything is built. A backend that needs more than "is the package importable", such
+   as a version check, does that in its own constructor.
+
+2. Add one entry to `BACKENDS` in `norm/__init__.py`:
 
    ```python
-   "liger": _liger_norm,
+   from megatron.core.ops.norm import liger
+   ...
+   "liger": liger.Norm,
    ```
 
-3. Add its targets to the family's equivalence test in
-   `tests/unit_tests/ops/test_backend_targets.py`.
+That is the whole change. Nothing central moves, no call site changes, and
+`--op-backend layer_norm=liger` works immediately. `tests/unit_tests/ops/test_conformance.py`
+is parametrized off `BACKENDS`, so the new backend is covered the moment it is registered — if
+it misses a slot its family declares, that test fails by name.
 
-That is the whole change. No existing branch moves, no call site changes, and
-`--op-backend layer_norm=liger` works immediately. A backend pointed at an operation it does
-not implement is rejected while the model is built, with the operation and the backend named.
+Backends that need a setting bound up front expose `from_options(options)` instead of a bare
+constructor; the loss family's `transformer_engine.Loss` does this for CUDA-graph capture.
 
-## Adding an operation
+## Adding a family
 
-Add an `Operation` member whose value is the new provider method name, declare the method on
-`BackendSpecProvider`, and give it a default there if most backends should share one. Add a
-member only when an existing class, callable, or builder already owns that boundary at
-construction time — an implementation that has to branch on shape, phase, or communication
-keeps its current owner and exposes a target through `ops` instead.
+Create `megatron/core/ops/<family>/contract.py` with the contract, the `Operation` constants,
+and a `*Slots` class whose methods raise `unowned(...)`. Add `BACKENDS` and `DEFAULT` to the
+family's `__init__.py`, list the family in `resolve.py:_FAMILIES`, and add its `*Slots` to the
+bases of `BackendSpecProvider`.
+
+Declare an operation only when an existing class, callable, or builder already owns that
+boundary at construction time. An implementation that has to branch on shape, phase, or
+communication keeps its current owner and exposes a target through `ops` instead.

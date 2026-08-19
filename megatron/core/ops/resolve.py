@@ -1,178 +1,215 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""The one place a BackendSpecProvider is built."""
+"""The one place a BackendSpecProvider is built.
+
+Nothing here names an individual backend. Each family under ``megatron.core.ops`` declares its
+own operations, its own backend table, and its own default, so adding a backend touches that
+family and nothing else.
+"""
 
 from __future__ import annotations
 
-from typing import Callable, Mapping
+import importlib
+from functools import lru_cache
+from types import ModuleType
+from typing import Mapping
 
+from megatron.core.ops._availability import is_installed, require
 from megatron.core.ops.operations import Operation
 from megatron.core.ops.options import BackendOptions
-from megatron.core.ops.spec_provider import BackendSpecProvider, compose
+from megatron.core.ops.spec_provider import BackendSpecProvider
 
-__all__ = ["available_backends", "build_spec_provider", "get_backend", "get_backend_spec_provider"]
+__all__ = [
+    "PRESETS",
+    "backends_for",
+    "build_spec_provider",
+    "find_operation",
+    "get_backend",
+    "get_backend_spec_provider",
+    "operations",
+    "validate_backend",
+]
 
+#: The families that declare operations. Adding one is a milestone; adding a backend is not.
+_FAMILIES = ("norm", "linear", "attention", "moe", "loss")
 
-def _local(options: BackendOptions) -> BackendSpecProvider:
-    from megatron.core.ops.providers.local import LocalSpecProvider
-
-    return LocalSpecProvider()
-
-
-def _transformer_engine(options: BackendOptions) -> BackendSpecProvider:
-    from megatron.core.ops.providers.transformer_engine import TESpecProvider
-
-    return TESpecProvider()
-
-
-def _inference_optimized(options: BackendOptions) -> BackendSpecProvider:
-    from megatron.core.ops.providers.inference import InferenceSpecProvider
-
-    return InferenceSpecProvider()
+#: What --transformer-impl accepts. A preset names the backend each family should prefer;
+#: a family that does not offer that name keeps its own default.
+PRESETS = ("local", "transformer_engine", "inference_optimized")
 
 
-def _torch_norm(options: BackendOptions) -> object:
-    from megatron.core.ops.norm.reference import TorchNormBackend
-
-    return TorchNormBackend()
-
-
-def _apex_norm(options: BackendOptions) -> object:
-    from megatron.core.ops.norm.apex import ApexNormBackend
-
-    return ApexNormBackend()
+@lru_cache(maxsize=None)
+def _families() -> tuple[ModuleType, ...]:
+    return tuple(importlib.import_module(f"megatron.core.ops.{name}") for name in _FAMILIES)
 
 
-def _te_norm(options: BackendOptions) -> object:
-    from megatron.core.ops.norm.transformer_engine import TENormBackend
-
-    return TENormBackend()
-
-
-def _megatron_cross_entropy(options: BackendOptions) -> object:
-    from megatron.core.ops.loss.cross_entropy import MegatronCrossEntropyBackend
-
-    return MegatronCrossEntropyBackend()
+@lru_cache(maxsize=None)
+def _family_of(operation: Operation) -> ModuleType:
+    for family in _families():
+        if family.FAMILY == operation.family:
+            return family
+    raise ValueError(f"No family declares '{operation.qualified_name}'")
 
 
-def _megatron_fused_cross_entropy(options: BackendOptions) -> object:
-    from megatron.core.ops.loss.fused_cross_entropy import MegatronFusedCrossEntropyBackend
-
-    return MegatronFusedCrossEntropyBackend()
-
-
-def _te_cross_entropy(options: BackendOptions) -> object:
-    from megatron.core.ops.loss.transformer_engine import TECrossEntropyBackend
-
-    return TECrossEntropyBackend(cuda_graph_capturable=options.cuda_graph_impl == "full_iteration")
+def operations() -> tuple[Operation, ...]:
+    """Every operation, in family order."""
+    return tuple(op for family in _families() for op in family.OPERATIONS)
 
 
-#: Every named backend, and how to build it. A backend that implements the whole protocol can
-#: serve as a base; the rest own a single operation. Each factory takes the options so it can
-#: bind anything it must decide up front, and nothing here is consulted after the model is built.
-#:
-#: Adding a backend means adding its module under megatron/core/ops/<operation>/ and one entry
-#: here. No existing branch changes, and no call site changes.
-_BACKENDS: Mapping[str, Callable[[BackendOptions], object]] = {
-    # Complete backends, selectable through --transformer-impl.
-    "local": _local,
-    "transformer_engine": _transformer_engine,
-    "inference_optimized": _inference_optimized,
-    # Single-operation backends, selectable through --op-backend.
-    "torch": _torch_norm,
-    "apex": _apex_norm,
-    "te_norm": _te_norm,
-    "megatron_cross_entropy": _megatron_cross_entropy,
-    "megatron_fused_cross_entropy": _megatron_fused_cross_entropy,
-    "te_cross_entropy": _te_cross_entropy,
-}
-
-_BASE_BACKENDS = ("local", "transformer_engine", "inference_optimized")
-
-#: How the pre-existing cross entropy settings map onto the operation they select.
-_CROSS_ENTROPY_FUSION = {"native": "megatron_fused_cross_entropy", "te": "te_cross_entropy"}
+def find_operation(name: str) -> Operation:
+    """Return the operation called ``name``, accepting ``method`` or ``family.method``."""
+    matches = [op for op in operations() if name in (op.method, op.qualified_name)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        choices = ", ".join(op.method for op in operations())
+        raise ValueError(f"Unknown operation '{name}'. Valid operations: {choices}")
+    choices = ", ".join(op.qualified_name for op in matches)
+    raise ValueError(f"Operation '{name}' is ambiguous. Use one of: {choices}")
 
 
-def available_backends() -> tuple[str, ...]:
-    """Every backend name that --op-backend accepts."""
-    return tuple(_BACKENDS)
+def backends_for(operation: Operation) -> tuple[str, ...]:
+    """Every backend name that can fill one operation."""
+    return tuple(_family_of(operation).BACKENDS)
 
 
-def _build_backend(
-    name: str, options: BackendOptions, *, operation: Operation | None = None
-) -> object:
-    factory = _BACKENDS.get(name)
-    if factory is None:
-        where = f" for operation '{operation}'" if operation is not None else ""
+def _instantiate(backend: object, options: BackendOptions) -> object:
+    """Build one backend, giving it the options only if it asked for them."""
+    from_options = getattr(backend, "from_options", None)
+    return from_options(options) if from_options is not None else backend()  # type: ignore[operator]
+
+
+def _check_backend(family: ModuleType, backend_name: str, wanted_by: str) -> None:
+    """The one place a backend name and its optional dependency are checked."""
+    if backend_name not in family.BACKENDS:
         raise ValueError(
-            f"Unknown backend '{name}'{where}. Available backends: {', '.join(_BACKENDS)}"
+            f"Unknown backend '{backend_name}' for {wanted_by}. "
+            f"Available backends: {', '.join(family.BACKENDS)}"
         )
-    return factory(options)
+    requires = getattr(family.BACKENDS[backend_name], "REQUIRES", None)
+    if requires is not None and not is_installed(requires):
+        raise ValueError(
+            f"Backend '{backend_name}' for {wanted_by} requires '{requires}', "
+            "which is not installed."
+        )
 
 
-def _base_provider(options: BackendOptions) -> BackendSpecProvider:
-    """Select the backend that supplies every operation nothing else claims."""
-    if options.transformer_impl not in _BASE_BACKENDS:
+def validate_backend(operation: Operation, backend_name: str) -> None:
+    """Raise if ``backend_name`` cannot fill ``operation`` here.
+
+    A backend declares what it needs as ``REQUIRES``, so no family repeats the check. Public
+    so the command line can reject a bad ``--op-backend`` while it parses, rather than leaving
+    it to fail at model build time.
+    """
+    _check_backend(_family_of(operation), backend_name, f"operation '{operation.method}'")
+
+
+def _owner_for(operation: Operation, backend_name: str, options: BackendOptions) -> object:
+    validate_backend(operation, backend_name)
+    return _instantiate(_family_of(operation).BACKENDS[backend_name], options)
+
+
+def _preset_owners(options: BackendOptions) -> dict[Operation, object]:
+    """Assign every operation from one preset: the family's entry for it, or its default."""
+    if options.transformer_impl not in PRESETS:
         raise ValueError(
             f"unknown transformer_impl='{options.transformer_impl}'. "
-            f"Valid choices: {', '.join(_BASE_BACKENDS)}"
+            f"Valid choices: {', '.join(PRESETS)}"
         )
-    provider = _build_backend(options.transformer_impl, options)
-    if options.use_kitchen:
-        from megatron.core.ops.providers.kitchen import kitchen_provider
-
-        provider = kitchen_provider(
-            provider,
-            use_kitchen_attention=options.use_kitchen_attention,
-            kitchen_attention_backend=options.kitchen_attention_backend,
+    owners: dict[Operation, object] = {}
+    for family in _families():
+        name = (
+            options.transformer_impl
+            if options.transformer_impl in family.BACKENDS
+            else family.DEFAULT
         )
-    return provider  # type: ignore[return-value]
-
-
-def _legacy_operation_backends(options: BackendOptions) -> dict[Operation, str]:
-    """Translate settings that predate --op-backend into operation choices."""
-    owners: dict[Operation, str] = {}
-    if options.cross_entropy_loss_fusion:
-        impl = options.cross_entropy_fusion_impl
-        if impl not in _CROSS_ENTROPY_FUSION:
-            raise ValueError(
-                f"Unknown cross_entropy_fusion_impl='{impl}'. "
-                f"Valid choices: {', '.join(_CROSS_ENTROPY_FUSION)}"
-            )
-        owners[Operation.VOCAB_PARALLEL_CROSS_ENTROPY] = _CROSS_ENTROPY_FUSION[impl]
+        # A named preset fails clearly when its backend cannot be used here.
+        _check_backend(family, name, f"--transformer-impl {options.transformer_impl}")
+        backend = _instantiate(family.BACKENDS[name], options)
+        owners.update(
+            {
+                operation: backend
+                for operation in family.OPERATIONS
+                if not operation.optional or callable(getattr(backend, operation.method, None))
+            }
+        )
     return owners
 
 
-def _operation_owners(options: BackendOptions) -> dict[Operation, object]:
-    """Resolve every operation an explicit selector claims, rejecting two claims on one slot."""
-    legacy = _legacy_operation_backends(options)
-    explicit = dict(options.operation_backends)
+def _legacy_overrides(options: BackendOptions) -> dict[Operation, str]:
+    """Translate settings that predate --op-backend into the operation they always selected."""
+    from megatron.core.ops.loss import VOCAB_PARALLEL_CROSS_ENTROPY
 
-    contested = sorted(str(operation) for operation in set(legacy) & set(explicit))
+    overrides: dict[Operation, str] = {}
+    if options.cross_entropy_loss_fusion:
+        fusion = {"native": "megatron_fused", "te": "te_fused"}
+        impl = options.cross_entropy_fusion_impl
+        if impl not in fusion:
+            raise ValueError(
+                f"Unknown cross_entropy_fusion_impl='{impl}'. Valid choices: {', '.join(fusion)}"
+            )
+        overrides[VOCAB_PARALLEL_CROSS_ENTROPY] = fusion[impl]
+    return overrides
+
+
+def _override_owners(options: BackendOptions) -> dict[Operation, object]:
+    """Resolve every operation an explicit selector claims, rejecting two claims on one slot."""
+    legacy = _legacy_overrides(options)
+    explicit = {
+        find_operation(name): backend for name, backend in options.operation_backends.items()
+    }
+
+    contested = sorted(op.method for op in set(legacy) & set(explicit))
     if contested:
         raise ValueError(
             "Two settings select a backend for the same operation: "
             + ", ".join(
-                f"'{operation}' (from an existing setting and from --op-backend)"
-                for operation in contested
+                f"'{name}' (from an existing setting and from --op-backend)" for name in contested
             )
             + ". Keep only one of them."
         )
-
     return {
-        operation: _build_backend(name, options, operation=operation)
+        operation: _owner_for(operation, name, options)
         for operation, name in {**legacy, **explicit}.items()
     }
 
 
-def build_spec_provider(options: BackendOptions) -> BackendSpecProvider:
-    """Build the provider for ``options``: one base backend, then explicit operation owners.
+def _layered_owners(
+    overlay: object, owners: dict[Operation, object]
+) -> dict[Operation, object]:
+    """Give ``overlay`` the slots it implements, and leave the rest where they are.
 
-    Selection order is fixed and total: the base backend answers everything, settings that
-    predate --op-backend take over the operations they name, and --op-backend takes over last.
-    Everything an optional dependency needs is checked here, while the model is being built.
+    A partial backend layered over an assembled provider -- Kitchen is the one in tree --
+    forwards the operations it does not own to a fallback. It cannot forward a slot that did
+    not exist when it was written, so anything it does not define itself stays with the
+    backend that already had it, rather than reaching an unowned stub.
     """
-    return compose(_base_provider(options), _operation_owners(options))
+    return {
+        operation: (
+            overlay
+            if getattr(type(overlay), operation.method, None)
+            not in (None, getattr(BackendSpecProvider, operation.method, None))
+            else owner
+        )
+        for operation, owner in owners.items()
+    }
+
+
+def build_spec_provider(options: BackendOptions) -> BackendSpecProvider:
+    """Build the provider for ``options``.
+
+    Selection order is fixed and total: the preset assigns every operation, Kitchen layers over
+    that when enabled, and --op-backend wins last. Every optional dependency a selected backend
+    needs is checked here, while the model is being built.
+    """
+    owners = _preset_owners(options)
+    if options.use_kitchen:
+        from megatron.core.ops.kitchen import kitchen_backend
+
+        require("nvidia_kitchen")
+        owners = _layered_owners(kitchen_backend(BackendSpecProvider(owners), options), owners)
+    owners.update(_override_owners(options))
+    return BackendSpecProvider(owners)
 
 
 def get_backend_spec_provider(
@@ -185,5 +222,5 @@ def get_backend_spec_provider(
 
 
 def get_backend(transformer_impl: str, **options) -> BackendSpecProvider:
-    """Build the provider for a base backend name, with no config to read."""
+    """Build the provider for a preset name, with no config to read."""
     return build_spec_provider(BackendOptions(transformer_impl=transformer_impl, **options))

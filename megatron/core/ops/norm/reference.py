@@ -6,13 +6,15 @@ from __future__ import annotations
 
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder, WrappedTorchNorm
 
-__all__ = ["L2Norm", "TorchNormBackend", "WrappedTorchNorm"]
+__all__ = ["L2Norm", "Norm", "WrappedTorchNorm"]
 
 
-class TorchNormBackend:
-    """Owns ``layer_norm`` using PyTorch's own LayerNorm/RMSNorm.
+class Norm:
+    """Owns ``layer_norm`` using PyTorch's own LayerNorm and RMSNorm.
 
-    Always available, so this is the fallback whenever a faster norm is not installed.
+    Always available, so this is the fallback whenever a faster norm is not installed. It does
+    not support sequence parallelism, persistent norm, zero-centered gamma, or the
+    memory-efficient path; ``WrappedTorchNorm`` rejects those configurations itself.
     """
 
     def layer_norm(

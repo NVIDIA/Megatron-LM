@@ -10,7 +10,7 @@ from megatron.core.tensor_parallel.cross_entropy import (
     vocab_parallel_cross_entropy as _vocab_parallel_cross_entropy,
 )
 
-__all__ = ["MegatronCrossEntropyBackend", "vocab_parallel_cross_entropy"]
+__all__ = ["Loss", "vocab_parallel_cross_entropy"]
 
 
 def vocab_parallel_cross_entropy(
@@ -22,7 +22,7 @@ def vocab_parallel_cross_entropy(
     return _vocab_parallel_cross_entropy(logits, labels, tp_group=tp_group)
 
 
-class MegatronCrossEntropyBackend:
+class Loss:
     """Owns ``vocab_parallel_cross_entropy`` using Megatron's unfused implementation."""
 
     def vocab_parallel_cross_entropy(self):

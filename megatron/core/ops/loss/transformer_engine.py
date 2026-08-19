@@ -8,11 +8,7 @@ from functools import partial
 
 import torch
 
-from megatron.core.ops import _availability
-
-__all__ = ["TECrossEntropyBackend"]
-
-_BACKEND_NAME = "te_fused_cross_entropy"
+__all__ = ["Loss"]
 
 
 def _te_cross_entropy(
@@ -32,15 +28,21 @@ def _te_cross_entropy(
     return target(logits, labels, tp_group, cuda_graph_capturable)
 
 
-class TECrossEntropyBackend:
+class Loss:
     """Owns ``vocab_parallel_cross_entropy`` using Transformer Engine's fused kernel.
 
     Both the TE version check and the CUDA-graph capture mode are resolved here, once, so the
     forward pass has no version branch left.
     """
 
+    REQUIRES = "transformer_engine"
+
+    @classmethod
+    def from_options(cls, options) -> "Loss":
+        """Read the one setting this backend must bind up front."""
+        return cls(cuda_graph_capturable=options.cuda_graph_impl == "full_iteration")
+
     def __init__(self, *, cuda_graph_capturable: bool = False) -> None:
-        _availability.require("transformer_engine", backend=_BACKEND_NAME)
         from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
 
         if te_parallel_cross_entropy is None:

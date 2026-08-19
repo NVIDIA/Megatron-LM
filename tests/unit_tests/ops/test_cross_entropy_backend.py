@@ -8,8 +8,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.ops import BackendOptions, build_spec_provider
-from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
-from megatron.core.ops.loss.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+from megatron.core.ops.loss import fused_vocab_parallel_cross_entropy, vocab_parallel_cross_entropy
 from tests.unit_tests.test_utilities import Utils
 
 _needs_te = pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required")
@@ -37,9 +36,7 @@ class TestCrossEntropySelection:
             _provider(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="jax")
 
     def test_explicit_override_selects_the_same_kernel(self):
-        provider = _provider(
-            operation_backends={"vocab_parallel_cross_entropy": "megatron_fused_cross_entropy"}
-        )
+        provider = _provider(operation_backends={"vocab_parallel_cross_entropy": "megatron_fused"})
         assert provider.vocab_parallel_cross_entropy() is fused_vocab_parallel_cross_entropy
 
     @_needs_te
@@ -69,9 +66,7 @@ class TestCrossEntropyContract:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
-        "backend_name",
-        ["megatron_cross_entropy", "megatron_fused_cross_entropy"]
-        + (["te_cross_entropy"] if HAVE_TE else []),
+        "backend_name", ["megatron", "megatron_fused"] + (["te_fused"] if HAVE_TE else [])
     )
     def test_target_accepts_a_default_tensor_parallel_group(self, backend_name):
         """tp_group=None means the default group, whatever the underlying kernel needs."""
@@ -107,9 +102,9 @@ class TestCrossEntropyParity:
             logits.float().reshape(-1, 16), labels.reshape(-1), reduction="none"
         ).reshape(6, 2)
 
-        names = ["megatron_cross_entropy", "megatron_fused_cross_entropy"]
+        names = ["megatron", "megatron_fused"]
         if HAVE_TE:
-            names.append("te_cross_entropy")
+            names.append("te_fused")
         for name in names:
             target = _provider(
                 operation_backends={"vocab_parallel_cross_entropy": name}

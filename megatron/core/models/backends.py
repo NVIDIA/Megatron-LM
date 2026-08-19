@@ -2,8 +2,11 @@
 
 """Compatibility imports for backend selection.
 
-Backend selection now lives in :mod:`megatron.core.ops`. This module re-exports the names it
-used to define so existing imports keep working.
+Backend selection lives in :mod:`megatron.core.ops`. This module keeps the names it used to
+define working. The three ``*SpecProvider`` names are now factories rather than classes: there
+is one provider type, and a preset selects which backend fills each operation. Calling them
+still returns something with the same methods, so ``TESpecProvider().layer_norm()`` is
+unchanged, but ``isinstance`` against them no longer makes sense.
 """
 
 from megatron.core.ops import (
@@ -13,8 +16,17 @@ from megatron.core.ops import (
     get_backend,
     get_backend_spec_provider,
 )
-from megatron.core.ops.providers.inference import InferenceSpecProvider
-from megatron.core.ops.providers.local import LocalSpecProvider
+
+
+def LocalSpecProvider() -> BackendSpecProvider:  # pylint: disable=invalid-name
+    """Deprecated: use ``get_backend("local")``."""
+    return get_backend("local")
+
+
+def InferenceSpecProvider() -> BackendSpecProvider:  # pylint: disable=invalid-name
+    """Deprecated: use ``get_backend("inference_optimized")``."""
+    return get_backend("inference_optimized")
+
 
 __all__ = [
     "BackendOptions",

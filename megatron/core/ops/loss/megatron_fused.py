@@ -10,7 +10,7 @@ from megatron.core.fusions.fused_cross_entropy import (
     fused_vocab_parallel_cross_entropy as _fused_vocab_parallel_cross_entropy,
 )
 
-__all__ = ["MegatronFusedCrossEntropyBackend", "fused_vocab_parallel_cross_entropy"]
+__all__ = ["Loss", "fused_vocab_parallel_cross_entropy"]
 
 
 def fused_vocab_parallel_cross_entropy(
@@ -30,7 +30,7 @@ def fused_vocab_parallel_cross_entropy(
     return _fused_vocab_parallel_cross_entropy(logits, labels, tp_group)
 
 
-class MegatronFusedCrossEntropyBackend:
+class Loss:
     """Owns ``vocab_parallel_cross_entropy`` using Megatron's compiled reductions."""
 
     def vocab_parallel_cross_entropy(self):

@@ -1,38 +1,40 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Loss implementations, grouped by backend.
+"""Loss implementations, grouped by backend. See :mod:`.contract` for the requirements."""
 
-Contract for vocab-parallel cross entropy
------------------------------------------
-* **Target**: ``loss = target(logits, labels, tp_group)``.
-* **Layout**: ``logits`` are ``[s, b, vocab / tp]`` and ``labels`` are ``[s, b]``, already
-  transposed by the caller. The returned loss is ``[s, b]``.
-* **State**: none. The target holds no parameters and no cache. It does, however, *consume*
-  ``logits``: every target subtracts the row max and exponentiates in place to save memory,
-  and the up-cast that would otherwise copy is a no-op when ``logits`` is already float32. A
-  caller that needs ``logits`` afterwards has to pass a clone.
-* **Process groups**: the target owns every reduction over ``tp_group``. The caller performs
-  no collectives, so backends are free to fuse the reduction into their kernel. ``tp_group``
-  may be ``None``, meaning the default tensor-parallel group; targets whose kernel cannot take
-  ``None`` fill it in themselves rather than pushing that onto the caller.
-* **Modes**: all three backends support training and backward. Only the Transformer Engine
-  target supports capture under a full-iteration CUDA graph, and only from TE 2.7.
-"""
+from megatron.core.ops.loss import megatron, megatron_fused, transformer_engine
+from megatron.core.ops.loss.contract import (
+    FAMILY,
+    OPERATIONS,
+    VOCAB_PARALLEL_CROSS_ENTROPY,
+    LossSlots,
+    VocabParallelCrossEntropy,
+)
+from megatron.core.ops.loss.megatron import vocab_parallel_cross_entropy
+from megatron.core.ops.loss.megatron_fused import fused_vocab_parallel_cross_entropy
 
-from megatron.core.ops.loss.cross_entropy import (
-    MegatronCrossEntropyBackend,
-    vocab_parallel_cross_entropy,
-)
-from megatron.core.ops.loss.fused_cross_entropy import (
-    MegatronFusedCrossEntropyBackend,
-    fused_vocab_parallel_cross_entropy,
-)
-from megatron.core.ops.loss.transformer_engine import TECrossEntropyBackend
+#: Backend name -> the class that owns this family's slots.
+#:
+#: Deliberately no "transformer_engine" key: a Transformer Engine run defaults to the reference
+#: cross entropy, and only takes TE's fused kernel when asked for it. Naming the fused entry
+#: "te_fused" keeps the --transformer-impl preset from silently claiming this slot.
+BACKENDS = {
+    "megatron": megatron.Loss,
+    "megatron_fused": megatron_fused.Loss,
+    "te_fused": transformer_engine.Loss,
+}
+
+#: Used when the selected preset has no entry above, which for this family is always.
+DEFAULT = "megatron"
 
 __all__ = [
-    "MegatronCrossEntropyBackend",
-    "MegatronFusedCrossEntropyBackend",
-    "TECrossEntropyBackend",
+    "BACKENDS",
+    "DEFAULT",
+    "FAMILY",
+    "OPERATIONS",
+    "VOCAB_PARALLEL_CROSS_ENTROPY",
+    "LossSlots",
+    "VocabParallelCrossEntropy",
     "fused_vocab_parallel_cross_entropy",
     "vocab_parallel_cross_entropy",
 ]

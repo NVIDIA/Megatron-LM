@@ -1,37 +1,49 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""The set of operations a backend can own."""
+"""What an operation is. The operations themselves are declared by their family."""
 
-from enum import Enum
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+__all__ = ["Operation", "unowned"]
 
 
-class Operation(str, Enum):
+@dataclass(frozen=True)
+class Operation:
     """One :class:`~megatron.core.ops.BackendSpecProvider` method a backend can own.
 
-    Each value is the name of the provider method that fills the slot, so an operation
-    and the method implementing it cannot drift apart. Add a member here only when an
-    existing class, callable, or builder already owns that boundary at construction time.
+    ``family`` names the package under ``megatron.core.ops`` that declares this operation and
+    the backends able to fill it. ``method`` is the provider method name, so an operation and
+    the method implementing it cannot drift apart.
+
+    Operations are declared by their family, next to their contract, rather than in one central
+    list. Declare one only when an existing class, callable, or builder already owns that
+    boundary at construction time; an implementation that has to branch on shape, phase, or
+    communication keeps its current owner and exposes a target through ``ops`` instead.
     """
 
-    LINEAR = "linear"
-    COLUMN_PARALLEL_LINEAR = "column_parallel_linear"
-    ROW_PARALLEL_LINEAR = "row_parallel_linear"
-    COLUMN_PARALLEL_LAYER_NORM_LINEAR = "column_parallel_layer_norm_linear"
-    LAYER_NORM = "layer_norm"
-    CORE_ATTENTION = "core_attention"
-    GROUPED_MLP_MODULES = "grouped_mlp_modules"
-    ACTIVATION_FUNC = "activation_func"
-    MOE_ROUTER = "moe_router"
-    VOCAB_PARALLEL_CROSS_ENTROPY = "vocab_parallel_cross_entropy"
+    family: str
+    method: str
+    optional: bool = False
+    """True when a backend may leave this slot alone, because not every backend has one.
+
+    An optional slot that nobody owns raises :func:`unowned` when it is called, rather than
+    silently returning something wrong.
+    """
 
     def __str__(self) -> str:
-        return self.value
+        return self.method
+
+    @property
+    def qualified_name(self) -> str:
+        """``family.method``, for error messages and for disambiguating on the command line."""
+        return f"{self.family}.{self.method}"
 
 
-def parse_operation(name: str) -> Operation:
-    """Return the operation named ``name``, or raise with the valid choices listed."""
-    try:
-        return Operation(name)
-    except ValueError:
-        choices = ", ".join(operation.value for operation in Operation)
-        raise ValueError(f"Unknown operation '{name}'. Valid operations: {choices}") from None
+def unowned(operation: Operation) -> NotImplementedError:
+    """The error a slot raises when no selected backend fills it."""
+    return NotImplementedError(
+        f"No backend owns '{operation.qualified_name}' for this configuration. "
+        f"Select one with --op-backend {operation.method}=<backend>."
+    )

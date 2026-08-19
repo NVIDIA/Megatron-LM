@@ -7,8 +7,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
-from megatron.core.ops.operations import Operation, parse_operation
-
 __all__ = ["BackendOptions"]
 
 
@@ -16,12 +14,14 @@ __all__ = ["BackendOptions"]
 class BackendOptions:
     """The complete set of selectors read while a provider is built.
 
-    Adding a new selector means adding a field here and one line to :meth:`from_config`. That
-    is deliberately the only place to look for "what can change which implementation I get".
+    Adding a selector means adding a field here and one line to :meth:`from_config`. That is
+    deliberately the only place to look for "what can change which implementation I get".
+    Names are left as strings; :mod:`megatron.core.ops.resolve` is what turns them into
+    operations and backends, so this stays plain data.
     """
 
     transformer_impl: str = "transformer_engine"
-    """Chooses the base backend that supplies every operation not overridden below."""
+    """Chooses the backend each family should prefer for every operation it declares."""
 
     use_kitchen: bool = False
     use_kitchen_attention: bool = False
@@ -31,15 +31,11 @@ class BackendOptions:
     cross_entropy_fusion_impl: str = "native"
     cuda_graph_impl: str | None = None
 
-    operation_backends: Mapping[Operation, str] = field(default_factory=dict)
+    operation_backends: Mapping[str, str] = field(default_factory=dict)
     """Explicit per-operation choices, applied last and never silently ignored."""
 
     def __post_init__(self) -> None:
-        normalized = {
-            operation if isinstance(operation, Operation) else parse_operation(str(operation)): name
-            for operation, name in self.operation_backends.items()
-        }
-        object.__setattr__(self, "operation_backends", normalized)
+        object.__setattr__(self, "operation_backends", dict(self.operation_backends))
 
     @classmethod
     def from_config(
@@ -49,8 +45,8 @@ class BackendOptions:
 
         Args:
             config: a TransformerConfig, or anything exposing the same attributes.
-            transformer_impl: overrides ``config.transformer_impl``, for the callers that
-                build a Transformer Engine spec regardless of what the config says.
+            transformer_impl: overrides ``config.transformer_impl``, for the callers that build
+                a Transformer Engine spec regardless of what the config says.
         """
         return cls(
             transformer_impl=transformer_impl or getattr(config, "transformer_impl"),

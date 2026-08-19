@@ -10,8 +10,8 @@ built from.
 import pytest
 
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.ops import Operation, available_backends, get_backend
-from megatron.core.ops.norm.apex import have_apex
+from megatron.core.ops import get_backend
+from megatron.core.ops._availability import is_installed
 from megatron.core.ops.norm.reference import WrappedTorchNorm
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -36,7 +36,7 @@ class TestLocalBackend:
 
     def test_layer_norm_prefers_apex_when_installed(self):
         target = get_backend("local").layer_norm(rms_norm=False)
-        if have_apex():
+        if is_installed("apex"):
             from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
             assert target is FusedLayerNorm
@@ -53,8 +53,9 @@ class TestLocalBackend:
     def test_no_router_override(self):
         assert get_backend("local").moe_router() is None
 
-    def test_linear_reports_the_backend_that_lacks_it(self):
-        with pytest.raises(NotImplementedError, match="LocalSpecProvider"):
+    def test_unowned_linear_says_how_to_select_one(self):
+        """Megatron Core has no non-parallel linear, and the slot says so."""
+        with pytest.raises(NotImplementedError, match="linear.linear"):
             get_backend("local").linear()
 
 
@@ -124,20 +125,3 @@ class TestInferenceBackend:
         from megatron.core.extensions.transformer_engine import TENorm
 
         assert get_backend("inference_optimized").layer_norm(has_residual=True) is TENorm
-
-
-class TestBackendNames:
-    def test_unknown_transformer_impl_is_rejected(self):
-        with pytest.raises(ValueError, match="unknown transformer_impl='nope'"):
-            get_backend("nope")
-
-    def test_single_operation_backend_is_not_a_complete_backend(self):
-        with pytest.raises(ValueError, match="unknown transformer_impl='apex'"):
-            get_backend("apex")
-
-    def test_every_advertised_backend_name_is_buildable_or_optional(self):
-        """available_backends() is what --op-backend accepts, so no name may be a typo."""
-        for name in available_backends():
-            assert isinstance(name, str) and name
-        assert "local" in available_backends()
-        assert str(Operation.LAYER_NORM) == "layer_norm"
