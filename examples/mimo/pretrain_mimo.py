@@ -86,7 +86,7 @@ def main() -> None:
     # generic over any number of encoder grids in the topology.
     encoder_name = provider.encoder_module_names[0] if provider.encoder_module_names else None
     specs = build_module_grid_specs(args, args.world_size, encoder_name)
-    topology = create_topology(specs)
+    topology = create_topology(specs, args.high_priority_stream_groups)
 
     communicator = provider.build_communicator(args, topology)
 

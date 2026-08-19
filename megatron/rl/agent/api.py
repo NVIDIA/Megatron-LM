@@ -35,7 +35,6 @@ class GroupedRolloutRequest(Request):
     inference_interface: InferenceInterface
     validation: bool = False
     filter_groups_with_same_reward: bool = False
-    streaming: bool = False
     submission_granularity: SubmissionGranularity = "B"
     consumption_granularity: ConsumptionGranularity = "B"
 
