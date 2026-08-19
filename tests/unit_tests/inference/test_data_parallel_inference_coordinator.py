@@ -116,6 +116,7 @@ class DummyEngine(DynamicInferenceEngine):
         self.context = DummyContext()
         self.controller = DummyController()
         self._disagg_config = None
+        self._kv_transfer_role = None
         self.pending_microbatch = deque()
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.rank = torch.distributed.get_rank()

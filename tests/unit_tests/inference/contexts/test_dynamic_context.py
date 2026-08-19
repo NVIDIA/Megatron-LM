@@ -95,6 +95,8 @@ class TestDynamicContext:
         num_speculative_tokens=0,
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
+        expert_model_parallel_size: int = 1,
+        reserve_recurrent_state_dummy_slot: bool = False,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -117,6 +119,8 @@ class TestDynamicContext:
                 num_layers=num_layers,
                 kv_channels=kv_channels,
                 num_attention_heads=num_attention_heads,
+                expert_model_parallel_size=expert_model_parallel_size,
+                num_moe_experts=2 if expert_model_parallel_size > 1 else None,
             ),
             inference_config=InferenceConfig(
                 max_sequence_length=max_sequence_length,
@@ -135,6 +139,7 @@ class TestDynamicContext:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 enable_chunked_prefill=enable_chunked_prefill,
                 max_requests=max_requests,
+                reserve_recurrent_state_dummy_slot=reserve_recurrent_state_dummy_slot,
             ),
         )
         return dynamic_context
@@ -2394,6 +2399,8 @@ class TestDynamicContext:
             num_cuda_graphs=16,
             is_hybrid_model=True,
             layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP, Symbols.ATTENTION],
+            expert_model_parallel_size=2,
+            reserve_recurrent_state_dummy_slot=True,
         )
         metadata = ctx.mamba_metadata
         retained_slots = metadata.batch_allocate_slots(ctx.max_requests)

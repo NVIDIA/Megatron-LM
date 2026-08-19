@@ -43,7 +43,7 @@ class DisaggStateFlowControl:
 
     @staticmethod
     def _capacity_from_instance_meta(instance_meta) -> Optional[int]:
-        """Return the conservative durable capacity across model-parallel ranks."""
+        """Return the conservative live-state capacity across model-parallel ranks."""
 
         if not isinstance(instance_meta, list):
             return None
@@ -124,7 +124,7 @@ class DisaggStateFlowControl:
                     reservations.pop(request_id)
 
     def capacity(self, identity) -> Optional[int]:
-        """Return an engine's advertised durable capacity, if any."""
+        """Return an engine's advertised live recurrent-state capacity, if any."""
 
         return self._capacity.get(identity)
 
@@ -138,8 +138,26 @@ class DisaggStateFlowControl:
 
         return self._prefill_usage.get(identity, 0)
 
+    def prefill_load(self, identity) -> tuple[int, int, int]:
+        """Return queued, active, and weighted live-state prefill load."""
+
+        return (
+            len(self._prefill_queues.get(identity, ())),
+            self._prefill_count(identity),
+            self.prefill_usage(identity),
+        )
+
+    def decode_load(self, identity) -> tuple[int, int, int]:
+        """Return queued, active, and weighted live-state decode load."""
+
+        active = sum(
+            reserved_identity == identity
+            for reserved_identity, _ in self._decode_reservations.values()
+        )
+        return len(self._decode_queues.get(identity, ())), active, self.decode_usage(identity)
+
     def prefill_slot_cost(self, identity) -> int:
-        """Return the engine-advertised durable handoff demand per request."""
+        """Return the engine-advertised live-state handoff demand per request."""
 
         return self._prefill_slot_cost.get(identity, 0)
 
@@ -221,12 +239,11 @@ class DisaggStateFlowControl:
 
     @staticmethod
     def slot_cost_from_handoff(handoff) -> int:
-        """Return the exact durable-slot demand advertised by a handoff."""
+        """Return the live recurrent-state demand carried by a handoff."""
 
         kv_meta = handoff.get("kv_meta") if isinstance(handoff, dict) else None
         ssm_meta = kv_meta.get("ssm") if isinstance(kv_meta, dict) else None
-        positions = ssm_meta.get("positions", []) if isinstance(ssm_meta, dict) else []
-        return len({int(position) for position in positions})
+        return int(bool(ssm_meta))
 
     def can_ever_fit(self, identity, slot_cost: int) -> bool:
         """Return whether one request can fit the engine's advertised capacity."""
@@ -240,12 +257,10 @@ class DisaggStateFlowControl:
         if slot_cost < 0:
             raise ValueError(f"SSM slot cost cannot be negative, got {slot_cost}")
         capacity = self._capacity.get(identity)
-        if capacity is None or slot_cost == 0:
-            return True
         if request_id in self._decode_reservations:
             raise RuntimeError(f"Decode request {request_id} already holds an SSM reservation")
         usage = self._decode_usage.get(identity, 0)
-        if usage + slot_cost > capacity:
+        if capacity is not None and usage + slot_cost > capacity:
             return False
         self._decode_usage[identity] = usage + slot_cost
         self._decode_reservations[request_id] = (identity, slot_cost)
@@ -297,8 +312,8 @@ class DisaggStateFlowControl:
         self._decode_usage[identity] = usage - slot_cost
         return identity
 
-    def remove_queued(self, request_id: int) -> None:
-        """Remove a request from a prefill or decode capacity queue."""
+    def remove_queued(self, request_id: int) -> bool:
+        """Remove a queued request and report whether one was found."""
 
         for queues in (self._prefill_queues, self._decode_queues):
             for identity, queue in list(queues.items()):
@@ -309,7 +324,8 @@ class DisaggStateFlowControl:
                     queues[identity] = remaining
                 else:
                     queues.pop(identity, None)
-                return
+                return True
+        return False
 
     def pop_queued_for_engine(self, identity) -> List[int]:
         """Remove and return all requests queued for an engine."""

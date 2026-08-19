@@ -44,12 +44,7 @@ class DisaggDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceE
 
         instance_meta = []
         pp_ssm_metas = self._pp_ssm_peer_metas or [{}] * len(self._pp_kv_peer_metas)
-        ssm_capacities = []
-        for ssm_stage in pp_ssm_metas:
-            for state_metas in ssm_stage.values():
-                metas = state_metas if isinstance(state_metas, list) else [state_metas]
-                ssm_capacities.extend(int(meta["num_blocks"]) for meta in metas)
-        ssm_capacity = min(ssm_capacities) if ssm_capacities else None
+        ssm_capacity = self.context.max_requests if self.context.is_hybrid_model else None
         for kv_stage, ssm_stage in zip(self._pp_kv_peer_metas, pp_ssm_metas):
             kv_rank_metas = kv_stage if isinstance(kv_stage, list) else [kv_stage]
             for tp_index, kv_meta in enumerate(kv_rank_metas):
@@ -75,4 +70,15 @@ class DisaggDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceE
         if self._disagg_config is not None and self.is_mp_coordinator:
             self.socket_for_receiving_requests.send(
                 msgpack.packb([Headers.KV_READ_DONE.value, int(request_id)], use_bin_type=True)
+            )
+
+    def _notify_kv_transfer_ready(self, request_id: int, cached_prefix_blocks: int) -> None:
+        """Tell the native coordinator that NCCL destination storage is committed."""
+
+        if self._disagg_config is not None and self.is_mp_coordinator:
+            self.socket_for_receiving_requests.send(
+                msgpack.packb(
+                    [Headers.KV_TRANSFER_READY.value, int(request_id), int(cached_prefix_blocks)],
+                    use_bin_type=True,
+                )
             )

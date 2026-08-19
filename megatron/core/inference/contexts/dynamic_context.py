@@ -566,6 +566,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         mamba_max_requests = float('inf')
+        self.reserve_recurrent_state_dummy_slot = bool(
+            self.is_hybrid_model
+            and inference_config.reserve_recurrent_state_dummy_slot
+            and model_config.expert_model_parallel_size > 1
+        )
+        reserved_mamba_slots = int(self.reserve_recurrent_state_dummy_slot)
 
         if (mamba_memory_ratio := inference_config.mamba_memory_ratio) is not None:
             assert self.is_hybrid_model
@@ -574,8 +580,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Calculate total memory before partition
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
             mamba_memory_bytes = total_memory * mamba_memory_ratio
-            # Reserve one state slot for idle EP ranks.
-            mamba_max_requests = int(mamba_memory_bytes // mamba_states_memory_per_request) - 1
+            mamba_max_requests = (
+                int(mamba_memory_bytes // mamba_states_memory_per_request) - reserved_mamba_slots
+            )
 
             # Reduce buffer sizes for KV cache
             buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
@@ -589,11 +596,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             # mamba memory for max_requests, and give the rest to KV cache blocks.
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
             mamba_memory_needed = (
-                inference_config.max_requests + 1
+                inference_config.max_requests + reserved_mamba_slots
             ) * mamba_states_memory_per_request
             assert mamba_memory_needed < total_memory, (
                 f"Not enough memory for {inference_config.max_requests} mamba requests. "
-                f"Need {mamba_memory_needed / 1024**3:.2f} GB for request and EP dummy states, "
+                f"Need {mamba_memory_needed / 1024**3:.2f} GB for recurrent states, "
                 f"but total buffer is {total_memory / 1024**3:.2f} GB."
             )
             mamba_max_requests = inference_config.max_requests
@@ -607,7 +614,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_count = max(2, block_count)  # need >= 1 usable block + 1 dummy block
             paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
         else:
-            if self.is_hybrid_model:
+            if self.is_hybrid_model and self.reserve_recurrent_state_dummy_slot:
                 buffer_size_bytes -= mamba_states_memory_per_request
                 assert (
                     buffer_size_bytes > 0
@@ -883,7 +890,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * self.num_mamba_layers
             )
             mamba_bytes_per_req = mamba_conv_bytes + mamba_ssm_bytes
-            state_slot_count = self.max_requests + 1
+            state_slot_count = self.max_requests + int(self.reserve_recurrent_state_dummy_slot)
             mamba_total_bytes = mamba_bytes_per_req * state_slot_count
             log_lines += [
                 f"  Mamba states:",
@@ -891,7 +898,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 f"    conv_state_shape:      {self.mamba_conv_states_shape}",
                 f"    ssm_state_shape:       {self.mamba_ssm_states_shape}",
                 f"    per_request:           {get_mem_size_str(mamba_bytes_per_req)}",
-                f"    total ({self.max_requests} requests + 1 EP dummy):  "
+                f"    total ({state_slot_count} state slots):  "
                 f"{get_mem_size_str(mamba_total_bytes)}",
             ]
 
@@ -902,7 +909,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 log_lines += [
                     f"  Mamba speculative buffers (num_speculative_tokens={self.num_speculative_tokens}):",
                     f"    per_request:           {get_mem_size_str(spec_bytes_per_req)}",
-                    f"    total ({self.max_requests} requests + 1 EP dummy):  "
+                    f"    total ({state_slot_count} state slots):  "
                     f"{get_mem_size_str(spec_total_bytes)}",
                 ]
 
@@ -976,6 +983,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 max_intermediate_count=self.max_mamba_intermediate_states_per_step,
+                reserve_dummy_state_slot=self.reserve_recurrent_state_dummy_slot,
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
                 decode_indices_dtype=self._mamba_decode_indices_dtype,
@@ -997,7 +1005,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 }
             )
             self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
-            state_slot_count = self.max_requests + 1
+            state_slot_count = self.max_requests + int(self.reserve_recurrent_state_dummy_slot)
             self.mamba_conv_states = torch.empty(
                 (self.num_mamba_layers, state_slot_count) + self.mamba_conv_states_shape,
                 dtype=self.mamba_conv_states_dtype,
@@ -2310,9 +2318,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_query_lengths[0:N],
             )
 
-            # 5. Use the reserved slot for the EP dummy request.
-            assert N == 1
-            self.mamba_metadata.request_to_mamba_state_idx[0] = self.mamba_metadata.dummy_state_idx
+            # 5. Use the reserved slot when live request slots may remain pinned by handoff.
+            if self.mamba_metadata.dummy_state_idx is not None:
+                assert N == 1
+                self.mamba_metadata.request_to_mamba_state_idx[0] = (
+                    self.mamba_metadata.dummy_state_idx
+                )
+            else:
+                self.mamba_metadata.request_to_mamba_state_idx[0:N] = (
+                    self.mamba_metadata.batch_allocate_slots(N)
+                )
 
     def initialize_attention_state(
         self,

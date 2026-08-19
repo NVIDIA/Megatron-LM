@@ -64,6 +64,9 @@ def handle_register_role(coordinator, sender_identity, payload):
         raise RuntimeError("REGISTER_ROLE requires a disaggregated coordinator")
     _, role, transport, instance_meta = payload
     coordinator.disagg.register_engine(sender_identity, role, transport, instance_meta)
+    coordinator.router_socket.send_multipart(
+        [sender_identity, msgpack.packb([Headers.REGISTER_ROLE_ACK.value], use_bin_type=True)]
+    )
 
 
 @message_handler(Headers.CONNECT)
@@ -261,6 +264,76 @@ def handle_kv_read_done(coordinator, sender_identity, payload):
     coordinator.disagg.handle_kv_read_done(int(payload[1]))
 
 
+@message_handler(Headers.KV_TRANSFER_READY)
+def handle_kv_transfer_ready(coordinator, sender_identity, payload):
+    """Start NCCL sends after decode commits the matching destinations."""
+
+    if coordinator.disagg is None:
+        raise RuntimeError("KV_TRANSFER_READY requires a disaggregated coordinator")
+    coordinator.disagg.handle_kv_transfer_ready(sender_identity, int(payload[1]), int(payload[2]))
+
+
+@message_handler(Headers.REQUEST_ERROR)
+def handle_request_error(coordinator, sender_identity, payload):
+    """Forward a terminal engine-side request failure to its client."""
+
+    request_id, reason, source_safe = int(payload[1]), str(payload[2]), bool(payload[3])
+    if coordinator.disagg is not None:
+        coordinator.disagg.handle_engine_failure(request_id, reason, source_safe=source_safe)
+        return
+
+    client_identity = coordinator.request_id_to_client_id.get(request_id)
+    client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
+    if client_identity is None or client_request_id is None:
+        return
+    coordinator.router_socket.send_multipart(
+        [
+            client_identity,
+            msgpack.packb(
+                [Headers.REQUEST_ERROR.value, client_request_id, reason, source_safe],
+                use_bin_type=True,
+            ),
+        ]
+    )
+    if source_safe:
+        coordinator.request_id_to_client_id.pop(request_id, None)
+        coordinator.request_id_to_client_request_id.pop(request_id, None)
+        coordinator.client_request_to_request_id.pop((client_identity, client_request_id), None)
+        assigned_rank = coordinator.request_id_to_rank.pop(request_id, None)
+        if assigned_rank is not None:
+            index = coordinator.identity_to_rank_index.get(assigned_rank)
+            if index is not None and coordinator._pending_counts[index] > 0:
+                coordinator._pending_counts[index] -= 1
+
+
+@message_handler(Headers.REQUEST_ABORTED)
+def handle_request_aborted(coordinator, sender_identity, payload):
+    """Forward engine cancellation completion to the requesting client."""
+
+    request_id, source_safe = int(payload[1]), bool(payload[2])
+    if coordinator.disagg is not None:
+        coordinator.disagg.handle_engine_aborted(request_id, source_safe=source_safe)
+        return
+    client_identity = coordinator.request_id_to_client_id.pop(request_id, None)
+    client_request_id = coordinator.request_id_to_client_request_id.pop(request_id, None)
+    assigned_rank = coordinator.request_id_to_rank.pop(request_id, None)
+    if assigned_rank is not None:
+        index = coordinator.identity_to_rank_index.get(assigned_rank)
+        if index is not None and coordinator._pending_counts[index] > 0:
+            coordinator._pending_counts[index] -= 1
+    if client_identity is None or client_request_id is None:
+        return
+    coordinator.client_request_to_request_id.pop((client_identity, client_request_id), None)
+    coordinator.router_socket.send_multipart(
+        [
+            client_identity,
+            msgpack.packb(
+                [Headers.REQUEST_ABORTED.value, client_request_id, source_safe], use_bin_type=True
+            ),
+        ]
+    )
+
+
 @message_handler(Headers.SUBMIT_REQUEST_WITH_KV)
 def handle_submit_request_with_kv(coordinator, sender_identity, payload):
     """Route a client-supplied handoff to a decode engine."""
@@ -300,9 +373,15 @@ def handle_submit_request_with_kv(coordinator, sender_identity, payload):
         ),
         use_bin_type=True,
     )
+    request_hashes = coordinator.compute_request_hashes(prompt)
+    if (
+        coordinator.prefix_caching_coordinator_policy
+        == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+    ):
+        request_hashes = request_hashes[:1]
 
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
-        next_identity = coordinator.get_least_loaded_data_parallel_rank()
+        next_identity = coordinator.get_best_data_parallel_rank(request_hashes)
         if coordinator._send_to_engine(next_identity, engine_payload):
             break
     else:
@@ -313,6 +392,16 @@ def handle_submit_request_with_kv(coordinator, sender_identity, payload):
         return True
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
+    if request_hashes:
+        coordinator._update_rank_hashes(next_identity, request_hashes)
+    if coordinator.schedule_records is not None:
+        coordinator.schedule_records.append(
+            {
+                "request_id": request_id,
+                "rank_index": coordinator.identity_to_rank_index[next_identity],
+                "num_hashes": len(request_hashes),
+            }
+        )
 
 
 @message_handler(Headers.RELEASE_KV)
@@ -361,6 +450,9 @@ def handle_abort_request(coordinator, sender_identity, payload):
     client_request_id = int(payload[1])
     request_id = coordinator.client_request_to_request_id.get((sender_identity, client_request_id))
     if request_id is None:
+        return
+    if coordinator.disagg is not None:
+        coordinator.disagg.abort_request(request_id)
         return
     assigned_rank = coordinator.request_id_to_rank.get(request_id)
     if assigned_rank is not None:

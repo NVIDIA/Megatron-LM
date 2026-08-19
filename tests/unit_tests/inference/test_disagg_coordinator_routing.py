@@ -25,10 +25,10 @@ def test_router_registry_and_abc():
         def remove(self, identity):
             pass
 
-        def route_submit(self, request_id):
+        def route_submit(self, request_id, score=None):
             return "p"
 
-        def route_prefill_done(self, request_id):
+        def route_prefill_done(self, request_id, score=None):
             return ("p", "d")
 
         def forget(self, request_id):
@@ -78,6 +78,13 @@ def test_submit_round_robins_across_multiple_prefill():
     assert r.route_prefill_done(0)[0] == "p0"
     assert r.route_prefill_done(1)[0] == "p1"
     assert r.route_prefill_done(2)[0] == "p0"
+
+
+def test_routing_prefers_lower_load_and_round_robins_ties():
+    r = _routing(n_prefill=2, n_decode=2)
+    assert r.route_submit(0, {"p0": (2,), "p1": (1,)}.get) == "p1"
+    assert r.route_submit(1, {"p0": (0,), "p1": (0,)}.get) == "p1"
+    assert r.route_prefill_done(0, {"d0": (3,), "d1": (1,)}.get)[1] == "d1"
 
 
 def test_forget_clears_request_state():

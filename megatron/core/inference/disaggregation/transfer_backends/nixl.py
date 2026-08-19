@@ -134,6 +134,12 @@ class NixlPullHandle:
     done: bool = False
     error: Optional[str] = None
 
+    @property
+    def storage_safe(self) -> bool:
+        """Whether every operation has stopped accessing its buffers."""
+
+        return self.done
+
     def poll(self) -> bool:
         """Return True if every transfer has settled, without blocking."""
         if self.done:

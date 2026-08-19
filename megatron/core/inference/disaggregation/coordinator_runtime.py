@@ -31,6 +31,7 @@ class DisaggCoordinatorRuntime:
         self.prefill_by_request: dict[int, Any] = {}
         self.engine_transport: dict[Any, str] = {}
         self.engine_metadata: dict[Any, Any] = {}
+        self.cancelled_request_ids: set[int] = set()
 
     def register_engine(self, identity, role: str, transport: str, instance_meta: Any) -> None:
         """Register one prefill or decode instance and its transfer metadata."""
@@ -44,7 +45,7 @@ class DisaggCoordinatorRuntime:
         self.engine_transport[identity] = transport
         self.engine_metadata[identity] = instance_meta
         logging.info(
-            "Coordinator: registered %s engine %s with SSM cache capacity=%s",
+            "Coordinator: registered %s engine %s with live SSM capacity=%s",
             role,
             identity,
             capacity,
@@ -69,7 +70,7 @@ class DisaggCoordinatorRuntime:
 
         self.request_metadata[request_id] = (prompt, sampling_params)
         try:
-            prefill_id = self.router.route_submit(request_id)
+            prefill_id = self.router.route_submit(request_id, self.flow.prefill_load)
         except RuntimeError as error:
             self.drop_request(request_id, f"cannot route to prefill: {error}")
             return
@@ -79,7 +80,7 @@ class DisaggCoordinatorRuntime:
         if not self.flow.can_ever_fit(prefill_id, slot_cost):
             self.drop_request(
                 request_id,
-                f"request requires {slot_cost} durable SSM slots, but prefill "
+                f"request requires {slot_cost} live SSM slots, but prefill "
                 f"engine {prefill_id!r} advertises only {capacity}",
             )
             return
@@ -118,6 +119,9 @@ class DisaggCoordinatorRuntime:
         """Route a completed prefill handoff to a decode instance."""
 
         self.hop1_request_ids.discard(request_id)
+        if request_id in self.cancelled_request_ids:
+            self._finish_abort(request_id, source_safe=True)
+            return
         request_meta = self.request_metadata.get(request_id)
         handoff = finished_request.get("disaggregated_params")
         if request_meta is None or not handoff:
@@ -125,7 +129,7 @@ class DisaggCoordinatorRuntime:
             return
         prompt, sampling_params = request_meta
         try:
-            _, decode_id = self.router.route_prefill_done(request_id)
+            _, decode_id = self.router.route_prefill_done(request_id, self.flow.decode_load)
         except RuntimeError as error:
             self.drop_request(request_id, f"cannot route to decode: {error}")
             return
@@ -157,7 +161,7 @@ class DisaggCoordinatorRuntime:
         if not self.flow.can_ever_fit(decode_id, slot_cost):
             self.drop_request(
                 request_id,
-                f"SSM handoff requires {slot_cost} durable slots, but decode "
+                f"SSM handoff requires {slot_cost} live slots, but decode "
                 f"engine {decode_id!r} advertises only {capacity}",
             )
             return
@@ -169,12 +173,27 @@ class DisaggCoordinatorRuntime:
         self._send_decode_handoff(decode_id, request_id, payload)
 
     def _send_decode_handoff(self, decode_id, request_id: int, payload: bytes) -> bool:
-        if not self.coordinator._send_to_engine(decode_id, payload):
-            return False
+        return self.coordinator._send_to_engine(decode_id, payload)
+
+    def handle_kv_transfer_ready(
+        self, sender_identity, request_id: int, cached_prefix_blocks: int
+    ) -> None:
+        """Start a two-sided send after the assigned decode commits destinations."""
+
+        if self.router.decode_for_request(request_id) != sender_identity:
+            self.drop_request(request_id, "KV transfer readiness came from the wrong decode engine")
+            return
         prefill_id = self.prefill_by_request.get(request_id)
-        if prefill_id is not None and self.engine_transport.get(prefill_id) == "nccl":
-            self._send(prefill_id, Headers.SEND_KV, request_id, self.engine_metadata[decode_id])
-        return True
+        if prefill_id is None or self.engine_transport.get(prefill_id) != "nccl":
+            self.drop_request(request_id, "unexpected KV transfer readiness notification")
+            return
+        self._send(
+            prefill_id,
+            Headers.SEND_KV,
+            request_id,
+            self.engine_metadata[sender_identity],
+            cached_prefix_blocks,
+        )
 
     def _drain_decode_queue(self, decode_id) -> None:
         while True:
@@ -205,10 +224,23 @@ class DisaggCoordinatorRuntime:
         self.request_metadata.pop(request_id, None)
         self.handle_kv_read_done(request_id)
 
-    def drop_request(self, request_id: int, reason: str) -> None:
-        """Discard coordinator state for a request that cannot complete."""
+    def drop_request(self, request_id: int, reason: str, *, source_safe: bool = True) -> None:
+        """Fail a client request and discard its coordinator state."""
 
         logging.error("Coordinator: dropping disagg request %s: %s", request_id, reason)
+        coordinator = self.coordinator
+        client_identity = coordinator.request_id_to_client_id.get(request_id)
+        client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
+        if client_identity is not None and client_request_id is not None:
+            coordinator.router_socket.send_multipart(
+                [
+                    client_identity,
+                    msgpack.packb(
+                        [Headers.REQUEST_ERROR.value, client_request_id, reason, source_safe],
+                        use_bin_type=True,
+                    ),
+                ]
+            )
         self.flow.remove_queued(request_id)
         decode_id = self.flow.release_decode(request_id)
         if decode_id is not None:
@@ -216,15 +248,76 @@ class DisaggCoordinatorRuntime:
         self.router.forget(request_id)
         self.request_metadata.pop(request_id, None)
         self.hop1_request_ids.discard(request_id)
-        self.handle_kv_read_done(request_id)
+        self.cancelled_request_ids.discard(request_id)
+        if source_safe:
+            self.handle_kv_read_done(request_id)
 
-        coordinator = self.coordinator
         coordinator.request_id_to_client_id.pop(request_id, None)
         client_request_id = coordinator.request_id_to_client_request_id.pop(request_id, None)
         if client_request_id is not None:
             for key, mapped_request_id in list(coordinator.client_request_to_request_id.items()):
                 if mapped_request_id == request_id:
                     coordinator.client_request_to_request_id.pop(key)
+
+    def handle_engine_failure(
+        self, request_id: int, reason: str, *, source_safe: bool = False
+    ) -> None:
+        """Fail a decode handoff without releasing a source still in use."""
+
+        self.drop_request(request_id, reason, source_safe=source_safe)
+
+    def abort_request(self, request_id: int) -> None:
+        """Cancel queued work or forward cancellation to its active engine."""
+
+        self.cancelled_request_ids.add(request_id)
+        if self.flow.remove_queued(request_id):
+            self._finish_abort(request_id, source_safe=True)
+            return
+        decode_id = self.router.decode_for_request(request_id)
+        if decode_id is not None:
+            self._send(decode_id, Headers.ABORT_REQUEST, request_id)
+            return
+        prefill_id = self.prefill_by_request.get(request_id)
+        if prefill_id is not None:
+            self._send(prefill_id, Headers.ABORT_REQUEST, request_id)
+            return
+        self._finish_abort(request_id, source_safe=True)
+
+    def handle_engine_aborted(self, request_id: int, *, source_safe: bool) -> None:
+        """Finish a cancellation after the engine reports transport safety."""
+
+        if request_id in self.cancelled_request_ids:
+            self._finish_abort(request_id, source_safe=source_safe)
+
+    def _finish_abort(self, request_id: int, *, source_safe: bool) -> None:
+        coordinator = self.coordinator
+        client_identity = coordinator.request_id_to_client_id.get(request_id)
+        client_request_id = coordinator.request_id_to_client_request_id.get(request_id)
+        if source_safe:
+            self.handle_kv_read_done(request_id)
+        decode_id = self.flow.release_decode(request_id)
+        if decode_id is not None:
+            self._drain_decode_queue(decode_id)
+        prefill_id = self.flow.release_prefill(request_id)
+        if prefill_id is not None:
+            self._drain_prefill_queue(prefill_id)
+        self.router.forget(request_id)
+        self.request_metadata.pop(request_id, None)
+        self.hop1_request_ids.discard(request_id)
+        self.cancelled_request_ids.discard(request_id)
+        coordinator.request_id_to_client_id.pop(request_id, None)
+        coordinator.request_id_to_client_request_id.pop(request_id, None)
+        if client_identity is not None and client_request_id is not None:
+            coordinator.client_request_to_request_id.pop((client_identity, client_request_id), None)
+            coordinator.router_socket.send_multipart(
+                [
+                    client_identity,
+                    msgpack.packb(
+                        [Headers.REQUEST_ABORTED.value, client_request_id, source_safe],
+                        use_bin_type=True,
+                    ),
+                ]
+            )
 
     def _send(self, identity, header, *parts) -> bool:
         payload = msgpack.packb([header.value, *parts], use_bin_type=True)

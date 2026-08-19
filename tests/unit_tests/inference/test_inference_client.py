@@ -8,7 +8,7 @@ import pytest
 import zmq
 
 from megatron.core.inference.headers import Headers
-from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.inference_client import InferenceClient, InferenceRequestError
 from megatron.core.inference.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.asyncio
@@ -139,3 +139,30 @@ async def test_add_request_with_kv_handoff_returns_future():
     assert payload[4] == {"agent": "prefill"}
     assert payload[5] == [10, 11]
     future.cancel()
+
+
+async def test_terminal_error_and_abort_acknowledgement():
+    client, _, fake_socket = _make_client()
+    recv_queue = [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
+
+    def fake_recv(*args, **kwargs):
+        if recv_queue:
+            return recv_queue.pop(0)
+        raise zmq.Again()
+
+    fake_socket.recv.side_effect = fake_recv
+    client.start()
+
+    failed = client.add_request("failed", SamplingParams())
+    recv_queue.append(msgpack.packb([Headers.REQUEST_ERROR.value, 0, "transfer failed", True]))
+    with pytest.raises(InferenceRequestError, match="transfer failed") as error:
+        await asyncio.wait_for(failed, timeout=2.0)
+    assert error.value.source_safe
+
+    cancelled = client.add_request("cancelled", SamplingParams())
+    abort_ack = client.abort_request(1)
+    assert cancelled.cancelled()
+    recv_queue.append(msgpack.packb([Headers.REQUEST_ABORTED.value, 1, True]))
+    assert await asyncio.wait_for(abort_ack, timeout=2.0)
+
+    client.stop()

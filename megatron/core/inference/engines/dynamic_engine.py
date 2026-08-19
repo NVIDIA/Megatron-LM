@@ -349,6 +349,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """Hook overridden by the KV-handoff engine composition."""
 
         self._disagg_config = None
+        self._pinned_handoff_blocks = {}
+        self._pinned_handoff_ssm_slots = {}
+        self._kv_transfer_role = None
 
     def _reset_pending_kv_imports(self) -> None:
         """Hook overridden by the KV-handoff engine composition."""
@@ -391,6 +394,30 @@ class DynamicInferenceEngine(AbstractEngine):
             self._raise_kv_handoff_not_enabled("KV handoff completion")
         return {}
 
+    def _notify_request_error(
+        self, request_id: int, error: BaseException, *, source_safe: bool = False
+    ) -> None:
+        """Report a terminal request failure from the model-parallel coordinator."""
+
+        if self.use_coordinator and self.is_mp_coordinator:
+            self.socket_for_receiving_requests.send(
+                msgpack.packb(
+                    [Headers.REQUEST_ERROR.value, int(request_id), str(error), bool(source_safe)],
+                    use_bin_type=True,
+                )
+            )
+
+    def _notify_request_aborted(self, request_id: int, *, source_safe: bool) -> None:
+        """Report that cancellation can safely complete."""
+
+        if self.use_coordinator and self.is_mp_coordinator:
+            self.socket_for_receiving_requests.send(
+                msgpack.packb(
+                    [Headers.REQUEST_ABORTED.value, int(request_id), bool(source_safe)],
+                    use_bin_type=True,
+                )
+            )
+
     def _capture_handoff_meta(self, request, prepared) -> None:
         self._raise_kv_handoff_not_enabled("KV handoff completion")
 
@@ -416,6 +443,12 @@ class DynamicInferenceEngine(AbstractEngine):
         """Number of prefill sends awaiting completion (none here)."""
         return 0
 
+    @property
+    def pinned_handoff_block_count(self) -> int:
+        """Number of source KV blocks retained by handoff, if enabled."""
+
+        return 0
+
     def add_request_with_kv_handoff(
         self, request_id, prompt, sampling_params, kv_meta, src_block_ids
     ) -> asyncio.Future[DynamicInferenceRequest]:
@@ -425,6 +458,11 @@ class DynamicInferenceEngine(AbstractEngine):
     def release_handoff_blocks(self, request_id: int) -> None:
         """Raising stub; the hand-off engine composition overrides it."""
         self._raise_kv_handoff_not_enabled("RELEASE_KV")
+
+    def abort_kv_handoff(self, request_id: int) -> bool:
+        """Return whether a composed handoff engine consumed the cancellation."""
+
+        return False
 
     @staticmethod
     def _raise_kv_handoff_not_enabled(operation: str) -> None:
@@ -446,9 +484,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
-        if hasattr(self, "_pinned_handoff_blocks"):
-            self._pinned_handoff_blocks.clear()
-            self._pinned_handoff_ssm_slots.clear()
+        self._pinned_handoff_blocks.clear()
+        self._pinned_handoff_ssm_slots.clear()
         self.failed_request_ids = []
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
@@ -859,6 +896,15 @@ class DynamicInferenceEngine(AbstractEngine):
                         use_bin_type=True,
                     )
                 )
+                if not self.socket_for_receiving_requests.poll(timeout=30_000):
+                    raise TimeoutError("Timed out waiting for disaggregated role registration")
+                registration_reply = msgpack.unpackb(
+                    self.socket_for_receiving_requests.recv(), raw=False
+                )
+                if Headers(registration_reply[0]) != Headers.REGISTER_ROLE_ACK:
+                    raise RuntimeError(
+                        f"Unexpected role registration reply: {registration_reply!r}"
+                    )
             else:
                 # Empty registration is the aggregated coordinator protocol.
                 self.socket_for_receiving_requests.send(b"")
@@ -2011,8 +2057,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Walks the captured-CG list (sorted descending by token_count) and returns the first chunk
         that falls within budget and produces an applicable batch_dim under the engine's matching
-        mode (strict for hybrid models). Callers decide whether a miss can be deferred without
-        blocking forward progress.
+        mode (strict for hybrid models). Callers must explicitly handle the None case by deferring
+        the admission rather than scheduling eagerly.
         """
         active_tok = self.context.active_token_count
         active_p = self.context.num_prefill_requests
@@ -2036,22 +2082,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 return chunk
 
         return None
-
-    def _select_cg_chunk_size(
-        self, req: DynamicInferenceRequest, max_chunk_tokens: int
-    ) -> Optional[int]:
-        """Select a graph-aligned chunk, deferring busy misses but not idle work."""
-        snapped_chunk = self._find_cg_chunk_size(max_chunk_tokens)
-        if snapped_chunk is not None:
-            req.cg_wait_iters = 0
-            return snapped_chunk
-
-        if self.context.num_prefill_requests or self.context.num_decode_requests:
-            self._register_cg_wait(req)
-            return None
-
-        req.cg_wait_iters = 0
-        return max_chunk_tokens
 
     def _register_cg_wait(self, req) -> None:
         """Track a deferred admission attempt and throw a starvation warning at the threshold.
@@ -2180,12 +2210,15 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 computed_budget = min(remaining_len - prefix_skip, token_budget)
 
-                if self._cg_admission_gating_active():
+                # Skip CG gating for the continuation of an in-flight chunked prefill:
+                # the request is already mid-flight, deferring it would deadlock progress.
+                if self._cg_admission_gating_active() and not is_continuing_chunked_prefill:
                     # Snap the COMPUTED chunk size to the largest captured-CG boundary
                     # within budget (skipped tokens don't affect the CG batch shape).
-                    computed_chunk = self._select_cg_chunk_size(req, computed_budget)
-                    if computed_chunk is None:
-                        break
+                    # Fall back to eager (computed_budget) if no CG shape covers it.
+                    snapped_chunk = self._find_cg_chunk_size(computed_budget)
+                    computed_chunk = snapped_chunk if snapped_chunk is not None else computed_budget
+                    req.cg_wait_iters = 0
                 else:
                     computed_chunk = computed_budget
 
@@ -2742,6 +2775,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     kv_alloc.pool_size,
                     int(kv_alloc.get_evictable_block_count()),
                 )
+                if self.pinned_handoff_block_count:
+                    output_str += ", %d handoff-pinned" % self.pinned_handoff_block_count
                 msa = self.context.mamba_slot_allocator
                 if msa is not None:
                     output_str += ", mamba %d/%d durable slots" % (
@@ -2906,6 +2941,15 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
+                if self._kv_transfer_role == "decode":
+                    self._notify_request_error(
+                        request_id,
+                        RuntimeError(
+                            "A disaggregated decode engine cannot accept prompt prefill requests"
+                        ),
+                        source_safe=True,
+                    )
+                    continue
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
@@ -2914,9 +2958,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 request_id, prompt, sampling_params, kv_meta, src_block_ids = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request_with_kv_handoff")
-                self.add_request_with_kv_handoff(
-                    request_id, prompt, sampling_params, kv_meta, src_block_ids
-                )
+                try:
+                    self.add_request_with_kv_handoff(
+                        request_id, prompt, sampling_params, kv_meta, src_block_ids
+                    )
+                except Exception as error:
+                    self._notify_request_error(request_id, error, source_safe=True)
                 nvtx_range_pop("add_request_with_kv_handoff")
             elif header == Headers.RELEASE_KV:
                 # Coordinator-broadcast release. Unknown request ids are no-ops.
@@ -2924,11 +2971,14 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.SEND_KV:
                 # Push transport: send a pinned hand-off's KV to the decode
                 # instance the coordinator picked.
-                self.push_handoff_kv(int(data[1]), data[2])
+                cached_prefix_blocks = int(data[3]) if len(data) > 3 else 0
+                self.push_handoff_kv(int(data[1]), data[2], cached_prefix_blocks)
             elif header == Headers.KV_HANDOFF_COMPLETE:
                 self._record_handoff_completion_notification(int(data[1]), bool(data[2]))
             elif header == Headers.ABORT_REQUEST:
                 request_id = int(data[1])
+                if self.abort_kv_handoff(request_id):
+                    continue
                 entry = self.requests.get(request_id)
                 if entry is not None:
                     request = entry.record[-1]
@@ -2943,6 +2993,8 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.context.request_kv_length_offsets[idx]
                             + self.context.request_query_lengths[idx]
                         )
+                    if self._kv_transfer_role != "prefill":
+                        self._notify_request_aborted(request_id, source_safe=True)
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             elif header == Headers.START_CUDA_PROFILER:
@@ -3007,6 +3059,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             elif header == Headers.STOP:
                 assert self.state in (
+                    EngineState.PAUSING,
                     EngineState.PAUSED,
                     EngineState.SUSPENDED,
                 ), f"Received STOP in state {self.state}"

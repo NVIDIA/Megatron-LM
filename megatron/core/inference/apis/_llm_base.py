@@ -289,6 +289,8 @@ class _MegatronLLMBase:
             inference_config = InferenceConfig()
 
         # Build the engine pipeline. Mirrors examples/inference/gpt/gpt_dynamic_inference.py.
+        if inference_shards is not None:
+            inference_config.reserve_recurrent_state_dummy_slot = True
         context = DynamicInferenceContext(model.config, inference_config)
         wrapper = GPTInferenceWrapper(model, context)
         controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)

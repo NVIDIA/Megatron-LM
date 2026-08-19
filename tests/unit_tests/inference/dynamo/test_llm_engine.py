@@ -119,21 +119,6 @@ class _Context:
 async def test_decode_health_probe_bypasses_kv_handoff():
     handoff_called = False
 
-    class Stream:
-        request_id = 31
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            if getattr(self, "done", False):
-                raise StopAsyncIteration
-            self.done = True
-            return {"final": {"generated_tokens": [9]}}
-
-        async def aclose(self):
-            return None
-
     def add_request_with_kv_handoff(*_args, **_kwargs):
         nonlocal handoff_called
         handoff_called = True
@@ -141,7 +126,9 @@ async def test_decode_health_probe_bypasses_kv_handoff():
 
     engine = MegatronLLMEngine(_config("decode"))
     engine.client = SimpleNamespace(
-        add_request_streaming=lambda *_args, **_kwargs: Stream(),
+        add_request_streaming=lambda *_args, **_kwargs: pytest.fail(
+            "decode health probe must not enter the model engine"
+        ),
         add_request_with_kv_handoff=add_request_with_kv_handoff,
     )
     request = {
@@ -153,8 +140,8 @@ async def test_decode_health_probe_bypasses_kv_handoff():
 
     chunks = [chunk async for chunk in engine.generate(request, _Context())]
 
-    assert chunks[-1]["token_ids"] == [9]
-    assert chunks[-1]["finish_reason"] == "length"
+    assert chunks[-1]["token_ids"] == []
+    assert chunks[-1]["finish_reason"] == "stop"
     assert not handoff_called
 
 
@@ -177,7 +164,9 @@ async def test_decode_uses_streaming_kv_handoff():
 
     handoff = MagicMock(return_value=Stream())
     engine = MegatronLLMEngine(_config("decode"))
-    engine.client = SimpleNamespace(add_request_with_kv_handoff_streaming=handoff)
+    engine.client = SimpleNamespace(
+        add_request_with_kv_handoff_streaming=handoff, forget_abort=MagicMock()
+    )
     request = {"token_ids": [1], "sampling_options": {}, "stop_conditions": {"max_tokens": 1}}
     prefill = {"disaggregated_params": {"kv_meta": {"peer": "prefill"}, "block_ids": [4, 5]}}
 
@@ -196,10 +185,18 @@ async def test_decode_uses_streaming_kv_handoff():
 async def test_abort_uses_megatron_request_id_recorded_for_context():
     aborted = []
 
+    async def wait_for_abort(request_id):
+        assert request_id == 77
+        return True
+
+    forgotten = []
     engine = MegatronLLMEngine(_config())
-    engine.client = SimpleNamespace(abort_request=aborted.append)
+    engine.client = SimpleNamespace(
+        abort_request=aborted.append, wait_for_abort=wait_for_abort, forget_abort=forgotten.append
+    )
     engine._request_ids["dynamo-request"] = 77
 
     await engine.abort(_Context())
 
     assert aborted == [77]
+    assert forgotten == [77]

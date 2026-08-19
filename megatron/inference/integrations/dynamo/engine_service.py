@@ -34,7 +34,10 @@ def _extra_args(parser):
 async def _serve() -> None:
     args = get_args()
     args.return_log_probs = True
-    engine = get_dynamic_inference_engine(engine_class=DynamoDynamicInferenceEngine)
+    engine = get_dynamic_inference_engine(
+        engine_class=DynamoDynamicInferenceEngine,
+        reserve_recurrent_state_dummy_slot=args.role in ("prefill", "decode"),
+    )
 
     replica_group = (
         engine.pg_collection.expt_dp

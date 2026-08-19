@@ -19,6 +19,7 @@ class MambaMetadata:
         max_tokens: int,
         *,
         max_intermediate_count: int,
+        reserve_dummy_state_slot: bool = False,
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
         decode_indices_dtype: torch.dtype = torch.int64,
@@ -34,14 +35,15 @@ class MambaMetadata:
                 buffers. Computed once by DynamicInferenceContext (as
                 max_mamba_intermediate_states_per_step) and shared with
                 MambaSlotAllocator.
+            reserve_dummy_state_slot (bool): Whether a dedicated slot is available for
+                expert-parallel dummy forwards.
             mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
             d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
             decode_indices_dtype (torch.dtype): Dtype for decode state-slot indices.
         """
         self.max_requests = max_requests
-        # Keep one slot for EP dummy forwards.
-        self.dummy_state_idx = max_requests
+        self.dummy_state_idx = max_requests if reserve_dummy_state_slot else None
         self.max_tokens = max_tokens
         self.mamba_chunk_size = mamba_chunk_size
         self.d_conv = d_conv

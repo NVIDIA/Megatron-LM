@@ -25,7 +25,7 @@ from dynamo.common.backend.worker import WorkerConfig
 from dynamo.common.constants import DisaggregationMode
 from dynamo.llm import KvEventPublisher, ModelInput
 
-from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.inference_client import InferenceClient, InferenceRequestError
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.integrations.dynamo.args import Config, parse_args
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
@@ -299,6 +299,18 @@ class MegatronLLMEngine(LLMEngine):
         context_id = str(context.id())
 
         probe = is_probe(request)
+        if probe and self.config.role == "decode":
+            yield {
+                "token_ids": [],
+                "index": 0,
+                "finish_reason": "stop",
+                "completion_usage": {
+                    "prompt_tokens": len(token_ids),
+                    "completion_tokens": 0,
+                    "total_tokens": len(token_ids),
+                },
+            }
+            return
         if self.config.role == "prefill" and not probe:
             params.do_kv_handoff = True
             params.num_tokens_to_generate = 0
@@ -352,18 +364,29 @@ class MegatronLLMEngine(LLMEngine):
         self._request_ids[context_id] = stream.request_id
 
         released = False
+        source_safe = False
         try:
             async for chunk in self._stream_chunks(stream, token_ids, params):
-                if not released and self.config.role == "decode":
-                    released = self._release_handoff_from_meta(release)
+                source_safe = True
                 yield chunk
+                if not released and self.config.role == "decode":
+                    released = await self._release_handoff_from_meta_async(release)
+        except InferenceRequestError as error:
+            source_safe = error.source_safe
+            raise
         finally:
             self._request_ids.pop(context_id, None)
             if not released and self.config.role == "decode":
                 try:
-                    self._release_handoff_from_meta(release)
+                    if not source_safe:
+                        self.client.abort_request(stream.request_id)
+                        source_safe = await self.client.wait_for_abort(stream.request_id)
+                    if source_safe:
+                        await self._release_handoff_from_meta_async(release)
                 except Exception:
-                    logger.exception("Failed to release Megatron handoff")
+                    logger.exception("Failed to finish cancelled Megatron handoff")
+                finally:
+                    self.client.forget_abort(stream.request_id)
 
     async def _stream_chunks(
         self, stream, prompt_token_ids: list[int], params: SamplingParams
@@ -423,10 +446,21 @@ class MegatronLLMEngine(LLMEngine):
         self._release_remote_handoff(str(address), int(request_id))
         return True
 
+    async def _release_handoff_from_meta_async(self, release: dict[str, Any]) -> bool:
+        """Release source state without blocking Dynamo's request loop."""
+
+        if release.get("coordinator_addr") is None or release.get("request_id") is None:
+            return False
+        return await asyncio.to_thread(self._release_handoff_from_meta, release)
+
     async def abort(self, context: Context) -> None:
         request_id = self._request_ids.pop(str(context.id()), None)
         if request_id is not None and self.client is not None:
             self.client.abort_request(request_id)
+            try:
+                await self.client.wait_for_abort(request_id)
+            finally:
+                self.client.forget_abort(request_id)
 
     async def drain(self) -> None:
         deadline = asyncio.get_running_loop().time() + self.config.drain_timeout

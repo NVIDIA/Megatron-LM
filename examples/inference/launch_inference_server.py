@@ -71,6 +71,7 @@ def _build_model_and_inference_config(args):
             checkpoint_group=local_shard.process_group,
         )
         inference_config = get_inference_config_from_model_and_args(model, args)
+        inference_config.reserve_recurrent_state_dummy_slot = True
         inference_config.pg_collection = local_shard.pg_collection
         return model, inference_config, specs
 

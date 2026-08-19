@@ -405,6 +405,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
 def get_dynamic_inference_engine(
     model: Optional[MegatronModule] = None,
     engine_class: Type[DynamicInferenceEngine] = DynamicInferenceEngine,
+    reserve_recurrent_state_dummy_slot: bool = False,
 ) -> DynamicInferenceEngine:
     """Build a dynamic inference engine of the requested class."""
     args = get_args()
@@ -413,6 +414,7 @@ def get_dynamic_inference_engine(
     tokenizer = build_tokenizer(args)
 
     inference_config = get_inference_config_from_model_and_args(model, args)
+    inference_config.reserve_recurrent_state_dummy_slot = reserve_recurrent_state_dummy_slot
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = GPTInferenceWrapper(model, context)
     controller = TextGenerationController(inference_wrapped_model, tokenizer)

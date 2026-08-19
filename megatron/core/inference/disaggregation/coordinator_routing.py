@@ -23,11 +23,13 @@ class DisaggRouter(abc.ABC):
         """Drop a disconnected engine."""
 
     @abc.abstractmethod
-    def route_submit(self, request_id: int):
+    def route_submit(self, request_id: int, score: Callable | None = None):
         """Hop 1: pick (and remember) the prefill engine for a new request."""
 
     @abc.abstractmethod
-    def route_prefill_done(self, request_id: int) -> Tuple[object, object]:
+    def route_prefill_done(
+        self, request_id: int, score: Callable | None = None
+    ) -> Tuple[object, object]:
         """Hop 2: pick the decode engine; return (prefill_id, decode_id)."""
 
     @abc.abstractmethod
@@ -38,9 +40,14 @@ class DisaggRouter(abc.ABC):
         """Return requests routed through an engine."""
         return []
 
+    def decode_for_request(self, request_id: int):
+        """Return the decode engine assigned to a request, if any."""
+
+        return None
+
 
 class DisaggRouting(DisaggRouter):
-    """Round-robin prefill-to-decode router."""
+    """Load-aware prefill-to-decode router with round-robin tie breaking."""
 
     def __init__(self) -> None:
         self.prefill_engines: List = []
@@ -67,21 +74,23 @@ class DisaggRouting(DisaggRouter):
             if identity in pool:
                 pool.remove(identity)
 
-    def route_submit(self, request_id: int):
+    def route_submit(self, request_id: int, score: Callable | None = None):
         """Hop 1: pick the prefill engine for a newly submitted request."""
-        # TODO: load- and prefix-locality-aware selection instead of round-robin.
         if not self.prefill_engines:
             raise RuntimeError("no prefill engines registered")
-        ident = self.prefill_engines[self._prefill_rr % len(self.prefill_engines)]
+        ident = self._pick(self.prefill_engines, self._prefill_rr, score)
         self._prefill_rr += 1
         self._req_prefill[request_id] = ident
         return ident
 
-    def route_prefill_done(self, request_id: int) -> Tuple[object, object]:
+    def route_prefill_done(
+        self, request_id: int, score: Callable | None = None
+    ) -> Tuple[object, object]:
         """Pick decode after prefill and return both engine identities."""
         if not self.decode_engines:
             raise RuntimeError("no decode engines registered")
-        dec = self._pick_decode(request_id)
+        dec = self._pick(self.decode_engines, self._decode_rr, score)
+        self._decode_rr += 1
         self._req_decode[request_id] = dec
         prefill = self._req_prefill.get(request_id)
         return prefill, dec
@@ -97,11 +106,15 @@ class DisaggRouting(DisaggRouter):
         rids.update(rid for rid, ident in self._req_decode.items() if ident == identity)
         return list(rids)
 
-    def _pick_decode(self, request_id: int):
-        # TODO: load- and handoff-cost-aware selection instead of round-robin.
-        dec = self.decode_engines[self._decode_rr % len(self.decode_engines)]
-        self._decode_rr += 1
-        return dec
+    def decode_for_request(self, request_id: int):
+        """Return the decode engine assigned to a request, if any."""
+
+        return self._req_decode.get(request_id)
+
+    @staticmethod
+    def _pick(pool: List, offset: int, score: Callable | None):
+        rotated = pool[offset % len(pool) :] + pool[: offset % len(pool)]
+        return rotated[0] if score is None else min(rotated, key=score)
 
 
 # Named policies survive the coordinator spawn boundary.
