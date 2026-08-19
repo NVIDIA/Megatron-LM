@@ -390,14 +390,10 @@ class TransformerLayerNode(ScheduleNode):
             )
 
     def reset_for_recompute(self):
-        """Release the forward activation tensors held by this node while keeping the
-        node reusable for a later recompute forward.
+        """Release this node's forward activations, keeping it reusable for a replay.
 
-        Used by the VPP-stage full recompute path (EP A2A overlap): after the initial
-        (no-grad) forward, the layer node's activation tensors are freed so that only
-        the stage input tensor survives the forward->backward gap. The same node
-        object is later re-run (with grad enabled) to rebuild ``inputs``/``output``/
-        ``detached`` before the backward pass.
+        Under full recompute only each segment's input survives the forward->backward
+        gap; the same node is later re-run with grad enabled to rebuild its state.
         """
         self.inputs = None
         self.output = None
