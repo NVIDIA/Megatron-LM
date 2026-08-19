@@ -20,6 +20,19 @@ from megatron.training.models.dist_utils import (
 from tests.unit_tests.test_utilities import Utils
 
 
+def _model_process_groups() -> ProcessGroupCollection:
+    """Build the explicit groups consumed by the model-initialization lifecycle."""
+    return ProcessGroupCollection(
+        tp=ps.get_tensor_model_parallel_group(),
+        pp=ps.get_pipeline_model_parallel_group(),
+        dp=ps.get_data_parallel_group(with_gtp_remat=False),
+        cp=ps.get_context_parallel_group(),
+        gtp_remat=ps.get_gtp_weight_remat_group(check_initialized=False),
+        expt_tp=ps.get_expert_tensor_parallel_group(check_initialized=False),
+        expt_gtp_remat=ps.get_expert_gtp_weight_remat_group(check_initialized=False),
+    )
+
+
 class Test:
 
     transformer_config = TransformerConfig(
@@ -41,7 +54,7 @@ class Test:
         result = prepare_existing_model_chunks_for_distributed_training(
             [model],
             config,
-            ProcessGroupCollection.use_mpu_process_groups(),
+            _model_process_groups(),
             wrap_with_ddp=False,
             mixed_precision_wrapper=None,
         )
@@ -65,7 +78,7 @@ class Test:
         result = prepare_existing_model_chunks_for_distributed_training(
             [model],
             config,
-            ProcessGroupCollection.use_mpu_process_groups(),
+            _model_process_groups(),
             wrap_with_ddp=False,
             mixed_precision_wrapper=None,
         )
