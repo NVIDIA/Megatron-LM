@@ -1851,7 +1851,8 @@ class TransformerConfig(ModelParallelConfig):
                     and self.moe_expert_capacity_factor >= 0
                 ):
                     raise ValueError(
-                        "global_batch quantile_balancing does not support per-expert token dropping."
+                        "global_batch quantile_balancing does not support "
+                        "per-expert token dropping."
                     )
                 if self.moe_expert_rank_capacity_factor is not None and not self.moe_paged_stash:
                     raise ValueError(
