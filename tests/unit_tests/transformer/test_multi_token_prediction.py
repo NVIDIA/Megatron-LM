@@ -1235,6 +1235,19 @@ class TestMultiTokenPrediction:
         assert sum_val is None
         Utils.destroy_model_parallel()
 
+    def test_roll_tensor_return_sum_false(self):
+        """Disabling return_sum preserves values and omits the unused reduction."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        tensor = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device="cuda")
+
+        rolled, rolled_sum = roll_tensor(tensor, shifts=-1, dims=-1)
+        rolled_without_sum, disabled_sum = roll_tensor(tensor, shifts=-1, dims=-1, return_sum=False)
+
+        assert torch.equal(rolled_without_sum, rolled)
+        assert torch.equal(rolled_sum, rolled.sum())
+        assert disabled_sum is None
+        Utils.destroy_model_parallel()
+
     def test_roll_tensor_shifts_left_and_zeroes_last(self):
         """Test that roll_tensor(-1) shifts left and zeroes the last position.
 
@@ -1361,6 +1374,16 @@ class TestMultiTokenPrediction:
             rolled, sum_val = roll_tensor(
                 tensor, shifts=-1, dims=0, cp_group=cp_group, packed_seq_params=packed_seq_params
             )
+            rolled_without_sum, disabled_sum = roll_tensor(
+                tensor,
+                shifts=-1,
+                dims=0,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                return_sum=False,
+            )
+            assert torch.equal(rolled_without_sum, rolled)
+            assert disabled_sum is None
 
             # Expected: [2, 3, 0, 5, 0] - boundaries at indices 2 and 4 are zeroed
             expected = torch.tensor([2, 3, 0, 5, 0], dtype=torch.float32).cuda()
@@ -1402,6 +1425,16 @@ class TestMultiTokenPrediction:
             rolled, sum_val = roll_tensor(
                 tensor, shifts=-1, dims=0, cp_group=cp_group, packed_seq_params=packed_seq_params
             )
+            rolled_without_sum, disabled_sum = roll_tensor(
+                tensor,
+                shifts=-1,
+                dims=0,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                return_sum=False,
+            )
+            assert torch.equal(rolled_without_sum, rolled)
+            assert disabled_sum is None
 
             # Verify the rolled tensor matches expected values
             assert (

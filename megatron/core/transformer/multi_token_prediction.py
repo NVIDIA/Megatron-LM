@@ -183,7 +183,7 @@ def tie_output_layer_state_dict(
     )
 
 
-def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
+def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None, return_sum=True):
     """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
 
     This function extends the original roll_tensor to support Context Parallelism, which allows
@@ -206,21 +206,26 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
                                falls back to standard rolling behavior.
         packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
                                             If provided, respects sequence boundaries.
+        return_sum (bool): Whether to calculate and return the rolled tensor sum.
+                           Defaults to True.
     Returns:
-        tuple: (rolled_tensor, sum_of_rolled_tensor)
+        tuple: (rolled_tensor, sum_of_rolled_tensor). The sum is None when disabled.
     """
     if tensor is None:
         return None, None
 
     # Handle packed sequences cases
     if packed_seq_params is not None:
-        return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
+        return _roll_tensor_packed_seq(
+            tensor, shifts, dims, packed_seq_params, cp_group, return_sum=return_sum
+        )
 
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
     if cp_group is None or cp_group.size() == 1:
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
         rolled_tensor.select(dims, shifts).fill_(0)
-        return rolled_tensor, rolled_tensor.sum()
+        rolled_sum = rolled_tensor.sum() if return_sum else None
+        return rolled_tensor, rolled_sum
 
     # CP-enabled rolling: Split tensor into chunks and handle boundary communication
     # This matches the batch splitting logic in get_batch_on_this_cp_rank() function
@@ -281,10 +286,13 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     # Concatenate the processed chunks back into a single tensor
     rolled_tensor = torch.cat(rolled_tensor_list, dim=dims)
 
-    return rolled_tensor, rolled_tensor.sum()
+    rolled_sum = rolled_tensor.sum() if return_sum else None
+    return rolled_tensor, rolled_sum
 
 
-def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=None):
+def _roll_tensor_packed_seq(
+    tensor, shifts, dims, packed_seq_params, cp_group=None, return_sum=True
+):
     """Roll tensor with packed sequence support.
     This function handles rolling for packed sequences by respecting sequence boundaries
     """
@@ -311,7 +319,8 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
             # Zero out the last position(s) that would cross sequence boundaries
             rolled_seq[..., shifts:] = 0
             rolled_tensor[..., start_idx:end_idx] = rolled_seq
-        return rolled_tensor, rolled_tensor.sum()
+        rolled_sum = rolled_tensor.sum() if return_sum else None
+        return rolled_tensor, rolled_sum
 
     # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
     local_rank = torch.distributed.get_rank(group=cp_group)
@@ -385,7 +394,8 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         # update the rolled tensor
         rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
 
-    return rolled_tensor, rolled_tensor.sum()
+    rolled_sum = rolled_tensor.sum() if return_sum else None
+    return rolled_tensor, rolled_sum
 
 
 class MTPLossLoggingHelper:
@@ -1929,6 +1939,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     dims=-1,
                     cp_group=self.cp_group,
                     packed_seq_params=packed_seq_params,
+                    return_sum=False,
                 )
                 hsm_history = list(
                     rolled.reshape(num_entries, batch_size, hidden_size, sequence_length)
