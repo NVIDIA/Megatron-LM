@@ -83,7 +83,9 @@ class HeteroTopology:
             grid.destroy()
 
 
-def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
+def create_topology(
+    specs: list[ModuleGridSpec], high_priority_stream_groups: Optional[list[str]] = None
+) -> HeteroTopology:
     """Build every module's grid, PGC, and embedding groups.
 
     Exactly one spec must be named ``MIMO_LANGUAGE_MODULE_KEY`` (the language module); specs must
@@ -103,11 +105,15 @@ def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
     module_pgs: dict[str, ProcessGroupCollection] = {}
     try:
         for spec in specs:
-            grids[spec.name] = _build_grid(spec)
+            grids[spec.name] = _build_grid(spec, high_priority_stream_groups)
         _validate_grid_layout(grids)
 
         for name, grid in grids.items():
-            module_pgs[name] = pg_collection_from_grid(grid, is_language=(name == language_name))
+            module_pgs[name] = pg_collection_from_grid(
+                grid,
+                is_language=(name == language_name),
+                high_priority_stream_groups=high_priority_stream_groups,
+            )
 
         schedule_pg_collection = build_schedule_pg_collection(grids, module_pgs, language_name)
         return HeteroTopology(
@@ -118,7 +124,9 @@ def create_topology(specs: list[ModuleGridSpec]) -> HeteroTopology:
         raise
 
 
-def _build_grid(spec: ModuleGridSpec) -> HyperCommGrid:
+def _build_grid(
+    spec: ModuleGridSpec, high_priority_stream_groups: Optional[list[str]] = None
+) -> HyperCommGrid:
     """Create a dense grid plus its expert view and the process groups MIMO needs."""
     grid = HyperCommGrid(
         shape=[spec.tp, spec.gtp_remat, spec.cp, spec.dp, spec.pp],
@@ -134,37 +142,48 @@ def _build_grid(spec: ModuleGridSpec) -> HyperCommGrid:
         shared_dims=["pp"],
     )
 
+    def create_pg(dims: list[str], pg_name: str, *, view: Optional[str] = None) -> None:
+        grid.create_pg(
+            dims, view=view, pg_options=_get_pg_options(pg_name, high_priority_stream_groups)
+        )
+
     try:
-        for dims in (
-            ["tp"],
-            ["gtp_remat"],
-            ["cp"],
-            ["pp"],
-            ["dp"],
-            ["dp", "cp"],
-            ["gtp_remat", "dp", "cp"],
-            ["tp", "cp"],
-            ["tp", "gtp_remat", "pp"],
-            ["tp", "gtp_remat", "dp"],
-            ["tp", "gtp_remat", "dp", "cp"],
-            ["tp", "gtp_remat", "cp", "dp", "pp"],
-        ):
-            grid.create_pg(dims)
-        for dims in (
-            ["ep"],
-            ["expt_tp"],
-            ["expt_gtp_remat"],
-            ["expt_dp"],
-            ["expt_tp", "ep"],
-            ["expt_tp", "ep", "pp"],
-            ["expt_tp", "ep", "expt_gtp_remat", "pp"],
-            ["expt_gtp_remat", "expt_dp"],
-        ):
-            grid.create_pg(dims, view=_EXPERT_VIEW)
+        create_pg(["tp"], "tp")
+        create_pg(["gtp_remat"], "gtp_remat")
+        create_pg(["cp"], "cp")
+        create_pg(["pp"], "pp")
+        create_pg(["dp"], "dp")
+        create_pg(["dp", "cp"], "dp_cp")
+        create_pg(["gtp_remat", "dp", "cp"], "gtp_remat_dp_cp")
+        create_pg(["tp", "cp"], "tp_cp")
+        create_pg(["tp", "gtp_remat", "pp"], "mp")
+        create_pg(["tp", "gtp_remat", "dp"], "tp_dp")
+        create_pg(["tp", "gtp_remat", "dp", "cp"], "tp_dp_cp")
+        create_pg(["tp", "gtp_remat", "cp", "dp", "pp"], "intra_dist_opt_instance")
+
+        create_pg(["ep"], "ep", view=_EXPERT_VIEW)
+        create_pg(["expt_tp"], "ep_tp", view=_EXPERT_VIEW)
+        create_pg(["expt_gtp_remat"], "expt_gtp_remat", view=_EXPERT_VIEW)
+        create_pg(["expt_dp"], "ep_dp", view=_EXPERT_VIEW)
+        create_pg(["expt_tp", "ep"], "tp_ep_mp", view=_EXPERT_VIEW)
+        create_pg(["expt_tp", "ep", "pp"], "tp_ep_pp", view=_EXPERT_VIEW)
+        create_pg(
+            ["expt_tp", "ep", "expt_gtp_remat", "pp"], "tp_ep_gtp_remat_pp", view=_EXPERT_VIEW
+        )
+        create_pg(["expt_gtp_remat", "expt_dp"], "ep_gtp_remat_dp", view=_EXPERT_VIEW)
     except Exception:
         grid.destroy()
         raise
     return grid
+
+
+def _get_pg_options(
+    group_name: str, high_priority_stream_groups: Optional[list[str]]
+) -> Optional[dist.ProcessGroupNCCL.Options]:
+    """Return high-priority NCCL options for a stock parallel-state group name."""
+    if group_name not in (high_priority_stream_groups or ()):
+        return None
+    return dist.ProcessGroupNCCL.Options(is_high_priority_stream=True)
 
 
 def _validate_grid_layout(grids: dict[str, HyperCommGrid]) -> None:
@@ -202,7 +221,9 @@ def _validate_grid_layout(grids: dict[str, HyperCommGrid]) -> None:
 
 
 def pg_collection_from_grid(
-    grid: HyperCommGrid, is_language: bool = False
+    grid: HyperCommGrid,
+    is_language: bool = False,
+    high_priority_stream_groups: Optional[list[str]] = None,
 ) -> ProcessGroupCollection:
     """Adapt a populated ``HyperCommGrid`` into a ``ProcessGroupCollection``.
 
@@ -236,19 +257,29 @@ def pg_collection_from_grid(
     pgc.embd = None
     pgc.pos_embd = None
     if is_language:
-        _build_language_embedding_groups(grid, pgc)
+        _build_language_embedding_groups(grid, pgc, high_priority_stream_groups)
     return pgc
 
 
-def _build_language_embedding_groups(grid: HyperCommGrid, pgc: ProcessGroupCollection) -> None:
+def _build_language_embedding_groups(
+    grid: HyperCommGrid,
+    pgc: ProcessGroupCollection,
+    high_priority_stream_groups: Optional[list[str]] = None,
+) -> None:
     """Set this rank's word/position embedding groups, mirroring parallel_state.
 
     Creation is collective: every grid rank calls ``new_group`` for each PP tuple.
     """
     own_pp_ranks = tuple(dist.get_process_group_ranks(pgc.pp)) if pgc.pp is not None else ()
     for pp_ranks in grid.get_rank_enum("pp"):
-        emb_group = dist.new_group(ranks=default_embedding_ranks(list(pp_ranks)))
-        pos_group = dist.new_group(ranks=default_position_embedding_ranks(list(pp_ranks)))
+        emb_group = dist.new_group(
+            ranks=default_embedding_ranks(list(pp_ranks)),
+            pg_options=_get_pg_options("embd", high_priority_stream_groups),
+        )
+        pos_group = dist.new_group(
+            ranks=default_position_embedding_ranks(list(pp_ranks)),
+            pg_options=_get_pg_options("pos_embd", high_priority_stream_groups),
+        )
         if tuple(pp_ranks) == own_pp_ranks:
             if _is_process_group_member(emb_group):
                 pgc.embd = emb_group
