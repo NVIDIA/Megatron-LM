@@ -440,13 +440,6 @@ class HybridEPDispatch(torch.autograd.Function):
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
         non_blocking = num_permuted_tokens is not None
-        if topk_idx is not None and not HAVE_HYBRIDEP_DENSE_ROUTING:
-            raise RuntimeError(
-                "HybridEP topk_idx was provided, but the installed HybridEPBuffer does not "
-                "support dense topk_idx metadata. Use a newer HybridEP backend or pass a sparse "
-                "routing_map without topk_idx."
-            )
-
         use_dense = topk_idx is not None and HAVE_HYBRIDEP_DENSE_ROUTING
         if use_dense:
             assert num_of_experts is not None, "num_of_experts is required for dense routing"
@@ -457,6 +450,9 @@ class HybridEPDispatch(torch.autograd.Function):
                 **dense_kwargs,
             }
         else:
+            assert routing_map is not None, (
+                "routing_map is required when dense HybridEP routing is unavailable"
+            )
             dispatch_kwargs = {"routing_map": routing_map}
 
         (
