@@ -65,6 +65,7 @@ from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
+    _get_glu_split_shapes,
     _get_qkv_split_shapes,
 )
 from .fully_sharded_optimizer import FullyShardedOptimizer
@@ -779,7 +780,7 @@ def _get_megatron_emerging_optimizer(
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
-    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
+    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv, is_glu).
     for model_chunk in model_chunks:
         qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
@@ -800,6 +801,21 @@ def _get_megatron_emerging_optimizer(
                         logging.DEBUG,
                         f"Emerging optimizer QKV split skipped for {name}: "
                         f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
+                    )
+            if (
+                model_chunk.config.gated_linear_unit
+                and 'linear_fc1.weight' in name
+                and len(param.shape) == 2
+            ):
+                if param.shape[0] % 2 == 0:
+                    param.is_glu = True
+                    param.glu_split_shapes = _get_glu_split_shapes(param)
+                else:
+                    log_single_rank(
+                        logger,
+                        logging.DEBUG,
+                        f"Emerging optimizer GLU split skipped for {name}: "
+                        f"shape={tuple(param.shape)}",
                     )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).

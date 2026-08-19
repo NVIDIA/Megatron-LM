@@ -92,16 +92,20 @@ class TestTPAttributesWithoutInitialization:
         assert hasattr(w, "partition_stride") and w.partition_stride == 1
 
 
-def test_copy_tensor_model_parallel_attributes_preserves_qkv_split_shapes():
+def test_copy_tensor_model_parallel_attributes_preserves_optimizer_split_shapes():
     source = torch.empty(4, 4)
     destination = torch.empty_like(source)
     source.is_qkv = True
     source.qkv_split_shapes = [256, 64, 64]
+    source.is_glu = True
+    source.glu_split_shapes = [128, 128]
 
     copy_tensor_model_parallel_attributes(destination, source)
 
     assert destination.is_qkv is True
     assert destination.qkv_split_shapes == source.qkv_split_shapes
+    assert destination.is_glu is True
+    assert destination.glu_split_shapes == source.glu_split_shapes
 
 
 def test_copy_gtp_attributes_preserves_pad_length():

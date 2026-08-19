@@ -162,6 +162,14 @@ def _get_qkv_split_shapes(model_cfg) -> list[int]:
     return [query_projection_size, model_cfg.kv_channels, model_cfg.kv_channels]
 
 
+def _get_glu_split_shapes(param: torch.Tensor) -> list[int]:
+    """Compute the local gate and up split shapes for a fused GLU FC1 weight."""
+    if param.shape[0] % 2 != 0:
+        raise ValueError(f"GLU FC1 output dimension must be even, got shape={tuple(param.shape)}")
+    split_size = param.shape[0] // 2
+    return [split_size, split_size]
+
+
 # ===========================================================================
 # Registry – populated below only when emerging_optimizers is installed.
 # ===========================================================================
@@ -261,6 +269,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
+        gated_linear_unit: bool = False,
+        is_glu_fn: Callable[[torch.Tensor], bool] | None = None,
+        glu_split_shapes: list[int] | None = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
@@ -321,6 +332,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.elem_size = 2 if fp32_matmul_prec == "medium" else 4  # bf16 vs tf32/fp32
         self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
+        self.gated_linear_unit = gated_linear_unit
+        self.is_glu_fn = is_glu_fn
+        self.glu_split_shapes = glu_split_shapes
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -563,6 +577,31 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 for g in qkv_grads
             ]
             grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
+        elif self.gated_linear_unit and (
+            self.is_glu_fn(p) if self.is_glu_fn is not None else getattr(p, "is_glu", False)
+        ):
+            grad_shape = grad.shape
+            glu_split_shapes = getattr(p, "glu_split_shapes", None)
+            if glu_split_shapes is None:
+                glu_split_shapes = self.glu_split_shapes
+            if glu_split_shapes is None:
+                raise RuntimeError("Muon GLU split requested but glu_split_shapes is not set")
+            if len(glu_split_shapes) != 2 or sum(glu_split_shapes) != grad_shape[0]:
+                raise RuntimeError(
+                    f"Muon GLU split shape mismatch: grad_shape={tuple(grad_shape)}, "
+                    f"split_shapes={glu_split_shapes}"
+                )
+            log_single_rank(
+                logger,
+                logging.DEBUG,
+                f'glu split grad shape {grad_shape}, split shapes {glu_split_shapes}',
+            )
+            glu_grads = torch.split(grad, glu_split_shapes, dim=0)
+            glu_grads = [
+                self.scaled_orthogonalize_fn_with_gtp_remat(p, glu_grad, tp_group, partition_dim)
+                for glu_grad in glu_grads
+            ]
+            grad = torch.cat(glu_grads, dim=0).view(grad_shape)
         else:
             grad = self.scaled_orthogonalize_fn_with_gtp_remat(p, grad, tp_group, partition_dim)
         return grad
@@ -587,6 +626,9 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         split_qkv: Whether to split QKV weights for orthogonalization.
         is_qkv_fn: Function to determine if a tensor is a QKV weight.
         qkv_split_shapes: Shapes for splitting QKV weights.
+        gated_linear_unit: Whether the model uses fused GLU FC1 weights.
+        is_glu_fn: Function to determine if a tensor is a fused GLU FC1 weight.
+        glu_split_shapes: Local gate and up shapes for splitting GLU FC1 weights.
         fp32_matmul_prec: Precision for FP32 matrix multiplication.
         coefficient_type: The type of coefficient set to use for the Newton-Schulz iteration.
         num_ns_steps: The number of iteration steps to use in the Newton-Schulz iteration.
@@ -612,6 +654,9 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: list[int] | None = None,
+        gated_linear_unit: bool = False,
+        is_glu_fn: Callable[[torch.Tensor], bool] | None = None,
+        glu_split_shapes: list[int] | None = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
@@ -635,6 +680,9 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
             split_qkv=split_qkv,
             is_qkv_fn=is_qkv_fn,
             qkv_split_shapes=qkv_split_shapes,
+            gated_linear_unit=gated_linear_unit,
+            is_glu_fn=is_glu_fn,
+            glu_split_shapes=glu_split_shapes,
             fp32_matmul_prec=fp32_matmul_prec,
             coefficient_type=coefficient_type,
             num_ns_steps=num_ns_steps,
@@ -684,6 +732,8 @@ def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any
     kwargs = _kwargs_from_config(TensorParallelMuon, "muon", config)
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
     kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
+    kwargs["gated_linear_unit"] = model_chunks[0].config.gated_linear_unit
+    kwargs["is_glu_fn"] = lambda p: getattr(p, "is_glu", False)
     kwargs["pg_collection"] = pg_collection
     return kwargs
 
