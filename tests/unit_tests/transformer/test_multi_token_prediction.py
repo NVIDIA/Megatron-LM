@@ -1474,7 +1474,6 @@ class TestMultiTokenPredictionHybrid:
     def _make_forward_stub():
         hidden_states = torch.arange(4, dtype=torch.float32).reshape(2, 1, 2)
         call_counts = {"mtp": 0, "mtp_loss": 0, "main_loss": 0}
-        seen = {}
 
         def decoder(**kwargs):
             decoder_hidden_states = kwargs["hidden_states"]
@@ -1486,7 +1485,6 @@ class TestMultiTokenPredictionHybrid:
 
         def mtp(**kwargs):
             call_counts["mtp"] += 1
-            seen["padding_mask"] = kwargs["padding_mask"]
             decoder_hidden_states = kwargs["hidden_states"]
             return torch.cat((decoder_hidden_states, decoder_hidden_states + 100.0), dim=0)
 
@@ -1521,7 +1519,7 @@ class TestMultiTokenPredictionHybrid:
             tp_group=None,
             _scale_logits=lambda logits: logits,
         )
-        return model, hidden_states, call_counts, seen
+        return model, hidden_states, call_counts
 
     @pytest.mark.parametrize(
         (
@@ -1548,7 +1546,7 @@ class TestMultiTokenPredictionHybrid:
         expected_main_loss_calls,
     ):
         """Test that MTP execution and the main output contract are independent."""
-        model, hidden_states, call_counts, _ = self._make_forward_stub()
+        model, hidden_states, call_counts = self._make_forward_stub()
         labels = torch.tensor([[3, 4]]) if provide_labels else None
         input_ids = torch.zeros(1, 2, dtype=torch.long)
         loss_mask = torch.ones(1, 2)
@@ -1587,45 +1585,12 @@ class TestMultiTokenPredictionHybrid:
         else:
             torch.testing.assert_close(output, hidden_states.transpose(0, 1).contiguous())
 
-    def test_forward_mtp_propagates_padding_mask(self, monkeypatch):
-        """Test that HybridModel forwards the padding mask into native MTP."""
-        model, hidden_states, call_counts, seen = self._make_forward_stub()
-        input_ids = torch.zeros(1, 2, dtype=torch.long)
-        loss_mask = torch.ones(1, 2)
-        padding_mask = torch.tensor([[False, True]])
-
-        def process_mtp_loss_spy(**kwargs):
-            call_counts["mtp_loss"] += 1
-            assert kwargs["labels"] is None
-            assert kwargs["input_ids"] is input_ids
-            assert kwargs["loss_mask"] is loss_mask
-            return torch.chunk(kwargs["hidden_states"], 1 + kwargs["config"].mtp_num_layers, dim=0)[
-                0
-            ]
-
-        monkeypatch.setattr(
-            "megatron.core.models.hybrid.hybrid_model.process_mtp_loss", process_mtp_loss_spy
-        )
-
-        HybridModel.forward(
-            model,
-            input_ids=input_ids,
-            position_ids=torch.arange(2).unsqueeze(0),
-            attention_mask=None,
-            decoder_input=hidden_states,
-            loss_mask=loss_mask,
-            padding_mask=padding_mask,
-        )
-
-        assert seen["padding_mask"] is padding_mask
-        assert call_counts == {"mtp": 1, "mtp_loss": 1, "main_loss": 0}
-
     @pytest.mark.parametrize("compute_mtp_loss", [True, False])
     def test_compute_mtp_loss_does_not_control_speculative_decoding(
         self, monkeypatch, compute_mtp_loss
     ):
         """Test the auxiliary MTP switch does not disable speculative-decoding state capture."""
-        model, hidden_states, call_counts, _ = self._make_forward_stub()
+        model, hidden_states, call_counts = self._make_forward_stub()
         inference_context = types.SimpleNamespace(
             is_dynamic_batching=lambda: True,
             num_speculative_tokens=1,

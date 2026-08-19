@@ -563,7 +563,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
-                padding_mask=padding_mask,
                 embedding=self.embedding,
             )
 
