@@ -1823,18 +1823,24 @@ def _collect_rollout_pipeline_metrics() -> dict:
     # Per-env metrics, in env layout order (the pipeline arrays are env-indexed;
     # weighted env_ids are unique by construction).
     for env_index, allocation in enumerate(pipeline.allocations):
+        restored_groups = pipeline.restored_groups_per_env[env_index]
+        yielded_groups = pipeline.yielded_groups_per_env[env_index]
+        if yielded_groups:
+            restored_groups_percentage = 100.0 * restored_groups / yielded_groups
+            fresh_groups_percentage = 100.0 - restored_groups_percentage
+        else:
+            restored_groups_percentage = 0.0
+            fresh_groups_percentage = 0.0
         metrics[f"{allocation.env_id}_prepared_groups"] = (
             pipeline.prepared_groups_per_env[env_index]
         )
         metrics[f"{allocation.env_id}_assembled_groups"] = (
             pipeline.assembled_groups_per_env[env_index]
         )
-        metrics[f"{allocation.env_id}_restored_groups"] = (
-            pipeline.restored_groups_per_env[env_index]
-        )
-        metrics[f"{allocation.env_id}_yielded_groups"] = (
-            pipeline.yielded_groups_per_env[env_index]
-        )
+        metrics[f"{allocation.env_id}_restored_groups"] = restored_groups
+        metrics[f"{allocation.env_id}_restored_groups_percentage"] = restored_groups_percentage
+        metrics[f"{allocation.env_id}_fresh_groups_percentage"] = fresh_groups_percentage
+        metrics[f"{allocation.env_id}_yielded_groups"] = yielded_groups
         metrics[f"{allocation.env_id}_agent_groups"] = allocation.num_groups
         # The realized weight: the constant share of each batch the env actually owns.
         metrics[f"{allocation.env_id}_weight"] = (
