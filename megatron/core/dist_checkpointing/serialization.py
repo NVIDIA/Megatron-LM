@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Entrypoints for saving and loading the distributed checkpoints.
 
@@ -28,6 +28,7 @@ from .mapping import (
     StateDict,
     apply_factory_merges,
 )
+from .metadata import merge_global_dp_reshardable_padding_metadata
 from .state_dict_utils import load_preprocess, save_preprocess
 from .strategies.async_utils import AsyncRequest
 from .strategies.common import COMMON_STATE_FNAME, load_common
@@ -415,6 +416,15 @@ def save(
         or isinstance(sharded_strategy, FullyParallelSaveStrategyWrapper)
     ):
         sharded_strategy = TorchDistSaveShardedStrategy()
+
+    if (
+        content_metadata is not None
+        and content_metadata.get('distrib_optim_sharding_type') == 'dp_reshardable'
+    ):
+        # Each DP replica can derive its model-parallel domain's fragment without communication.
+        # Merge those fragments once so the common content metadata saved by global rank 0 contains
+        # the padding contract for every optimizer tensor in the checkpoint.
+        content_metadata = merge_global_dp_reshardable_padding_metadata(content_metadata)
 
     if content_metadata is not None:
         sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata

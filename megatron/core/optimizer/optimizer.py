@@ -39,6 +39,11 @@ except ImportError:
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
+from ..dist_checkpointing.metadata import (
+    DP_RESHARDABLE_PADDING_MANIFEST_KEY,
+    extract_scoped_dp_reshardable_padding_metadata,
+    merge_scoped_dp_reshardable_padding_metadata,
+)
 from ..dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
     make_sharded_optimizer_tensor,
@@ -1721,11 +1726,28 @@ class ChainedOptimizer(MegatronOptimizer):
             self._synchronize_steps()
             sharded_state_dict = {}
             for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+                child_prefix = f'chained_{optimizer_idx}.' if should_add_prefix else ''
+                child_kwargs = dict(kwargs)
+                if is_loading:
+                    child_metadata = extract_scoped_dp_reshardable_padding_metadata(
+                        metadata, child_prefix
+                    )
+                else:
+                    # Each child builds a manifest using its pre-prefix ShardedTensor keys. Keep
+                    # that fragment isolated, then merge it into the parent with the same prefix
+                    # applied below to the actual state dict.
+                    child_metadata = dict(metadata)
+                    child_metadata.pop(DP_RESHARDABLE_PADDING_MANIFEST_KEY, None)
+                child_kwargs['metadata'] = child_metadata
                 optim_state_dict = optimizer.sharded_state_dict(
-                    model_sharded_state_dict, is_loading, **kwargs
+                    model_sharded_state_dict, is_loading, **child_kwargs
                 )
                 if should_add_prefix:
-                    add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
+                    add_prefix_for_sharding(optim_state_dict, child_prefix)
+                if not is_loading:
+                    merge_scoped_dp_reshardable_padding_metadata(
+                        metadata, child_metadata, child_prefix
+                    )
                 sharded_state_dict[optimizer_idx] = optim_state_dict
             return sharded_state_dict
 
