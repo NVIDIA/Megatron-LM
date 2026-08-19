@@ -12,7 +12,7 @@ from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+from torch._utils import _unflatten_dense_tensors
 from torch.distributed import _coalescing_manager
 
 import megatron.core.nccl_allocator as nccl_allocator
@@ -29,13 +29,13 @@ from ..fp4_utils import (
     modify_nvfp4_rowwise_storage,
 )
 from ..fp8_utils import (
-    _stage_param_to_bf16,
-    copy_back_gathered_bf16_into_fp8_param,
-    copy_tensor_to_quantized_param,
+    copy_back_gathered_bf16_into_fp8_params,
+    copy_tensors_to_quantized_params,
     is_float8tensor,
     is_grouped_mxfp8tensor,
     is_grouped_tensor,
     is_grouped_tensor_with_quantized_storage,
+    is_layerwise_fp8_param,
     is_mxfp8tensor,
     modify_grouped_tensor_rowwise_storage,
     modify_underlying_storage,
@@ -195,7 +195,8 @@ def _layerwise_copy_back_gathered_params(bucket, local_rank: int, fp8_staged: bo
     * bf16 (``fp8_staged=False``): unflatten against the params, ``copy_`` into non-owned
       ``model_p.data`` (owned already hold the staged value).
     * fp8 (``fp8_staged=True``): the all-gather rode bf16; requantize ALL ranks (owned included)
-      via ``copy_back_gathered_bf16_into_fp8_param`` so every owner holds ``Q(bf16(master))``.
+      via ``copy_back_gathered_bf16_into_fp8_params`` so every owner holds
+      ``Q(bf16(master))``.
 
     no_grad: in-place copy_ on a leaf param trips autograd's in-place guard.
     """
@@ -205,8 +206,7 @@ def _layerwise_copy_back_gathered_params(bucket, local_rank: int, fp8_staged: bo
         if fp8_staged:
             templates = [torch.empty(p.shape, device="meta", dtype=torch.bfloat16) for p in params]
             updated_params = _unflatten_dense_tensors(bucket.layerwise_gather_list[idx], templates)
-            for updated_p, model_p in zip(updated_params, params):
-                copy_back_gathered_bf16_into_fp8_param(model_p, updated_p)
+            copy_back_gathered_bf16_into_fp8_params(params, updated_params)
             continue
         # bf16 transport: owned params already hold the staged bf16 value in their data, so only
         # non-owned ranks need the copy.
@@ -379,6 +379,9 @@ class _ParamAndGradBucketGroup:
                 if bucket.param_data is None:
                     continue
                 has_non_quantized_weight = False
+                quantized_params = []
+                param_slices = []
+                flat_param_data = bucket.param_data.view(-1)
                 for param in bucket.params:
                     # Non-quantized weights are already mapped to param.data. Skip
                     # mixed buckets because zeroing bucket.param_data would also
@@ -387,8 +390,11 @@ class _ParamAndGradBucketGroup:
                         has_non_quantized_weight = True
                         break
                     param_start, param_end = bucket.param_to_index[param]
-                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                    copy_tensor_to_quantized_param(param, param_slice)
+                    quantized_params.append(param)
+                    param_slices.append(flat_param_data[param_start:param_end])
+                # Cast the bucket in one call: these casts are small, so the per-param cost of
+                # issuing them is worth avoiding.
+                copy_tensors_to_quantized_params(quantized_params, param_slices)
                 if has_non_quantized_weight:
                     continue
                 # All-gathered params are not needed after being copied to param.data.
@@ -496,22 +502,22 @@ class _ParamAndGradBucketGroup:
             local_rank = self.intra_distributed_optimizer_instance_rank
             group = self.intra_distributed_optimizer_instance_group
             layerwise_work_handles = []
-            # Decouple fp8 param-gather: model params are Float8/MXFP8 but the all-gather rides bf16
-            # — stage owned to bf16, gather, requantize on copy-back. Plain bf16 collapses to the
-            # original path.
+            # Decouple fp8 param-gather: supported MXFP8/blockwise model params ride BF16 — stage
+            # the local owner's FP32 master, gather, then requantize on copy-back. Plain BF16
+            # collapses to the original path.
             decouple = not getattr(self.ddp_config, 'use_layer_wise_param_layout', True)
             for bucket in self.buckets:
-                # A decoupled LayerWise (Muon) bucket can MIX fp8 and bf16 params:
+                # A decoupled LayerWise (Muon) bucket can MIX supported fp8 and bf16 params:
                 # merge_layerwise_fp8_grads keys fp8 Muon grads by their bf16 logical dtype so they
                 # share ONE buffer (hence bucket) with their bf16 siblings (e.g. an MoE router /
                 # DSA indexer / mHC weight that is not fp8-quantized). The bf16-staged path handles
-                # both dtypes, so a bucket holding ANY fp8 param must take it -- scanning only
-                # params_list[0] mis-routes a bf16-first mixed bucket into the raw
+                # both dtypes, so a bucket holding ANY supported fp8 param must take it -- scanning
+                # only params_list[0] mis-routes a bf16-first mixed bucket into the raw
                 # _flatten_dense_tensors() path, which crashes on the MXFP8 .view(-1).
                 bucket_is_fp8 = bool(
                     decouple
                     and bucket.params_list
-                    and any(is_float8tensor(p) for p in bucket.params_list)
+                    and any(is_layerwise_fp8_param(p) for p in bucket.params_list)
                 )
                 # TODO(perf, blockwise-only): blockwise could gather the owner's fp8 rowwise data
                 # (~2x less comm) + its small scale_inv and rebuild columnwise via transpose
@@ -545,22 +551,37 @@ class _ParamAndGradBucketGroup:
                     offset += size
                 local_slot_view = gather_list[local_rank]
 
-                # Flatten local params and copy into the local rank's slot.
-                # Detach from autograd since start_param_sync may be called
-                # during the forward pass where autograd is active.
+                # Copy local params directly into their views of the flat transport slot.
+                # This avoids allocating one BF16 tensor per parameter and then flattening it.
+                # Detach from autograd since start_param_sync may be called during forward.
                 if local_size > 0:
-                    if bucket_is_fp8:
-                        # Stage fp32 master->bf16 (high-precision source), not lossy dequant(fp8).
-                        staged = [
-                            _stage_param_to_bf16(p)
-                            for p in bucket.layerwise_params_list[local_rank]
-                        ]
-                        flat_local_params = _flatten_dense_tensors(staged)
-                    else:
-                        flat_local_params = _flatten_dense_tensors(
-                            bucket.layerwise_params_list[local_rank]
-                        ).detach()
-                    local_slot_view.copy_(flat_local_params)
+                    local_offset = 0
+                    for param in bucket.layerwise_params_list[local_rank]:
+                        param_numel = param.numel()
+                        transport_view = local_slot_view[local_offset : local_offset + param_numel]
+                        if bucket_is_fp8 or is_mxfp8tensor(param):
+                            # Decoupled FP8 buckets stage every param from its FP32 master so
+                            # mixed FP8/BF16 buckets all use the same high-precision source.
+                            # Padded buckets need the same source only for MXFP8, whose tensor
+                            # subclass cannot be flattened.
+                            source = getattr(param, "main_param", None)
+                            if source is None:
+                                raise RuntimeError(
+                                    "LayerWise FP8 parameter-gather staging requires "
+                                    "param.main_param (FP32 master)."
+                                )
+                        else:
+                            source = param
+                        source = source.detach()
+                        if source.numel() != param_numel:
+                            raise RuntimeError(
+                                "LayerWise parameter-gather staging source size mismatch: "
+                                f"source has {source.numel()} elements, parameter has "
+                                f"{param_numel}."
+                            )
+                        transport_view.copy_(source.reshape(-1))
+                        local_offset += param_numel
+                    assert local_offset == local_size
                 bucket.layerwise_gather_list = gather_list
 
                 work = torch.distributed.all_gather(
@@ -983,7 +1004,7 @@ def group_params_for_buffers(
         # share ONE fp32 all_reduce buffer; a split uint8/bf16 reduction diverges ~1 ULP from OFF.
         if (
             merge_layerwise_fp8_grads
-            and is_float8tensor(param)
+            and is_layerwise_fp8_param(param)
             and is_managed_by_layer_wise_optimizer
         ):
             param_dtype = param.dtype

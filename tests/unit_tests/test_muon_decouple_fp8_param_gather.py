@@ -22,6 +22,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.enums import ModelType
+from megatron.core.fp8_utils import is_float8tensor
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -47,7 +48,10 @@ fp8_available, reason_for_no_fp8 = check_fp8_support()
 
 
 def _is_quantized(p):
-    return hasattr(p, 'dequantize') or hasattr(p.data, 'dequantize')
+    # NB: do not probe for a ``dequantize`` attribute -- ``torch.Tensor.dequantize`` is defined
+    # for every tensor (it returns ``self.to(float32)`` for dense ones), so ``hasattr`` is always
+    # True and would classify plain bf16 params as quantized.
+    return is_float8tensor(p) or is_float8tensor(p.data)
 
 
 def _assert_equal(actual, expected, msg):
@@ -69,8 +73,11 @@ def _snapshot_masters(model):
 
 
 def _snapshot_params(model, include_quantized=False):
-    # By default only non-quantized (bf16) params; fp8 weights are compared via master + grad.
-    # With include_quantized, fp8 params are dequantized so gathered fp8 bytes are checked directly.
+    """Model params for ON-vs-OFF comparison. fp8 params are skipped by default (covered via
+    master + grad; OFF's bf16 vs ON's Q(bf16(master)) differ by the quantization step).
+    ``include_quantized`` dequantizes them instead, for single-run comparisons (force_sync)
+    where both sides hold the same fp8 storage.
+    """
     out = {}
     for n, p in model.named_parameters():
         if _is_quantized(p):
@@ -78,6 +85,7 @@ def _snapshot_params(model, include_quantized=False):
                 out[n] = p.data.dequantize().detach().clone().float()
         else:
             out[n] = p.detach().clone()
+    assert out, "snapshot is empty -- the param comparison would assert nothing"
     return out
 
 
@@ -307,6 +315,30 @@ class TestMuonDecoupleFP8ParamGather:
                         opt._copy_main_params_to_param_buffer()
             if delay_master_offload:
                 optimizer.offload_optimizer_state_for_forward()
+            if args.overlap_param_gather:
+                # Without chunked offload every gather stays pending for the forward pre-hook.
+                # With it, each optimizer whose gather needs an FP32 master must synchronize its
+                # required bucket subset before offloading that master. A child-level requirement
+                # does not imply that every bucket owned by that child is dispatched here, so the
+                # 30-step numerical check below remains the source of truth for the mixed state.
+                # MXFP8 then stages the sibling DistOpt buffer above; that staging deliberately
+                # resets every dispatch flag because it overwrites the gathered payload.
+                _groups = model[0].bucket_groups + model[0].expert_parallel_bucket_groups
+                assert _groups
+                staging_rearmed_forward_hook = (
+                    pre_forward_sync and args.reuse_grad_buf_for_mxfp8_param_ag
+                )
+                if pre_forward_sync and not staging_rearmed_forward_hook:
+                    assert any(g.param_gather_dispatched for g in _groups), (
+                        "pre-forward parameter synchronization did not dispatch any bucket "
+                        "before optimizer master offload"
+                    )
+                else:
+                    assert all(not g.param_gather_dispatched for g in _groups), (
+                        "forward pre-hook is not armed for every bucket group: the deferred "
+                        "param all-gather would be skipped, so this iteration does not exercise "
+                        "the overlap path"
+                    )
             model[0].set_is_first_microbatch()
             out = model[0].forward(
                 input_ids=ids,
@@ -328,6 +360,20 @@ class TestMuonDecoupleFP8ParamGather:
                 optimizer.prefetch_optimizer_state_for_gradient_finalization()
             ok, _, _ = optimizer.step()
             assert ok
+            if args.overlap_param_gather:
+                # Under overlap the gather is deferred to the next forward pre-hook, so right
+                # after ``step()`` the buffer still holds pre-update values -- no well-defined
+                # instant to compare ON vs OFF. Finalize here, restaging the sibling DistOpt
+                # masters FIRST: they gather from a param_data shard and backward has refilled the
+                # aliased grad buffer, so a forced gather would else broadcast gradients as params.
+                optimizer.prepare_model_params_for_param_sync()
+                model[0].disable_forward_pre_hook(param_sync=True)
+                model[0].enable_forward_pre_hook()
+                # Reset param_gather_dispatched (left True by the forced sync), else the next
+                # forward pre-hook is a no-op and steps 2..n stop exercising the deferred path.
+                model[0].reset_param_sync_dispatch_state()
+            # include_quantized stays False: OFF holds bf16, ON holds Q(bf16(master)), differing
+            # by the quantization step by construction.
             params.append(_snapshot_params(model[0]))
             masters.append(_snapshot_masters(model[0]))
             grads.append(grad)
@@ -367,11 +413,21 @@ class TestMuonDecoupleFP8ParamGather:
             assert gn[s].keys() == go[s].keys(), f"grad param set mismatch step {s}"
             for k in gn[s]:
                 _assert_equal(gn[s][k], go[s][k], f"grad step {s} {k}")
-            assert pn[s].keys() == po[s].keys(), f"param set mismatch step {s}"
+            # ON skips its fp8 weights (covered by the master/grad checks above), so its key set
+            # is a subset; the surviving bf16 params are compared bitwise. Pin the skipped set so
+            # a param silently dropping out of the comparison is caught.
+            assert pn[s].keys() <= po[s].keys(), f"param set mismatch step {s}"
+            assert pn[s], f"no comparable params captured step {s}"
+            _dropped = po[s].keys() - pn[s].keys()
+            if s == 0:
+                _dropped_0 = _dropped
+                assert _dropped, "no fp8 params skipped -- the ON run is not using fp8 storage"
+            assert _dropped == _dropped_0, f"fp8-skipped param set changed at step {s}"
             for k in pn[s]:
                 _assert_equal(pn[s][k], po[s][k], f"param step {s} {k}")
-            common = mn[s].keys() & mo[s].keys()
-            assert common, f"no common masters step {s}"
+            assert mn[s].keys() == mo[s].keys(), f"master param set mismatch step {s}"
+            assert mn[s], f"no masters captured step {s}"
+            common = mn[s].keys()
             for k in common:
                 _assert_equal(mn[s][k], mo[s][k], f"master step {s} {k}")
 
@@ -600,3 +656,9 @@ class TestMuonDecoupleFP8ParamGather:
         assert len(ref_grads) == len(got_grads) and ref_grads, "expected LayerWise grad buffers"
         for i, (gr, gg) in enumerate(zip(ref_grads, got_grads)):
             _assert_equal(gg, gr, f"grad_data buffer {i} after force_sync")
+            # Both routes end in _finalize_layerwise_param_sync -> grad_data.zero_(), so equality
+            # alone is zeros-vs-zeros on the happy path. State the intended post-condition
+            # directly: force_sync must not leave the gather payload behind.
+            assert (
+                torch.count_nonzero(gg) == 0
+            ), f"grad_data buffer {i} still holds the gather payload after force_sync"

@@ -45,7 +45,11 @@ from ..dist_checkpointing.optimizer import (
     optim_state_to_sharding_state,
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
-from ..fp8_utils import copy_back_gathered_bf16_into_fp8_param, is_float8tensor
+from ..fp8_utils import (
+    copy_back_gathered_bf16_into_fp8_params,
+    is_layerwise_fp8_param,
+    pop_high_precision_init_val,
+)
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
@@ -976,15 +980,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             # Seed the fp32 master from the high-precision pre-quantization init
                             # for fp8 params (not the lossy fp8 dequant), matching DistOpt so
                             # fp8_param_gather ON/OFF hold an identical master at iter 0.
-                            if hasattr(param, 'get_high_precision_init_val'):
+                            high_precision_init_val = pop_high_precision_init_val(param)
+                            if high_precision_init_val is not None:
                                 main_param = (
-                                    param.get_high_precision_init_val()
-                                    .detach()
+                                    high_precision_init_val.detach()
                                     .clone()
                                     .to(param.device)
                                     .float()
                                 )
-                                param.clear_high_precision_init_val()
                             else:
                                 main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
@@ -1096,15 +1099,15 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             other_model_data, other_main_data = [], []
             for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
                 for model_param, main_param in zip(model_group, main_group):
-                    if is_float8tensor(model_param):
+                    if is_layerwise_fp8_param(model_param):
                         # Gathered fp8 params get ``Q(bf16(master))`` written into ``param.data``
                         # by the fp8 all-gather's requantize (``_allgather_helper_fp8``), which
                         # would overwrite this copy -- so skip it for them. Non-gathered fp8 params
                         # (e.g. MoE experts at expt_dp == 1, which the all-gather skips) are not
                         # tagged and still get their ``Q(bf16(master))`` written here.
                         if not getattr(model_param, '_layer_wise_fp8_gathered', False):
-                            copy_back_gathered_bf16_into_fp8_param(
-                                model_param, main_param.detach().to(torch.bfloat16)
+                            copy_back_gathered_bf16_into_fp8_params(
+                                [model_param], [main_param.detach().to(torch.bfloat16)]
                             )
                     else:
                         other_model_data.append(model_param.data)

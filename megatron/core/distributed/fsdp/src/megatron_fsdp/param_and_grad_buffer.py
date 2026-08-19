@@ -65,6 +65,7 @@ try:
     from megatron.core.distributed.distributed_data_parallel_config import (
         DistributedDataParallelConfig,
     )
+    from megatron.core.fp8_utils import pop_high_precision_init_val
     from megatron.core.tensor_parallel import get_cuda_rng_tracker
     from megatron.core.utils import is_submodule
 
@@ -75,6 +76,18 @@ except ImportError:
     # Megatron-LM is not installed, use Megatron-FSDP as a standalone module.
     from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import get_cuda_rng_tracker, is_submodule
+
+    # Standalone compatibility: MCore's shared helper is intentionally unavailable when the
+    # independently installable megatron_fsdp package is used without Megatron Core.
+    def pop_high_precision_init_val(param: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return and clear a TE preserved high-precision initial value, if present."""
+        getter = getattr(param, "get_high_precision_init_val", None)
+        if getter is None:
+            return None
+
+        high_precision_init_val = getter()
+        param.clear_high_precision_init_val()
+        return high_precision_init_val
 
     HAVE_MCORE = False
     logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
@@ -3077,8 +3090,9 @@ class ParamAndGradBuffer:
                         )
                         # Needed to instantiate FP8 parameters. Requires installing
                         # TransformerEngine.
-                        mbuf.set_item(item_id, p.get_high_precision_init_val())
-                        p.clear_high_precision_init_val()
+                        high_precision_init_val = pop_high_precision_init_val(p)
+                        assert high_precision_init_val is not None
+                        mbuf.set_item(item_id, high_precision_init_val)
                     else:
                         # Insert a copy of the model weight parameter tensor into
                         # the (high-precision) main weight buffer.
