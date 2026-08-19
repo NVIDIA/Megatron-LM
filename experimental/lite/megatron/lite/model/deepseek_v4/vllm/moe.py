@@ -1,5 +1,3 @@
-"""DS4 MoE with vLLM-visible compute and training DeepEP communication."""
-
 from __future__ import annotations
 
 import torch
@@ -25,7 +23,6 @@ from megatron.lite.primitive.quantization.deployment_block_fp8 import (
 
 
 def _kernel_topk_weights(weights: torch.Tensor) -> torch.Tensor:
-    """Restore the FP32 grouped-kernel boundary after FSDP input casting."""
     return weights if weights.dtype == torch.float32 else weights.float()
 
 
@@ -62,8 +59,6 @@ def _hash_route(logits, token_ids, tid2eid, *, topk, renormalize, scale):
 
 
 class _VLLMVisibleExperts(Experts):
-    """Lite expert parameters behind the vLLM-visible grouped compute boundary."""
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -143,8 +138,6 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         weights: torch.Tensor,
         ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Replay IDs while retaining weights from this actor's live router."""
-
         replay = self.gate.router_replay
         if replay is None:
             return weights, ids
@@ -237,6 +230,3 @@ class DeepseekV4MoE(LiteDeepseekV4MoE):
         if self.shared_experts is not None:
             output = output + self._visible_shared_experts(hidden_states)
         return output
-
-
-__all__ = ["DeepseekV4MoE", "MoEKernelMetadata"]

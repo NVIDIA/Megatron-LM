@@ -1,5 +1,3 @@
-"""Reusable visible-forward/functional-backward autograd owner."""
-
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -69,6 +67,3 @@ def visible_functional_vjp(
     return _VisibleFunctionalVJP.apply(
         visible_op, functional_op, version_indices, *inputs
     )
-
-
-__all__ = ["visible_functional_vjp"]

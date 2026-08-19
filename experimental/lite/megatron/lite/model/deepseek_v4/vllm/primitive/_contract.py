@@ -1,5 +1,3 @@
-"""Shared contracts for DS4 vLLM-visible training bridges."""
-
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -41,8 +39,6 @@ def fp32_linear_vjp(
     value: torch.Tensor,
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """BF16-master linear VJP with FP32 accumulation."""
-
     input_shape = value.shape
     output_shape = grad_output.shape
     x2d = value.reshape(-1, value.shape[-1]).float()
@@ -52,11 +48,3 @@ def fp32_linear_vjp(
     if output_shape[:-1] != input_shape[:-1]:
         raise RuntimeError("linear bridge received incompatible grad_output shape")
     return dx, dw
-
-
-__all__ = [
-    "check_parameter_versions",
-    "fp32_linear_vjp",
-    "own_visible_tensor",
-    "parameter_versions",
-]

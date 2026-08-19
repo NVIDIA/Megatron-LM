@@ -1,5 +1,3 @@
-"""Native, fail-closed DeepSeek-V4 layer-0 vLLM execution."""
-
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -75,8 +73,6 @@ def _default_attention_ops() -> SimpleNamespace:
 
 
 class _AttentionState(CompressedSparseAttention):
-    """BF16 attention masters wired to explicit vLLM deployment kernels."""
-
     def __init__(
         self,
         config: DeepseekV4Config,
@@ -159,7 +155,6 @@ class _AttentionState(CompressedSparseAttention):
     def _forward_native_cp(
         self, hidden_states: torch.Tensor, metadata: AttentionKernelMetadata
     ) -> torch.Tensor:
-        """Run local-Q CSA with boundary exchange and compressed-KV all-gather."""
         if self.ps is None or self.ps.cp_size <= 1 or self.ps.cp_group is None:
             raise RuntimeError("native DS4 CP requires a model-owned CP group")
         if metadata.cp_packed_seq_params is None or metadata.cp_positions is None:
@@ -790,7 +785,6 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         hc: HyperConnection,
         norm_weight: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Match lite/official-vLLM unfused HyperConnection pre."""
         fn = hc.fn.float().contiguous()
         scale = hc.scale.float().contiguous()
         base = hc.base.float().contiguous()
@@ -885,8 +879,6 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
 
 
 class DeepseekV4Model(LiteDeepseekV4Model):
-    """Layer-0 candidate; every production stage must execute explicitly."""
-
     def __init__(
         self,
         config: DeepseekV4Config,
@@ -1066,10 +1058,3 @@ class DeepseekV4Model(LiteDeepseekV4Model):
                 raise ValueError("loss_mask must select at least one token")
             result["loss"] = (token_loss * mask).sum() / denominator
         return result
-
-
-__all__ = [
-    "AttentionKernelMetadata",
-    "DeepseekV4Layer",
-    "DeepseekV4Model",
-]

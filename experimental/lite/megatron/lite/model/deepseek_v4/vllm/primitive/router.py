@@ -1,5 +1,3 @@
-"""Fixed-active-set VJP for DS4 vLLM router kernels."""
-
 from __future__ import annotations
 
 from typing import Any
@@ -41,6 +39,3 @@ def fixed_route_vjp(visible_op, logits, *, renormalize: bool, route_scale: float
     return _VLLMFixedRouteFunction.apply(
         logits, visible_op, renormalize, route_scale
     )
-
-
-__all__ = ["fixed_route_vjp"]

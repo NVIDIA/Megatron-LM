@@ -1,5 +1,3 @@
-"""Native contiguous CSA/CP helpers for the vLLM-visible DS4 training path."""
-
 from __future__ import annotations
 
 import math
@@ -39,7 +37,6 @@ def _dequantize_packed_cache(
 
 
 def quantized_main_k_visible(functional_k: torch.Tensor) -> torch.Tensor:
-    """Use the official mixed FP8/BF16 cache as value and graph as gradient."""
     from vllm.models.deepseek_v4.common.ops.cache_utils import quantize_and_insert_k_cache
 
     rows = functional_k.shape[0]
@@ -165,7 +162,6 @@ def official_local_qk_visible(
     rope_dim: int,
     padded_heads: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the exact vLLM fused Q/K boundary while retaining a local VJP graph."""
     rows = q.shape[0]
     cache = _packed_cache(rows, q.device)
     slots = torch.arange(rows, dtype=torch.int64, device=q.device)
@@ -206,7 +202,6 @@ def official_indexer_topk(
     ratio: int,
     topk: int,
 ) -> torch.Tensor:
-    """Execute vLLM's unpaged DeepGEMM score and prefill top-k on local Q."""
     from vllm import _custom_ops as ops
     from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
         fused_indexer_q_rope_quant,
@@ -288,13 +283,3 @@ def compressed_width(max_seqlen: int, ratio: int, index_topk: int) -> int:
         return int(index_topk)
     rows = max(1, max_seqlen // max(1, ratio))
     return max(128, math.ceil(rows / 128) * 128)
-
-
-__all__ = [
-    "c128_all_visible_topk",
-    "compressed_width",
-    "official_indexer_topk",
-    "official_compact_compressed_visible",
-    "official_local_qk_visible",
-    "quantized_main_k_visible",
-]

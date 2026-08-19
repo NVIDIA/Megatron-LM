@@ -1,5 +1,3 @@
-"""Training-capable protocol for the DeepSeek-V4 vLLM implementation."""
-
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -165,7 +163,6 @@ def _forward_step(
 def _prepare_cp_forward_inputs(
     model: nn.Module, batch
 ) -> tuple[dict[str, Any], list[int], Any | None]:
-    """Pad then slice packed rows using DS4 lite's contiguous CP layout."""
 
     ps = parallel_state_from_model(model)
     packed = pack_packed_batch(model, batch, batch.seq_lens)
@@ -383,16 +380,3 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
 def vocab_size(model_cfg: DeepseekV4Config) -> int | None:
     return model_cfg.vocab_size
-
-
-__all__ = [
-    "ImplConfig",
-    "build_model",
-    "build_model_config",
-    "export_hf_weights",
-    "is_expert_param",
-    "load_hf_weights",
-    "save_hf_weights",
-    "unpack_forward_output",
-    "vocab_size",
-]

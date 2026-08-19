@@ -1,5 +1,3 @@
-"""Ephemeral vLLM-kernel inputs for DeepSeek-V4 training prefill."""
-
 from __future__ import annotations
 
 import importlib
@@ -39,8 +37,6 @@ def _round_up(value: int, alignment: int) -> int:
 
 @dataclass(frozen=True)
 class _PackedBlocks:
-    """Contiguous training storage expressed in vLLM's block-table ABI."""
-
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     num_blocks: int
@@ -103,7 +99,6 @@ def _local_num_tokens(batch: Any) -> int:
 
 
 def initialize_ds4_vllm_batch_invariance() -> None:
-    """Enable the mandatory process-local vLLM-alignment contract."""
 
     # This model implementation is the batch-invariant vLLM alignment path;
     # the environment must not select a second mathematical implementation.
@@ -143,7 +138,6 @@ def ds4_vllm_forward_context(
     *,
     vllm_config: Any,
 ) -> Iterator[None]:
-    """Install the vLLM per-microbatch token contract used by MoE kernels."""
 
     input_ids = getattr(batch, "input_ids", None)
     if not isinstance(input_ids, torch.Tensor):
@@ -187,8 +181,6 @@ def ds4_vllm_forward_context(
 
 
 class _RuntimeGateLinear(nn.Module):
-    """TP-independent composition of vLLM's DS4 router GEMM primitives."""
-
     def __init__(self, input_size: int, output_size: int, *, device: torch.device) -> None:
         super().__init__()
         self.weight = nn.Parameter(
@@ -217,7 +209,6 @@ def _build_rope(
     compress_ratio: int,
     device: torch.device | str,
 ) -> Any:
-    """Instantiate vLLM's CustomOp-backed RoPE in its required scoped context."""
     build_rope = _symbol(
         "vllm.models.deepseek_v4.common.rope", "build_deepseek_v4_rope"
     )
@@ -252,8 +243,6 @@ def _cos_sin_from_hf(
 
 @dataclass(frozen=True)
 class DS4RuntimeLayout:
-    """Minimal contiguous page ABI required by vLLM's prefill cache kernels."""
-
     block_table: torch.Tensor
     seq_lens: torch.Tensor
     query_start_loc: torch.Tensor
@@ -261,8 +250,6 @@ class DS4RuntimeLayout:
 
 @dataclass
 class DS4CompressorRuntimeMetadata:
-    """Caller-owned tensors consumed by one official DS4 compressor launch."""
-
     state_cache: torch.Tensor
     state_slot_mapping: torch.Tensor
     state_block_table: torch.Tensor
@@ -277,8 +264,6 @@ class DS4CompressorRuntimeMetadata:
 
 @dataclass
 class DS4IndexerRuntimeMetadata:
-    """Official indexer metadata plus its caller-owned cache and output."""
-
     compressor: DS4CompressorRuntimeMetadata
     attention_metadata: Any
     k_cache_prefix: str
@@ -289,8 +274,6 @@ class DS4IndexerRuntimeMetadata:
 
 @dataclass
 class AttentionKernelMetadata:
-    """Ephemeral inputs for one training-prefill attention invocation."""
-
     positions: torch.Tensor
     slot_mapping: torch.Tensor
     cos_sin_cache: torch.Tensor
@@ -317,8 +300,6 @@ class AttentionKernelMetadata:
 
 @dataclass
 class MoEKernelMetadata:
-    """Ephemeral inputs for one training-prefill router invocation."""
-
     gate_linear: Any | None
 
 
@@ -330,7 +311,6 @@ def build_native_cp_attention_metadata(
     local_positions: torch.Tensor,
     packed_seq_params: Any,
 ):
-    """Allocate only local/native-CP metadata, never CP1 paged caches."""
     device = local_positions.device
     empty_i64 = torch.empty(0, dtype=torch.int64, device=device)
     empty_i32 = torch.empty(0, dtype=torch.int32, device=device)
@@ -382,8 +362,6 @@ def build_native_cp_attention_metadata(
 
 
 class DS4PrefillMetadataBuilder:
-    """Build ephemeral vLLM prefill metadata for one DS4 decoder layer."""
-
     def __init__(
         self,
         config: DeepseekV4Config,
@@ -431,7 +409,6 @@ class DS4PrefillMetadataBuilder:
         layer_idx: int = 0,
         device: torch.device | str,
     ) -> "DS4PrefillMetadataBuilder":
-        """Create the exact RoPE cache through vLLM's public DS4 rope builder."""
 
         return cls(
             config,
@@ -461,7 +438,6 @@ class DS4PrefillMetadataBuilder:
         return indices.unsqueeze(1).contiguous(), lengths.contiguous()
 
     def build_prefill_batch(self, token_counts: list[int]):
-        """Build packed prefill metadata for multiple independent requests."""
 
         if not token_counts or any(count <= 0 for count in token_counts):
             raise ValueError("token_counts must contain positive sequence lengths")
@@ -573,7 +549,6 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
     def _allocate_k_cache(
         self, num_blocks: int, block_size: int, token_bytes: int
     ) -> torch.Tensor:
-        """Allocate logical cache rows with the 32-byte block stride CuTe expects."""
         block_stride = _round_up(block_size * token_bytes, 32)
         storage = torch.zeros(
             num_blocks * block_stride, dtype=torch.uint8, device=self.device
@@ -591,7 +566,6 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
         head_dim: int,
         token_bytes: int,
     ) -> tuple[DS4CompressorRuntimeMetadata, torch.Tensor]:
-        """Allocate sequence-isolated compressor state and cache tables."""
 
         ratio = self.compress_ratio
         coff = 2 if ratio == 4 else 1
@@ -642,7 +616,6 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
         head_dim: int,
         metadata: DS4CompressorRuntimeMetadata | DS4IndexerRuntimeMetadata,
     ) -> None:
-        """Call the two official operation-level compressor launches."""
 
         if isinstance(metadata, DS4IndexerRuntimeMetadata):
             metadata = metadata.compressor
@@ -770,7 +743,6 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
         topk: int,
         metadata: DS4IndexerRuntimeMetadata,
     ) -> torch.Tensor:
-        """Call official indexer quantization/metadata and sparse selection ops."""
 
         if metadata.attention_metadata.max_seq_len // compress_ratio <= topk:
             fill = _symbol(
@@ -859,7 +831,6 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
         )[2]
 
     def build_prefill_batch(self, token_counts: list[int]):
-        """Build packed, sequence-isolated metadata for extended DS4 layers."""
 
         if not token_counts or any(count <= 0 for count in token_counts):
             raise ValueError("token_counts must contain positive sequence lengths")
@@ -1050,15 +1021,3 @@ def build_moe_metadata(config: DeepseekV4Config, device: torch.device | str):
         device=torch.device(device),
     )
     return MoEKernelMetadata(gate_linear=gate)
-
-
-__all__ = [
-    "DS4_FLASHMLA_INDEX_ALIGNMENT",
-    "DS4_FP8_MLA_TOKEN_BYTES",
-    "DS4_SWA_BLOCK_SIZE",
-    "DS4RuntimeLayout",
-    "build_moe_metadata",
-    "DS4SparseIndexerCompressorMetadataAdapter",
-    "ds4_vllm_forward_context",
-    "initialize_ds4_vllm_batch_invariance",
-]

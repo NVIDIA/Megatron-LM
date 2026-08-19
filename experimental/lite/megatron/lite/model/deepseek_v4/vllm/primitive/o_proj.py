@@ -1,5 +1,3 @@
-"""vLLM inverse-RoPE FP8 O-projection with BF16-master VJP."""
-
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -46,6 +44,3 @@ def o_projection(
     return visible_functional_vjp(
         visible_op, functional, (o, wo_a, wo_b), version_indices=(1, 2)
     )
-
-
-__all__ = ["o_projection"]

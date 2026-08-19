@@ -1,5 +1,3 @@
-"""vLLM-visible linear forward with the shared BF16-master VJP."""
-
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -55,11 +53,3 @@ def gate_linear(visible_op, value, master_weight):
         value,
         master_weight,
     )
-
-
-__all__ = [
-    "block_fp8_linear",
-    "fused_block_fp8_linear",
-    "gate_linear",
-    "visible_linear",
-]

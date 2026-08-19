@@ -1,5 +1,3 @@
-"""vLLM-visible RMSNorm forwards with functional training VJPs."""
-
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -35,6 +33,3 @@ def fused_qkv_rms_norm(visible_op: Callable, q, kv, q_weight, kv_weight, eps):
         (q, kv, q_weight, kv_weight),
         version_indices=(2, 3),
     )
-
-
-__all__ = ["fused_qkv_rms_norm", "rms_norm"]

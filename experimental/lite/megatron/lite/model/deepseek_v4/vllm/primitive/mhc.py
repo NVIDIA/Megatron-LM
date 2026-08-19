@@ -1,5 +1,3 @@
-"""TileLang-visible mHC functions with native functional VJPs."""
-
 from __future__ import annotations
 
 import math
@@ -83,6 +81,3 @@ def mhc_head(
     return visible_functional_vjp(
         visible_op, functional, (x, fn, scale, base), version_indices=(1, 2, 3)
     )
-
-
-__all__ = ["mhc_head", "mhc_post", "mhc_pre_broadcast"]

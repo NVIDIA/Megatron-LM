@@ -1,5 +1,3 @@
-"""Attention-core owner spanning KV cache insertion and sparse FlashMLA."""
-
 from __future__ import annotations
 
 from typing import Any
@@ -73,7 +71,6 @@ def _compressed_sequence_graph(
     rope_dim,
     eps,
 ):
-    """Differentiable compressor graph before the visible cache quantization."""
     blocks = kv_score.shape[0] // ratio
     if blocks == 0:
         return kv_score.new_empty((0, head_dim))
@@ -119,7 +116,6 @@ def _compressed_sequence_graph_packed(
     query_start_loc,
     **kwargs,
 ):
-    """Replay compression independently for every packed request."""
     starts = query_start_loc.detach().cpu().tolist()
     parts = [
         _compressed_sequence_graph(
@@ -147,7 +143,6 @@ def compressed_compact_graph(
     rope_dim,
     eps,
 ):
-    """Differentiable compressor on MCore's fixed-capacity CP group layout."""
     groups = compressed_group_ids.numel()
     if groups == 0:
         return kv_score.new_empty((0, head_dim))
@@ -588,11 +583,3 @@ def visible_sparse_attention(
         topk_length,
         sink,
     )
-
-
-__all__ = [
-    "attention_core",
-    "attach_indexer_aux_loss",
-    "compressed_compact_graph",
-    "visible_sparse_attention",
-]
