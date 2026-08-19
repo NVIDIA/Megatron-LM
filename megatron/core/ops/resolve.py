@@ -49,6 +49,24 @@ def _te_norm(options: BackendOptions) -> object:
     return TENormBackend()
 
 
+def _megatron_cross_entropy(options: BackendOptions) -> object:
+    from megatron.core.ops.loss.cross_entropy import MegatronCrossEntropyBackend
+
+    return MegatronCrossEntropyBackend()
+
+
+def _megatron_fused_cross_entropy(options: BackendOptions) -> object:
+    from megatron.core.ops.loss.fused_cross_entropy import MegatronFusedCrossEntropyBackend
+
+    return MegatronFusedCrossEntropyBackend()
+
+
+def _te_cross_entropy(options: BackendOptions) -> object:
+    from megatron.core.ops.loss.transformer_engine import TECrossEntropyBackend
+
+    return TECrossEntropyBackend(cuda_graph_capturable=options.cuda_graph_impl == "full_iteration")
+
+
 #: Every named backend, and how to build it. A backend that implements the whole protocol can
 #: serve as a base; the rest own a single operation. Each factory takes the options so it can
 #: bind anything it must decide up front, and nothing here is consulted after the model is built.
@@ -64,9 +82,15 @@ _BACKENDS: Mapping[str, Callable[[BackendOptions], object]] = {
     "torch": _torch_norm,
     "apex": _apex_norm,
     "te_norm": _te_norm,
+    "megatron_cross_entropy": _megatron_cross_entropy,
+    "megatron_fused_cross_entropy": _megatron_fused_cross_entropy,
+    "te_cross_entropy": _te_cross_entropy,
 }
 
 _BASE_BACKENDS = ("local", "transformer_engine", "inference_optimized")
+
+#: How the pre-existing cross entropy settings map onto the operation they select.
+_CROSS_ENTROPY_FUSION = {"native": "megatron_fused_cross_entropy", "te": "te_cross_entropy"}
 
 
 def available_backends() -> tuple[str, ...]:
@@ -106,12 +130,17 @@ def _base_provider(options: BackendOptions) -> BackendSpecProvider:
 
 
 def _legacy_operation_backends(options: BackendOptions) -> dict[Operation, str]:
-    """Translate settings that predate --op-backend into operation choices.
-
-    Empty for now; operations still selected by an older setting join as they migrate.
-    """
-    del options
-    return {}
+    """Translate settings that predate --op-backend into operation choices."""
+    owners: dict[Operation, str] = {}
+    if options.cross_entropy_loss_fusion:
+        impl = options.cross_entropy_fusion_impl
+        if impl not in _CROSS_ENTROPY_FUSION:
+            raise ValueError(
+                f"Unknown cross_entropy_fusion_impl='{impl}'. "
+                f"Valid choices: {', '.join(_CROSS_ENTROPY_FUSION)}"
+            )
+        owners[Operation.VOCAB_PARALLEL_CROSS_ENTROPY] = _CROSS_ENTROPY_FUSION[impl]
+    return owners
 
 
 def _operation_owners(options: BackendOptions) -> dict[Operation, object]:

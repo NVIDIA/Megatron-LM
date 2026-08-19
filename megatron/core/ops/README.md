@@ -28,8 +28,8 @@ There is no registry lookup, no resolver, and no dispatch in the forward path.
 Exactly three steps, in this order:
 
 1. `--transformer-impl` picks the base backend, which answers every operation.
-2. Settings that predate `--op-backend` take over the operations they name, as each of them
-   migrates onto an operation slot.
+2. Settings that predate `--op-backend` (today, the cross entropy fusion flags) take over the
+   operations they name.
 3. `--op-backend` takes over last.
 
 Two settings claiming the same operation is an error, not a silent win for one of them.
@@ -49,6 +49,7 @@ or from a file, which is the same thing:
 ```yaml
 # backends.yaml, passed as --op-backend-config backends.yaml
 layer_norm: apex
+vocab_parallel_cross_entropy: te_cross_entropy
 ```
 
 `compose()` attaches the owning backend's bound method to the provider, so combining backends

@@ -27,6 +27,10 @@ class BackendOptions:
     use_kitchen_attention: bool = False
     kitchen_attention_backend: str = "sdpa"
 
+    cross_entropy_loss_fusion: bool = False
+    cross_entropy_fusion_impl: str = "native"
+    cuda_graph_impl: str | None = None
+
     operation_backends: Mapping[Operation, str] = field(default_factory=dict)
     """Explicit per-operation choices, applied last and never silently ignored."""
 
@@ -53,5 +57,8 @@ class BackendOptions:
             use_kitchen=getattr(config, "use_kitchen", False),
             use_kitchen_attention=getattr(config, "use_kitchen_attention", False),
             kitchen_attention_backend=getattr(config, "kitchen_attention_backend", "sdpa"),
+            cross_entropy_loss_fusion=getattr(config, "cross_entropy_loss_fusion", False),
+            cross_entropy_fusion_impl=getattr(config, "cross_entropy_fusion_impl", "native"),
+            cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
             operation_backends=getattr(config, "op_backend_overrides", None) or {},
         )

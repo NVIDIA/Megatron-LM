@@ -15,6 +15,7 @@ _MIGRATED_MODULES = (
     "megatron.core.models.gpt.moe_module_specs",
     "megatron.core.models.gpt.experimental_attention_variant_module_specs",
     "megatron.core.transformer.multi_token_prediction",
+    "megatron.core.models.common.language_module.language_module",
 )
 
 

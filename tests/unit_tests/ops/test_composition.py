@@ -100,3 +100,22 @@ class TestOperationOverrides:
         )
         options = BackendOptions.from_config(config)
         assert options.operation_backends[Operation.LAYER_NORM] == "torch"
+
+
+class TestConflictingSelectors:
+    def test_two_settings_claiming_one_operation_is_an_error(self):
+        options = _options(
+            cross_entropy_loss_fusion=True,
+            cross_entropy_fusion_impl="native",
+            operation_backends={"vocab_parallel_cross_entropy": "megatron_cross_entropy"},
+        )
+        with pytest.raises(ValueError, match="vocab_parallel_cross_entropy"):
+            build_spec_provider(options)
+
+    def test_unrelated_settings_do_not_conflict(self):
+        options = _options(
+            cross_entropy_loss_fusion=True,
+            cross_entropy_fusion_impl="native",
+            operation_backends={"layer_norm": "torch"},
+        )
+        assert build_spec_provider(options).layer_norm(rms_norm=False) is WrappedTorchNorm

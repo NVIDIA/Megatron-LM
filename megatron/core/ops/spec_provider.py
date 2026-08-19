@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import copy
 from abc import abstractmethod
-from typing import TYPE_CHECKING, Mapping, Optional, Protocol
+from typing import TYPE_CHECKING, Callable, Mapping, Optional, Protocol
+
+import torch
 
 from megatron.core.ops.operations import Operation
 
@@ -14,6 +16,15 @@ if TYPE_CHECKING:
     from megatron.core.transformer.mlp import TEActivationFunctionBuilder
     from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
     from megatron.core.transformer.torch_norm import LayerNormBuilder
+
+VocabParallelCrossEntropy = Callable[
+    [torch.Tensor, torch.Tensor, Optional[torch.distributed.ProcessGroup]], torch.Tensor
+]
+"""Contract for a vocab-parallel cross entropy: ``(logits, labels, tp_group) -> loss``.
+
+``logits`` are ``[s, b, vocab / tp]`` and ``labels`` are ``[s, b]``. The implementation owns
+every tensor-parallel reduction over ``tp_group``; the caller owns no collectives.
+"""
 
 
 class BackendSpecProvider(Protocol):
@@ -82,6 +93,12 @@ class BackendSpecProvider(Protocol):
     def moe_router(self) -> Optional[type]:
         """Which MoE router to use, or None to keep the MoESubmodules default."""
         return None
+
+    def vocab_parallel_cross_entropy(self) -> VocabParallelCrossEntropy:
+        """Which vocab-parallel cross entropy to use."""
+        from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
+
+        return vocab_parallel_cross_entropy
 
 
 def compose(base: BackendSpecProvider, owners: Mapping[Operation, object]) -> BackendSpecProvider:

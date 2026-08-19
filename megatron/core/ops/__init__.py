@@ -24,12 +24,13 @@ from megatron.core.ops.resolve import (
     get_backend,
     get_backend_spec_provider,
 )
-from megatron.core.ops.spec_provider import BackendSpecProvider, compose
+from megatron.core.ops.spec_provider import BackendSpecProvider, VocabParallelCrossEntropy, compose
 
 __all__ = [
     "BackendOptions",
     "BackendSpecProvider",
     "Operation",
+    "VocabParallelCrossEntropy",
     "available_backends",
     "build_spec_provider",
     "compose",

@@ -22,6 +22,7 @@ class Operation(str, Enum):
     GROUPED_MLP_MODULES = "grouped_mlp_modules"
     ACTIVATION_FUNC = "activation_func"
     MOE_ROUTER = "moe_router"
+    VOCAB_PARALLEL_CROSS_ENTROPY = "vocab_parallel_cross_entropy"
 
     def __str__(self) -> str:
         return self.value
