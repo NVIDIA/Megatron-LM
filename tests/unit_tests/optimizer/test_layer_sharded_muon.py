@@ -31,13 +31,22 @@ from megatron.core.optimizer.layer_sharded_a2a import (
 )
 from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon, _check_eo_version
 
+# The per-matrix baseline (ns_batch_size=1) runs on any emerging-optimizers that
+# ships the newton_schulz API — 0.2.0 included — so the module no longer skips
+# wholesale. Only tests that request batching (ns_batch_size > 1, needing the
+# batched 3-D Newton-Schulz of >= 0.3.0) skip on older installs.
 try:
-    # LayerShardedMuon.__init__ raises on emerging-optimizers < 0.3.0 (no batched
-    # 3-D Newton-Schulz); turn that into a module-level skip so CI containers with
-    # an older wheel stay green instead of erroring at collection.
     _check_eo_version()
+    _HAVE_BATCHED_NS, _BATCHED_NS_REASON = True, ""
 except ImportError as _e:
-    pytest.skip(str(_e), allow_module_level=True)
+    _HAVE_BATCHED_NS, _BATCHED_NS_REASON = False, str(_e)
+
+
+def _require_batched_ns(ns_batch_size):
+    if ns_batch_size > 1 and not _HAVE_BATCHED_NS:
+        pytest.skip(_BATCHED_NS_REASON)
+
+
 from tests.unit_tests.test_utilities import Utils
 
 _SEED = 42
@@ -475,6 +484,7 @@ def test_mixed_partition_dims_match_full_matrix_reference():
 @pytest.mark.parametrize("fused", [False, True], ids=["two_stage", "fused"])
 def test_replicated_mixed_with_sharded(fused, ns_batch):
     _require_four_ranks("Requires exactly 4 ranks (TP=2 x GTP=2)")
+    _require_batched_ns(ns_batch)
     T, G = 2, 2
     r = dist.get_rank()
     t_rank, g_rank = r % T, r // T
@@ -859,6 +869,7 @@ def test_degenerate_domain_group_falls_back_to_local_ns():
 )
 def test_batched_matches_unbatched(ns_batch_size, n_same, n_other, home):
     _require_multi_rank()
+    _require_batched_ns(ns_batch_size)
     S = dist.get_world_size()
     r = dist.get_rank()
     lr, momentum = 1e-2, 0.95
@@ -925,6 +936,7 @@ def test_batched_matches_unbatched(ns_batch_size, n_same, n_other, home):
 def test_batched_expert_group_matches_full_matrix_reference():
     """Many same-shape expert weights on an EGTP(2) domain, batched, vs reference."""
     _require_four_ranks()
+    _require_batched_ns(8)
     G = 2
     r = dist.get_rank()
     egtp_group = _get_expert_group()
