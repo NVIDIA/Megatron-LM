@@ -166,6 +166,15 @@ iterations later. Call it where every rank arrives, such as a step boundary:
 calling it at the moment of choice would deadlock, since ranks reach a given
 kernel at different times.
 
+`MCORE_AUTOTUNE_VERIFY=N` is that call at a cadence. Megatron's training loop
+runs `maybe_verify_choices(iteration)` every step, which checks every `N`th one
+and does nothing when the variable is unset. Setting it also installs the
+interception on its own, so an `auto`-mode run still logs what Triton timed —
+which is the case worth checking, since it is the one that can differ. Outside
+the training loop, call `maybe_verify_choices()` from your own step boundary, or
+`verify_choices()` directly to check on demand; pass `group=` to verify within a
+subgroup rather than the whole world.
+
 `MCORE_AUTOTUNE_CHAOS=1` makes each rank pick a different config on purpose,
 reproducibly. It is a positive control — every other check is a negative one,
 and "the runs matched" cannot distinguish a working detector from a blind one.

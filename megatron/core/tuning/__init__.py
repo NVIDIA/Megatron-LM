@@ -36,6 +36,7 @@ from megatron.core.tuning.interception import (
     choice_log,
     install,
     install_from_env,
+    maybe_verify_choices,
     verify_choices,
 )
 from megatron.core.tuning.policy import (
@@ -53,6 +54,7 @@ __all__ = [
     "choice_log",
     "install",
     "install_from_env",
+    "maybe_verify_choices",
     "set_deterministic_mode",
     "use_deterministic_mode",
     "verify_choices",
