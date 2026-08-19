@@ -346,8 +346,8 @@ def test_layer3_packed_prefill_metadata_is_sequence_isolated(monkeypatch) -> Non
     metadata = runtime.DS4SparseIndexerCompressorMetadataAdapter(
         _config(max_position_embeddings=512),
         layer_idx=3,
-        device="cpu",
-        cos_sin_cache=torch.empty(512, 128),
+        device="cuda",
+        cos_sin_cache=torch.empty(512, 128, device="cuda"),
     ).build_prefill_batch([129, 257])
 
     main = metadata.compressor_metadata

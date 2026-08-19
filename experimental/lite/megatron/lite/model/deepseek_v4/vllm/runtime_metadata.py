@@ -840,47 +840,28 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
 
     def _c128_prefill_indices(self, num_tokens: int) -> torch.Tensor:
         width = max(128, _round_up(max(num_tokens // 128, 1), 128))
-        if self.device.type == "cuda":
-            build = _symbol(
-                "vllm.models.deepseek_v4.sparse_mla",
-                "build_c128a_topk_metadata",
-            )
-            positions = torch.arange(num_tokens, dtype=torch.int64, device=self.device)
-            global_buffer = torch.empty(
-                (1, width), dtype=torch.int32, device=self.device
-            )
-            decode_lens = torch.empty(1, dtype=torch.int32, device=self.device)
-            prefill_buffer = torch.empty(
-                (num_tokens, width), dtype=torch.int32, device=self.device
-            )
-            _, _, prefill = build(
-                positions,
-                128,
-                0,
-                torch.zeros(num_tokens, dtype=torch.int32, device=self.device),
-                torch.zeros((1, 1), dtype=torch.int32, device=self.device),
-                2,
-                torch.arange(num_tokens, dtype=torch.int64, device=self.device),
-                global_buffer,
-                decode_lens,
-                prefill_buffer,
-                max_compressed_tokens=width,
-            )
-            return prefill
-        output = torch.full(
-            (num_tokens, width), -1, dtype=torch.int32, device=self.device
+        build = _symbol(
+            "vllm.models.deepseek_v4.sparse_mla", "build_c128a_topk_metadata"
         )
-        counts = (torch.arange(num_tokens, device=self.device) + 1) // 128
-        columns = torch.arange(width, device=self.device)
-        output.masked_fill_(columns.unsqueeze(0) >= counts.unsqueeze(1), -1)
-        output.copy_(
-            torch.where(
-                columns.unsqueeze(0) < counts.unsqueeze(1),
-                columns.unsqueeze(0).expand(num_tokens, -1),
-                output,
-            ).to(torch.int32)
+        positions = torch.arange(num_tokens, dtype=torch.int64, device=self.device)
+        global_buffer = torch.empty((1, width), dtype=torch.int32, device=self.device)
+        decode_lens = torch.empty(1, dtype=torch.int32, device=self.device)
+        prefill_buffer = torch.empty(
+            (num_tokens, width), dtype=torch.int32, device=self.device
         )
-        return output
+        return build(
+            positions,
+            128,
+            0,
+            torch.zeros(num_tokens, dtype=torch.int32, device=self.device),
+            torch.zeros((1, 1), dtype=torch.int32, device=self.device),
+            2,
+            torch.arange(num_tokens, dtype=torch.int64, device=self.device),
+            global_buffer,
+            decode_lens,
+            prefill_buffer,
+            max_compressed_tokens=width,
+        )[2]
 
     def build_prefill_batch(self, token_counts: list[int]):
         """Build packed, sequence-isolated metadata for extended DS4 layers."""

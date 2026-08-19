@@ -142,10 +142,6 @@ class _AttentionState(CompressedSparseAttention):
                 self.indexer.compressor.wkv.weight,
                 self.indexer.compressor.wgate.weight,
             )
-        if hidden_states.device.type != "cuda":
-            return fused_projection(), tuple(
-                function() if function is not None else None for function in aux_fns
-            )
         if self._projection_streams is None:
             self._projection_streams = [torch.cuda.Stream() for _ in range(3)]
         if self._projection_events is None:
@@ -1013,17 +1009,16 @@ class DeepseekV4Model(LiteDeepseekV4Model):
                 hidden_states = self.embed_tokens.embedding(input_ids)
         if hidden_states is None:
             raise ValueError("input_ids or hidden_states is required.")
+        if not hidden_states.is_cuda:
+            raise RuntimeError("DeepSeek V4 vLLM training requires CUDA tensors")
         if hidden_states.ndim != 2 and not pipeline_streams:
             hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        if hidden_states.device.type == "cuda":
-            if self._shared_projection_streams is None:
-                self._shared_projection_streams = [
-                    torch.cuda.Stream() for _ in range(3)
-                ]
-            for layer in self.layers.values():
-                layer.self_attn.self_attn._projection_streams = (
-                    self._shared_projection_streams
-                )
+        if self._shared_projection_streams is None:
+            self._shared_projection_streams = [torch.cuda.Stream() for _ in range(3)]
+        for layer in self.layers.values():
+            layer.self_attn.self_attn._projection_streams = (
+                self._shared_projection_streams
+            )
         for local_idx, layer_idx in enumerate(self.layer_indices):
             layer = self.layers[str(local_idx)]
             layer_attention_metadata = (
