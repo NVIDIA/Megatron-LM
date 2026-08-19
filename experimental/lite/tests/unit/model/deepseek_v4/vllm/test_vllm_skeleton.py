@@ -155,3 +155,36 @@ def test_forward_reuses_caller_owned_ephemeral_metadata(monkeypatch) -> None:
     bundle.forward_step(bundle.chunks[0], batch)
     assert captured["attention_metadata"] is attention_metadata
     assert captured["moe_metadata"] is moe_metadata
+
+
+def test_build_model_returns_dist_opt_wrapped_chunks(monkeypatch) -> None:
+    """Keep the Lite backend's in-place DDP ownership contract."""
+
+    class WrappedModel(nn.Module):
+        def __init__(self, module: nn.Module) -> None:
+            super().__init__()
+            self.module = module
+
+    captured = {}
+
+    def fake_build_training_backend(chunks, *_args, **_kwargs):
+        captured["raw"] = chunks[0]
+        chunks[0] = WrappedModel(chunks[0])
+        captured["wrapped"] = chunks[0]
+        return None, None, None, "dist_opt"
+
+    monkeypatch.setattr(protocol, "initialize_ds4_vllm_batch_invariance", lambda: None)
+    monkeypatch.setattr(protocol, "init_parallel", lambda _cfg: ParallelState(ep_size=1, ep_rank=0))
+    monkeypatch.setattr(protocol, "build_training_backend", fake_build_training_backend)
+    monkeypatch.setitem(sys.modules, "vllm.config", SimpleNamespace(VllmConfig=lambda: object()))
+
+    bundle = protocol.build_model(
+        _tiny_config(layers=1),
+        impl_cfg=protocol.ImplConfig(
+            parallel=ParallelConfig(ep=1), use_deepep=True, hf_path="/unused"
+        ),
+    )
+
+    assert bundle.chunks == [captured["wrapped"]]
+    assert bundle.chunks[0].module is captured["raw"]
+    assert bundle.extras["optimizer_backend"] == "dist_opt"
