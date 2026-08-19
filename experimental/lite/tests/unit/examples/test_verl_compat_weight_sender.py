@@ -2,7 +2,7 @@
 
 import asyncio
 import sys
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -54,19 +54,23 @@ class _Sender:
         self.cleaned = True
 
 
-def test_lazy_weight_generator_is_consumed_on_the_caller_thread() -> None:
-    caller_thread = threading.get_ident()
-    generator_threads = []
+def test_lazy_weight_generator_is_not_submitted_to_an_executor(monkeypatch) -> None:
+    consumed = []
+
+    def forbidden_submit(*_args, **_kwargs):
+        raise AssertionError("lazy model-weight production must not enter an executor")
+
+    monkeypatch.setattr(ThreadPoolExecutor, "submit", forbidden_submit)
 
     def weights():
-        generator_threads.append(threading.get_ident())
+        consumed.append(True)
         yield "model.layers.0.weight", torch.arange(8, dtype=torch.bfloat16)
 
     assert compat._install_bucketed_sender_prefetch(_Sender)
     sender = _Sender()
     asyncio.run(sender.async_send_weights(weights()))
 
-    assert generator_threads == [caller_thread]
+    assert consumed == [True]
     assert sender.cleaned
     assert sender.socket.messages[0]["is_last"] is True
     assert "model.layers.0.weight" in sender.socket.messages[0]["bucket_meta"]
