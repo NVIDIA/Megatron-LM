@@ -1280,9 +1280,6 @@ class TransformerConfig(ModelParallelConfig):
     use_situ_glu: bool = False
     """Use SiTU-GLU in every gated dense, routed-expert, and shared-expert FFN."""
 
-    situ_glu_impl: Literal['cutedsl'] = "cutedsl"
-    """SiTU-GLU implementation backend. Only the MCore CuTe DSL fallback is available."""
-
     situ_glu_beta1: float = 4.0
     """SiTU-GLU gate tanh soft-cap."""
 
@@ -2743,8 +2740,6 @@ class TransformerConfig(ModelParallelConfig):
                     "Fused block-scaled MoE SiTU-GLU requires "
                     "moe_mlp_glu_interleave_size=32, matching TE's grouped-MLP layout."
                 )
-            if self.situ_glu_impl != "cutedsl":
-                raise ValueError(f"Unsupported SiTU-GLU implementation: {self.situ_glu_impl}.")
             if not math.isfinite(self.situ_glu_beta1) or self.situ_glu_beta1 <= 0:
                 raise ValueError("situ_glu_beta1 must be finite and positive.")
             if not math.isfinite(self.situ_glu_beta2) or self.situ_glu_beta2 <= 0:

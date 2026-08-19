@@ -3009,8 +3009,8 @@ def _add_network_size_args(parser):
         action='store_true',
         dest='use_situ_glu',
         help=(
-            'Use SiTU-GLU in all gated dense and MoE FFNs. The MCore CuTe DSL fallback '
-            'supports BF16, MXFP8, and NVFP4 execution.'
+            'Use SiTU-GLU in all gated dense and MoE FFNs. Native Transformer Engine '
+            'operators are preferred; otherwise MCore uses its local CuTe DSL fallback.'
         ),
     )
     group.add_argument(

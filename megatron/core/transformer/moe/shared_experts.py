@@ -465,7 +465,7 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         return self._fused_grouped_swiglu_recipe
 
     def _make_fused_grouped_swiglu_ops(self) -> torch.nn.Module:
-        """Construct GroupedLinear(num_groups=1) -> ScaledSwiGLU -> GroupedLinear."""
+        """Construct GroupedLinear(num_groups=1) -> scaled GLU -> GroupedLinear."""
         ops = te.pytorch.ops.Sequential()
         tp_world_size = get_pg_size(self.tp_group)
         rng_state_tracker_function = None
@@ -494,7 +494,6 @@ class FusedSharedExpertMLP(SharedExpertMLP):
             activation_op = make_scaled_situ_glu(
                 beta1=self.config.situ_glu_beta1,
                 beta2=self.config.situ_glu_beta2,
-                install_grouped_fallback=True,
                 glu_interleave_size=glu_interleave_size,
             )
         else:
