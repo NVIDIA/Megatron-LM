@@ -39,21 +39,12 @@ class TestCrossEntropySelection:
         provider = _provider(operation_backends={"vocab_parallel_cross_entropy": "megatron_fused"})
         assert provider.vocab_parallel_cross_entropy() is fused_vocab_parallel_cross_entropy
 
-    @_needs_te
-    def test_te_fusion_selects_a_bound_transformer_engine_target(self):
-        provider = _provider(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="te")
-        target = provider.vocab_parallel_cross_entropy()
-        assert target.keywords["cuda_graph_capturable"] is False
-
-    @_needs_te
-    def test_cuda_graph_capture_is_resolved_before_the_first_step(self):
-        provider = _provider(
-            cross_entropy_loss_fusion=True,
-            cross_entropy_fusion_impl="te",
-            cuda_graph_impl="full_iteration",
-        )
-        target = provider.vocab_parallel_cross_entropy()
-        assert target.keywords["cuda_graph_capturable"] is True
+    def test_te_fusion_is_refused_the_same_way_the_flag_check_refuses_it(self):
+        """--op-backend must not route around the stability block in arguments.py."""
+        with pytest.raises(ValueError, match="disabled due to stability issues"):
+            _provider(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="te")
+        with pytest.raises(ValueError, match="Unknown backend 'te_fused'"):
+            _provider(operation_backends={"vocab_parallel_cross_entropy": "te_fused"})
 
 
 class TestCrossEntropyContract:
@@ -65,9 +56,7 @@ class TestCrossEntropyContract:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize(
-        "backend_name", ["megatron", "megatron_fused"] + (["te_fused"] if HAVE_TE else [])
-    )
+    @pytest.mark.parametrize("backend_name", ["megatron", "megatron_fused"])
     def test_target_accepts_a_default_tensor_parallel_group(self, backend_name):
         """tp_group=None means the default group, whatever the underlying kernel needs."""
         torch.manual_seed(0)
@@ -103,8 +92,6 @@ class TestCrossEntropyParity:
         ).reshape(6, 2)
 
         names = ["megatron", "megatron_fused"]
-        if HAVE_TE:
-            names.append("te_fused")
         for name in names:
             target = _provider(
                 operation_backends={"vocab_parallel_cross_entropy": name}

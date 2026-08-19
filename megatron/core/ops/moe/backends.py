@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Every mixture-of-experts backend, side by side. See :mod:`.contract` for the requirements."""
+"""Every mixture-of-experts backend, side by side. The contract they meet is in this package's ``__init__``."""
 
 from __future__ import annotations
 
@@ -17,6 +17,9 @@ __all__ = ["MoeLocal", "MoeTE"]
 
 class MoeLocal:
     """Sequential experts made of Megatron Core linears."""
+
+    #: Not audited; routing and permutation are unexamined.
+    DETERMINISM = "unknown"
 
     def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> "ExpertsBuilder":
         """Megatron Core has no grouped GEMM, so experts are always sequential."""
@@ -45,6 +48,9 @@ class MoeLocal:
 
 class MoeTE:
     """Transformer Engine grouped linears."""
+
+    #: Not audited; routing and permutation are unexamined.
+    DETERMINISM = "unknown"
 
     REQUIRES = "transformer_engine"
 

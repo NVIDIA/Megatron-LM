@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Every vocab-parallel cross entropy backend. See :mod:`.contract` for the requirements."""
+"""Every vocab-parallel cross entropy backend. The contract they meet is in this package's ``__init__``."""
 
 from __future__ import annotations
 
@@ -64,6 +64,10 @@ def _te_cross_entropy(logits, labels, tp_group=None, *, target, cuda_graph_captu
 class LossMegatron:
     """Megatron's unfused implementation."""
 
+    #: The target that already runs under --deterministic-mode today, since the rule in
+    #: megatron/training/determinism.py requires cross entropy fusion to be off.
+    DETERMINISM = "deterministic"
+
     def vocab_parallel_cross_entropy(self):
         """Return the reference target."""
         return vocab_parallel_cross_entropy
@@ -71,6 +75,9 @@ class LossMegatron:
 
 class LossMegatronFused:
     """Megatron's compiled reductions and custom backward."""
+
+    #: megatron/training/determinism.py has always required cross_entropy_loss_fusion=False.
+    DETERMINISM = "nondeterministic"
 
     def vocab_parallel_cross_entropy(self):
         """Return the fused target."""
@@ -83,6 +90,9 @@ class LossTEFused:
     Both the TE version check and the CUDA-graph capture mode are resolved here, once, so the
     forward pass has no version branch left.
     """
+
+    #: Covered by the same cross_entropy_loss_fusion=False rule; not separately audited.
+    DETERMINISM = "nondeterministic"
 
     REQUIRES = "transformer_engine"
 

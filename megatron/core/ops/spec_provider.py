@@ -6,11 +6,11 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from megatron.core.ops.attention.contract import AttentionSlots
-from megatron.core.ops.linear.contract import LinearSlots
-from megatron.core.ops.loss.contract import LossSlots
-from megatron.core.ops.moe.contract import MoeSlots
-from megatron.core.ops.norm.contract import NormSlots
+from megatron.core.ops.attention import AttentionSlots
+from megatron.core.ops.linear import LinearSlots
+from megatron.core.ops.loss import LossSlots
+from megatron.core.ops.moe import MoeSlots
+from megatron.core.ops.norm import NormSlots
 from megatron.core.ops.operations import Operation
 
 __all__ = ["BackendSpecProvider"]

@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Every normalization backend, side by side. See :mod:`.contract` for what they must meet.
+"""Every normalization backend, side by side. The contract they meet is in this package's ``__init__``.
 
 Each class is named for the backend key that selects it, so ``--op-backend layer_norm=apex``
 and ``NormApex`` are the same word. Targets are imported inside the method that returns them,
@@ -21,18 +21,6 @@ if TYPE_CHECKING:
 __all__ = ["NormApex", "NormLocal", "NormTE", "NormTorch", "TENormWithResidual"]
 
 
-def _apex_layer_norm() -> type:
-    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-
-    return FusedLayerNorm
-
-
-def _te_norm() -> type:
-    from megatron.core.extensions.transformer_engine import TENorm
-
-    return TENorm
-
-
 class TENormWithResidual:
     """Class adapter for TENorm with residual fusion enabled.
 
@@ -41,7 +29,9 @@ class TENormWithResidual:
     """
 
     def __new__(cls, *args, **kwargs):
-        return _te_norm()(*args, has_residual=True, **kwargs)
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        return TENorm(*args, has_residual=True, **kwargs)
 
 
 class NormTorch:
@@ -51,6 +41,9 @@ class NormTorch:
     not support sequence parallelism, persistent norm, zero-centered gamma, or the
     memory-efficient path; ``WrappedTorchNorm`` rejects those configurations itself.
     """
+
+    #: Torch's norm backward has not been audited here.
+    DETERMINISM = "unknown"
 
     def layer_norm(
         self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
@@ -67,6 +60,9 @@ class NormApex:
     what Megatron has always done rather than failing a model that mixes the two.
     """
 
+    #: Apex's fused backward has not been audited here.
+    DETERMINISM = "unknown"
+
     REQUIRES = "apex"
 
     def layer_norm(
@@ -76,7 +72,9 @@ class NormApex:
         del for_qk, has_residual
         if rms_norm:
             return WrappedTorchNorm
-        return _apex_layer_norm()
+        from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+
+        return FusedLayerNorm
 
 
 class NormTE:
@@ -85,6 +83,9 @@ class NormTE:
     Two backend-internal details stay here rather than at the call site: TE below 1.9 harms
     convergence for query/key norm, and residual fusion needs a distinct target.
     """
+
+    #: TE's norm backward has not been audited here.
+    DETERMINISM = "unknown"
 
     REQUIRES = "transformer_engine"
     FUSES_RESIDUAL = True
@@ -99,10 +100,14 @@ class NormTE:
         if for_qk and not is_te_min_version("1.9.0"):
             # TENorm significantly harms convergence when used for QKLayerNorm if
             # TE version < 1.9; we instead use the Apex implementation.
-            return _apex_layer_norm()
+            from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+
+            return FusedLayerNorm
         if has_residual and self.FUSES_RESIDUAL:
             return TENormWithResidual
-        return _te_norm()
+        from megatron.core.extensions.transformer_engine import TENorm
+
+        return TENorm
 
 
 class NormLocal:
@@ -111,6 +116,9 @@ class NormLocal:
     Torch always for RMSNorm, because Apex has none and its constructor rejects an RMSNorm
     config. This is the one backend that chooses by capability rather than failing.
     """
+
+    #: Defers to Apex or Torch, neither audited here.
+    DETERMINISM = "unknown"
 
     def __init__(self) -> None:
         self._have_apex = is_installed("apex")
@@ -124,4 +132,6 @@ class NormLocal:
         del for_qk, has_residual
         if rms_norm or not self._have_apex:
             return WrappedTorchNorm
-        return _apex_layer_norm()
+        from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+
+        return FusedLayerNorm

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Literal, Mapping
 
 __all__ = ["BackendOptions"]
 
@@ -20,19 +20,31 @@ class BackendOptions:
     operations and backends, so this stays plain data.
     """
 
-    transformer_impl: str = "transformer_engine"
+    transformer_impl: Literal["local", "transformer_engine", "inference_optimized"] = (
+        "transformer_engine"
+    )
     """Chooses the backend each family should prefer for every operation it declares."""
 
     use_kitchen: bool = False
     use_kitchen_attention: bool = False
-    kitchen_attention_backend: str = "sdpa"
+    kitchen_attention_backend: Literal["sdpa", "fa"] = "sdpa"
 
     cross_entropy_loss_fusion: bool = False
-    cross_entropy_fusion_impl: str = "native"
-    cuda_graph_impl: str | None = None
+    cross_entropy_fusion_impl: Literal["native", "te"] = "native"
+    """Which fused cross entropy, when ``cross_entropy_loss_fusion`` is on.
+
+    ``megatron.core.ops.loss.legacy_backends`` is where these values turn into backend names.
+    """
+
+    cuda_graph_impl: Literal["none", "local", "transformer_engine", "full_iteration"] | None = None
+    deterministic_mode: bool = False
 
     operation_backends: Mapping[str, str] = field(default_factory=dict)
-    """Explicit per-operation choices, applied last and never silently ignored."""
+    """Explicit per-operation choices, applied last and never silently ignored.
+
+    Keys are operation names (``megatron.core.ops.operations()``); values are backend names
+    for that operation (``megatron.core.ops.backends_for(operation)``).
+    """
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "operation_backends", dict(self.operation_backends))
@@ -56,5 +68,6 @@ class BackendOptions:
             cross_entropy_loss_fusion=getattr(config, "cross_entropy_loss_fusion", False),
             cross_entropy_fusion_impl=getattr(config, "cross_entropy_fusion_impl", "native"),
             cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
+            deterministic_mode=getattr(config, "deterministic_mode", False),
             operation_backends=getattr(config, "op_backend_overrides", None) or {},
         )

@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Every linear backend, side by side. See :mod:`.contract` for what they must meet."""
+"""Every linear backend, side by side. The contract they meet is in this package's ``__init__``."""
 
 from __future__ import annotations
 
@@ -11,6 +11,9 @@ __all__ = ["LinearLocal", "LinearTE"]
 
 class LinearLocal:
     """The tensor-parallel linear layers in ``megatron.core.tensor_parallel``."""
+
+    #: Not audited; the TP collectives depend on NCCL_ALGO.
+    DETERMINISM = "unknown"
 
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module the backend uses."""
@@ -31,6 +34,9 @@ class LinearLocal:
 
 class LinearTE:
     """Transformer Engine's linear layers."""
+
+    #: Not audited; the TP collectives depend on NCCL_ALGO.
+    DETERMINISM = "unknown"
 
     REQUIRES = "transformer_engine"
 

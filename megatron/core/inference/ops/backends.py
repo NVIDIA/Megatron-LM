@@ -23,6 +23,9 @@ class NormInference:
     ``ops.norm`` names this class in its backend table.
     """
 
+    #: Defers to the Transformer Engine norm, which is not audited here.
+    DETERMINISM = "unknown"
+
     REQUIRES = "transformer_engine"
 
     def layer_norm(self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False):
@@ -35,6 +38,9 @@ class NormInference:
 
 class LinearInference:
     """The inference-optimized linear layers."""
+
+    #: Not audited.
+    DETERMINISM = "unknown"
 
     REQUIRES = "transformer_engine"
 
@@ -67,6 +73,9 @@ class LinearInference:
 
 class MoeInference:
     """The inference-optimized experts and router."""
+
+    #: Not audited; routing and permutation are unexamined.
+    DETERMINISM = "unknown"
 
     REQUIRES = "transformer_engine"
 

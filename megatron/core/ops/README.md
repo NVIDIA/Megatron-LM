@@ -24,12 +24,14 @@ adding a family is a milestone.
 
 ```
 megatron/core/ops/norm/
-  contract.py               # the contract, the Operation constants, and the slot methods
+  __init__.py               # the contract, the operations, the slots, BACKENDS, DEFAULT
   backends.py               # every implementation, side by side
-  __init__.py               # BACKENDS, DEFAULT
 ```
 
-Three files per family, always. Each backend class is named for the family and the key that
+Two files per family, split by who reads them: `__init__.py` is what a *caller* needs — what
+this family promises and which backends exist — and `backends.py` is what a *maintainer* of an
+implementation needs. A family becomes a package with sub-packages when its operations have
+disjoint backend sets, which is how `attention/dsa/` will work. Each backend class is named for the family and the key that
 selects it — `NormApex`, `NormTE`, `LinearLocal`, `MoeTE` — so `--op-backend layer_norm=apex`
 and `NormApex` are the same word, and nothing collides with the target classes themselves
 (`TENorm` and `TELinear` are real modules in `extensions/transformer_engine.py`).
@@ -65,6 +67,34 @@ implementation of whatever you named":
 `BackendSpecProvider` binds the owning backend's method onto itself while the model is being
 built, so combining backends costs one attribute lookup then and nothing afterwards. A slot no
 backend owns raises and says how to select one.
+
+## Where a choice is made
+
+One selection, end to end, so the hops are written down rather than discovered:
+
+```
+--transformer-impl transformer_engine --op-backend layer_norm=apex
+  |
+  options.py      BackendOptions          every selector, each with its valid values
+  resolve.py      _preset_owners          preset -> each family's entry, or its DEFAULT
+  resolve.py      _override_owners        legacy flags, then --op-backend, last word
+  norm/__init__   BACKENDS["apex"]        -> NormApex
+  norm/backends   NormApex.layer_norm     -> megatron.core.fusions.fused_layer_norm
+
+and at runtime, repr(provider) names the backend that won every slot:
+
+  BackendSpecProvider(activation_func=MoeTE, column_parallel_linear=LinearTE,
+                      layer_norm=NormApex, ...)
+```
+
+Two rules make that traceable:
+
+- **`resolve.py` names no family and no backend.** It asks each family for its table, its
+  default, and its `legacy_backends`. Grepping a backend name never lands there.
+- **A family's `__init__.py` is the whole story for its operations** — which backends exist,
+  which is the default, and how any older flag maps onto them. The cross entropy flags
+  (`--cross-entropy-fusion-impl native`) turn into backend names in
+  `loss/__init__.py:legacy_backends`, next to the `BACKENDS` table they refer to.
 
 ## Adding a backend
 
@@ -109,10 +139,12 @@ constructor; the loss family's `LossTEFused` does this for CUDA-graph capture.
 
 ## Adding a family
 
-Create `megatron/core/ops/<family>/` with `contract.py` (the contract, the `Operation`
-constants, and a `*Slots` class whose methods raise `unowned(...)`), `backends.py`, and an
-`__init__.py` carrying `BACKENDS` and `DEFAULT`. Then list the family in
-`resolve.py:_FAMILIES` and add its `*Slots` to the bases of `BackendSpecProvider`.
+Create `megatron/core/ops/<family>/` with an `__init__.py` carrying the contract, the
+`Operation` constants, a `*Slots` class whose methods raise `unowned(...)`, `BACKENDS` and
+`DEFAULT`, plus a `backends.py` with the implementations. Then list the family in
+`resolve.py:_FAMILIES` and add its `*Slots` to the bases of `BackendSpecProvider`. If any
+older setting selects one of its operations, give it a `legacy_backends(options)` so that
+mapping lives beside the table it refers to.
 
 Declare an operation only when an existing class, callable, or builder already owns that
 boundary at construction time. An implementation that has to branch on shape, phase, or

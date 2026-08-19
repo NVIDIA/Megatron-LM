@@ -100,3 +100,39 @@ def test_a_family_may_live_in_a_subfolder():
     dotted = [name for name in _FAMILIES if "." in name]
     for name in dotted:
         assert importlib.import_module(f"megatron.core.ops.{name}") is _family(name)
+
+
+@pytest.mark.parametrize(("family_name", "backend_name"), _REGISTERED)
+def test_backend_declares_its_determinism(family_name, backend_name):
+    """Every backend states whether it is bit-exact, so 'nobody checked' cannot look like 'safe'."""
+    from megatron.core.ops import determinism
+
+    backend = _family(family_name).BACKENDS[backend_name]
+    declared = getattr(backend, "DETERMINISM", None)
+    assert declared in determinism.VALUES, (
+        f"{family_name}.{backend_name} declares DETERMINISM={declared!r}; "
+        f"expected one of {sorted(determinism.VALUES)}"
+    )
+
+
+def test_deterministic_mode_rejects_a_nondeterministic_backend():
+    """--deterministic-mode must not silently select a backend known not to be bit-exact."""
+    from megatron.core.ops import determinism
+
+    options = BackendOptions(
+        transformer_impl="local",
+        deterministic_mode=True,
+        operation_backends={"vocab_parallel_cross_entropy": "megatron_fused"},
+    )
+    assert _family("loss").BACKENDS["megatron_fused"].DETERMINISM == determinism.NONDETERMINISTIC
+    with pytest.raises(ValueError, match="not deterministic"):
+        build_spec_provider(options)
+
+
+def test_deterministic_mode_allows_a_deterministic_backend():
+    options = BackendOptions(
+        transformer_impl="local",
+        deterministic_mode=True,
+        operation_backends={"vocab_parallel_cross_entropy": "megatron"},
+    )
+    assert build_spec_provider(options).vocab_parallel_cross_entropy() is not None

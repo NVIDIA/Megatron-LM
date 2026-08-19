@@ -10,10 +10,12 @@ family and nothing else.
 from __future__ import annotations
 
 import importlib
+import warnings
 from functools import lru_cache
 from types import ModuleType
 from typing import Mapping
 
+from megatron.core.ops import determinism
 from megatron.core.ops._availability import is_installed, require
 from megatron.core.ops.operations import Operation
 from megatron.core.ops.options import BackendOptions
@@ -79,33 +81,64 @@ def _instantiate(backend: object, options: BackendOptions) -> object:
     return from_options(options) if from_options is not None else backend()  # type: ignore[operator]
 
 
-def _check_backend(family: ModuleType, backend_name: str, wanted_by: str) -> None:
-    """The one place a backend name and its optional dependency are checked."""
+def _check_backend(
+    family: ModuleType, backend_name: str, wanted_by: str, *, deterministic_mode: bool = False
+) -> None:
+    """The one place a backend name, its dependency, and its determinism are checked."""
     if backend_name not in family.BACKENDS:
         raise ValueError(
             f"Unknown backend '{backend_name}' for {wanted_by}. "
             f"Available backends: {', '.join(family.BACKENDS)}"
         )
-    requires = getattr(family.BACKENDS[backend_name], "REQUIRES", None)
+    backend = family.BACKENDS[backend_name]
+
+    requires = getattr(backend, "REQUIRES", None)
     if requires is not None and not is_installed(requires):
         raise ValueError(
             f"Backend '{backend_name}' for {wanted_by} requires '{requires}', "
             "which is not installed."
         )
 
+    if not deterministic_mode:
+        return
+    declared = getattr(backend, "DETERMINISM", None)
+    if declared == determinism.NONDETERMINISTIC:
+        raise ValueError(
+            f"Backend '{backend_name}' for {wanted_by} is not deterministic, and "
+            "--deterministic-mode is on. Select a different backend or drop the flag."
+        )
+    if declared not in determinism.VALUES:
+        raise ValueError(
+            f"Backend '{backend_name}' for {wanted_by} does not declare DETERMINISM. "
+            f"Declare one of: {', '.join(sorted(determinism.VALUES))}."
+        )
+    if declared == determinism.UNKNOWN:
+        warnings.warn(
+            f"Backend '{backend_name}' for {wanted_by} has not been established as "
+            "deterministic, so --deterministic-mode cannot guarantee bit-exact results "
+            "for that operation."
+        )
 
-def validate_backend(operation: Operation, backend_name: str) -> None:
+
+def validate_backend(
+    operation: Operation, backend_name: str, *, deterministic_mode: bool = False
+) -> None:
     """Raise if ``backend_name`` cannot fill ``operation`` here.
 
     A backend declares what it needs as ``REQUIRES``, so no family repeats the check. Public
     so the command line can reject a bad ``--op-backend`` while it parses, rather than leaving
     it to fail at model build time.
     """
-    _check_backend(_family_of(operation), backend_name, f"operation '{operation.method}'")
+    _check_backend(
+        _family_of(operation),
+        backend_name,
+        f"operation '{operation.method}'",
+        deterministic_mode=deterministic_mode,
+    )
 
 
 def _owner_for(operation: Operation, backend_name: str, options: BackendOptions) -> object:
-    validate_backend(operation, backend_name)
+    validate_backend(operation, backend_name, deterministic_mode=options.deterministic_mode)
     return _instantiate(_family_of(operation).BACKENDS[backend_name], options)
 
 
@@ -124,7 +157,12 @@ def _preset_owners(options: BackendOptions) -> dict[Operation, object]:
             else family.DEFAULT
         )
         # A named preset fails clearly when its backend cannot be used here.
-        _check_backend(family, name, f"--transformer-impl {options.transformer_impl}")
+        _check_backend(
+            family,
+            name,
+            f"--transformer-impl {options.transformer_impl}",
+            deterministic_mode=options.deterministic_mode,
+        )
         backend = _instantiate(family.BACKENDS[name], options)
         owners.update(
             {
@@ -137,18 +175,17 @@ def _preset_owners(options: BackendOptions) -> dict[Operation, object]:
 
 
 def _legacy_overrides(options: BackendOptions) -> dict[Operation, str]:
-    """Translate settings that predate --op-backend into the operation they always selected."""
-    from megatron.core.ops.loss import VOCAB_PARALLEL_CROSS_ENTROPY
+    """Ask each family what the settings older than --op-backend select for it.
 
+    A family that has such settings exposes ``legacy_backends(options)``; the mapping lives
+    with the family so its flag values and its backend names can be read together. Nothing
+    about any particular family is known here.
+    """
     overrides: dict[Operation, str] = {}
-    if options.cross_entropy_loss_fusion:
-        fusion = {"native": "megatron_fused", "te": "te_fused"}
-        impl = options.cross_entropy_fusion_impl
-        if impl not in fusion:
-            raise ValueError(
-                f"Unknown cross_entropy_fusion_impl='{impl}'. Valid choices: {', '.join(fusion)}"
-            )
-        overrides[VOCAB_PARALLEL_CROSS_ENTROPY] = fusion[impl]
+    for family in _families():
+        translate = getattr(family, "legacy_backends", None)
+        if translate is not None:
+            overrides.update(translate(options))
     return overrides
 
 

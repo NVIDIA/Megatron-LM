@@ -15,7 +15,7 @@ from megatron.core.ops import (
     get_backend,
     operations,
 )
-from megatron.core.ops.linear.contract import COLUMN_PARALLEL_LAYER_NORM_LINEAR
+from megatron.core.ops.linear import COLUMN_PARALLEL_LAYER_NORM_LINEAR
 from megatron.core.ops.norm import LAYER_NORM, WrappedTorchNorm
 from megatron.core.ops.norm.backends import NormTorch
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
