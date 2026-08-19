@@ -20,6 +20,9 @@ from megatron.lite.model.deepseek_v4.lite.protocol import (
     build_model_config,
     build_training_backend,
     is_expert_param,
+    pack_r3_replay_mask,
+    pack_routed_experts,
+    unpack_forward_output,
 )
 from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
     DS4MoEKernelMetadataBuilderAdapter,
@@ -31,8 +34,6 @@ from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
 from megatron.lite.model.protocol_utils import (
     add_loss_context_kwargs,
     nested_from_packed,
-    pack_r3_replay_mask as _pack_r3_replay_mask,
-    pack_routed_experts as _pack_routed_experts,
     router_replay_roots as router_replay_roots,
 )
 from megatron.lite.primitive.bundle import ModelBundle
@@ -41,8 +42,6 @@ from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
 from megatron.lite.primitive.parallel.thd import (
     pack_nested_thd,
     parallel_state_from_model,
-    thd_pack_meta,
-    unpack_thd_to_nested,
 )
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
@@ -208,31 +207,6 @@ def _forward_step(
         kwargs.update(forward_inputs)
     add_loss_context_kwargs(kwargs)
     return model(**kwargs)
-
-
-def unpack_forward_output(model: nn.Module, batch, output) -> Any:
-    ps = parallel_state_from_model(model)
-    if ps is not None and ps.cp_size > 1:
-        meta = thd_pack_meta(
-            batch.seq_lens,
-            tp_size=ps.tp_size,
-            cp_size=ps.cp_size,
-            cp_group=ps.cp_group,
-        )
-        return unpack_thd_to_nested(output, meta, contiguous=True)
-    return nested_from_packed(output, batch.seq_lens)
-
-
-def pack_routed_experts(model: nn.Module, batch, routed_experts):
-    """Pack rollout routes in the contiguous token order used by DS4 vLLM."""
-
-    return _pack_routed_experts(model, batch, routed_experts, contiguous=True)
-
-
-def pack_r3_replay_mask(model: nn.Module, batch) -> torch.Tensor:
-    """Pack the causal replay mask in the contiguous DS4 vLLM token order."""
-
-    return _pack_r3_replay_mask(model, batch, contiguous=True)
 
 
 def _prepare_cp_forward_inputs(
