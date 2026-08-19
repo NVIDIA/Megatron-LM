@@ -282,15 +282,13 @@ class OptimizerConfig:
     muon_tp_mode: str = "blockwise"
     """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
 
-    muon_use_syrk: bool = False
-    """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
-
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
     muon_use_syrk: bool = False
-    """Use the Triton SYRK (symmetric rank-k) kernel for the two symmetric-output
-    Newton-Schulz GEMMs under layer-sharded muon, computing one triangle only —
+    """Use the Triton SYRK (symmetric rank-k) kernel for the symmetric-output
+    Newton-Schulz GEMMs (all Muon modes; TensorParallelMuon additionally needs
+    emerging-optimizers >= 0.4.0 for the TP entry point), computing one triangle only —
     roughly a third off total NS FLOPs for near-square matrices. Only takes effect
     with muon_fp32_matmul_prec='medium', 8-aligned dims, Triton >= 3.4 and a
     validated SM arch. Unbatched (2-D) NS chunks always qualify; batched (3-D)

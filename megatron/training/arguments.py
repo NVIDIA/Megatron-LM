@@ -2656,7 +2656,7 @@ def _add_regularization_args(parser):
                        'the cost of bitwise parity (baddbmm vs addmm rounding).')
     group.add_argument('--muon-use-syrk', action='store_true',
                        help='Use the Triton SYRK kernel for the symmetric-output '
-                       'Newton-Schulz GEMMs under --use-layer-sharding-muon (~1/3 off '
+                       'Newton-Schulz GEMMs in Muon (~1/3 off '
                        'NS FLOPs for near-square matrices). Requires '
                        '--muon-fp32-matmul-prec medium; auto-disabled when Triton/SM '
                        'requirements are unmet.')
