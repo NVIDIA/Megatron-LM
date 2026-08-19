@@ -1731,6 +1731,14 @@ def validate_args(args, defaults={}):
                 "--use-layer-sharding-muon does not implement split-QKV Newton-Schulz "
                 "yet; pass --muon-no-split-qkv."
             )
+            if args.muon_tp_mode != 'blockwise':
+                # The kwargs builder matches constructor parameters reflectively, so
+                # an unmatched muon_tp_mode is dropped silently — surface it instead.
+                warn_rank_0(
+                    f"--muon-tp-mode {args.muon_tp_mode} is ignored under "
+                    "--use-layer-sharding-muon: layer sharding replaces the "
+                    "duplicated/distributed mode selection entirely."
+                )
 
 
     # Make sure all functionality that requires Gloo process groups is disabled.
