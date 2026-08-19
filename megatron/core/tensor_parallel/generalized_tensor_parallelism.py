@@ -1762,7 +1762,9 @@ class GTPShardedParam(torch.nn.Parameter):
             if self._wgrad_symm_slot is not None:
                 raise RuntimeError(
                     "[GTP] get_wgrad_tensor called again before the previous symmetric "
-                    f"wgrad buffer was consumed ({self._debug_name})."
+                    f"wgrad buffer was consumed ({self._debug_name}). The previous backward "
+                    "either aborted between the wgrad GEMM and its reduce-scatter, or a "
+                    "deferred-wgrad schedule skipped the reduce-scatter for this weight."
                 )
             buf = _alloc_symmetric_wgrad_buffer(self, self.main_grad.dtype, self.device)
             self._wgrad_symm_slot = buf

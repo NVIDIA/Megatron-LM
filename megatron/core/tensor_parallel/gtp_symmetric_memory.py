@@ -129,6 +129,12 @@ class RegisteredLIFOPool:
     count. ``alloc`` returns a view tagged with ``_gtp_symm_group``; ``free`` ignores
     untagged tensors, which lets callers pass mixed buffer lists to both this pool and
     the plain scratch pool and have each take only its own.
+
+    Why LIFO: ordering cannot affect correctness (buffers enter the free list only
+    after their reduce-scatter has been waited on), but LIFO keeps the same buffer
+    reused for the same operation at steady state even if a key ever over-allocates,
+    whereas FIFO would rotate the assignment every iteration -- LIFO keeps memory
+    behavior deterministic and repeatable across iterations.
     """
 
     def __init__(self) -> None:
@@ -157,7 +163,9 @@ class RegisteredLIFOPool:
                     f"(group={group.group_name}, numel={numel}, dtype={dtype}). The "
                     "eager warmup did not pre-populate enough RS send buffers for "
                     "the reduce-scatter overlap depth -- run more warmup iters, or "
-                    "the RS concurrency changed between warmup and capture."
+                    "the RS concurrency changed between warmup and capture, or "
+                    "symmetric send buffers were stranded by backwards that never "
+                    "reduce-scattered."
                 )
             # Allocate from the group's registered pool when it has one; else plain memory.
             if is_gtp_symm_pool_registered(group):
