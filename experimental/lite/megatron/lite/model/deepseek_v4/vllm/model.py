@@ -95,8 +95,10 @@ class AttentionAdapters:
     flash: FlashMLAAdapter
     o_project: Callable[..., torch.Tensor]
     bf16_linear: Callable[[torch.Tensor, nn.Parameter], torch.Tensor] = F.linear
-    fp32_linear: Callable[[torch.Tensor, nn.Parameter], torch.Tensor] = (
-        lambda value, weight: F.linear(value.float(), weight.float())
+    fp32_linear: Callable[..., torch.Tensor] = (
+        lambda value, *weights: F.linear(
+            value.float(), torch.cat(weights, dim=0).float()
+        )
     )
     compressor: Callable[..., Any] = lambda operation, *args, **kwargs: operation(
         kv_score=args[0],
@@ -126,8 +128,10 @@ def _default_attention_adapters() -> AttentionAdapters:
             "vllm.model_executor.layers.batch_invariant",
             fromlist=["linear_batch_invariant"],
         ).linear_batch_invariant(value, weight),
-        fp32_linear=lambda value, weight: torch.mm(
-            value.contiguous(), weight.T, out_dtype=torch.float32
+        fp32_linear=lambda value, *weights: torch.mm(
+            value.contiguous(),
+            torch.cat(weights, dim=0).T,
+            out_dtype=torch.float32,
         ),
         norm=FusedQKVRMSNormAdapter(),
         kv_insert=DS4KVInsertAdapter(KVCacheLayout.FP8_DS_MLA),
