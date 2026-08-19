@@ -64,6 +64,8 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
     "qkv_split_shapes": None,
+    "is_glu": False,
+    "glu_split_shapes": None,
     "tensor_model_parallel": False,
     "partition_dim": -1,
     "partition_stride": 1,

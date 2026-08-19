@@ -15,6 +15,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     TensorParallelAdaptiveMuon,
     TensorParallelMuon,
+    _get_glu_split_shapes,
     _get_qkv_split_shapes,
     get_supported_coefficient_types,
     validate_coefficient_type,
@@ -61,6 +62,16 @@ class Net(nn.Module):
         return x
 
 
+class GatedNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear_fc1 = nn.Linear(4, 8, bias=False)
+
+    def forward(self, x):
+        gate, up = self.linear_fc1(x).chunk(2, dim=-1)
+        return F.silu(gate) * up
+
+
 # ===========================================================================
 # Muon optimizer tests
 # ===========================================================================
@@ -80,6 +91,45 @@ def test_muon_qkv_split_shapes():
 
     assert _get_qkv_split_shapes(config) == [128, 64, 64]
     assert _get_qkv_split_shapes(gated_config) == [128, 128, 64, 64]
+
+
+def test_muon_glu_split_shapes():
+    param = torch.empty(16, 8)
+
+    assert _get_glu_split_shapes(param) == [8, 8]
+
+    with pytest.raises(ValueError, match="output dimension must be even"):
+        _get_glu_split_shapes(torch.empty(15, 8))
+
+
+def test_muon_optimizer_glu_split(monkeypatch):
+    """Muon orthogonalizes the fused gate and up FC1 weights independently."""
+    param = torch.nn.Parameter(torch.zeros(8, 4, device='cuda'))
+    param.is_glu = True
+    param.glu_split_shapes = [4, 4]
+    optimizer = TensorParallelMuon(
+        params=[param],
+        gated_linear_unit=True,
+        is_glu_fn=lambda p: getattr(p, 'is_glu', False),
+        num_ns_steps=1,
+        pg_collection=None,
+        tp_mode="duplicated",
+    )
+    grad = torch.arange(32, dtype=torch.float32, device='cuda').view(8, 4)
+    orthogonalized_grads = []
+
+    def fake_orthogonalize(_param, split_grad, _tp_group, _partition_dim):
+        orthogonalized_grads.append(split_grad.clone())
+        return split_grad + len(orthogonalized_grads)
+
+    monkeypatch.setattr(optimizer, "scaled_orthogonalize_fn_with_gtp_remat", fake_orthogonalize)
+
+    result = optimizer.orthogonalize(param, grad)
+
+    assert [split.shape for split in orthogonalized_grads] == [(4, 4), (4, 4)]
+    torch.testing.assert_close(orthogonalized_grads[0], grad[:4])
+    torch.testing.assert_close(orthogonalized_grads[1], grad[4:])
+    torch.testing.assert_close(result, torch.cat((grad[:4] + 1, grad[4:] + 2)))
 
 
 def test_muon_optimizer_smoke():
@@ -265,6 +315,44 @@ class TestMuonOptimizerMultiRank:
 
         # Load state dict should not raise error
         optimizer.load_state_dict(state_dict)
+
+    def test_get_megatron_optimizer_tags_glu_fc1(self):
+        """The optimizer factory marks fused GLU FC1 weights with their local split shapes."""
+        transformer_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=4,
+            num_attention_heads=1,
+            gated_linear_unit=True,
+        )
+        model = DistributedDataParallel(
+            transformer_config,
+            DistributedDataParallelConfig(use_distributed_optimizer=False),
+            GatedNet().bfloat16().cuda().requires_grad_(True),
+        )
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            bf16=True,
+            muon_num_ns_steps=1,
+            muon_tp_mode="duplicated",
+        )
+
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+        )
+
+        fc1_param = next(
+            param for name, param in model.named_parameters() if 'linear_fc1.weight' in name
+        )
+        assert fc1_param.is_glu is True
+        assert fc1_param.glu_split_shapes == [4, 4]
+        raw_optimizers = [
+            child.optimizer
+            for child in optimizer.chained_optimizers
+            if isinstance(getattr(child, 'optimizer', None), TensorParallelMuon)
+        ]
+        assert len(raw_optimizers) == 1
+        assert raw_optimizers[0].gated_linear_unit is True
 
     def test_get_megatron_optimizer_validation(self):
         """Test validation logic for get_megatron_optimizer."""
