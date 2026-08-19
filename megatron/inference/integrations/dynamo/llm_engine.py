@@ -14,10 +14,7 @@ import sys
 import threading
 from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
-
-if TYPE_CHECKING:
-    from megatron.core.inference.sampling_params import SamplingParams
+from typing import Any, Optional
 
 from dynamo._core import Context
 from dynamo.common.backend.disagg import require_prefill_result
@@ -29,6 +26,7 @@ from dynamo.common.constants import DisaggregationMode
 from dynamo.llm import KvEventPublisher, ModelInput
 
 from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.integrations.dynamo.args import Config, parse_args
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
 
@@ -36,8 +34,6 @@ logger = logging.getLogger(__name__)
 
 
 def build_sampling_params(request: GenerateRequest) -> SamplingParams:
-    from megatron.core.inference.sampling_params import SamplingParams
-
     sampling = request.get("sampling_options") or {}
     stop = request.get("stop_conditions") or {}
     params = SamplingParams()
@@ -412,8 +408,6 @@ class MegatronLLMEngine(LLMEngine):
                 await stream.aclose()
 
     def _release_remote_handoff(self, address: str, request_id: int) -> None:
-        from megatron.core.inference.inference_client import InferenceClient
-
         client = self._release_clients.get(address)
         if client is None:
             client = InferenceClient(address, deserialize=False)

@@ -2040,15 +2040,7 @@ class DynamicInferenceEngine(AbstractEngine):
     def _select_cg_chunk_size(
         self, req: DynamicInferenceRequest, max_chunk_tokens: int
     ) -> Optional[int]:
-        """Select a graphed chunk size, or defer until the active batch can match one.
-
-        A chunked-prefill continuation is re-admitted from the waiting queue, so it
-        must satisfy the same CUDA-graph shape constraints as a new prefill. When
-        other work is active, deferring lets the next step change the prefill/decode
-        mix so a strict hybrid graph can cover the continuation. If the engine is
-        otherwise idle, eager progress is required for inputs that cannot match a
-        captured shape, such as a one-token prefill.
-        """
+        """Select a graph-aligned chunk, deferring busy misses but not idle work."""
         snapped_chunk = self._find_cg_chunk_size(max_chunk_tokens)
         if snapped_chunk is not None:
             req.cg_wait_iters = 0

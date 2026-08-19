@@ -110,11 +110,12 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         args.return_log_probs = True
         args.skip_prompt_log_probs = True
 
-        engine_class = DisaggDynamicInferenceEngine if is_disagg_rollout(args) else DynamicInferenceEngine
+        disaggregated = is_disagg_rollout(args)
+        engine_class = DisaggDynamicInferenceEngine if disaggregated else DynamicInferenceEngine
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(
             model=model, engine_class=engine_class
         )
-        if is_disagg_rollout(args):
+        if disaggregated:
             configure_disagg_engine(inference_engine)
         inference_engine.local_metadata_ledger_enabled = True
         if args.rl_partial_rollouts:

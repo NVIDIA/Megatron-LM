@@ -11,13 +11,7 @@ _NIXL_AGENT_METADATA = "agent_metadata_b64"
 
 
 def strip_registered_nixl_agent_metadata(value: Any) -> Any:
-    """Copy handoff metadata without repeated NIXL agent-registration blobs.
-
-    Native coordinator engines register their instance metadata once. The
-    per-request handoff still carries addresses, layouts, and block mappings,
-    but does not need to repeat the base64 agent metadata on its first hop to
-    that coordinator.
-    """
+    """Remove NIXL agent blobs already registered with the coordinator."""
 
     if isinstance(value, dict):
         is_agent_record = _NIXL_AGENT_NAME in value
@@ -57,12 +51,7 @@ def _registered_nixl_agents(instance_meta: Any) -> Dict[str, str]:
 
 
 def restore_registered_nixl_agent_metadata(value: Any, instance_meta: Any) -> Any:
-    """Restore omitted NIXL agent blobs from one engine's registration.
-
-    Every dictionary naming a NIXL agent must either carry the same metadata
-    registered by that source engine or be filled from that registration.
-    Unrelated dictionaries are copied unchanged.
-    """
+    """Restore and validate NIXL agent blobs from engine registration."""
 
     agents = _registered_nixl_agents(instance_meta)
 

@@ -11,7 +11,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 @dataclass(frozen=True)
 class QueuedPrefillRequest:
-    """Prefill request waiting for durable Mamba capacity."""
+    """Prefill request waiting for SSM state capacity."""
 
     request_id: int
     prompt: Any
@@ -21,7 +21,7 @@ class QueuedPrefillRequest:
 
 @dataclass(frozen=True)
 class QueuedDecodeHandoff:
-    """Decode handoff waiting for enough durable Mamba cache slots."""
+    """Decode handoff waiting for SSM state capacity."""
 
     request_id: int
     payload: bytes
@@ -29,14 +29,7 @@ class QueuedDecodeHandoff:
 
 
 class DisaggStateFlowControl:
-    """Weighted prefill/decode admission based on durable recurrent-state slots.
-
-    Engines advertise their durable slot capacity with their disaggregation
-    transfer metadata. Prefill reservations conservatively use prompt block
-    count; decode reservations use the exact number of Mamba block positions
-    in each handoff. Reservations remain held while the corresponding engine
-    owns the request's cache state.
-    """
+    """Reserve recurrent-state slots for prefill and decode handoffs."""
 
     def __init__(self) -> None:
         self._capacity: Dict[Any, int] = {}
@@ -102,9 +95,7 @@ class DisaggStateFlowControl:
         """Register an engine's capacity and return the parsed limit."""
 
         capacity = self._capacity_from_instance_meta(instance_meta)
-        # A reconnect may reuse an identity with different metadata. Replace
-        # the old limits instead of retaining values that are no longer
-        # advertised by the new engine instance.
+        # A reconnect may reuse an identity with new limits.
         self._capacity.pop(identity, None)
         self._prefill_slot_cost.pop(identity, None)
         if capacity is not None:

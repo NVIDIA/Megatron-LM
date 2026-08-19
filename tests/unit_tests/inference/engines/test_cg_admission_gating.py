@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Unit tests for CUDA-graph-aware admission gating."""
+""" Unit tests for CUDA-graph-aware admission gating. """
 
 import logging
 import types

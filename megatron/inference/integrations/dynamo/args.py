@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass
 
 
@@ -56,8 +57,6 @@ def add_engine_service_args(parser: argparse.ArgumentParser) -> argparse.Argumen
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
-    import sys
-
     dynamo_argv, megatron_argv = _split_argv(list(sys.argv[1:] if argv is None else argv))
     parser = argparse.ArgumentParser(
         prog="python -m megatron.inference.integrations.dynamo",

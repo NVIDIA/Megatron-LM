@@ -1,12 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Megatron-owned distributed engine service for the Dynamo integration.
-
-This module is intended to be launched by ``torch.distributed.run``.  It owns
-the model-parallel rank group and private inference coordinator, but no Dynamo
-runtime objects. Rank zero advertises coordinator readiness through the
-parent-owned engine event socket.
-"""
+"""Distributed Megatron engine service for Dynamo."""
 
 from __future__ import annotations
 

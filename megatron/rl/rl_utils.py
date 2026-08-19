@@ -47,10 +47,10 @@ from wandb import wandb_run
 from megatron.core import mpu
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
-from megatron.core.inference.disaggregation.coordinator_setup import disagg_refit_pools
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
+    create_unified_mempool,
     prefetch_managed_module_parameters,
 )
 from megatron.core.inference.utils import device_memory_summary, set_decode_expert_padding
@@ -97,6 +97,7 @@ from megatron.rl.agent.api import (
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
 from megatron.rl.inference import ReturnsRaw
+from megatron.rl.inference.disagg import disagg_refit_pools
 from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
@@ -137,6 +138,20 @@ _GLOBAL_PACKING_CONTEXT = None
 # Track whether the inference model is currently paused (offloaded to CPU).
 # Model starts on GPU after creation and is used immediately, so starts as False.
 _INFERENCE_MODEL_IS_PAUSED = False
+
+
+def inference_model_alloc_context(args):
+    """Return the allocation context for a separate RL inference model."""
+    uvm_level = args.rl_inference_model_unified_memory_level
+    if (
+        args.rl_offload_inference_model_weights_when_idle
+        and uvm_level == 0
+        and HAVE_TORCH_MEMORY_SAVER
+    ):
+        return torch_memory_saver.region(tag="rl_inference_model", enable_cpu_backup=True)
+    if uvm_level and uvm_level > 0:
+        return torch.cuda.use_mem_pool(create_unified_mempool())
+    return nullcontext()
 
 
 def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:

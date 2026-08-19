@@ -574,9 +574,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Calculate total memory before partition
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
             mamba_memory_bytes = total_memory * mamba_memory_ratio
-            # Keep one state slot outside the request pool so an idle EP rank can
-            # participate in model collectives while request slots are retained
-            # by in-flight handoffs.
+            # Reserve one state slot for idle EP ranks.
             mamba_max_requests = int(mamba_memory_bytes // mamba_states_memory_per_request) - 1
 
             # Reduce buffer sizes for KV cache
@@ -2312,7 +2310,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_query_lengths[0:N],
             )
 
-            # 5. The EP dummy step has one request and uses a reserved state slot.
+            # 5. Use the reserved slot for the EP dummy request.
             assert N == 1
             self.mamba_metadata.request_to_mamba_state_idx[0] = self.mamba_metadata.dummy_state_idx
 

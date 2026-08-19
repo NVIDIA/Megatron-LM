@@ -13,11 +13,7 @@ from megatron.core.utils import internal_api
 
 
 class DisaggDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceEngine):
-    """Dynamic inference engine with prefill/decode state hand-off support.
-
-    Used by both control planes: the Dynamo integration and the
-    coordinator-native 2-hop mode.
-    """
+    """Dynamic engine with prefill/decode state handoff support."""
 
     @internal_api
     def set_disaggregation_config(

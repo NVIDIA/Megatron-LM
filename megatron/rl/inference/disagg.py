@@ -1,16 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Disaggregated (prefill/decode) rollouts for RL.
-
-Hooks the coordinator-native prefill/decode split into RL's existing separate-
-inference-model lifecycle: build this rank's shard model on its shard groups
-(``build_disagg_inference_model``) and configure the shared coordinator on the
-engine that wraps it (``configure_disagg_engine``). Refit into the shard pools
-goes through the core ``swap_model_weights`` (one pass per pool, driven by
-``disagg_refit_pools``). All gated on ``--inference-shards`` declaring ``role=``
-tags; off otherwise."""
+"""Disaggregated prefill/decode rollouts for RL."""
 
 import copy
+import functools
 from contextlib import nullcontext
 
 import torch.distributed as dist
@@ -18,11 +11,12 @@ import torch.distributed as dist
 from megatron.core.inference.disaggregation.coordinator_setup import (
     configure_prebuilt_disagg_engine,
 )
+from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.inference.shards_spec import (
     parse_inference_shards_spec,
     spec_declares_disaggregation,
 )
-from megatron.core.inference.shards import build_inference_pg_collection
+from megatron.training.global_vars import get_args
 
 
 def is_disagg_rollout(args) -> bool:
@@ -35,9 +29,24 @@ def _specs(args):
     return parse_inference_shards_spec(args.inference_shards, args.world_size)
 
 
+@functools.lru_cache(maxsize=None)
+def disagg_refit_pools(inference_shards, world_size: int, rank: int = None) -> tuple[int, int]:
+    """Return the refit pool count and this rank's pool index."""
+    if rank is None:
+        rank = dist.get_rank()
+    if not (inference_shards and spec_declares_disaggregation(inference_shards)):
+        return 1, 0
+    specs = parse_inference_shards_spec(inference_shards, world_size)
+    offset = 0
+    for index, spec in enumerate(specs):
+        if offset <= rank < offset + spec.world_size:
+            return len(specs), index
+        offset += spec.world_size
+    raise RuntimeError(f"rank {rank} not in any disaggregated shard")
+
+
 def _iter_shard_windows(specs, rank):
-    """Yield ``(offset, spec, is_mine)`` for each contiguous shard window, in
-    order -- the same windowing ``configure_prebuilt_disagg_engine`` uses."""
+    """Yield each shard's rank offset and local-membership flag."""
     offset = 0
     for s in specs:
         yield offset, s, (offset <= rank < offset + s.world_size)
@@ -54,21 +63,7 @@ def build_disagg_inference_model(
     cfg_container=None,
     model_alloc_ctx=None,
 ):
-    """Build this rank's prefill/decode shard inference model (or ``None`` if
-    ``--inference-shards`` doesn't declare disaggregation).
-
-    Every rank builds *every* shard's process groups -- ``new_group`` is
-    collective, so non-members must call it too -- but instantiates the model
-    only on its own shard's groups, at that shard's parallelism. The result is
-    the refit target (``swap_model_weights`` driven by ``disagg_refit_pools``)
-    and what the engine wraps (see :func:`configure_disagg_engine`); placing it
-    on the shard groups is the only difference from RL's existing separate-
-    inference-model build.
-
-    ``model_alloc_ctx`` is the weight-allocation context (UVM / saver region for
-    idle-offload); the caller supplies the same one the colocated path uses so
-    ``--rl-offload-inference-model-weights-when-idle`` works here too.
-    """
+    """Build this rank's disaggregated RL inference shard."""
     if not is_disagg_rollout(args):
         return None
     assert args.inference_dynamic_batching_enable_prefix_caching, (
@@ -95,8 +90,7 @@ def build_disagg_inference_model(
             my_pg, my_spec = pg, s
     assert my_pg is not None, f"rank {rank} not in any disagg shard window"
 
-    # Shard parallelism. CP is forced to 1: spec.world_size = tp*pp*dp carries no
-    # CP factor (the pg is built cp_size=1), so the config must agree.
+    # RL inference shards use CP=1.
     cfg = copy.deepcopy(base_config)
     cfg.tensor_model_parallel_size = my_spec.tp
     cfg.pipeline_model_parallel_size = my_spec.pp
@@ -122,8 +116,6 @@ def build_disagg_inference_model(
 
 def configure_disagg_engine(engine, *, disagg_router="round_robin"):
     """Set the disagg role on `engine` and spawn the shared coordinator."""
-    from megatron.training.global_vars import get_args
-
     args = get_args()
     configure_prebuilt_disagg_engine(
         engine, _specs(args), disagg_router=disagg_router,

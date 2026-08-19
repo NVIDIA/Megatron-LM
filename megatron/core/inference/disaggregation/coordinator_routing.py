@@ -12,13 +12,7 @@ DECODE = "decode"
 
 
 class DisaggRouter(abc.ABC):
-    """The routing contract the coordinator delegates to for 2-hop disagg.
-
-    Swap in a different policy (KV-/load-aware, or a Dynamo router) by
-    implementing these five methods and registering the class under a name
-    (register_disagg_router); the coordinator resolves it by name so the
-    choice survives the spawn boundary. Implementations hold no sockets and
-    do no I/O; the coordinator owns the transport."""
+    """Routing policy for coordinator-native disaggregation."""
 
     @abc.abstractmethod
     def register(self, identity, role: str) -> None:
@@ -41,27 +35,12 @@ class DisaggRouter(abc.ABC):
         """Drop per-request state once the reply has been routed home."""
 
     def requests_involving(self, identity) -> List[int]:
-        """Request ids currently routed through `identity` on either hop:
-        what the coordinator must drop when the engine dies. Default: none (a
-        router that does not track this skips the dead-engine sweep; the
-        coordinator still stops routing to the engine)."""
+        """Return requests routed through an engine."""
         return []
 
 
 class DisaggRouting(DisaggRouter):
-    """Round-robin 2-hop router: prefill engine -> (KV handoff) -> decode
-    engine.
-
-    TODO: replace round-robin with a load- and prefix-aware policy. The KV
-    cache events the engines already publish (stored/removed/cleared) carry
-    the block hashes a prefix-overlap score needs, and GRPO's same-prompt
-    request groups make affinity routing especially valuable.
-
-    Engines are identified by their transport identity (bytes for ZMQ; any
-    hashable in tests). Decides which engine each hop goes to and remembers
-    the per-request pairing so the final reply can be routed home. Selection
-    is round-robin within each role, deterministic given registration order.
-    """
+    """Round-robin prefill-to-decode router."""
 
     def __init__(self) -> None:
         self.prefill_engines: List = []
@@ -70,8 +49,6 @@ class DisaggRouting(DisaggRouter):
         self._decode_rr = 0
         self._req_prefill: Dict[int, object] = {}  # request_id -> prefill identity
         self._req_decode: Dict[int, object] = {}  # request_id -> decode identity
-
-    # --- registration ------------------------------------------------------
 
     def register(self, identity, role: str) -> None:
         """Record an engine and its disagg role (idempotent)."""
@@ -90,8 +67,6 @@ class DisaggRouting(DisaggRouter):
             if identity in pool:
                 pool.remove(identity)
 
-    # --- per-request routing ----------------------------------------------
-
     def route_submit(self, request_id: int):
         """Hop 1: pick the prefill engine for a newly submitted request."""
         # TODO: load- and prefix-locality-aware selection instead of round-robin.
@@ -103,18 +78,11 @@ class DisaggRouting(DisaggRouter):
         return ident
 
     def route_prefill_done(self, request_id: int) -> Tuple[object, object]:
-        """Hop 2: a request finished prefill; pick its decode engine.
-
-        Returns (prefill_identity, decode_identity): the coordinator re-submits
-        the request to the decode engine as SUBMIT_REQUEST_WITH_KV (and, on
-        push transports, tells the prefill engine via SEND_KV).
-        """
+        """Pick decode after prefill and return both engine identities."""
         if not self.decode_engines:
             raise RuntimeError("no decode engines registered")
         dec = self._pick_decode(request_id)
         self._req_decode[request_id] = dec
-        # None if this router never saw the submit; the coordinator guarantees
-        # submit-first, but a standalone router tolerates it.
         prefill = self._req_prefill.get(request_id)
         return prefill, dec
 
@@ -136,9 +104,7 @@ class DisaggRouting(DisaggRouter):
         return dec
 
 
-# --- router registry: resolve by name so the choice survives the coordinator
-# spawn (the coordinator process re-imports modules; a custom router registers
-# itself on import). External frameworks (e.g. Dynamo) register their own.
+# Named policies survive the coordinator spawn boundary.
 _DISAGG_ROUTERS: Dict[str, Callable[[], DisaggRouter]] = {}
 
 

@@ -58,9 +58,8 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
+from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-from megatron.core.inference.disaggregation.coordinator_setup import disagg_refit_pools
-from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
     is_linear_attention_variant,
@@ -198,6 +197,11 @@ from .utils import (
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
 try:
     from megatron.rl import rl_utils
+    from megatron.rl.inference.disagg import (
+        build_disagg_inference_model,
+        disagg_refit_pools,
+        is_disagg_rollout,
+    )
     from megatron.rl.rl_profiling import (
         RL_LOGGABLE_TIMER_NAMES,
         initialize_rl_profiler,
@@ -224,14 +228,6 @@ try:
     HAVE_FSDP2 = True
 except ImportError:
     HAVE_FSDP2 = False
-
-try:
-    from torch_memory_saver import torch_memory_saver
-
-    torch_memory_saver.hook_mode = "torch"
-    HAVE_TORCH_MEMORY_SAVER = True
-except ImportError:
-    HAVE_TORCH_MEMORY_SAVER = False
 
 # Module-level globals.
 # Startup timestamps for tracking program initialization phases.
@@ -1498,20 +1494,6 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
-def _rl_inference_model_alloc_ctx(args):
-    """Return the weight-allocation context for a separate RL inference model."""
-    uvm_level = args.rl_inference_model_unified_memory_level
-    if (
-        args.rl_offload_inference_model_weights_when_idle
-        and uvm_level == 0
-        and HAVE_TORCH_MEMORY_SAVER
-    ):
-        return torch_memory_saver.region(tag="rl_inference_model", enable_cpu_backup=True)
-    if uvm_level and uvm_level > 0:
-        return torch.cuda.use_mem_pool(create_unified_mempool())
-    return nullcontext()
-
-
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -1851,8 +1833,6 @@ def pretrain(
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
-        from megatron.rl.inference.disagg import build_disagg_inference_model, is_disagg_rollout
-
         # RL inference doesn't support CP; when training uses CP>1, always build a
         # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
         force_cp1_inference_model = args.context_parallel_size > 1
@@ -1866,7 +1846,7 @@ def pretrain(
                 model_cfg,
                 get_model,
                 cfg_container=cfg_container,
-                model_alloc_ctx=_rl_inference_model_alloc_ctx(args),
+                model_alloc_ctx=rl_utils.inference_model_alloc_context(args),
             )
         elif (
             args.rl_inference_tensor_model_parallel_size is not None
@@ -1875,8 +1855,6 @@ def pretrain(
             or args.rl_inference_expert_tensor_model_parallel_size is not None
             or force_cp1_inference_model
         ):
-            from megatron.core.inference.shards import build_inference_pg_collection
-
             print_rank_0(
                 "Building separate RL inference model with custom parallelism: "
                 f"TP={args.rl_inference_tensor_model_parallel_size}, "
@@ -1914,7 +1892,7 @@ def pretrain(
                     args.rl_inference_expert_tensor_model_parallel_size
                 )
 
-            with _rl_inference_model_alloc_ctx(args):
+            with rl_utils.inference_model_alloc_context(args):
                 inference_model = get_model(
                     model_provider,
                     model_type,
