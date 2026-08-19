@@ -16,12 +16,12 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.linear import (
     gate_linear,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.mhc import (
-    _post_graph,
     _pre_graph,
     mhc_head,
     mhc_post,
     mhc_pre_broadcast,
 )
+from megatron.lite.primitive.modules.attention.hca import HyperConnection
 from megatron.lite.model.deepseek_v4.vllm.primitive.norm import (
     fused_qkv_rms_norm,
     rms_norm,
@@ -35,6 +35,10 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.router import fixed_route_vj
 
 def _grad_like(value: torch.Tensor) -> torch.Tensor:
     return torch.arange(1, value.numel() + 1, dtype=torch.float32).reshape_as(value).div(value.numel()).to(value)
+
+
+def _post_graph(x, residual, post, comb):
+    return HyperConnection.post(x, residual, post.squeeze(-1), comb)
 
 
 @pytest.mark.parametrize("fused", [False, True])

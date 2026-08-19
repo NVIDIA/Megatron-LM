@@ -248,24 +248,12 @@ def test_unified_builder_uses_selected_layer_ratio() -> None:
 
 
 def test_moe_metadata_builder_uses_tp_independent_runtime_gate() -> None:
-    builder = runtime.DS4MoEKernelMetadataBuilderAdapter(
-        _config(num_hidden_layers=4, num_hash_layers=3),
-        device="cpu",
-        layer_idx=3,
+    metadata = runtime.build_moe_metadata(
+        _config(num_hidden_layers=4, num_hash_layers=3), "cpu"
     )
-
-    assert builder.layer_idx == 3
-    assert isinstance(builder.gate_linear, runtime._RuntimeGateLinear)
-    assert builder.gate_linear.weight.shape == (256, 4096)
-    metadata = builder.build()
-    assert metadata.gate_linear is builder.gate_linear
+    assert isinstance(metadata.gate_linear, runtime._RuntimeGateLinear)
+    assert metadata.gate_linear.weight.shape == (256, 4096)
     assert not hasattr(metadata, "build_grouped_moe")
-
-
-def test_moe_metadata_builder_has_no_deepep_buffer_factory() -> None:
-    assert not hasattr(
-        runtime.DS4MoEKernelMetadataBuilderAdapter, "create_deepep_buffer"
-    )
 
 
 def test_layer1_extended_builder_reuses_swa_only_contract(monkeypatch) -> None:

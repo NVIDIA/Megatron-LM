@@ -1068,29 +1068,13 @@ class DS4SparseIndexerCompressorMetadataAdapter(DS4PrefillMetadataBuilder):
         return metadata
 
 
-class DS4MoEKernelMetadataBuilderAdapter:
-    """Build the caller-owned vLLM router projection metadata."""
-
-    def __init__(
-        self,
-        config: DeepseekV4Config,
-        *,
-        device: torch.device | str,
-        layer_idx: int = 0,
-    ) -> None:
-        if not 0 <= layer_idx < config.num_hidden_layers:
-            raise ValueError(f"layer_idx is outside the model: {layer_idx}")
-        self.config = config
-        self.device = torch.device(device)
-        self.layer_idx = layer_idx
-        self.gate_linear = _RuntimeGateLinear(
-            config.hidden_size,
-            config.n_routed_experts,
-            device=self.device,
-        )
-
-    def build(self):
-        return MoEKernelMetadata(gate_linear=self.gate_linear)
+def build_moe_metadata(config: DeepseekV4Config, device: torch.device | str):
+    gate = _RuntimeGateLinear(
+        config.hidden_size,
+        config.n_routed_experts,
+        device=torch.device(device),
+    )
+    return MoEKernelMetadata(gate_linear=gate)
 
 
 __all__ = [
@@ -1098,7 +1082,7 @@ __all__ = [
     "DS4_FP8_MLA_TOKEN_BYTES",
     "DS4_SWA_BLOCK_SIZE",
     "DS4RuntimeLayout",
-    "DS4MoEKernelMetadataBuilderAdapter",
+    "build_moe_metadata",
     "DS4SparseIndexerCompressorMetadataAdapter",
     "ds4_vllm_forward_context",
     "initialize_ds4_vllm_batch_invariance",

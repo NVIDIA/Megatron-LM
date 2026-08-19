@@ -27,8 +27,8 @@ from megatron.lite.model.deepseek_v4.lite.protocol import (
     unpack_forward_output,
 )
 from megatron.lite.model.deepseek_v4.vllm.runtime_metadata import (
-    DS4MoEKernelMetadataBuilderAdapter,
     DS4SparseIndexerCompressorMetadataAdapter,
+    build_moe_metadata,
     ds4_vllm_forward_context,
     initialize_ds4_vllm_batch_invariance,
 )
@@ -279,11 +279,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             for layer_idx in selected_layers
         }
         moe_metadata = {
-            layer_idx: DS4MoEKernelMetadataBuilderAdapter(
-                model_cfg,
-                device=device,
-                layer_idx=layer_idx,
-            ).build()
+            layer_idx: build_moe_metadata(model_cfg, device)
             for layer_idx in selected_layers
         }
         return attention_builders, moe_metadata

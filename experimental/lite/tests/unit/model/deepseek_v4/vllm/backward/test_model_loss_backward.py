@@ -8,21 +8,20 @@ from torch import nn
 
 from megatron.lite.model.deepseek_v4.vllm import model as model_module
 from megatron.lite.model.deepseek_v4.vllm.model import DeepseekV4Model
-from megatron.lite.model.deepseek_v4.vllm.primitive.mhc import _post_graph
 
 
 class _Layer(nn.Module):
     def __init__(self, hidden: int, mult: int):
         super().__init__()
         self.projection = nn.Linear(hidden, hidden, bias=False)
+        self.self_attn = SimpleNamespace(
+            self_attn=SimpleNamespace(_projection_streams=None)
+        )
         self.mult = mult
 
     def forward(self, hidden_states, **_kwargs):
         value = self.projection(hidden_states)
-        residual = value.unsqueeze(-2).expand(-1, self.mult, -1)
-        post = value.new_ones(value.shape[0], self.mult, 1)
-        comb = value.new_zeros(value.shape[0], self.mult, self.mult)
-        return value, residual, post, comb
+        return value.unsqueeze(-2).expand(-1, self.mult, -1)
 
 
 class _Norm(nn.Module):
@@ -44,6 +43,7 @@ def _head_graph(x, fn, scale, base, eps):
 
 def test_model_loss_log_probs_and_entropy_cover_embedding_and_head(monkeypatch) -> None:
     torch.manual_seed(29)
+    device = torch.device("cuda")
     tokens, hidden, mult, vocab = 5, 8, 2, 17
     config = SimpleNamespace(
         num_hidden_layers=1,
@@ -54,6 +54,8 @@ def test_model_loss_log_probs_and_entropy_cover_embedding_and_head(monkeypatch) 
     model = DeepseekV4Model.__new__(DeepseekV4Model)
     nn.Module.__init__(model)
     model.config = config
+    model.pre_process = True
+    model.post_process = True
     model.layer_indices = [0]
     model.embed_tokens = nn.Module()
     model.embed_tokens.embedding = nn.Embedding(vocab, hidden)
@@ -64,16 +66,12 @@ def test_model_loss_log_probs_and_entropy_cover_embedding_and_head(monkeypatch) 
     model.hc_head.hc_scale = nn.Parameter(torch.randn(mult))
     model.hc_head.hc_base = nn.Parameter(torch.randn(mult))
     model.lm_head = nn.Linear(hidden, vocab, bias=False)
+    model._head_weight_for_fused_ce = lambda _hidden: model.lm_head.weight
+    model.ps = SimpleNamespace(tp_group=None)
     model._input_tensor = None
     model._shared_projection_streams = None
+    model.to(device=device, dtype=torch.bfloat16)
 
-    monkeypatch.setattr(
-        model_module,
-        "mhc_post",
-        lambda _visible, x, residual, post, comb: _post_graph(
-            x, residual, post, comb
-        ),
-    )
     monkeypatch.setattr(
         model_module,
         "mhc_head",
@@ -82,9 +80,9 @@ def test_model_loss_log_probs_and_entropy_cover_embedding_and_head(monkeypatch) 
         ),
     )
 
-    input_ids = torch.tensor([1, 3, 5, 7, 9])
-    labels = torch.tensor([2, 4, 6, 8, 10])
-    loss_mask = torch.tensor([1, 1, 0, 1, 1], dtype=torch.float32)
+    input_ids = torch.tensor([1, 3, 5, 7, 9], device=device)
+    labels = torch.tensor([2, 4, 6, 8, 10], device=device)
+    loss_mask = torch.tensor([1, 1, 0, 1, 1], dtype=torch.float32, device=device)
     result = model(
         input_ids=input_ids,
         labels=labels,

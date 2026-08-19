@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Callable
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 from megatron.lite.model.deepseek_v4.lite.model import (
@@ -44,6 +42,7 @@ from megatron.lite.primitive.kernels.vllm_ds4 import (
     OProjectionAdapter,
 )
 from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.parallel.mhc import (
     fold_mhc_hidden_for_pipeline,
     unfold_mhc_hidden_from_pipeline,
@@ -54,76 +53,11 @@ from megatron.lite.primitive.quantization.deployment_block_fp8 import (
 )
 
 
-def _vllm_selected_log_probs(
-    logits: torch.Tensor, labels: torch.Tensor, temperature: float
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Match vLLM's selected-token reduction without changing its gradient.
-
-    Rollout records selected-token log probabilities with vLLM's bounded-memory
-    Triton reduction.  PyTorch's full ``log_softmax`` has the same mathematics
-    but can differ by a few FP32 ulps for large vocabularies.  Use the official
-    vLLM primitive for the forward value and the differentiable PyTorch result
-    for the (mathematically identical) backward.  Keeping the full tensor here
-    is temporary; LinearCE remains the memory-saving P1 replacement.
-    """
-    scaled_logits = logits.float() / temperature
-    token_log_probs = F.log_softmax(scaled_logits, dim=-1)
-    reference = token_log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
-    if not scaled_logits.is_cuda:
-        return reference, token_log_probs
-
-    from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
-
-    # vLLM keeps raw head logits at temperature=1.  Its sampler only creates
-    # FP32 processed logits when temperature (or another processor) requires
-    # it, so preserve that dtype boundary here as well.
-    rollout_logits = logits if temperature == 1.0 else scaled_logits
-    rollout_value = compute_token_logprobs(rollout_logits, labels.unsqueeze(-1)).squeeze(
-        -1
-    )
-    selected = reference + (rollout_value - reference).detach()
-    return selected, token_log_probs
-
-
-@dataclass
-class AttentionAdapters:
-    fused_linear: Callable[[torch.Tensor, nn.Parameter], torch.Tensor]
-    q_linear: Callable[[torch.Tensor, nn.Parameter], torch.Tensor]
-    indexer_q_linear: Callable[[torch.Tensor, nn.Parameter], torch.Tensor]
-    norm: Callable[..., tuple[torch.Tensor, torch.Tensor]]
-    kv_insert: Callable[..., torch.Tensor]
-    flash: FlashMLAAdapter
-    o_project: Callable[..., torch.Tensor]
-    bf16_linear: Callable[[torch.Tensor, nn.Parameter], torch.Tensor] = F.linear
-    fp32_linear: Callable[..., torch.Tensor] = (
-        lambda value, *weights: F.linear(
-            value.float(), torch.cat(weights, dim=0).float()
-        )
-    )
-    compressor: Callable[..., Any] = lambda operation, *args, **kwargs: operation(
-        kv_score=args[0],
-        positions=args[1],
-        ape=args[2],
-        norm_weight=args[3],
-        **kwargs,
-    )
-    indexer: Callable[..., Any] = lambda operation, *args, **kwargs: operation(
-        qr=args[0],
-        index_q=args[1],
-        index_weights=args[2],
-        positions=args[3],
-        **kwargs,
-    )
-
-
-def _default_attention_adapters() -> AttentionAdapters:
-    fused = DeploymentFusedBlockFP8Adapter(cache_weight=True)
-    q_proj = DeploymentBlockFP8Adapter(cache_weight=True)
-    indexer_q_proj = DeploymentBlockFP8Adapter(cache_weight=True)
-    return AttentionAdapters(
-        fused_linear=fused,
-        q_linear=q_proj,
-        indexer_q_linear=indexer_q_proj,
+def _default_attention_ops() -> SimpleNamespace:
+    return SimpleNamespace(
+        fused_linear=DeploymentFusedBlockFP8Adapter(cache_weight=True),
+        q_linear=DeploymentBlockFP8Adapter(cache_weight=True),
+        indexer_q_linear=DeploymentBlockFP8Adapter(cache_weight=True),
         bf16_linear=lambda value, weight: __import__(
             "vllm.model_executor.layers.batch_invariant",
             fromlist=["linear_batch_invariant"],
@@ -137,6 +71,20 @@ def _default_attention_adapters() -> AttentionAdapters:
         kv_insert=DS4KVInsertAdapter(KVCacheLayout.FP8_DS_MLA),
         flash=FlashMLAAdapter(),
         o_project=OProjectionAdapter(),
+        compressor=lambda operation, *args, **kwargs: operation(
+            kv_score=args[0],
+            positions=args[1],
+            ape=args[2],
+            norm_weight=args[3],
+            **kwargs,
+        ),
+        indexer=lambda operation, *args, **kwargs: operation(
+            qr=args[0],
+            index_q=args[1],
+            index_weights=args[2],
+            positions=args[3],
+            **kwargs,
+        ),
     )
 
 
@@ -150,7 +98,6 @@ class _AttentionState(CompressedSparseAttention):
         ps=None,
         layer_idx: int,
         indexer_loss_coeff: float = 0.0,
-        adapters: AttentionAdapters | None = None,
     ):
         ps = ps or ParallelState()
         super().__init__(config, layer_idx=layer_idx, ps=ps)
@@ -162,7 +109,7 @@ class _AttentionState(CompressedSparseAttention):
         )
         self.compress_ratio = max(1, configured_ratio)
         self.indexer_loss_coeff = indexer_loss_coeff
-        self.adapters = adapters or _default_attention_adapters()
+        self.adapters = _default_attention_ops()
         self._projection_streams: list[torch.cuda.Stream] | None = None
         self._projection_events: list[torch.cuda.Event] | None = None
 
@@ -809,10 +756,8 @@ class _VLLMCSAAttention(LiteDeepseekV4CSAAttention):
         ps: ParallelState,
         layer_idx: int,
         indexer_loss_coeff: float,
-        adapters: AttentionAdapters | None,
     ):
         self._indexer_loss_coeff = indexer_loss_coeff
-        self._adapters = adapters
         super().__init__(config, layer_idx=layer_idx, ps=ps)
 
     def _build_attention(
@@ -823,7 +768,6 @@ class _VLLMCSAAttention(LiteDeepseekV4CSAAttention):
             ps=ps,
             layer_idx=layer_idx,
             indexer_loss_coeff=self._indexer_loss_coeff,
-            adapters=self._adapters,
         )
 
     def forward(
@@ -844,11 +788,9 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         *,
         use_deepep: bool = False,
         indexer_loss_coeff: float = 0.0,
-        attention_adapters: AttentionAdapters | None = None,
     ):
         self.config = config
         self._vllm_indexer_loss_coeff = indexer_loss_coeff
-        self._vllm_attention_adapters = attention_adapters
         super().__init__(
             config,
             ps or ParallelState(),
@@ -864,7 +806,6 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
             ps=ps,
             layer_idx=layer_idx,
             indexer_loss_coeff=self._vllm_indexer_loss_coeff,
-            adapters=self._vllm_attention_adapters,
         )
 
     def _build_moe(
@@ -991,33 +932,16 @@ class DeepseekV4Model(LiteDeepseekV4Model):
         train_config=None,
         ps=None,
         *,
-        vpp_chunk_id: int | None = None,
-        use_thd: bool = False,
-        hf_path: str = "",
-        attention_backend_override: str | None = None,
-        mtp_enable: bool = False,
-        mtp_enable_train: bool = False,
-        mtp_detach_encoder: bool = False,
         use_deepep: bool = False,
         indexer_loss_coeff: float = 0.0,
-        attention_adapters: AttentionAdapters | None = None,
     ):
-        del mtp_enable_train, mtp_detach_encoder
-        if vpp_chunk_id is not None:
-            raise NotImplementedError("The vLLM implementation does not support VPP chunks.")
-        if mtp_enable:
-            raise NotImplementedError("The vLLM skeleton does not support MTP.")
         ps = ps or ParallelState()
         self._vllm_indexer_loss_coeff = indexer_loss_coeff
-        self._vllm_attention_adapters = attention_adapters
         train_config = train_config or SimpleNamespace(vpp=1, fp8=False)
         super().__init__(
             config,
             train_config,
             ps,
-            use_thd=use_thd,
-            hf_path=hf_path,
-            attention_backend_override=attention_backend_override,
             mtp_enable=False,
             use_deepep=use_deepep,
         )
@@ -1059,7 +983,6 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             layer_idx=layer_idx,
             use_deepep=use_deepep,
             indexer_loss_coeff=self._vllm_indexer_loss_coeff,
-            attention_adapters=self._vllm_attention_adapters,
         )
 
     def forward(
@@ -1150,11 +1073,7 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             self.norm.weight,
             self.config.rms_norm_eps,
         )
-        logits = self.lm_head(hidden_states)
-        result = {
-            "hidden_states": hidden_states,
-            "logits": logits,
-        }
+        result = {"hidden_states": hidden_states}
         if labels is not None:
             temperature_value = float(
                 temperature.detach().float().item()
@@ -1164,17 +1083,19 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             if temperature_value <= 0:
                 raise ValueError("temperature must be positive")
             flat_labels = labels.reshape(-1).long()
-            if flat_labels.numel() != logits.shape[0]:
+            if flat_labels.numel() != hidden_states.shape[0]:
                 raise ValueError("labels must contain one target per visible token")
-            selected_log_probs, token_log_probs = _vllm_selected_log_probs(
-                logits, flat_labels, temperature_value
+            selected_log_probs, entropy = linear_cross_entropy(
+                hidden_states,
+                self._head_weight_for_fused_ce(hidden_states),
+                flat_labels,
+                temperature_value,
+                self.ps.tp_group,
             )
             token_loss = -selected_log_probs
             result["log_probs"] = selected_log_probs
             if calculate_entropy:
-                result["entropy"] = -(
-                    token_log_probs.exp() * token_log_probs
-                ).sum(dim=-1)
+                result["entropy"] = entropy
             mask = (
                 torch.ones_like(token_loss)
                 if loss_mask is None
@@ -1188,7 +1109,6 @@ class DeepseekV4Model(LiteDeepseekV4Model):
 
 
 __all__ = [
-    "AttentionAdapters",
     "AttentionKernelMetadata",
     "DeepseekV4Layer",
     "DeepseekV4Model",
