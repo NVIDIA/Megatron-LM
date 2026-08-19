@@ -225,6 +225,7 @@ def load_hf_weights(
 ) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
         load_hf_weights as _load,
+        unwrap_model,
     )
 
     index_path = Path(path) / "model.safetensors.index.json"
@@ -237,7 +238,7 @@ def load_hf_weights(
         config, source_block_fp8=source_block_fp8
     )
     _load(model, path, spec, ps, vocab_size=config.vocab_size)
-    spec.bind_source_scales(model, ps)
+    spec.bind_source_scales(unwrap_model(model), ps)
 
 
 def _to_global_expert_name(

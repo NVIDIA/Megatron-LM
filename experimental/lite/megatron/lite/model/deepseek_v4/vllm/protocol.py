@@ -436,9 +436,14 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 forward_inputs=forward_inputs,
             )
 
+    # ``build_training_backend`` replaces this list in-place with Megatron DDP
+    # wrappers for dist-opt (Lite follows the same ownership contract).  Keep
+    # and return that mutated list; returning the raw model would bypass DDP's
+    # grad-accumulation hooks, leaving ``main_grad`` zero while ``.grad`` fills.
+    chunks = [model]
     optimizer, finalize_grads, post_model_load_hook, optimizer_backend = (
         build_training_backend(
-            [model],
+            chunks,
             model_cfg,
             impl_cfg,
             parallel_state,
@@ -463,7 +468,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         extras["post_model_load_hook"] = post_model_load_hook
 
     return ModelBundle(
-        chunks=[model],
+        chunks=chunks,
         parallel_state=parallel_state,
         optimizer=optimizer,
         finalize_grads=finalize_grads,
