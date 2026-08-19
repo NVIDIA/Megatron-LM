@@ -18,7 +18,7 @@ module holds the intent; :mod:`megatron.core.tuning.interception` carries it out
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -86,7 +86,6 @@ class AutotunePolicy:
     verify_strict: bool = False
     enumerate_autotuners: bool = False
     chaos: bool = False
-    _explicit_mode: bool = field(default=False, repr=False)
 
     @classmethod
     def from_env(cls) -> "AutotunePolicy":
@@ -128,7 +127,6 @@ class AutotunePolicy:
             verify_strict=_env("MCORE_AUTOTUNE_VERIFY_STRICT", "DET_AUTOTUNE_VERIFY_STRICT") == "1",
             enumerate_autotuners=_env("MCORE_AUTOTUNE_ENUMERATE", "DET_AUTOTUNE_ENUMERATE") == "1",
             chaos=_env("MCORE_AUTOTUNE_CHAOS", "DET_AUTOTUNE_CHAOS") == "1",
-            _explicit_mode=bool(explicit),
         )
 
     @property
