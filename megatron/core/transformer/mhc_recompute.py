@@ -34,7 +34,8 @@ def uses_mhc_recompute_attn_cuda_graph_split(config) -> bool:
     from megatron.core.transformer.enums import CudaGraphModule
 
     return (
-        config.cuda_graph_impl == "transformer_engine"
+        config.mhc_recompute_attn_cuda_graph_split
+        and config.cuda_graph_impl == "transformer_engine"
         and list(config.cuda_graph_modules or []) == [CudaGraphModule.attn]
         and config.recompute_granularity == "selective"
         and list(config.recompute_modules or []) == ["mhc"]

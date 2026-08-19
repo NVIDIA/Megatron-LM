@@ -67,6 +67,7 @@ MODEL_ARGS:
   # aggregation, post-processing, MLP, and recompute stay eager.
   --cuda-graph-impl: transformer_engine
   --cuda-graph-modules: "[attn]"
+  --mhc-recompute-attn-cuda-graph-split: true
   --cuda-graph-warmup-steps: 3
   --te-rng-tracker: true
 TEST_TYPE: regular
