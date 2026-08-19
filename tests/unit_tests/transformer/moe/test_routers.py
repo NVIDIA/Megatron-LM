@@ -40,19 +40,19 @@ HAVE_DENSE_ROUTER_FUSION = (
 
 
 @pytest.mark.parametrize(
-    "backend,use_hybridep_dense,num_experts,capacity_factor,expected_dtype",
+    "backend,routing_map_mode,num_experts,capacity_factor,expected_dtype",
     [
-        ("deepep", False, 8, None, torch.int64),
-        ("deepepv2", False, 8, None, torch.int64),
-        ("ncclep", False, 8, None, torch.int64),
-        ("hybridep", False, 8, None, None),
-        ("hybridep", True, 1 << 15, None, torch.int16),
-        ("hybridep", True, (1 << 15) + 1, None, None),
-        ("hybridep", True, 8, 1.0, None),
+        ("deepep", "bool", 8, None, torch.int64),
+        ("deepepv2", "bool", 8, None, torch.int64),
+        ("ncclep", "bool", 8, None, torch.int64),
+        ("hybridep", "bool", 8, None, None),
+        ("hybridep", "indices", 1 << 15, None, torch.int16),
+        ("hybridep", "indices", (1 << 15) + 1, None, None),
+        ("hybridep", "indices", 8, 1.0, None),
     ],
 )
 def test_dense_route_indices_dtype(
-    monkeypatch, backend, use_hybridep_dense, num_experts, capacity_factor, expected_dtype
+    monkeypatch, backend, routing_map_mode, num_experts, capacity_factor, expected_dtype
 ):
     monkeypatch.setattr(router_module, "fused_topk_with_score_function_supports_topk_indices", True)
     monkeypatch.setattr(router_module, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
@@ -62,7 +62,7 @@ def test_dense_route_indices_dtype(
             moe_token_dispatcher_type="flex",
             moe_expert_capacity_factor=capacity_factor,
             moe_flex_dispatcher_backend=backend,
-            moe_hybridep_use_dense_routing_map=use_hybridep_dense,
+            moe_hybridep_routing_map_mode=routing_map_mode,
             num_moe_experts=num_experts,
         ),
         expt_tp_group=SimpleNamespace(size=lambda: 1),
@@ -287,7 +287,7 @@ class TestTop2Router:
         self.router.config.moe_router_fusion = True
         self.router.config.moe_token_dispatcher_type = "flex"
         self.router.config.moe_flex_dispatcher_backend = "hybridep"
-        self.router.config.moe_hybridep_use_dense_routing_map = True
+        self.router.config.moe_hybridep_routing_map_mode = "indices"
         hidden_states = torch.randn(
             (8, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
         )
