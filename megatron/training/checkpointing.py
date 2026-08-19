@@ -3016,6 +3016,14 @@ def load_checkpoint(
         ):
             optimizer.quantize_and_sync_model_params_from_main_params()
     else:
+        if getattr(args, 'fp8_param_gather', False) or getattr(args, 'fp4_param_gather', False):
+            print_rank_0(
+                'WARNING: quantized params were loaded without the optimizer main params, so '
+                'they were re-quantized from the dequantized values in the checkpoint rather '
+                'than re-derived from the main params. The block scales need not match the '
+                'ones the saving job chose, so the weights are not guaranteed to be bit-wise '
+                'identical to those saved. Load the optimizer state to avoid this.'
+            )
         if (args.fp16 or args.bf16) and optimizer is not None:
             if args.load_main_params_from_ckpt:
                 optimizer.reload_model_params(state_dict=state_dict)
