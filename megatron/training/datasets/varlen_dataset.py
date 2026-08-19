@@ -486,6 +486,7 @@ class MockVarlenDataset(MockSFTDataset):
             }
         else:
             mock_config = load_json_arg(config.varlen_mock_dataset_config_json)
+        mock_config["vocab_size"] = config.tokenizer.vocab_size
         return MockSFTLowLevelDataset(**mock_config)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
