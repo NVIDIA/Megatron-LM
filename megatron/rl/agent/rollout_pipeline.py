@@ -470,26 +470,7 @@ class RolloutPipeline:
                     batch_id=first.item.batch_id,
                     index_in_batch=first.item.index_in_batch,
                 )
-                # All-placeholder groups carry zero salvageable work and must be refilled.
-                _placeholder = all(not rollout.trajectory for rollout in group.rollouts)
-                if _placeholder or self._should_drop(group):
-                    if _placeholder:
-                        self.refilled_placeholder_groups += 1
-                        if (
-                            self.refilled_placeholder_groups == 1
-                            or self.refilled_placeholder_groups % 32 == 0
-                        ):
-                            logger.warning(
-                                "Refilling all-placeholder group (batch %s slot %s): %d "
-                                "refilled so far. Groups whose episodes all failed are "
-                                "regenerated instead of reaching the trainer; a climbing "
-                                "count means episodes are failing upstream of the pipeline.",
-                                group.batch_id,
-                                group.index_in_batch,
-                                self.refilled_placeholder_groups,
-                            )
-                    else:
-                        self.filtered_count += 1
+                if self._decide_drop(group):
                     task = asyncio.create_task(self._regenerate_group(group))
                     self._regen_tasks.add(task)
                     task.add_done_callback(self._regen_tasks.discard)
@@ -505,11 +486,26 @@ class RolloutPipeline:
         finally:
             self.output_queue.shutdown()
 
-    def _should_drop(self, group: RolloutGroup) -> bool:
-        """A group with zero reward variance carries no learning signal."""
-        if not self.request.filter_groups_with_same_reward:
-            return False
-        return np.std([rollout.reward for rollout in group.rollouts]) <= 1e-6
+    def _decide_drop(self, group: RolloutGroup) -> bool:
+        """Decide whether to drop this group"""
+        if all(not rollout.trajectory for rollout in group.rollouts):
+            self.filtered_count += 1
+            self.refilled_placeholder_groups += 1
+            if self.refilled_placeholder_groups == 1 or self.refilled_placeholder_groups % 32 == 0:
+                logger.warning(
+                    "Refilling all-placeholder group (batch %s slot %s): %d refilled so far. "
+                    "Groups whose episodes all failed are regenerated; a climbing count means "
+                    "a likely failure upstream of the pipeline.",
+                    group.batch_id,
+                    group.index_in_batch,
+                    self.refilled_placeholder_groups,
+                )
+            return True
+        if self.request.filter_groups_with_same_reward:
+            if np.std([rollout.reward for rollout in group.rollouts]) <= 1e-6:
+                self.filtered_count += 1
+                return True
+        return False
 
     @trace_async_exceptions(verbose=True)
     async def _regenerate_group(self, dropped: RolloutGroup) -> None:

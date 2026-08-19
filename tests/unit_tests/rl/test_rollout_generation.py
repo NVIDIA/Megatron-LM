@@ -518,7 +518,9 @@ class TestGroupedRollouts:
             async for group in it:
                 groups.append(group)
                 refilled_counts.append(pipeline.refilled_placeholder_groups)
-                if streaming and len(groups) >= expected_count:
+                # stage_prepare no longer stops itself for non-streaming requests
+                # (persistent-stream redesign); every caller bounds its own pull.
+                if len(groups) >= expected_count:
                     break
 
         assert len(groups) == expected_count
@@ -545,8 +547,11 @@ class TestGroupedRollouts:
                 assert sorted(g.index_in_batch for g in batch) == list(range(num_groups))
         if not streaming:
             expected_refills = num_placeholder if all_placeholder else 0
-            # One extra prepare per refilled group, and no under-delivery.
-            assert gen.prepare_group_rollout_calls == num_groups + expected_refills
+            # No under-delivery: exactly the expected refills by the time the
+            # observed window is fully delivered. (stage_prepare no longer stops
+            # at one window's worth, so it also eagerly preps later batches in
+            # the background; gen.prepare_group_rollout_calls counts those too
+            # and is no longer a useful bound here.)
             assert refilled_counts[-1] == expected_refills
 
     @pytest.mark.asyncio
