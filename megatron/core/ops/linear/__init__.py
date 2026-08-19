@@ -1,8 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Linear implementations, grouped by backend. See :mod:`.contract` for the requirements."""
+"""Linear implementations. :mod:`.contract` says what they meet, :mod:`.backends` has them."""
 
-from megatron.core.ops.linear import inference, megatron, transformer_engine
+from megatron.core.inference.ops.backends import LinearInference
+from megatron.core.ops.linear.backends import LinearLocal, LinearTE
 from megatron.core.ops.linear.contract import (
     COLUMN_PARALLEL_LAYER_NORM_LINEAR,
     COLUMN_PARALLEL_LINEAR,
@@ -13,12 +14,12 @@ from megatron.core.ops.linear.contract import (
     LinearSlots,
 )
 
-#: Backend name -> the class that owns this family's slots. Add a backend by adding its module
-#: and one entry here; a backend that needs an optional package declares it as ``REQUIRES``.
+#: Backend name -> the class that owns this family's slots. Add a backend by adding its class
+#: to backends.py and one entry here; one that needs an optional package declares ``REQUIRES``.
 BACKENDS = {
-    "local": megatron.Linear,
-    "transformer_engine": transformer_engine.Linear,
-    "inference_optimized": inference.Linear,
+    "local": LinearLocal,
+    "transformer_engine": LinearTE,
+    "inference_optimized": LinearInference,
 }
 
 #: Used when the selected preset has no entry above.

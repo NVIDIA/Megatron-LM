@@ -17,13 +17,12 @@ __all__ = ["BackendSpecProvider"]
 
 
 def _backend_name(owner: object) -> str:
-    """``module.Class`` for a backend, since the class name alone is deliberately generic.
+    """How a backend identifies itself in a message.
 
-    Every backend module names its class after the family, so ``Linear`` says nothing on its
-    own; the module is what identifies the backend.
+    Each class is named for the family and the backend key that selects it -- ``NormApex``,
+    ``LinearTE`` -- so the class name alone is enough.
     """
-    kind = type(owner)
-    return f"{kind.__module__.rsplit('.', 1)[-1]}.{kind.__name__}"
+    return type(owner).__name__
 
 
 class BackendSpecProvider(NormSlots, LinearSlots, AttentionSlots, MoeSlots, LossSlots):

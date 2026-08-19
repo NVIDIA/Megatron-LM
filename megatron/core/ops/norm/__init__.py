@@ -1,19 +1,20 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Norm implementations, grouped by backend. See :mod:`.contract` for the requirements."""
+"""Norm implementations. :mod:`.contract` says what they meet, :mod:`.backends` has them."""
 
-from megatron.core.ops.norm import apex, megatron, reference, transformer_engine
+from megatron.core.inference.ops.backends import NormInference
+from megatron.core.ops.norm.backends import NormApex, NormLocal, NormTE, NormTorch
 from megatron.core.ops.norm.contract import FAMILY, LAYER_NORM, OPERATIONS, NormSlots
-from megatron.core.ops.norm.reference import L2Norm, WrappedTorchNorm
+from megatron.core.transformer.torch_norm import L2Norm, WrappedTorchNorm
 
-#: Backend name -> the class that owns this family's slots. Add a backend by adding its module
-#: and one entry here; a backend that needs an optional package declares it as ``REQUIRES``.
+#: Backend name -> the class that owns this family's slots. Add a backend by adding its class
+#: to backends.py and one entry here; one that needs an optional package declares ``REQUIRES``.
 BACKENDS = {
-    "local": megatron.Norm,
-    "transformer_engine": transformer_engine.Norm,
-    "inference_optimized": transformer_engine.InferenceNorm,
-    "torch": reference.Norm,
-    "apex": apex.Norm,
+    "local": NormLocal,
+    "transformer_engine": NormTE,
+    "inference_optimized": NormInference,
+    "torch": NormTorch,
+    "apex": NormApex,
 }
 
 #: Used when the selected preset has no entry above.

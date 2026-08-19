@@ -25,13 +25,17 @@ adding a family is a milestone.
 ```
 megatron/core/ops/norm/
   contract.py               # the contract, the Operation constants, and the slot methods
+  backends.py               # every implementation, side by side
   __init__.py               # BACKENDS, DEFAULT
-  reference.py apex.py megatron.py transformer_engine.py
 ```
 
-Every backend module exposes one class named for its family — `reference.Norm`,
-`transformer_engine.Norm`, `megatron.Linear`, `inference.Moe` — so a table reads as
-"this name, that vendor's implementation" and nothing collides with the targets themselves.
+Three files per family, always. Each backend class is named for the family and the key that
+selects it — `NormApex`, `NormTE`, `LinearLocal`, `MoeTE` — so `--op-backend layer_norm=apex`
+and `NormApex` are the same word, and nothing collides with the target classes themselves
+(`TENorm` and `TELinear` are real modules in `extensions/transformer_engine.py`).
+
+Backends whose implementations belong to another subsystem live there and are referenced by
+name: the inference-optimized ones are in `megatron/core/inference/ops/backends.py`.
 
 A family can split into sub-folders when its operations have disjoint backend sets, which is
 how `attention.dsa` will work: `FAMILY = "attention.dsa"` is the module path, so the resolver
@@ -66,12 +70,13 @@ backend owns raises and says how to select one.
 
 Say you want Liger's RMSNorm.
 
-1. Write `megatron/core/ops/norm/liger.py`. Meet the contract in `norm/contract.py`, keep the
-   import lazy, and let `_availability.require` produce the error when it is missing:
+1. Add a class to `megatron/core/ops/norm/backends.py`. Meet the contract in
+   `norm/contract.py`, and keep the target import inside the method that returns it — nothing
+   in that file may import an optional package at module scope:
 
    ```python
-   class Norm:
-       """Owns ``layer_norm`` using Liger's fused RMSNorm."""
+   class NormLiger:
+       """Liger's fused RMSNorm."""
 
        REQUIRES = "liger_kernel"
 
@@ -91,9 +96,7 @@ Say you want Liger's RMSNorm.
 2. Add one entry to `BACKENDS` in `norm/__init__.py`:
 
    ```python
-   from megatron.core.ops.norm import liger
-   ...
-   "liger": liger.Norm,
+   "liger": NormLiger,
    ```
 
 That is the whole change. Nothing central moves, no call site changes, and
@@ -102,14 +105,14 @@ is parametrized off `BACKENDS`, so the new backend is covered the moment it is r
 it misses a slot its family declares, that test fails by name.
 
 Backends that need a setting bound up front expose `from_options(options)` instead of a bare
-constructor; the loss family's `transformer_engine.Loss` does this for CUDA-graph capture.
+constructor; the loss family's `LossTEFused` does this for CUDA-graph capture.
 
 ## Adding a family
 
-Create `megatron/core/ops/<family>/contract.py` with the contract, the `Operation` constants,
-and a `*Slots` class whose methods raise `unowned(...)`. Add `BACKENDS` and `DEFAULT` to the
-family's `__init__.py`, list the family in `resolve.py:_FAMILIES`, and add its `*Slots` to the
-bases of `BackendSpecProvider`.
+Create `megatron/core/ops/<family>/` with `contract.py` (the contract, the `Operation`
+constants, and a `*Slots` class whose methods raise `unowned(...)`), `backends.py`, and an
+`__init__.py` carrying `BACKENDS` and `DEFAULT`. Then list the family in
+`resolve.py:_FAMILIES` and add its `*Slots` to the bases of `BackendSpecProvider`.
 
 Declare an operation only when an existing class, callable, or builder already owns that
 boundary at construction time. An implementation that has to branch on shape, phase, or

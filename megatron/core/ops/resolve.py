@@ -174,9 +174,7 @@ def _override_owners(options: BackendOptions) -> dict[Operation, object]:
     }
 
 
-def _layered_owners(
-    overlay: object, owners: dict[Operation, object]
-) -> dict[Operation, object]:
+def _layered_owners(overlay: object, owners: dict[Operation, object]) -> dict[Operation, object]:
     """Give ``overlay`` the slots it implements, and leave the rest where they are.
 
     A partial backend layered over an assembled provider -- Kitchen is the one in tree --

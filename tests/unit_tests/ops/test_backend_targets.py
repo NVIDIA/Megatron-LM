@@ -12,7 +12,7 @@ import pytest
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.ops import get_backend
 from megatron.core.ops._availability import is_installed
-from megatron.core.ops.norm.reference import WrappedTorchNorm
+from megatron.core.ops.norm import WrappedTorchNorm
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 
@@ -83,7 +83,7 @@ class TestTransformerEngineBackend:
 
     def test_norm_targets(self):
         from megatron.core.extensions.transformer_engine import TENorm
-        from megatron.core.ops.norm.transformer_engine import TENormWithResidual
+        from megatron.core.ops.norm.backends import TENormWithResidual
 
         backend = get_backend("transformer_engine")
         assert backend.layer_norm() is TENorm

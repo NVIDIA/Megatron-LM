@@ -17,7 +17,7 @@ from megatron.core.ops import (
 )
 from megatron.core.ops.linear.contract import COLUMN_PARALLEL_LAYER_NORM_LINEAR
 from megatron.core.ops.norm import LAYER_NORM, WrappedTorchNorm
-from megatron.core.ops.norm import reference as reference_norm
+from megatron.core.ops.norm.backends import NormTorch
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 
 _needs_te = pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required")
@@ -51,9 +51,9 @@ class TestAssembly:
 
     def test_assembly_costs_nothing_at_call_time(self):
         """The owner's bound method is attached directly, with no forwarding wrapper."""
-        owner = reference_norm.Norm()
+        owner = NormTorch()
         provider = BackendSpecProvider({LAYER_NORM: owner})
-        assert provider.layer_norm.__func__ is reference_norm.Norm.layer_norm
+        assert provider.layer_norm.__func__ is NormTorch.layer_norm
         assert provider.layer_norm.__self__ is owner
 
     def test_derived_query_follows_the_override(self):
@@ -69,12 +69,12 @@ class TestAssembly:
         assert provider.fuse_layernorm_and_linear() is True
 
     def test_owner_without_the_operation_is_rejected(self):
-        with pytest.raises(ValueError, match="reference.Norm.*does not implement core_attention"):
-            BackendSpecProvider({find_operation("core_attention"): reference_norm.Norm()})
+        with pytest.raises(ValueError, match="NormTorch.*does not implement core_attention"):
+            BackendSpecProvider({find_operation("core_attention"): NormTorch()})
 
     def test_repr_shows_who_owns_what(self):
-        provider = BackendSpecProvider({LAYER_NORM: reference_norm.Norm()})
-        assert "layer_norm=reference.Norm" in repr(provider)
+        provider = BackendSpecProvider({LAYER_NORM: NormTorch()})
+        assert "layer_norm=NormTorch" in repr(provider)
 
 
 class TestBackendNamesAreScopedToTheirOperation:
@@ -150,3 +150,62 @@ class TestConflictingSelectors:
 
 def test_every_operation_is_declared_by_exactly_one_family():
     assert {op.family for op in operations()} == {"norm", "linear", "attention", "moe", "loss"}
+
+
+class _OverlayLinear:
+    """Stand-in for a quantized linear target."""
+
+
+class _PartialOverlay(BackendSpecProvider):
+    """Stands in for Kitchen: owns a couple of slots and inherits the rest.
+
+    Kitchen was written against a protocol that declared eight methods, so it cannot forward
+    the slots added since. Subclassing without overriding those is exactly its shape.
+    """
+
+    def __init__(self, fallback):
+        self._fallback = fallback
+
+    def column_parallel_linear(self):
+        return _OverlayLinear
+
+
+class TestLayeredBackend:
+    """A partial backend layered over an assembled provider, which is how Kitchen works."""
+
+    @staticmethod
+    def _build(monkeypatch):
+        from megatron.core.ops import kitchen, resolve
+
+        monkeypatch.setattr(
+            kitchen, "kitchen_backend", lambda fallback, options: _PartialOverlay(fallback)
+        )
+        monkeypatch.setattr(resolve, "require", lambda module_name: None)
+        return build_spec_provider(BackendOptions(transformer_impl="local", use_kitchen=True))
+
+    def test_overlay_takes_the_slots_it_implements(self, monkeypatch):
+        assert self._build(monkeypatch).column_parallel_linear() is _OverlayLinear
+
+    def test_slots_the_overlay_predates_stay_with_the_base(self, monkeypatch):
+        """It inherits raising stubs for these, so handing them over would break the model."""
+        provider = self._build(monkeypatch)
+        assert provider.moe_router() is None
+        assert provider.vocab_parallel_cross_entropy() is not None
+        assert provider.layer_norm(rms_norm=True) is WrappedTorchNorm
+
+    def test_an_explicit_override_still_wins_over_the_overlay(self, monkeypatch):
+        from megatron.core.ops import kitchen, resolve
+
+        monkeypatch.setattr(
+            kitchen, "kitchen_backend", lambda fallback, options: _PartialOverlay(fallback)
+        )
+        monkeypatch.setattr(resolve, "require", lambda module_name: None)
+        provider = build_spec_provider(
+            BackendOptions(
+                transformer_impl="local",
+                use_kitchen=True,
+                operation_backends={"layer_norm": "torch"},
+            )
+        )
+        assert provider.column_parallel_linear() is _OverlayLinear
+        assert provider.layer_norm(rms_norm=False) is WrappedTorchNorm
