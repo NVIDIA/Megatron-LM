@@ -1195,7 +1195,7 @@ class _HybridEPManager(_DispatchManager):
             self.topk_idx = provided_topk_idx.to(torch.int16)
         elif (
             HAVE_HYBRIDEP_DENSE_ROUTING
-            and self.config.moe_hybridep_use_dense_routing_map
+            and self.config.moe_hybridep_routing_map_mode == "indices"
             and self.num_experts <= _HYBRIDEP_INT16_EXPERT_LIMIT
         ):
             _, self.topk_idx = torch.topk(self.token_probs, self.router_topk, dim=-1)
