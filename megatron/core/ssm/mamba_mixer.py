@@ -23,6 +23,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.common.intermediate_extraction import (
     scatter_intermediate_conv,
@@ -366,6 +367,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                     nn.init.uniform_(self.conv1d_weight, -self.conv_init, self.conv_init)
                 else:
                     nn.init.kaiming_uniform_(self.conv1d_weight, a=math.sqrt(5))
+
+        # Both of this mixer's conv layouts need it; see assert_causal_conv1d_deterministic.
+        assert_causal_conv1d_deterministic(config.deterministic_mode)
 
         self.activation = "silu"
         self.act = nn.SiLU()
