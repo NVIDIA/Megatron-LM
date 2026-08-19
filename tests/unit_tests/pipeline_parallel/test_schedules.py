@@ -17,7 +17,10 @@ from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
@@ -26,6 +29,28 @@ from megatron.core.transformer.cuda_graphs import (
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+def test_reset_activation_offload_uses_language_model_group(mocker):
+    reset = mocker.patch.object(schedule.off_interface, "reset")
+    language_group = object()
+    collection = MultiModuleProcessGroupCollection(
+        module_pgs={
+            "encoder_1": object(),
+            "encoder_2": object(),
+            "llm": SimpleNamespace(tp_dp_cp=language_group),
+        },
+        language_model_module_name="llm",
+    )
+    schedule._reset_activation_offload(collection)
+    reset.assert_called_once_with(process_group=language_group)
+
+    reset.reset_mock()
+    collection = MultiModuleProcessGroupCollection(
+        module_pgs={"encoder_1": object(), "encoder_2": object()}
+    )
+    schedule._reset_activation_offload(collection)
+    reset.assert_not_called()
 
 
 def _populate_embedding_and_position_groups(pp_group):
