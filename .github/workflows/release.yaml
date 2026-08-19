@@ -83,7 +83,7 @@ jobs:
       && !(needs.pre-flight.outputs.docs_only == 'true'
            || needs.pre-flight.outputs.is_merge_group == 'true'
            || needs.pre-flight.outputs.is_deployment_workflow == 'true')
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@6dfd1b435cca9e3c2640f7b31c4f37e42c6bf796 # v1.4.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_bump.yml@dd5b4dcb2201e6db8f3656a3ac1e8490356e02c0 # PR NVIDIA-NeMo/FW-CI-templates#554
     with:
       release-branch-pattern: "core_[rv][0-9]*.[0-9]*.[0-9]*"
       release-ref: ${{ inputs.release-ref || github.sha }}
@@ -93,6 +93,10 @@ jobs:
       restrict-to-admins: true
       app-id: ${{ vars.BOT_ID }}
       library-name: Megatron Core
+      prepare-release-docs: true
+      docs-version-directory: docs
+      docs-target-path: megatron-core/developer-guide
+      publish-as-latest: true
       bump-targets: |
         [
           {"python-package": "megatron.core", "src-dir": ""},
@@ -112,7 +116,7 @@ jobs:
       )
     uses: ./.github/workflows/_build_test_publish_wheel.yml
     with:
-      ref: ${{ inputs.release-ref || github.sha }}
+      ref: ${{ needs.bump.outputs.prepared-release-ref || inputs.release-ref || github.sha }}
       dry-run: ${{ inputs.dry-run || false }}
       no-publish: ${{ github.event_name != 'workflow_dispatch' || inputs.dry-run }}
     secrets: inherit  # pragma: allowlist secret
@@ -125,7 +129,7 @@ jobs:
       && !cancelled()
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_finalize.yml@6a2f81195fd910ae91d3c001d2e32ceb6d82e975 # v1.0.0
     with:
-      release-ref: ${{ inputs.release-ref || github.sha }}
+      release-ref: ${{ needs.bump.outputs.prepared-release-ref || inputs.release-ref || github.sha }}
       release-version: ${{ needs.bump.outputs.release-version }}
       library-name: Megatron Core
       pypi-name: megatron-core
