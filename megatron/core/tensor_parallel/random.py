@@ -832,8 +832,7 @@ class CheckpointWithoutOutputManager:
     def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
         """Discard all checkpoint outputs to save memory and register unified recompute hook."""
         for ckpt in self.checkpoints:
-            for output in ckpt.outputs:
-                output.untyped_storage().resize_(0)
+            ckpt._discard_outputs()
 
         # Register unified recompute hook
         if hook_tensor.requires_grad:
@@ -983,6 +982,19 @@ class CheckpointWithoutOutput(object):
         self.outputs = None
         self.ctx = None
 
+    def _discard_outputs(self):
+        """Release output storage, preserving outputs that alias retained inputs."""
+        if self.retain_input_tensors:
+            # Skip outputs whose storage is shared with a saved input — freeing those
+            # would destroy the data needed for recomputation (e.g. TE.ops.Sequential
+            # operations with MakeExtraOutput).
+            for output in self.outputs:
+                if output.untyped_storage().data_ptr() not in self._saved_input_ptrs:
+                    output.untyped_storage().resize_(0)
+        else:
+            for output in self.outputs:
+                output.untyped_storage().resize_(0)
+
     def discard_output_and_register_recompute(self, hook_tensor):
         """
         Release the output tensor storages and register the recompute function as a grad hook of
@@ -1000,16 +1012,7 @@ class CheckpointWithoutOutput(object):
             return
 
         # Release output tensor memory while keeping metadata for backward.
-        if self.retain_input_tensors:
-            # Skip outputs whose storage is shared with a saved input — freeing those
-            # would destroy the data needed for recomputation (e.g. TE.ops.Sequential
-            # operations with MakeExtraOutput).
-            for output in self.outputs:
-                if output.untyped_storage().data_ptr() not in self._saved_input_ptrs:
-                    output.untyped_storage().resize_(0)
-        else:
-            for output in self.outputs:
-                output.untyped_storage().resize_(0)
+        self._discard_outputs()
 
         # register the recomputation as a backward hook, when the the gradient of the hook_tensor
         # is computed, the recomputation will be triggered. The hook_tensor should be selected

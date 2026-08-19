@@ -5,6 +5,7 @@ import torch
 
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
+    CheckpointWithoutOutputManager,
     CudaRNGStatesTracker,
     checkpoint,
     convert_cuda_rng_state,
@@ -328,7 +329,8 @@ class _FusedResidualNorm(torch.autograd.Function):
         return grad_x, grad_weight
 
 
-def test_checkpoint_without_output_retain_input_tensors():
+@pytest.mark.parametrize("use_manager", [False, True])
+def test_checkpoint_without_output_retain_input_tensors(use_manager):
     """CheckpointWithoutOutput with retain_input_tensors=True must not free
     outputs that share storage with inputs (the fused residual norm pattern)."""
 
@@ -342,10 +344,14 @@ def test_checkpoint_without_output_retain_input_tensors():
         return normed + residual
 
     def checkpoint_forward(x):
-        ckpt = CheckpointWithoutOutput(retain_input_tensors=True)
+        manager = CheckpointWithoutOutputManager() if use_manager else None
+        ckpt = CheckpointWithoutOutput(ckpt_manager=manager, retain_input_tensors=True)
         normed, residual = ckpt.checkpoint(fused_norm, x)
         y = normed + residual
-        ckpt.discard_output_and_register_recompute(y)
+        if manager is None:
+            ckpt.discard_output_and_register_recompute(y)
+        else:
+            manager.discard_all_outputs_and_register_unified_recompute(y)
         return y
 
     Utils.initialize_model_parallel()
