@@ -2629,14 +2629,14 @@ def _add_regularization_args(parser):
     group.add_argument(
         '--muon-ht-eps',
         type=float,
-        default=1e-8,
+        default=1e-15,
         help='Minimum norm used for numerical stability by muon_ht',
     )
     group.add_argument(
         '--muon-ht-radius',
         type=float,
         default=None,
-        help='Optional fixed global Frobenius norm for all muon_ht parameters',
+        help='Fixed global Frobenius norm required to initialize all muon_ht parameters',
     )
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '

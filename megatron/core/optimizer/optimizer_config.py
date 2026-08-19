@@ -292,12 +292,13 @@ class OptimizerConfig:
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
-    muon_ht_eps: float = 1e-8
+    muon_ht_eps: float = 1e-15
     """Minimum norm used for numerical stability by TensorParallelMuonHT."""
 
     muon_ht_radius: float | None = None
-    """Optional fixed global Frobenius norm for TensorParallelMuonHT parameters. If unset,
-    each matrix preserves its own initial norm."""
+    """Fixed global Frobenius norm required by TensorParallelMuonHT. Megatron's optimizer
+    factory initializes every Muon-managed matrix to this radius before constructing
+    mixed-precision parameter copies."""
 
     # Lion.
     lion_beta1: float = 0.95

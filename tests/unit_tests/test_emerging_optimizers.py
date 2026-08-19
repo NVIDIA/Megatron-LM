@@ -149,17 +149,18 @@ def test_muon_ht_normalizes_update_and_preserves_weight_norm():
     parameter = torch.nn.Parameter(
         torch.arange(1, 13, dtype=torch.float32, device='cuda').reshape(3, 4)
     )
+    radius = parameter.norm()
     optimizer = TensorParallelMuonHT(
         params=[parameter],
         lr=0.1,
         momentum=0.0,
         nesterov=False,
         weight_decay=0.0,
+        hyperball_radius=radius.item(),
         pg_collection=None,
         tp_mode="duplicated",
     )
     update = torch.arange(12, 0, -1, dtype=torch.float32, device='cuda').reshape(3, 4)
-    radius = parameter.norm()
 
     with torch.no_grad():
         optimizer.pre_weight_update_fn_inplace(parameter, update)
@@ -171,49 +172,127 @@ def test_muon_ht_normalizes_update_and_preserves_weight_norm():
     torch.testing.assert_close(parameter.norm(), radius)
 
 
-def test_muon_ht_optimizer_step_preserves_initial_weight_norm():
-    """The emerging-optimizer step should invoke the Hyperball pre/post hooks."""
+def test_muon_ht_sets_update_below_eps_to_zero():
+    """An update whose norm is below epsilon should be treated as numerical zero."""
+    parameter = torch.nn.Parameter(torch.tensor([[2.0, 0.0]], device='cuda'))
+    optimizer = TensorParallelMuonHT(
+        params=[parameter], weight_decay=0.0, hyperball_eps=0.25, hyperball_radius=2.0
+    )
+    update = torch.tensor([[0.125, 0.0]], device='cuda')
+
+    with torch.no_grad():
+        optimizer.pre_weight_update_fn_inplace(parameter, update)
+        torch.testing.assert_close(update, torch.zeros_like(update), rtol=0.0, atol=0.0)
+        parameter.add_(update, alpha=-optimizer.param_groups[0]["lr"])
+        optimizer.post_weight_update_fn_inplace(parameter)
+
+    torch.testing.assert_close(parameter, torch.tensor([[2.0, 0.0]], device='cuda'))
+
+
+def test_muon_ht_scales_update_equal_to_eps_to_weight_norm():
+    """An update whose norm equals epsilon should remain numerically nonzero."""
+    parameter = torch.nn.Parameter(torch.tensor([[2.0, 0.0]], device='cuda'))
+    optimizer = TensorParallelMuonHT(
+        params=[parameter], weight_decay=0.0, hyperball_eps=0.25, hyperball_radius=2.0
+    )
+    update = torch.tensor([[0.25, 0.0]], device='cuda')
+
+    with torch.no_grad():
+        optimizer.pre_weight_update_fn_inplace(parameter, update)
+        torch.testing.assert_close(update.norm(), torch.tensor(2.0, device='cuda'))
+        parameter.add_(update, alpha=-optimizer.param_groups[0]["lr"])
+        optimizer.post_weight_update_fn_inplace(parameter)
+
+
+def test_muon_ht_sets_weight_below_eps_to_zero():
+    """A weight whose norm is below epsilon should be treated as numerical zero."""
+    parameter = torch.nn.Parameter(torch.tensor([[2.0, 0.0]], device='cuda'))
+    optimizer = TensorParallelMuonHT(
+        params=[parameter], weight_decay=0.0, hyperball_eps=0.25, hyperball_radius=2.0
+    )
+    update = torch.tensor([[2.0, 0.0]], device='cuda')
+
+    with torch.no_grad():
+        parameter.copy_(torch.tensor([[0.125, 0.0]], device='cuda'))
+        optimizer.pre_weight_update_fn_inplace(parameter, update)
+        parameter.add_(update, alpha=-optimizer.param_groups[0]["lr"])
+        optimizer.post_weight_update_fn_inplace(parameter)
+
+    torch.testing.assert_close(parameter, torch.zeros_like(parameter), rtol=0.0, atol=0.0)
+
+
+def test_muon_ht_optimizer_step_preserves_configured_radius_without_state():
+    """The optimizer step should preserve its configured radius without persistent state."""
     model = torch.nn.Linear(16, 8, bias=False, dtype=torch.float32, device='cuda')
     model.weight.data.normal_(0.0, 0.1)
+    initial_radius = model.weight.norm().detach().clone()
     optimizer = TensorParallelMuonHT(
         params=[model.weight],
         lr=0.01,
         momentum=0.95,
         nesterov=True,
         weight_decay=0.0,
+        hyperball_radius=initial_radius.item(),
         num_ns_steps=5,
         pg_collection=None,
         tp_mode="duplicated",
     )
-    initial_radius = model.weight.norm().detach().clone()
 
     loss = model(torch.randn(4, 16, device='cuda')).sum()
     loss.backward()
     optimizer.step()
 
     torch.testing.assert_close(model.weight.norm(), initial_radius, rtol=1e-5, atol=1e-6)
-    assert model.weight._muon_ht_radius is not None
+    assert not hasattr(model.weight, "_muon_ht_radius")
     assert "hyperball_R" not in optimizer.state[model.weight]
 
     optimizer.load_state_dict(optimizer.state_dict())
-    assert model.weight._muon_ht_radius is None
+    restored_radius = model.weight.norm().detach().clone()
+    update = torch.ones_like(model.weight)
     with torch.no_grad():
-        optimizer.pre_weight_update_fn_inplace(model.weight, torch.ones_like(model.weight))
-    torch.testing.assert_close(model.weight._muon_ht_radius, initial_radius, rtol=1e-5, atol=1e-6)
+        optimizer.pre_weight_update_fn_inplace(model.weight, update)
+        torch.testing.assert_close(update.norm(), restored_radius, rtol=1e-5, atol=1e-6)
+        model.weight.add_(update, alpha=-optimizer.param_groups[0]["lr"])
+        optimizer.post_weight_update_fn_inplace(model.weight)
+    torch.testing.assert_close(model.weight.norm(), restored_radius, rtol=1e-5, atol=1e-6)
 
 
 def test_muon_ht_fixed_radius_and_validation():
-    """A fixed radius should rescale at construction and weight decay should be rejected."""
+    """A fixed radius should be applied by the hooks and weight decay should be rejected."""
     parameter = torch.nn.Parameter(torch.ones(3, 4, dtype=torch.float32, device='cuda'))
+    parameter.data.mul_(2.5 / parameter.norm())
+    initial_parameter = parameter.detach().clone()
     optimizer = TensorParallelMuonHT(params=[parameter], weight_decay=0.0, hyperball_radius=2.5)
 
-    torch.testing.assert_close(parameter.norm(), torch.tensor(2.5, device='cuda'))
+    torch.testing.assert_close(parameter, initial_parameter)
     assert optimizer.hyperball_radius == 2.5
+
+    update = torch.arange(1, 13, dtype=torch.float32, device='cuda').reshape(3, 4)
+    with torch.no_grad():
+        optimizer.pre_weight_update_fn_inplace(parameter, update)
+        torch.testing.assert_close(update.norm(), torch.tensor(2.5, device='cuda'))
+        parameter.add_(update, alpha=-optimizer.param_groups[0]["lr"])
+        optimizer.post_weight_update_fn_inplace(parameter)
+    torch.testing.assert_close(parameter.norm(), torch.tensor(2.5, device='cuda'))
 
     with pytest.raises(ValueError, match="set weight_decay=0.0"):
         TensorParallelMuonHT(
-            params=[torch.nn.Parameter(torch.ones(2, 2, device='cuda'))], weight_decay=0.01
+            params=[torch.nn.Parameter(torch.ones(2, 2, device='cuda'))],
+            weight_decay=0.01,
+            hyperball_radius=2.0,
         )
+    with pytest.raises(TypeError, match="hyperball_radius"):
+        TensorParallelMuonHT(params=[parameter], weight_decay=0.0)
+    with pytest.raises(ValueError, match="hyperball_eps must be finite and positive"):
+        TensorParallelMuonHT(
+            params=[parameter], weight_decay=0.0, hyperball_eps=0.0, hyperball_radius=2.5
+        )
+    with pytest.raises(ValueError, match="hyperball_radius must be finite and at least"):
+        TensorParallelMuonHT(
+            params=[parameter], weight_decay=0.0, hyperball_eps=1e-3, hyperball_radius=1e-4
+        )
+    with pytest.raises(ValueError, match="requires parameters to be initialized"):
+        TensorParallelMuonHT(params=[parameter], weight_decay=0.0, hyperball_radius=3.0)
 
 
 @pytest.mark.skipif(
@@ -380,7 +459,8 @@ class TestMuonOptimizerMultiRank:
             muon_nesterov=True,
             muon_num_ns_steps=5,
             muon_tp_mode="duplicated",
-            muon_ht_eps=1e-8,
+            muon_ht_eps=1e-15,
+            muon_ht_radius=2.5,
         )
 
         optimizer = get_megatron_optimizer(
@@ -390,6 +470,14 @@ class TestMuonOptimizerMultiRank:
             child.optimizer for child in optimizer.chained_optimizers if hasattr(child, "optimizer")
         ]
         assert any(isinstance(raw, TensorParallelMuonHT) for raw in raw_optimizers)
+        for parameter in model.parameters():
+            if parameter.ndim == 2:
+                torch.testing.assert_close(
+                    parameter.float().norm(),
+                    torch.tensor(2.5, device=parameter.device),
+                    rtol=1e-2,
+                    atol=1e-2,
+                )
 
         loss = model(torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')).sum()
         loss.backward()
@@ -629,19 +717,20 @@ class TestMuonOptimizerMultiRankTP:
         parameter.partition_dim = 0
         update = torch.full_like(parameter, float(tp_rank + 2))
 
+        radius_squared = parameter.float().square().sum()
+        torch.distributed.all_reduce(radius_squared, group=pg_collection.tp)
+        radius = radius_squared.sqrt()
+
         optimizer = TensorParallelMuonHT(
             params=[parameter],
             lr=0.1,
             momentum=0.0,
             nesterov=False,
             weight_decay=0.0,
+            hyperball_radius=radius.item(),
             pg_collection=pg_collection,
             tp_mode="distributed",
         )
-
-        radius_squared = parameter.float().square().sum()
-        torch.distributed.all_reduce(radius_squared, group=pg_collection.tp)
-        radius = radius_squared.sqrt()
 
         with torch.no_grad():
             optimizer.pre_weight_update_fn_inplace(parameter, update)
@@ -685,19 +774,20 @@ class TestMuonOptimizerMultiRankGTP:
         parameter.allreduce = True
         update = torch.full_like(parameter, float(gtp_rank + 2))
 
+        radius_squared = parameter.float().square().sum()
+        torch.distributed.all_reduce(radius_squared, group=pg_collection.gtp_remat)
+        radius = radius_squared.sqrt()
+
         optimizer = TensorParallelMuonHT(
             params=[parameter],
             lr=0.1,
             momentum=0.0,
             nesterov=False,
             weight_decay=0.0,
+            hyperball_radius=radius.item(),
             pg_collection=pg_collection,
             tp_mode="duplicated",
         )
-
-        radius_squared = parameter.float().square().sum()
-        torch.distributed.all_reduce(radius_squared, group=pg_collection.gtp_remat)
-        radius = radius_squared.sqrt()
 
         with torch.no_grad():
             optimizer.pre_weight_update_fn_inplace(parameter, update)

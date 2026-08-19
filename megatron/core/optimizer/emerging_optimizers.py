@@ -10,6 +10,7 @@ To add a new emerging optimizer:
 
 import inspect
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Literal, Optional, get_args
 
@@ -107,6 +108,8 @@ class EmergingOptimizerEntry:
         optimizer_cls: The torch optimizer class.
         init_state_fn: Lazily initialises optimizer state (needed for checkpoint formats).
         config_to_kwargs: ``(config, model_chunks, pg_collection) -> dict`` of constructor kwargs.
+        param_init_fn: Optional parameter initialization performed by the optimizer factory before
+            constructing the optimizer and Megatron's mixed-precision parameter copies.
         default_param_overrides: Per-parameter config overrides applied automatically
             (e.g. route non-linear params to Adam).
     """
@@ -114,6 +117,7 @@ class EmergingOptimizerEntry:
     optimizer_cls: type
     init_state_fn: Callable = _eopt_init_state_fn
     config_to_kwargs: Callable | None = None
+    param_init_fn: Callable | None = None
     default_param_overrides: Dict[ParamKey, Dict[str, Any]] = field(
         default_factory=_default_param_overrides_factory
     )
@@ -128,6 +132,8 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
         eopt_kwargs = _default_adam_based_eopt_config_to_kwargs(
             eopt_name, config, model_chunks, pg_collection
         )
+    if entry.param_init_fn is not None:
+        entry.param_init_fn(param_groups, eopt_kwargs)
     optimizer = entry.optimizer_cls(param_groups, **eopt_kwargs)
     return optimizer, entry.init_state_fn
 
@@ -355,19 +361,114 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         return grad
 
 
+def _muon_ht_is_tensor_parallel_shard(p: torch.Tensor) -> bool:
+    """Return whether ``p`` contains a unique tensor-parallel shard."""
+    is_parallel = getattr(p, "tensor_model_parallel", None)
+    if is_parallel is not None:
+        return bool(is_parallel)
+    return getattr(p, "partition_dim", None) not in (None, -1)
+
+
+def _muon_ht_is_expert_parameter(p: torch.Tensor) -> bool:
+    """Return whether ``p`` uses the expert tensor-parallel topology."""
+    return bool(getattr(p, "expert_tp", False) or not getattr(p, "allreduce", True))
+
+
+def _muon_ht_parameter_shard_groups(
+    p: torch.Tensor, pg_collection: ProcessGroupCollection | None
+) -> tuple[torch.distributed.ProcessGroup, ...]:
+    """Return process groups spanning all unique shards of ``p``."""
+    if pg_collection is None:
+        if (
+            _muon_ht_is_tensor_parallel_shard(p) or getattr(p, "is_gtp_weight_remat", False)
+        ) and torch.distributed.is_initialized():
+            raise RuntimeError(
+                "TensorParallelMuonHT requires a ProcessGroupCollection for sharded weights"
+            )
+        return ()
+
+    is_expert = _muon_ht_is_expert_parameter(p)
+    groups = []
+    if _muon_ht_is_tensor_parallel_shard(p):
+        tp_group = pg_collection.expt_tp if is_expert else pg_collection.tp
+        if tp_group is None:
+            raise RuntimeError("TensorParallelMuonHT is missing the parameter's TP group")
+        if get_pg_size(tp_group) > 1:
+            groups.append(tp_group)
+
+    if getattr(p, "is_gtp_weight_remat", False):
+        gtp_group = pg_collection.expt_gtp_remat if is_expert else pg_collection.gtp_remat
+        if gtp_group is None:
+            raise RuntimeError("TensorParallelMuonHT is missing the parameter's GTP-remat group")
+        if get_pg_size(gtp_group) > 1 and all(gtp_group is not group for group in groups):
+            groups.append(gtp_group)
+
+    return tuple(groups)
+
+
+def _muon_ht_global_frobenius_norm(
+    tensor: torch.Tensor, p: torch.Tensor, pg_collection: ProcessGroupCollection | None
+) -> torch.Tensor:
+    """Compute the FP32 Frobenius norm over all unique shards of ``p``."""
+    squared_norm = tensor.float().square().sum()
+    for group in _muon_ht_parameter_shard_groups(p, pg_collection):
+        torch.distributed.all_reduce(squared_norm, op=torch.distributed.ReduceOp.SUM, group=group)
+    return squared_norm.sqrt()
+
+
+def _validate_muon_ht_hyperball_config(eps: float, radius: float | None) -> None:
+    """Validate MuonHT normalization configuration."""
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError(f"hyperball_eps must be finite and positive, got {eps}")
+    if radius is None:
+        raise ValueError("TensorParallelMuonHT requires hyperball_radius to be configured")
+    if not math.isfinite(radius) or radius < eps:
+        raise ValueError(
+            f"hyperball_radius must be finite and at least hyperball_eps={eps}, got {radius}"
+        )
+
+
+@torch.no_grad()  # type: ignore[misc]
+def _initialize_muon_ht_parameters(param_groups: list[dict], kwargs: Dict[str, Any]) -> None:
+    """Normalize MuonHT parameters to a configured radius before optimizer construction."""
+    radius = kwargs["hyperball_radius"]
+    eps = kwargs["hyperball_eps"]
+    _validate_muon_ht_hyperball_config(eps, radius)
+    assert radius is not None
+
+    pg_collection = kwargs["pg_collection"]
+    params_and_norms = []
+    for group in param_groups:
+        if group["weight_decay"] != 0.0:
+            raise ValueError(
+                "TensorParallelMuonHT replaces weight decay with Hyperball norm control; "
+                "set weight_decay=0.0"
+            )
+        for p in group["params"]:
+            norm = _muon_ht_global_frobenius_norm(p, p, pg_collection)
+            if bool((norm < eps).item()):
+                raise ValueError(
+                    "TensorParallelMuonHT requires all parameters to have non-zero norm"
+                )
+            params_and_norms.append((p, norm))
+
+    for p, norm in params_and_norms:
+        p.mul_(radius / norm)
+
+
 class TensorParallelMuonHT(TensorParallelMuon):
     """Tensor-parallel Muon with Hyperball-style weight and update normalization.
 
-    For every matrix parameter, the update is normalized to the parameter's Frobenius
-    norm before it is applied, and the updated parameter is projected back to the same
-    radius afterward. When a parameter is sharded, both norms are computed across all
-    of its tensor-parallel and GTP-remat shards.
+    For every matrix parameter, the update is normalized to a configured Frobenius norm
+    before it is applied, and the updated parameter is projected back to that same radius
+    afterward. When a parameter is sharded, both norms are computed across all of its
+    tensor-parallel and GTP-remat shards.
 
     Args:
         params: Iterable of parameters to optimize or dicts defining parameter groups.
         hyperball_eps: Minimum norm used for numerical stability.
-        hyperball_radius: Optional fixed global Frobenius norm for every parameter. If
-            unset, each parameter preserves its own norm.
+        hyperball_radius: Fixed global Frobenius norm for every parameter. The Megatron
+            optimizer factory initializes Muon-managed parameters to this radius.
         **kwargs: Arguments passed to :class:`TensorParallelMuon`.
     """
 
@@ -375,16 +476,14 @@ class TensorParallelMuonHT(TensorParallelMuon):
         self,
         params: ParamsT,
         *,
-        hyperball_eps: float = 1e-8,
-        hyperball_radius: float | None = None,
+        hyperball_radius: float,
+        hyperball_eps: float = 1e-15,
         **kwargs: Any,
     ) -> None:
-        if hyperball_eps <= 0.0:
-            raise ValueError(f"hyperball_eps must be positive, got {hyperball_eps}")
-        if hyperball_radius is not None and hyperball_radius <= 0.0:
-            raise ValueError(f"hyperball_radius must be positive, got {hyperball_radius}")
+        _validate_muon_ht_hyperball_config(hyperball_eps, hyperball_radius)
 
         self.hyperball_eps = hyperball_eps
+        assert hyperball_radius is not None
         self.hyperball_radius = hyperball_radius
         super().__init__(params, **kwargs)
 
@@ -394,120 +493,48 @@ class TensorParallelMuonHT(TensorParallelMuon):
                     "TensorParallelMuonHT replaces weight decay with Hyperball norm control; "
                     "set weight_decay=0.0"
                 )
-
-        # Validate W_0 and apply an optional fixed radius now. The preserved radius is
-        # captured lazily on the first step because Megatron constructs the optimizer
-        # before loading model checkpoints. It is parameter metadata rather than ordinary
-        # optimizer state because distributed checkpoints require state tensors to match
-        # the parameter shape.
-        with torch.no_grad():
-            for group in self.param_groups:
-                for p in group["params"]:
-                    p_norm = self._global_frobenius_norm(p, p)
-                    if p_norm.item() == 0.0:
-                        raise ValueError(
-                            "TensorParallelMuonHT requires all parameters to have non-zero norm"
-                        )
-                    if self.hyperball_radius is not None:
-                        p.mul_(self.hyperball_radius / p_norm.clamp_min(self.hyperball_eps))
-                    p._muon_ht_radius = None
-
-    def load_state_dict(self, state_dict: dict) -> None:
-        """Load optimizer state and defer radius reconstruction until parameters are loaded."""
-        super().load_state_dict(state_dict)
-        # Mixed-precision wrappers copy checkpointed main parameters after calling this
-        # method. Mark radii stale here so the first pre-update hook reconstructs them
-        # from those loaded weights, which already lie on the Hyperball sphere.
-        for group in self.param_groups:
             for p in group["params"]:
-                p._muon_ht_radius = None
-
-    @staticmethod
-    def _is_tensor_parallel_shard(p: torch.Tensor) -> bool:
-        """Return whether ``p`` contains a unique tensor-parallel shard."""
-        is_parallel = getattr(p, "tensor_model_parallel", None)
-        if is_parallel is not None:
-            return bool(is_parallel)
-        return getattr(p, "partition_dim", None) not in (None, -1)
-
-    @staticmethod
-    def _is_expert_parameter(p: torch.Tensor) -> bool:
-        """Return whether ``p`` uses the expert tensor-parallel topology."""
-        # ``expert_tp`` is tagged on model parameters. The mixed-precision wrapper
-        # preserves ``allreduce`` on its FP32 main-parameter copies, so use it as a
-        # fallback when the direct tag is unavailable.
-        return bool(getattr(p, "expert_tp", False) or not getattr(p, "allreduce", True))
-
-    def _parameter_shard_groups(
-        self, p: torch.Tensor
-    ) -> tuple[torch.distributed.ProcessGroup, ...]:
-        """Return process groups spanning all unique shards of ``p``."""
-        if self.pg_collection is None:
-            if (
-                self._is_tensor_parallel_shard(p) or getattr(p, "is_gtp_weight_remat", False)
-            ) and torch.distributed.is_initialized():
-                raise RuntimeError(
-                    "TensorParallelMuonHT requires a ProcessGroupCollection for sharded weights"
-                )
-            return ()
-
-        is_expert = self._is_expert_parameter(p)
-        groups = []
-        if self._is_tensor_parallel_shard(p):
-            tp_group = self.pg_collection.expt_tp if is_expert else self.pg_collection.tp
-            if tp_group is None:
-                raise RuntimeError("TensorParallelMuonHT is missing the parameter's TP group")
-            if get_pg_size(tp_group) > 1:
-                groups.append(tp_group)
-
-        if getattr(p, "is_gtp_weight_remat", False):
-            gtp_group = (
-                self.pg_collection.expt_gtp_remat if is_expert else self.pg_collection.gtp_remat
-            )
-            if gtp_group is None:
-                raise RuntimeError(
-                    "TensorParallelMuonHT is missing the parameter's GTP-remat group"
-                )
-            if get_pg_size(gtp_group) > 1:
-                # TP and GTP-remat are normally orthogonal groups. Guard against
-                # a custom ProcessGroupCollection aliasing them.
-                if all(gtp_group is not group for group in groups):
-                    groups.append(gtp_group)
-
-        return tuple(groups)
+                p_norm = self._global_frobenius_norm(p, p)
+                dtype_rtol = torch.finfo(p.dtype).eps if p.is_floating_point() else 0.0
+                if not torch.isclose(
+                    p_norm,
+                    p_norm.new_tensor(self.hyperball_radius),
+                    atol=0.0,
+                    rtol=max(1e-5, dtype_rtol),
+                ):
+                    raise ValueError(
+                        f"TensorParallelMuonHT requires parameters to be initialized at "
+                        f"hyperball_radius={self.hyperball_radius}, but found global Frobenius "
+                        f"norm {p_norm.item()}"
+                    )
 
     def _global_frobenius_norm(self, tensor: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
         """Compute the FP32 Frobenius norm over all unique shards of ``p``."""
-        squared_norm = tensor.float().square().sum()
-        for group in self._parameter_shard_groups(p):
-            torch.distributed.all_reduce(
-                squared_norm, op=torch.distributed.ReduceOp.SUM, group=group
-            )
-        return squared_norm.sqrt()
+        return _muon_ht_global_frobenius_norm(tensor, p, self.pg_collection)
 
     def pre_weight_update_fn_inplace(self, p: torch.Tensor, update: torch.Tensor) -> None:
-        """Scale the global update norm to the parameter's preserved radius."""
-        radius = p._muon_ht_radius
-        if radius is None:
-            radius = (
-                p.new_tensor(self.hyperball_radius, dtype=torch.float32)
-                if self.hyperball_radius is not None
-                else self._global_frobenius_norm(p, p)
-            )
-            if radius.item() == 0.0:
-                raise ValueError(
-                    "TensorParallelMuonHT requires all parameters to have non-zero norm"
-                )
-            p._muon_ht_radius = radius
-        update_norm = self._global_frobenius_norm(update, p).clamp_min(self.hyperball_eps)
-        update.mul_(radius / update_norm)
+        """Scale the global update norm to the configured radius."""
+        radius = p.new_tensor(self.hyperball_radius, dtype=torch.float32)
+        update_norm = self._global_frobenius_norm(update, p)
+        is_numerical_zero = update_norm < self.hyperball_eps
+        scale = torch.where(
+            is_numerical_zero,
+            torch.zeros_like(update_norm),
+            radius / update_norm.clamp_min(self.hyperball_eps),
+        )
+        update.mul_(scale.to(dtype=update.dtype))
 
     def post_weight_update_fn_inplace(self, p: torch.Tensor) -> None:
-        """Project the global updated parameter norm back to its preserved radius."""
-        radius = p._muon_ht_radius
-        assert radius is not None
-        p_norm = self._global_frobenius_norm(p, p).clamp_min(self.hyperball_eps)
-        p.mul_(radius / p_norm)
+        """Project the global updated parameter norm back to the configured radius."""
+        radius = p.new_tensor(self.hyperball_radius, dtype=torch.float32)
+        p_norm = self._global_frobenius_norm(p, p)
+        is_numerical_zero = p_norm < self.hyperball_eps
+        scale = torch.where(
+            is_numerical_zero,
+            torch.zeros_like(p_norm),
+            radius / p_norm.clamp_min(self.hyperball_eps),
+        )
+        p.mul_(scale.to(dtype=p.dtype))
 
 
 class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
@@ -671,12 +698,11 @@ _EMERGING_OPTIMIZERS.update(
             optimizer_cls=TensorParallelMuonHT,
             init_state_fn=_eopt_init_state_fn,
             config_to_kwargs=_muon_ht_config_to_kwargs,
+            param_init_fn=_initialize_muon_ht_parameters,
             default_param_overrides={
-                ParamKey(
-                    predicate=ParamPredicate(
-                        name="nonlinear_or_embedding", fn=_is_nonlinear_or_embedding
-                    )
-                ): {'optimizer': 'adam'}
+                ParamKey(predicate=ParamPredicate(name="muon_excluded", fn=_is_muon_excluded)): {
+                    'optimizer': 'adam'
+                }
             },
         ),
         "adaptive_muon": EmergingOptimizerEntry(
