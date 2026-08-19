@@ -212,9 +212,9 @@ def test_fully_shard_zero_cta_moves_all_gather_to_copy_engine(distributed_setup)
 
     allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
     reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
-    # Zero-CTA moves the all-gather to the copy engine: no symmetric-memory all-gather kernel.
-    assert not allgather_kernels, (
-        f"Expected no symmetric-memory all-gather kernel under zero-CTA. "
+    # Two sharded modules each all-gather in forward and backward on every training step.
+    assert len(allgather_kernels) == num_training_steps * 2 * 2, (
+        "Expected zero-CTA all-gather D2D memcpys. "
         f"Observed all-gather kernels: {[kernel.name for kernel in allgather_kernels[:20]]}"
     )
     # The reduce-scatter's reduction cannot run on the copy engine, so it stays a

@@ -17,15 +17,15 @@ def events_overlap(first: FunctionEvent, second: FunctionEvent) -> bool:
 def collect_linked_kernels(
     prof: TorchProfiler, cpu_event_name_substring: str
 ) -> list[FunctionEvent]:
-    """Collect device kernel events linked to matching CPU op instances.
+    """Collect kernels and D2D memcpys linked to matching CPU op instances.
 
     Device events are attributed by their launching CPU op rather than searched by their
     own name: device-side names vary across GPU architectures and kernel libraries -- for
     example a matmul kernel is named ``nvjet_``/``cutlass_``/``cublas_``... while its
     CPU op is simply ``aten::mm``.
 
-    Zero-CTA all-gather copy-engine memcpys are not kernels and are intentionally not
-    returned.
+    Zero-CTA all-gather copy-engine D2D memcpys are included, while P2P copies,
+    host-to-device copies, and memset activities are excluded.
     """
     # A correlation id is shared by a device event and the leaf runtime op that issued it,
     # not the enclosing matched op, so walk cpu_parent up from each correlated leaf. Id 0
@@ -46,7 +46,8 @@ def collect_linked_kernels(
     for event in events:
         if event.device_type != DeviceType.CUDA:
             continue
-        if event.activity_type != "kernel":
+        is_d2d_memcpy = event.activity_type == "gpu_memcpy" and event.name.startswith("Memcpy DtoD")
+        if event.activity_type != "kernel" and not is_d2d_memcpy:
             continue
         if event.linked_correlation_id not in matching_correlations:
             continue
