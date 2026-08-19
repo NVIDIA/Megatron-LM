@@ -225,7 +225,7 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 sock=serve_config.sock,
                 default_top_p=serve_config.default_top_p,
                 default_top_k=serve_config.default_top_k,
-                serving_mode=serve_config.serving_mode,
+                eval_mode=serve_config.eval_mode,
             )
             self._serve_started = True
 

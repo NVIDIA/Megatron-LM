@@ -179,9 +179,7 @@ class TestLifecycleGuards:
 
         sock = MagicMock()
         llm.serve(
-            ServeConfig(
-                port=1234, sock=sock, default_top_p=0.95, default_top_k=20, serving_mode=True
-            ),
+            ServeConfig(port=1234, sock=sock, default_top_p=0.95, default_top_k=20, eval_mode=True),
             blocking=False,
         )
         assert llm._serve_started is True
@@ -190,7 +188,7 @@ class TestLifecycleGuards:
         assert started["sock"] is sock
         assert started["default_top_p"] == 0.95
         assert started["default_top_k"] == 20
-        assert started["serving_mode"] is True
+        assert started["eval_mode"] is True
 
 
 class TestNormalizePrompts:

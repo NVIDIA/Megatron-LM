@@ -58,8 +58,10 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser = add_multimodal_extra_args(parser)
     parser.add_argument("--port", type=int, default=5000, help="Port for Flask server to run on")
     parser.add_argument(
-        "--host", type=str, default=None,
-        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces)."
+        "--host",
+        type=str,
+        default=None,
+        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces).",
     )
     parser.add_argument(
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
@@ -183,7 +185,7 @@ async def run_text_generation_server(
     chat_template: str | None = None,
     default_top_p: float = 1.0,
     default_top_k: int = 0,
-    serving_mode: bool = False,
+    eval_mode: bool = False,
 ):
     """
     Runs the text generation server from rank 0 and initializes the
@@ -197,13 +199,14 @@ async def run_text_generation_server(
         chat_template (str | None): Inline chat template or contents loaded from a file.
         default_top_p (float): Sampling default when a request omits `top_p`.
         default_top_k (int): Sampling default when a request omits `top_k`.
-        serving_mode (bool): Whether to use pure-serving response defaults.
+        eval_mode (bool): Whether to use evaluation response defaults.
     """
 
     rank = torch.distributed.get_rank()
 
     coordinator_addr = await engine.start_listening_to_data_parallel_coordinator(
-        inference_coordinator_port=coordinator_port, launch_inference_coordinator=True,
+        inference_coordinator_port=coordinator_port,
+        launch_inference_coordinator=True,
         hostname=hostname,
     )
 
@@ -220,7 +223,7 @@ async def run_text_generation_server(
                 chat_template=chat_template,
                 default_top_p=default_top_p,
                 default_top_k=default_top_k,
-                serving_mode=serving_mode,
+                eval_mode=eval_mode,
             )
 
         # Await the engine loop directly since the server is running in a separate process
