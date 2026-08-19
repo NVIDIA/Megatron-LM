@@ -60,6 +60,7 @@ from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
+from megatron.core.model_initialization import maybe_initialize_muon_ht_parameters
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
     is_linear_attention_variant,
@@ -2457,6 +2458,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         for model_module in model:
             model_module.cuda(torch.cuda.current_device())
 
+    if not args.init_model_with_meta_device:
+        maybe_initialize_muon_ht_parameters(model, get_model_config(model[0]), pg_collection)
+
     # Fp16 conversion.
     if args.fp16 or args.bf16:
         config = get_model_config(model[0])
@@ -2465,6 +2469,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
         model = [to_empty_if_meta_device(model_module, device=torch.device("cuda")) for model_module in model]
+        maybe_initialize_muon_ht_parameters(model, get_model_config(model[0]), pg_collection)
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
     #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated

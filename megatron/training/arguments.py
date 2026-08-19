@@ -2257,6 +2257,9 @@ def _add_network_size_args(parser):
         "init_method",
         "output_layer_init_method",
         "embedding_init_method",
+        # optimizer-specific model initialization; declared in regularization args
+        "muon_ht_radius",
+        "muon_ht_eps",
         "activation_func",
         "experimental_attention_variant_loss_scale_func",
         # types affect docstring
