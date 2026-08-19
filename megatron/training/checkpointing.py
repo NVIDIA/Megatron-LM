@@ -15,7 +15,7 @@ import types
 from argparse import Namespace
 from datetime import datetime
 from enum import Enum, auto
-from logging import getLogger
+from logging import DEBUG, getLogger
 from pathlib import Path
 from time import time
 from typing import Any, Dict, List, Optional, Union
@@ -24,8 +24,14 @@ import numpy as np
 import torch
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+except ImportError:
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
-from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
+from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
@@ -36,11 +42,16 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
-from megatron.core.msc_utils import maybe_msc
+from megatron.core.msc_utils import maybe_msc, MultiStorageClientFeature 
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
+from megatron.core._rank_utils import safe_get_rank as get_rank_safe
+from megatron.training.argument_utils import _default_config_from_args
+from megatron.training.config import TokenizerConfig
+from megatron.training.global_vars import get_tokenizer
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
@@ -103,9 +114,13 @@ def finalize_deletion_processes(blocking=False):
     finished = []
     for proc in _deletion_processes:
         if not proc.is_alive() or blocking:
-            logger.debug(
-                f'Joining deletion process {proc.pid} (blocking={blocking}, is_alive={proc.is_alive()})'
-            )
+            if logger.isEnabledFor(DEBUG):
+                logger.debug(
+                    "Joining deletion process %s (blocking=%s, is_alive=%s)",
+                    proc.pid,
+                    blocking,
+                    proc.is_alive(),
+                )
             proc.join()
             finished.append(proc)
     for proc in finished:
@@ -168,6 +183,8 @@ def check_checkpoint_args(checkpoint_args, skip_args: set[str] | None = None):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
+    if hasattr(args, 'gdp_num_householder'):
+        _compare('gdp_num_householder', default=3)
     _compare('add_position_embedding', default=True)
     if args.vocab_file:
         _compare('max_position_embeddings')
@@ -771,17 +788,18 @@ def save_checkpoint(
                 )
         else:
             sharded_sd_metadata = None
-        state_dict = generate_state_dict(
-            args,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            rng_state,
-            iteration=iteration,
-            optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
-            model_sd_kwargs=dict(metadata=sharded_sd_metadata),
-            rerun_state=rerun_state,
-        )
+        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
+            state_dict = generate_state_dict(
+                args,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                rng_state,
+                iteration=iteration,
+                optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                model_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                rerun_state=rerun_state,
+            )
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
@@ -837,8 +855,18 @@ def save_checkpoint(
                             else mpu.get_expert_data_parallel_group()
                         )
                     save_strategy = FullyParallelSaveStrategyWrapper(
-                        save_strategy, process_group, args.ckpt_assume_constant_structure
+                        save_strategy,
+                        process_group,
+                        args.ckpt_assume_constant_structure,
+                        validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
+                        pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+                        pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
                     )
+            # Allow opting out of save-side sharding validation entirely (even on
+            # the first save) via --no-ckpt-load-validate-sharding-integrity. This
+            # skips the world-wide determine_global_metadata all_gather_object.
+            if not args.ckpt_load_validate_sharding_integrity:
+                validate_sharding_integrity = False
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
@@ -846,17 +874,18 @@ def save_checkpoint(
             logger.debug(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
-            async_save_request = dist_checkpointing.save(
-                state_dict,
-                checkpoint_name,
-                save_strategy,
-                async_sharded_save=args.async_save,
-                validate_access_integrity=validate_sharding_integrity,
-                preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
-                content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
-                async_strategy=args.async_strategy,
-                verify_integrity=args.verify_integrity,
-            )
+            with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.io_write', is_goodput_span=True):
+                async_save_request = dist_checkpointing.save(
+                    state_dict,
+                    checkpoint_name,
+                    save_strategy,
+                    async_sharded_save=args.async_save,
+                    validate_access_integrity=validate_sharding_integrity,
+                    preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
+                    content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
+                    async_strategy=args.async_strategy,
+                    verify_integrity=args.verify_integrity,
+                )
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
@@ -1042,6 +1071,17 @@ def save_checkpoint(
                     f'gtp_remat {gtp_remat_rank}/{gtp_remat_size_to_print}, '
                     f'p {pipeline_mp_rank}/{pp_size_to_print} ]'
                 )
+                # Save tokenizer files for torch_dist checkpoints (if enabled)
+                if (
+                    args.save_tokenizer_assets
+                    and args.ckpt_format == 'torch_dist'
+                    and iteration > 0
+                ):
+                    checkpoint_name = get_checkpoint_name(
+                        save_dir, iteration=iteration, return_base_dir=True
+                    )
+                    config = _default_config_from_args(TokenizerConfig, args)
+                    save_tokenizer_assets(get_tokenizer(), config, checkpoint_name)
                 if args.log_progress and args.async_save:
                     append_to_progress_log(
                         args.save, f'Saved async checkpoint\tIteration: {iteration}', barrier=False
@@ -1188,6 +1228,141 @@ def save_checkpoint(
             torch.distributed.barrier()
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
+
+
+def save_tokenizer_assets(
+    tokenizer: MegatronTokenizer,
+    config: TokenizerConfig,
+    checkpoint_path: str,
+) -> None:
+    """Save tokenizer files to the checkpoint directory.
+
+    Always saves tokenizer files to ensure checkpoints are self-contained
+    and portable. Handles both HuggingFace tokenizers and file-based tokenizers.
+    Compatible with MultiStorageClient for cloud storage support.
+
+    Args:
+        tokenizer: The tokenizer instance to save.
+        config: Tokenizers config.
+        checkpoint_path: The checkpoint directory path.
+    """
+    if tokenizer is None:
+        return
+
+    # Only rank 0 saves tokenizer files
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if rank != 0:
+        return
+
+    def resolve_path(path_str: str) -> str:
+        """Resolve relative paths to absolute paths."""
+        if not path_str:
+            return path_str
+        path_obj = Path(path_str)
+        if path_obj.is_absolute():
+            return path_str
+        # Resolve relative to current working directory
+        return str(path_obj.resolve())
+
+    try:
+        # Check if MultiStorageClient is enabled
+        if MultiStorageClientFeature .is_enabled():
+            msc = MultiStorageClientFeature .import_package()
+            checkpoint_path_obj = msc.Path(checkpoint_path)
+            tokenizer_dir = checkpoint_path_obj / "tokenizer"
+            tokenizer_dir.mkdir(parents=True, exist_ok=True)
+            use_msc = True
+        else:
+            tokenizer_dir = os.path.join(checkpoint_path, "tokenizer")
+            os.makedirs(tokenizer_dir, exist_ok=True)
+            use_msc = False
+
+        tokenizer_type = config.tokenizer_type
+
+        # Handle HuggingFace and Multimodal tokenizers
+        if tokenizer_type in ("HuggingFaceTokenizer", "MultimodalTokenizer"):
+            if use_msc:
+                import tempfile
+
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    if hasattr(tokenizer, "save_pretrained"):
+                        tokenizer.save_pretrained(tmp_dir)
+                    elif hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer._tokenizer, "save_pretrained"):
+                        tokenizer._tokenizer.save_pretrained(tmp_dir)
+                    else:
+                        logger.debug(f"{tokenizer_type} does not support save_pretrained(), skipping tokenizer save")
+                        return
+
+                    logger.debug(f"Saving {tokenizer_type} files to {tokenizer_dir}")
+                    for filename in os.listdir(tmp_dir):
+                        src_path = os.path.join(tmp_dir, filename)
+                        if os.path.isfile(src_path):
+                            dest_path = tokenizer_dir / filename
+                            with open(src_path, "rb") as src_f:
+                                with msc.open(str(dest_path), "wb") as dest_f:
+                                    dest_f.write(src_f.read())
+            else:
+                logger.debug(f"Saving {tokenizer_type} files to {tokenizer_dir}")
+                if hasattr(tokenizer, "save_pretrained"):
+                    tokenizer.save_pretrained(tokenizer_dir)
+                elif hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer._tokenizer, "save_pretrained"):
+                    tokenizer._tokenizer.save_pretrained(tokenizer_dir)
+            return
+
+        # Handle file-based tokenizers - resolve all paths
+        files_to_copy = []
+
+        if tokenizer_type in ("BertWordPieceLowerCase", "BertWordPieceCase"):
+            if config.vocab_file:
+                resolved_path = resolve_path(config.vocab_file)
+                files_to_copy.append(("vocab_file", resolved_path, "vocab.txt"))
+
+        elif tokenizer_type == "GPT2BPETokenizer":
+            if config.vocab_file:
+                resolved_path = resolve_path(config.vocab_file)
+                files_to_copy.append(("vocab_file", resolved_path, "vocab.json"))
+            if config.merge_file:
+                resolved_path = resolve_path(config.merge_file)
+                files_to_copy.append(("merge_file", resolved_path, "merges.txt"))
+
+        elif tokenizer_type in ("SentencePieceTokenizer", "GPTSentencePieceTokenizer", "Llama2Tokenizer"):
+            if config.tokenizer_model:
+                resolved_path = resolve_path(config.tokenizer_model)
+                files_to_copy.append(("tokenizer_model", resolved_path, "tokenizer.model"))
+
+        elif tokenizer_type == "TikTokenizer":
+            if config.tokenizer_model:
+                resolved_path = resolve_path(config.tokenizer_model)
+                files_to_copy.append(("tokenizer_model", resolved_path, "tokenizer.json"))
+
+        elif tokenizer_type == "NullTokenizer":
+            logger.debug(f"{tokenizer_type} requires no file artifacts")
+            return
+
+        # Copy the files
+        if files_to_copy:
+            logger.debug(f"Saving {tokenizer_type} files to {tokenizer_dir}")
+            for config_attr, source_path, dest_filename in files_to_copy:
+                if source_path and os.path.exists(source_path):
+                    if use_msc:
+                        dest_path = tokenizer_dir / dest_filename
+                        with open(source_path, "rb") as src_f:
+                            with msc.open(str(dest_path), "wb") as dest_f:
+                                dest_f.write(src_f.read())
+                        logger.debug(f"Copied {config_attr}: {source_path} -> {dest_path}")
+                    else:
+                        dest_path = os.path.join(tokenizer_dir, dest_filename)
+                        shutil.copy2(source_path, dest_path)
+                        logger.debug(f"Copied {config_attr}: {source_path} -> {dest_path}")
+                else:
+                    logger.debug(f"{config_attr} not found at resolved path: {source_path}")
+
+    except Exception as e:
+        if get_rank_safe() == 0:
+            logger.error(f"Failed to save tokenizer files: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
 
 
 @_disable_gc()
@@ -1426,7 +1601,97 @@ def generate_state_dict(
     if not args.no_save_rng and rng_state:
         state_dict['rng_state'] = rng_state
 
+    # Optionally avoid persisting TE `_extra_state` artifacts that carry no
+    # irreplaceable state (see `_localize_redundant_extra_states`). Opt-in via
+    # --ckpt-drop-redundant-extra-state (off by default, preserving prior behavior).
+    # Applied here so the SAME decision is used for both the save state dict and
+    # the load *request* (`generate_state_dict` is the shared chokepoint), which
+    # keeps the two symmetric and backward compatible.
+    if args.ckpt_format == "torch_dist" and getattr(
+        args, "ckpt_drop_redundant_extra_state", False
+    ):
+        _localize_redundant_extra_states(state_dict)
+
     return state_dict
+
+
+# Byte markers of the dict keys that TE `get_extra_state` writes ONLY under
+# `if recipe.delayed():` (see TransformerEngine `module/base.py`). Their presence
+# in the serialized payload is a robust, unpickle-free signal that the
+# `_extra_state` carries persistent delayed-scaling state (amax history + scale).
+_FP8_PERSISTENT_EXTRA_STATE_MARKERS = (b"amax_history_fwd", b"scale_fwd", b"scale_bwd")
+
+
+def _fp8_extra_state_is_persistent(data) -> bool:
+    """Whether a TE `_extra_state` payload must be checkpointed.
+
+    A `_extra_state` is worth persisting only when it carries state that cannot
+    be reconstructed from the run config at model-build time, i.e. the
+    delayed-scaling FP8 amax history + scale. Concretely:
+
+    * ``None`` / empty ``uint8`` tensor  -> FP8 disabled        -> NOT persistent
+    * non-empty, no delayed-scaling key  -> block/current scaling (NVFP4, MXFP8,
+      Float8CurrentScaling): recipe + scalars only, all config-derived
+                                                                  -> NOT persistent
+    * non-empty, has ``scale_fwd`` / ``amax_history_fwd`` / ``scale_bwd``
+                                          -> delayed scaling      -> persistent
+
+    The check operates on the raw serialized bytes (the uint8 tensor that
+    ``get_extra_state`` returns) so it needs no unpickling and no TE import.
+    Anything unrecognized defaults to persistent, so real state is never
+    silently dropped.
+    """
+    if data is None:
+        return False
+    if isinstance(data, torch.Tensor):
+        if data.numel() == 0:
+            return False
+        try:
+            raw = data.detach().cpu().contiguous().numpy().tobytes()
+        except Exception:
+            return True
+        return any(marker in raw for marker in _FP8_PERSISTENT_EXTRA_STATE_MARKERS)
+    # Unknown payload type: keep it persistent to be safe.
+    return True
+
+
+def _localize_redundant_extra_states(state_dict):
+    """Rewrite non-persistent TE `_extra_state` ShardedObjects as local objects.
+
+    For checkpoints with no FP8, or with block/current FP8 scaling (NVFP4,
+    MXFP8, Float8CurrentScaling), every `_extra_state` is either empty or a
+    recipe-only blob that the freshly-built model reproduces from config — see
+    `_fp8_extra_state_is_persistent`. Such artifacts are pure overhead: in a
+    large MoE model they account for the overwhelming majority of the
+    checkpoint's ShardedObjects (e.g. ~50k on the 55B hybrid-MoE run).
+
+    Wrapping them in ``LocalNonpersistentObject`` (instead of ``ShardedObject``)
+    means, via the dist-checkpointing pipeline:
+
+    * SAVE: ``save_preprocess`` drops them, so they are never written to disk.
+    * LOAD: ``load_preprocess`` unwraps them back into the loaded state dict with
+      the local (freshly-built) value, so the module's ``_extra_state`` key is
+      still present (strict ``load_state_dict`` stays happy) and
+      ``set_extra_state`` no-ops on the empty/recipe payload.
+
+    Because this runs in ``generate_state_dict`` (shared by save and the load
+    request), the decision is symmetric: dropped keys are never *requested*, so
+    loading an older checkpoint that still stores them simply does not read them
+    (they are neither "missing" nor "unexpected" in the request) — backward
+    compatible. Delayed-scaling `_extra_state` stays a ``ShardedObject`` and is
+    saved/loaded exactly as before.
+    """
+
+    def _maybe_localize(value):
+        if (
+            isinstance(value, ShardedObject)
+            and value.key.endswith("_extra_state")
+            and not _fp8_extra_state_is_persistent(value.data)
+        ):
+            return LocalNonpersistentObject(value.data)
+        return value
+
+    dict_list_map_inplace(_maybe_localize, state_dict)
 
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
@@ -1624,10 +1889,7 @@ def _load_global_dist_base_checkpoint(
         )
 
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
-    load_strategy = TorchDistLoadShardedStrategy(
-        cache_metadata=args.ckpt_assume_constant_structure,
-        stream_ckpt_dequant=args.stream_ckpt_dequant,
-    )
+    load_strategy = TorchDistLoadShardedStrategy(cache_metadata=args.ckpt_assume_constant_structure)
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
         if args.ckpt_fully_parallel_load_process_group == 'dp':
@@ -1646,7 +1908,14 @@ def _load_global_dist_base_checkpoint(
             )
 
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, process_group, exchange_algo=args.ckpt_fully_parallel_load_exchange_algo
+            load_strategy,
+            process_group,
+            exchange_algo=args.ckpt_fully_parallel_load_exchange_algo,
+            per_rank_object_load=getattr(
+                args, 'ckpt_fully_parallel_load_per_rank_objects', False
+            ),
+            pg_cache_path=getattr(args, 'ckpt_pg_tensors_cache_path', None),
+            pg_cache_create=getattr(args, 'ckpt_pg_tensors_cache_create', False),
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
@@ -1743,10 +2012,16 @@ def _load_base_checkpoint(
             print_rank_0('    will not load any checkpoints and will start from random')
         # Conditionally exit if checkpoint not found.
         if args.exit_on_missing_checkpoint:
-            print_rank_0(">> '--exit-on-missing-checkpoint' set ... exiting. <<")
+            print_rank_0(
+                ">> '--exit-on-missing-checkpoint' is set but no checkpoint was found under "
+                f"load directory '{load_dir}' (missing metadata/tracker file "
+                f"'{tracker_filename}'). Exiting with a non-zero status. <<"
+            )
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
-            sys.exit()
+            # Exit non-zero so that callers (e.g. CI harnesses) detect the missing
+            # checkpoint as a failure instead of silently treating exit code 0 as success.
+            sys.exit(1)
 
         return None, '', False, None
 
@@ -1999,6 +2274,10 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('mamba_head_dim', force=True)
     _set_arg('mamba_num_groups', force=True)
     _set_arg('mamba_num_heads', force=True)
+    # GDP checkpoints created before this argument existed always used three reflections.
+    if not hasattr(checkpoint_args, 'gdp_num_householder'):
+        setattr(checkpoint_args, 'gdp_num_householder', 3)
+    _set_arg('gdp_num_householder', force=True)
     # We need to be able to override hybrid_layer_pattern from the command-line so that different
     # pipelining can be specified when re-loading a model (e.g. for inference or post-training).
     _set_arg('hybrid_layer_pattern')
@@ -2177,9 +2456,10 @@ def load_checkpoint(
     state_dict = None
     release = False
     if args.auto_detect_ckpt_format or ckpt_format in ('torch_dist', 'fsdp_dtensor'):
-        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-            load_dir, args, rank0=True, checkpointing_context=checkpointing_context
-        )
+        with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load.io_read', is_goodput_span=True):
+            state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+                load_dir, args, rank0=True, checkpointing_context=checkpointing_context
+            )
 
         ckpt_format = None
         if ckpt_type == CheckpointType.TORCH_DCP:
@@ -2668,6 +2948,47 @@ def load_checkpoint(
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+
+            # Optimizer state dict can overwrite per-group max_lr/min_lr values.
+            # If scheduler override is requested, re-apply runtime lr bounds from
+            # args so scheduler math does not stay pinned to checkpoint lr settings.
+            if getattr(args, "override_opt_param_scheduler", False):
+                if (
+                    optimizer is None
+                    or getattr(optimizer, "is_stub_optimizer", False)
+                    or opt_param_scheduler is None
+                ):
+                    print_rank_0(
+                        " > WARNING: --override-opt-param-scheduler is set, but optimizer or "
+                        "opt_param_scheduler is not available; skipping override of scheduler "
+                        "and optimizer param_group max_lr/min_lr."
+                    )
+                else:
+                    for param_group in optimizer.param_groups:
+                        if param_group.get("is_decoupled_lr", False):
+                            max_lr = getattr(args, "decoupled_lr", None)
+                            min_lr = getattr(args, "decoupled_min_lr", None)
+                        else:
+                            max_lr = args.lr
+                            min_lr = args.min_lr
+                        if max_lr is not None:
+                            param_group["max_lr"] = max_lr
+                        if min_lr is not None:
+                            param_group["min_lr"] = min_lr
+                    # Synchronize scheduler num_steps with consumed_train_samples
+                    # to ensure lr calculation is based on current training progress
+                    if opt_param_scheduler.num_steps != args.consumed_train_samples:
+                        print_rank_0(
+                            f" > WARNING: scheduler num_steps ({opt_param_scheduler.num_steps}) "
+                            f"differs from consumed_train_samples ({args.consumed_train_samples}). "
+                            f"Resetting scheduler num_steps to match consumed_train_samples."
+                        )
+                        opt_param_scheduler.num_steps = args.consumed_train_samples
+                    opt_param_scheduler.step(increment=0)
+                    print_rank_0(
+                        " > restored optimizer param_group max_lr/min_lr from runtime config "
+                        "because --override-opt-param-scheduler is set"
+                    )
         except KeyError as e:
             print_rank_0(
                 'Unable to load optimizer from checkpoint {}. '
