@@ -29,6 +29,7 @@ def test_o_projection_cpu_contract_calls_all_official_boundaries(monkeypatch) ->
 
     official = Mock(return_value=torch.ones(2, 128, dtype=torch.bfloat16))
     entries = {
+        ("vllm.utils.deep_gemm", "per_block_cast_to_fp8"): cast,
         (
             "vllm.model_executor.layers.quantization.utils.fp8_utils",
             "deepgemm_post_process_fp8_weight_block",
@@ -53,8 +54,8 @@ def test_o_projection_cpu_contract_calls_all_official_boundaries(monkeypatch) ->
     monkeypatch.setattr(vllm_ds4, "_symbol", lambda module, name: entries[(module, name)])
     monkeypatch.setattr(
         deployment_block_fp8,
-        "_import_attr",
-        lambda module, name: cast,
+        "_entry",
+        lambda module, name: entries[(module, name)],
     )
     result = OProjectionAdapter()(
         torch.zeros(2, 2, 128, dtype=torch.bfloat16),

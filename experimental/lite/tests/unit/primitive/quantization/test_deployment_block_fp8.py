@@ -132,7 +132,7 @@ def test_vllm_import_is_lazy_and_missing_entry_point_fails_closed(
         adapter.pack_weight(_weight())
 
 
-def test_weight_path_calls_vllm_and_describes_deepgemm_layout(fake_vllm) -> None:
+def test_weight_path_calls_vllm_and_packs_official_layout(fake_vllm) -> None:
     master = _weight()
     packed = pack_block_fp8_weight(master)
 
@@ -148,12 +148,9 @@ def test_weight_path_calls_vllm_and_describes_deepgemm_layout(fake_vllm) -> None
     assert packed.qweight.dtype == torch.float8_e4m3fn
     assert packed.qweight.shape == master.shape
     assert packed.scales.dtype == torch.int32
-    assert packed.block_shape == (128, 128)
-    assert packed.scale_format == "ue8m0"
-    assert packed.scale_layout == "deepgemm_block_tma"
-    assert packed.cache_key.version == master._version
-    assert packed.cache_key.device == master.device
-    assert packed.cache_key.dtype == torch.bfloat16
+    assert packed.cache_key == (
+        id(master), master._version, master.device, master.dtype, tuple(master.shape)
+    )
 
 
 def test_fixed_scale_requantization_reconstructs_fp8_bitwise() -> None:
@@ -182,9 +179,7 @@ def test_grouped_weight_scales_are_transformed_jointly(fake_vllm) -> None:
     assert post_call[2].shape == (2, 1, 2)
     assert packed.qweight.shape == (2, 128, 256)
     assert packed.scales.shape == (2, 1, 2)
-    assert tuple(key.parameter_id for key in packed.cache_keys) == tuple(
-        id(master) for master in masters
-    )
+    assert tuple(key[0] for key in packed.cache_key) == tuple(id(master) for master in masters)
 
 
 def test_fused_release_parameters_preserve_bytes_scales_and_cache(fake_vllm) -> None:
@@ -212,9 +207,7 @@ def test_fused_release_parameters_preserve_bytes_scales_and_cache(fake_vllm) -> 
     assert torch.equal(post[1], torch.cat(qweights))
     assert torch.equal(post[2], torch.cat(scales))
     assert adapter.pack_weight(masters) is packed
-    assert tuple(key.parameter_id for key in packed.cache_key) == tuple(
-        id(master) for master in masters
-    )
+    assert tuple(key[0] for key in packed.cache_key) == tuple(id(master) for master in masters)
 
     with torch.no_grad():
         masters[1].add_(1)
@@ -228,9 +221,6 @@ def test_activation_and_gemm_call_use_packed_vllm_contract(fake_vllm) -> None:
 
     assert packed_activation.qactivation.shape == x.shape
     assert packed_activation.scales.shape == (4, 1)
-    assert packed_activation.group_size == 128
-    assert packed_activation.scale_format == "ue8m0_packed_int32"
-    assert packed_activation.scale_layout == "deepgemm_packed_k_tma"
     activation_call = fake_vllm[-1]
     assert activation_call[0] == "activation_quant"
     assert activation_call[1:] == (x, 128, True)
@@ -279,7 +269,7 @@ def test_opt_in_cache_uses_parameter_version_and_invalidates(fake_vllm) -> None:
         master.add_(1)
     third = adapter.pack_weight(master)
     assert third is not first
-    assert third.cache_key.version > first.cache_key.version
+    assert third.cache_key[1] > first.cache_key[1]
     assert [call[0] for call in fake_vllm].count("weight_quant") == 2
 
     adapter.clear_cache()
@@ -292,17 +282,17 @@ def test_opt_in_cache_uses_parameter_version_and_invalidates(fake_vllm) -> None:
         (
             torch.randn(128, 128),
             TypeError,
-            "must be a BF16 torch.nn.Parameter",
+            "must be a 2-D BF16 tensor",
         ),
         (
             nn.Parameter(torch.randn(128, 128)),
             TypeError,
-            "must be BF16",
+            "must be a 2-D BF16 tensor",
         ),
         (
             nn.Parameter(torch.randn(2, 128, 128, dtype=torch.bfloat16)),
-            ValueError,
-            "must be 2-D",
+            TypeError,
+            "must be a 2-D BF16 tensor",
         ),
         (
             nn.Parameter(torch.randn(128, 129, dtype=torch.bfloat16)),
@@ -319,35 +309,19 @@ def test_invalid_master_weight_fails_before_vllm_import(
 
 
 def test_invalid_activation_and_gemm_contracts_fail_closed(fake_vllm) -> None:
-    with pytest.raises(TypeError, match="must be BF16"):
+    with pytest.raises(ValueError, match="contiguous 2-D BF16"):
         pack_block_fp8_activation(torch.randn(2, 128))
-    with pytest.raises(ValueError, match="must be 2-D"):
+    with pytest.raises(ValueError, match="contiguous 2-D BF16"):
         pack_block_fp8_activation(
             torch.randn(2, 2, 128, dtype=torch.bfloat16)
         )
-    with pytest.raises(ValueError, match="must be divisible"):
+    with pytest.raises(ValueError, match="contiguous 2-D BF16"):
         pack_block_fp8_activation(
             torch.randn(2, 129, dtype=torch.bfloat16)
         )
     noncontiguous = torch.randn(2, 256, dtype=torch.bfloat16)[:, ::2]
-    with pytest.raises(ValueError, match="must be contiguous"):
+    with pytest.raises(ValueError, match="contiguous 2-D BF16"):
         pack_block_fp8_activation(noncontiguous)
-
-    packed = pack_block_fp8_weight(_weight())
-    with pytest.raises(ValueError, match="does not match"):
-        fp8_gemm_nt(torch.randn(2, 128, dtype=torch.bfloat16), packed)
-
-    bad_layout = PackedBlockFP8Weight(
-        qweight=packed.qweight,
-        scales=packed.scales,
-        block_shape=packed.block_shape,
-        scale_format=packed.scale_format,
-        scale_layout="wrong",  # type: ignore[arg-type]
-        cache_key=packed.cache_key,
-    )
-    with pytest.raises(ValueError, match="block-TMA"):
-        fp8_gemm_nt(torch.randn(2, 256, dtype=torch.bfloat16), bad_layout)
-
 
 def test_missing_deep_gemm_entry_fails_closed(fake_vllm, monkeypatch) -> None:
     packed = pack_block_fp8_weight(_weight())
