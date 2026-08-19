@@ -47,10 +47,7 @@ def test_post_wrap_assign_true_load_raises(distributed_setup):
     with fully_shard_context(device=device):
         fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    with pytest.raises(
-        RuntimeError,
-        match=r"load_state_dict\(assign=True\)",
-    ):
+    with pytest.raises(RuntimeError, match=r"load_state_dict\(assign=True\)"):
         model.load_state_dict(checkpoint, assign=True)
 
 
