@@ -50,20 +50,6 @@ def _configure_deepep_deterministic_allocator() -> None:
         torch.utils.deterministic.fill_uninitialized_memory = False
 
 
-def _validate_finite(stage: str, **tensors: torch.Tensor) -> None:
-    if os.environ.get("MLITE_VALIDATE_FINITE") != "1":
-        return
-    for name, tensor in tensors.items():
-        if tensor.is_floating_point():
-            finite = torch.isfinite(tensor)
-            if not bool(finite.all()):
-                raise FloatingPointError(
-                    f"MLITE_NONFINITE stage={stage} tensor={name} "
-                    f"dtype={tensor.dtype} shape={tuple(tensor.shape)} "
-                    f"nonfinite={int((~finite).sum().item())}"
-                )
-
-
 def _hidden_bytes(hidden_size: int) -> int:
     return hidden_size * 2
 
@@ -554,16 +540,8 @@ class TokenDispatcher:
     def _combine_low_latency_aligned(
         self, expert_output: torch.Tensor
     ) -> torch.Tensor:
-        _validate_finite(
-            "deepep.aligned_combine.input",
-            expert_output=expert_output,
-        )
         route_outputs = expert_output.index_select(
             0, self._aligned_metadata_route_rows
-        )
-        _validate_finite(
-            "deepep.aligned_combine.route_outputs",
-            route_outputs=route_outputs,
         )
         if self.ep_size > 1:
             # Match Slime's route-preserving DeepEP lifecycle in both training
@@ -581,10 +559,6 @@ class TokenDispatcher:
             )
         else:
             source_routes = route_outputs
-        _validate_finite(
-            "deepep.aligned_combine.source_routes",
-            source_routes=source_routes,
-        )
         output = _VLLMEPGatherWithBF16Backward.apply(
             source_routes,
             self._aligned_source_indices,
@@ -592,10 +566,6 @@ class TokenDispatcher:
             self._aligned_source_output_index,
             True,
             self._aligned_source_all_routes_valid,
-        )
-        _validate_finite(
-            "deepep.aligned_combine.output",
-            output=output,
         )
         for name in (
             "_aligned_received_output_index",
@@ -950,14 +920,12 @@ class TokenDispatcher:
             self._deepep_event = None
 
     def _combine_deepep(self, expert_output):
-        _validate_finite("deepep.combine.input", expert_output=expert_output)
         rank_grouped = unpermute(
             expert_output,
             self._row_id_map,
             restore_shape=self._restore_shape,
             fused=self.moe_permute_fusion,
         )
-        _validate_finite("deepep.combine.unpermute", rank_grouped=rank_grouped)
         if torch.is_grad_enabled():
             combined = _DeepEPCombine.apply(
                 self._deepep_group, rank_grouped, self._handle, False, False
@@ -969,7 +937,6 @@ class TokenDispatcher:
             combined = buffer.combine(rank_grouped, self._handle)
         if isinstance(combined, tuple):
             combined = combined[0]
-        _validate_finite("deepep.combine.output", combined=combined)
         self._row_id_map = None
         self._restore_shape = None
         self._handle = None
