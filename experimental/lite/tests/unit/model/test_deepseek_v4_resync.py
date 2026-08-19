@@ -48,7 +48,6 @@ def test_fp8_resync_reuses_checkpoint_scale_and_bytes() -> None:
         expert_dtype="fp8",
         quantization_config={"weight_block_size": [128, 128]},
     )
-    name = "layers.0.attn.wq_a.weight"
     qweight = torch.randn(128, 128).clamp(-4, 4).to(torch.float8_e4m3fn)
     scale = torch.tensor([[0.25]], dtype=torch.float32)
     master = (
@@ -56,17 +55,21 @@ def test_fp8_resync_reuses_checkpoint_scale_and_bytes() -> None:
         * scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
     ).to(torch.bfloat16)
 
-    exported = dict(
-        export_resync_weights(
-            [(name, master)],
-            config,
-            resync_config={"expert_dtype": "fp8"},
-            source_scales={name: scale},
+    for name in (
+        "layers.0.attn.wq_a.weight",
+        "layers.0.ffn.experts.0.up_proj.weight",
+    ):
+        exported = dict(
+            export_resync_weights(
+                [(name, master)],
+                config,
+                resync_config={"expert_dtype": "fp8"},
+                source_scales={name: scale},
+            )
         )
-    )
 
-    assert torch.equal(exported[name], qweight)
-    assert torch.equal(exported[name.removesuffix(".weight") + ".scale"], scale)
+        assert torch.equal(exported[name], qweight)
+        assert torch.equal(exported[name.removesuffix(".weight") + ".scale"], scale)
 
 
 def test_fp4_resync_uses_mxfp4_only_for_routed_experts(monkeypatch) -> None:

@@ -93,7 +93,11 @@ def export_resync_weights(
             continue
 
         fixed_scale = None if source_scales is None else source_scales.get(name)
-        if fixed_scale is not None and is_routed_expert(name):
+        if (
+            fixed_scale is not None
+            and is_routed_expert(name)
+            and expert_dtype == "fp4"
+        ):
             raise RuntimeError("routed MXFP4 weights cannot carry block-FP8 source scales")
         if fixed_scale is not None:
             canonical = requantize_block_fp8_weight(
