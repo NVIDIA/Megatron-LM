@@ -49,6 +49,7 @@ from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 
 from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
     parse_expert_idx,
+    remap_layer_index,
     to_global_layer_name,
 )
 
@@ -236,7 +237,7 @@ def load_hf_weights(
         config, source_block_fp8=source_block_fp8
     )
     _load(model, path, spec, ps, vocab_size=config.vocab_size)
-    spec.bind_source_scales(model)
+    spec.bind_source_scales(model, ps)
 
 
 def _to_global_expert_name(
@@ -408,15 +409,30 @@ class DeepseekV4WeightSpec:
         del source_index, source_name
         return self._source_is_quantized(native_name)
 
-    def bind_source_scales(self, model: nn.Module) -> None:
+    def bind_source_scales(self, model: nn.Module, ps: ParallelState) -> None:
         parameters = dict(model.named_parameters())
         registry: dict[str, torch.Tensor] = {}
-        for name, scale in self.source_block_scales.items():
+        global_to_local = {
+            global_idx: local_idx
+            for local_idx, global_idx in enumerate(
+                getattr(model, "layer_indices", ())
+            )
+        }
+        local_start = ps.ep_rank * ensure_divisible(
+            self.config.n_routed_experts, ps.ep_size
+        )
+        for global_name, scale in self.source_block_scales.items():
+            name = remap_layer_index(global_name, global_to_local)
+            if name is None:
+                continue
+            expert_id = self.expert_global_id(name)
+            if expert_id is not None:
+                name = self.expert_local_name(name, expert_id - local_start)
             parameter = parameters[name]
             value = scale.to(parameter.device, dtype=torch.float32).contiguous()
             parameter._fp8_source_scales = value
             parameter._fp8_source_scale_version = parameter._version
-            registry[name] = scale.detach().cpu().float().contiguous()
+            registry[global_name] = scale.detach().cpu().float().contiguous()
         model._fp8_source_scales_by_name = registry
         model._fp8_source_scales_valid = True
 

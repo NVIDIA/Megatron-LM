@@ -465,6 +465,9 @@ class DS4SparseAttentionMetadataBuilderAdapter:
         indices.masked_fill_(offsets[None, :] >= lengths[:, None], -1)
         return indices.unsqueeze(1).contiguous(), lengths.contiguous()
 
+    def build_prefill(self, num_tokens: int):
+        return self.build_prefill_batch([num_tokens])
+
     def build_prefill_batch(self, token_counts: list[int]):
         """Build packed prefill metadata for multiple independent requests."""
 
@@ -941,6 +944,9 @@ class DS4SparseIndexerCompressorMetadataAdapter:
             ).to(torch.int32)
         )
         return output
+
+    def build_prefill(self, num_tokens: int):
+        return self.build_prefill_batch([num_tokens])
 
     def build_prefill_batch(self, token_counts: list[int]):
         """Build packed, sequence-isolated metadata for extended DS4 layers."""

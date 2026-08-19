@@ -199,6 +199,33 @@ def test_ds4_shared_checkpoint_preserves_reversible_fp8_source_scale(tmp_path):
     )
 
 
+def test_ds4_source_scales_bind_global_expert_to_ep_local_parameter():
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+
+    ckpt = _checkpoint_module()
+    model = nn.Module()
+    model.layer_indices = [0]
+    model.layers = nn.ModuleDict({"0": nn.Module()})
+    layer = model.layers["0"]
+    layer.mlp = nn.Module()
+    layer.mlp.experts = nn.Module()
+    layer.mlp.experts.fc1 = nn.Module()
+    layer.mlp.experts.fc1.register_parameter(
+        "weight0", nn.Parameter(torch.zeros(128, 128, dtype=torch.bfloat16))
+    )
+    cfg = DeepseekV4Config(num_hidden_layers=1, n_routed_experts=256)
+    spec = ckpt.DeepseekV4WeightSpec(cfg, source_block_fp8=True)
+    scale = torch.ones(1, 1, dtype=torch.float32)
+    spec.source_block_scales["layers.0.mlp.experts.fc1.weight128"] = scale
+    ps = SimpleNamespace(ep_size=2, ep_rank=1)
+
+    spec.bind_source_scales(model, ps)
+
+    parameter = layer.mlp.experts.fc1.weight0
+    assert torch.equal(parameter._fp8_source_scales, scale)
+    assert "layers.0.mlp.experts.fc1.weight128" in model._fp8_source_scales_by_name
+
+
 def test_ds4_export_streams_router_buffers_from_every_pp_stage(monkeypatch):
     from megatron.lite.primitive.ckpt import hf_weights
 
