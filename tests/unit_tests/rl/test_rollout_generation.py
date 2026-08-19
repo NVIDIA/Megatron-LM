@@ -565,10 +565,12 @@ class TestGroupedRollouts:
         [
             pytest.param("B", "B", 0, 1, 2, id="batch_batch"),
             pytest.param("G", "G", 0, 1, 2, id="group_group"),
-            # Balanced G under out-of-order completion and a depth-2 gate.
-            pytest.param("G", "G", 2, 2, 3, id="group_group_out_of_order"),
             pytest.param("E", "E", 0, 1, 2, id="env_env"),
             pytest.param("G", "E", 0, 1, 2, id="group_env"),
+            # Balanced E under out-of-order completion and a depth-2 gate. G no
+            # longer balances on its own (that guarantee moved to E), so this
+            # case targets E instead of the old group_group_out_of_order.
+            pytest.param("E", "E", 2, 2, 3, id="env_env_out_of_order"),
         ],
     )
     async def test_weighted_multi_task(
