@@ -159,13 +159,22 @@ async def test_terminal_error_and_abort_acknowledgement():
         await asyncio.wait_for(failed, timeout=2.0)
     assert error.value.source_safe
 
-    cancelled = client.add_request("cancelled", SamplingParams())
-    abort_ack = client.abort_request(1)
-    assert cancelled.cancelled()
-    recv_queue.append(msgpack.packb([Headers.REQUEST_ABORTED.value, 1, True]))
-    assert await asyncio.wait_for(abort_ack, timeout=2.0)
+    unsafe = client.add_request("unsafe", SamplingParams())
+    recv_queue.append(msgpack.packb([Headers.REQUEST_ERROR.value, 1, "read failed", False]))
+    with pytest.raises(InferenceRequestError, match="read failed") as error:
+        await asyncio.wait_for(unsafe, timeout=2.0)
+    assert not error.value.source_safe
+    assert 1 not in client.abort_futures
 
-    recv_queue.append(msgpack.packb([Headers.ENGINE_REPLY.value, 1, {}], use_bin_type=True))
+    cancelled = client.add_request("cancelled", SamplingParams())
+    abort_ack = client.abort_request(2)
+    assert cancelled.cancelled()
+    recv_queue.append(msgpack.packb([Headers.REQUEST_ERROR.value, 2, "read failed", False]))
+    assert not await asyncio.wait_for(abort_ack, timeout=2.0)
+    await asyncio.sleep(0)
+    assert 2 not in client.abort_futures
+
+    recv_queue.append(msgpack.packb([Headers.ENGINE_REPLY.value, 2, {}], use_bin_type=True))
     await asyncio.sleep(0.01)
     assert not client.listener_task.done()
 

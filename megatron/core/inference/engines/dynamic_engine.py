@@ -348,10 +348,15 @@ class DynamicInferenceEngine(AbstractEngine):
     def _initialize_disaggregation_state(self) -> None:
         """Hook overridden by the KV-handoff engine composition."""
 
-        self._disagg_config = None
-        self._pinned_handoff_blocks = {}
-        self._pinned_handoff_ssm_slots = {}
-        self._kv_transfer_role = None
+    def _get_disaggregation_config(self):
+        """Return native disaggregation setup, if configured."""
+
+        return None
+
+    def _is_disaggregated_role(self, role: str) -> bool:
+        """Return whether this engine has the given disaggregated role."""
+
+        return False
 
     def _reset_pending_kv_imports(self) -> None:
         """Hook overridden by the KV-handoff engine composition."""
@@ -375,11 +380,13 @@ class DynamicInferenceEngine(AbstractEngine):
     def _setup_handoff_completion_tracking(self, hostname: str | None = None) -> None:
         """Hook overridden by the KV-handoff engine composition."""
 
-    def _drain_handoff_completion_notifications(self) -> list[tuple[int, bool]]:
+    def _drain_handoff_completion_notifications(self) -> list[tuple[int, bool, bool]]:
         """Hook overridden by the KV-handoff engine composition."""
         return []
 
-    def _record_handoff_completion_notification(self, request_id: int, failed: bool) -> None:
+    def _record_handoff_completion_notification(
+        self, request_id: int, failed: bool, source_safe: bool
+    ) -> None:
         """Hook overridden by the KV-handoff engine composition."""
         self._raise_kv_handoff_not_enabled("KV handoff completion notification")
 
@@ -431,9 +438,16 @@ class DynamicInferenceEngine(AbstractEngine):
         """Raising stub; the hand-off engine composition overrides it."""
         self._raise_kv_handoff_not_enabled("KV transfer setup")
 
-    def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
+    def push_handoff_kv(
+        self, request_id: int, decode_metas: list, cached_prefix_blocks: int = 0
+    ) -> None:
         """Raising stub; the hand-off engine composition overrides it."""
         self._raise_kv_handoff_not_enabled("SEND_KV")
+
+    def _handoff_push_error_source_safe(self, error: Exception) -> bool:
+        """Return whether source storage is reusable after a push setup error."""
+
+        return True
 
     def _poll_pending_kv_pushes(self) -> int:
         return 0
@@ -484,8 +498,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
-        self._pinned_handoff_blocks.clear()
-        self._pinned_handoff_ssm_slots.clear()
         self.failed_request_ids = []
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
@@ -794,7 +806,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
         local_ip = hostname or socket.gethostname()
-        disagg_config = self._disagg_config
+        disagg_config = self._get_disaggregation_config()
 
         # Spawn a DP coordinator process and get the connection info.
         if disagg_config is not None:
@@ -2091,7 +2103,12 @@ class DynamicInferenceEngine(AbstractEngine):
     def _select_cg_chunk_size(
         self, req: DynamicInferenceRequest, max_chunk_tokens: int
     ) -> Optional[int]:
-        """Select a graphed chunk size without blocking an otherwise idle engine."""
+        """Select a graphed chunk size, or wait for the resident batch to drain.
+
+        A deferred request remains at the queue head, so no new work is admitted
+        behind it. The finite resident batch can therefore drain and change the
+        graph shape without forcing the continuation onto an eager path.
+        """
         chunk_size = self._find_cg_chunk_size(max_chunk_tokens)
         if chunk_size is not None:
             req.cg_wait_iters = 0
@@ -2930,9 +2947,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.is_mp_coordinator:
             all_messages.extend(
                 msgpack.packb(
-                    [Headers.KV_HANDOFF_COMPLETE.value, request_id, failed], use_bin_type=True
+                    [Headers.KV_HANDOFF_COMPLETE.value, request_id, failed, source_safe],
+                    use_bin_type=True,
                 )
-                for request_id, failed in self._drain_handoff_completion_notifications()
+                for request_id, failed, source_safe in self._drain_handoff_completion_notifications()
             )
             while True:
                 try:
@@ -2959,7 +2977,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
-                if self._kv_transfer_role == "decode":
+                if self._is_disaggregated_role("decode"):
                     self._notify_request_error(
                         request_id,
                         RuntimeError(
@@ -2990,9 +3008,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Push transport: send a pinned hand-off's KV to the decode
                 # instance the coordinator picked.
                 cached_prefix_blocks = int(data[3]) if len(data) > 3 else 0
-                self.push_handoff_kv(int(data[1]), data[2], cached_prefix_blocks)
+                request_id = int(data[1])
+                try:
+                    self.push_handoff_kv(request_id, data[2], cached_prefix_blocks)
+                except Exception as error:
+                    self._notify_request_error(
+                        request_id, error, source_safe=self._handoff_push_error_source_safe(error)
+                    )
             elif header == Headers.KV_HANDOFF_COMPLETE:
-                self._record_handoff_completion_notification(int(data[1]), bool(data[2]))
+                self._record_handoff_completion_notification(
+                    int(data[1]), bool(data[2]), bool(data[3])
+                )
             elif header == Headers.ABORT_REQUEST:
                 request_id = int(data[1])
                 if self.abort_kv_handoff(request_id):
@@ -3011,7 +3037,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.context.request_kv_length_offsets[idx]
                             + self.context.request_query_lengths[idx]
                         )
-                    if self._kv_transfer_role != "prefill":
+                    if not self._is_disaggregated_role("prefill"):
                         self._notify_request_aborted(request_id, source_safe=True)
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]

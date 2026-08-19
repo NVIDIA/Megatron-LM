@@ -28,6 +28,7 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
     PendingKvImport,
     PendingSSMImport,
 )
+from megatron.core.inference.disaggregation.transfer_backends.base import TransferStartError
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -54,6 +55,13 @@ class _TransferAgent:
 
     def begin_pull_blocks(self, peer_meta, src_block_ids, dst_block_ids):
         self.calls.append((peer_meta, list(src_block_ids), list(dst_block_ids)))
+        return _PendingHandle()
+
+    def prepare_pull_blocks(self, peer_meta, src_block_ids, dst_block_ids):
+        self.calls.append((peer_meta, list(src_block_ids), list(dst_block_ids)))
+        return (peer_meta, list(src_block_ids), list(dst_block_ids))
+
+    def start_prepared(self, _plans):
         return _PendingHandle()
 
 
@@ -345,8 +353,10 @@ def test_completed_exact_ssm_handoff_enters_decode_without_waiting_queue(handoff
 
 def test_setup_pins_handoff_outputs_only_on_prefill():
     class _Backend:
-        def __init__(self, **_kwargs):
-            pass
+        names = []
+
+        def __init__(self, **kwargs):
+            self.names.append(kwargs["agent_name"])
 
         def export_meta(self):
             return {"transport": "test"}
@@ -387,6 +397,9 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
         assert not allocator.enable_handoff_pinning
         engine.setup_kv_transfer("prefill")
         assert allocator.enable_handoff_pinning
+        engine.setup_kv_transfer("prefill")
+
+    assert _Backend.names[-2] != _Backend.names[-1]
 
 
 def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
@@ -518,7 +531,7 @@ def test_cancelled_import_releases_only_after_transfer_completion(handoff_loop):
     assert engine.abort_kv_handoff(7)
     assert not future.done()
 
-    engine._handoff_completion_notifications[7] = False
+    engine._handoff_completion_notifications[7] = (False, True)
     engine._admit_pending_kv_imports()
 
     assert future.cancelled()
@@ -617,6 +630,34 @@ def test_reset_does_not_release_unsafe_import_destinations(handoff_loop):
     assert list(engine._pending_kv_imports) == [pending]
 
 
+def test_poll_does_not_release_untracked_transfer_destinations(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
+    pending = _pending_import(engine, 4, block_id, 104)
+    pending.destinations_safe = False
+    engine._quarantined_kv_imports.append(pending)
+
+    engine._poll_quarantined_kv_imports()
+
+    assert engine.context.kv_block_allocator.releases == []
+    assert engine._quarantined_kv_imports == [pending]
+
+
+def test_quarantined_import_survives_backend_poll_error(handoff_loop, caplog):
+    engine = _HandoffHarness(handoff_loop)
+    block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
+    pending = _pending_import(engine, 4, block_id, 104)
+    pending.handle = mock.Mock(storage_safe=False)
+    pending.handle.poll.side_effect = ValueError("backend poll failed")
+    engine._quarantined_kv_imports.append(pending)
+
+    engine._poll_quarantined_kv_imports()
+
+    assert engine.context.kv_block_allocator.releases == []
+    assert engine._quarantined_kv_imports == [pending]
+    assert "Polling quarantined KV import failed" in caplog.text
+
+
 def test_prefill_handoff_pins_protect_blocks_and_restore_capacity(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     engine.context.prefix_cache_lru_clock = 0
@@ -674,7 +715,7 @@ def test_peer_failure_quarantines_an_unfinished_local_transfer(handoff_loop):
     pending = _pending_import(engine, 4, block_id, 104)
     pending.handle = _PendingHandle()
     engine._pending_kv_imports.append(pending)
-    engine._record_handoff_completion_notification(4, failed=True)
+    engine._record_handoff_completion_notification(4, failed=True, source_safe=False)
 
     engine._poll_pending_kv_imports()
     engine._admit_pending_kv_imports()
@@ -699,7 +740,7 @@ def test_completed_handoff_keeps_notification_while_decode_is_full(handoff_loop)
     pending = _pending_import(engine, 4, block_id, 104)
     pending.terminal_state_reported = True
     engine._pending_kv_imports.append(pending)
-    engine._record_handoff_completion_notification(4, failed=False)
+    engine._record_handoff_completion_notification(4, failed=False, source_safe=True)
     engine.context.total_request_count = engine.context.max_requests
 
     with mock.patch.object(engine, "_finalize_kv_handoff_import") as finalize:
@@ -708,7 +749,7 @@ def test_completed_handoff_keeps_notification_while_decode_is_full(handoff_loop)
 
         finalize.assert_not_called()
         assert list(engine._pending_kv_imports) == [pending]
-        assert engine._handoff_completion_notifications == {4: False}
+        assert engine._handoff_completion_notifications == {4: (False, True)}
 
         engine.context.total_request_count = 0
         engine._admit_pending_kv_imports()
@@ -726,7 +767,7 @@ def test_transfer_polling_defers_batch_mutation_to_scheduling(handoff_loop):
     pending = _pending_import(engine, 4, block_id, 104)
     pending.terminal_state_reported = True
     engine._pending_kv_imports.append(pending)
-    engine._record_handoff_completion_notification(4, failed=False)
+    engine._record_handoff_completion_notification(4, failed=False, source_safe=True)
 
     with mock.patch.object(engine, "_finalize_kv_handoff_import") as finalize:
         assert engine._poll_pending_kv_imports() == 1
@@ -826,16 +867,18 @@ def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
 
 def test_handoff_completion_waits_for_all_ranks_but_failure_is_immediate():
     tracker = _completion_tracker()
-    tracker._record(7, rank=0, failed=False)
+    tracker._record(7, rank=0, failed=False, source_safe=True)
     assert tracker.drain_completed() == []
 
-    tracker._record(7, rank=1, failed=False)
-    assert tracker.drain_completed() == [(7, False)]
+    tracker._record(7, rank=1, failed=False, source_safe=True)
+    assert tracker.drain_completed() == [(7, False, True)]
 
-    tracker._record(8, rank=1, failed=True)
-    assert tracker.drain_completed() == [(8, True)]
-    tracker._record(8, rank=0, failed=False)
+    tracker._record(8, rank=1, failed=True, source_safe=False)
+    assert tracker.drain_completed() == [(8, True, False)]
+    tracker._record(8, rank=0, failed=False, source_safe=True)
     assert tracker.drain_completed() == []
+    tracker._record(8, rank=1, failed=True, source_safe=True)
+    assert tracker.drain_completed() == [(8, True, True)]
     assert 8 not in tracker._reports
 
 
@@ -1039,7 +1082,7 @@ def test_decode_handoff_defers_until_kv_capacity_is_available(handoff_loop):
 def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     engine._kv_transfer_agent.is_push = True
-    engine._kv_transfer_agent.begin_pull_blocks = mock.Mock(
+    engine._kv_transfer_agent.prepare_pull_blocks = mock.Mock(
         side_effect=RuntimeError("local handoff submission failed")
     )
     engine._notify_request_error = mock.Mock()
@@ -1059,16 +1102,16 @@ def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(ha
     assert engine._try_start_kv_handoff_import(handoff)
     _drain_loop(handoff_loop)
     engine._poll_pending_kv_imports()
-    engine._handoff_completion_tracker.report.assert_called_once_with(8, True)
+    engine._handoff_completion_tracker.report.assert_called_once_with(8, True, True)
 
-    engine._record_handoff_completion_notification(8, failed=True)
+    engine._record_handoff_completion_notification(8, failed=True, source_safe=True)
     engine._admit_pending_kv_imports()
 
     assert isinstance(future.exception(), RuntimeError)
     assert engine.context.kv_block_allocator.releases == [[10, 11, 12]]
     assert not engine._pending_kv_imports
     engine._notify_request_error.assert_called_once()
-    assert engine._notify_request_error.call_args.kwargs == {"source_safe": False}
+    assert engine._notify_request_error.call_args.kwargs == {"source_safe": True}
 
 
 def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):
@@ -1124,13 +1167,19 @@ def test_nccl_handoff_reuses_decode_cached_prefix(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     engine._kv_transfer_agent.is_push = True
     events = []
-    original_begin_pull = engine._kv_transfer_agent.begin_pull_blocks
+    original_prepare_pull = engine._kv_transfer_agent.prepare_pull_blocks
+    original_start_prepared = engine._kv_transfer_agent.start_prepared
 
-    def begin_pull(*args):
+    def prepare_pull(*args):
+        events.append("prepare")
+        return original_prepare_pull(*args)
+
+    def start_prepared(*args):
         events.append("receive")
-        return original_begin_pull(*args)
+        return original_start_prepared(*args)
 
-    engine._kv_transfer_agent.begin_pull_blocks = begin_pull
+    engine._kv_transfer_agent.prepare_pull_blocks = prepare_pull
+    engine._kv_transfer_agent.start_prepared = start_prepared
     engine._notify_kv_transfer_ready = lambda *_: events.append("ready")
     prompt = [3] * 8
     hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
@@ -1143,7 +1192,7 @@ def test_nccl_handoff_reuses_decode_cached_prefix(handoff_loop):
     _drain_loop(handoff_loop)
 
     assert engine._kv_transfer_agent.calls == [(kv_meta, [101], [10])]
-    assert events == ["ready", "receive"]
+    assert events == ["prepare", "ready", "receive"]
 
 
 def test_decode_role_rejects_prompt_scheduling(handoff_loop):
@@ -1165,18 +1214,42 @@ def test_push_handoff_uses_final_pinned_blocks_ssm_slot():
     decode_metas = [
         {"ssm": {"conv": {"agent": "decode-conv"}, "recurrent": {"agent": "decode-ssm"}}}
     ]
+    kv_plan, conv_plan, recurrent_plan = object(), object(), object()
+    engine._kv_transfer_agent.prepare_push_blocks.return_value = kv_plan
+    engine._ssm_transfer_agents["conv"].prepare_push_blocks.return_value = conv_plan
+    engine._ssm_transfer_agents["recurrent"].prepare_push_blocks.return_value = recurrent_plan
 
     engine.push_handoff_kv(7, decode_metas)
 
-    engine._kv_transfer_agent.begin_push_blocks.assert_called_once_with(
+    engine._kv_transfer_agent.prepare_push_blocks.assert_called_once_with(
         {"tp_metas": decode_metas}, [20, 21]
     )
-    engine._ssm_transfer_agents["conv"].begin_push_blocks.assert_called_once_with(
+    engine._ssm_transfer_agents["conv"].prepare_push_blocks.assert_called_once_with(
         {"tp_metas": [{"agent": "decode-conv"}]}, [3]
     )
-    engine._ssm_transfer_agents["recurrent"].begin_push_blocks.assert_called_once_with(
+    engine._ssm_transfer_agents["recurrent"].prepare_push_blocks.assert_called_once_with(
         {"tp_metas": [{"agent": "decode-ssm"}]}, [3]
     )
+    engine._kv_transfer_agent.start_prepared.assert_called_once_with(
+        [kv_plan, conv_plan, recurrent_plan]
+    )
+
+
+def test_push_start_failure_retains_untracked_transfer_resources():
+    engine = object.__new__(InferenceStateHandoffMixin)
+    engine._initialize_disaggregation_state()
+    engine._kv_transfer_agent = mock.Mock()
+    engine._ssm_transfer_agents = {}
+    engine._pinned_handoff_blocks[7] = [20]
+    plan = object()
+    engine._kv_transfer_agent.prepare_push_blocks.return_value = plan
+    error = TransferStartError("post failed", storage_safe=False, resources=[plan])
+    engine._kv_transfer_agent.start_prepared.side_effect = error
+
+    with pytest.raises(TransferStartError, match="post failed"):
+        engine.push_handoff_kv(7, [])
+
+    assert engine._unsafe_kv_push_resources == [[plan]]
 
 
 def test_push_handoff_rejects_ssm_state_without_kv_blocks():
@@ -1189,9 +1262,9 @@ def test_push_handoff_rejects_ssm_state_without_kv_blocks():
     with pytest.raises(RuntimeError, match="detached SSM state but no pinned KV blocks"):
         engine.push_handoff_kv(7, [])
 
-    engine._kv_transfer_agent.begin_push_blocks.assert_not_called()
-    engine._ssm_transfer_agents["conv"].begin_push_blocks.assert_not_called()
-    engine._ssm_transfer_agents["recurrent"].begin_push_blocks.assert_not_called()
+    engine._kv_transfer_agent.prepare_push_blocks.assert_not_called()
+    engine._ssm_transfer_agents["conv"].prepare_push_blocks.assert_not_called()
+    engine._ssm_transfer_agents["recurrent"].prepare_push_blocks.assert_not_called()
 
 
 def test_push_handoff_validates_ssm_metadata_before_posting_sends():
@@ -1205,8 +1278,8 @@ def test_push_handoff_validates_ssm_metadata_before_posting_sends():
     with pytest.raises(RuntimeError, match="recurrent SSM transfer state"):
         engine.push_handoff_kv(7, [{"ssm": {"conv": {"agent": "decode"}}}])
 
-    engine._kv_transfer_agent.begin_push_blocks.assert_not_called()
-    engine._ssm_transfer_agents["conv"].begin_push_blocks.assert_not_called()
+    engine._kv_transfer_agent.prepare_push_blocks.assert_not_called()
+    engine._ssm_transfer_agents["conv"].prepare_push_blocks.assert_not_called()
 
 
 def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():

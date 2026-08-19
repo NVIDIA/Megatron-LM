@@ -88,6 +88,27 @@ def test_invalid_advertised_capacity_is_rejected():
         flow.register_engine(b"decode", "decode", [_meta(ssm_slot_capacity=0)])
 
 
+@pytest.mark.parametrize("metadata", [None, [None]])
+def test_malformed_engine_metadata_is_rejected(metadata):
+    flow = DisaggStateFlowControl()
+
+    with pytest.raises(ValueError, match="transfer metadata"):
+        flow.register_engine(b"decode", "decode", metadata)
+
+
+def test_removed_engine_cannot_acquire_new_reservations():
+    flow = DisaggStateFlowControl()
+    flow.register_engine(b"prefill", "prefill", [_meta()])
+    flow.register_engine(b"decode", "decode", [_meta()])
+    flow.remove_engine(b"prefill")
+    flow.remove_engine(b"decode")
+
+    assert flow.available_fraction(b"prefill", "prefill") == 0.0
+    assert flow.available_fraction(b"decode", "decode") == 0.0
+    assert not flow.try_reserve_prefill(b"prefill", 1, 0)
+    assert not flow.try_reserve(b"decode", 2, 0)
+
+
 def test_partially_advertised_model_parallel_capacity_is_rejected():
     flow = DisaggStateFlowControl()
 
@@ -117,3 +138,12 @@ def test_prefill_reservations_use_advertised_handoff_bound_and_fifo_queue():
 
     assert admitted.request_id == 2
     assert flow.prefill_usage(b"prefill") == 1
+
+
+def test_available_fraction_uses_binding_request_or_state_capacity():
+    flow = DisaggStateFlowControl()
+    flow.register_engine(b"decode", "decode", [_meta(request_capacity=4, ssm_slot_capacity=8)])
+
+    assert flow.try_reserve(b"decode", 1, 6)
+
+    assert flow.available_fraction(b"decode", "decode") == 0.25

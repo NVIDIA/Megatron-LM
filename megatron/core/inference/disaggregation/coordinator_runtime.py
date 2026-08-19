@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import msgpack
 
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.disaggregation.coordinator_flow_control import DisaggStateFlowControl
 from megatron.core.inference.disaggregation.coordinator_routing import make_disagg_router
 from megatron.core.inference.disaggregation.handoff_wire_protocol import (
@@ -16,6 +18,60 @@ from megatron.core.inference.disaggregation.handoff_wire_protocol import (
     restore_registered_nixl_agent_metadata,
 )
 from megatron.core.inference.headers import Headers
+
+
+@dataclass
+class _RequestState:
+    prompt: Any
+    sampling_params: dict
+    block_hashes: list[int]
+
+
+def _instance_transfer_signature(instance_meta: Any) -> tuple:
+    """Return model-wide state geometry shared by compatible instances."""
+
+    if not isinstance(instance_meta, list) or not instance_meta:
+        raise ValueError("state transfer metadata must be a non-empty list")
+    if not all(isinstance(entry, dict) for entry in instance_meta):
+        raise ValueError("every model-parallel transfer descriptor must be a dictionary")
+
+    kv_fields = (
+        "tokens_per_block",
+        "element_size",
+        "head_dim",
+        "num_layers_global",
+        "num_kv_heads_global",
+    )
+    kv_signatures = {tuple(entry.get(field) for field in kv_fields) for entry in instance_meta}
+    if len(kv_signatures) != 1 or None in next(iter(kv_signatures)):
+        raise ValueError("model-parallel ranks advertise inconsistent KV transfer geometry")
+
+    state_kinds = {
+        state_kind for entry in instance_meta for state_kind in (entry.get("ssm") or {}).keys()
+    }
+    ssm_signatures = []
+    for state_kind in sorted(state_kinds):
+        signatures = set()
+        layer_ranges = set()
+        for entry in instance_meta:
+            state_meta = (entry.get("ssm") or {}).get(state_kind)
+            layout = state_meta.get("ssm_layout") if isinstance(state_meta, dict) else None
+            dims = layout.get("dims") if isinstance(layout, dict) else None
+            if not isinstance(dims, dict):
+                raise ValueError(f"model-parallel metadata is missing {state_kind} SSM geometry")
+            signatures.add((state_meta.get("element_size"), tuple(sorted(dims.items()))))
+            layer_ranges.add((int(layout["layer_start"]), int(layout["num_layers"])))
+        if len(signatures) != 1 or next(iter(signatures))[0] is None:
+            raise ValueError(
+                f"model-parallel ranks advertise inconsistent {state_kind} SSM geometry"
+            )
+        layer_count = 0
+        for layer_start, local_count in sorted(layer_ranges):
+            if layer_start != layer_count:
+                raise ValueError(f"model-parallel {state_kind} SSM layers are not contiguous")
+            layer_count = max(layer_count, layer_start + local_count)
+        ssm_signatures.append((state_kind, next(iter(signatures)), layer_count))
+    return (next(iter(kv_signatures)), tuple(ssm_signatures))
 
 
 class DisaggCoordinatorRuntime:
@@ -26,12 +82,13 @@ class DisaggCoordinatorRuntime:
         self.router = make_disagg_router(router_name)
         self.flow = DisaggStateFlowControl()
         self.hop1_request_ids: set[int] = set()
-        self.request_metadata: dict[int, tuple[Any, dict]] = {}
+        self.requests: dict[int, _RequestState] = {}
         self.prefill_by_request: dict[int, Any] = {}
         self.engine_role: dict[Any, str] = {}
         self.engine_transport: dict[Any, str] = {}
         self.engine_metadata: dict[Any, Any] = {}
         self.cancelled_request_ids: set[int] = set()
+        self._transfer_signature: tuple | None = None
 
     def register_engine(self, identity, role: str, transport: str, instance_meta: Any) -> None:
         """Register one prefill or decode instance and its transfer metadata."""
@@ -42,8 +99,13 @@ class DisaggCoordinatorRuntime:
             raise ValueError(f"engine {identity!r} cannot change disaggregated role or transport")
         if self.engine_transport and transport not in set(self.engine_transport.values()):
             raise ValueError("prefill and decode engines must use the same state transport")
+        signature = _instance_transfer_signature(instance_meta)
+        if self._transfer_signature is not None and signature != self._transfer_signature:
+            raise ValueError("prefill and decode engines have incompatible transfer geometry")
 
         capacity = self.flow.register_engine(identity, role, instance_meta)
+        if self._transfer_signature is None:
+            self._transfer_signature = signature
         coordinator = self.coordinator
         if identity not in coordinator.identities_of_data_parallel_ranks:
             coordinator.identities_of_data_parallel_ranks.append(identity)
@@ -79,13 +141,64 @@ class DisaggCoordinatorRuntime:
         self.engine_transport.pop(identity, None)
         self.engine_metadata.pop(identity, None)
         self.flow.remove_engine(identity)
+        if not self.engine_role:
+            self._transfer_signature = None
+
+    def _request_hashes(self, prompt: Any) -> list[int]:
+        hashes = self.coordinator.compute_request_hashes(prompt)
+        if (
+            self.coordinator.prefix_caching_coordinator_policy
+            == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+        ):
+            return hashes[:1]
+        return hashes
+
+    def _make_routing_score(self, block_hashes: list[int], role: str):
+        """Build a role-local routing score, computing prefix affinity once.
+
+        Decode affinity avoids allocating and transferring prefix blocks that
+        are already cached on the selected decode engine.
+        """
+
+        policy = self.coordinator.prefix_caching_coordinator_policy
+        if block_hashes and policy != PrefixCachingCoordinatorPolicy.LOAD_BALANCED:
+            matches, recencies = self.coordinator._match_vector(block_hashes)
+        else:
+            matches = recencies = None
+
+        def score(identity) -> tuple:
+            free_capacity = self.flow.available_fraction(identity, role)
+            recency = 0.0
+            if matches is None:
+                combined = free_capacity
+            else:
+                rank_index = self.coordinator.identity_to_rank_index[identity]
+                match = float(matches[rank_index])
+                recency = float(recencies[rank_index])
+                alpha = self.coordinator.prefix_caching_routing_alpha
+                combined = alpha * match + (1.0 - alpha) * free_capacity
+            load = (
+                self.flow.prefill_load(identity)
+                if role == "prefill"
+                else self.flow.decode_load(identity)
+            )
+            return (-combined, -recency, *load)
+
+        return score
+
+    def _record_hash_assignment(self, identity, block_hashes: list[int]) -> None:
+        if block_hashes:
+            self.coordinator._update_rank_hashes(identity, block_hashes)
 
     def route_submit(self, request_id: int, prompt: Any, sampling_params: dict) -> None:
         """Reserve capacity and send a client request to a prefill instance."""
 
-        self.request_metadata[request_id] = (prompt, sampling_params)
+        block_hashes = self._request_hashes(prompt)
+        self.requests[request_id] = _RequestState(prompt, sampling_params, block_hashes)
         try:
-            prefill_id = self.router.route_submit(request_id, self.flow.prefill_load)
+            prefill_id = self.router.route_submit(
+                request_id, self._make_routing_score(block_hashes, "prefill")
+            )
         except RuntimeError as error:
             self.drop_request(request_id, f"cannot route to prefill: {error}", source_safe=True)
             return
@@ -120,15 +233,18 @@ class DisaggCoordinatorRuntime:
         prefill_params["skip_prompt_log_probs"] = True
         if "num_tokens_total" in prefill_params:
             prefill_params["num_tokens_total"] = None
-        self._send(prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, prefill_params)
+        if self._send(prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, prefill_params):
+            self._record_hash_assignment(prefill_id, self.requests[request_id].block_hashes)
 
     def _drain_prefill_queue(self, prefill_id) -> None:
         while True:
             request = self.flow.pop_next_prefill(prefill_id)
             if request is None:
                 return
-            prompt, sampling_params = self.request_metadata[request.request_id]
-            self._submit_prefill(prefill_id, request.request_id, prompt, sampling_params)
+            state = self.requests[request.request_id]
+            self._submit_prefill(
+                prefill_id, request.request_id, state.prompt, state.sampling_params
+            )
 
     def handle_prefill_done(self, request_id: int, finished_request: dict) -> None:
         """Route a completed prefill handoff to a decode instance."""
@@ -137,16 +253,17 @@ class DisaggCoordinatorRuntime:
         if request_id in self.cancelled_request_ids:
             self._finish_abort(request_id, source_safe=True)
             return
-        request_meta = self.request_metadata.get(request_id)
+        request_state = self.requests.get(request_id)
         handoff = finished_request.get("disaggregated_params")
-        if request_meta is None or not handoff:
+        if request_state is None or not handoff:
             self.drop_request(
                 request_id, "prefill reply carried no handoff metadata", source_safe=True
             )
             return
-        prompt, sampling_params = request_meta
         try:
-            _, decode_id = self.router.route_prefill_done(request_id, self.flow.decode_load)
+            _, decode_id = self.router.route_prefill_done(
+                request_id, self._make_routing_score(request_state.block_hashes, "decode")
+            )
         except RuntimeError as error:
             self.drop_request(request_id, f"cannot route to decode: {error}", source_safe=True)
             return
@@ -168,13 +285,16 @@ class DisaggCoordinatorRuntime:
             make_submit_request_with_kv_message(
                 Headers.SUBMIT_REQUEST_WITH_KV.value,
                 request_id,
-                prompt,
-                sampling_params,
+                request_state.prompt,
+                request_state.sampling_params,
                 kv_meta,
                 handoff["block_ids"],
             ),
             use_bin_type=True,
         )
+        # The serialized handoff owns these values until decode receives it.
+        request_state.prompt = None
+        request_state.sampling_params = {}
         slot_cost = self.flow.slot_cost_from_handoff(handoff)
         capacity = self.flow.capacity(decode_id)
         if not self.flow.can_ever_fit(decode_id, slot_cost):
@@ -193,7 +313,19 @@ class DisaggCoordinatorRuntime:
         self._send_decode_handoff(decode_id, request_id, payload)
 
     def _send_decode_handoff(self, decode_id, request_id: int, payload: bytes) -> bool:
-        return self.coordinator._send_to_engine(decode_id, payload)
+        """Send a handoff; an unreachable engine is removed with its assigned work."""
+
+        sent = self.coordinator._send_to_engine(decode_id, payload)
+        if sent:
+            request = self.requests[request_id]
+            self._record_hash_assignment(decode_id, request.block_hashes)
+            request.block_hashes = []
+        else:
+            # EHOSTUNREACH means the ROUTER did not deliver the handoff, so no
+            # transfer can still be reading the prefill source.
+            self._release_prefill(request_id)
+            self.router.forget(request_id)
+        return sent
 
     def handle_kv_transfer_ready(
         self, sender_identity, request_id: int, cached_prefix_blocks: int
@@ -255,7 +387,7 @@ class DisaggCoordinatorRuntime:
             )
             return
         self._release_prefill(request_id)
-        if request_id not in self.request_metadata:
+        if request_id not in self.requests:
             self.router.forget(request_id)
 
     def handle_decode_done(self, request_id: int) -> None:
@@ -266,7 +398,7 @@ class DisaggCoordinatorRuntime:
             self._drain_decode_queue(decode_id)
         self._release_prefill(request_id)
         self.router.forget(request_id)
-        self.request_metadata.pop(request_id, None)
+        self.requests.pop(request_id, None)
 
     def drop_request(self, request_id: int, reason: str, *, source_safe: bool) -> None:
         """Fail a client request and discard its coordinator state."""
@@ -289,7 +421,7 @@ class DisaggCoordinatorRuntime:
         decode_id = self.flow.release_decode(request_id)
         if decode_id is not None:
             self._drain_decode_queue(decode_id)
-        self.request_metadata.pop(request_id, None)
+        self.requests.pop(request_id, None)
         self.hop1_request_ids.discard(request_id)
         self.cancelled_request_ids.discard(request_id)
         if source_safe:
@@ -330,6 +462,10 @@ class DisaggCoordinatorRuntime:
 
         if request_id in self.cancelled_request_ids:
             self._finish_abort(request_id, source_safe=source_safe)
+        elif source_safe and request_id in self.prefill_by_request:
+            # A failed handoff can report source safety after the client error.
+            self._release_prefill(request_id)
+            self.router.forget(request_id)
 
     def _finish_abort(self, request_id: int, *, source_safe: bool) -> None:
         coordinator = self.coordinator
@@ -342,7 +478,7 @@ class DisaggCoordinatorRuntime:
             self._drain_decode_queue(decode_id)
         if source_safe:
             self.router.forget(request_id)
-        self.request_metadata.pop(request_id, None)
+        self.requests.pop(request_id, None)
         self.hop1_request_ids.discard(request_id)
         self.cancelled_request_ids.discard(request_id)
         coordinator.request_id_to_client_id.pop(request_id, None)

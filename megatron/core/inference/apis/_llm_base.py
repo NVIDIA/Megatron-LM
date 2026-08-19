@@ -13,7 +13,7 @@ helpers, the public sync bridge (``submit``/``run_sync``), and the private
 import asyncio
 import concurrent.futures
 import threading
-from typing import Coroutine, List, Optional, Tuple, Union
+from typing import Coroutine, List, Optional, Sequence, Tuple, Union
 
 import torch.distributed as dist
 
@@ -29,7 +29,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
     GPTInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.shards_spec import normalize_shard_specs
+from megatron.core.inference.shards_spec import InferenceShardSpec, normalize_shard_specs
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -266,7 +266,7 @@ class _MegatronLLMBase:
         use_coordinator: bool = True,
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
-        inference_shards=None,
+        inference_shards: Optional[Union[str, Sequence[InferenceShardSpec], Sequence[dict]]] = None,
         disagg_router: str = "round_robin",
         kv_transport_backend: str = "nixl",
     ) -> None:

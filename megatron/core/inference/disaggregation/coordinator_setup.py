@@ -8,7 +8,6 @@ from typing import Any, List
 
 import torch.distributed as dist
 
-from megatron.core.inference.config import PrefixCachingEvictionPolicy
 from megatron.core.inference.shards_spec import InferenceShardSpec
 from megatron.core.utils import get_pg_rank
 
@@ -43,12 +42,6 @@ def configure_prebuilt_disagg_engine(
     assert ctx.enable_prefix_caching, (
         "disaggregation requires prefix caching (enable_prefix_caching=True); "
         "the decode side admits handed-off KV via a prefix-cache hit."
-    )
-    # REF_ZERO would deregister imported blocks before decode admission.
-    assert ctx.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU, (
-        "disaggregation requires the LRU prefix-cache eviction policy "
-        "(--inference-dynamic-batching-prefix-caching-eviction-policy lru); "
-        f"got {ctx.prefix_caching_eviction_policy!r}."
     )
     rank = dist.get_rank()
 

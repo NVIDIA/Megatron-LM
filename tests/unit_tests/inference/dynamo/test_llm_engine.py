@@ -178,9 +178,7 @@ async def test_decode_uses_streaming_kv_handoff():
 
     handoff = MagicMock(return_value=Stream())
     engine = MegatronLLMEngine(_config("decode"))
-    engine.client = SimpleNamespace(
-        add_request_with_kv_handoff_streaming=handoff, forget_abort=MagicMock()
-    )
+    engine.client = SimpleNamespace(add_request_with_kv_handoff_streaming=handoff)
     request = {"token_ids": [1], "sampling_options": {}, "stop_conditions": {"max_tokens": 1}}
     prefill = {"disaggregated_params": {"kv_meta": {"peer": "prefill"}, "block_ids": [4, 5]}}
 
@@ -199,21 +197,20 @@ async def test_decode_uses_streaming_kv_handoff():
 async def test_abort_uses_megatron_request_id_recorded_for_context():
     aborted = []
 
-    async def wait_for_abort(request_id):
+    def abort_request(request_id):
         assert request_id == 77
-        return True
+        aborted.append(request_id)
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(True)
+        return future
 
-    forgotten = []
     engine = MegatronLLMEngine(_config())
-    engine.client = SimpleNamespace(
-        abort_request=aborted.append, wait_for_abort=wait_for_abort, forget_abort=forgotten.append
-    )
+    engine.client = SimpleNamespace(abort_request=abort_request)
     engine._request_ids["dynamo-request"] = 77
 
     await engine.abort(_Context())
 
     assert aborted == [77]
-    assert forgotten == [77]
 
 
 @pytest.mark.asyncio

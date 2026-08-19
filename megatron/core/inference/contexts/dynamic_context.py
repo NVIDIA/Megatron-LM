@@ -584,6 +584,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_max_requests = (
                 int(mamba_memory_bytes // mamba_states_memory_per_request) - reserved_mamba_slots
             )
+            assert mamba_max_requests >= 1, (
+                f"mamba_memory_ratio {mamba_memory_ratio} leaves no request capacity after "
+                f"reserving {reserved_mamba_slots} recurrent-state dummy slot(s)"
+            )
 
             # Reduce buffer sizes for KV cache
             buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
@@ -2328,9 +2332,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.mamba_metadata.dummy_state_idx
                 )
             else:
-                self.mamba_metadata.request_to_mamba_state_idx[0:N] = (
-                    self.mamba_metadata.batch_allocate_slots(N)
-                )
+                dummy_slots = self.mamba_metadata.batch_allocate_slots(N)
+                assert (
+                    dummy_slots is not None
+                ), f"No free recurrent-state slots for {N} expert-parallel dummy request(s)"
+                self.mamba_metadata.request_to_mamba_state_idx[0:N] = dummy_slots
 
     def initialize_attention_state(
         self,

@@ -295,14 +295,15 @@ def handle_request_error(coordinator, sender_identity, payload):
             ),
         ]
     )
-    coordinator.request_id_to_client_id.pop(request_id, None)
-    coordinator.request_id_to_client_request_id.pop(request_id, None)
-    coordinator.client_request_to_request_id.pop((client_identity, client_request_id), None)
-    assigned_rank = coordinator.request_id_to_rank.pop(request_id, None)
-    if assigned_rank is not None:
-        index = coordinator.identity_to_rank_index.get(assigned_rank)
-        if index is not None and coordinator._pending_counts[index] > 0:
-            coordinator._pending_counts[index] -= 1
+    if source_safe:
+        coordinator.request_id_to_client_id.pop(request_id, None)
+        coordinator.request_id_to_client_request_id.pop(request_id, None)
+        coordinator.client_request_to_request_id.pop((client_identity, client_request_id), None)
+        assigned_rank = coordinator.request_id_to_rank.pop(request_id, None)
+        if assigned_rank is not None:
+            index = coordinator.identity_to_rank_index.get(assigned_rank)
+            if index is not None and coordinator._pending_counts[index] > 0:
+                coordinator._pending_counts[index] -= 1
 
 
 @message_handler(Headers.REQUEST_ABORTED)

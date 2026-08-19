@@ -388,14 +388,14 @@ class MegatronLLMEngine(LLMEngine):
             if not released and self.config.role == "decode":
                 try:
                     if not source_safe:
-                        self.client.abort_request(stream.request_id)
-                        source_safe = await self.client.wait_for_abort(stream.request_id)
+                        source_safe = await asyncio.wait_for(
+                            self.client.abort_request(stream.request_id),
+                            timeout=self.config.drain_timeout,
+                        )
                     if source_safe:
                         await self._release_handoff_from_meta_async(release)
                 except Exception:
                     logger.exception("Failed to finish cancelled Megatron handoff")
-                finally:
-                    self.client.forget_abort(stream.request_id)
 
     async def _stream_chunks(
         self, stream, prompt_token_ids: list[int], params: SamplingParams
@@ -480,11 +480,9 @@ class MegatronLLMEngine(LLMEngine):
     async def abort(self, context: Context) -> None:
         request_id = self._request_ids.pop(str(context.id()), None)
         if request_id is not None and self.client is not None:
-            self.client.abort_request(request_id)
-            try:
-                await self.client.wait_for_abort(request_id)
-            finally:
-                self.client.forget_abort(request_id)
+            await asyncio.wait_for(
+                self.client.abort_request(request_id), timeout=self.config.drain_timeout
+            )
 
     async def drain(self) -> None:
         deadline = asyncio.get_running_loop().time() + self.config.drain_timeout

@@ -914,7 +914,7 @@ class TestRoutingPolicies:
         assert "duplicate or late ENGINE_REPLY" in caplog.text
         assert coord.router_socket.send_multipart.call_count == 1
 
-    def test_terminal_error_clears_routing_when_source_is_unsafe(self):
+    def test_unsafe_terminal_error_keeps_routing_until_safety_ack(self):
         coord = _make_routing_coordinator(num_ranks=1)
         coord.router_socket = unittest.mock.MagicMock()
         coord.request_id_to_client_id = {11: b"client-A"}
@@ -925,6 +925,16 @@ class TestRoutingPolicies:
 
         HANDLERS[Headers.REQUEST_ERROR](
             coord, b"rank-0", [Headers.REQUEST_ERROR.value, 11, "failed", False]
+        )
+
+        assert coord.request_id_to_client_id == {11: b"client-A"}
+        assert coord.request_id_to_client_request_id == {11: 7}
+        assert coord.client_request_to_request_id == {(b"client-A", 7): 11}
+        assert coord.request_id_to_rank == {11: b"rank-0"}
+        assert coord._pending_counts[0] == 1
+
+        HANDLERS[Headers.REQUEST_ABORTED](
+            coord, b"rank-0", [Headers.REQUEST_ABORTED.value, 11, True]
         )
 
         assert coord.request_id_to_client_id == {}

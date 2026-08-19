@@ -19,6 +19,19 @@ from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout
 KVTransportBackend = Any
 
 
+class TransferStartError(RuntimeError):
+    """Transfer submission failed after storage may have become transport-owned.
+
+    ``resources`` keeps transport descriptors and staging buffers alive while
+    their storage cannot be safely reused.
+    """
+
+    def __init__(self, message: str, *, storage_safe: bool, resources: Any = None):
+        super().__init__(message)
+        self.storage_safe = storage_safe
+        self.resources = resources
+
+
 def construct_kv_transfer_backend_class(name: str) -> KVTransportBackend:
     """Return the backend class registered under ``name``."""
 

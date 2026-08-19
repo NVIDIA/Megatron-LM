@@ -206,13 +206,12 @@ class InferenceClient:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
     def abort_request(self, request_id: int) -> asyncio.Future:
-        """Cancel an in-flight request and return its safety acknowledgement."""
+        """Cancel a request and return a self-pruning safety acknowledgement."""
         request_id = int(request_id)
         existing = self.abort_futures.get(request_id)
         if existing is not None:
             return existing
-        abort_future = self._loop.create_future()
-        self.abort_futures[request_id] = abort_future
+        abort_future = self._new_abort_future(request_id)
         stream = self.streams.pop(request_id, None)
         if stream is not None:
             stream.finish()
@@ -224,18 +223,19 @@ class InferenceClient:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
         return abort_future
 
-    async def wait_for_abort(self, request_id: int, timeout: float = 30.0) -> bool:
-        """Wait until cancellation can no longer race handoff storage."""
+    def _new_abort_future(self, request_id: int) -> asyncio.Future:
+        """Create a safety acknowledgement that removes itself on completion."""
 
-        future = self.abort_futures.get(int(request_id))
-        if future is None:
-            return False
-        return bool(await asyncio.wait_for(asyncio.shield(future), timeout))
+        future = self._loop.create_future()
+        self.abort_futures[request_id] = future
+        future.add_done_callback(functools.partial(self._discard_abort_future, request_id))
+        return future
 
-    def forget_abort(self, request_id: int) -> None:
-        """Discard a cancellation acknowledgement after all waiters finish."""
+    def _discard_abort_future(self, request_id: int, future: asyncio.Future) -> None:
+        """Remove a completed acknowledgement without discarding a newer waiter."""
 
-        self.abort_futures.pop(int(request_id), None)
+        if self.abort_futures.get(request_id) is future:
+            self.abort_futures.pop(request_id)
 
     def add_request_streaming(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams

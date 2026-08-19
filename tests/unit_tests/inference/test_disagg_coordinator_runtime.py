@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import msgpack
 import pytest
 
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoordinatorRuntime
 from megatron.core.inference.headers import Headers
 
@@ -17,10 +18,28 @@ def _runtime(*, request_capacity=32, backend="nixl", ssm_capacity=None):
         request_id_to_client_id={5: b"client", 6: b"client"},
         request_id_to_client_request_id={5: 50, 6: 60},
         client_request_to_request_id={(b"client", 50): 5, (b"client", 60): 6},
-        _register_rank_identity=lambda identity: None,
         router_socket=SimpleNamespace(
             send_multipart=lambda message: sent.append((b"client", message))
         ),
+        prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        prefix_caching_routing_alpha=0.5,
+        identity_to_rank_index={},
+        hash_updates=[],
+    )
+
+    def register_identity(identity):
+        coordinator.identity_to_rank_index.setdefault(
+            identity, len(coordinator.identity_to_rank_index)
+        )
+
+    coordinator._register_rank_identity = register_identity
+    coordinator.compute_request_hashes = lambda prompt: list(prompt)
+    coordinator._update_rank_hashes = lambda identity, hashes: coordinator.hash_updates.append(
+        (identity, hashes)
+    )
+    coordinator._match_vector = lambda _hashes: (
+        [0.0] * len(coordinator.identity_to_rank_index),
+        [0.0] * len(coordinator.identity_to_rank_index),
     )
     coordinator._send_to_engine = lambda identity, payload: (
         sent.append((identity, msgpack.unpackb(payload, raw=False))) or True
@@ -28,8 +47,16 @@ def _runtime(*, request_capacity=32, backend="nixl", ssm_capacity=None):
     runtime = DisaggCoordinatorRuntime(coordinator, "round_robin")
     coordinator.disagg = runtime
 
-    prefill_meta = {"global_rank": 0, "request_capacity": request_capacity}
-    decode_meta = {"global_rank": 1, "request_capacity": request_capacity}
+    common_meta = {
+        "request_capacity": request_capacity,
+        "tokens_per_block": 256,
+        "element_size": 2,
+        "head_dim": 128,
+        "num_layers_global": 4,
+        "num_kv_heads_global": 8,
+    }
+    prefill_meta = {"global_rank": 0, **common_meta}
+    decode_meta = {"global_rank": 1, **common_meta}
     if ssm_capacity is not None:
         for meta in (prefill_meta, decode_meta):
             meta["ssm_slot_capacity"] = ssm_capacity
@@ -60,6 +87,7 @@ def test_request_routes_prefill_then_decode():
     assert Headers(message[0]) == Headers.SUBMIT_REQUEST_WITH_KV
     assert message[1:4] == [5, [1, 2, 3], sampling_params]
     assert message[4:] == [handoff["kv_meta"], handoff["block_ids"]]
+    assert runtime.coordinator.hash_updates == [(b"prefill", [1, 2, 3]), (b"decode", [1, 2, 3])]
 
 
 def test_nccl_send_waits_for_decode_destinations():
@@ -82,16 +110,23 @@ def test_nccl_send_waits_for_decode_destinations():
 
     assert sent[-1][0] == b"prefill"
     assert Headers(sent[-1][1][0]) == Headers.SEND_KV
-    assert sent[-1][1][2:] == [[{"global_rank": 1, "request_capacity": 32}], 1]
+    assert sent[-1][1][2:] == [runtime.engine_metadata[b"decode"], 1]
 
 
 def test_registration_rejects_mixed_transports():
     runtime, _ = _runtime()
 
     with pytest.raises(ValueError, match="same state transport"):
-        runtime.register_engine(
-            b"decode-2", "decode", "nccl", [{"global_rank": 2, "request_capacity": 32}]
-        )
+        runtime.register_engine(b"decode-2", "decode", "nccl", runtime.engine_metadata[b"decode"])
+
+
+def test_registration_rejects_incompatible_transfer_geometry():
+    runtime, _ = _runtime()
+    incompatible = dict(runtime.engine_metadata[b"decode"][0])
+    incompatible["head_dim"] = 64
+
+    with pytest.raises(ValueError, match="incompatible transfer geometry"):
+        runtime.register_engine(b"decode-2", "decode", "nixl", [incompatible])
 
 
 def test_read_done_releases_prefill_and_admits_queued_request():
@@ -231,3 +266,103 @@ def test_decode_removal_does_not_release_inflight_source():
         identity == b"prefill" and Headers(message[0]) == Headers.RELEASE_KV
         for identity, message in sent
     )
+
+
+def test_undelivered_decode_handoff_releases_prefill_source():
+    runtime, sent = _runtime(ssm_capacity=1)
+    runtime.route_submit(5, [1], {})
+
+    def reject_decode(identity, payload):
+        if identity == b"decode":
+            runtime.remove_engine(identity)
+            return False
+        sent.append((identity, msgpack.unpackb(payload, raw=False)))
+        return True
+
+    runtime.coordinator._send_to_engine = reject_decode
+    runtime.handle_prefill_done(
+        5,
+        {
+            "request_id": 5,
+            "disaggregated_params": {"kv_meta": {"ssm": {"positions": [0]}}, "block_ids": [4]},
+        },
+    )
+
+    assert 5 not in runtime.prefill_by_request
+    assert runtime.flow.prefill_usage(b"prefill") == 0
+    assert runtime.router.decode_for_request(5) is None
+
+
+def test_late_source_safety_releases_prefill_after_request_failure():
+    runtime, sent = _runtime(ssm_capacity=1)
+    runtime.route_submit(5, [1], {})
+    runtime.handle_prefill_done(
+        5,
+        {
+            "request_id": 5,
+            "disaggregated_params": {"kv_meta": {"ssm": {"positions": [0]}}, "block_ids": [4]},
+        },
+    )
+    sent.clear()
+
+    runtime.handle_engine_failure(5, "transfer failed", source_safe=False)
+
+    assert runtime.prefill_by_request[5] == b"prefill"
+    assert runtime.flow.prefill_usage(b"prefill") == 1
+
+    runtime.handle_engine_aborted(5, source_safe=True)
+
+    assert 5 not in runtime.prefill_by_request
+    assert runtime.flow.prefill_usage(b"prefill") == 0
+    assert any(
+        identity == b"prefill" and Headers(message[0]) == Headers.RELEASE_KV
+        for identity, message in sent
+    )
+
+
+def test_serialized_handoff_releases_prompt_storage():
+    runtime, _ = _runtime()
+    runtime.route_submit(5, [1, 2, 3], {})
+
+    runtime.handle_prefill_done(
+        5,
+        {
+            "request_id": 5,
+            "disaggregated_params": {"kv_meta": {"agent": "prefill"}, "block_ids": [4]},
+        },
+    )
+
+    assert runtime.requests[5].prompt is None
+    assert runtime.requests[5].sampling_params == {}
+    assert runtime.requests[5].block_hashes == []
+
+
+def test_load_balanced_routing_uses_free_capacity_independent_of_prefix_alpha():
+    runtime, sent = _runtime()
+    runtime.register_engine(b"prefill-2", "prefill", "nixl", runtime.engine_metadata[b"prefill"])
+    runtime.coordinator.prefix_caching_coordinator_policy = (
+        PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+    )
+    runtime.coordinator.prefix_caching_routing_alpha = 1.0
+    assert runtime.flow.try_reserve_prefill(b"prefill", 99, 0)
+
+    runtime.route_submit(5, [1], {})
+
+    assert sent[-1][0] == b"prefill-2"
+
+
+def test_prefix_affinity_routes_and_is_computed_once():
+    runtime, sent = _runtime()
+    runtime.register_engine(b"prefill-2", "prefill", "nixl", runtime.engine_metadata[b"prefill"])
+    calls = 0
+
+    def counted_match_vector(_hashes):
+        nonlocal calls
+        calls += 1
+        return [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]
+
+    runtime.coordinator._match_vector = counted_match_vector
+    runtime.route_submit(5, [1], {})
+
+    assert calls == 1
+    assert sent[-1][0] == b"prefill-2"

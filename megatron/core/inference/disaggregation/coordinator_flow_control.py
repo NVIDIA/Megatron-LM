@@ -46,11 +46,14 @@ class DisaggStateFlowControl:
     def _request_capacity_from_instance_meta(instance_meta) -> int:
         """Return the conservative request capacity across model-parallel ranks."""
 
-        entries = (
-            [entry for entry in instance_meta if isinstance(entry, dict)]
-            if isinstance(instance_meta, list)
-            else []
-        )
+        if not isinstance(instance_meta, list):
+            raise ValueError(
+                "Engine transfer metadata must be a per-model-parallel-rank list, got "
+                f"{type(instance_meta).__name__}"
+            )
+        entries = [entry for entry in instance_meta if isinstance(entry, dict)]
+        if len(entries) != len(instance_meta):
+            raise ValueError("Engine transfer metadata must contain one mapping per rank")
         capacities = [
             int(entry["request_capacity"])
             for entry in entries
@@ -183,6 +186,30 @@ class DisaggStateFlowControl:
             self.decode_usage(identity),
         )
 
+    def available_fraction(self, identity, role: str) -> float:
+        """Return the binding free-capacity fraction for routing."""
+
+        if role == "prefill":
+            count = self._prefill_counts.get(identity, 0)
+            queued = len(self._prefill_queues.get(identity, ()))
+            usage = self.prefill_usage(identity)
+        elif role == "decode":
+            count = self._decode_counts.get(identity, 0)
+            queued = len(self._decode_queues.get(identity, ()))
+            usage = self.decode_usage(identity)
+        else:
+            raise ValueError(f"unknown disaggregated role {role!r}")
+
+        request_capacity = self._request_capacity.get(identity)
+        if request_capacity is None:
+            return 0.0
+        request_fraction = max(0.0, request_capacity - count - queued) / request_capacity
+        state_capacity = self._capacity.get(identity)
+        if state_capacity is None:
+            return request_fraction
+        state_fraction = max(0.0, state_capacity - usage) / state_capacity
+        return min(request_fraction, state_fraction)
+
     def prefill_slot_cost(self, identity) -> int:
         """Return the engine-advertised live-state handoff demand per request."""
 
@@ -196,7 +223,7 @@ class DisaggStateFlowControl:
         if request_id in self._prefill_reservations:
             raise RuntimeError(f"Prefill request {request_id} already holds an SSM reservation")
         count = self._prefill_counts.get(identity, 0)
-        if count >= self._request_capacity[identity]:
+        if count >= self._request_capacity.get(identity, 0):
             return False
         capacity = self._capacity.get(identity)
         usage = self._prefill_usage.get(identity, 0)
@@ -277,7 +304,7 @@ class DisaggStateFlowControl:
         if request_id in self._decode_reservations:
             raise RuntimeError(f"Decode request {request_id} already holds an SSM reservation")
         count = self._decode_counts.get(identity, 0)
-        if count >= self._request_capacity[identity]:
+        if count >= self._request_capacity.get(identity, 0):
             return False
         usage = self._decode_usage.get(identity, 0)
         if capacity is not None and usage + slot_cost > capacity:
