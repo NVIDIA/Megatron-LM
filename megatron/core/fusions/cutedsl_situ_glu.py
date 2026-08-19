@@ -331,6 +331,7 @@ class _SiTUGLUFunction(torch.autograd.Function):
     def forward(
         ctx, input_: torch.Tensor, beta1: float, beta2: float, interleave_size: int
     ) -> torch.Tensor:
+        """Run SiTU-GLU forward and save its input for the custom backward."""
         ctx.save_for_backward(input_)
         ctx.beta1 = beta1
         ctx.beta2 = beta2
@@ -339,6 +340,7 @@ class _SiTUGLUFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        """Compute the input gradient for the custom SiTU-GLU operation."""
         (input_,) = ctx.saved_tensors
         return (
             _situ_glu_backward(grad_output, input_, ctx.beta1, ctx.beta2, ctx.interleave_size),
@@ -359,6 +361,7 @@ class CuTeDSLSiTUGLU(torch.nn.Module):
             raise ValueError("SiTU-GLU interleave size must be non-negative.")
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        """Apply standalone SiTU-GLU to the input tensor."""
         return _SiTUGLUFunction.apply(input_, self.beta1, self.beta2, self.interleave_size)
 
 
@@ -550,12 +553,16 @@ def install_grouped_situ_glu_kernels(beta1: float, beta2: float) -> None:
 
     try:
         from cudnn.grouped_gemm.grouped_gemm_glu_hadamard import api as glu_hadamard_api
+
+        # pylint: disable-next=line-too-long
         from cudnn.grouped_gemm.grouped_gemm_glu_hadamard.moe_blockscaled_grouped_gemm_glu_hadamard import (
             BlockScaledMoEGroupedGemmGluHadamardKernel,
         )
     except ImportError:
         try:
             from cudnn.gemm.cutedsl.grouped.glu_hadamard import api as glu_hadamard_api
+
+            # pylint: disable-next=line-too-long
             from cudnn.gemm.cutedsl.grouped.glu_hadamard.moe_blockscaled_grouped_gemm_glu_hadamard import (
                 BlockScaledMoEGroupedGemmGluHadamardKernel,
             )
@@ -588,7 +595,9 @@ def install_grouped_situ_glu_kernels(beta1: float, beta2: float) -> None:
 
     class _SiTUForwardKernel(BlockScaledMoEGroupedGemmGluBiasKernel):
         @cute.jit
-        def swiglu_act(self, tCompute, acc_vec_up, acc_vec_gate, mProb):
+        def swiglu_act(
+            self, tCompute, acc_vec_up, acc_vec_gate, mProb
+        ):  # pylint: disable=missing-function-docstring
             inv_beta1 = cutlass.Float32(1.0 / beta1)
             inv_beta2 = cutlass.Float32(1.0 / beta2)
             beta_product = cutlass.Float32(beta1 * beta2)
@@ -615,7 +624,7 @@ def install_grouped_situ_glu_kernels(beta1: float, beta2: float) -> None:
             beta_val,
             square_alpha,
             dprob_swiglu=None,
-        ):
+        ):  # pylint: disable=missing-function-docstring
             dgate = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
             dup = cute.make_rmem_tensor(acc_vec.shape, cutlass.Float32)
             inv_beta1 = cutlass.Float32(1.0 / beta1)
@@ -652,7 +661,9 @@ def install_grouped_situ_glu_kernels(beta1: float, beta2: float) -> None:
 
         class _SiTUForwardHadamardKernel(BlockScaledMoEGroupedGemmGluHadamardKernel):
             @cute.jit
-            def swiglu_act(self, tCompute, acc_vec_up, acc_vec_gate, mProb):
+            def swiglu_act(
+                self, tCompute, acc_vec_up, acc_vec_gate, mProb
+            ):  # pylint: disable=missing-function-docstring
                 inv_beta1 = cutlass.Float32(1.0 / beta1)
                 inv_beta2 = cutlass.Float32(1.0 / beta2)
                 beta_product = cutlass.Float32(beta1 * beta2)
