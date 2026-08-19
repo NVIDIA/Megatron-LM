@@ -3008,8 +3008,11 @@ def load_checkpoint(
         if (
             not skip_load_to_model_and_opt
             and optimizer is not None
-            and not optimizer.is_stub_optimizer
-            and (args.fp8_param_gather or args.fp4_param_gather)
+            and not getattr(optimizer, 'is_stub_optimizer', False)
+            and (
+                getattr(args, 'fp8_param_gather', False)
+                or getattr(args, 'fp4_param_gather', False)
+            )
         ):
             optimizer.quantize_and_sync_model_params_from_main_params()
     else:
