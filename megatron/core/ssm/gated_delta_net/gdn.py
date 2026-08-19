@@ -110,7 +110,8 @@ class GatedDeltaNet(_GDNBase):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        base_cp_group = pg_collection.cp if pg_collection is not None else self.pg_collection.cp
+        active_pg_collection = pg_collection if pg_collection is not None else self.pg_collection
+        base_cp_group = active_pg_collection.cp
         cp_group = resolve_cp_group(base_cp_group, packed_seq_params)
         if self.config.linear_cp_mode == "chunkwise":
             cp_group_chunkwise = cp_group
@@ -136,7 +137,7 @@ class GatedDeltaNet(_GDNBase):
                 packed_seq_params=packed_seq_params,
                 cp_group=cp_group_chunkwise,
                 tp_group=self.tp_group,
-                tp_cp_group=self.pg_collection.tp_cp,
+                tp_cp_group=getattr(active_pg_collection, "tp_cp", None),
                 target_partition_mode="contiguous",
                 sequence_parallel=self.config.sequence_parallel,
                 config=self.config,

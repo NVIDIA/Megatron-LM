@@ -1370,7 +1370,7 @@ class Attention(MegatronModule, ABC):
             packed_seq_params=packed_seq_params,
             cp_group=self.pg_collection.cp,
             tp_group=self.pg_collection.tp,
-            tp_cp_group=self.pg_collection.tp_cp,
+            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
             target_partition_mode="zigzag",
             sequence_parallel=self.config.sequence_parallel,
             config=self.config,

@@ -215,7 +215,8 @@ class TestGatedDeltaNet:
         # Get TP and CP process groups from device mesh
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
-        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+        tp_cp_group = parallel_state.get_tensor_and_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, tp_cp=tp_cp_group)
 
         # Initialize model, with the same config as Qwen Next except `num_layers`
         self.transformer_config = TransformerConfig(
