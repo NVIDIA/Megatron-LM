@@ -1,5 +1,6 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import dataclasses
 import fnmatch
 import functools
 import logging
@@ -11,7 +12,7 @@ from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+from torch._utils import _unflatten_dense_tensors
 from torch.distributed import _coalescing_manager
 
 import megatron.core.nccl_allocator as nccl_allocator
@@ -28,11 +29,13 @@ from ..fp4_utils import (
     modify_nvfp4_rowwise_storage,
 )
 from ..fp8_utils import (
+    copy_back_gathered_bf16_into_fp8_params,
     copy_tensors_to_quantized_params,
     is_float8tensor,
     is_grouped_mxfp8tensor,
     is_grouped_tensor,
     is_grouped_tensor_with_quantized_storage,
+    is_layerwise_fp8_param,
     is_mxfp8tensor,
     modify_grouped_tensor_rowwise_storage,
     modify_underlying_storage,
@@ -176,6 +179,36 @@ class _LayerwiseAllGatherHandle:
         self.handles = None
 
 
+@torch.no_grad()
+def _layerwise_copy_back_gathered_params(bucket, local_rank: int, fp8_staged: bool = False) -> None:
+    """Copy each rank's gathered params from the bucket gather slots into model params (non-DistOpt
+    LayerWise overlap path). ``fp8_staged`` MUST match ``start_param_sync``'s staging decision.
+
+    * bf16 (``fp8_staged=False``): unflatten against the params, ``copy_`` into non-owned
+      ``model_p.data`` (owned already hold the staged value).
+    * fp8 (``fp8_staged=True``): the all-gather rode bf16; requantize ALL ranks (owned included)
+      via ``copy_back_gathered_bf16_into_fp8_params`` so every owner holds
+      ``Q(bf16(master))``.
+
+    no_grad: in-place copy_ on a leaf param trips autograd's in-place guard.
+    """
+    for idx, params in enumerate(bucket.layerwise_params_list):
+        if len(params) == 0:
+            continue
+        if fp8_staged:
+            templates = [torch.empty(p.shape, device="meta", dtype=torch.bfloat16) for p in params]
+            updated_params = _unflatten_dense_tensors(bucket.layerwise_gather_list[idx], templates)
+            copy_back_gathered_bf16_into_fp8_params(params, updated_params)
+            continue
+        # bf16 transport: owned params already hold the staged bf16 value in their data, so only
+        # non-owned ranks need the copy.
+        if idx == local_rank:
+            continue
+        updated_params = _unflatten_dense_tensors(bucket.layerwise_gather_list[idx], params)
+        for updated_p, model_p in zip(updated_params, params):
+            model_p.data.copy_(updated_p)
+
+
 class _ParamAndGradBucketGroup:
     """
     Put multiple buckets into a group so that their communications can be aggregated together.
@@ -298,14 +331,41 @@ class _ParamAndGradBucketGroup:
         self.is_last_microbatch = True
         self.grad_reduce_finished = False
 
+    def _finalize_layerwise_param_sync(self):
+        """Copy gathered LayerWise (non-DistOpt) params back and release the reused grad buffer.
+
+        Every path that completes a LayerWise param all-gather must run this before
+        ``_post_param_sync``: the gathered (possibly bf16-staged fp8) whole params sit in
+        ``bucket.layerwise_gather_list`` (views into ``grad_data``) until they are unflattened
+        into ``param.data``, and ``grad_data`` must be re-zeroed afterwards so the next
+        backward's accumulation into ``main_grad`` does not start from the gather payload.
+        """
+        if self.ddp_config.use_distributed_optimizer:
+            return
+        for bucket in self.buckets:
+            if bucket.layerwise_gather_list is None:
+                continue
+            # Unflatten and copy gathered params for each rank (FP8-aware: see helper).
+            _layerwise_copy_back_gathered_params(
+                bucket,
+                self.intra_distributed_optimizer_instance_rank,
+                fp8_staged=getattr(bucket, 'layerwise_fp8_staged', False),
+            )
+            bucket.layerwise_gather_list = None
+            # Zero out grad_data since it was reused as the all-gather
+            # receive buffer. Without this, accumulation into main_grad
+            # (a view into grad_data) would start from the result of the
+            # latest parameter all-gather instead of zero.
+            bucket.grad_data.zero_()
+
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
             for bucket in self.buckets:
                 if bucket.param_data is None:
-                    # LayerWise variable-size gather path: params are already updated via
-                    # unflatten + copy_ in finish_param_sync, and there is no param_data
-                    # buffer to copy back from.
+                    # LayerWise variable-size gather path (incl. the non-DistOpt decoupled
+                    # bucket): params are already updated via unflatten + copy_ / requantize in
+                    # finish_param_sync, and there is no param_data buffer to copy back from.
                     continue
                 has_non_quantized_weight = False
                 quantized_params = []
@@ -400,6 +460,10 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+                # A pending LayerWise gather normally lands in finish_param_sync (forward
+                # pre-hook), which force_sync bypasses -- finalize it here or every rank
+                # keeps stale ``param.data`` and the gather payload pollutes ``grad_data``.
+                self._finalize_layerwise_param_sync()
                 self._post_param_sync()
                 return
         else:
@@ -427,10 +491,33 @@ class _ParamAndGradBucketGroup:
             local_rank = self.intra_distributed_optimizer_instance_rank
             group = self.intra_distributed_optimizer_instance_group
             layerwise_work_handles = []
+            # Decouple fp8 param-gather: supported MXFP8/blockwise model params ride BF16 — stage
+            # the local owner's FP32 master, gather, then requantize on copy-back. Plain BF16
+            # collapses to the original path.
+            decouple = not getattr(self.ddp_config, 'use_layer_wise_param_layout', True)
             for bucket in self.buckets:
-                # Use param dtype (e.g., bf16), NOT grad dtype (which may be
-                # fp32 when grad_reduce_in_fp32 is enabled).
-                param_dtype = bucket.params_list[0].dtype
+                # A decoupled LayerWise (Muon) bucket can MIX supported fp8 and bf16 params:
+                # merge_layerwise_fp8_grads keys fp8 Muon grads by their bf16 logical dtype so they
+                # share ONE buffer (hence bucket) with their bf16 siblings (e.g. an MoE router /
+                # DSA indexer / mHC weight that is not fp8-quantized). The bf16-staged path handles
+                # both dtypes, so a bucket holding ANY supported fp8 param must take it -- scanning
+                # only params_list[0] mis-routes a bf16-first mixed bucket into the raw
+                # _flatten_dense_tensors() path, which crashes on the MXFP8 .view(-1).
+                bucket_is_fp8 = bool(
+                    decouple
+                    and bucket.params_list
+                    and any(is_layerwise_fp8_param(p) for p in bucket.params_list)
+                )
+                # TODO(perf, blockwise-only): blockwise could gather the owner's fp8 rowwise data
+                # (~2x less comm) + its small scale_inv and rebuild columnwise via transpose
+                # (Adam/DistOpt-style), instead of bf16. mxfp8 must stay on bf16: its row/col block
+                # scales cannot be derived from one another.
+                #
+                # Persist the staging decision so the copy-back (sync here, overlap in
+                # finish_param_sync) uses the same signal, keeping transport and copy-back in sync.
+                bucket.layerwise_fp8_staged = bucket_is_fp8
+                # Transport dtype: bf16 for decouple fp8 param-gather; else the param's own dtype.
+                param_dtype = torch.bfloat16 if bucket_is_fp8 else bucket.params_list[0].dtype
 
                 if max(bucket.layerwise_param_flat_sizes) == 0:
                     bucket.layerwise_gather_list = None
@@ -453,26 +540,37 @@ class _ParamAndGradBucketGroup:
                     offset += size
                 local_slot_view = gather_list[local_rank]
 
-                # Flatten local params and copy into the local rank's slot.
-                # Detach from autograd since start_param_sync may be called
-                # during the forward pass where autograd is active.
+                # Copy local params directly into their views of the flat transport slot.
+                # This avoids allocating one BF16 tensor per parameter and then flattening it.
+                # Detach from autograd since start_param_sync may be called during forward.
                 if local_size > 0:
-                    # MXFP8 params can't be flattened (view(-1) unsupported); gather the
-                    # fp32 master (param.main_param -> bf16), which the receive-side copy_
-                    # re-quantizes. Non-mxfp8 params flatten as-is.
-                    src_params = []
-                    for p in bucket.layerwise_params_list[local_rank]:
-                        if is_mxfp8tensor(p):
-                            main_param = getattr(p, "main_param", None)
-                            assert main_param is not None, (
-                                "LayerWise mxfp8 param sync needs param.main_param (fp32 "
-                                "master) to stage the all-gather source; got None."
-                            )
-                            src_params.append(main_param.to(param_dtype))
+                    local_offset = 0
+                    for param in bucket.layerwise_params_list[local_rank]:
+                        param_numel = param.numel()
+                        transport_view = local_slot_view[local_offset : local_offset + param_numel]
+                        if bucket_is_fp8 or is_mxfp8tensor(param):
+                            # Decoupled FP8 buckets stage every param from its FP32 master so
+                            # mixed FP8/BF16 buckets all use the same high-precision source.
+                            # Padded buckets need the same source only for MXFP8, whose tensor
+                            # subclass cannot be flattened.
+                            source = getattr(param, "main_param", None)
+                            if source is None:
+                                raise RuntimeError(
+                                    "LayerWise FP8 parameter-gather staging requires "
+                                    "param.main_param (FP32 master)."
+                                )
                         else:
-                            src_params.append(p)
-                    flat_local_params = _flatten_dense_tensors(src_params).detach()
-                    local_slot_view.copy_(flat_local_params)
+                            source = param
+                        source = source.detach()
+                        if source.numel() != param_numel:
+                            raise RuntimeError(
+                                "LayerWise parameter-gather staging source size mismatch: "
+                                f"source has {source.numel()} elements, parameter has "
+                                f"{param_numel}."
+                            )
+                        transport_view.copy_(source.reshape(-1))
+                        local_offset += param_numel
+                    assert local_offset == local_size
                 bucket.layerwise_gather_list = gather_list
 
                 work = torch.distributed.all_gather(
@@ -485,23 +583,7 @@ class _ParamAndGradBucketGroup:
                 self.param_gather_handle = _LayerwiseAllGatherHandle(layerwise_work_handles)
             else:
                 # Synchronous: unflatten and copy gathered params immediately.
-                for bucket in self.buckets:
-                    if bucket.layerwise_gather_list is None:
-                        continue
-                    for idx, params in enumerate(bucket.layerwise_params_list):
-                        if len(params) == 0 or idx == local_rank:
-                            continue
-                        updated_params = _unflatten_dense_tensors(
-                            bucket.layerwise_gather_list[idx], params
-                        )
-                        for updated_p, model_p in zip(updated_params, params):
-                            model_p.data.copy_(updated_p)
-                    bucket.layerwise_gather_list = None
-                    # Zero out grad_data since it was reused as the all-gather
-                    # receive buffer. Without this, accumulation into main_grad
-                    # (a view into grad_data) would start from the result of the
-                    # latest parameter all-gather instead of zero.
-                    bucket.grad_data.zero_()
+                self._finalize_layerwise_param_sync()
                 self.param_gather_handle = None
         else:
             # Standard distributed optimizer path: use _coalescing_manager.
@@ -572,29 +654,7 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
-            if not self.ddp_config.use_distributed_optimizer:
-                for bucket in self.buckets:
-                    if bucket.layerwise_gather_list is None:
-                        continue
-                    # Unflatten and copy gathered params for each rank.
-                    for idx, params in enumerate(bucket.layerwise_params_list):
-                        # Skip local params and empty tensors.
-                        if (
-                            len(params) == 0
-                            or idx == self.intra_distributed_optimizer_instance_rank
-                        ):
-                            continue
-                        updated_params = _unflatten_dense_tensors(
-                            bucket.layerwise_gather_list[idx], params
-                        )
-                        for updated_p, model_p in zip(updated_params, params):
-                            model_p.data.copy_(updated_p)
-                    bucket.layerwise_gather_list = None
-                    # Zero out grad_data since it was reused as the all-gather
-                    # receive buffer. Without this, accumulation into main_grad
-                    # (a view into grad_data) would start from the result of the
-                    # latest parameter all-gather instead of zero.
-                    bucket.grad_data.zero_()
+            self._finalize_layerwise_param_sync()
             self._post_param_sync()
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
@@ -842,6 +902,10 @@ class _ParamAndGradBucketGroup:
         if self.param_gather_handle is not None:
             self.param_gather_handle.wait()
             self.param_gather_handle = None
+            # Finalize a pending LayerWise gather before dropping its receive views:
+            # discarding layerwise_gather_list here would leave stale ``param.data``
+            # (checkpointed weights) and gather payload in ``grad_data``.
+            self._finalize_layerwise_param_sync()
         for bucket in self.buckets:
             bucket.layerwise_gather_list = None
 
@@ -886,7 +950,9 @@ class _ParamAndGradBucketGroup:
 
 
 def group_params_for_buffers(
-    params: List[torch.nn.Parameter], grad_reduce_in_fp32: bool
+    params: List[torch.nn.Parameter],
+    grad_reduce_in_fp32: bool,
+    merge_layerwise_fp8_grads: bool = False,
 ) -> Dict['BufferKey', Tuple[List[torch.nn.Parameter], List[int]]]:
     """Group parameters by buffer identity for buffer allocation.
 
@@ -905,6 +971,8 @@ def group_params_for_buffers(
     Args:
         params: List of parameters to group.
         grad_reduce_in_fp32: Whether gradients are reduced in FP32.
+        merge_layerwise_fp8_grads: Decouple layout only — merge LayerWise (Muon) fp8 grads with
+            their bf16 siblings into one fp32 all_reduce buffer (see below).
 
     Returns:
         Dict mapping BufferKey to (params_list, param_indices).
@@ -926,6 +994,15 @@ def group_params_for_buffers(
         is_managed_by_layer_wise_optimizer = getattr(
             param, 'is_managed_by_layer_wise_optimizer', False
         )
+
+        # Decouple layout only: key fp8 Muon grads by their bf16 logical dtype so fp8 + bf16 grads
+        # share ONE fp32 all_reduce buffer; a split uint8/bf16 reduction diverges ~1 ULP from OFF.
+        if (
+            merge_layerwise_fp8_grads
+            and is_layerwise_fp8_param(param)
+            and is_managed_by_layer_wise_optimizer
+        ):
+            param_dtype = param.dtype
 
         key = BufferKey(
             param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
@@ -1069,6 +1146,17 @@ class _ParamAndGradBuffer:
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
 
+        self._is_layer_wise_buffer = bool(
+            self.params and getattr(self.params[0], "is_managed_by_layer_wise_optimizer", False)
+        )
+        # Bake the per-buffer DistOpt decision into this buffer's ddp_config (single source of
+        # truth; bucket groups inherit it): a LayerWise (Muon) buffer on the compact decoupled
+        # layout disables DistributedOptimizer, while sibling buffers keep the model-level setting.
+        if self._is_layer_wise_buffer and not getattr(
+            self.ddp_config, "use_layer_wise_param_layout", True
+        ):
+            self.ddp_config = dataclasses.replace(self.ddp_config, use_distributed_optimizer=False)
+
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
@@ -1119,6 +1207,27 @@ class _ParamAndGradBuffer:
             # nvfp4_packed_numel_unpadded is already set by _compute_nvfp4_packed_layout.
 
         assert self.numel_unpadded <= self.numel
+
+        # Diagnostic: log persistent buffer size vs. unpadded payload so the cost of any
+        # optimizer-driven padding (e.g. the LayerWise shard-aligned ``dp_size * max(shard_load)``
+        # layout) is visible per buffer. Emit at INFO only when it is interesting — a
+        # LayerWise-managed buffer or one that actually carries padding — and DEBUG otherwise, so
+        # ordinary (zero-padding) buffers do not spam non-experimental runs.
+        _padding = self.numel - self.numel_unpadded
+        _pad_frac = _padding / max(self.numel_unpadded, 1)
+        log_on_each_pipeline_stage(
+            logger,
+            logging.INFO if (self._is_layer_wise_buffer or _padding > 0) else logging.DEBUG,
+            f"ParamAndGradBuffer layout: param_dtype={self.param_dtype} "
+            f"grad_dtype={self.grad_dtype} dp_world_size={self.data_parallel_world_size} "
+            f"layerwise={self._is_layer_wise_buffer} "
+            f"distopt={self.ddp_config.use_distributed_optimizer} "
+            f"numel={self.numel} numel_unpadded={self.numel_unpadded} "
+            f"padding={_padding} ({_pad_frac:.1%})",
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+        )
+
         if self.has_nvfp4_params:
             assert self.nvfp4_packed_numel_unpadded <= self.nvfp4_packed_numel
         if self.ddp_config.use_distributed_optimizer:
@@ -1688,6 +1797,10 @@ def partition_buckets(
          has completed. This is because we need to wait for the non-fp8 params from the beginning
          layers to obtain their gradients.
        - Combining the non-fp8 bucket with the last fp8 bucket can help avoid this issue.
+       - A bucket group runs one collective type, so only buckets agreeing on the effective
+         per-buffer ``use_distributed_optimizer`` are merged; non-fp8 buckets with a different
+         value (the decouple-LayerWise path) go to their own group(s). When all buckets agree,
+         this collapses to the original behavior.
 
     Args:
         buffers (list): list of input buffers.
@@ -1709,22 +1822,72 @@ def partition_buckets(
             assert fp8_buffer is None
             fp8_buffer = buffer
 
-    # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
+    # A bucket group performs a single collective type (reduce-scatter for DistOpt buffers,
+    # all-reduce otherwise), so buckets merged into one group must agree on the effective
+    # per-buffer ``use_distributed_optimizer``. The decoupled LayerWise layout
+    # (``use_layer_wise_param_layout=False``) gives LayerWise (Muon) buffers
+    # ``use_distributed_optimizer=False`` while sibling buffers keep True; the no-fp8 branch below
+    # keeps every bucket in its own group so they never mix, but the merging branches must assert
+    # consistency.
+    _ddp_config = buffers[0].ddp_config
+    _decouple = not getattr(_ddp_config, "use_layer_wise_param_layout", True)
+
+    def _bucket_distopt(bucket):
+        """This bucket's effective ``use_distributed_optimizer``."""
+        is_lw = bool(
+            bucket.params_list
+            and getattr(bucket.params_list[0], "is_managed_by_layer_wise_optimizer", False)
+        )
+        if _decouple and is_lw:
+            return False
+        return _ddp_config.use_distributed_optimizer
+
+    def _merged_use_distributed_optimizer(merge_buckets):
+        values = {_bucket_distopt(bucket) for bucket in merge_buckets}
+        assert len(values) == 1, (
+            "Cannot merge buckets with differing effective use_distributed_optimizer into one "
+            "bucket group. This happens when the decoupled LayerWise layout "
+            "(use_layer_wise_param_layout=False) mixes LayerWise (all-reduce) and non-LayerWise "
+            "(reduce-scatter) buffers under a merging bucketing strategy (e.g. the fp8 merge "
+            "path). Disable bucket merging for the decoupled LayerWise path."
+        )
+        return values.pop()
+
+    # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True
+    # (e.g. disable_bucketing / non-first VPP chunks). A bucket group performs a single
+    # collective type, so when the decoupled LayerWise layout (use_layer_wise_param_layout=False)
+    # mixes LayerWise (all-reduce, non-DistOpt) and non-LayerWise (reduce-scatter, DistOpt)
+    # buffers in one chunk, we cannot
+    # merge them into a single group. Split by the effective per-bucket use_distributed_optimizer
+    # instead, preserving order. When all buckets agree (the non-decoupled case) this collapses
+    # to exactly one group, identical to the previous behavior.
     if force_single_bucket_group:
-        buckets = []
-        ddp_config = buffers[0].ddp_config
         data_parallel_group = buffers[0].data_parallel_group
         data_parallel_world_size = buffers[0].data_parallel_world_size
+        ordered_distopt_values = []
+        buckets_by_distopt = {}
+        # buffer.ddp_config already carries the per-buffer use_distributed_optimizer.
+        ddp_config_by_distopt = {}
         for buffer in buffers:
-            assert ddp_config == buffer.ddp_config
             assert data_parallel_group == buffer.data_parallel_group
             assert data_parallel_world_size == buffer.data_parallel_world_size
-            buckets.extend(buffer.buckets)
+            distopt = buffer.ddp_config.use_distributed_optimizer
+            ddp_config_by_distopt.setdefault(distopt, buffer.ddp_config)
+            for bucket in buffer.buckets:
+                if distopt not in buckets_by_distopt:
+                    buckets_by_distopt[distopt] = []
+                    ordered_distopt_values.append(distopt)
+                buckets_by_distopt[distopt].append(bucket)
 
-        bucket_group = _ParamAndGradBucketGroup(
-            buckets, ddp_config, data_parallel_group, data_parallel_world_size
-        )
-        return [bucket_group]
+        return [
+            _ParamAndGradBucketGroup(
+                buckets_by_distopt[distopt],
+                ddp_config_by_distopt[distopt],
+                data_parallel_group,
+                data_parallel_world_size,
+            )
+            for distopt in ordered_distopt_values
+        ]
 
     if fp8_buffer is None:
         # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
@@ -1743,11 +1906,12 @@ def partition_buckets(
         return bucket_groups
     else:
         # Case 3: When using fp8 params, merge all non-fp8 buckets into the last fp8 bucket group.
-        non_fp8_buckets = []
+        # Track each non-fp8 bucket with its buffer's (authoritative) ddp_config.
+        non_fp8_buckets = []  # list of (bucket, ddp_config)
         for buffer in buffers:
             if buffer.param_dtype != torch.uint8:
                 for bucket in buffer.buckets:
-                    non_fp8_buckets.append(bucket)
+                    non_fp8_buckets.append((bucket, buffer.ddp_config))
 
         bucket_groups = []
         for bucket in fp8_buffer.buckets:
@@ -1761,17 +1925,17 @@ def partition_buckets(
                     bucket_groups.append(
                         _ParamAndGradBucketGroup(
                             [bucket],
-                            buffer.ddp_config,
+                            fp8_buffer.ddp_config,
                             buffer.data_parallel_group,
                             buffer.data_parallel_world_size,
                         )
                     )
                     if non_fp8_buckets:
-                        for non_fp8_bucket in non_fp8_buckets:
+                        for non_fp8_bucket, non_fp8_ddp_config in non_fp8_buckets:
                             bucket_groups.append(
                                 _ParamAndGradBucketGroup(
                                     [non_fp8_bucket],
-                                    buffer.ddp_config,
+                                    non_fp8_ddp_config,
                                     buffer.data_parallel_group,
                                     buffer.data_parallel_world_size,
                                 )
@@ -1779,16 +1943,22 @@ def partition_buckets(
 
                     continue  # Skip the default bucket group creation below
                 else:
-                    group_buckets = [bucket] + non_fp8_buckets
+                    group_buckets = [bucket] + [b for b, _ in non_fp8_buckets]
             else:
                 # The first N-1 bucket groups.
                 group_buckets = [bucket]
+            # Merged buckets must share the fp8 group's effective use_distributed_optimizer.
+            assert (
+                _merged_use_distributed_optimizer(group_buckets)
+                == fp8_buffer.ddp_config.use_distributed_optimizer
+            )
             bucket_groups.append(
                 _ParamAndGradBucketGroup(
                     group_buckets,
-                    buffer.ddp_config,
+                    fp8_buffer.ddp_config,
                     buffer.data_parallel_group,
                     buffer.data_parallel_world_size,
                 )
             )
+
         return bucket_groups

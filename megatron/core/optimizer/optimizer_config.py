@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
 from dataclasses import dataclass, field
@@ -329,6 +329,13 @@ class OptimizerConfig:
     When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
     arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
     that the standard distributed-optimizer path is not triggered."""
+
+    use_layer_wise_param_layout: bool = False
+    """Layer-wise (Muon) optimizer only. When True, LayerWise-managed buffers use
+    the shard-aligned padded LayerWise param layout. When False (default), the compact decoupled
+    layout is selected: LayerWise-managed (Muon) buffers use a compact no-padding DDP layout with
+    all-reduce gradients and legacy whole-param ping-pong ownership + ``allgather_params``
+    param sync."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 

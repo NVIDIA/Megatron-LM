@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import abc
 import importlib
@@ -69,12 +69,16 @@ class ModelConfig:
     Must be serializable."""
 
     # === pre-wrap and post-wrap hooks ===
-    pre_wrap_hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]] = field(default_factory=list)
+    pre_wrap_hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]] = field(
+        default_factory=list
+    )
     """List of functions that are executed before the model is wrapped with DDP/FSDP.
     Should take the model as the only argument and return a new model as the only return value.
     """
 
-    post_wrap_hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]] = field(default_factory=list)
+    post_wrap_hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]] = field(
+        default_factory=list
+    )
     """List of functions that are executed after model initialization is complete.
     Should take the model as the only argument and return a new model as the only return value.
     """
@@ -98,13 +102,15 @@ class ModelConfig:
         """
 
         def _as_dict(config):
-            result = {
-                "_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}",
-            }
+            result = {"_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}"}
             for f in dataclass_fields(config):
                 value = getattr(config, f.name)
                 # Skip non-serializable fields
-                if callable(value) or f.name.startswith("_") or f.name in ["pre_wrap_hooks", "post_wrap_hooks"]:
+                if (
+                    callable(value)
+                    or f.name.startswith("_")
+                    or f.name in ["pre_wrap_hooks", "post_wrap_hooks"]
+                ):
                     continue
 
                 if is_dataclass(value):
@@ -144,7 +150,9 @@ class ModelConfig:
 
             # Filter to valid fields for this class
             valid_fields = {f.name for f in dataclass_fields(config_cls)}
-            filtered_data = {k: v for k, v in subdata.items() if k in valid_fields and not k.startswith("_")}
+            filtered_data = {
+                k: v for k, v in subdata.items() if k in valid_fields and not k.startswith("_")
+            }
 
             # recurse on serialized nested dataclasses
             subconfigs = {}
@@ -220,7 +228,9 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         use_torch_fsdp2: bool = False,
         wrap_with_ddp: bool = True,
         data_parallel_random_init: bool = False,
-        mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+        mixed_precision_wrapper: (
+            Callable[[Any, MegatronModule], MegatronModule] | None
+        ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool = True,
@@ -239,7 +249,8 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
             use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-                controls whether to compute and supply a shard-aligned param layout to DDP.
+                selects the padded shard-aligned layout (``True``) or compact decoupled
+                layout (``False``) for LayerWise-managed buffers.
 
         Returns:
             List of model stages. If the model does not support virtual pipeline parallelism,
