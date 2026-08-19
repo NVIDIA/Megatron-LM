@@ -1967,13 +1967,18 @@ def training_log(
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
-    # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
-    should_reset = not is_first_iteration
+    # Preserve first-iteration timer accumulation for the next normal logging interval.
+    # Loss stats are preserved only for a fresh run; resumed runs start with an empty
+    # total_loss_dict, so keeping the first resumed loss would count it twice.
+    should_reset_timers = not is_first_iteration
+    should_reset_loss_stats = should_reset_timers or args.iteration > 0
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
     skipped_iters_key = 'skipped iterations'
     nan_iters_key = 'nan iterations'
+    timer_iters_key = 'timer iterations'
+    total_loss_dict[timer_iters_key] = total_loss_dict.get(timer_iters_key, 0) + 1
     # Advanced iterations.
     if not skipped_iter:
         total_loss_dict[advanced_iters_key] = total_loss_dict.get(advanced_iters_key, 0) + 1
@@ -2039,6 +2044,7 @@ def training_log(
     one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
+    timer_iterations = total_loss_dict[timer_iters_key]
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
@@ -2185,8 +2191,8 @@ def training_log(
             with open(args.memory_snapshot_path, 'wb') as f:
                 dump(snapshot, f)
 
-        elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
-        elapsed_time_per_iteration = elapsed_time / total_iterations
+        elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset_timers)
+        elapsed_time_per_iteration = elapsed_time / timer_iterations
 
         throughput = num_floating_point_operations(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size
@@ -2235,13 +2241,13 @@ def training_log(
             log_string += f' learning rate: {learning_rate:.6E} |'
         log_string += f' global batch size: {batch_size:5d} |'
         for key in total_loss_dict:
-            if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
+            if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key, timer_iters_key]:
                 avg = total_loss_dict[key].item() / float(
                     max(1, total_loss_dict[advanced_iters_key])
                 )
                 if avg >= 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
-                if should_reset:
+                if should_reset_loss_stats:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
@@ -2254,10 +2260,12 @@ def training_log(
             total_loss_dict[skipped_iters_key]
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
-        if should_reset:
+        if should_reset_loss_stats:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
+        if should_reset_timers:
+            total_loss_dict[timer_iters_key] = 0
         print_rank_last(log_string)
         reported_memory_in_this_iteration = False
         if report_memory_flag:
@@ -2276,10 +2284,10 @@ def training_log(
             report_memory(f'(after {iteration} iterations)')
         # Write timers to wandb, don't reset the counts.
         if args.log_timers_to_tensorboard:
-            timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
-            timers.write(timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False)
+            timers.write(timers_to_log, writer, iteration, normalizer=timer_iterations, reset=False)
+            timers.write(timers_to_log, wandb_writer, iteration, normalizer=timer_iterations, reset=False)
         # Log timers to stdout
-        timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
+        timers.log(timers_to_log, normalizer=timer_iterations, reset=should_reset_timers)
 
     return report_memory_flag
 
