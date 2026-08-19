@@ -338,6 +338,7 @@ def _check_supported_type(meta):
 
     _SUPPORTED_TYPES = {
         torch.Tensor,
+        torch.distributed.ProcessGroup,
         type(None),
         bool,
         int,

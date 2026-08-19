@@ -221,6 +221,7 @@ class TestRLUtils:
         args.wandb_project = None
 
         args.micro_batch_size = 1
+        args.eval_micro_batch_size = 1
 
         for key, value in kwargs.items():
             setattr(args, key, value)
@@ -228,6 +229,34 @@ class TestRLUtils:
         args = validate_args(args)
         set_global_variables(args, False)
         return args
+
+    @pytest.mark.parametrize(
+        "traj_len, last_token, cap, generated, ok",
+        [
+            pytest.param(8, 99, None, 8, True, id="ends_in_eod"),
+            pytest.param(16, 7, None, 8, True, id="truncated_at_seq_len"),
+            pytest.param(8, 7, 5, 5, True, id="stopped_exactly_at_cap"),
+            pytest.param(8, 7, 5, 4, False, id="under_cap_is_corruption"),
+            pytest.param(8, 7, None, 8, False, id="uncapped_stays_strict"),
+            pytest.param(0, None, 5, 0, False, id="empty_turn_rejected"),
+        ],
+    )
+    def test_single_turn_termination_ok(self, traj_len, last_token, cap, generated, ok):
+        """The eod tripwire admits exactly-at-cap stops (verified from the
+        generation mask, not a label) and stays strict everywhere else — the
+        2026-07-30 workplace_assistant rollout (prompt + exactly
+        max_output_tokens_per_step generated, no eod) is the admit case."""
+        eod, seq_len = 99, 16
+        traj = [1] * (traj_len - 1) + [last_token] if traj_len else []
+        mask = [False] * (traj_len - generated) + [True] * generated
+        rollout = TokenRollout(
+            trajectory=[traj],
+            generation_mask=[mask],
+            reward=0.0,
+            env_id="cap-test",
+            generation_cap=cap,
+        )
+        assert rl_utils.single_turn_termination_ok(rollout, traj, seq_len, eod) is ok
 
     def test_rl_granularity_defaults(self):
         args = self.create_test_args(perform_rl_step=True, grpo_prompts_per_step=8)
@@ -703,8 +732,8 @@ class TestRLUtils:
         indirect=["initialize_model_parallel"],
     )
     def test_prepare_data_for_update(self, initialize_model_parallel):
-        """Logprobs path runs; single-turn EOD guard holds; multi-turn turns are split,
-        padded to a DP*microbatch multiple, and size the microbatch calculator by turns."""
+        """Logprobs path runs; single-turn EOD guard holds; multi-turn rollouts collapse to one
+        row each, padded to a DP*microbatch multiple to size the microbatch calculator."""
         world_size, dp, tp, pp = initialize_model_parallel
         # Here I assume that we will be consuming all data in one step.
         group_size = 2
@@ -739,16 +768,15 @@ class TestRLUtils:
                 request_ledger={},
             )
 
-        # Multi-turn rollouts with uneven turn counts: a turn may stop on a tool-call
-        # boundary (short, no eod) and is accepted. 2 + 3 turns per group * dp groups
-        # = 5*dp turns, padded up to the next multiple of micro_batch_size*dp (= 2*dp)
-        # -> 6*dp turns. With samples_ratio 1 the calculator is sized by total turns
-        # (6*dp -> 3 microbatches), not by rollout count (the pre-fix bug gave 1).
+        # Multi-turn rollouts with uneven turn counts: each collapses to ONE combined row
+        # (the final turn) regardless of turn count, so a group of 2 rollouts yields 2 rows.
+        # token_ids are cumulative and each turn generates the newly-added tokens (no overlap),
+        # so the combined generation mask / logprobs are well-formed.
         def mt1():
             return make_token_rollout(
                 [[1, 2, 3], [1, 2, 3, 4]],
-                [[-0.1, -0.2], [-0.3, -0.4]],
-                [[False, True, True], [False, False, True, True]],
+                [[-0.1, -0.2], [-0.3]],
+                [[False, True, True], [False, False, False, True]],
                 problem_id="1",
             )
 
@@ -775,8 +803,9 @@ class TestRLUtils:
             is_correction=False,
             request_ledger=mt_ledger,
         )
-        # 5*dp turns padded to 6*dp; 6*dp / (micro_batch_size 2 * dp) = 3 microbatches.
-        assert get_num_microbatches() == 3
+        # 2 rollouts/group * dp groups = 2*dp rows (already a multiple of micro_batch_size*dp);
+        # 2*dp / (micro_batch_size 2 * dp) = 1 microbatch.
+        assert get_num_microbatches() == 1
 
         def r1():
             return make_token_rollout(
@@ -818,26 +847,15 @@ class TestRLUtils:
         [pytest.param((1, 1), id="tp1-pp1")],
         indirect=["initialize_model_parallel"],
     )
-    def test_prepare_data_for_update_oversampling(self, initialize_model_parallel):
-        """Oversampling (ratio < 1) consumes a fraction of the (padded) turn count per step:
-        the microbatch calculator is sized by ceil(ratio * total turns), not the full batch."""
+    @pytest.mark.parametrize("scenario", ["fallback_and_pad", "oversampling", "empty_rollout"])
+    def test_prepare_data_for_update_row_accounting(self, initialize_model_parallel, scenario):
+        """Rows = one per rollout, except non-prefix rollouts fall back to one row per turn
+        and zero-turn placeholders (failed episodes) contribute no row at all.
+        The (padded) row count -- not the rollout count -- sizes the microbatch calculator, and
+        oversampling (ratio < 1) consumes a fraction of the rows per step."""
         world_size, dp, tp, pp = initialize_model_parallel
         tokenizer = MockTokenizer()
         model = MockModel()
-
-        # ratio = global_batch_size/(prompts*group) = 2*dp/(dp*4) = 0.5.
-        # 4*dp single-turn turns (already a multiple of 2*dp); ceil(0.5 * 4*dp) = 2*dp;
-        # 2*dp / (2 * dp) = 1 microbatch.
-        self.create_test_args(
-            micro_batch_size=2,
-            seq_length=4,
-            curr_iteration=1,
-            tensor_model_parallel_size=tp,
-            pipeline_model_parallel_size=pp,
-            global_batch_size=dp * 2,
-            grpo_prompts_per_step=dp,
-            grpo_group_size=4,
-        )
 
         def single(problem_id, reward):
             return make_token_rollout(
@@ -848,7 +866,70 @@ class TestRLUtils:
                 problem_id=problem_id,
             )
 
-        rollouts = [[single(str(i), float(i % 2)) for i in range(4)] for _ in range(dp)]
+        if scenario == "fallback_and_pad":
+            # group = [collapsible single-turn, NON-prefix 2-turn] -> 1 + 2 = 3 rows/group.
+            # 3*dp rows padded up to the next multiple of micro_batch_size*dp (= 2*dp) -> 4*dp;
+            # 4*dp / (2 * dp) = 2 microbatches.
+            self.create_test_args(
+                micro_batch_size=2,
+                seq_length=4,
+                curr_iteration=1,
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                global_batch_size=dp * 2,
+                grpo_prompts_per_step=dp,
+                grpo_group_size=2,
+            )
+
+            def non_prefix():
+                return make_token_rollout(
+                    [[1, 2, 3, tokenizer.eod], [7, 8, 9, tokenizer.eod]],
+                    [[-0.1, -0.2, -0.3], [-0.4, -0.5, -0.6]],
+                    [[False, True, True, True], [False, True, True, True]],
+                    reward=0.0,
+                    problem_id="x",
+                )
+
+            rollouts = [[single("a", 1.0), non_prefix()] for _ in range(dp)]
+            expected_microbatches = 2
+        elif scenario == "empty_rollout":
+            # group = [2 single-turn, 1 zero-turn placeholder (failed episode)] -> 2 rows/group:
+            # the placeholder is skipped (keeping it would crash indexing trajectory[-1], and
+            # counting it would give 3*dp rows -> 3 microbatches).
+            # 2*dp rows / (micro_batch_size 1 * dp) -> 2 microbatches.
+            # micro_batch_size must be 1: the microbatch calculator is first built from the
+            # raw args, and global_batch_size (3*dp) must be divisible by mbs*dp.
+            self.create_test_args(
+                micro_batch_size=1,
+                seq_length=4,
+                curr_iteration=1,
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                global_batch_size=dp * 3,
+                grpo_prompts_per_step=dp,
+                grpo_group_size=3,
+            )
+            rollouts = [
+                [single("a", 1.0), single("b", 0.0), make_token_rollout([], [], [], reward=0.0)]
+                for _ in range(dp)
+            ]
+            expected_microbatches = 2
+        else:  # oversampling: ratio = global_batch_size/(prompts*group) = 2*dp/(dp*4) = 0.5.
+            # 4*dp single-turn rows (already a multiple of 2*dp); ceil(0.5 * 4*dp) = 2*dp;
+            # 2*dp / (2 * dp) = 1 microbatch.
+            self.create_test_args(
+                micro_batch_size=2,
+                seq_length=4,
+                curr_iteration=1,
+                tensor_model_parallel_size=tp,
+                pipeline_model_parallel_size=pp,
+                global_batch_size=dp * 2,
+                grpo_prompts_per_step=dp,
+                grpo_group_size=4,
+            )
+            rollouts = [[single(str(i), float(i % 2)) for i in range(4)] for _ in range(dp)]
+            expected_microbatches = 1
+
         request_ledger = _ledger_for(*(r for g in rollouts for r in g))
         rl_utils.prepare_data_for_update(
             [model],
@@ -859,77 +940,88 @@ class TestRLUtils:
             is_correction=False,
             request_ledger=request_ledger,
         )
-        assert get_num_microbatches() == 1
+        assert get_num_microbatches() == expected_microbatches
 
-    @pytest.mark.parametrize("num_turns", [1, 2])
-    def test_prepare_trajectories(self, num_turns):
-        """Each (rollout, turn_idx) unit becomes one padded training row (a rollout with T
-        turns contributes T rows); PAD_TURN_UNIT entries become inert all-pad rows with no
-        generated tokens and no inference logprobs (DP count equalization)."""
+    def test_prepare_trajectories(self):
+        """Every row kind becomes one padded training row in a single batch: a single-turn
+        rollout (one contiguous generated region), a multi-turn rollout collapsed to its final
+        sequence (multi-region mask with a gap at the observation, per-turn logprobs
+        concatenated), the per-turn fallback rows of a NON-prefix rollout (each trained on its own
+        tokens/mask), and an inert PAD_ROW."""
         seq_length = 8
         self.create_test_args(rl_skip_bos_token=False, micro_batch_size=1, seq_length=seq_length)
         tokenizer = MockTokenizer()
         eod, pad = tokenizer.eod, tokenizer.pad
 
-        r1 = make_token_rollout(
-            [[1, 2, 3, eod]] * num_turns,
-            [[0.1, 0.2, 0.3, 0.35]] * num_turns,
-            [[False, True, True, True]] * num_turns,
+        # Single-turn rollout: one contiguous generated region.
+        single = make_token_rollout(
+            [[1, 2, 3, eod]],
+            [[0.1, 0.2, 0.3]],
+            [[False, True, True, True]],
             reward=3.14,
             problem_id="1",
         )
-        r2 = make_token_rollout(
-            [[4, 5, 6, 7, eod]] * num_turns,
-            [[0.4, 0.5, 0.6, 0.7, 0.75]] * num_turns,
-            [[False, True, True, True, True]] * num_turns,
+        # Multi-turn prefix chain: turn 0 generates [2, 3, eod]; an observation (token 5) is
+        # appended; turn 1 generates [6, eod]. token_ids are cumulative, so this collapses to the
+        # final sequence with TWO generated regions (a gap at the observation) and per-turn
+        # logprobs concatenated.
+        multi = make_token_rollout(
+            [[1, 2, 3, eod], [1, 2, 3, eod, 5, 6, eod]],
+            [[0.4, 0.5, 0.6], [0.7, 0.75]],
+            [[False, True, True, True], [False, False, False, False, False, True, True]],
             reward=0.14,
             problem_id="2",
         )
-        r3 = make_token_rollout(
-            [[8, 9, eod]] * num_turns,
-            [[0.8, 0.9, 0.95]] * num_turns,
-            [[False, True, True]] * num_turns,
-            reward=2.71,
+        # Non-prefix rollout: turn 1 is not a prefix-extension of turn 0, so it is trained as
+        # per-turn fallback rows (rollout, turn_idx) -- each on its own tokens/mask.
+        non_prefix = make_token_rollout(
+            [[1, 2, 3, eod], [7, 8, 9, eod]],
+            [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+            [[False, True, True, True], [False, True, True, True]],
             problem_id="3",
         )
 
-        turn_units = [
-            (rollout, turn_idx)
-            for rollout in [r1, r2, r3]
-            for turn_idx in range(len(rollout.trajectory))
-        ] + [rl_utils.PAD_TURN_UNIT]
+        rows = [single, multi, (non_prefix, 0), (non_prefix, 1), rl_utils.PAD_ROW]
         trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
-            turn_units, tokenizer, seq_length, skip_bos_token=False
+            rows, tokenizer, seq_length, skip_bos_token=False
         )
 
         expected_trajs = torch.tensor(
-            [[1, 2, 3, eod] + [pad] * 4, [4, 5, 6, 7, eod] + [pad] * 3, [8, 9, eod] + [pad] * 5],
+            [
+                [1, 2, 3, eod] + [pad] * 4,
+                [1, 2, 3, eod, 5, 6, eod] + [pad] * 1,
+                [1, 2, 3, eod] + [pad] * 4,
+                [7, 8, 9, eod] + [pad] * 4,
+                [pad] * 8,
+            ],
             dtype=torch.long,
             device=trajs.device,
-        ).repeat_interleave(num_turns, dim=0)
-        expected_trajs = torch.cat(
-            [expected_trajs, torch.full((1, seq_length), pad, dtype=expected_trajs.dtype)]
         )
         assert torch.equal(trajs, expected_trajs)
 
         expected_genmask = torch.tensor(
             [
-                [False, True, True, True] + [False] * 4,
-                [False, True, True, True, True] + [False] * 3,
-                [False, True, True] + [False] * 5,
+                [False, True, True, True, False, False, False, False],
+                # union of both turns' generated spans, with a gap at the observation (pos 4)
+                [False, True, True, True, False, True, True, False],
+                [False, True, True, True, False, False, False, False],
+                [False, True, True, True, False, False, False, False],
+                [False] * 8,  # inert PAD_ROW
             ],
             dtype=torch.bool,
             device=genmask.device,
-        ).repeat_interleave(num_turns, dim=0)
-        expected_genmask = torch.cat(
-            [expected_genmask, torch.zeros((1, seq_length), dtype=torch.bool)]
         )
         assert torch.equal(genmask, expected_genmask)
 
-        # Per-row list: unpadded tensor per real row, None for the pad unit. (Packing-mode
+        # Per-row list: unpadded tensor per real row, None for the pad row. (Packing-mode
         # densification happens at the call site via _pad_nonnull_with_zeros, tested separately.)
-        expected_logprobs = [[0.1, 0.2, 0.3, 0.35], [0.4, 0.5, 0.6, 0.7, 0.75], [0.8, 0.9, 0.95]]
-        expected_logprobs = [el for el in expected_logprobs for _ in range(num_turns)] + [None]
+        expected_logprobs = [
+            [0.1, 0.2, 0.3],
+            [0.4, 0.5, 0.6, 0.7, 0.75],
+            [0.1, 0.2, 0.3],
+            [0.4, 0.5, 0.6],
+            None,
+        ]
         assert len(inference_logprobs) == len(expected_logprobs)
         for got, exp in zip(inference_logprobs, expected_logprobs):
             if exp is None:
@@ -939,16 +1031,90 @@ class TestRLUtils:
                 torch.testing.assert_close(got, exp_t, rtol=0, atol=0)
 
     @pytest.mark.parametrize(
-        "num_turns, expected",
+        "trajectory, logprobs, generation_mask, collapsible",
         [
-            pytest.param([[1, 1], [1, 1]], [-1.0, 1.0, 0.0, 0.0], id="single_turn"),
-            # A rollout's group advantage is repeated once per turn.
-            pytest.param([[2, 1], [1, 3]], [-1.0, -1.0, 1.0, 0.0, 0.0, 0.0, 0.0], id="multi_turn"),
+            pytest.param([[1, 2, 3]], [[0.1, 0.2]], [[False, True, True]], True, id="single_turn"),
+            pytest.param(
+                [[1, 2], [1, 2, 3, 4]],
+                [[0.1], [0.2, 0.3]],
+                [[False, True], [False, False, True, True]],
+                True,
+                id="prefix_chain",
+            ),
+            pytest.param(
+                [[1, 2, 3, 4], [5, 6, 7, 8]],
+                [[0.1, 0.2, 0.3], [0.1, 0.2, 0.3]],
+                [[False, True, True, True], [False, True, True, True]],
+                False,
+                id="non_prefix",
+            ),
+            pytest.param(
+                [[1, 2, 3], [1, 2]],
+                [[0.1, 0.2], [0.1]],
+                [[False, True, True], [False, True]],
+                False,
+                id="later_turn_shorter",
+            ),
+            pytest.param(
+                [[1, 2], [1, 2, 3, 4]],
+                [[0.1], [0.2]],
+                [[False, True], [False, False, True, True]],
+                True,
+                id="final_turn_short_one_eod",
+            ),
+            pytest.param(
+                [[1, 2], [1, 2, 3, 4]],
+                [[0.1], [0.2, 0.3]],
+                [[True, True], [False, False, True, True]],
+                False,
+                id="nonfinal_turn_short_one",
+            ),
+            pytest.param(
+                [[1, 2], [1, 2, 3, 4]],
+                [[0.1], [0.2]],
+                [[False, True], [False, True, True, True]],
+                False,
+                id="final_turn_short_two",
+            ),
+            pytest.param(
+                [[1, 2], [1, 2, 3, 4]],
+                [[0.1], [0.2, 0.3]],
+                [[False, True], [False, False, False, True]],
+                False,
+                id="extra_logprobs",
+            ),
         ],
     )
-    def test_advantage_calculation(self, num_turns, expected):
-        advs = rl_utils.calculate_grpo_advantages([[-1, 1], [4, 4]], num_turns)
-        torch.testing.assert_close(torch.tensor(advs), torch.tensor(expected), atol=1e-4, rtol=1e-5)
+    def test_is_collapsible_rollout(self, trajectory, logprobs, generation_mask, collapsible):
+        """A rollout collapses to one combined row only when each turn's token_ids is an exact
+        prefix of the next AND each turn's logprob count matches its generated-token count
+        (the final turn may be short one: train-side-appended eod); otherwise it must fall
+        back to one row per turn."""
+        rollout = make_token_rollout(trajectory, logprobs, generation_mask)
+        assert rl_utils._is_collapsible_rollout(rollout) is collapsible
+
+    @pytest.mark.parametrize(
+        "rewards, num_turns, expected",
+        [
+            pytest.param(
+                [[-1, 1], [4, 4]],
+                [[1, 1], [1, 1]],
+                [-1.0, 1.0, 0.0, 0.0],
+                id="normalized_and_zero_variance",
+            ),
+            pytest.param([[2, 2, 2]], [[1, 2, 3]], [0.0, 0.0, 0.0], id="all_equal"),
+            pytest.param(
+                [[0, 1, 0]], [[0, 1, 1]], [0.0, 1.0, -1.0], id="placeholder_masked_from_stats"
+            ),
+            pytest.param([[0, 0]], [[0, 0]], [0.0, 0.0], id="all_placeholder_group"),
+        ],
+    )
+    def test_calculate_grpo_advantages(self, rewards, num_turns, expected):
+        """One group-normalized advantage per rollout (independent of turn counts), flattened
+        group-major; zero-turn placeholders are masked out of the group statistics and pinned
+        to advantage 0.0, so their synthetic rewards manufacture no advantage."""
+        advs = rl_utils.calculate_grpo_advantages(rewards, num_turns)
+        torch.testing.assert_close(torch.tensor(advs), torch.tensor(expected), atol=3e-4, rtol=1e-5)
 
     def test_bounded_artifact_key(self):
         short = "env_rollout_table"
@@ -960,18 +1126,6 @@ class TestRLUtils:
         # Deterministic, and distinct keys stay distinct after bounding.
         assert bounded == rl_utils._bounded_artifact_key(long_key)
         assert bounded != rl_utils._bounded_artifact_key(long_key + "y")
-
-    def test_placeholder_rewards_do_not_affect_advantage_normalization(self):
-        # Group of 3 with one zero-turn placeholder: the two real rollouts
-        # normalize against each other, so the placeholder's synthetic 0.0
-        # reward manufactures no advantage.
-        advs = rl_utils.calculate_grpo_advantages([[0, 1, 0]], [[0, 1, 1]])
-        torch.testing.assert_close(
-            torch.tensor(advs), torch.tensor([1.0, -1.0]), atol=3e-4, rtol=1e-5
-        )
-
-    def test_all_placeholder_group_has_no_advantages(self):
-        assert rl_utils.calculate_grpo_advantages([[0, 0]], [[0, 0]]) == []
 
     def test_advantage_shape_mismatch_raises(self):
         with pytest.raises(AssertionError, match="matching shape"):
@@ -1044,6 +1198,39 @@ class TestRLUtils:
         padded = rl_utils._pad_nonnull_with_zeros(data, max_len)
         assert padded.shape == expected_shape
         assert (padded == 0).all()  # zero inputs and zero-filled padding/None rows
+
+    def test_align_unpacked_inference_logprobs(self):
+        """Scatter positions: a generated token at position p lands at index p-1, hopping
+        observation gaps; a short logprob list leaves trailing generated slots at old_logprobs
+        (train-side eod); all-False (PAD) rows are untouched and never dereference their
+        (None) list entry."""
+        width = 7
+        # Distinct value per cell so any wrong-position write breaks exact equality.
+        old = -0.5 - 0.01 * torch.arange(4 * width, dtype=torch.float32).reshape(4, width)
+        # Masks are seq_length (width + 1) wide, as in the pipeline: exercises the stats clip.
+        masks = torch.tensor(
+            [
+                [False, True, True, False, True, True, False, False],  # multi-region, gap at 3
+                [False, True, True, True, False, False, False, False],  # contiguous, 3 gen slots
+                [True, True, False, False, False, False, False, False],  # gen at 0: target -1
+                [False] * 8,  # PAD row
+            ]
+        )
+        logprobs = [
+            torch.tensor([-0.11, -0.12, -0.21, -0.22]),  # two turns' logprobs, concatenated
+            torch.tensor([-0.31, -0.32]),  # one short: the eod slot keeps old_logprobs
+            torch.tensor([-0.41, -0.42]),  # first pairs with the dropped target -1
+            None,  # PAD: must not be touched
+        ]
+        expected = old.clone()
+        expected[0, [0, 1, 3, 4]] = torch.tensor([-0.11, -0.12, -0.21, -0.22])
+        expected[1, [0, 1]] = torch.tensor([-0.31, -0.32])  # index 2 keeps old (ratio 1)
+        expected[2, 0] = -0.42
+
+        aligned = rl_utils.align_unpacked_inference_logprobs(
+            logprobs, old, masks, SimpleNamespace()
+        )
+        torch.testing.assert_close(aligned, expected, rtol=0, atol=0)
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
@@ -1291,14 +1478,7 @@ class TestRLUtils:
             pytest.param((1, 1), id="tp1-pp1"),
             pytest.param((2, 1), id="tp2-pp1"),
             pytest.param((1, 2), id="tp1-pp2"),
-            pytest.param(
-                (1, 1, 2),
-                id="tp1-pp1-cp2",
-                marks=pytest.mark.skip(
-                    reason="PackedSeqParams.cp_group (a ProcessGroup) is rejected by the "
-                    "CUDA-graph arg type whitelist; fixed and unskipped in a follow-up PR"
-                ),
-            ),
+            pytest.param((1, 1, 2), id="tp1-pp1-cp2"),
         ],
         indirect=["initialize_model_parallel"],
     )
@@ -1466,7 +1646,8 @@ class TestRLUtils:
             # inner lists, which the group-level stats must skip, not crash on.
             turn_lens.append([])
             completed_epochs.append([])
-            # advantages stay [0, 1]: zero-turn rollouts emit no advantage entries.
+            # advantages stay [0, 1]: prep treats them as an opaque flat vector
+            # (production pins placeholder entries to 0.0; alignment is not prep's concern).
         writer = MagicMock()
         metrics = rl_utils.prep_wandb_metrics(
             writer,
@@ -1687,9 +1868,10 @@ class TestRLUtils:
         # Rewards keep the placeholder zeros: the lists stay rectangular for
         # alignment; GRPO normalization masks them by num_turns downstream.
         assert stats.rewards == [[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]]
-        # Which the advantages reflect: both real rollouts earned 1.0, so with
-        # the placeholder masked there is no contrast left in the group.
-        assert stats.advantages == [0.0, 0.0]
+        # Which the advantages reflect: one entry per rollout, placeholders pinned to 0.0;
+        # both real rollouts earned 1.0, so with the placeholders masked from the group
+        # statistics there is no contrast left anywhere.
+        assert stats.advantages == [0.0] * 6
         # Adapter stamps pass through; bare empties are inferred to 'placeholder'.
         assert stats.rollout_statuses == [
             ["ok", "ok", "placeholder"],

@@ -1048,8 +1048,29 @@ def test_async_bookkeeping_retains_finished_handoff_state():
     )
 
     assert result.finished_handoff_block_ids == {11: [10, 11]}
+    assert result.finished_handoff_ssm_slots == {}
     assert result.finished_handoff_decode_tokens == {11: [99]}
     context.kv_block_allocator.retain_memory_blocks.assert_called_once_with([10, 11])
+
+
+def test_finished_hybrid_handoff_detaches_live_ssm_slot():
+    context = _make_async_sched_context(total_request_count=2)
+    context.is_hybrid_model = True
+    context.kv_block_allocator = SimpleNamespace(
+        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
+    )
+    context.request_to_kv_block_ids = torch.tensor([[10, 11, -1], [12, 13, -1]], dtype=torch.int32)
+    context.mamba_metadata = SimpleNamespace(detach_state_slot=mock.Mock(return_value=7))
+    controller = _make_async_sched_controller(context)
+
+    blocks, ssm_slots, decode_tokens = controller._collect_finished_handoff_state(
+        torch.tensor([1]), torch.tensor([91, 92]), None
+    )
+
+    assert blocks == {11: [12, 13]}
+    assert ssm_slots == {11: 7}
+    assert decode_tokens == {11: [92]}
+    context.mamba_metadata.detach_state_slot.assert_called_once_with(1)
 
 
 @pytest.mark.parametrize(
@@ -1161,6 +1182,7 @@ def test_async_sched_step_overlap_order():
             newly_paused_request_ids=None,
             evict_request_ids=None,
             finished_handoff_block_ids={},
+            finished_handoff_ssm_slots={},
             finished_handoff_decode_tokens={},
         )
     )
@@ -1290,6 +1312,7 @@ def test_async_sched_step_yields_after_resolution_outside_inference_mode():
             newly_paused_request_ids=None,
             evict_request_ids=None,
             finished_handoff_block_ids={},
+            finished_handoff_ssm_slots={},
             finished_handoff_decode_tokens={},
         )
     )
@@ -1433,6 +1456,7 @@ def test_async_sched_no_overlap_updates_before_admission(
         newly_paused_request_ids=torch.tensor([10]),
         evict_request_ids=torch.tensor([11]),
         finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
     )
     input_ids = torch.empty(1, dtype=torch.int64)
@@ -1539,6 +1563,7 @@ def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
         newly_paused_request_ids=None,
         evict_request_ids=None,
         finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
     )
     controller._run_async_sched_sample = mock.Mock(return_value=sample_result)
@@ -1591,6 +1616,7 @@ def test_async_sched_mtp_overlap_step_order():
         newly_paused_request_ids=None,
         evict_request_ids=None,
         finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
     )
     input_ids = torch.empty(9, dtype=torch.int64)
