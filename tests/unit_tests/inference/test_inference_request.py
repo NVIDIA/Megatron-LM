@@ -11,6 +11,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    FinishedRequestRecord,
     InferenceRequest,
     compute_block_hashes_batched,
     deserialize_ndarray,
@@ -122,6 +123,8 @@ def test_inference_request_serialize_round_trip_through_msgpack():
     dyn_out = DynamicInferenceRequest.deserialize(dyn_data)
     assert isinstance(dyn_out.routing_indices, np.ndarray)
     assert dyn_out.routing_indices.tolist() == [[1, 2], [3, 4]]
+    # The engine-minted uid (the OpenAI response id / ledger key) survives the wire.
+    assert dyn_out.uid == dyn.uid
 
 
 def test_dynamic_inference_request_post_init_prefix_caching():
@@ -168,27 +171,55 @@ def test_dynamic_inference_request_tracked_metadata_defaults_termination_id():
 def test_dynamic_inference_request_record_checkpoint_and_merge():
     """RequestRecord.checkpoint() rolls the current request forward — prompt
     becomes prompt+generated, num_tokens_to_generate is debited, and the
-    add_engine event is inherited (or created) so downstream tooling can find
-    it. RequestRecord.merge() collapses the chain back into a single request
-    with concatenated tokens, text, routing_indices, and the record's latency.
-    Both are non-trivial state machines."""
-    sp = SamplingParams(num_tokens_to_generate=5, termination_id=0)
+    prefix-cache configuration is inherited while hashes are recomputed for the
+    expanded prompt. The add_engine event is inherited (or created) so
+    downstream tooling can find it. RequestRecord.merge() collapses the chain
+    back into a single request with concatenated tokens, text, routing_indices,
+    and the record's latency. Both are non-trivial state machines."""
+    sp = SamplingParams(num_tokens_to_generate=8, termination_id=0)
 
-    # checkpoint() inherits event_add_engine when present.
+    # checkpoint() inherits prefix-cache configuration and event_add_engine.
     req = DynamicInferenceRequest(
         request_id=1,
-        prompt_tokens=torch.tensor([1, 2, 3]),
+        prompt_tokens=torch.tensor([1, 2, 3, 4, 5, 6]),
         sampling_params=sp,
-        generated_tokens=[10, 11],
+        generated_tokens=[7, 8],
+        block_size_tokens=4,
+        enable_prefix_caching=True,
     )
+    original_hashes = req.precomputed_block_hashes
     original_event = req.add_event_add_engine()
     record = DynamicInferenceRequestRecord.from_request(req)
     record.checkpoint()
     assert len(record.requests) == 2
     new_req = record.requests[-1]
-    assert new_req.prompt_tokens.tolist() == [1, 2, 3, 10, 11]
-    assert new_req.sampling_params.num_tokens_to_generate == 3
+    assert new_req.prompt_tokens.tolist() == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert new_req.sampling_params.num_tokens_to_generate == 6
+    assert new_req.block_size_tokens == 4
+    assert new_req.enable_prefix_caching
+    assert new_req.precomputed_block_hashes == compute_block_hashes_batched(
+        new_req.prompt_tokens, new_req.block_size_tokens
+    )
+    assert new_req.precomputed_block_hashes is not original_hashes
+    assert len(new_req.precomputed_block_hashes) == 2
     assert new_req.event_add_engine is original_event
+
+    # A second checkpoint must keep the sticky configuration and extend the hash chain again.
+    new_req.generated_tokens = [9, 10, 11, 12]
+    previous_hashes = new_req.precomputed_block_hashes
+    record.checkpoint()
+    assert len(record.requests) == 3
+    second_new_req = record.requests[-1]
+    assert second_new_req.prompt_tokens.tolist() == list(range(1, 13))
+    assert second_new_req.sampling_params.num_tokens_to_generate == 2
+    assert second_new_req.block_size_tokens == 4
+    assert second_new_req.enable_prefix_caching
+    assert second_new_req.precomputed_block_hashes == compute_block_hashes_batched(
+        second_new_req.prompt_tokens, second_new_req.block_size_tokens
+    )
+    assert second_new_req.precomputed_block_hashes is not previous_hashes
+    assert len(second_new_req.precomputed_block_hashes) == 3
+    assert second_new_req.event_add_engine is original_event
 
     # checkpoint() creates a new event_add_engine when the previous request had none.
     req2 = DynamicInferenceRequest(
@@ -218,6 +249,8 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     b.generated_text = "bar"
     a.routing_indices = np.array([[1, 2]])
     b.routing_indices = np.array([[3, 4]])
+    b.policy_epoch = [(0, 3)]
+    a.add_event_evict()
     rec = DynamicInferenceRequestRecord(requests=[a, b])
     rec.latency = 4.2
     merged = rec.merge()
@@ -225,6 +258,14 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert merged.generated_text == "foobar"
     assert merged.generated_length == 3 and merged.latency == 4.2
     assert merged.routing_indices.tolist() == [[1, 2], [3, 4]]
+    # Every request mints a distinct chatcmpl- uid; merge() keeps the FIRST
+    # segment's — the id the response and the finished-request ledger key on.
+    assert a.uid.startswith("chatcmpl-") and a.uid != b.uid
+    assert merged.uid == a.uid
+    # FinishedRequestRecord mirrors the merged stamps and counts EVICT events.
+    finished = FinishedRequestRecord.from_request(merged)
+    assert finished.policy_epoch == [(0, 3)] and finished.kv_cache_epoch is None
+    assert finished.num_evictions == 1
 
     # merge() with both generated_text=None propagates None (rather than "None"+"None").
     c = DynamicInferenceRequest(
@@ -239,7 +280,11 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
         sampling_params=sp,
         generated_tokens=[12],
     )
-    assert DynamicInferenceRequestRecord(requests=[c, d]).merge().generated_text is None
+    merged_cd = DynamicInferenceRequestRecord(requests=[c, d]).merge()
+    assert merged_cd.generated_text is None
+    # Never-stamped requests record None epochs (non-RL serving).
+    finished_cd = FinishedRequestRecord.from_request(merged_cd)
+    assert finished_cd.policy_epoch is None and finished_cd.num_evictions == 0
 
 
 def test_dynamic_inference_request_serialize_strips_event_add_engine():

@@ -421,6 +421,7 @@ class MultiLatentAttention(Attention):
                     cu_kv_lengths,
                     kv_lengths,
                     block_table,
+                    inference_context.is_decode_only(),
                 )
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
                 if not inference_context.is_decode_only():
@@ -727,8 +728,16 @@ class MLASelfAttention(MultiLatentAttention):
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
             else:
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            rope_max_seqlen_q = packed_seq_params.max_seqlen_q
+            rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
+            rope_freqs_max_seqlen = (
+                max(rope_max_seqlen_q, rope_max_seqlen_kv)
+                if rope_max_seqlen_q is not None and rope_max_seqlen_kv is not None
+                else None
+            )
         else:
             cu_seqlens_q = cu_seqlens_kv = None
+            rope_freqs_max_seqlen = None
 
         # =========================================
         # QKV down projection and layernorm
@@ -940,6 +949,7 @@ class MLASelfAttention(MultiLatentAttention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    max_seqlen=rope_freqs_max_seqlen,
                 )
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                 k_pos_emb = apply_rotary_pos_emb(
@@ -950,6 +960,7 @@ class MLASelfAttention(MultiLatentAttention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    max_seqlen=rope_freqs_max_seqlen,
                 )
 
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
