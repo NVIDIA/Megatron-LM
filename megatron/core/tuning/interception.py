@@ -108,12 +108,15 @@ def verify_choices(group=None) -> bool:
 
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return True
-    digests: list = [None] * torch.distributed.get_world_size()
+    # all_gather_object requires one slot per member of ``group``, which is not the
+    # global world size once a caller verifies agreement within a DP or TP subgroup.
+    world_size = torch.distributed.get_world_size(group=group)
+    digests: list = [None] * world_size
     torch.distributed.all_gather_object(digests, choice_digest(), group=group)
     if len(set(digests)) == 1:
         return True
 
-    maps: list = [None] * torch.distributed.get_world_size()
+    maps: list = [None] * world_size
     torch.distributed.all_gather_object(maps, dict(_choice_log), group=group)
     offenders: dict = {}
     for key in {k for m in maps if m for k in m}:

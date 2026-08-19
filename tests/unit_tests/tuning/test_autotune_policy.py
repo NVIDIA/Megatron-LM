@@ -187,3 +187,32 @@ def test_packaged_tables_are_loadable():
         table = table_mod.load(arch)
         assert table, f"packaged table for {arch} is empty"
         assert table.provenance["arch"] == arch
+
+
+def test_verify_choices_sizes_the_gather_to_its_group(monkeypatch):
+    """all_gather_object needs one slot per group member, not per world rank."""
+    import torch
+
+    from megatron.core.tuning import interception
+
+    lengths = []
+
+    def fake_world_size(group=None):
+        return 8 if group is None else 2
+
+    def fake_all_gather_object(object_list, obj, group=None):
+        # This is the assertion torch itself makes; a subgroup used to fail it.
+        assert len(object_list) == fake_world_size(group=group)
+        lengths.append(len(object_list))
+        object_list[:] = [obj] * len(object_list)
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", fake_world_size)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", fake_all_gather_object)
+
+    subgroup = object()
+    assert interception.verify_choices(group=subgroup) is True
+    assert lengths == [2]
+    assert interception.verify_choices() is True
+    assert lengths == [2, 8]
