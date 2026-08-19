@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
@@ -30,14 +29,6 @@ class _VLLMFixedRouteFunction(torch.autograd.Function):
         with torch.enable_grad():
             replay = logits.detach().float().requires_grad_(True)
             scores = torch.sqrt(F.softplus(replay))
-            if os.getenv("MLITE_VALIDATE_INDICES") == "1" and ids.numel():
-                minimum, maximum = torch.aminmax(ids)
-                if int(minimum.item()) < 0 or int(maximum.item()) >= scores.shape[-1]:
-                    raise ValueError(
-                        "router VJP expert IDs are outside logits: "
-                        f"min={int(minimum.item())}, max={int(maximum.item())}, "
-                        f"experts={scores.shape[-1]}"
-                    )
             selected = scores.gather(-1, ids.long())
             if ctx.renormalize:
                 selected = selected / selected.sum(dim=-1, keepdim=True).clamp_min(1e-20)

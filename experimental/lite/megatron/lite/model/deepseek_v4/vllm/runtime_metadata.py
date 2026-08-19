@@ -301,7 +301,6 @@ class AttentionKernelMetadata:
     cp_positions: torch.Tensor | None = None
     cp_compressor_operation: Any | None = None
     cp_compressor_metadata: Any | None = None
-    cp_debug: dict[str, torch.Tensor] | None = None
 
 
 @dataclass

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -53,22 +52,6 @@ from megatron.lite.primitive.quantization.deployment_block_fp8 import (
     DeploymentBlockFP8Adapter,
     DeploymentFusedBlockFP8Adapter,
 )
-
-
-def _validate_finite(stage: str, **tensors: torch.Tensor | None) -> None:
-    if os.environ.get("MLITE_VALIDATE_FINITE") != "1":
-        return
-    for name, tensor in tensors.items():
-        if tensor is None or not tensor.is_floating_point():
-            continue
-        finite = torch.isfinite(tensor)
-        if bool(finite.all()):
-            continue
-        raise FloatingPointError(
-            f"MLITE_NONFINITE stage={stage} tensor={name} "
-            f"dtype={tensor.dtype} shape={tuple(tensor.shape)} "
-            f"nonfinite={int((~finite).sum().item())}"
-        )
 
 
 def _vllm_selected_log_probs(
@@ -556,22 +539,6 @@ class _AttentionState(CompressedSparseAttention):
             sink,
             softmax_scale=scale,
         )
-        if os.environ.get("MLITE_CP_DEBUG") == "1":
-            metadata.cp_debug = {
-                "q": q_visible.detach(),
-                "workspace": workspace.detach(),
-                "indices": indices.detach(),
-                "topk_length": topk_length.detach(),
-                "flash_output": result.detach(),
-                "boundary_k": boundary_k_visible.detach(),
-                "local_k": kv_visible.detach(),
-                "compressed_rank_major": compressed_rank_major.detach(),
-                "seq_to_rank_row": (
-                    seq_to_rank_row.detach()
-                    if seq_to_rank_row is not None
-                    else torch.empty(0, dtype=torch.int32, device=hidden_states.device)
-                ),
-            }
         result = result[:, : self.config.num_attention_heads, :]
         heads_per_group = self.config.num_attention_heads // self.config.o_groups
         nope_dim = self.config.head_dim - self.config.qk_rope_head_dim
@@ -731,14 +698,6 @@ class _AttentionState(CompressedSparseAttention):
                 topk_length=metadata.topk_length,
                 out=metadata.output,
             )
-            if os.environ.get("MLITE_CP_DEBUG") == "1":
-                metadata.cp_debug = {
-                    "q": q_visible.detach(),
-                    "workspace": metadata.kv_workspace.detach(),
-                    "indices": metadata.indices.detach(),
-                    "topk_length": metadata.topk_length.detach(),
-                    "flash_output": flash_result[0].detach(),
-                }
             if not isinstance(flash_result, (tuple, list)) or len(flash_result) < 2:
                 raise RuntimeError("training FlashMLA prefill must return output and lse")
             # vLLM returns (output, max_logits, lse); Lite returns (output, lse).
@@ -1000,18 +959,7 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         residual, post_mix, res_mix, hidden_states = self._mhc_pre(
             x, self.attn_hc, self.input_layernorm.weight
         )
-        _validate_finite(
-            f"layer_{self.layer_idx}.mhc_pre_attn",
-            hidden_states=hidden_states,
-            residual=residual,
-            post_mix=post_mix,
-            res_mix=res_mix,
-        )
         hidden_states = self.self_attn(hidden_states, metadata=metadata)
-        _validate_finite(
-            f"layer_{self.layer_idx}.attention",
-            hidden_states=hidden_states,
-        )
         return self._mhc_post(hidden_states, residual, post_mix, res_mix)
 
     def _mlp_block(
@@ -1024,19 +972,8 @@ class DeepseekV4Layer(LiteDeepseekV4Layer):
         residual, post_mix, res_mix, hidden_states = self._mhc_pre(
             x, self.ffn_hc, self.post_attention_layernorm.weight
         )
-        _validate_finite(
-            f"layer_{self.layer_idx}.mhc_pre_ffn",
-            hidden_states=hidden_states,
-            residual=residual,
-            post_mix=post_mix,
-            res_mix=res_mix,
-        )
         hidden_states = self.mlp(
             hidden_states, input_ids=input_ids, metadata=metadata
-        )
-        _validate_finite(
-            f"layer_{self.layer_idx}.moe",
-            hidden_states=hidden_states,
         )
         return self._mhc_post(hidden_states, residual, post_mix, res_mix)
 
@@ -1145,14 +1082,6 @@ class DeepseekV4Model(LiteDeepseekV4Model):
                     ).reshape(-1, self.config.hc_mult, self.config.hidden_size)
                     pipeline_streams = True
             elif input_ids is not None:
-                if os.getenv("MLITE_VALIDATE_INDICES") == "1" and input_ids.numel():
-                    minimum, maximum = torch.aminmax(input_ids)
-                    if int(minimum.item()) < 0 or int(maximum.item()) >= self.config.vocab_size:
-                        raise ValueError(
-                            "input token IDs are outside embedding vocabulary: "
-                            f"min={int(minimum.item())}, max={int(maximum.item())}, "
-                            f"vocab={self.config.vocab_size}"
-                        )
                 assert self.embed_tokens is not None
                 hidden_states = self.embed_tokens.embedding(input_ids)
         if hidden_states is None:
@@ -1187,10 +1116,6 @@ class DeepseekV4Model(LiteDeepseekV4Model):
                 moe_metadata=layer_moe_metadata,
                 input_ids=input_ids,
             )
-            _validate_finite(
-                f"layer_{layer_idx}.output",
-                hidden_states=hidden_states,
-            )
         if not self.post_process:
             # Pipeline P2P is [S, B, hc_mult*H].  Packed DS4 uses B=1.
             return {
@@ -1211,7 +1136,6 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             self.hc_head.hc_base.float().contiguous(),
             eps=self.config.hc_eps,
         )
-        _validate_finite("model.mhc_head", hidden_states=hidden_states)
         from vllm.model_executor.layers.batch_invariant import (
             rms_norm_batch_invariant,
         )
@@ -1222,9 +1146,7 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             self.norm.weight,
             self.config.rms_norm_eps,
         )
-        _validate_finite("model.norm", hidden_states=hidden_states)
         logits = self.lm_head(hidden_states)
-        _validate_finite("model.logits", logits=logits)
         result = {
             "hidden_states": hidden_states,
             "logits": logits,
@@ -1240,20 +1162,11 @@ class DeepseekV4Model(LiteDeepseekV4Model):
             flat_labels = labels.reshape(-1).long()
             if flat_labels.numel() != logits.shape[0]:
                 raise ValueError("labels must contain one target per visible token")
-            if os.getenv("MLITE_VALIDATE_INDICES") == "1" and flat_labels.numel():
-                minimum, maximum = torch.aminmax(flat_labels)
-                if int(minimum.item()) < 0 or int(maximum.item()) >= logits.shape[-1]:
-                    raise ValueError(
-                        "language-model targets are outside logits vocabulary: "
-                        f"min={int(minimum.item())}, max={int(maximum.item())}, "
-                        f"vocab={logits.shape[-1]}"
-                    )
             selected_log_probs, token_log_probs = _vllm_selected_log_probs(
                 logits, flat_labels, temperature_value
             )
             token_loss = -selected_log_probs
             result["log_probs"] = selected_log_probs
-            _validate_finite("model.selected_log_probs", log_probs=result["log_probs"])
             if calculate_entropy:
                 result["entropy"] = -(
                     token_log_probs.exp() * token_log_probs
