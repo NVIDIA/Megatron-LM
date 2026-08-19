@@ -378,18 +378,14 @@ class ShortcutMoEBlock(MegatronModule):
     _parallel_streams: dict[int, torch.cuda.Stream] = {}
 
     def __init__(
-        self,
-        compute_layer,
-        moe_layer,
-        enable_cudagraph: bool,
-        is_mtp_layer: bool = False,
+        self, compute_layer, moe_layer, enable_cudagraph: bool, is_mtp_layer: bool = False
     ):
         if not compute_layer.config.moe_shortcut_parallel:
             raise ValueError("Shortcut MoE requires moe_shortcut_parallel")
         if enable_cudagraph:
-            assert compute_layer.config.pipeline_model_parallel_size == 1, (
-                "Fused shortcut CUDA graphs currently require pipeline parallel size 1"
-            )
+            assert (
+                compute_layer.config.pipeline_model_parallel_size == 1
+            ), "Fused shortcut CUDA graphs currently require pipeline parallel size 1"
         persistent_slot_count = 1
         if enable_cudagraph and is_mtp_layer and compute_layer.config.mtp_use_repeated_layer:
             if not compute_layer.config.mtp_num_layers:
@@ -406,6 +402,14 @@ class ShortcutMoEBlock(MegatronModule):
         self.compute_layer = compute_layer
         self.moe_layer = moe_layer
 
+        # The shortcut path uses the same normalization implementation and configuration as
+        # the MoE path, but owns an independent parameter. Keeping ownership on the registered
+        # shortcut block avoids adding a shortcut-only field to every transformer-layer spec.
+        self.shortcut_pre_mlp_layernorm = moe_layer.submodules_config.pre_mlp_layernorm(
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
         self.shortcut_post_norm = torch.nn.RMSNorm(
             self.config.hidden_size, eps=self.config.layernorm_epsilon
         )
@@ -441,7 +445,7 @@ class ShortcutMoEBlock(MegatronModule):
 
         route_participants = (
             self.compute_layer,
-            self.moe_layer.pre_mlp_layernorm,
+            self.shortcut_pre_mlp_layernorm,
             self.moe_layer.mlp,
         )
         output_participants = [self.compute_layer, self.moe_layer.pre_mlp_layernorm]
@@ -563,7 +567,7 @@ class ShortcutMoEBlock(MegatronModule):
 
     def _shortcut_route_preprocess(self, shortcut_hidden, padding_mask=None):
         """Run shortcut normalization, routing, and dispatch preprocessing."""
-        shortcut_input = apply_module(self.moe_layer.pre_mlp_layernorm)(shortcut_hidden)
+        shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
         probs, routing_map = self.moe_layer.mlp.route(shortcut_input, padding_mask)
@@ -726,9 +730,7 @@ class ShortcutMoEBlock(MegatronModule):
         )
 
     def _launch_dispatch(
-        self,
-        route_outputs,
-        persistent_slot: int,
+        self, route_outputs, persistent_slot: int
     ) -> tuple[_PairedState, _DispatchOutput]:
         """Normalize route outputs and return paired state plus in-flight dispatch output."""
         if self.enable_cudagraph:
@@ -739,13 +741,22 @@ class ShortcutMoEBlock(MegatronModule):
                     "dispatcher attributes"
                 )
             paired_state = tuple(route_outputs[:-attr_count] if attr_count else route_outputs)
-            token_dispatcher_attr_outputs = (
-                tuple(route_outputs[-attr_count:]) if attr_count else ()
-            )
+            token_dispatcher_attr_outputs = tuple(route_outputs[-attr_count:]) if attr_count else ()
             if not paired_state:
                 raise RuntimeError("Shortcut dispatch requires a non-empty paired state")
 
             slot = self._require_graph_state().get_slot(persistent_slot)
+            # Dispatcher metadata crosses from reusable CUDA-graph output storage into the
+            # eager expert autograd graph. In particular, permutation backward saves routing
+            # masks beyond the output graph's forward lifetime. Give those tensors eager-owned
+            # storage so a later graph-pool reuse cannot expose stale or overwritten metadata.
+            token_dispatcher_attr_outputs = tuple(
+                output.clone() for output in token_dispatcher_attr_outputs
+            )
+            # The clones run outside the route graph on the main stream, after the event
+            # recorded by route_input_compute. Re-publish readiness here so side-stream
+            # dispatch cannot consume partially copied metadata under TP/SP execution.
+            slot.route_ready_event.record(torch.cuda.current_stream())
             self.moe_layer._restore_token_dispatcher_attrs(token_dispatcher_attr_outputs)
             dispatch_output = self._launch_dispatch_async(
                 slot.route_input_buffer.tensor,
@@ -812,8 +823,7 @@ class ShortcutMoEBlock(MegatronModule):
                     grad_ready_event=output_slot.combine_grad_ready_event,
                 )
             combined_output = self._wait_dispatch_and_launch_combine(
-                dispatch_output,
-                **combine_kwargs,
+                dispatch_output, **combine_kwargs
             )
 
             return self.output_shared(

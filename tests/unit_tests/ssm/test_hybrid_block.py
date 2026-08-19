@@ -11,9 +11,17 @@ from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_layer import MambaLayer
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    initialize_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    _CudagraphGlobalRecord,
+    create_cudagraphs,
+)
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
 )
@@ -249,9 +257,14 @@ class TestHybridBlock:
             Symbols.MAMBA + Symbols.MOE,
             num_moe_experts=1,
             moe_router_topk=1,
+            moe_router_pre_softmax=True,
             moe_token_dispatcher_type="allgather",
             moe_shortcut_connection=True,
+            moe_shortcut_parallel=True,
             moe_shared_expert_intermediate_size=256,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
         )
 
         assert len(block.layers) == 1
@@ -259,13 +272,164 @@ class TestHybridBlock:
         assert isinstance(shortcut, ShortcutMoEBlock)
         assert isinstance(shortcut.compute_layer, MambaLayer)
         assert isinstance(shortcut.moe_layer, TransformerLayer)
+        assert shortcut.shortcut_pre_mlp_layernorm is not shortcut.moe_layer.pre_mlp_layernorm
         assert isinstance(shortcut.shortcut_post_norm, torch.nn.RMSNorm)
         assert block.num_layers_per_pipeline_rank == 2
 
         state_keys = set(block.state_dict())
         assert any(key.startswith("layers.0.compute_layer.") for key in state_keys)
         assert any(key.startswith("layers.0.moe_layer.") for key in state_keys)
+        assert any(key.startswith("layers.0.shortcut_pre_mlp_layernorm.") for key in state_keys)
         assert "layers.0.shortcut_post_norm.weight" in state_keys
+
+    def test_shortcut_pair_eager_forward_backward(self):
+        block = self.get_hybrid_block(
+            Symbols.MAMBA + Symbols.MOE,
+            num_moe_experts=1,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_token_dispatcher_type="allgather",
+            moe_shortcut_connection=True,
+            moe_shortcut_parallel=True,
+            moe_shared_expert_intermediate_size=256,
+            add_bias_linear=False,
+        ).cuda()
+        block.train()
+
+        hidden_states = torch.randn(
+            16, 2, block.config.hidden_size, device=torch.cuda.current_device(), requires_grad=True
+        )
+        output = block(hidden_states, attention_mask=None)
+        output.float().square().mean().backward()
+
+        assert output.shape == hidden_states.shape
+        shortcut = block.layers[0]
+        logical_norms = (
+            shortcut.shortcut_pre_mlp_layernorm,
+            shortcut.moe_layer.pre_mlp_layernorm,
+            shortcut.shortcut_post_norm,
+        )
+        assert len({id(norm.weight) for norm in logical_norms}) == len(logical_norms)
+        for norm in logical_norms:
+            assert norm.weight.grad is not None
+            assert torch.isfinite(norm.weight.grad).all()
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
+
+    @pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2-sp"])
+    def test_shortcut_pair_cuda_graph_replay_matches_eager(self, tp_size):
+        if tp_size == 2:
+            if torch.distributed.get_world_size() < 4:
+                pytest.skip("TP=2/EP=2 shortcut graph parity requires four ranks")
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=2,
+                pipeline_model_parallel_size=1,
+                expert_model_parallel_size=2,
+            )
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        model_parallel_cuda_manual_seed(123)
+        common_config = dict(
+            num_moe_experts=4 if tp_size == 2 else 1,
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=2 if tp_size == 2 else 1,
+            sequence_parallel=tp_size > 1,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            moe_token_dispatcher_type="allgather",
+            moe_shortcut_connection=True,
+            moe_shortcut_parallel=True,
+            moe_shared_expert_intermediate_size=256,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        eager = self.get_hybrid_block(Symbols.MAMBA + Symbols.MOE, **common_config).cuda()
+        graphed = self.get_hybrid_block(
+            Symbols.MAMBA + Symbols.MOE,
+            cuda_graph_impl="local",
+            cuda_graph_warmup_steps=1,
+            cuda_graph_modules=["shortcut_block"],
+            **common_config,
+        ).cuda()
+        graphed.load_state_dict(eager.state_dict())
+        eager.train()
+        graphed.train()
+        for parameter in graphed.parameters():
+            parameter.main_grad = torch.zeros_like(parameter)
+
+        def logical_norms(block):
+            shortcut = block.layers[0]
+            return (
+                shortcut.shortcut_pre_mlp_layernorm,
+                shortcut.moe_layer.pre_mlp_layernorm,
+                shortcut.shortcut_post_norm,
+            )
+
+        def clear_gradients(block):
+            block.zero_grad(set_to_none=True)
+            for parameter in block.parameters():
+                if hasattr(parameter, "main_grad"):
+                    parameter.main_grad.zero_()
+
+        def forward_backward(block, hidden_states, output_gradient):
+            output = block(hidden_states, attention_mask=None)
+            output_snapshot = output.detach().clone()
+            dispatcher = block.layers[0].moe_layer.mlp.token_dispatcher
+            expected_tokens = hidden_states.shape[0] * hidden_states.shape[1]
+            assert dispatcher.local_map.sum().item() == expected_tokens
+            assert dispatcher.local_probs.numel() == expected_tokens
+            output.backward(output_gradient)
+            gradients = []
+            for norm in logical_norms(block):
+                gradient = norm.weight.grad
+                if gradient is None and hasattr(norm.weight, "main_grad"):
+                    gradient = norm.weight.main_grad
+                gradients.append(gradient.clone())
+            return output_snapshot, gradients
+
+        try:
+            capture_input = torch.randn(
+                16, 2, graphed.config.hidden_size, device="cuda", requires_grad=True
+            )
+            capture_gradient = torch.randn_like(capture_input)
+            forward_backward(graphed, capture_input, capture_gradient)
+            create_cudagraphs()
+
+            for replay_index in range(2):
+                torch.manual_seed(1000 + replay_index)
+                replay_input = torch.randn(
+                    16, 2, eager.config.hidden_size, device="cuda", requires_grad=True
+                )
+                output_gradient = torch.randn_like(replay_input)
+
+                clear_gradients(eager)
+                eager_output, eager_gradients = forward_backward(
+                    eager, replay_input.detach().clone().requires_grad_(True), output_gradient
+                )
+                clear_gradients(graphed)
+                graph_output, graph_gradients = forward_backward(
+                    graphed, replay_input.detach().clone().requires_grad_(True), output_gradient
+                )
+
+                torch.testing.assert_close(graph_output, eager_output, rtol=1e-5, atol=1e-6)
+                for graph_gradient, eager_gradient in zip(graph_gradients, eager_gradients):
+                    torch.testing.assert_close(graph_gradient, eager_gradient, rtol=1e-5, atol=1e-6)
+        finally:
+            shortcut = graphed.layers[0]
+            for manager in (
+                shortcut._graph_state.route_manager,
+                shortcut._graph_state.output_manager,
+            ):
+                for runner in manager.cudagraph_runners:
+                    if hasattr(runner, "fwd_graph"):
+                        del runner.fwd_graph
+                    if hasattr(runner, "bwd_graph"):
+                        del runner.bwd_graph
+            torch.cuda.synchronize()
+            _CudagraphGlobalRecord.cudagraph_created = False
+            _CudagraphGlobalRecord.cudagraph_record = []
+            _CudagraphGlobalRecord.cudagraph_inference_record = []
+            CudaGraphManager.global_mempool = None
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_symbol = 'X'

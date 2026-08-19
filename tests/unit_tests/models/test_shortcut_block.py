@@ -6,6 +6,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core import parallel_state
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import (
+    _allreduce_non_tensor_model_parallel_grads,
+)
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.models.hybrid.shortcut_block import (
     AsyncCombineToPersistentBuffer,
@@ -20,6 +25,7 @@ from megatron.core.models.hybrid.shortcut_block import (
 from megatron.core.transformer.module import SplitOutputProjection
 from megatron.core.transformer.moe.token_dispatcher import MoEFlexTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
 
 
 def test_group_layers_into_registered_shortcut_blocks():
@@ -60,6 +66,9 @@ def test_group_layers_into_registered_shortcut_blocks():
             self.layer_number = 2
             self.is_first_layer = False
             self.is_last_layer = False
+            self.submodules_config = SimpleNamespace(
+                pre_mlp_layernorm=lambda **kwargs: torch.nn.Identity()
+            )
             self.mlp = FakeMLP()
 
     compute = FakeCompute()
@@ -68,9 +77,7 @@ def test_group_layers_into_registered_shortcut_blocks():
     config.moe_shortcut_parallel = False
     with pytest.raises(ValueError, match="requires moe_shortcut_parallel"):
         group_layers_into_shortcut_blocks(
-            torch.nn.ModuleList([compute, moe]),
-            [LayerSymbols.MAMBA, LayerSymbols.MOE],
-            config,
+            torch.nn.ModuleList([compute, moe]), [LayerSymbols.MAMBA, LayerSymbols.MOE], config
         )
     config.moe_shortcut_parallel = True
     grouped = group_layers_into_shortcut_blocks(
@@ -103,10 +110,9 @@ def cuda_graph_mempool():
 
 
 def test_shortcut_block_registers_pair_and_post_norm():
-    config = TransformerConfig(
-        num_layers=2, hidden_size=8, num_attention_heads=1, sequence_parallel=True
+    config = SimpleNamespace(
+        hidden_size=8, moe_shortcut_parallel=True, layernorm_epsilon=1e-5, sequence_parallel=True
     )
-    config.moe_shortcut_parallel = True
 
     class FakeCompute(torch.nn.Module):
         def __init__(self):
@@ -129,6 +135,9 @@ def test_shortcut_block_registers_pair_and_post_norm():
             self.is_first_layer = False
             self.is_last_layer = True
             self.pre_mlp_layernorm = torch.nn.Identity()
+            self.submodules_config = SimpleNamespace(
+                pre_mlp_layernorm=lambda **kwargs: torch.nn.Identity()
+            )
             self.mlp = FakeMLP()
 
     compute = FakeCompute()
@@ -149,6 +158,7 @@ def test_shortcut_block_registers_pair_and_post_norm():
     assert list(dict(block.named_children())) == [
         "compute_layer",
         "moe_layer",
+        "shortcut_pre_mlp_layernorm",
         "shortcut_post_norm",
     ]
 
@@ -216,7 +226,7 @@ def test_persistent_dispatch_gradients_flow_into_route_backward(monkeypatch, cud
             self.input_scale = torch.nn.Parameter(torch.tensor(2.0))
             self.prob_scale = torch.nn.Parameter(torch.tensor(3.0))
             self.dispatch_args = None
-            self._local_cudagraph_attr_names = ()
+            self._local_cudagraph_attr_names = ("routing_map",)
 
         def shortcut_route_preprocess(self, shortcut_hidden, padding_mask=None):
             return shortcut_hidden * self.input_scale, shortcut_hidden * self.prob_scale
@@ -242,14 +252,9 @@ def test_persistent_dispatch_gradients_flow_into_route_backward(monkeypatch, cud
     block.compute_layer = compute
     block.moe_layer = moe
     block.enable_cudagraph = True
-    route_slot = SimpleNamespace(
-        route_input_buffer=PersistentBuffer("route input", requires_grad=True),
-        route_probs_buffer=PersistentBuffer("route probabilities", requires_grad=True),
-        route_input_grad_buffer=PersistentBuffer("route input gradient"),
-        route_probs_grad_buffer=PersistentBuffer("route probability gradient"),
-        route_ready_event=route_ready_event,
-        route_grad_ready_event=route_grad_ready_event,
-    )
+    route_slot = _PersistentSlot(0)
+    route_slot.route_ready_event = route_ready_event
+    route_slot.route_grad_ready_event = route_grad_ready_event
     block._graph_state = SimpleNamespace(get_slot=lambda index: route_slot)
     dispatch_output = (object(), object())
 
@@ -257,21 +262,32 @@ def test_persistent_dispatch_gradients_flow_into_route_backward(monkeypatch, cud
         moe.dispatch_args = (route_input, route_probs, event, kwargs)
         return dispatch_output
 
-    monkeypatch.setattr(block, "_shortcut_route_preprocess", moe.shortcut_route_preprocess)
     monkeypatch.setattr(block, "_launch_dispatch_async", launch_dispatch)
 
     hidden = torch.ones(4, device="cuda", requires_grad=True)
+    dispatcher_attr = torch.ones(4, dtype=torch.bool, device="cuda")
+    monkeypatch.setattr(
+        block,
+        "_shortcut_route_preprocess",
+        lambda shortcut_hidden, padding_mask=None: (
+            *moe.shortcut_route_preprocess(shortcut_hidden, padding_mask),
+            dispatcher_attr,
+        ),
+    )
     route_outputs = ShortcutMoEBlock.route_input_compute(block, hidden)
     paired_state, actual_dispatch_output = block._launch_dispatch(route_outputs, 0)
-    assert len(paired_state) == len(route_outputs)
-    assert all(actual is expected for actual, expected in zip(paired_state, route_outputs))
+    assert len(paired_state) == len(route_outputs) - 1
+    assert all(actual is expected for actual, expected in zip(paired_state, route_outputs[:-1]))
     assert actual_dispatch_output is dispatch_output
 
     route_input, route_probs, actual_event, dispatch_kwargs = moe.dispatch_args
     assert route_input is route_slot.route_input_buffer.tensor
     assert route_probs is route_slot.route_probs_buffer.tensor
     assert actual_event is route_ready_event
-    assert moe.restored_attrs == ()
+    assert len(moe.restored_attrs) == 1
+    torch.testing.assert_close(moe.restored_attrs[0], dispatcher_attr)
+    assert moe.restored_attrs[0].data_ptr() != dispatcher_attr.data_ptr()
+    assert [call[0] for call in calls].count("route_ready_record") == 2
     route_grad_buffers = dispatch_kwargs["route_grad_buffers"]
     assert route_grad_buffers[0] is route_slot.route_input_grad_buffer.tensor
     assert route_grad_buffers[1] is route_slot.route_probs_grad_buffer.tensor
@@ -307,6 +323,7 @@ def test_shortcut_block_uses_two_method_level_graph_managers(monkeypatch):
         pre_mlp_layernorm=torch.nn.Identity(),
         mlp=SimpleNamespace(shared_experts=torch.nn.Identity()),
     )
+    target.shortcut_pre_mlp_layernorm = torch.nn.Identity()
     target.shortcut_post_norm = torch.nn.Identity()
     calls = []
 
@@ -327,7 +344,7 @@ def test_shortcut_block_uses_two_method_level_graph_managers(monkeypatch):
         "is_last_layer": False,
         "participant_modules": (
             target.compute_layer,
-            target.moe_layer.pre_mlp_layernorm,
+            target.shortcut_pre_mlp_layernorm,
             target.moe_layer.mlp,
         ),
     }
@@ -436,9 +453,7 @@ def test_async_dispatch_bridge_publishes_both_route_gradients(monkeypatch):
     backward_dependency = torch.zeros((), device="cuda", requires_grad=True)
 
     monkeypatch.setattr(
-        ShortcutMoEBlock,
-        "_parallel_streams",
-        {torch.cuda.current_device(): dispatch_stream},
+        ShortcutMoEBlock, "_parallel_streams", {torch.cuda.current_device(): dispatch_stream}
     )
     dispatch_output = block._launch_dispatch_async(
         route_input,
@@ -596,7 +611,7 @@ def test_async_combine_bridge_preserves_gradient_and_event_order():
     torch.testing.assert_close(source.grad, 2 * grad)
 
 
-def test_eager_overlap_produces_gradients(monkeypatch):
+def test_eager_overlap_matches_serialized_output_and_gradients(monkeypatch):
     config = TransformerConfig(num_layers=2, hidden_size=4, num_attention_heads=1)
     config.moe_shortcut_parallel = True
 
@@ -647,6 +662,9 @@ def test_eager_overlap_produces_gradients(monkeypatch):
             self.is_first_layer = False
             self.is_last_layer = True
             self.pre_mlp_layernorm = torch.nn.Identity()
+            self.submodules_config = SimpleNamespace(
+                pre_mlp_layernorm=lambda **kwargs: torch.nn.Identity()
+            )
             self.route_scale = torch.nn.Parameter(torch.tensor(13.0))
             self.prob_scale = torch.nn.Parameter(torch.tensor(17.0))
             self.shared_scale = torch.nn.Parameter(torch.tensor(19.0))
@@ -660,9 +678,7 @@ def test_eager_overlap_produces_gradients(monkeypatch):
 
         def wait_dispatch_and_launch_combine(self, dispatch_output):
             dispatched_input, dispatched_probs = dispatch_output
-            routed_output, _ = self.mlp.routed_experts_compute(
-                dispatched_input, dispatched_probs
-            )
+            routed_output, _ = self.mlp.routed_experts_compute(dispatched_input, dispatched_probs)
             return self.mlp.combine(routed_output)
 
         def _shortcut_shared_experts(self, hidden_states):
@@ -675,7 +691,7 @@ def test_eager_overlap_produces_gradients(monkeypatch):
     def quant_context_factory(config, layer_number):
         yield
 
-    def run():
+    def run(overlap):
         compute = FakeCompute()
         moe = FakeMoE()
         block = ShortcutMoEBlock(compute, moe, enable_cudagraph=False)
@@ -683,43 +699,101 @@ def test_eager_overlap_produces_gradients(monkeypatch):
         monkeypatch.setattr(block, "_shortcut_shared_experts", moe._shortcut_shared_experts)
         monkeypatch.setattr(block, "_launch_dispatch_async", moe.launch_dispatch)
         monkeypatch.setattr(
-            block,
-            "_wait_dispatch_and_launch_combine",
-            moe.wait_dispatch_and_launch_combine,
+            block, "_wait_dispatch_and_launch_combine", moe.wait_dispatch_and_launch_combine
         )
         monkeypatch.setattr(block, "_wait_combine", moe.mlp.wait_combine)
 
         hidden_states = torch.arange(1.0, 5.0, requires_grad=True)
-        output = block(
-            hidden_states=hidden_states,
-            attention_mask=None,
-            inference_context=None,
-            rotary_pos_emb=None,
-            sequence_len_offset=None,
-            packed_seq_params=None,
-            padding_mask=None,
-            quant_context_factory=quant_context_factory,
-            quant_config=None,
-        )
+        optimizer = torch.optim.SGD(block.parameters(), lr=0.01)
+        if overlap:
+            output = block(
+                hidden_states=hidden_states,
+                attention_mask=None,
+                inference_context=None,
+                rotary_pos_emb=None,
+                sequence_len_offset=None,
+                packed_seq_params=None,
+                padding_mask=None,
+                quant_context_factory=quant_context_factory,
+                quant_config=None,
+            )
+        else:
+            route_input, route_probs = block._shortcut_route_preprocess(hidden_states)
+            compute_state = compute.forward_pre_output_proj(hidden_states)
+            dispatched_input, dispatched_probs = moe.mlp.dispatch(route_input, route_probs)
+            routed_output, _ = moe.mlp.routed_experts_compute(dispatched_input, dispatched_probs)
+            combined_output = moe.mlp.combine(routed_output)
+            projected_hidden = compute.forward_output_proj(*compute_state)
+            shared_expert_output = block._shortcut_shared_experts(projected_hidden)
+            output = block._postprocess(projected_hidden, combined_output, shared_expert_output)
         output.sum().backward()
         gradients = [hidden_states.grad]
         gradients.extend(parameter.grad for parameter in compute.parameters())
         gradients.extend(parameter.grad for parameter in moe.parameters())
-        return output, gradients
+        gradients.extend(parameter.grad for parameter in block.shortcut_post_norm.parameters())
+        optimizer.step()
+        updated_parameters = [parameter.detach().clone() for parameter in block.parameters()]
+        return output, gradients, updated_parameters
 
     monkeypatch.setattr(
         torch.cuda, "Event", lambda *args, **kwargs: SimpleNamespace(record=lambda stream: None)
     )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: object())
-    output, gradients = run()
+    serialized_output, serialized_gradients, serialized_parameters = run(overlap=False)
+    overlap_output, overlap_gradients, overlap_parameters = run(overlap=True)
 
-    assert output.isfinite().all()
-    assert all(gradient is not None and gradient.isfinite().all() for gradient in gradients)
+    torch.testing.assert_close(overlap_output, serialized_output, rtol=1e-5, atol=1e-6)
+    assert len(overlap_gradients) == len(serialized_gradients)
+    for overlap_gradient, serialized_gradient in zip(overlap_gradients, serialized_gradients):
+        torch.testing.assert_close(overlap_gradient, serialized_gradient, rtol=1e-5, atol=1e-6)
+    assert len(overlap_parameters) == len(serialized_parameters)
+    for overlap_parameter, serialized_parameter in zip(overlap_parameters, serialized_parameters):
+        torch.testing.assert_close(overlap_parameter, serialized_parameter, rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize(
-    "enable_cudagraph", [False, True], ids=["eager-overlap", "graph-overlap"]
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_tp2_sequence_shards_reduce_post_norm_gradient_to_unsharded_reference():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    try:
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+        )
+        device = torch.device("cuda", torch.cuda.current_device())
+        full_input = torch.arange(1, 65, dtype=torch.float32, device=device).view(8, 1, 8)
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+
+        post_norm = torch.nn.RMSNorm(
+            config.hidden_size, eps=config.layernorm_epsilon, device=device
+        )
+        post_norm.ddp_config = DistributedDataParallelConfig()
+        post_norm.weight.sequence_parallel = True
+        local_input = full_input.chunk(2, dim=0)[tp_rank].detach().requires_grad_(True)
+        post_norm(local_input).sum().backward()
+
+        reference_norm = torch.nn.RMSNorm(
+            config.hidden_size, eps=config.layernorm_epsilon, device=device
+        )
+        reference_norm.load_state_dict(post_norm.state_dict())
+        reference_norm(full_input).sum().backward()
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        _allreduce_non_tensor_model_parallel_grads([post_norm], config, tp_group)
+
+        reduced_grads = [torch.empty_like(post_norm.weight.grad) for _ in range(2)]
+        torch.distributed.all_gather(reduced_grads, post_norm.weight.grad, group=tp_group)
+        assert torch.equal(reduced_grads[0], reduced_grads[1])
+        torch.testing.assert_close(
+            post_norm.weight.grad, reference_norm.weight.grad, rtol=1e-5, atol=1e-6
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("enable_cudagraph", [False, True], ids=["eager-overlap", "graph-overlap"])
 def test_shortcut_block_selects_a2a_schedule(monkeypatch, enable_cudagraph):
     calls = []
     quant_contexts = []
@@ -823,11 +897,7 @@ def test_shortcut_block_selects_a2a_schedule(monkeypatch, enable_cudagraph):
         return actual_combined_output
 
     def output_shared(
-        *paired_state,
-        combined_output,
-        inference_context,
-        padding_mask,
-        persistent_slot=0,
+        *paired_state, combined_output, inference_context, padding_mask, persistent_slot=0
     ):
         assert persistent_slot == 0
         assert paired_state == (compute_dependency, compute_aux)
@@ -867,9 +937,7 @@ def test_shortcut_block_selects_a2a_schedule(monkeypatch, enable_cudagraph):
     monkeypatch.setattr(block, "output_shared", output_shared)
     monkeypatch.setattr(block, "_postprocess", postprocess)
     monkeypatch.setattr(
-        block,
-        "_wait_dispatch_and_launch_combine",
-        wait_dispatch_and_launch_combine,
+        block, "_wait_dispatch_and_launch_combine", wait_dispatch_and_launch_combine
     )
     monkeypatch.setattr(block, "_wait_combine", wait_combine)
     output_slot = SimpleNamespace(
