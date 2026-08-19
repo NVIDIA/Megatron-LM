@@ -75,8 +75,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate release-ref is a commit SHA
+        env:
+          RELEASE_REF: ${{ inputs.release-ref || github.sha }}
         run: |
-          if ! echo "${{ inputs.release-ref || github.sha }}" | grep -qE '^[0-9a-f]{40}$'; then
+          if ! echo "$RELEASE_REF" | grep -qE '^[0-9a-f]{40}$'; then
             echo "::error::release-ref must be a full 40-character commit SHA, not a branch name."
             exit 1
           fi
