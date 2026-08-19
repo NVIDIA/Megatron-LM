@@ -80,6 +80,30 @@ class GoldenValues(pydantic.RootModel):
     root: Dict[str, GoldenValueMetric]
 
 
+def _remove_leading_nan_iteration_times(
+    golden_values: Dict[str, GoldenValueMetric],
+) -> Dict[str, GoldenValueMetric]:
+    """Remove leading synthetic NaNs from iteration-time values.
+
+    Internal NaNs are preserved, and an all-NaN metric is left unchanged so
+    missing iteration-time telemetry remains visible.
+    """
+    iteration_time = golden_values.get("iteration-time")
+    if iteration_time is None:
+        return golden_values
+
+    values = list(iteration_time.values.items())
+    first_valid_index = next(
+        (index for index, (_, value) in enumerate(values) if value != "nan"), None
+    )
+    if first_valid_index in (None, 0):
+        return golden_values
+
+    iteration_time.values = dict(values[first_valid_index:])
+    iteration_time.start_step = values[first_valid_index][0]
+    return golden_values
+
+
 class MissingTensorboardLogsError(Exception):
     """Raised if TensorboardLogs not found"""
 
@@ -185,11 +209,11 @@ def read_tb_logs_as_list(
             values=values,
         )
 
-    return golden_values
+    return _remove_leading_nan_iteration_times(golden_values)
 
 
 def read_golden_values_from_json(
-    golden_values_path: Union[str, pathlib.Path]
+    golden_values_path: Union[str, pathlib.Path],
 ) -> Dict[str, GoldenValueMetric]:
     with open(golden_values_path) as f:
         if os.path.exists(golden_values_path):
