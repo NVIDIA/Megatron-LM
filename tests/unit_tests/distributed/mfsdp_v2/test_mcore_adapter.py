@@ -13,7 +13,6 @@ import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -267,8 +266,12 @@ class TestMcoreAdapterDense:
         assert torch.isfinite(reference_losses).all()
         torch.testing.assert_close(losses, reference_losses, rtol=1e-3, atol=0)
 
-        # The optimizer must refresh every chunk's compute weights once per step.
-        assert all(count == len(steps) for count in sync_counts.values())
+        # Eager execution enters the Python callback once per step. CUDA graph mode
+        # enters it for the eager warmup and capture; subsequent steps replay the
+        # captured weight-refresh kernels without re-entering Python.
+        expected_sync_calls = 2 if optimizer_cuda_graph else len(steps)
+        assert all(count == expected_sync_calls for count in sync_counts.values())
+
 
 class TestMcoreAdapterExpertParallel:
     """Exercise the MFSDP v2 adapter over an MoE model with EP=2."""

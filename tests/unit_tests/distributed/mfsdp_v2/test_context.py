@@ -269,9 +269,7 @@ def test_post_backward_release_processes_nested_fsdp_modules_once(distributed_se
     calls = []
     for name, module in (("root", model), ("inner", model.inner)):
         monkeypatch.setattr(
-            module,
-            "_reshard_parameter_groups",
-            lambda name=name: calls.append((name, "reshard")),
+            module, "_reshard_parameter_groups", lambda name=name: calls.append((name, "reshard"))
         )
         monkeypatch.setattr(
             module, "_reduce_gradient_groups", lambda name=name: calls.append((name, "reduce"))

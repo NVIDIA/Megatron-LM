@@ -512,6 +512,7 @@ def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
 
+
 # ---------------------------------------------------------------------------
 # Fine-grained hook registration for 1F1B EP overlap support
 # ---------------------------------------------------------------------------
