@@ -219,6 +219,16 @@ class TestParallelMLAAttention:
     def test_constructor(self):
         assert isinstance(self.parallel_attention, MLASelfAttention)
         assert self.parallel_attention.layer_number == 1
+        assert self.parallel_attention.linear_q_up_proj.weight.qkv_layout.num_groups == 4
+        assert (
+            self.parallel_attention.linear_q_up_proj.weight.qkv_layout.projection_split_shapes
+            == (128, 64)
+        )
+        assert self.parallel_attention.linear_kv_up_proj.weight.qkv_layout.num_groups == 4
+        assert (
+            self.parallel_attention.linear_kv_up_proj.weight.qkv_layout.projection_split_shapes
+            == (128, 128)
+        )
 
         num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
         assert num_weights == 65036
@@ -1700,6 +1710,9 @@ class TestFusedMLASelfAttention:
         assert isinstance(self.fused_attention, MLASelfAttention)
         assert self.fused_attention.layer_number == 1
         assert hasattr(self.fused_attention, 'linear_qkv_down_proj')
+        assert self.fused_attention.linear_q_up_proj.weight.qkv_layout.num_groups == 4
+        assert self.fused_attention.linear_kv_up_proj.weight.qkv_layout.num_groups == 4
+        assert getattr(self.fused_attention.linear_qkv_down_proj.weight, 'qkv_layout', None) is None
 
     def test_fused_weight_shape(self):
         config = self.transformer_config

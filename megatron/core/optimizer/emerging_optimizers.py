@@ -149,12 +149,15 @@ def _get_qkv_split_shapes(model_cfg, split_qkv_per_head: bool = False) -> list[i
     """Compute fused QKV split shapes from logical attention layout metadata.
 
     Args:
-        model_cfg: Object exposing ``num_attention_heads``, ``num_query_groups``,
-            ``kv_channels``, and ``attention_output_gate``. This can be a transformer
-            config or the owning attention layer's parameter metadata.
+        model_cfg: Transformer config or an owning attention layer's ``QKVLayout`` metadata.
         split_qkv_per_head: Return one split size per physical attention head. When false,
             return the per-query-group Q, gate (if present), K, and V projection widths.
     """
+    if hasattr(model_cfg, 'projection_split_shapes'):
+        if split_qkv_per_head:
+            return list(model_cfg.per_head_split_shapes) * model_cfg.num_groups
+        return list(model_cfg.projection_split_shapes)
+
     query_projection_size = (
         model_cfg.num_attention_heads // model_cfg.num_query_groups * model_cfg.kv_channels
     )

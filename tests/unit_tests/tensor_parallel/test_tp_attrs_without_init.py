@@ -97,10 +97,9 @@ def test_copy_tensor_model_parallel_attributes_preserves_qkv_metadata():
     destination = torch.empty_like(source)
     source.is_qkv = True
     source.qkv_layout = QKVLayout(
-        num_attention_heads=8,
-        num_query_groups=2,
-        kv_channels=64,
-        attention_output_gate=False,
+        num_groups=2,
+        projection_split_shapes=(256, 64, 64),
+        per_head_split_shapes=(64, 64, 64, 64, 64, 64),
     )
     source.qkv_split_shapes = [2, 2]
     source.qkv_split_shapes_global = [2] * 4

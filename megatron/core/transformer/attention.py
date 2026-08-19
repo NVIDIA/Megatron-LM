@@ -138,12 +138,45 @@ except ImportError:
 
 @dataclass(frozen=True)
 class QKVLayout:
-    """Logical layout metadata for a fused QKV projection weight."""
+    """Logical row layout for a packed attention projection weight.
 
-    num_attention_heads: int
-    num_query_groups: int
-    kv_channels: int
-    attention_output_gate: bool
+    ``projection_split_shapes`` describes the projection slices repeated in every group.
+    ``per_head_split_shapes`` describes the independently orthogonalizable head slices in the
+    same group. Standard fused QKV has one group per query group, while MLA up-projections have
+    one group per attention head.
+    """
+
+    num_groups: int
+    projection_split_shapes: tuple[int, ...]
+    per_head_split_shapes: tuple[int, ...]
+
+    @classmethod
+    def from_standard_attention_config(cls, config: TransformerConfig) -> 'QKVLayout':
+        """Build the fused QKV row layout described by a transformer config."""
+        assert config.num_query_groups is not None
+        assert config.kv_channels is not None
+        num_query_heads_per_group = config.num_attention_heads // config.num_query_groups
+        projection_split_shapes = [num_query_heads_per_group * config.kv_channels]
+        per_head_split_shapes = [config.kv_channels] * num_query_heads_per_group
+        if config.attention_output_gate:
+            projection_split_shapes.append(num_query_heads_per_group * config.kv_channels)
+            per_head_split_shapes += [config.kv_channels] * num_query_heads_per_group
+        projection_split_shapes += [config.kv_channels, config.kv_channels]
+        per_head_split_shapes += [config.kv_channels, config.kv_channels]
+        return cls(
+            num_groups=config.num_query_groups,
+            projection_split_shapes=tuple(projection_split_shapes),
+            per_head_split_shapes=tuple(per_head_split_shapes),
+        )
+
+    @classmethod
+    def from_repeated_splits(cls, num_groups: int, split_shapes: tuple[int, ...]) -> 'QKVLayout':
+        """Build a layout whose projection slices are repeated once per attention head."""
+        return cls(
+            num_groups=num_groups,
+            projection_split_shapes=split_shapes,
+            per_head_split_shapes=split_shapes,
+        )
 
 
 class LinearQkvInterface(Protocol):
@@ -1703,12 +1736,7 @@ class SelfAttention(Attention):
             pg_collection=self.pg_collection,
             name=(name + ".linear_qkv") if name is not None else None,
         )
-        self.linear_qkv.weight.qkv_layout = QKVLayout(
-            num_attention_heads=self.config.num_attention_heads,
-            num_query_groups=self.config.num_query_groups,
-            kv_channels=self.config.kv_channels,
-            attention_output_gate=self.config.attention_output_gate,
-        )
+        self.linear_qkv.weight.qkv_layout = QKVLayout.from_standard_attention_config(self.config)
 
         # Resolve which norm class to use for Q and K.
         # Config selects the default norm class; spec overrides if set.

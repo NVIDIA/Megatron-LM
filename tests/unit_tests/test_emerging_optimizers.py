@@ -30,7 +30,8 @@ from megatron.core.optimizer.emerging_optimizers import (
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.attention import QKVLayout
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
 )
@@ -94,6 +95,10 @@ def test_muon_qkv_split_shapes():
     assert _get_qkv_split_shapes(gated_config) == [128, 128, 64, 64]
     assert _get_qkv_split_shapes(config, split_qkv_per_head=True) == [64] * 32
     assert _get_qkv_split_shapes(gated_config, split_qkv_per_head=True) == [64] * 48
+
+    mla_layout = QKVLayout.from_repeated_splits(4, (128, 64))
+    assert _get_qkv_split_shapes(mla_layout) == [128, 64]
+    assert _get_qkv_split_shapes(mla_layout, split_qkv_per_head=True) == [128, 64] * 4
 
 
 def test_muon_local_qkv_head_split_shapes_can_differ_by_tp_rank():
@@ -584,11 +589,7 @@ class TestMuonOptimizerMultiRankTP:
                         "replace_with_linear": False,
                         "num_query_groups": 2,
                     },
-                    "mlp": {
-                        "no_op": False,
-                        "replace_with_linear": False,
-                        "ffn_hidden_size": 16,
-                    },
+                    "mlp": {"no_op": False, "replace_with_linear": False, "ffn_hidden_size": 16},
                 },
                 {
                     "attention": {
@@ -596,11 +597,7 @@ class TestMuonOptimizerMultiRankTP:
                         "replace_with_linear": False,
                         "num_query_groups": 1,
                     },
-                    "mlp": {
-                        "no_op": False,
-                        "replace_with_linear": False,
-                        "ffn_hidden_size": 16,
-                    },
+                    "mlp": {"no_op": False, "replace_with_linear": False, "ffn_hidden_size": 16},
                 },
             ]
         }
@@ -643,8 +640,8 @@ class TestMuonOptimizerMultiRankTP:
         second_qkv = model.decoder.layers[1].self_attention.linear_qkv.weight
         assert optimizer is not None
         assert transformer_config.num_query_groups == 2
-        assert first_qkv.qkv_layout.num_query_groups == 2
-        assert second_qkv.qkv_layout.num_query_groups == 1
+        assert first_qkv.qkv_layout.num_groups == 2
+        assert second_qkv.qkv_layout.num_groups == 1
         assert first_qkv.shape[0] == 12
         assert second_qkv.shape[0] == 8
         assert first_qkv.is_qkv
@@ -659,6 +656,78 @@ class TestMuonOptimizerMultiRankTP:
             assert second_qkv.qkv_split_shapes_global == [8, 4, 4]
             assert first_qkv.qkv_split_groups_are_complete
             assert not second_qkv.qkv_split_groups_are_complete
+
+    @pytest.mark.parametrize("split_per_head", [False, True])
+    @pytest.mark.parametrize("q_lora_rank", [None, 4])
+    def test_optimizer_factory_uses_mla_up_projection_layouts(self, split_per_head, q_lora_rank):
+        """MLA up-projections use module-owned layouts with TP-aware Muon splitting."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tp_size = pg_collection.tp.size()
+        assert tp_size == 2
+        model_parallel_cuda_manual_seed(123)
+        transformer_config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=4,
+            qk_head_dim=4,
+            qk_pos_emb_head_dim=2,
+            v_head_dim=3,
+            tensor_model_parallel_size=tp_size,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            multi_latent_attention=True,
+            rope_type="rope",
+            rotary_base=10000,
+            original_max_position_embeddings=8,
+        )
+        model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_local_spec(multi_latent_attention=True),
+            vocab_size=32,
+            max_sequence_length=8,
+            pre_process=False,
+            post_process=False,
+            pg_collection=pg_collection,
+        )
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            use_distributed_optimizer=False,
+            muon_split_qkv=True,
+            muon_split_qkv_per_head=split_per_head,
+            muon_tp_mode="blockwise",
+        )
+
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=False,
+            pg_collection=pg_collection,
+        )
+
+        attention = model.decoder.layers[0].self_attention
+        q_up_weight = (
+            attention.linear_q_proj.weight
+            if q_lora_rank is None
+            else attention.linear_q_up_proj.weight
+        )
+        kv_up_weight = attention.linear_kv_up_proj.weight
+        assert optimizer is not None
+        assert q_up_weight.is_qkv
+        assert kv_up_weight.is_qkv
+        assert q_up_weight.qkv_split_shapes_global == [4, 2] * 2
+        assert kv_up_weight.qkv_split_shapes_global == [4, 3] * 2
+        if split_per_head:
+            assert q_up_weight.qkv_split_heads_are_complete
+            assert kv_up_weight.qkv_split_heads_are_complete
+        else:
+            assert q_up_weight.qkv_split_groups_are_complete
+            assert kv_up_weight.qkv_split_groups_are_complete
+        if q_lora_rank is not None:
+            assert not getattr(attention.linear_q_down_proj.weight, 'is_qkv', False)
+        assert not getattr(attention.linear_kv_down_proj.weight, 'is_qkv', False)
 
     def test_optimizer_factory_skips_mismatched_qkv_layout(self):
         """A QKV layout mismatch falls back to whole-matrix Muon orthogonalization."""
@@ -779,7 +848,7 @@ class TestMuonOptimizerMultiRankTP:
         expected = expected_global[tp_rank * 3 : (tp_rank + 1) * 3]
         torch.testing.assert_close(actual, expected)
 
-    @pytest.mark.parametrize("split_shapes", ([4, 2, 2], [4, 4, 2, 2]))
+    @pytest.mark.parametrize("split_shapes", ([4, 2, 2], [4, 4, 2, 2], [3, 5]))
     def test_muon_optimizer_projection_split_gathers_fragmented_query_group(self, split_shapes):
         """Projection splitting reconstructs a query group split over TP ranks."""
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
