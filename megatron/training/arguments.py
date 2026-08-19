@@ -2677,7 +2677,7 @@ def _add_regularization_args(parser):
 >>>>>>> 0b20d07f8 (Default muon ns_batch_size to 1 to keep bitwise parity out of the box)
     group.add_argument('--muon-use-syrk', action='store_true',
                        help='Use the Triton SYRK kernel for the symmetric-output '
-                       'Newton-Schulz GEMMs under --use-layer-sharding-muon (~1/3 off '
+                       'Newton-Schulz GEMMs in Muon (~1/3 off '
                        'NS FLOPs for near-square matrices). Requires '
                        '--muon-fp32-matmul-prec medium; auto-disabled when Triton/SM '
                        'requirements are unmet.')
