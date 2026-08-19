@@ -43,6 +43,18 @@ from megatron.core.inference.inference_request import (
     FinishedRequestRecord,
     Status,
 )
+from megatron.core.inference.messages import (
+    ENGINE_REPLY,
+    ENGINE_REPLY_PARTIAL,
+    KV_HANDOFF_COMPLETE,
+    SEND_KV,
+    SET_GENERATION_EPOCH,
+    SUBMIT_REQUEST,
+    SUBMIT_REQUEST_WITH_KV,
+    header_of,
+    pack_signal,
+    request_id_of,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     DecodeOnly,
@@ -167,19 +179,16 @@ def _engine_reply_frames(finished_requests: List[dict]) -> List[bytes]:
     Returns:
         The frames to send, metadata first.
     """
-    metadata = [
-        Headers.ENGINE_REPLY.value,
-        [
-            [
+    return ENGINE_REPLY.pack(
+        entries=[
+            (
                 request["request_id"],
                 bool((request.get("sampling_params") or {}).get("detokenize_generations")),
-            ]
+            )
             for request in finished_requests
         ],
-    ]
-    return [msgpack.packb(metadata, use_bin_type=True)] + [
-        msgpack.packb(request, use_bin_type=True) for request in finished_requests
-    ]
+        payloads=[msgpack.packb(request, use_bin_type=True) for request in finished_requests],
+    )
 
 
 def _get_decode_only_log_state(
@@ -2427,13 +2436,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         nvtx_range_push("coordinator_streaming")
         self.socket_for_receiving_requests.send_multipart(
-            [
-                msgpack.packb(
-                    [Headers.ENGINE_REPLY_PARTIAL.value, [p["request_id"] for p in partials]],
-                    use_bin_type=True,
-                )
-            ]
-            + [msgpack.packb(p, use_bin_type=True) for p in partials]
+            ENGINE_REPLY_PARTIAL.pack(
+                entries=[p["request_id"] for p in partials],
+                payloads=[msgpack.packb(p, use_bin_type=True) for p in partials],
+            )
         )
         nvtx_range_pop("coordinator_streaming")
 
@@ -2904,11 +2910,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Locally-generated notifications are single-frame messages, so they
             # are wrapped to match the frame-list shape of socket traffic.
             all_messages.extend(
-                [
-                    msgpack.packb(
-                        [Headers.KV_HANDOFF_COMPLETE.value, request_id, failed], use_bin_type=True
-                    )
-                ]
+                KV_HANDOFF_COMPLETE.pack(request_id=request_id, failed=failed)
                 for request_id, failed in self._drain_handoff_completion_notifications()
             )
             while True:
@@ -2934,40 +2936,47 @@ class DynamicInferenceEngine(AbstractEngine):
         # Control signals are queued for the second pass.
         new_generation_epoch = None
         for message in all_messages:
-            data = msgpack.unpackb(message[0], raw=False)
-            header = Headers(data[0])
+            metadata = msgpack.unpackb(message[0], raw=False)
+            header = header_of(metadata)
             if header == Headers.SUBMIT_REQUEST:
-                request_id, sampling_params = data[1:]
+                request = SUBMIT_REQUEST.parse(metadata, message[1:])
                 # The prompt rides in its own frame; the engine is its first
                 # consumer, so this is where it finally gets decoded.
-                prompt = msgpack.unpackb(message[1], raw=False)
-                sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request")
-                self.add_request(request_id, prompt, sampling_params)
+                self.add_request(
+                    request.request_id,
+                    msgpack.unpackb(request.prompt, raw=False),
+                    SamplingParams.deserialize(request.sampling_params),
+                )
                 nvtx_range_pop("add_request")
             elif header == Headers.SUBMIT_REQUEST_WITH_KV:
                 # Decode-side KV import. As on the plain path, the prompt rides
                 # in its own frame and the engine is its first consumer.
-                request_id, sampling_params, kv_meta = data[1:]
-                prompt = msgpack.unpackb(message[1], raw=False)
-                src_block_ids = msgpack.unpackb(message[2], raw=False)
-                sampling_params = SamplingParams.deserialize(sampling_params)
+                request = SUBMIT_REQUEST_WITH_KV.parse(metadata, message[1:])
                 nvtx_range_push("add_request_with_kv_handoff")
                 self.add_request_with_kv_handoff(
-                    request_id, prompt, sampling_params, kv_meta, src_block_ids
+                    request.request_id,
+                    msgpack.unpackb(request.prompt, raw=False),
+                    SamplingParams.deserialize(request.sampling_params),
+                    request.kv_meta,
+                    msgpack.unpackb(request.src_block_ids, raw=False),
                 )
                 nvtx_range_pop("add_request_with_kv_handoff")
             elif header == Headers.RELEASE_KV:
                 # Coordinator-broadcast release. Unknown request ids are no-ops.
-                self.release_handoff_blocks(int(data[1]))
+                self.release_handoff_blocks(request_id_of(metadata))
             elif header == Headers.SEND_KV:
                 # Push transport: send a pinned hand-off's KV to the decode
                 # instance the coordinator picked.
-                self.push_handoff_kv(int(data[1]), data[2])
+                send_kv = SEND_KV.parse(metadata, ())
+                self.push_handoff_kv(int(send_kv.request_id), send_kv.decode_metas)
             elif header == Headers.KV_HANDOFF_COMPLETE:
-                self._record_handoff_completion_notification(int(data[1]), bool(data[2]))
+                completion = KV_HANDOFF_COMPLETE.parse(metadata, ())
+                self._record_handoff_completion_notification(
+                    int(completion.request_id), bool(completion.failed)
+                )
             elif header == Headers.ABORT_REQUEST:
-                request_id = int(data[1])
+                request_id = request_id_of(metadata)
                 entry = self.requests.get(request_id)
                 if entry is not None:
                     request = entry.record[-1]
@@ -2983,7 +2992,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             + self.context.request_query_lengths[idx]
                         )
             elif header == Headers.SET_GENERATION_EPOCH:
-                new_generation_epoch = data[1]
+                new_generation_epoch = SET_GENERATION_EPOCH.parse(metadata, ()).generation_epoch
             elif header == Headers.START_CUDA_PROFILER:
                 # Side-effect, not a state transition: apply immediately on every
                 # rank so an outer nsys --capture-range=cudaProfilerApi starts here.
@@ -3019,8 +3028,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # processes one state transition per iteration).
         if self._pending_signals:
             message = self._pending_signals.popleft()
-            data = msgpack.unpackb(message[0], raw=False)
-            header = Headers(data[0])
+            metadata = msgpack.unpackb(message[0], raw=False)
+            header = header_of(metadata)
 
             if header == Headers.PAUSE:
                 if self.state == EngineState.RUNNING:
@@ -3074,7 +3083,7 @@ class DynamicInferenceEngine(AbstractEngine):
         sock = getattr(self, 'socket_for_receiving_requests', None)
         if sock is not None and not sock.closed:
             try:
-                sock.send(msgpack.packb([Headers.DISCONNECT.value], use_bin_type=True))
+                sock.send_multipart(pack_signal(Headers.DISCONNECT))
             except Exception:
                 pass
         for socket in getattr(self, 'zmq_sockets', []):

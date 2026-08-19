@@ -27,6 +27,17 @@ import logging
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.messages import (
+    CLIENT_REPLY,
+    CLIENT_REPLY_PARTIAL,
+    ENGINE_REPLY,
+    ENGINE_REPLY_PARTIAL,
+    SUBMIT_REQUEST,
+    SUBMIT_REQUEST_WITH_KV,
+    header_of,
+    pack_signal,
+    request_id_of,
+)
 
 from .state import CONTROL_TRANSITIONS, CoordinatorState
 
@@ -73,9 +84,7 @@ def handle_connect(coordinator, sender_identity, metadata, bodies):
         return
 
     coordinator.known_clients.add(sender_identity)
-    coordinator.router_socket.send_multipart(
-        [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
-    )
+    coordinator.router_socket.send_multipart([sender_identity, *pack_signal(Headers.CONNECT_ACK)])
 
 
 @message_handler(Headers.SUBMIT_REQUEST)
@@ -97,8 +106,8 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         logging.info(f"Received message from unknown client {sender_identity}. Ignoring.")
         return
 
-    _, client_request_id, sampling_params = metadata
-    prompt_frame = bodies[0]
+    request = SUBMIT_REQUEST.parse(metadata, bodies)
+    client_request_id = request.request_id
 
     # map client request_id to server request_id
     # necessary because multiple clients might have the same request_id.
@@ -109,8 +118,8 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Rebuilding the metadata frame is cheap: it holds no prompt tokens.
-    engine_metadata = msgpack.packb(
-        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params], use_bin_type=True
+    engine_frames = SUBMIT_REQUEST.pack(
+        request_id=request_id, sampling_params=request.sampling_params, prompt=request.prompt
     )
 
     # Only prefix-affinity routing consults the block hashes. When nothing will
@@ -123,7 +132,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         != PrefixCachingCoordinatorPolicy.LOAD_BALANCED
     ):
         request_hashes = coordinator.compute_request_hashes(
-            msgpack.unpackb(prompt_frame, raw=False)
+            msgpack.unpackb(request.prompt, raw=False)
         )
     else:
         request_hashes = []
@@ -137,7 +146,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     # Account for the fact that some engines may have died.
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
         next_identity = coordinator.get_best_data_parallel_rank(request_hashes)
-        if coordinator._send_to_engine(next_identity, [engine_metadata, prompt_frame]):
+        if coordinator._send_to_engine(next_identity, engine_frames):
             break
     else:
         # If all engines have died, we are in an abnormal state, and must exit cleanly.
@@ -193,7 +202,8 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
         )
         return
 
-    _, client_request_id, sampling_params, kv_meta = metadata
+    request = SUBMIT_REQUEST_WITH_KV.parse(metadata, bodies)
+    client_request_id = request.request_id
     request_id = coordinator.next_request_id
     coordinator.next_request_id += 1
     coordinator.request_id_to_client_id[request_id] = sender_identity
@@ -201,14 +211,17 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
     # Rebuilding the metadata frame is cheap: it holds no prompt tokens.
-    engine_metadata = msgpack.packb(
-        [Headers.SUBMIT_REQUEST_WITH_KV.value, request_id, sampling_params, kv_meta],
-        use_bin_type=True,
+    engine_frames = SUBMIT_REQUEST_WITH_KV.pack(
+        request_id=request_id,
+        sampling_params=request.sampling_params,
+        kv_meta=request.kv_meta,
+        prompt=request.prompt,
+        src_block_ids=request.src_block_ids,
     )
 
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
         next_identity = coordinator.get_least_loaded_data_parallel_rank()
-        if coordinator._send_to_engine(next_identity, [engine_metadata, *bodies]):
+        if coordinator._send_to_engine(next_identity, engine_frames):
             break
     else:
         logging.error("Coordinator: no reachable engines for handoff request %d", request_id)
@@ -235,7 +248,7 @@ def handle_release_kv(coordinator, sender_identity, metadata, bodies):
     if sender_identity not in coordinator.known_clients:
         logging.warning("Coordinator: ignoring RELEASE_KV from unknown client.")
         return
-    coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, int(metadata[1])])
+    coordinator._broadcast_to_engines([Headers.RELEASE_KV.value, request_id_of(metadata)])
 
 
 @message_handler(
@@ -261,7 +274,7 @@ def handle_control_signal(coordinator, sender_identity, metadata, bodies):
         logging.warning("Coordinator: ignoring signal from unknown client.")
         return
 
-    header = Headers(metadata[0])
+    header = header_of(metadata)
     transition = CONTROL_TRANSITIONS[header]
     if coordinator.state not in transition.allowed_from:
         # Silently ignore redundant signals; warn on genuinely invalid ones.
@@ -321,7 +334,9 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
         ), f"ENGINE_REPLY from never-connected sender {sender_identity!r}"
         logging.warning("Coordinator: ENGINE_REPLY from removed engine %r", sender_identity)
 
-    for (fid, needs_detokenize), body in zip(metadata[1], bodies):
+    for finished in ENGINE_REPLY.parse(metadata, bodies):
+        fid = finished.request_id
+        body = finished.reply
         client_identity = coordinator.request_id_to_client_id[fid]
         client_request_id = coordinator.request_id_to_client_request_id[fid]
         del coordinator.request_id_to_client_id[fid]
@@ -334,7 +349,7 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
                 assert coordinator._pending_counts[idx] >= 1
                 coordinator._pending_counts[idx] -= 1
 
-        if needs_detokenize:
+        if finished.needs_detokenize:
             # Detokenizing writes generated_text into the reply, so this one has
             # to be decoded and re-encoded. Clients that detokenize for
             # themselves (the OpenAI frontend does) never take this path.
@@ -342,10 +357,9 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
             coordinator.detokenize(finished_request)
             body = msgpack.packb(finished_request, use_bin_type=True)
 
-        reply_metadata = msgpack.packb(
-            [Headers.ENGINE_REPLY.value, client_request_id], use_bin_type=True
+        coordinator.router_socket.send_multipart(
+            [client_identity, *CLIENT_REPLY.pack(request_id=client_request_id, reply=body)]
         )
-        coordinator.router_socket.send_multipart([client_identity, reply_metadata, body])
 
 
 @message_handler(Headers.ENGINE_REPLY_PARTIAL)
@@ -367,18 +381,15 @@ def handle_engine_reply_partial(coordinator, sender_identity, metadata, bodies):
         ), f"ENGINE_REPLY_PARTIAL from never-connected sender {sender_identity!r}"
         logging.warning("Coordinator: ENGINE_REPLY_PARTIAL from removed engine %r", sender_identity)
         return
-    for request_id, body in zip(metadata[1], bodies):
-        client_identity = coordinator.request_id_to_client_id[request_id]
-        client_request_id = coordinator.request_id_to_client_request_id[request_id]
+    for partial in ENGINE_REPLY_PARTIAL.parse(metadata, bodies):
+        client_identity = coordinator.request_id_to_client_id[partial.request_id]
+        client_request_id = coordinator.request_id_to_client_request_id[partial.request_id]
         # Partial tokens are detokenized incrementally by the client-facing
         # streaming layer, so the body is always forwarded untouched.
         coordinator.router_socket.send_multipart(
             [
                 client_identity,
-                msgpack.packb(
-                    [Headers.ENGINE_REPLY_PARTIAL.value, client_request_id], use_bin_type=True
-                ),
-                body,
+                *CLIENT_REPLY_PARTIAL.pack(request_id=client_request_id, partial=partial.partial),
             ]
         )
 
@@ -396,16 +407,13 @@ def handle_abort_request(coordinator, sender_identity, metadata, bodies):
     if sender_identity not in coordinator.known_clients:
         logging.warning("Coordinator: ignoring abort from unknown client.")
         return
-    client_request_id = int(metadata[1])
+    client_request_id = request_id_of(metadata)
     request_id = coordinator.client_request_to_request_id.get((sender_identity, client_request_id))
     if request_id is None:
         return
     assigned_rank = coordinator.request_id_to_rank.get(request_id)
     if assigned_rank is not None:
-        coordinator._send_to_engine(
-            assigned_rank,
-            [msgpack.packb([Headers.ABORT_REQUEST.value, request_id], use_bin_type=True)],
-        )
+        coordinator._send_to_engine(assigned_rank, pack_signal(Headers.ABORT_REQUEST, request_id))
 
 
 @message_handler(Headers.SHUTDOWN)
