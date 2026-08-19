@@ -186,17 +186,33 @@ class InferenceSetupConfig:
 
     inference_dynamic_batching_prefix_caching_coordinator_policy: Literal[
         "longest_prefix", "first_prefix_block", "load_balanced"
-    ] = "load_balanced"
-    """Coordinator routing policy for prefix caching. "load_balanced" (default) routes to the rank
-    with the fewest in-flight requests, ignoring prefix affinity. "first_prefix_block" routes based
-    on the first block hash only. "longest_prefix" routes to the rank with the longest matching
-    prefix. "first_prefix_block" and "longest_prefix" both combine prefix affinity with load
-    balancing and fall back to load-balanced routing when prefix caching is disabled or no prefix
-    match exists."""
+    ] = "longest_prefix"
+    """Coordinator routing policy for prefix caching. Selects the affinity signal only; how that
+    signal is weighed against load is set by
+    --inference-dynamic-batching-prefix-caching-cost-policy. "longest_prefix" (default) routes to
+    the rank with the longest matching prefix. "first_prefix_block" routes based on the first block
+    hash only. "load_balanced" routes to the rank with the fewest in-flight requests, ignoring
+    prefix affinity. All fall back to load-balanced routing when prefix caching is disabled or no
+    prefix match exists."""
+
+    inference_dynamic_batching_prefix_caching_cost_policy: Literal[
+        "relative_load_weighted", "free_capacity_weighted"
+    ] = "relative_load_weighted"
+    """How prefix affinity is weighed against rank load. Applies to both "longest_prefix" and
+    "first_prefix_block". "relative_load_weighted" (default) scores
+    fraction - beta * (load - mean) / max(1, mean), so the load penalty vanishes while ranks are
+    balanced and only pulls toward idle ranks as the fleet diverges. "free_capacity_weighted"
+    scores alpha * fraction + (1 - alpha) * free_capacity, fixing the trade-off in absolute
+    terms."""
+
+    inference_dynamic_batching_prefix_caching_load_beta: float = 1.0
+    """Weight on the load penalty under the "relative_load_weighted" cost policy, in units of full
+    cache hits per 100% above mean load. 0 disables the penalty (pure affinity)."""
 
     inference_dynamic_batching_prefix_caching_routing_alpha: float = 0.5
-    """Weight for prefix-aware routing score: score = alpha * match + (1 - alpha) * normalized_load.
-    Higher alpha favors prefix cache hits; lower alpha favors load balance."""
+    """Weight for the "free_capacity_weighted" cost policy: score = alpha * match +
+    (1 - alpha) * normalized_load. Higher alpha favors prefix cache hits; lower alpha favors load
+    balance."""
 
     inference_dynamic_batching_prefix_caching_mamba_gb: float | None = None
     """GPU memory budget (in GB) for the Mamba state cache used by prefix caching on hybrid models.
@@ -297,6 +313,7 @@ class InferenceSetupConfig:
             KVCacheManagementMode,
             MambaInferenceStateConfig,
             PrefixCachingCoordinatorPolicy,
+            PrefixCachingCostPolicy,
             PrefixCachingEvictionPolicy,
         )
         from megatron.core.utils import get_attr_wrapped_model
@@ -370,6 +387,10 @@ class InferenceSetupConfig:
             prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(
                 self.inference_dynamic_batching_prefix_caching_coordinator_policy
             ),
+            prefix_caching_cost_policy=PrefixCachingCostPolicy(
+                self.inference_dynamic_batching_prefix_caching_cost_policy
+            ),
+            prefix_caching_load_beta=self.inference_dynamic_batching_prefix_caching_load_beta,
             prefix_caching_routing_alpha=self.inference_dynamic_batching_prefix_caching_routing_alpha,
             prefix_caching_mamba_gb=self.inference_dynamic_batching_prefix_caching_mamba_gb,
             metrics_writer=metrics_writer,

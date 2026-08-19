@@ -16,6 +16,7 @@ import torch
 
 from megatron.core.inference.config import (
     PrefixCachingCoordinatorPolicy,
+    PrefixCachingCostPolicy,
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.headers import Headers, UnknownHeaderError
@@ -100,9 +101,13 @@ class DataParallelInferenceCoordinator:
         block_size_tokens: int | None = None,
         enable_prefix_caching: bool = False,
         prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-            PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         ),
         prefix_caching_routing_alpha: float = 0.5,
+        prefix_caching_cost_policy: PrefixCachingCostPolicy = (
+            PrefixCachingCostPolicy.RELATIVE_LOAD_WEIGHTED
+        ),
+        prefix_caching_load_beta: float = 1.0,
         prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
             PrefixCachingEvictionPolicy.LRU
         ),
@@ -208,6 +213,8 @@ class DataParallelInferenceCoordinator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
         self.prefix_caching_routing_alpha = prefix_caching_routing_alpha
+        self.prefix_caching_cost_policy = prefix_caching_cost_policy
+        self.prefix_caching_load_beta = prefix_caching_load_beta
         self.max_requests = max_requests
         assert self.max_requests is not None and self.max_requests > 0
 
@@ -374,13 +381,14 @@ class DataParallelInferenceCoordinator:
         return compute_block_hashes_batched(token_tensor, self.block_size_tokens)
 
     def get_best_data_parallel_rank(self, request_hashes):
-        """Select the best DP rank based on prefix cache affinity and load.
+        """Select the best DP rank by trading prefix-cache affinity against load.
 
-        Uses a scoring function: score = alpha * match + (1 - alpha) * normalized_load
-        where *match* is a policy-dependent affinity score in [0, 1] (binary for
-        ``first_prefix_block``, normalized prefix depth for ``longest_prefix``)
-        and normalized_load = free_slots / max_requests (higher means more free
-        capacity).
+        Two independent choices. `prefix_caching_coordinator_policy` picks the
+        affinity signal -- a binary first-block hit for ``first_prefix_block``, the
+        contiguous prefix depth for ``longest_prefix`` -- and both are normalized to
+        the fraction of the request already cached on each rank. Then
+        `prefix_caching_cost_policy` picks how that fraction is weighed against rank
+        load; see `PrefixCachingCostPolicy`.
 
         Args:
             request_hashes: List of block hashes for the request.
@@ -396,39 +404,48 @@ class DataParallelInferenceCoordinator:
         if not self.enable_prefix_caching or not request_hashes:
             return self.get_least_loaded_data_parallel_rank()
 
-        if self.prefix_caching_coordinator_policy == PrefixCachingCoordinatorPolicy.LONGEST_PREFIX:
-            # Cost of sending here: the prefill this rank would still have to
-            # compute, scaled by how contended it is. Multiplicative rather than a
-            # weighted sum because prefill saved on a rank that cannot start it
-            # promptly is not saved.
-            #
-            # 1 + load, so an idle rank is charged for the prefill it would still
-            # have to do rather than scoring zero on any prefix. Reading it as
-            # queue position: this request is the (load + 1)-th on that rank, so
-            # the product approximates when its prefill would finish. Affinity
-            # therefore decides from the first request, including while every rank
-            # is idle.
+        n_ranks = len(self._identities_list)
+        n_blocks = len(request_hashes)
+
+        # Affinity signal, normalized to a fraction of the request in [0, 1].
+        # `recency` only separates ranks under the first-block signal, where many tie
+        # at the same binary match; it is zero for the depth signal.
+        if (
+            self.prefix_caching_coordinator_policy
+            == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+        ):
+            fraction, recency = self._match_vector(request_hashes)
+        else:
             depth = self._prefix_depth_vector(request_hashes)
-            remaining_blocks = np.maximum(0, len(request_hashes) - depth)
-            cost = remaining_blocks.astype(np.float64) * (1.0 + self._pending_counts)
-            # Tiebreak: lowest cost, then least loaded, then lowest rank index.
-            n_ranks = len(self._identities_list)
-            order = np.lexsort((np.arange(n_ranks), self._pending_counts, cost))
+            fraction = depth.astype(np.float64) / max(n_blocks, 1)
+            recency = np.zeros(n_ranks, dtype=np.float64)
+
+        if self.prefix_caching_cost_policy == PrefixCachingCostPolicy.FREE_CAPACITY_WEIGHTED:
+            # Weighted sum of affinity and free capacity, both in [0, 1]. alpha fixes
+            # the trade-off in absolute terms, irrespective of how loaded the fleet is.
+            alpha = self.prefix_caching_routing_alpha
+            free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(np.float64)
+            scores = alpha * fraction + (1.0 - alpha) * (free_slots / self.max_requests)
+            # Tiebreak: highest score, then highest recency, then lowest rank index.
+            order = np.lexsort((np.arange(n_ranks), -recency, -scores))
             return self._identities_list[int(order[0])]
 
-        match, recency = self._match_vector(request_hashes)
-
-        alpha = self.prefix_caching_routing_alpha
-
-        # Vectorized score: alpha * match + (1-alpha) * free_capacity_fraction.
-        free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(np.float64)
-        scores = alpha * match + (1.0 - alpha) * (free_slots / self.max_requests)
-
-        # Tiebreak: highest score, then highest recency, then lowest rank index.
-        n_ranks = len(self._identities_list)
-        order = np.lexsort((np.arange(n_ranks), -recency, -scores))
-        best_idx = int(order[0])
-        return self._identities_list[best_idx]
+        # RELATIVE_LOAD_WEIGHTED: score = fraction - beta * relative_load, highest wins.
+        #
+        # Approximates session stickiness without a session id: a multi-turn request
+        # lands back on the rank holding its history. Both terms are normalized, so
+        # beta is dimensionless, and relative_load is measured against the fleet mean
+        # so it vanishes while ranks are balanced -- at saturation this is pure
+        # affinity, and load only pulls toward idle ranks as the fleet diverges.
+        #
+        # The mean is floored at 1 so a near-idle fleet does not turn one in-flight
+        # request into a large relative load and thrash on noise.
+        mean_load = float(self._pending_counts.mean()) if n_ranks else 0.0
+        relative_load = (self._pending_counts - mean_load) / max(1.0, mean_load)
+        scores = fraction - self.prefix_caching_load_beta * relative_load
+        # Tiebreak: highest score, then least loaded, then lowest rank index.
+        order = np.lexsort((np.arange(n_ranks), self._pending_counts, -scores))
+        return self._identities_list[int(order[0])]
 
     def _update_rank_hashes(self, rank_identity, request_hashes):
         """Record that a rank owns the given hashes, and take a reference to them.
@@ -625,9 +642,13 @@ class DataParallelInferenceCoordinator:
         block_size_tokens: int | None = None,
         enable_prefix_caching: bool = False,
         prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-            PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         ),
         prefix_caching_routing_alpha: float = 0.5,
+        prefix_caching_cost_policy: PrefixCachingCostPolicy = (
+            PrefixCachingCostPolicy.RELATIVE_LOAD_WEIGHTED
+        ),
+        prefix_caching_load_beta: float = 1.0,
         prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
             PrefixCachingEvictionPolicy.LRU
         ),
@@ -666,6 +687,8 @@ class DataParallelInferenceCoordinator:
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
+            prefix_caching_cost_policy=prefix_caching_cost_policy,
+            prefix_caching_load_beta=prefix_caching_load_beta,
             prefix_caching_eviction_policy=prefix_caching_eviction_policy,
             prefix_cache_ttl_seconds=prefix_cache_ttl_seconds,
             schedule_output_path=schedule_output_path,

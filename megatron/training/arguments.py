@@ -2088,22 +2088,41 @@ def _add_inference_args(parser):
                        'free pool when ref_count hits 0. "lru" keeps blocks '
                        'cached and evicts via LRU only when space is needed.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
-                       type=str, default='load_balanced',
+                       type=str, default='longest_prefix',
                        choices=['longest_prefix', 'first_prefix_block', 'load_balanced'],
                        dest='inference_dynamic_batching_prefix_caching_coordinator_policy',
-                       help='Coordinator routing policy for prefix caching. '
-                       '"load_balanced" (default) routes to the rank with the fewest '
-                       'in-flight requests, ignoring prefix affinity. '
-                       '"first_prefix_block" routes based on the first block hash only. '
-                       '"longest_prefix" routes to the rank with the longest matching '
-                       'prefix. "first_prefix_block" and "longest_prefix" both combine '
-                       'prefix affinity with load balancing and fall back to '
-                       'load-balanced routing when prefix caching is disabled or no '
-                       'prefix match exists.')
+                       help='Coordinator affinity signal for prefix caching; how it is '
+                       'weighed against load is set by '
+                       '--inference-dynamic-batching-prefix-caching-cost-policy. '
+                       '"longest_prefix" (default) routes to the rank with the longest '
+                       'matching prefix. "first_prefix_block" routes based on the first '
+                       'block hash only. "load_balanced" routes to the rank with the '
+                       'fewest in-flight requests, ignoring prefix affinity. All fall '
+                       'back to load-balanced routing when prefix caching is disabled '
+                       'or no prefix match exists.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-cost-policy',
+                       type=str, default='relative_load_weighted',
+                       choices=['relative_load_weighted', 'free_capacity_weighted'],
+                       dest='inference_dynamic_batching_prefix_caching_cost_policy',
+                       help='How prefix affinity is weighed against rank load. Applies '
+                       'to both "longest_prefix" and "first_prefix_block". '
+                       '"relative_load_weighted" (default) scores '
+                       'fraction - beta * (load - mean) / max(1, mean), so the load '
+                       'penalty vanishes while ranks are balanced and only pulls toward '
+                       'idle ranks as the fleet diverges. "free_capacity_weighted" '
+                       'scores alpha * fraction + (1 - alpha) * free_capacity, fixing '
+                       'the trade-off in absolute terms.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-load-beta',
+                       type=float, default=1.0,
+                       dest='inference_dynamic_batching_prefix_caching_load_beta',
+                       help='Weight on the load penalty under the '
+                       '"relative_load_weighted" cost policy, in units of full cache '
+                       'hits per 100%% above mean load. 0 disables the penalty (pure '
+                       'affinity). Default: 1.0.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-routing-alpha',
                        type=float, default=0.5,
                        dest='inference_dynamic_batching_prefix_caching_routing_alpha',
-                       help='Weight for prefix-aware routing score: '
+                       help='Weight for the "free_capacity_weighted" cost policy: '
                        'score = alpha * match + (1 - alpha) * normalized_load. '
                        'Higher alpha favors prefix cache hits; lower alpha '
                        'favors load balance. Default: 0.5.')

@@ -114,6 +114,34 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
 
 
+class PrefixCachingCostPolicy(str, Enum):
+    """How the coordinator weighs prefix affinity against rank load.
+
+    Orthogonal to `PrefixCachingCoordinatorPolicy`, which only selects the affinity
+    signal. Both signals are normalized to the fraction of the request already cached
+    on a rank, in [0, 1], so either cost policy composes with either of
+    LONGEST_PREFIX and FIRST_PREFIX_BLOCK. Neither applies under LOAD_BALANCED, which
+    ignores affinity entirely.
+
+    RELATIVE_LOAD_WEIGHTED (default) — score = fraction - beta * relative_load, highest
+    wins, where relative_load is (load - mean) / max(1, mean). Approximates the session
+    stickiness a session-affinity router gets for free: a multi-turn request lands back
+    on the rank holding its history, with no session id to key on. Both terms are
+    normalized, so beta is dimensionless, and measuring load against the fleet mean
+    makes the penalty vanish while ranks are balanced -- at saturation this is pure
+    affinity, and load only pulls toward idle ranks as the fleet diverges. The mean is
+    floored at 1 so a near-idle fleet does not turn one in-flight request into a large
+    relative load and thrash on noise.
+
+    FREE_CAPACITY_WEIGHTED — score = alpha * fraction + (1 - alpha) * free_capacity, highest
+    wins, with alpha from `prefix_caching_routing_alpha`. Fixes the trade-off in
+    absolute terms rather than relative to how loaded the fleet actually is.
+    """
+
+    RELATIVE_LOAD_WEIGHTED = "relative_load_weighted"
+    FREE_CAPACITY_WEIGHTED = "free_capacity_weighted"
+
+
 def routes_on_prefix(policy) -> bool:
     """Whether `policy` needs per-request block hashes to make a routing decision.
 
@@ -338,7 +366,7 @@ class InferenceConfig:
     """
 
     prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-        PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
     )
     """Routing policy for the DP inference coordinator. See
     `PrefixCachingCoordinatorPolicy` for options.
@@ -356,10 +384,25 @@ class InferenceConfig:
     anyway; too short and it forgets blocks the engine still holds.
     """
 
+    prefix_caching_cost_policy: PrefixCachingCostPolicy = (
+        PrefixCachingCostPolicy.RELATIVE_LOAD_WEIGHTED
+    )
+    """How prefix affinity is weighed against rank load. See `PrefixCachingCostPolicy`.
+
+    Only applies when enable_prefix_caching is True and using a coordinator.
+    """
+
+    prefix_caching_load_beta: float = 1.0
+    """Weight on the load penalty under `PrefixCachingCostPolicy.RELATIVE_LOAD_WEIGHTED`,
+    in units of "full cache hits per 100% above mean load". 0 disables the penalty
+    (pure affinity); 1.0 means a rank at twice the fleet mean forfeits a whole
+    prompt's worth of cache credit.
+    """
+
     prefix_caching_routing_alpha: float = 0.5
     """Weight for prefix-aware scoring: score = alpha * match + (1 - alpha) * normalized_load.
     Higher alpha favors prefix cache hits; lower alpha favors load balance.
-    Must be in [0, 1]. Only applies when enable_prefix_caching is True and using a coordinator.
+    Must be in [0, 1]. Only applies under `PrefixCachingCostPolicy.FREE_CAPACITY_WEIGHTED`.
     """
 
     prefix_caching_mamba_gb: Optional[float] = None
