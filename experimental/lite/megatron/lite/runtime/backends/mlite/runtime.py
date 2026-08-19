@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import gc
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import fields as dc_fields
 from datetime import timedelta
 from itertools import chain
@@ -171,6 +171,14 @@ class MegatronLiteRuntime(RuntimeBase):
             if isinstance(cfg, MegatronLiteConfig)
             else MegatronLiteConfig.from_dict(hf_path, cfg)
         )
+        plugins = self._cfg.impl_cfg.get("runtime_plugins", {})
+        if not isinstance(plugins, Mapping):
+            raise TypeError("impl_cfg.runtime_plugins must be a mapping.")
+        dynamic_cp = plugins.get("dynamic_context_parallel")
+        if dynamic_cp:
+            from megatron.lite.runtime.backends.mlite.dynamic_cp import install
+
+            install(self, dynamic_cp)
 
     # ── build_model ──
 

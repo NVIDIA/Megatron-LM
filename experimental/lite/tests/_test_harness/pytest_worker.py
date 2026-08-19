@@ -96,7 +96,9 @@ def main(argv: list[str] | None = None) -> int:
 
     import pytest
 
-    recorder = OutcomeRecorder(allow_skips=os.environ.get("MLITE_TEST_ALLOW_SKIPS") == "1")
+    recorder = OutcomeRecorder(
+        allow_skips=os.environ.get("MLITE_TEST_ALLOW_SKIPS") == "1"
+    )
     exit_code = int(pytest.main(args, plugins=[recorder]))
     report = recorder.as_dict(exit_code)
     _write_report(report)

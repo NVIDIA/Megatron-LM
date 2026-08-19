@@ -55,6 +55,11 @@ bash experimental/lite/examples/verl/scripts/run_qwen3moe_sft.sh
 Useful knobs:
 
 - `TP_SIZE`, `PP_SIZE`, `VPP_SIZE`, `CP_SIZE`, `EP_SIZE`, `ETP_SIZE`
+- `DYNAMIC_CONTEXT_PARALLEL=True`, `MAX_SEQLEN_PER_DP_CP_RANK`, and
+  `MIN_DYNAMIC_CONTEXT_PARALLEL_SIZE` enable runtime-owned dynamic CP scheduling.
+  The SFT launcher sets `REQUIRE_FULL_CP_SIZE_COVERAGE=True` by default so an
+  acceptance run fails unless every feasible CP size is scheduled; set it to
+  `False` only for a workload that intentionally cannot cover the full range.
 - `TOTAL_STEPS`, `TOTAL_EPOCHS`, `TRAIN_BATCH_SIZE`, `MICRO_BATCH_SIZE`
 - `MAX_TOKENS_PER_GPU`, `MAX_LENGTH`, `MESSAGES_KEY`
 - `PARAM_OFFLOAD`, `OPTIMIZER_OFFLOAD`, `GRAD_OFFLOAD`
@@ -77,6 +82,38 @@ TRAIN_FILES=/path/to/train.parquet \
 DRY_RUN=1 \
 bash experimental/lite/examples/verl/scripts/run_qwen3moe_sft.sh
 ```
+
+Dynamic CP keeps the same VERL engine API and is an explicitly enabled MLite
+runtime plugin. It is disabled by default; enabling it also requires
+`MAX_SEQLEN_PER_DP_CP_RANK`:
+
+```bash
+MODEL_PATH=/path/to/qwen3.5-35b-a3b-hf \
+TRAIN_FILES=/path/to/train.parquet \
+NUM_GPUS=4 TP_SIZE=1 CP_SIZE=1 EP_SIZE=1 \
+DYNAMIC_CONTEXT_PARALLEL=True \
+MAX_SEQLEN_PER_DP_CP_RANK=4096 \
+REQUIRE_FULL_CP_SIZE_COVERAGE=True \
+bash experimental/lite/examples/verl/scripts/run_qwen3moe_sft.sh
+```
+
+Dynamic CP uses the physical DP×CP pool to normalize the training loss, while
+VERL's `batch_num_tokens` and loss logging retain their logical-DP view.  Do
+not compare those telemetry values as though they were the training-loss
+normalization denominator.
+
+Ordinary pipeline parallelism and R2/R3 router replay are supported. Virtual
+pipeline parallelism remains unsupported and fails loudly. R2/R3 also require
+`moe_router_fusion=False`, because the fused router path bypasses the replay
+hook; this restriction does not apply when router replay is disabled.
+
+Dynamic CP is not unconditionally faster. Its benefit depends on a sequence
+length distribution that lets the scheduler use smaller CP groups for enough
+microbatches while keeping all DP×CP ranks busy. Decide with an A/B run that
+keeps the checkpoint, samples, token budget, and parallel topology fixed; after
+warm-up, compare both processed tokens per second and the emitted
+`cp_size_histogram`. Leave it disabled when the histogram stays concentrated at
+the full static CP size or throughput does not improve.
 
 By default, logs, command snapshots, JSONL logger output, and checkpoints are
 written under `experimental/lite/examples/verl/outputs/qwen3moe_sft`. Override
@@ -162,6 +199,31 @@ so the MLite actor is wired up correctly without any extra worker-path knob.
 By default, GSM8K GRPO artifacts are written under
 `experimental/lite/examples/verl/outputs/qwen35_gsm8k_grpo`.
 
+### MXFP4 QAT four-arm launch
+
+For the complete `QATSpec` field reference, supported-format table,
+optimizer/checkpoint ordering contract, packed snapshot layout, and an
+end-to-end MXFP4 QAT launch recipe, see [QAT.md](QAT.md).
+
+Run the generalized four-arm Qwen3-MoE recipe with:
+
+```bash
+MODEL_PATH=Qwen/Qwen3-30B-A3B \
+TRAIN_FILES=/path/to/dapo-math-17k.parquet \
+VAL_FILES=/path/to/aime-2024.parquet \
+MXFP4_QUANTIZATION_CONFIG=/path/to/mxfp4_w4a16.json \
+bash experimental/lite/examples/verl/scripts/run_qwen3moe_mxfp4_qat.sh \
+  --mode qat_on
+```
+
+Modes are `baseline`, `qat_off`, `qat_on`, and `r3`. The `qat_off` and
+`qat_on` arms deliberately keep rollout MXFP4 identical and change only
+training-side `impl_cfg.qat.enabled`. This recipe uses vLLM
+compressed-tensors plus `verl.utils.qat.vllm_patch`, with paired
+`actor.engine.qat` export and `rollout.qat` configuration. See
+[QAT.md](QAT.md) for the exact arm semantics, validation scope, safe
+exclusions, and required MXFP4 JSON schema.
+
 ## Smoke / Dry-Run Checks
 
 Checked on this branch on 2026-06-07. These checks cover shell syntax,
@@ -172,6 +234,7 @@ cover end-to-end SFT or GRPO training.
   - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_sft.sh`
   - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_gsm8k_sft.sh`
   - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_gsm8k_grpo.sh`
+  - `bash -n experimental/lite/examples/verl/scripts/run_qwen3moe_mxfp4_qat.sh`
 - Python import compilation:
   - `PYTHONPYCACHEPREFIX="$(mktemp -d)" python3 -m compileall -q experimental/lite/examples/verl/verl_mlite`
 - GSM8K SFT dry run:

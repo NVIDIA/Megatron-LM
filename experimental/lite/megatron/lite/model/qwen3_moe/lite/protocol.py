@@ -30,6 +30,7 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     pack_thd_forward_kwargs,
+    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
@@ -46,6 +47,11 @@ from megatron.lite.primitive.modules.lora import (
     trainable_param_stats,
 )
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
+from megatron.lite.primitive.quantization import (
+    QATSpec,
+    apply_qat_to_chunks,
+    normalize_qat_spec,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
@@ -89,6 +95,8 @@ class ImplConfig:
     mtp_use_repeated_layer: bool | None = None
     deterministic: bool = True
     lora: LoraConfig | dict | None = None
+    # Weight-only QAT: float fp8_e4m3 / mxfp4 or int8 / int4. Default None = disabled.
+    qat: QATSpec | dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +228,10 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             freeze_stats = freeze_non_lora_params(chunk)
             trainable_stats = trainable_param_stats(chunk)
             lora_stats["chunks"].append({**freeze_stats, **trainable_stats})
+
+    # Weight-only QAT (fake-quant/STE on the BF16 master, including MoE experts).
+    # Must run before optimizer construction so dist_opt captures weight.original.
+    apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
 
     # ── optimizer (model chooses which primitive) ──
     optimizer = None
