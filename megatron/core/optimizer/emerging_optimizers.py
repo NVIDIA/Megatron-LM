@@ -459,10 +459,12 @@ def _initialize_muon_ht_parameters(param_groups: list[dict], kwargs: Dict[str, A
 class TensorParallelMuonHT(TensorParallelMuon):
     """Tensor-parallel Muon with Hyperball-style weight and update normalization.
 
-    For every matrix parameter, the update is normalized to a configured Frobenius norm
-    before it is applied, and the updated parameter is projected back to that same radius
-    afterward. When a parameter is sharded, both norms are computed across all of its
-    tensor-parallel and GTP-remat shards.
+    Applies ``W_next = R * normalize(W - lr * R * normalize(update))`` through
+    Emerging Optimizers' pre- and post-weight-update extension points. The factory
+    initializes every Muon-managed matrix to the configured radius ``R`` before creating
+    mixed-precision copies. FP32 norm sums are reduced only across applicable TP,
+    expert-TP, and GTP-remat shard groups. The fixed radius remains configuration rather
+    than per-parameter optimizer state, avoiding scalar distributed-checkpoint entries.
 
     Args:
         params: Iterable of parameters to optimize or dicts defining parameter groups.
