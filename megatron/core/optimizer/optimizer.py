@@ -233,21 +233,26 @@ class MegatronOptimizer(ABC):
 
         Does not zero any shared buffer and does not all-gather; both are the caller's
         responsibility so that optimizers sharing a DDP model chunk can be staged together.
-        See :meth:`refresh_model_params_from_main_params`.
+        See :meth:`quantize_and_sync_model_params_from_main_params`.
         """
         return
 
     @torch.no_grad()
-    def refresh_model_params_from_main_params(self) -> None:
-        """Re-derive the model params from the FP32 main params.
+    def quantize_and_sync_model_params_from_main_params(self) -> None:
+        """Re-derive the model params from the main params, then all-gather them.
 
-        This is the same main-to-model copy the optimizer performs at the end of every step,
-        exposed so it can be run after the main params are restored from a checkpoint.
+        Runs the same main-to-model copy an optimizer step performs, quantizing where the
+        model params are quantized, and follows it with a *synchronous* param all-gather.
+        Exposed so it can be run after the main params are restored from a checkpoint.
+
+        Not for use inside the training loop: the all-gather is forced synchronous and would
+        defeat the overlapped param gather. The training loop reaches the same copy through
+        :meth:`step_with_ready_grads`.
 
         Quantized model params (MXFP8, NVFP4) are stored dequantized and carry no block
         scales, so loading them re-quantizes a value that has already been through one
         quantization round trip, which need not land on the same block scales the saving job
-        chose from its FP32 masters. Re-deriving the model params from those masters
+        chose from its main params. Re-deriving the model params from those masters
         reproduces the saved weights exactly.
         """
         self._stage_model_params_from_main_params()
@@ -1613,8 +1618,8 @@ class ChainedOptimizer(MegatronOptimizer):
 
     @override
     @torch.no_grad()
-    def refresh_model_params_from_main_params(self) -> None:
-        """Re-derive the model params from the FP32 main params (see MegatronOptimizer)."""
+    def quantize_and_sync_model_params_from_main_params(self) -> None:
+        """Re-derive and all-gather the model params (see MegatronOptimizer)."""
         model_chunks = self._unique_model_chunks()
         if self.config.reuse_grad_buf_for_mxfp8_param_ag:
             # The param buffer aliases the grad buffer and is shared by every chained

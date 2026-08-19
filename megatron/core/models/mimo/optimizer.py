@@ -129,10 +129,10 @@ class MimoOptimizer(MegatronOptimizer):
         for opt in self._active_optimizers:
             opt.prepare_model_params_for_param_sync()
 
-    def refresh_model_params_from_main_params(self) -> None:
+    def quantize_and_sync_model_params_from_main_params(self) -> None:
         """Re-derive model params from main params in all active module optimizers."""
         for opt in self._active_optimizers:
-            opt.refresh_model_params_from_main_params()
+            opt.quantize_and_sync_model_params_from_main_params()
 
     def get_loss_scale(self) -> torch.Tensor:
         """Return the loss scale tensor from the first active optimizer."""

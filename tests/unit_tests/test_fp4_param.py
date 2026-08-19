@@ -493,7 +493,9 @@ class TestFP4Param:
     @pytest.mark.skipif(not is_nvfp4_available, reason=reason_for_no_nvfp4)
     @pytest.mark.skipif(not is_te_min_version("2.7.0.dev0"), reason="TE 2.7.0.dev0 is required")
     @pytest.mark.parametrize("tp_size", [2])
-    def test_nvfp4_checkpoint_resume_is_bitwise_exact(self, tmp_path_dist_ckpt, tp_size):
+    def test_nvfp4_checkpoint_resume_is_bitwise_exact(
+        self, tmp_path_dist_ckpt, monkeypatch, tp_size
+    ):
         """A resumed run must hold exactly the NVFP4 weights the saving run held.
 
         NVFP4 is block-scaled like MXFP8: an E4M3 scale per 16-element block on top of a
@@ -503,6 +505,9 @@ class TestFP4Param:
         costs MXFP8 its block scales; NVFP4 is measured to survive it today, so this is a
         regression guard rather than a reproduction of a known break.
         """
+        # TE refuses to load a pickled extra state by default. This checkpoint is created
+        # by the test and is therefore trusted.
+        monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
         kwargs = {"overlap_param_gather": True, "overlap_grad_reduce": True}
         # TempNamedDir(sync=True) barriers, so the process group has to exist first.
         Utils.initialize_distributed()

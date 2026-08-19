@@ -727,7 +727,7 @@ class TestFP8Param:
         ("recipe", "reuse_grad_buf"), [("mxfp8", True), ("tensorwise", False), ("delayed", False)]
     )
     def test_fp8_param_checkpoint_resume_is_bitwise_exact(
-        self, tmp_path_dist_ckpt, tp_size, recipe, reuse_grad_buf
+        self, tmp_path_dist_ckpt, monkeypatch, tp_size, recipe, reuse_grad_buf
     ):
         """A resumed run must hold exactly the quantized weights the saving run held.
 
@@ -743,6 +743,10 @@ class TestFP8Param:
         """
         if recipe == "mxfp8" and get_device_arch_version() < 10:
             pytest.skip("MXFP8 is supported since Blackwell architecture")
+        # Delayed scaling stores its FP8 metadata as a pickled TE extra state, which TE
+        # refuses to load by default. This checkpoint is created by the test and is
+        # therefore trusted.
+        monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
         kwargs = {
             "overlap_param_gather": True,
             "overlap_grad_reduce": True,

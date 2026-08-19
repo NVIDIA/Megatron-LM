@@ -2998,21 +2998,20 @@ def load_checkpoint(
             )
             raise e
 
-        # Quantized params are stored dequantized to BF16 and carry no block scales, so
-        # loading them re-quantizes -- from a value that has already been through one
-        # quantization round trip, whereas a training step quantizes the FP32 master. Same
-        # quantizer, same blocks, different input: for MXFP8 that moves the block scale of
-        # roughly 5% of 32-element blocks one E8M0 exponent finer (never coarser, since a
-        # round trip can only lower a block's amax, which is capped at 448*scale), and every
-        # element in those blocks re-encodes. Re-derive the params from the FP32 masters that
-        # were just restored, so the resumed weights are bit-wise the weights that were saved.
+        # Quantized weights are stored dequantized to BF16 with no block scales, so loading
+        # them re-quantizes a value that has already been through one quantization round
+        # trip, while a training step quantizes the main weights. Same quantizer, different
+        # input, so for MXFP8 the block scales do not come back the same. Recover the compute
+        # weights from the main weights in the optimizer state instead. Reaching here already
+        # implies they were loaded: the enclosing block excludes --no-load-optim, --finetune
+        # and release checkpoints, and the load above re-raises on failure.
         if (
             not skip_load_to_model_and_opt
             and optimizer is not None
             and not optimizer.is_stub_optimizer
             and (args.fp8_param_gather or args.fp4_param_gather)
         ):
-            optimizer.refresh_model_params_from_main_params()
+            optimizer.quantize_and_sync_model_params_from_main_params()
     else:
         if (args.fp16 or args.bf16) and optimizer is not None:
             if args.load_main_params_from_ckpt:
