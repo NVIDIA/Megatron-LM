@@ -29,11 +29,15 @@ def _specs(args):
     return parse_inference_shards_spec(args.inference_shards, args.world_size)
 
 
-@functools.lru_cache(maxsize=None)
 def disagg_refit_pools(inference_shards, world_size: int, rank: int = None) -> tuple[int, int]:
     """Return the refit pool count and this rank's pool index."""
     if rank is None:
         rank = dist.get_rank()
+    return _disagg_refit_pools(inference_shards, world_size, rank)
+
+
+@functools.lru_cache(maxsize=32)
+def _disagg_refit_pools(inference_shards, world_size: int, rank: int) -> tuple[int, int]:
     if not (inference_shards and spec_declares_disaggregation(inference_shards)):
         return 1, 0
     specs = parse_inference_shards_spec(inference_shards, world_size)

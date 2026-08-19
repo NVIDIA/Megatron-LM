@@ -4,10 +4,12 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import msgpack
 import pytest
 
 pytest.importorskip("dynamo")
 
+from megatron.core.inference.headers import Headers
 from megatron.inference.integrations.dynamo.args import Config
 from megatron.inference.integrations.dynamo.llm_engine import (
     MegatronLLMEngine,
@@ -47,6 +49,18 @@ def test_sampling_params_maps_greedy_and_limits():
     assert params.top_k == 1
     assert params.top_p == 0.0
     assert params.num_tokens_to_generate == 7
+
+    prompt_logprobs = build_sampling_params(
+        {"token_ids": [1], "output_options": {"prompt_logprobs": 5}}
+    )
+    assert prompt_logprobs.return_log_probs
+    assert prompt_logprobs.top_n_logprobs == 5
+    assert not prompt_logprobs.skip_prompt_log_probs
+
+    with pytest.raises(ValueError, match="same count"):
+        build_sampling_params(
+            {"token_ids": [1], "output_options": {"logprobs": 1, "prompt_logprobs": 5}}
+        )
 
 
 @pytest.mark.asyncio
@@ -200,3 +214,27 @@ async def test_abort_uses_megatron_request_id_recorded_for_context():
 
     assert aborted == [77]
     assert forgotten == [77]
+
+
+@pytest.mark.asyncio
+async def test_release_handoff_reuses_async_socket():
+    engine = MegatronLLMEngine(_config("decode"))
+    release = {"coordinator_addr": "tcp://prefill:5000", "request_id": 7}
+    socket = SimpleNamespace(
+        setsockopt=MagicMock(),
+        connect=MagicMock(),
+        send=AsyncMock(),
+        recv=AsyncMock(return_value=msgpack.packb([Headers.CONNECT_ACK.value])),
+        close=MagicMock(),
+    )
+    context = SimpleNamespace(socket=MagicMock(return_value=socket), term=MagicMock())
+    engine._release_context = context
+
+    assert await engine._release_handoff_from_meta_async(release)
+    release["request_id"] = 8
+    assert await engine._release_handoff_from_meta_async(release)
+    await engine.cleanup()
+
+    context.socket.assert_called_once()
+    assert socket.send.await_count == 3
+    socket.close.assert_called_once_with(linger=0)

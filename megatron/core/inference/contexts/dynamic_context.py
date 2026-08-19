@@ -572,6 +572,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             and model_config.expert_model_parallel_size > 1
         )
         reserved_mamba_slots = int(self.reserve_recurrent_state_dummy_slot)
+        reserved_mamba_bytes = reserved_mamba_slots * mamba_states_memory_per_request
 
         if (mamba_memory_ratio := inference_config.mamba_memory_ratio) is not None:
             assert self.is_hybrid_model
@@ -596,10 +597,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             # mamba memory for max_requests, and give the rest to KV cache blocks.
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
             mamba_memory_needed = (
-                inference_config.max_requests + reserved_mamba_slots
-            ) * mamba_states_memory_per_request
+                inference_config.max_requests * mamba_states_memory_per_request
+                + reserved_mamba_bytes
+            )
             assert mamba_memory_needed < total_memory, (
-                f"Not enough memory for {inference_config.max_requests} mamba requests. "
+                f"Not enough memory for {inference_config.max_requests} mamba requests "
+                f"plus {reserved_mamba_slots} reserved EP dummy slot(s). "
                 f"Need {mamba_memory_needed / 1024**3:.2f} GB for recurrent states, "
                 f"but total buffer is {total_memory / 1024**3:.2f} GB."
             )
@@ -614,8 +617,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_count = max(2, block_count)  # need >= 1 usable block + 1 dummy block
             paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
         else:
-            if self.is_hybrid_model and self.reserve_recurrent_state_dummy_slot:
-                buffer_size_bytes -= mamba_states_memory_per_request
+            if reserved_mamba_bytes:
+                buffer_size_bytes -= reserved_mamba_bytes
                 assert (
                     buffer_size_bytes > 0
                 ), "Not enough buffer memory for the reserved Mamba EP dummy state slot."
@@ -2320,7 +2323,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # 5. Use the reserved slot when live request slots may remain pinned by handoff.
             if self.mamba_metadata.dummy_state_idx is not None:
-                assert N == 1
+                assert N == 1, "The reserved recurrent-state dummy slot supports one request"
                 self.mamba_metadata.request_to_mamba_state_idx[0] = (
                     self.mamba_metadata.dummy_state_idx
                 )

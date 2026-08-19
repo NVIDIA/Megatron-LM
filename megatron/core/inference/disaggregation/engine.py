@@ -22,6 +22,7 @@ class DisaggDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceE
         role,
         identity,
         spawn_coordinator,
+        coordinator_group,
         disagg_router="round_robin",
         kv_transport_backend="nixl",
     ) -> None:
@@ -35,6 +36,7 @@ class DisaggDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceE
             "spawn_coordinator": spawn_coordinator,
             "disagg_router": disagg_router,
             "kv_transport_backend": kv_transport_backend,
+            "coordinator_group": coordinator_group,
         }
         self.setup_kv_transfer(role, backend=kv_transport_backend)
         self._instance_transfer_meta = self._build_instance_transfer_meta()
@@ -49,6 +51,7 @@ class DisaggDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceE
             kv_rank_metas = kv_stage if isinstance(kv_stage, list) else [kv_stage]
             for tp_index, kv_meta in enumerate(kv_rank_metas):
                 rank_meta = dict(kv_meta)
+                rank_meta["request_capacity"] = self.context.max_requests
                 rank_ssm_meta = {}
                 for state_kind, state_metas in ssm_stage.items():
                     if isinstance(state_metas, list):

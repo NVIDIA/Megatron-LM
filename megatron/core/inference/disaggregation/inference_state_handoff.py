@@ -425,6 +425,12 @@ class InferenceStateHandoffMixin:
             )
             return
 
+        if not 0 <= cached_prefix_blocks <= len(block_ids):
+            raise ValueError(
+                f"Invalid cached prefix length {cached_prefix_blocks} for "
+                f"{len(block_ids)} handoff blocks"
+            )
+
         ssm_pushes = []
         if self._ssm_transfer_agents:
             slot = self._pinned_handoff_ssm_slots.get(request_id)
@@ -439,11 +445,6 @@ class InferenceStateHandoffMixin:
                     ) from error
                 ssm_pushes.append((self._ssm_transfer_agents[state_kind], peer_metas, [slot]))
 
-        if not 0 <= cached_prefix_blocks <= len(block_ids):
-            raise ValueError(
-                f"Invalid cached prefix length {cached_prefix_blocks} for "
-                f"{len(block_ids)} handoff blocks"
-            )
         kv_peer = {"tp_metas": list(decode_metas)}
         handles = [
             self._kv_transfer_agent.begin_push_blocks(kv_peer, block_ids[cached_prefix_blocks:])
@@ -791,6 +792,9 @@ class InferenceStateHandoffMixin:
         expected_blocks = (
             len(prompt) + self.context.block_size_tokens - 1
         ) // self.context.block_size_tokens
+        # Hashes cover complete blocks; the transfer also includes a partial tail.
+        if not len(hashes) <= expected_blocks <= len(hashes) + 1:
+            raise RuntimeError("Prompt hash and transfer block counts are inconsistent")
         if num_blocks != expected_blocks:
             raise RuntimeError(
                 "Decode-only handoff requires every prompt KV block, including the partial tail: "

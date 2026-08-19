@@ -45,7 +45,6 @@ faulthandler.register(signal.SIGINT, all_threads=False, chain=True)
 
 
 class DataParallelInferenceCoordinator:
-    disagg = None
     """
     Coordinates inference requests between clients and distributed model engines.
 
@@ -83,6 +82,8 @@ class DataParallelInferenceCoordinator:
         next_request_id (int): A counter for generating unique server-side request IDs.
     """
 
+    disagg: DisaggCoordinatorRuntime | None = None
+
     # Exposed as a class attribute for backwards compatibility; the canonical
     # definition lives in state.py.
     CoordinatorState = CoordinatorState
@@ -105,7 +106,6 @@ class DataParallelInferenceCoordinator:
         hostname: str | None = None,
         disaggregated: bool = False,
         disagg_router: str = "round_robin",
-        disagg_max_outstanding: int = 32,
     ):
         """
         Initializes the inference coordinator.
@@ -234,11 +234,7 @@ class DataParallelInferenceCoordinator:
 
         # Header -> handler dispatch table, sourced from the handler registry.
         self._handlers = dict(HANDLERS)
-        self.disagg = (
-            DisaggCoordinatorRuntime(self, disagg_router, disagg_max_outstanding)
-            if disaggregated
-            else None
-        )
+        self.disagg = DisaggCoordinatorRuntime(self, disagg_router) if disaggregated else None
 
     def get_least_loaded_data_parallel_rank(self):
         """
@@ -507,7 +503,6 @@ class DataParallelInferenceCoordinator:
         hostname: str | None = None,
         disaggregated: bool = False,
         disagg_router: str = "round_robin",
-        disagg_max_outstanding: int = 32,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -544,7 +539,6 @@ class DataParallelInferenceCoordinator:
             hostname=hostname,
             disaggregated=disaggregated,
             disagg_router=disagg_router,
-            disagg_max_outstanding=disagg_max_outstanding,
         )
         ready_event.set()
         try:

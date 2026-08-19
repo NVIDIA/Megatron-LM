@@ -185,8 +185,8 @@ class InferenceShard:
     spec: InferenceShardSpec
     rank_offset: int
     world_size: int
-    pg_collection: Optional[ProcessGroupCollection]
-    process_group: Optional[dist.ProcessGroup]
+    pg_collection: Optional[ProcessGroupCollection] = None
+    process_group: Optional[dist.ProcessGroup] = None
 
 
 def build_inference_pg_collections_for_shards(

@@ -8,8 +8,6 @@ from megatron.core.dist_checkpointing.validation import determine_global_metadat
 
 
 def test_determine_global_metadata_uses_explicit_process_group(monkeypatch):
-    """Replica-local validation must not gather metadata from sibling replicas."""
-
     process_group = Mock()
     metadata = Mock()
     shard = Mock()

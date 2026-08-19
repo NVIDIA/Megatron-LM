@@ -165,4 +165,8 @@ async def test_terminal_error_and_abort_acknowledgement():
     recv_queue.append(msgpack.packb([Headers.REQUEST_ABORTED.value, 1, True]))
     assert await asyncio.wait_for(abort_ack, timeout=2.0)
 
+    recv_queue.append(msgpack.packb([Headers.ENGINE_REPLY.value, 1, {}], use_bin_type=True))
+    await asyncio.sleep(0.01)
+    assert not client.listener_task.done()
+
     client.stop()

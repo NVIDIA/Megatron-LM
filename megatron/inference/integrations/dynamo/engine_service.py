@@ -14,11 +14,7 @@ from megatron.inference.integrations.dynamo.args import add_engine_service_args
 from megatron.inference.integrations.dynamo.dynamic_engine import DynamoDynamicInferenceEngine
 from megatron.inference.integrations.dynamo.protocol import engine_metadata
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReporter
-from megatron.inference.utils import (
-    add_inference_args,
-    get_dynamic_inference_engine,
-    serve_dynamic_inference_engine,
-)
+from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
@@ -68,12 +64,13 @@ async def _serve() -> None:
         )
 
     try:
-        await serve_dynamic_inference_engine(
-            engine,
-            coordinator_host=args.coordinator_host,
-            coordinator_port=args.coordinator_port,
-            on_ready=ready,
+        address = await engine.start_listening_to_data_parallel_coordinator(
+            inference_coordinator_port=args.coordinator_port,
+            hostname=args.coordinator_host,
         )
+        if dist.get_rank() == 0:
+            ready(address)
+        await engine.engine_loop_task
     finally:
         reporter.stop()
 

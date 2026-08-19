@@ -14,8 +14,6 @@ class QueuedPrefillRequest:
     """Prefill request waiting for SSM state capacity."""
 
     request_id: int
-    prompt: Any
-    sampling_params: Any
     slot_cost: int
 
 
@@ -33,13 +31,39 @@ class DisaggStateFlowControl:
 
     def __init__(self) -> None:
         self._capacity: Dict[Any, int] = {}
+        self._request_capacity: Dict[Any, int] = {}
         self._prefill_slot_cost: Dict[Any, int] = {}
         self._prefill_usage: Dict[Any, int] = {}
+        self._prefill_counts: Dict[Any, int] = {}
         self._prefill_reservations: Dict[int, Tuple[Any, int]] = {}
         self._prefill_queues: Dict[Any, Deque[QueuedPrefillRequest]] = {}
         self._decode_usage: Dict[Any, int] = {}
+        self._decode_counts: Dict[Any, int] = {}
         self._decode_reservations: Dict[int, Tuple[Any, int]] = {}
         self._decode_queues: Dict[Any, Deque[QueuedDecodeHandoff]] = {}
+
+    @staticmethod
+    def _request_capacity_from_instance_meta(instance_meta) -> int:
+        """Return the conservative request capacity across model-parallel ranks."""
+
+        entries = (
+            [entry for entry in instance_meta if isinstance(entry, dict)]
+            if isinstance(instance_meta, list)
+            else []
+        )
+        capacities = [
+            int(entry["request_capacity"])
+            for entry in entries
+            if entry.get("request_capacity") is not None
+        ]
+        if not capacities or len(capacities) != len(entries):
+            raise ValueError(
+                "Request capacity is missing from part of an engine's model-parallel metadata"
+            )
+        capacity = min(capacities)
+        if capacity < 1:
+            raise ValueError(f"Request capacity must be positive, got {capacity}")
+        return capacity
 
     @staticmethod
     def _capacity_from_instance_meta(instance_meta) -> Optional[int]:
@@ -49,13 +73,13 @@ class DisaggStateFlowControl:
             return None
         entries = [entry for entry in instance_meta if isinstance(entry, dict)]
         capacities = [
-            int(entry.get("ssm_slot_capacity", entry.get("mamba_slot_capacity")))
+            int(entry["ssm_slot_capacity"])
             for entry in entries
-            if entry.get("ssm_slot_capacity", entry.get("mamba_slot_capacity")) is not None
+            if entry.get("ssm_slot_capacity") is not None
         ]
         if capacities and len(capacities) != len(entries):
             raise ValueError(
-                "SSM slot capacity is missing from part of an engine's " "model-parallel metadata"
+                "SSM slot capacity is missing from part of an engine's model-parallel metadata"
             )
         capacity = min(capacities) if capacities else None
         if capacity is not None and capacity < 1:
@@ -69,17 +93,13 @@ class DisaggStateFlowControl:
         if not isinstance(instance_meta, list):
             return 0
         entries = [entry for entry in instance_meta if isinstance(entry, dict)]
-        hybrid_entries = [
-            entry
-            for entry in entries
-            if entry.get("ssm_slot_capacity", entry.get("mamba_slot_capacity")) is not None
-        ]
+        hybrid_entries = [entry for entry in entries if entry.get("ssm_slot_capacity") is not None]
         if not hybrid_entries:
             return 0
         costs = [
-            int(entry.get("ssm_handoff_max_slots", entry.get("mamba_handoff_max_slots")))
+            int(entry["ssm_handoff_max_slots"])
             for entry in hybrid_entries
-            if entry.get("ssm_handoff_max_slots", entry.get("mamba_handoff_max_slots")) is not None
+            if entry.get("ssm_handoff_max_slots") is not None
         ]
         if len(costs) != len(hybrid_entries):
             raise ValueError(
@@ -95,8 +115,10 @@ class DisaggStateFlowControl:
         """Register an engine's capacity and return the parsed limit."""
 
         capacity = self._capacity_from_instance_meta(instance_meta)
+        request_capacity = self._request_capacity_from_instance_meta(instance_meta)
         # A reconnect may reuse an identity with new limits.
         self._capacity.pop(identity, None)
+        self._request_capacity[identity] = request_capacity
         self._prefill_slot_cost.pop(identity, None)
         if capacity is not None:
             self._capacity[identity] = capacity
@@ -105,18 +127,23 @@ class DisaggStateFlowControl:
                 instance_meta
             )
             self._prefill_usage.setdefault(identity, 0)
+            self._prefill_counts.setdefault(identity, 0)
         if role == "decode":
             self._decode_usage.setdefault(identity, 0)
+            self._decode_counts.setdefault(identity, 0)
         return capacity
 
     def remove_engine(self, identity) -> None:
         """Forget an engine after its queued and in-flight requests are dropped."""
 
         self._capacity.pop(identity, None)
+        self._request_capacity.pop(identity, None)
         self._prefill_slot_cost.pop(identity, None)
         self._prefill_usage.pop(identity, None)
+        self._prefill_counts.pop(identity, None)
         self._prefill_queues.pop(identity, None)
         self._decode_usage.pop(identity, None)
+        self._decode_counts.pop(identity, None)
         self._decode_queues.pop(identity, None)
         for reservations in (self._prefill_reservations, self._decode_reservations):
             for request_id, (reserved_identity, _) in list(reservations.items()):
@@ -143,61 +170,48 @@ class DisaggStateFlowControl:
 
         return (
             len(self._prefill_queues.get(identity, ())),
-            self._prefill_count(identity),
+            self._prefill_counts.get(identity, 0),
             self.prefill_usage(identity),
         )
 
     def decode_load(self, identity) -> tuple[int, int, int]:
         """Return queued, active, and weighted live-state decode load."""
 
-        active = sum(
-            reserved_identity == identity
-            for reserved_identity, _ in self._decode_reservations.values()
+        return (
+            len(self._decode_queues.get(identity, ())),
+            self._decode_counts.get(identity, 0),
+            self.decode_usage(identity),
         )
-        return len(self._decode_queues.get(identity, ())), active, self.decode_usage(identity)
 
     def prefill_slot_cost(self, identity) -> int:
         """Return the engine-advertised live-state handoff demand per request."""
 
         return self._prefill_slot_cost.get(identity, 0)
 
-    def _prefill_count(self, identity) -> int:
-        return sum(
-            reserved_identity == identity
-            for reserved_identity, _ in self._prefill_reservations.values()
-        )
-
-    def try_reserve_prefill(
-        self, identity, request_id: int, slot_cost: int, max_requests: int
-    ) -> bool:
+    def try_reserve_prefill(self, identity, request_id: int, slot_cost: int) -> bool:
         """Reserve one prefill request by count and weighted slot demand."""
 
         if slot_cost < 0:
             raise ValueError(f"SSM slot cost cannot be negative, got {slot_cost}")
         if request_id in self._prefill_reservations:
             raise RuntimeError(f"Prefill request {request_id} already holds an SSM reservation")
-        if self._prefill_count(identity) >= max_requests:
+        count = self._prefill_counts.get(identity, 0)
+        if count >= self._request_capacity[identity]:
             return False
         capacity = self._capacity.get(identity)
         usage = self._prefill_usage.get(identity, 0)
         if capacity is not None and usage + slot_cost > capacity:
             return False
         self._prefill_usage[identity] = usage + slot_cost
+        self._prefill_counts[identity] = count + 1
         self._prefill_reservations[request_id] = (identity, slot_cost)
         return True
 
-    def enqueue_prefill(
-        self, identity, request_id: int, prompt, sampling_params, slot_cost: int
-    ) -> None:
+    def enqueue_prefill(self, identity, request_id: int, slot_cost: int) -> None:
         """Append a prefill request to an engine's FIFO capacity queue."""
 
         self._prefill_queues.setdefault(identity, deque()).append(
-            QueuedPrefillRequest(
-                request_id=request_id,
-                prompt=prompt,
-                sampling_params=sampling_params,
-                slot_cost=slot_cost,
-            )
+            QueuedPrefillRequest(request_id=request_id, slot_cost=slot_cost)
         )
 
     def has_queued_prefill(self, identity) -> bool:
@@ -205,16 +219,14 @@ class DisaggStateFlowControl:
 
         return bool(self._prefill_queues.get(identity))
 
-    def pop_next_prefill(self, identity, max_requests: int) -> Optional[QueuedPrefillRequest]:
+    def pop_next_prefill(self, identity) -> Optional[QueuedPrefillRequest]:
         """Reserve and return the next queued prefill, if it fits."""
 
         queue = self._prefill_queues.get(identity)
         if not queue:
             return None
         request = queue[0]
-        if not self.try_reserve_prefill(
-            identity, request.request_id, request.slot_cost, max_requests
-        ):
+        if not self.try_reserve_prefill(identity, request.request_id, request.slot_cost):
             return None
         queue.popleft()
         if not queue:
@@ -224,17 +236,22 @@ class DisaggStateFlowControl:
     def release_prefill(self, request_id: int):
         """Release a request's prefill reservation and return its identity."""
 
-        reservation = self._prefill_reservations.pop(request_id, None)
+        reservation = self._prefill_reservations.get(request_id)
         if reservation is None:
             return None
         identity, slot_cost = reservation
         usage = self._prefill_usage.get(identity, 0)
+        count = self._prefill_counts.get(identity, 0)
         if usage < slot_cost:
             raise RuntimeError(
                 f"Prefill SSM slot accounting underflow on {identity!r}: "
                 f"used={usage}, release={slot_cost}"
             )
+        if count < 1:
+            raise RuntimeError(f"Prefill request accounting underflow on {identity!r}")
+        self._prefill_reservations.pop(request_id)
         self._prefill_usage[identity] = usage - slot_cost
+        self._prefill_counts[identity] = count - 1
         return identity
 
     @staticmethod
@@ -259,10 +276,14 @@ class DisaggStateFlowControl:
         capacity = self._capacity.get(identity)
         if request_id in self._decode_reservations:
             raise RuntimeError(f"Decode request {request_id} already holds an SSM reservation")
+        count = self._decode_counts.get(identity, 0)
+        if count >= self._request_capacity[identity]:
+            return False
         usage = self._decode_usage.get(identity, 0)
         if capacity is not None and usage + slot_cost > capacity:
             return False
         self._decode_usage[identity] = usage + slot_cost
+        self._decode_counts[identity] = count + 1
         self._decode_reservations[request_id] = (identity, slot_cost)
         return True
 
@@ -299,17 +320,22 @@ class DisaggStateFlowControl:
     def release_decode(self, request_id: int):
         """Release a request's reservation and return its decode identity."""
 
-        reservation = self._decode_reservations.pop(request_id, None)
+        reservation = self._decode_reservations.get(request_id)
         if reservation is None:
             return None
         identity, slot_cost = reservation
         usage = self._decode_usage.get(identity, 0)
+        count = self._decode_counts.get(identity, 0)
         if usage < slot_cost:
             raise RuntimeError(
                 f"Decode SSM slot accounting underflow on {identity!r}: "
                 f"used={usage}, release={slot_cost}"
             )
+        if count < 1:
+            raise RuntimeError(f"Decode request accounting underflow on {identity!r}")
+        self._decode_reservations.pop(request_id)
         self._decode_usage[identity] = usage - slot_cost
+        self._decode_counts[identity] = count - 1
         return identity
 
     def remove_queued(self, request_id: int) -> bool:

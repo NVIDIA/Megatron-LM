@@ -34,6 +34,12 @@ def test_router_registry_and_abc():
         def forget(self, request_id):
             pass
 
+        def requests_involving(self, identity):
+            return []
+
+        def decode_for_request(self, request_id):
+            return None
+
     register_disagg_router("custom_test", _Custom)
     assert isinstance(make_disagg_router("custom_test"), _Custom)
 

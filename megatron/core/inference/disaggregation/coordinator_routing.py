@@ -36,14 +36,13 @@ class DisaggRouter(abc.ABC):
     def forget(self, request_id: int) -> None:
         """Drop per-request state once the reply has been routed home."""
 
+    @abc.abstractmethod
     def requests_involving(self, identity) -> List[int]:
         """Return requests routed through an engine."""
-        return []
 
+    @abc.abstractmethod
     def decode_for_request(self, request_id: int):
         """Return the decode engine assigned to a request, if any."""
-
-        return None
 
 
 class DisaggRouting(DisaggRouter):

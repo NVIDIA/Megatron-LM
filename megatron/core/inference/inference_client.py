@@ -94,7 +94,6 @@ class InferenceClient:
         self.request_submission_times = {}
         self.next_request_id = 0
         self.streams: dict[int, AsyncStream[dict]] = {}
-        self.aborted_request_ids: set[int] = set()
         self.abort_futures: dict[int, asyncio.Future] = {}
         self.listener_task: asyncio.Task | None = None
 
@@ -214,7 +213,6 @@ class InferenceClient:
             return existing
         abort_future = self._loop.create_future()
         self.abort_futures[request_id] = abort_future
-        self.aborted_request_ids.add(request_id)
         stream = self.streams.pop(request_id, None)
         if stream is not None:
             stream.finish()
@@ -308,9 +306,6 @@ class InferenceClient:
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
                     request_id, reply = data[1:]
-                    if request_id in self.aborted_request_ids:
-                        self.aborted_request_ids.discard(request_id)
-                        continue
                     submitted = self.request_submission_times.pop(request_id, None)
                     if submitted is not None:
                         reply['latency'] = time.perf_counter() - submitted
@@ -325,7 +320,12 @@ class InferenceClient:
                         stream.put({"final": completed_request})
                         stream.finish()
                         continue
-                    completion_future = self.completion_futures.pop(request_id)
+                    completion_future = self.completion_futures.pop(request_id, None)
+                    if completion_future is None:
+                        logging.warning(
+                            "Client: ignoring late ENGINE_REPLY for request %d", request_id
+                        )
+                        continue
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
@@ -356,8 +356,10 @@ class InferenceClient:
                     request_id, source_safe = int(data[1]), bool(data[2])
                     future = self.abort_futures.get(request_id)
                     if future is None:
-                        future = self._loop.create_future()
-                        self.abort_futures[request_id] = future
+                        logging.warning(
+                            "Client: ignoring REQUEST_ABORTED for unknown request %d", request_id
+                        )
+                        continue
                     if not future.done():
                         future.set_result(source_safe)
             except zmq.Again:
@@ -493,7 +495,6 @@ class InferenceClient:
         for stream in self.streams.values():
             stream.finish()
         self.streams.clear()
-        self.aborted_request_ids.clear()
         for future in self.abort_futures.values():
             if not future.done():
                 future.cancel()

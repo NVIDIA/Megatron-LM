@@ -38,24 +38,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-async def serve_dynamic_inference_engine(
-    engine: DynamicInferenceEngine,
-    *,
-    coordinator_host: Optional[str] = None,
-    coordinator_port: Optional[int] = None,
-    on_ready=None,
-) -> None:
-    """Run a dynamic engine coordinator until the engine stops."""
-
-    address = await engine.start_listening_to_data_parallel_coordinator(
-        inference_coordinator_port=coordinator_port,
-        hostname=coordinator_host,
-    )
-    if on_ready is not None and torch.distributed.get_rank() == 0:
-        on_ready(address)
-    await engine.engine_loop_task
-
-
 def get_model_builder(
     args: Namespace, provider: Optional[Literal["gpt", "hybrid", "mamba"]] = None
 ) -> ModelBuilder:

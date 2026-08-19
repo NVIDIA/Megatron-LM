@@ -855,7 +855,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # Shards have disjoint process groups, so share the one coordinator
             # address across the world before each shard broadcasts it locally.
             bcast = [dp_addr]
-            torch.distributed.broadcast_object_list(bcast, src=0)
+            torch.distributed.broadcast_object_list(
+                bcast, src=0, group=disagg_config["coordinator_group"]
+            )
             [dp_addr] = bcast
 
         # Find available ports for MP and bind to them.
@@ -1721,7 +1723,10 @@ class DynamicInferenceEngine(AbstractEngine):
             # Skip for requests being finished due to stop words — tokens are not
             # appended for these requests, so log probs must also be skipped to keep
             # the two lists in sync.
-            if request_log_probs and request_id not in self.stop_word_being_finished_ids:
+            if (
+                request_log_probs is not None
+                and request_id not in self.stop_word_being_finished_ids
+            ):
                 # Initialize lists if they don't exist
                 if not request.prompt_log_probs:
                     request.prompt_log_probs = []
@@ -2083,6 +2088,22 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return None
 
+    def _select_cg_chunk_size(
+        self, req: DynamicInferenceRequest, max_chunk_tokens: int
+    ) -> Optional[int]:
+        """Select a graphed chunk size without blocking an otherwise idle engine."""
+        chunk_size = self._find_cg_chunk_size(max_chunk_tokens)
+        if chunk_size is not None:
+            req.cg_wait_iters = 0
+            return chunk_size
+
+        if self.context.num_prefill_requests or self.context.num_decode_requests:
+            self._register_cg_wait(req)
+            return None
+
+        req.cg_wait_iters = 0
+        return max_chunk_tokens
+
     def _register_cg_wait(self, req) -> None:
         """Track a deferred admission attempt and throw a starvation warning at the threshold.
 
@@ -2210,15 +2231,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 computed_budget = min(remaining_len - prefix_skip, token_budget)
 
-                # Skip CG gating for the continuation of an in-flight chunked prefill:
-                # the request is already mid-flight, deferring it would deadlock progress.
-                if self._cg_admission_gating_active() and not is_continuing_chunked_prefill:
+                if self._cg_admission_gating_active():
                     # Snap the COMPUTED chunk size to the largest captured-CG boundary
                     # within budget (skipped tokens don't affect the CG batch shape).
-                    # Fall back to eager (computed_budget) if no CG shape covers it.
-                    snapped_chunk = self._find_cg_chunk_size(computed_budget)
-                    computed_chunk = snapped_chunk if snapped_chunk is not None else computed_budget
-                    req.cg_wait_iters = 0
+                    computed_chunk = self._select_cg_chunk_size(req, computed_budget)
+                    if computed_chunk is None:
+                        break
                 else:
                     computed_chunk = computed_budget
 

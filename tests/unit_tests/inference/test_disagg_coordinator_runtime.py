@@ -4,12 +4,13 @@ from collections import deque
 from types import SimpleNamespace
 
 import msgpack
+import pytest
 
 from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoordinatorRuntime
 from megatron.core.inference.headers import Headers
 
 
-def _runtime(*, max_outstanding=32, backend="nixl", ssm_capacity=None):
+def _runtime(*, request_capacity=32, backend="nixl", ssm_capacity=None):
     sent = []
     coordinator = SimpleNamespace(
         identities_of_data_parallel_ranks=deque(),
@@ -24,11 +25,11 @@ def _runtime(*, max_outstanding=32, backend="nixl", ssm_capacity=None):
     coordinator._send_to_engine = lambda identity, payload: (
         sent.append((identity, msgpack.unpackb(payload, raw=False))) or True
     )
-    runtime = DisaggCoordinatorRuntime(coordinator, "round_robin", max_outstanding)
+    runtime = DisaggCoordinatorRuntime(coordinator, "round_robin")
     coordinator.disagg = runtime
 
-    prefill_meta = {"global_rank": 0}
-    decode_meta = {"global_rank": 1}
+    prefill_meta = {"global_rank": 0, "request_capacity": request_capacity}
+    decode_meta = {"global_rank": 1, "request_capacity": request_capacity}
     if ssm_capacity is not None:
         for meta in (prefill_meta, decode_meta):
             meta["ssm_slot_capacity"] = ssm_capacity
@@ -81,22 +82,56 @@ def test_nccl_send_waits_for_decode_destinations():
 
     assert sent[-1][0] == b"prefill"
     assert Headers(sent[-1][1][0]) == Headers.SEND_KV
-    assert sent[-1][1][2:] == [[{"global_rank": 1}], 1]
+    assert sent[-1][1][2:] == [[{"global_rank": 1, "request_capacity": 32}], 1]
+
+
+def test_registration_rejects_mixed_transports():
+    runtime, _ = _runtime()
+
+    with pytest.raises(ValueError, match="same state transport"):
+        runtime.register_engine(
+            b"decode-2", "decode", "nccl", [{"global_rank": 2, "request_capacity": 32}]
+        )
 
 
 def test_read_done_releases_prefill_and_admits_queued_request():
-    runtime, sent = _runtime(max_outstanding=1)
+    runtime, sent = _runtime(request_capacity=1)
     runtime.route_submit(5, [1], {})
     runtime.route_submit(6, [2], {})
+    runtime.handle_prefill_done(
+        5,
+        {
+            "request_id": 5,
+            "disaggregated_params": {"kv_meta": {"agent": "prefill"}, "block_ids": [4]},
+        },
+    )
     sent.clear()
 
-    runtime.handle_kv_read_done(5)
+    runtime.handle_kv_read_done(b"decode", 5)
 
     assert [(identity, Headers(message[0])) for identity, message in sent] == [
         (b"prefill", Headers.RELEASE_KV),
         (b"prefill", Headers.SUBMIT_REQUEST),
     ]
     assert runtime.prefill_by_request[6] == b"prefill"
+
+
+def test_read_done_from_wrong_decode_does_not_release_prefill():
+    runtime, sent = _runtime()
+    runtime.route_submit(5, [1], {})
+    runtime.handle_prefill_done(
+        5,
+        {
+            "request_id": 5,
+            "disaggregated_params": {"kv_meta": {"agent": "prefill"}, "block_ids": [4]},
+        },
+    )
+    sent.clear()
+
+    runtime.handle_kv_read_done(b"other-decode", 5)
+
+    assert 5 in runtime.prefill_by_request
+    assert sent == []
 
 
 def test_decode_ssm_capacity_is_released_on_generation_completion():
@@ -150,3 +185,49 @@ def test_active_decode_cancellation_waits_for_engine_safety():
     assert Headers(msgpack.unpackb(client_frames[1], raw=False)[0]) == Headers.REQUEST_ABORTED
     assert 5 not in runtime.prefill_by_request
     assert 5 not in runtime.cancelled_request_ids
+
+
+def test_unsafe_cancellation_keeps_prefill_capacity_until_read_completes():
+    runtime, sent = _runtime(ssm_capacity=1)
+    runtime.route_submit(5, [1], {})
+    runtime.handle_prefill_done(
+        5,
+        {
+            "request_id": 5,
+            "disaggregated_params": {"kv_meta": {"ssm": {"positions": [0]}}, "block_ids": [4]},
+        },
+    )
+
+    runtime.abort_request(5)
+    runtime.handle_engine_aborted(5, source_safe=False)
+
+    assert runtime.prefill_by_request[5] == b"prefill"
+    assert runtime.flow.prefill_usage(b"prefill") == 1
+
+    runtime.handle_kv_read_done(b"decode", 5)
+
+    assert 5 not in runtime.prefill_by_request
+    assert runtime.flow.prefill_usage(b"prefill") == 0
+    assert runtime.router.decode_for_request(5) is None
+
+
+def test_decode_removal_does_not_release_inflight_source():
+    runtime, sent = _runtime(ssm_capacity=1)
+    runtime.route_submit(5, [1], {})
+    runtime.handle_prefill_done(
+        5,
+        {
+            "request_id": 5,
+            "disaggregated_params": {"kv_meta": {"ssm": {"positions": [0]}}, "block_ids": [4]},
+        },
+    )
+    sent.clear()
+
+    runtime.remove_engine(b"decode")
+
+    assert runtime.prefill_by_request[5] == b"prefill"
+    assert runtime.flow.prefill_usage(b"prefill") == 1
+    assert not any(
+        identity == b"prefill" and Headers(message[0]) == Headers.RELEASE_KV
+        for identity, message in sent
+    )

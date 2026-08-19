@@ -14,7 +14,6 @@ there is no staging copy on the send side.
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -30,9 +29,6 @@ from megatron.core.inference.disaggregation.utils import transfer_peer_records
 
 logger = logging.getLogger(__name__)
 
-_TRANSFER_TIMEOUT_S = 30.0
-_POLL_INTERVAL_S = 0.001
-
 
 class NcclTransferHandle:
     """Pollable handle for one batched NCCL transfer.
@@ -47,7 +43,6 @@ class NcclTransferHandle:
         self._keepalive = keepalive
         self._scatters = scatters
         self._done = not works and not scatters
-        self._submitted_at = time.perf_counter()
 
     @property
     def storage_safe(self) -> bool:
@@ -61,16 +56,15 @@ class NcclTransferHandle:
         if self._done:
             return True
         if not all(w.is_completed() for w in self._works):
-            if time.perf_counter() - self._submitted_at > _TRANSFER_TIMEOUT_S:
-                raise TimeoutError(f"NCCL transfer timed out after {_TRANSFER_TIMEOUT_S}s")
             return False
         self._finish()
         return True
 
     def wait(self) -> None:
         """Block until the transfer completes, then scatter."""
-        while not self.poll():
-            time.sleep(_POLL_INTERVAL_S)
+        for work in self._works:
+            work.wait()
+        self._finish()
 
     def _finish(self) -> None:
         if self._done:

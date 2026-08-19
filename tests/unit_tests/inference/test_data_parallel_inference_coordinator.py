@@ -913,3 +913,36 @@ class TestRoutingPolicies:
             handle_engine_reply(coord, b"rank-0", reply(11))
         assert "duplicate or late ENGINE_REPLY" in caplog.text
         assert coord.router_socket.send_multipart.call_count == 1
+
+    def test_terminal_error_clears_routing_when_source_is_unsafe(self):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.router_socket = unittest.mock.MagicMock()
+        coord.request_id_to_client_id = {11: b"client-A"}
+        coord.request_id_to_client_request_id = {11: 7}
+        coord.client_request_to_request_id = {(b"client-A", 7): 11}
+        coord.request_id_to_rank = {11: b"rank-0"}
+        coord._pending_counts[0] = 1
+
+        HANDLERS[Headers.REQUEST_ERROR](
+            coord, b"rank-0", [Headers.REQUEST_ERROR.value, 11, "failed", False]
+        )
+
+        assert coord.request_id_to_client_id == {}
+        assert coord.request_id_to_client_request_id == {}
+        assert coord.client_request_to_request_id == {}
+        assert coord.request_id_to_rank == {}
+        assert coord._pending_counts[0] == 0
+
+    def test_late_partial_reply_is_ignored(self, caplog):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.router_socket = unittest.mock.MagicMock()
+        coord.request_id_to_client_id = {}
+        coord.request_id_to_client_request_id = {}
+
+        with caplog.at_level(logging.WARNING):
+            HANDLERS[Headers.ENGINE_REPLY_PARTIAL](
+                coord, b"rank-0", [Headers.ENGINE_REPLY_PARTIAL.value, [{"request_id": 11}]]
+            )
+
+        assert "late ENGINE_REPLY_PARTIAL" in caplog.text
+        coord.router_socket.send_multipart.assert_not_called()

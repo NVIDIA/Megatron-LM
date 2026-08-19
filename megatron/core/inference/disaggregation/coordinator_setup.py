@@ -71,4 +71,5 @@ def configure_prebuilt_disagg_engine(
         spawn_coordinator=(rank == 0),
         disagg_router=disagg_router,
         kv_transport_backend=kv_transport_backend,
+        coordinator_group=dist.group.WORLD,
     )

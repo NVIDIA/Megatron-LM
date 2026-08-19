@@ -16,6 +16,9 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, Optional
 
+import msgpack
+import zmq
+import zmq.asyncio
 from dynamo._core import Context
 from dynamo.common.backend.disagg import require_prefill_result
 from dynamo.common.backend.engine import EngineConfig, GenerateChunk, GenerateRequest, LLMEngine
@@ -26,6 +29,7 @@ from dynamo.common.constants import DisaggregationMode
 from dynamo.llm import KvEventPublisher, ModelInput
 
 from megatron.core.inference.inference_client import InferenceClient, InferenceRequestError
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.integrations.dynamo.args import Config, parse_args
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
@@ -60,10 +64,13 @@ def build_sampling_params(request: GenerateRequest) -> SamplingParams:
     output = request.get("output_options") or {}
     token_logprobs = output.get("logprobs")
     prompt_logprobs = output.get("prompt_logprobs")
-    params.top_n_logprobs = max(
-        int(token_logprobs or 0), int(prompt_logprobs or 0)
-    )
-    params.return_log_probs = token_logprobs is not None
+    requested_logprob_counts = {
+        int(value) for value in (token_logprobs, prompt_logprobs) if value is not None
+    }
+    if len(requested_logprob_counts) > 1:
+        raise ValueError("Megatron requires logprobs and prompt_logprobs to use the same count")
+    params.top_n_logprobs = next(iter(requested_logprob_counts), 0)
+    params.return_log_probs = token_logprobs is not None or prompt_logprobs is not None
     params.skip_prompt_log_probs = prompt_logprobs is None
     params.add_attributes({})
     if params.temperature == 0.0:
@@ -91,7 +98,9 @@ class MegatronLLMEngine(LLMEngine):
         self._publisher: Optional[KvEventPublisher] = None
         self._publisher_lock = threading.Lock()
         self._event_receiver: Optional[EngineEventReceiver] = None
-        self._release_clients: dict[str, Any] = {}
+        self._release_context: zmq.asyncio.Context | None = None
+        self._release_sockets: dict[str, zmq.asyncio.Socket] = {}
+        self._release_lock = asyncio.Lock()
         self._request_ids: dict[str, int] = {}
         self.worker_id: Optional[int] = None
 
@@ -202,7 +211,9 @@ class MegatronLLMEngine(LLMEngine):
             "torch.distributed.run",
         ]
         if self.config.launcher == "local":
-            command.append("--standalone")
+            command.extend(
+                ["--standalone", f"--nproc-per-node={self.config.nproc_per_node}"]
+            )
         else:
             command.extend(
                 [
@@ -213,8 +224,6 @@ class MegatronLLMEngine(LLMEngine):
                     f"--master-port={self.config.master_port}",
                 ]
             )
-        if self.config.launcher == "local":
-            command.append(f"--nproc-per-node={self.config.nproc_per_node}")
         command.extend(
             [
                 "--module",
@@ -430,28 +439,43 @@ class MegatronLLMEngine(LLMEngine):
             if not completed:
                 await stream.aclose()
 
-    def _release_remote_handoff(self, address: str, request_id: int) -> None:
-        client = self._release_clients.get(address)
-        if client is None:
-            client = InferenceClient(address, deserialize=False)
-            client.start()
-            self._release_clients[address] = client
-        client.release_handoff(request_id)
-
-    def _release_handoff_from_meta(self, release: dict[str, Any]) -> bool:
-        address = release.get("coordinator_addr")
-        request_id = release.get("request_id")
-        if address is None or request_id is None:
-            return False
-        self._release_remote_handoff(str(address), int(request_id))
-        return True
+    async def _release_remote_handoff(self, address: str, request_id: int) -> None:
+        async with self._release_lock:
+            socket = self._release_sockets.get(address)
+            if socket is None:
+                if self._release_context is None:
+                    self._release_context = zmq.asyncio.Context()
+                socket = self._release_context.socket(zmq.DEALER)
+                socket.setsockopt(zmq.SNDHWM, 0)
+                socket.setsockopt(zmq.RCVHWM, 0)
+                socket.connect(address)
+                await socket.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
+                try:
+                    reply = await asyncio.wait_for(
+                        socket.recv(), timeout=min(30.0, self.config.engine_start_timeout)
+                    )
+                except Exception:
+                    socket.close(linger=0)
+                    raise
+                if Headers(msgpack.unpackb(reply, raw=False)[0]) != Headers.CONNECT_ACK:
+                    socket.close(linger=0)
+                    raise RuntimeError("Unexpected handoff release coordinator reply")
+                self._release_sockets[address] = socket
+            await socket.send(
+                msgpack.packb(
+                    [Headers.RELEASE_KV.value, int(request_id)], use_bin_type=True
+                )
+            )
 
     async def _release_handoff_from_meta_async(self, release: dict[str, Any]) -> bool:
         """Release source state without blocking Dynamo's request loop."""
 
         if release.get("coordinator_addr") is None or release.get("request_id") is None:
             return False
-        return await asyncio.to_thread(self._release_handoff_from_meta, release)
+        await self._release_remote_handoff(
+            str(release["coordinator_addr"]), int(release["request_id"])
+        )
+        return True
 
     async def abort(self, context: Context) -> None:
         request_id = self._request_ids.pop(str(context.id()), None)
@@ -472,12 +496,12 @@ class MegatronLLMEngine(LLMEngine):
 
     async def cleanup(self) -> None:
         self._shutting_down = True
-        for client in self._release_clients.values():
-            try:
-                client.stop()
-            except Exception:
-                logger.exception("Failed to close Megatron handoff client")
-        self._release_clients.clear()
+        for socket in self._release_sockets.values():
+            socket.close(linger=0)
+        self._release_sockets.clear()
+        if self._release_context is not None:
+            self._release_context.term()
+            self._release_context = None
         client = self.client
         self.client = None
         if client is not None:
