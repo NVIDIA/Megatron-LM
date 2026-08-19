@@ -1,14 +1,19 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import argparse
+import os
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 
+from megatron.core import parallel_state
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.extensions.transformer_engine import fused_topk_with_score_function_supports_qb
 from megatron.core.distributed.finalize_model_grads import (
     _update_router_qb_bias,
+    finalize_model_grads,
     reset_model_temporary_tensors,
 )
 from megatron.core.transformer.moe.moe_utils import (
@@ -16,6 +21,21 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_routing_with_score_function,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+class _QBFinalizeModel(torch.nn.Module):
+    """Minimal model wrapper that runs the production gradient finalizer."""
+
+    def __init__(self, router: torch.nn.Module, config: TransformerConfig):
+        super().__init__()
+        self.router = router
+        self.config = config
+        self.ddp_config = DistributedDataParallelConfig()
+        self.finish_grad_sync_calls = 0
+
+    def finish_grad_sync(self, force_all_reduce: bool = False):
+        del force_all_reduce
+        self.finish_grad_sync_calls += 1
 
 
 def _config(**overrides):
@@ -287,3 +307,156 @@ def test_qb_mcore_router_accumulates_microbatches_and_finalizes():
     assert router.qb_histogram.data_ptr() == histogram_ptr
     assert router.qb_bin_bounds.data_ptr() == bounds_ptr
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not fused_topk_with_score_function_supports_qb,
+    reason="requires CUDA and the Transformer Engine QB fused-router API",
+)
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "tp_size,ep_size,dense_dp_size,expert_dp_size", [(1, 4, 8, 2), (1, 8, 8, 1), (4, 2, 2, 1)]
+)
+def test_qb_world8_ep_topologies_finalize_model_grads(
+    tp_size, ep_size, dense_dp_size, expert_dp_size
+):
+    """Validate QB reduction and finalization across eight-rank EP topologies."""
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+    from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+    from megatron.core.transformer.spec_utils import get_submodules
+    from megatron.training.initialize import _set_random_seed
+    from tests.unit_tests.test_utilities import Utils
+
+    # torchrun exports WORLD_SIZE before MCore initializes the process group. Guard on the
+    # environment here so a normal single-GPU unit-test run skips before trying to construct an
+    # impossible EP4/EP8 topology, while the intended eight-rank launch reaches initialization.
+    if int(os.environ.get("WORLD_SIZE", "1")) != 8:
+        pytest.skip("requires a world size of 8")
+
+    Utils.destroy_model_parallel()
+    try:
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=ep_size,
+            expert_tensor_parallel_size=tp_size,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+
+        # Establish that MCore generated exactly the topology under test. In particular, EP is
+        # folded into the router's dense-data-parallel group, while expert data parallelism is
+        # world_size / (TP * EP). The production QB reduction group spans TP x dense-DP x CP and
+        # must therefore contain all eight ranks for every parameterized topology.
+        assert dist.get_world_size() == 8
+        assert parallel_state.get_tensor_model_parallel_world_size() == tp_size
+        assert parallel_state.get_expert_model_parallel_world_size() == ep_size
+        assert parallel_state.get_data_parallel_world_size() == dense_dp_size
+        assert parallel_state.get_expert_data_parallel_world_size() == expert_dp_size
+        tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+            with_context_parallel=True
+        )
+        assert tp_dp_cp_group.size() == 8
+
+        config = _config(
+            hidden_size=16,
+            ffn_hidden_size=32,
+            num_moe_experts=8,
+            moe_router_topk=1,
+            moe_router_fusion=True,
+            moe_token_dispatcher_type="alltoall",
+            moe_router_qb_num_bins=128,
+            tensor_model_parallel_size=tp_size,
+            expert_model_parallel_size=ep_size,
+            expert_tensor_parallel_size=tp_size,
+            # MCore requires sequence parallelism whenever training combines MoE with TP. The
+            # TP1 cases deliberately leave it off; TP4/EP2 turns it on to exercise the supported
+            # expert-tensor-parallel execution path rather than bypassing MoELayer's safety check.
+            sequence_parallel=tp_size > 1,
+            params_dtype=torch.float32,
+            add_bias_linear=False,
+        )
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(config.num_moe_experts, moe_grouped_gemm=False).mlp
+        )
+        assert isinstance(submodules, MoESubmodules)
+        layer = MoELayer(config, submodules).cuda()
+        with torch.no_grad():
+            layer.router.weight.zero_()
+            layer.router.weight[:, 0].copy_(
+                torch.tensor([3.0, 2.0, 1.0, 0.25, -0.25, -1.0, -2.0, -3.0], device="cuda")
+            )
+
+        dense_dp_rank = parallel_state.get_data_parallel_rank()
+        token_axis = torch.linspace(-2.0, 2.0, 32, device="cuda")
+        for microbatch in range(2):
+            hidden_states = torch.zeros(32, 1, config.hidden_size, device="cuda")
+            hidden_states[:, 0, 0] = (
+                (1.0 if microbatch == 0 else -1.0) * token_axis
+                + 0.35 * dense_dp_rank
+                + 0.2 * microbatch
+            )
+            output, _ = layer(hidden_states)
+            output.float().square().mean().backward()
+
+        # Every token contributes one margin sample to every expert's histogram, independent of
+        # top-k. Two 32-token microbatches must therefore leave exactly 64 samples per expert in
+        # each rank-local accumulator. This also proves accumulation happened across microbatches
+        # instead of replacing the first microbatch's statistics.
+        router = layer.router
+        local_histogram = router.qb_histogram.clone()
+        torch.testing.assert_close(
+            local_histogram.sum(dim=1),
+            torch.full((config.num_moe_experts,), 64, dtype=torch.int64, device="cuda"),
+        )
+        gathered_histograms = [torch.empty_like(local_histogram) for _ in range(8)]
+        dist.all_gather(gathered_histograms, local_histogram)
+
+        # Rank-dependent inputs deliberately produce at least two distinct local histograms. This
+        # prevents a false-positive where final biases agree merely because every rank started from
+        # identical statistics, without exercising the distributed histogram reduction.
+        assert any(
+            not torch.equal(gathered_histograms[0], histogram)
+            for histogram in gathered_histograms[1:]
+        )
+
+        # Build an independent oracle from an explicit all-reduce of the pre-finalization local
+        # histogram, then apply the same pure quantile update math. finalize_model_grads must
+        # reproduce both the resulting expert bias and the adaptively updated bin bounds.
+        expected_histogram = local_histogram.clone()
+        dist.all_reduce(expected_histogram, group=tp_dp_cp_group)
+        expected_bias, expected_bounds = get_updated_expert_bias_with_quantile(
+            expected_histogram,
+            router.qb_bin_bounds.clone(),
+            router.qb_bias.clone(),
+            config.moe_router_topk,
+        )
+        histogram_ptr = router.qb_histogram.data_ptr()
+        bounds_ptr = router.qb_bin_bounds.data_ptr()
+        model = _QBFinalizeModel(router, config)
+
+        finalize_model_grads([model])
+
+        torch.testing.assert_close(router.qb_bias, expected_bias)
+        torch.testing.assert_close(router.qb_bin_bounds, expected_bounds)
+
+        # Verify global agreement explicitly on WORLD, rather than checking only each rank against
+        # its locally computed oracle. This catches a wrong reduction group that could otherwise
+        # leave different EP or TP subgroups internally self-consistent.
+        gathered_biases = [torch.empty_like(router.qb_bias) for _ in range(8)]
+        gathered_bounds = [torch.empty_like(router.qb_bin_bounds) for _ in range(8)]
+        dist.all_gather(gathered_biases, router.qb_bias)
+        dist.all_gather(gathered_bounds, router.qb_bin_bounds)
+        for bias, bounds in zip(gathered_biases[1:], gathered_bounds[1:]):
+            torch.testing.assert_close(bias, gathered_biases[0])
+            torch.testing.assert_close(bounds, gathered_bounds[0])
+
+        # Finalization consumes the global-batch histogram exactly once and clears it in place.
+        # Stable storage addresses are required by full-iteration CUDA graph capture; the persistent
+        # bin-bound buffer must likewise be updated without replacement. The wrapper also proves the
+        # normal gradient synchronization stage still executes exactly once.
+        assert torch.count_nonzero(router.qb_histogram) == 0
+        assert router.qb_histogram.data_ptr() == histogram_ptr
+        assert router.qb_bin_bounds.data_ptr() == bounds_ptr
+        assert model.finish_grad_sync_calls == 1
+    finally:
+        Utils.destroy_model_parallel()
