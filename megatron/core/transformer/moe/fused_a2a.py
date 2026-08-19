@@ -64,25 +64,12 @@ def get_hidden_bytes(x: torch.Tensor) -> int:
 # the cross-node Gin barrier (kHybridDispatchTag0) can hang with
 # `signal: 1, target: 2`. Pinning at construction ensures template
 # homogeneity across ranks (matches DeepEP `tests/elastic/test_ep.py`
-# reference harness; also used in the downstream reproduction at
-# https://github.com/antonai-work/nemo-rl-deepep-v2-efa).
+# reference harness).
 _V2_NUM_MAX_TOKENS_PER_RANK = int(
     os.environ.get("MCORE_DEEPEP_V2_MAX_TOKENS_PER_RANK", "8192")
 )
 _V2_HIDDEN = int(os.environ.get("MCORE_DEEPEP_V2_HIDDEN", "7168"))
 _V2_NUM_TOPK = int(os.environ.get("MCORE_DEEPEP_V2_NUM_TOPK", "8"))
-
-
-def _is_efa_environment() -> bool:
-    """Detect AWS EFA fabric so we can prefer V2's MoE-shape ctor and
-    auto-cap the Queue-Pair budget. The byte-pool ctor has been
-    observed to hang the tag-6 Gin cross-node barrier on EFA; the
-    MoE-shape ctor does not (validated downstream at
-    https://github.com/antonai-work/nemo-rl-deepep-v2-efa)."""
-    return (
-        os.environ.get("FI_PROVIDER", "") == "efa"
-        or os.environ.get("DEEP_EP_BACKEND", "") == "nccl"
-    )
 
 
 def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
@@ -127,11 +114,10 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
             or getattr(_buffer, "num_nvl_bytes", 0) < num_nvl_bytes
             or getattr(_buffer, "num_rdma_bytes", 0) < num_rdma_bytes
         ):
-            # EFA QP auto-cap: pass num_allocated_qps=0 so V2 clamps
-            # to the per-fabric safe ceiling. Explicit non-zero values
-            # over-subscribe the aws-ofi-nccl 128-slot shared GIN ring
+            # QP auto-cap: pass num_allocated_qps=0 so V2 clamps to the
+            # per-fabric safe ceiling. Explicit non-zero values can
+            # over-subscribe the transport's shared GIN ring slots
             # (CUDA 719 at dispatch.hpp:183).
-            num_qps = 0 if _is_efa_environment() else 0
             _buffer = ElasticBuffer(
                 group=group,
                 num_max_tokens_per_rank=_V2_NUM_MAX_TOKENS_PER_RANK,
@@ -139,7 +125,7 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
                 num_topk=_V2_NUM_TOPK,
                 use_fp8_dispatch=False,
                 allow_hybrid_mode=True,
-                num_allocated_qps=num_qps,
+                num_allocated_qps=0,
             )
             # Emulate the V1 attributes used by the cache-invalidation
             # check above (ElasticBuffer doesn't expose them natively).
