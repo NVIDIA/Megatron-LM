@@ -450,9 +450,9 @@ class HybridEPDispatch(torch.autograd.Function):
                 **dense_kwargs,
             }
         else:
-            assert routing_map is not None, (
-                "routing_map is required when dense HybridEP routing is unavailable"
-            )
+            assert (
+                routing_map is not None
+            ), "routing_map is required when dense HybridEP routing is unavailable"
             dispatch_kwargs = {"routing_map": routing_map}
 
         (

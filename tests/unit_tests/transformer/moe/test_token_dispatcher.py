@@ -116,9 +116,7 @@ class MoEModelTestContainer:
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_router_fusion=kwargs.get("moe_router_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
-            moe_hybridep_use_dense_routing_map=kwargs.get(
-                "moe_hybridep_use_dense_routing_map", False
-            ),
+            moe_hybridep_routing_map_mode=kwargs.get("moe_hybridep_routing_map_mode", "bool"),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
             moe_ncclep_zero_copy=kwargs.get("moe_ncclep_zero_copy", False),
             moe_dispatch_fwd_dtype=kwargs.get("moe_dispatch_fwd_dtype", 'bf16'),
@@ -622,7 +620,7 @@ def test_hybridep_sparse_fallback_marks_empty_routes_invalid(monkeypatch):
     monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", True)
     manager = object.__new__(_HybridEPManager)
     manager.config = SimpleNamespace(
-        moe_hybridep_pad_uneven_dispatch_inputs=False, moe_hybridep_use_dense_routing_map=True
+        moe_hybridep_pad_uneven_dispatch_inputs=False, moe_hybridep_routing_map_mode="indices"
     )
     manager.group = object()
     manager.num_experts = 2
@@ -642,7 +640,7 @@ def test_hybridep_dense_input_requires_backend_support(monkeypatch):
     monkeypatch.setattr(token_dispatcher, "HAVE_HYBRIDEP_DENSE_ROUTING", False)
     manager = object.__new__(_HybridEPManager)
     manager.config = SimpleNamespace(
-        moe_hybridep_pad_uneven_dispatch_inputs=False, moe_hybridep_use_dense_routing_map=True
+        moe_hybridep_pad_uneven_dispatch_inputs=False, moe_hybridep_routing_map_mode="indices"
     )
     manager.group = object()
     manager.num_experts = 4
@@ -738,11 +736,11 @@ class TestFlexDispatcher:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    @pytest.mark.parametrize("use_dense_routing", [False, True])
-    def test_hybridep_dense_routing_forward_backward(self, use_dense_routing):
+    @pytest.mark.parametrize("routing_map_mode", ["bool", "indices"])
+    def test_hybridep_routing_map_modes_forward_backward(self, routing_map_mode):
         if not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
-        if use_dense_routing and (
+        if routing_map_mode == "indices" and (
             not fused_topk_with_score_function_supports_topk_indices
             or not HAVE_HYBRIDEP_DENSE_ROUTING
         ):
@@ -758,7 +756,7 @@ class TestFlexDispatcher:
             moe_token_dispatcher_type="flex",
             moe_router_fusion=True,
             moe_flex_dispatcher_backend="hybridep",
-            moe_hybridep_use_dense_routing_map=use_dense_routing,
+            moe_hybridep_routing_map_mode=routing_map_mode,
             hidden_size=1024,
             test_dtype=torch.bfloat16,
         )
