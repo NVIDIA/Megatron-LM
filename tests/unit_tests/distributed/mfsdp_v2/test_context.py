@@ -13,7 +13,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard,
     fully_shard_context,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
 
 class NestedModel(nn.Module):
@@ -277,8 +276,8 @@ def test_post_backward_release_processes_nested_fsdp_modules_once(distributed_se
 
     # The schedule skipped the inner unit's per-module release; its post_backward
     # should still finalize it because it remains in the BACKWARD phase.
-    model.phase = FsdpModule.Phase.BACKWARD
-    model.inner.phase = FsdpModule.Phase.BACKWARD
+    model.pre_backward(register_final_callback=False)
+    model.inner.pre_backward(register_final_callback=False)
     model.post_backward()
 
     # The root post_backward finalizes itself and any nested unit still in the
