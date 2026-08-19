@@ -135,34 +135,6 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
     return only_left, only_right, mismatch
 
 
-def inspect_types(x: Any, prefix: Tuple = (), indent: int = 4):
-    """Helper to print types of (nested) dict values."""
-    print_indent = lambda: print(" " * indent * len(prefix), end="")
-    if isinstance(x, dict):
-        print()
-        for k, v in x.items():
-            print_indent()
-            print(f"> {k}: ", end="")
-            inspect_types(v, prefix + (k,), indent)
-    elif isinstance(x, list):
-        print()
-        for i, v in enumerate(x):
-            print_indent()
-            print(f"- {i}: ", end="")
-            inspect_types(v, prefix + (i,), indent)
-    else:
-        if isinstance(x, torch.Tensor):
-            print(f"Tensor of shape {x.shape}")
-        else:
-            try:
-                x_str = str(x)
-            except:
-                x_str = "<no string repr>"
-            if len(x_str) > 30:
-                x_str = x_str[:30] + "... (truncated)"
-            print(f"[{type(x)}]: {x_str}")
-
-
 def nested_values(x: Union[dict, list]):
     """Returns iterator over (nested) values of a given dict or list."""
     x_iter = x.values() if isinstance(x, dict) else x
@@ -171,28 +143,6 @@ def nested_values(x: Union[dict, list]):
             yield from nested_values(v)
         else:
             yield v
-
-
-def nested_items_iter(x: Union[dict, list]):
-    """Returns iterator over (nested) tuples (container, key, value) of a given dict or list."""
-    x_iter = x.items() if isinstance(x, dict) else enumerate(x)
-    for k, v in x_iter:
-        if isinstance(v, (dict, list)):
-            yield from nested_items_iter(v)
-        else:
-            yield x, k, v
-
-
-def dict_map(f: Callable, d: dict):
-    """`map` equivalent for dicts."""
-    for sub_d, k, v in nested_items_iter(d):
-        sub_d[k] = f(v)
-
-
-def dict_map_with_key(f: Callable, d: dict):
-    """`map` equivalent for dicts with a function that accepts tuple (key, value)."""
-    for sub_d, k, v in nested_items_iter(d):
-        sub_d[k] = f(k, v)
 
 
 def dict_list_map_inplace(f: Callable[[U], V], x: Union[Dict, List, U]):
