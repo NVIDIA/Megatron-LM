@@ -41,14 +41,18 @@ class DisaggDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceE
         """Flatten this instance's PP/TP transport descriptors for registration."""
 
         instance_meta = []
+        # Keep PP stages aligned for models without SSM state.
         pp_ssm_metas = self._pp_ssm_peer_metas or [{}] * len(self._pp_kv_peer_metas)
         ssm_capacity = self.context.max_requests if self.context.is_hybrid_model else None
         for kv_stage, ssm_stage in zip(self._pp_kv_peer_metas, pp_ssm_metas):
+            # TP=1 exports one descriptor; TP>1 exports one per rank.
             kv_rank_metas = kv_stage if isinstance(kv_stage, list) else [kv_stage]
             for tp_index, kv_meta in enumerate(kv_rank_metas):
                 rank_meta = dict(kv_meta)
+                # Flow control uses the lowest capacity advertised by the MP ranks.
                 rank_meta["request_capacity"] = self.context.max_requests
                 rank_ssm_meta = {}
+                # Pair each KV descriptor with the SSM buffers on the same TP rank.
                 for state_kind, state_metas in ssm_stage.items():
                     if isinstance(state_metas, list):
                         rank_ssm_meta[state_kind] = state_metas[tp_index]
@@ -58,7 +62,7 @@ class DisaggDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceE
                     rank_meta["ssm"] = rank_ssm_meta
                 if ssm_capacity is not None:
                     rank_meta["ssm_slot_capacity"] = ssm_capacity
-                    # Decode-only handoff transfers the final recurrent state.
+                    # One hybrid handoff owns one live slot across all SSM state buffers.
                     rank_meta["ssm_handoff_max_slots"] = 1
                 instance_meta.append(rank_meta)
         return instance_meta

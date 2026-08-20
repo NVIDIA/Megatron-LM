@@ -36,9 +36,9 @@ logger = logging.getLogger(__name__)
 class NcclTransferPlan:
     """Validated point-to-point operations that have not been posted yet."""
 
-    ops: List[Any]
-    keepalive: List[torch.Tensor]
-    scatters: List[Any]
+    ops: List[Any]  # Validated NCCL P2P operations awaiting submission.
+    keepalive: List[torch.Tensor]  # Transfer buffers retained until NCCL completes.
+    scatters: List[Any]  # Receive-side copies into paged KV or SSM storage.
 
 
 class NcclTransferHandle:

@@ -40,6 +40,7 @@ class DisaggRouting:
 
     def route_submit(self, request_id: int, score: Callable | None = None):
         """Hop 1: pick the prefill engine for a newly submitted request."""
+        # TODO: Keep related requests on the same prefill engine when a routing key is available.
         if not self.prefill_engines:
             raise RuntimeError("no prefill engines registered")
         ident = self._pick(self.prefill_engines, self._prefill_rr, score)
@@ -76,4 +77,5 @@ class DisaggRouting:
     def _pick(pool: list, offset: int, score: Callable | None):
         if score is None:
             return pool[offset % len(pool)]
+        # Rotate the pool so min() breaks equal-score ties round-robin.
         return min((pool[(offset + i) % len(pool)] for i in range(len(pool))), key=score)

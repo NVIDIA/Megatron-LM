@@ -304,6 +304,7 @@ class DataParallelInferenceCoordinator:
             if new_row:
                 new_hash_table[h] = new_row
         self._hash_table = new_hash_table
+        # Remove role routing and fail disaggregated work assigned to the dead engine.
         if self.disagg is not None:
             self.disagg.remove_engine(identity)
         logging.warning(

@@ -94,7 +94,9 @@ class InferenceClient:
         self.request_submission_times = {}
         self.next_request_id = 0
         self.streams: dict[int, AsyncStream[dict]] = {}
+        # Resolves when abort cleanup makes transferred state safe to reuse.
         self.abort_futures: dict[int, asyncio.Future] = {}
+        # Background socket receiver for request, stream, and abort replies.
         self.listener_task: asyncio.Task | None = None
 
     def add_request(
