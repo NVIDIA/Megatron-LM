@@ -12,6 +12,11 @@ Four fused operations:
   - h_aggregate:         weighted n-stream -> 1-stream aggregation
   - h_post_bda:          fused H_res.T @ residual + H_post * (x + bias)
   - proj_rms_compute_h:  fused projection + RMS normalization + compute_h
+
+Determinism:
+  The native, Triton, and cuTile backends are currently tagged ``unknown``.
+  Numerical and gradient parity are covered, but bit-exact repeatability has
+  not been certified. The accelerated backends use timing-based autotuning.
 """
 
 import logging
@@ -29,6 +34,16 @@ from megatron.core._rank_utils import log_single_rank, safe_get_rank
 
 logger = logging.getLogger(__name__)
 LOG2E = math.log2(math.e)
+
+#: Bit-exact determinism status for each concrete mHC backend. This uses the
+#: same three-value vocabulary proposed for operation-backend metadata while
+#: the ops registry is not available on this PR's base. ``auto`` is a
+#: per-operation selection policy, not a backend of its own.
+MHC_BACKEND_DETERMINISM: dict[str, str] = {
+    "native": "unknown",
+    "triton": "unknown",
+    "cutile": "unknown",
+}
 
 
 def _env_flag(name: str) -> bool:
