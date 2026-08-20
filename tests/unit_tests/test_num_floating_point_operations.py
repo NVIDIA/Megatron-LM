@@ -1038,3 +1038,378 @@ class TestDSv4HybridMatchesStandard:
         std_flops = num_floating_point_operations(standard, batch_size)
         hyb_flops = num_floating_point_operations(hybrid, batch_size)
         assert hyb_flops == std_flops
+
+
+def _make_dsa_args(dsa_indexer_loss_coeff=0.01):
+    """Minimal MLA + DSA args (GLM-5.2 style, small scale).
+
+    Uses ``dsa_indexer_topk_freq=1`` and ``dsa_indexer_skip_topk_offset=0``
+    so every layer computes its own top-k index -- the golden reference can
+    set ``num_indexer_layers = num_layers`` without importing the skip-layer
+    predicate from megatron.core.
+
+    ``dsa_indexer_loss_coeff`` drives the indexer's fwd/bwd expansion: the
+    indexer only has a backward pass when its KL loss is enabled. The default
+    here matches the in-tree functional test configs.
+    """
+    args = _make_gpt_args(
+        num_layers=4,
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
+    )
+    args.multi_latent_attention = True
+    args.group_query_attention = False
+    args.q_lora_rank = 128
+    args.kv_lora_rank = 64
+    args.qk_head_dim = 48
+    args.qk_pos_emb_head_dim = 16
+    args.v_head_dim = 64
+    args.experimental_attention_variant = "dsa"
+    args.dsa_indexer_n_heads = 4
+    args.dsa_indexer_head_dim = 32
+    args.dsa_indexer_topk = 16
+    args.dsa_indexer_topk_freq = 1
+    args.dsa_indexer_skip_topk_offset = 0
+    args.dsa_indexer_loss_coeff = dsa_indexer_loss_coeff
+    return args
+
+
+def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum, num_indexer_layers=None):
+    """Independent golden calculator for DSA FLOPs.
+
+    Reimplements the formula from ``num_floating_point_operations`` so that
+    the test does not just call the same code twice. Assumes no MoE / MTP.
+    ``num_indexer_layers`` defaults to every layer, which is what
+    ``dsa_indexer_topk_freq=1`` / ``dsa_indexer_skip_topk_offset=0`` give;
+    cross-layer sharing cases pass the expected count explicitly.
+    """
+    fwd_bwd = 3
+    fma = 2
+    ffn_exp = 3 if args.swiglu else 2
+    num_layers = args.num_layers
+    nh = args.num_attention_heads
+
+    # ---- MLA projections (token-linear, per layer) ----
+    q_term = args.q_lora_rank * (
+        args.hidden_size + nh * (args.qk_head_dim + args.qk_pos_emb_head_dim) + 1
+    )
+    kv_term = (
+        args.kv_lora_rank * (args.hidden_size + nh * (args.qk_head_dim + args.v_head_dim) + 1)
+        + args.hidden_size * args.qk_pos_emb_head_dim
+    )
+    o_term = nh * args.v_head_dim * args.hidden_size
+    mla_proj_per_layer = fwd_bwd * fma * (q_term + kv_term + o_term)
+
+    # ---- Core attention: MLA cost scaled down to top-k sparse pairs ----
+    raw_core = nh * (args.qk_head_dim + args.qk_pos_emb_head_dim) / 2 + nh * args.v_head_dim / 2
+    mean_seqlen = seqlen_squared_sum / total_tokens
+    topk = args.dsa_indexer_topk
+    if mean_seqlen <= topk:
+        sparse_scale = 1.0
+    else:
+        dense_pairs = mean_seqlen * mean_seqlen / 2
+        topk_pairs = topk * mean_seqlen - topk * topk / 2
+        sparse_scale = topk_pairs / dense_pairs
+    sparse_core_per_layer = fwd_bwd * fma * raw_core * sparse_scale
+
+    # ---- DSA indexer: only layers that compute their own top-k index ----
+    if num_indexer_layers is None:
+        num_indexer_layers = num_layers
+    idx_dim = args.dsa_indexer_n_heads * args.dsa_indexer_head_dim
+    idx_token = num_indexer_layers * (
+        args.q_lora_rank * idx_dim  # wq_b
+        + args.hidden_size * args.dsa_indexer_head_dim  # wk
+        + args.hidden_size * args.dsa_indexer_n_heads  # weights_proj
+    )
+    idx_core = num_indexer_layers * idx_dim / 2
+    # The indexer only runs a backward pass when its KL loss is on, and its
+    # inputs are detached: projections pay fwd + wgrad, scoring pays fwd + dq + dk.
+    if (args.dsa_indexer_loss_coeff or 0.0) > 0:
+        idx_token_expansion, idx_core_expansion = 2, 3
+    else:
+        idx_token_expansion, idx_core_expansion = 1, 1
+    dsa_extra_token = idx_token_expansion * fma * idx_token
+    dsa_extra_core = idx_core_expansion * fma * idx_core
+
+    # ---- Aggregation ----
+    mlp = fwd_bwd * fma * args.hidden_size * (args.ffn_hidden_size * ffn_exp * num_layers)
+    logit = fwd_bwd * fma * args.hidden_size * args.padded_vocab_size
+    self_attn_term = mla_proj_per_layer * num_layers + dsa_extra_token
+    self_attn_core_term = sparse_core_per_layer * num_layers + dsa_extra_core
+
+    return total_tokens * (mlp + self_attn_term + logit) + seqlen_squared_sum * self_attn_core_term
+
+
+class TestDSA:
+    """DSA sparse-attention FLOPs against an independent golden calculator."""
+
+    def test_bshd(self):
+        """BSHD (uniform sequences) must match the golden calculator."""
+        args = _make_dsa_args()
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        flops = num_floating_point_operations(args, batch_size)
+        expected = _dsa_golden_flops(args, total_tokens, sum_sq)
+        assert flops == expected
+
+    def test_thd(self):
+        """THD (packed variable-length subsequences) must match the golden
+        calculator and be strictly less than BSHD due to the L^2 terms
+        (indexer scoring and sparse core attention)."""
+        args = _make_dsa_args()
+        batch_size = 2
+        packed_lengths = [64, 64, 128, 256]
+        total_tokens = sum(packed_lengths)
+        thd_sum_sq = sum(L**2 for L in packed_lengths)
+
+        flops = num_floating_point_operations(
+            args,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=total_tokens,
+        )
+        expected = _dsa_golden_flops(args, total_tokens, thd_sum_sq)
+        assert flops == expected
+        # THD must be strictly less than BSHD.
+        bshd_flops = num_floating_point_operations(args, batch_size)
+        assert flops < bshd_flops
+
+    @pytest.mark.parametrize("loss_coeff", [0.0, None])
+    def test_indexer_without_loss_is_forward_only(self, loss_coeff):
+        """With the indexer KL loss disabled the indexer has no backward pass.
+
+        ``DSAttention.forward`` runs it under ``torch.no_grad()`` in that case,
+        so its terms must drop from 2x/3x to 1x rather than keep the global
+        fwd+bwd factor. Everything outside the indexer is unchanged.
+        """
+        args = _make_dsa_args(dsa_indexer_loss_coeff=loss_coeff)
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        flops = num_floating_point_operations(args, batch_size)
+        assert flops == _dsa_golden_flops(args, total_tokens, sum_sq)
+        # A frozen indexer must cost strictly less than a trained one.
+        assert flops < num_floating_point_operations(_make_dsa_args(0.01), batch_size)
+
+    def test_cross_layer_index_sharing(self):
+        """Only layers that compute their own top-k index pay for the indexer.
+
+        ``dsa_indexer_topk_freq=1`` makes ``is_dsa_skip_topk_layer``
+        unconditionally False, so the layer-counting logic is only actually
+        exercised with sharing on. Here ``freq=4, offset=1`` leaves layers 1 and
+        5 computing out of 8, and ``_num_dsa_indexer_layers`` has to stay in
+        lockstep with the predicate in megatron.core.
+        """
+        args = _make_dsa_args()
+        args.num_layers = 8
+        args.dsa_indexer_topk_freq = 4
+        args.dsa_indexer_skip_topk_offset = 1
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+        sum_sq = batch_size * args.seq_length**2
+
+        # Layers 1..8 compute when (max(L - 1, 0) % 4) == 0, i.e. layers 1 and 5.
+        expected = _dsa_golden_flops(args, total_tokens, sum_sq, num_indexer_layers=2)
+        assert num_floating_point_operations(args, batch_size) == expected
+
+        # Sharing must be cheaper than every layer running its own indexer.
+        no_sharing = _make_dsa_args()
+        no_sharing.num_layers = 8
+        assert num_floating_point_operations(args, batch_size) < num_floating_point_operations(
+            no_sharing, batch_size
+        )
+
+
+def _make_dsa_pair(*, num_layers, moe):
+    """Build (standard_args, hybrid_args) for the SAME DSA model.
+
+    The standard-model path expresses it as ``num_layers`` fused layers
+    (MLA attention + FFN, ``experimental_attention_variant`` = ``dsa``); the
+    hybrid-model path expresses the identical model as a ``D<ffn>`` pattern with
+    one attention layer and one FFN layer each.
+
+    Both use ``dsa_indexer_topk_freq=1``. With cross-layer index sharing the two
+    expressions are genuinely different models rather than two spellings of one:
+    ``is_dsa_skip_topk_layer`` keys off the layer's global position, and the
+    hybrid pattern gives its DSA layers the odd positions (1, 3, 5, ...) because
+    the FFN layers are counted separately. Sharing therefore lands on a different
+    subset of layers and the FLOPs are legitimately allowed to differ.
+    """
+    ffn_symbol = "E" if moe else "-"
+
+    def _configure(args):
+        args.multi_latent_attention = True
+        args.group_query_attention = False
+        args.q_lora_rank = 128
+        args.kv_lora_rank = 64
+        args.qk_head_dim = 48
+        args.qk_pos_emb_head_dim = 16
+        args.v_head_dim = 64
+        args.experimental_attention_variant = "dsa"
+        args.dsa_indexer_n_heads = 4
+        args.dsa_indexer_head_dim = 32
+        args.dsa_indexer_topk = 16
+        args.dsa_indexer_topk_freq = 1
+        args.dsa_indexer_skip_topk_offset = 0
+        args.dsa_indexer_loss_coeff = 0.01
+        if moe:
+            args.num_experts = 256
+            args.moe_layer_freq = 1
+            args.moe_router_topk = 6
+            args.moe_ffn_hidden_size = 2048
+            args.moe_shared_expert_intermediate_size = 2048
+
+    standard = _make_gpt_args(
+        num_layers=num_layers,
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
+    )
+    _configure(standard)
+
+    hybrid = _make_gpt_args(
+        num_layers=num_layers,
+        hidden_size=512,
+        num_attention_heads=8,
+        seq_length=256,
+        ffn_hidden_size=2048,
+        padded_vocab_size=1024,
+    )
+    _configure(hybrid)
+    hybrid.mamba_state_dim = 128
+    hybrid.mamba_head_dim = 64
+    hybrid.mamba_num_groups = 8
+    hybrid.mamba_num_heads = 128
+    hybrid.hybrid_layer_pattern = "D" + ffn_symbol
+    hybrid.hybrid_layer_pattern *= num_layers
+    return standard, hybrid
+
+
+class TestDSAHybridMatchesStandard:
+    """The hybrid-model path and the standard-model path must agree for DSA.
+
+    A ``--hybrid-layer-pattern`` containing ``D`` builds a real ``DSAttention``
+    (``arguments.py`` sets ``experimental_attention_variant='dsa'`` for it), but
+    ``hybrid_flops`` used to fall through to the plain full-MLA helper: dense
+    ``O(L^2)`` core attention with no top-k scaling, and no indexer cost at all.
+    The same model therefore reported very different FLOPs depending only on
+    whether it was launched with a layer pattern.
+    """
+
+    @staticmethod
+    def _assert_match(*, num_layers, moe):
+        standard, hybrid = _make_dsa_pair(num_layers=num_layers, moe=moe)
+        batch_size = 2
+
+        # BSHD (closed-form defaults).
+        assert num_floating_point_operations(standard, batch_size) == num_floating_point_operations(
+            hybrid, batch_size
+        )
+
+        # THD: both paths must consume the ragged stats identically.
+        s = standard.seq_length
+        thd_sum_sq = batch_size * 4 * (s // 4) ** 2
+        thd_tokens = batch_size * s * 3 // 4
+        assert num_floating_point_operations(
+            standard,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=thd_tokens,
+        ) == num_floating_point_operations(
+            hybrid,
+            batch_size,
+            seqlen_squared_sum_in_batch=thd_sum_sq,
+            total_real_tokens_in_batch=thd_tokens,
+        )
+
+    def test_dense(self):
+        """Dense FFN: the two paths must agree."""
+        self._assert_match(num_layers=4, moe=False)
+
+    def test_moe(self):
+        """MoE FFN: the two paths must agree."""
+        self._assert_match(num_layers=4, moe=True)
+
+    def test_hybrid_overcount_is_gone(self):
+        """Pin the bug: a long sequence must not be charged dense ``L^2 / 2``.
+
+        With ``seq_length`` well past ``dsa_indexer_topk`` the old hybrid path
+        (dense MLA core, no indexer) was strictly more expensive than the
+        corrected estimate.
+        """
+        _, hybrid = _make_dsa_pair(num_layers=4, moe=False)
+        hybrid.seq_length = 8192
+        batch_size = 1
+
+        corrected = num_floating_point_operations(hybrid, batch_size)
+
+        # Same model with the sparse correction disabled == the old behaviour.
+        dense = SimpleNamespace(**vars(hybrid))
+        dense.experimental_attention_variant = None
+        assert corrected < num_floating_point_operations(dense, batch_size)
+
+
+class TestDSAHelperEdgeCases:
+    """Direct coverage of the helper guards and the hybrid MTP layer walk."""
+
+    def test_indexer_flops_zero_layers(self):
+        """No indexer layers (or missing dims) contribute nothing."""
+        from megatron.training.training import _lightning_indexer_flops
+
+        assert _lightning_indexer_flops(
+            hidden_size=512,
+            q_lora_rank=128,
+            n_heads=4,
+            head_dim=32,
+            num_indexer_layers=0,
+            key_proj_factor=1,
+            scoring_core_divisor=2,
+        ) == (0, 0)
+
+    def test_sparse_core_scale_degenerate_inputs(self):
+        """Zero tokens or an unset top-k fall back to the dense scale of 1.0."""
+        from megatron.training.training import _dsa_sparse_core_scale
+
+        assert _dsa_sparse_core_scale(0, 0, 2048) == 1.0
+        assert _dsa_sparse_core_scale(512, 512 * 4096, None) == 1.0
+
+    def test_hybrid_indexer_layer_walk_with_mtp(self):
+        """MTP 'D' layers are numbered past the main pattern, once per depth.
+
+        Pattern ``D-D-/D-`` with two MTP depths: main 'D's sit at global
+        positions 1 and 3; each MTP depth restarts at ``len(main) + 1 = 5``.
+        With ``freq=2, offset=1`` a layer computes when ``(L - 1) % 2 == 0``
+        (odd positions), so all six 'D' layers compute; with ``freq=4`` only
+        ``L in (1, 5)`` do -- main layer 1 plus the (identically numbered)
+        MTP layer in each of the two depths.
+        """
+        from megatron.training.training import _num_hybrid_dsa_indexer_layers
+
+        assert _num_hybrid_dsa_indexer_layers("D-D-/D-/D-", 1, 2) == 4
+        assert _num_hybrid_dsa_indexer_layers("D-D-/D-/D-", 1, 4) == 3
+
+    def test_config_requires_indexer_topk(self):
+        """An unset dsa_indexer_topk must fail at config time, not mid-run."""
+        from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+        kwargs = dict(
+            num_layers=4,
+            hidden_size=512,
+            num_attention_heads=8,
+            experimental_attention_variant="dsa",
+            add_bias_linear=False,
+            dsa_indexer_n_heads=4,
+            dsa_indexer_head_dim=32,
+        )
+        with pytest.raises(ValueError, match="dsa_indexer_topk must be set"):
+            MLATransformerConfig(**kwargs)
+        cfg = MLATransformerConfig(**kwargs, dsa_indexer_topk=16)
+        assert cfg.dsa_indexer_topk == 16
