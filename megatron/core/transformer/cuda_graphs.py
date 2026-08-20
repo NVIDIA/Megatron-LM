@@ -32,6 +32,7 @@ from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
+    ensure_params_ready,
     get_attr_wrapped_model,
     get_torch_version,
     is_te_min_version,
@@ -760,6 +761,7 @@ def delete_cuda_graphs():
         runner.fwd_graph = None
         runner.bwd_graph = None
         runner.mempool = None
+        runner._gtp_fwd_params_to_ensure_ready = ()
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
@@ -998,6 +1000,8 @@ class _CudaGraphRunner(torch.nn.Module):
         # Persistent wgrad slots written by this graph. Replay waits for each slot's previous RS
         # reader before launching the graph.
         self._gtp_wgrad_ring_slots = []
+        # GTP weights read by this forward graph before their owning module pre-hooks execute.
+        self._gtp_fwd_params_to_ensure_ready = ()
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
@@ -1385,8 +1389,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 if FREEZE_GC:
                     gc.freeze()
 
-                with torch.cuda.graph(
-                    self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                capture_comm_context = (
+                    track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
+                )
+                with (
+                    capture_comm_context as capture_comms,
+                    torch.cuda.graph(
+                        self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                    ),
                 ):
 
                     self._sync_against_side_streams(self.fwd_side_streams)
@@ -1404,6 +1414,11 @@ class _CudaGraphRunner(torch.nn.Module):
 
                     if self.use_stream:
                         self.fwd_completion_event.record()
+
+                if self.gtp_remat:
+                    self._gtp_fwd_params_to_ensure_ready = tuple(
+                        capture_comms.params_to_ensure_ready
+                    )
 
                 # Unfreeze GC.
                 if FREEZE_GC:
@@ -1714,6 +1729,9 @@ class _CudaGraphRunner(torch.nn.Module):
         if mismatch_errors:
             error_msg = "CUDA graph argument mismatch:\n" + "\n".join(mismatch_errors)
             raise AssertionError(error_msg)
+
+        if self._gtp_fwd_params_to_ensure_ready:
+            ensure_params_ready(self._gtp_fwd_params_to_ensure_ready)
 
         inp_tensors = self.get_tensors(args, kwargs, check_types=False)
         if self.grad_enabled:
