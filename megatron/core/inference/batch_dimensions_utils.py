@@ -16,6 +16,14 @@ import torch
 
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
+# Canonical token-count alignment multiple for dynamic inference. The eager
+# path's DynamicInferenceContext.TOKEN_ROUNDER references this constant, and
+# batch-invariant mode aligns every CUDA-graph bucket to it (norm kernels
+# select reduction codepaths by M % 32 alignment class; see
+# _batch_invariant_token_align). Single source of truth: do not restate the
+# literal elsewhere.
+TOKEN_ROUNDER = 64
+
 
 @dataclass(order=True, frozen=True)
 class InferenceBatchDimensions:
@@ -216,14 +224,8 @@ def _batch_invariant_token_align(token_count: int) -> int:
     graphed norms execute in a different bit-class, breaking cross-batch
     bit-equality.  Request counts are untouched (mirrors eager semantics).
     """
-    # Lazy import (dynamic_context imports this module at its top level).
-    # Tying to TOKEN_ROUNDER keeps the graph-bucket alignment and the eager
-    # path's padding multiple from drifting apart.
-    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-
-    rounder = DynamicInferenceContext.TOKEN_ROUNDER
-    rounded_up = math.ceil(token_count / rounder) * rounder
-    return max(rounder, rounded_up)
+    rounded_up = math.ceil(token_count / TOKEN_ROUNDER) * TOKEN_ROUNDER
+    return max(TOKEN_ROUNDER, rounded_up)
 
 
 def _batch_invariant_mode_enabled() -> bool:
@@ -309,9 +311,9 @@ class CUDAGraphBatchDimensionBuilder:
 
         rounder = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
         if _batch_invariant_mode_enabled():
-            # Batch-invariant mode: 64-multiple token ladder (see
+            # Batch-invariant mode: TOKEN_ROUNDER-multiple token ladder (see
             # _batch_invariant_token_align).
-            rounder = 64
+            rounder = TOKEN_ROUNDER
             cuda_graph_max_tokens = _batch_invariant_token_align(cuda_graph_max_tokens)
 
         # Cuda graph step size.
@@ -346,8 +348,8 @@ class CUDAGraphBatchDimensionBuilder:
 
         # Always include the endpoints: cuda_graph_max_tokens (largest) and tp_size (smallest).
         sizes.add(cuda_graph_max_tokens)
-        # Batch-invariant mode: smallest bucket is 64, never tp_size.
-        sizes.add(64 if _batch_invariant_mode_enabled() else tp_size)
+        # Batch-invariant mode: smallest bucket is TOKEN_ROUNDER, never tp_size.
+        sizes.add(TOKEN_ROUNDER if _batch_invariant_mode_enabled() else tp_size)
 
         cuda_graph_token_counts = sorted(sizes, reverse=True)
 
