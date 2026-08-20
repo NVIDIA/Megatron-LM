@@ -65,6 +65,7 @@ from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
+    _pop_high_precision_init_val,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
     param_group_identifier_keys,
@@ -432,22 +433,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # precision at the beginning of training (this problem will not occur if the
                         # training is long enough or if the main params are loaded from a
                         # checkpoint).
-                        if cls._is_distopt_quantized_param(model_param) or is_nvfp4tensor(
-                            model_param
-                        ):
-                            if hasattr(model_param, 'get_high_precision_init_val'):
-                                shard_main_param = (
-                                    model_param.get_high_precision_init_val()
-                                    .view(-1)[param_range.start : param_range.end]
-                                    .clone()
-                                    .to(model_param.device)
-                                    .float()
-                                )
-                                model_param.clear_high_precision_init_val()
-                            else:
-                                shard_main_param = model_param.float().view(-1)[
+                        high_precision_init_val = _pop_high_precision_init_val(model_param)
+                        if high_precision_init_val is not None:
+                            shard_main_param = (
+                                high_precision_init_val.view(-1)[
                                     param_range.start : param_range.end
                                 ]
+                                .clone()
+                                .to(model_param.device)
+                                .float()
+                            )
+                        elif cls._is_distopt_quantized_param(model_param) or is_nvfp4tensor(
+                            model_param
+                        ):
+                            shard_main_param = model_param.float().view(-1)[
+                                param_range.start : param_range.end
+                            ]
                         else:
                             shard_main_param = shard_model_param.clone().float()
 

@@ -13,6 +13,28 @@ from typing import Any, Iterable
 import torch
 from torch import nn
 
+_MOK_HIGH_PRECISION_INIT_ATTR = "_mok_high_precision_init_val"
+_MOK_MXFP8_COMPAT_WARNING_EMITTED = False
+
+
+def _warn_mxfp8_compatibility_fallback() -> None:
+    """Emit the non-single MXFP8 hybrid-memory tradeoff once on rank zero."""
+    global _MOK_MXFP8_COMPAT_WARNING_EMITTED
+    if _MOK_MXFP8_COMPAT_WARNING_EMITTED:
+        return
+    _MOK_MXFP8_COMPAT_WARNING_EMITTED = True
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    print(
+        "WARNING: MOK MXFP8 with moe_single_grouped_weight=False uses the "
+        "hybrid compatibility fallback: routed weights remain BF16 parameters and "
+        "use BF16 parameter buffers, while other eligible TE parameters retain the "
+        "configured FP8 parameter gather and grad-buffer reuse behavior. MOK also "
+        "materializes cached rowwise/columnwise MXFP8 routed-weight copies, which uses "
+        "substantially more GPU memory than the native single-grouped path.",
+        flush=True,
+    )
+
 
 def _copy_parameter_attributes(dst: nn.Parameter, src: torch.Tensor, *, allreduce: bool) -> None:
     """Copy the parameter metadata MCore uses for optimizer/DDP classification."""
@@ -37,6 +59,28 @@ def _dequantize_bf16(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to(dtype=torch.bfloat16)
 
 
+def _materialize_parameter_init(tensor: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """Return the logical initialization value and whether TE preserved it losslessly."""
+    get_high_precision_init_val = getattr(tensor, "get_high_precision_init_val", None)
+    if callable(get_high_precision_init_val):
+        init_val = get_high_precision_init_val().detach()
+        tensor.clear_high_precision_init_val()
+        return init_val, True
+    return _dequantize_bf16(tensor), False
+
+
+def _attach_high_precision_init(param: nn.Parameter, init_val: torch.Tensor | None) -> None:
+    """Preserve a reordered pre-quantization init until MCore creates its FP32 master."""
+    if init_val is None:
+        return
+    if init_val.shape != param.shape:
+        raise RuntimeError(
+            "MOK high-precision initialization shape mismatch: "
+            f"init={tuple(init_val.shape)}, param={tuple(param.shape)}"
+        )
+    setattr(param, _MOK_HIGH_PRECISION_INIT_ATTR, init_val.detach().contiguous())
+
+
 def _indexed_grouped_weight(linear: nn.Module, index: int, num_experts: int) -> torch.Tensor:
     """Return one logical expert weight from either TE grouped layout."""
     if not getattr(linear, "single_grouped_weight", False):
@@ -53,7 +97,9 @@ def _indexed_grouped_weight(linear: nn.Module, index: int, num_experts: int) -> 
             f"Cannot split grouped weight with shape {tuple(weight.shape)} "
             f"into {num_experts} experts"
         )
-    return weight.narrow(0, index * (weight.shape[0] // num_experts), weight.shape[0] // num_experts)
+    return weight.narrow(
+        0, index * (weight.shape[0] // num_experts), weight.shape[0] // num_experts
+    )
 
 
 def _new_bf16_parameter(
@@ -68,14 +114,19 @@ def _new_bf16_parameter(
 
 
 def _dummy_weight_gradient(param: nn.Parameter) -> torch.Tensor:
-    """Return TE's shared dummy tensor used to trigger MCore DDP hooks."""
-    from transformer_engine.pytorch.module.base import get_dummy_wgrad
+    """Return a storage-free gradient sentinel used to trigger MCore DDP hooks.
 
-    return get_dummy_wgrad(list(param.shape), param.dtype)
+    MOK has already accumulated the numerical gradient into ``main_grad``. The
+    autograd return only needs the parameter's shape and dtype so that MCore's
+    post-accumulate hook runs; the hook does not read it when
+    ``grad_added_to_main_grad`` is true. A detached parameter view therefore
+    avoids allocating a full-sized dummy gradient.
+    """
+    return param.detach()
 
 
 def _main_grad_buffer(param: nn.Parameter) -> torch.Tensor:
-    """Return and validate the optimizer-visible FP32 gradient buffer."""
+    """Return and validate the optimizer-visible FP32 or BF16 gradient buffer."""
     main_grad = getattr(param, "main_grad", None)
     if main_grad is None:
         raise RuntimeError(
@@ -86,8 +137,10 @@ def _main_grad_buffer(param: nn.Parameter) -> torch.Tensor:
             "MOK weight-gradient shape mismatch: "
             f"main_grad={tuple(main_grad.shape)}, param={tuple(param.shape)}"
         )
-    if main_grad.dtype != torch.float32 or not main_grad.is_contiguous():
-        raise RuntimeError("MOK direct accumulation requires contiguous FP32 main_grad")
+    if main_grad.dtype not in (torch.float32, torch.bfloat16):
+        raise RuntimeError("MOK direct accumulation requires FP32 or BF16 main_grad")
+    if not main_grad.is_contiguous():
+        raise RuntimeError("MOK direct accumulation requires contiguous main_grad")
     if getattr(param, "zero_out_wgrad", False):
         raise RuntimeError("MOK does not support zero_out_wgrad parameters")
     if main_grad.device != param.device:
@@ -99,6 +152,206 @@ def _finish_weight_gradient(param: nn.Parameter) -> torch.Tensor:
     """Mark an in-kernel accumulation complete and return a DDP hook-only grad."""
     param.grad_added_to_main_grad = True
     return _dummy_weight_gradient(param)
+
+
+def _storage_view(
+    storage: torch.Tensor,
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    name: str,
+) -> torch.Tensor:
+    """Return a zero-copy dense view over a TE grouped backing tensor."""
+    if not storage.is_cuda or not storage.is_contiguous():
+        raise RuntimeError(f"MOK {name} storage must be contiguous CUDA storage")
+    if storage.dtype != dtype:
+        if storage.dtype == torch.uint8 and dtype == torch.float8_e4m3fn:
+            storage = storage.view(dtype)
+        else:
+            raise RuntimeError(
+                f"MOK {name} storage has dtype {storage.dtype}, expected {dtype}"
+            )
+    expected_numel = 1
+    for dim in shape:
+        expected_numel *= dim
+    if storage.numel() != expected_numel:
+        raise RuntimeError(
+            f"MOK {name} storage size mismatch: got {storage.numel()}, "
+            f"expected {expected_numel} for {shape}"
+        )
+    return storage.view(shape)
+
+
+def _grouped_mxfp8_scale_view(
+    param: nn.Parameter,
+    member_attr: str,
+    shape: tuple[int, ...],
+    *,
+    name: str,
+) -> torch.Tensor:
+    """Expose all experts' contiguous TE MXFP8 scale storage through member zero."""
+    from megatron.core.fp8_utils import get_grouped_quantized_members
+
+    members = get_grouped_quantized_members(param)
+    if not members:
+        raise RuntimeError(f"MOK {name} grouped parameter has no quantized members")
+    first = getattr(members[0], member_attr, None)
+    if first is None or first.dtype != torch.uint8 or not first.is_contiguous():
+        raise RuntimeError(
+            f"MOK {name} requires contiguous uint8 TE member storage {member_attr}"
+        )
+    expected_numel = 1
+    for dim in shape:
+        expected_numel *= dim
+    storage_numel = first.untyped_storage().nbytes() // first.element_size()
+    available_numel = storage_numel - first.storage_offset()
+    if available_numel < expected_numel:
+        raise RuntimeError(
+            f"MOK {name} scale storage is too small: available={available_numel}, "
+            f"expected={expected_numel}"
+        )
+    flat = torch.as_strided(
+        first,
+        (expected_numel,),
+        (1,),
+        storage_offset=first.storage_offset(),
+    )
+    return flat.view(shape)
+
+
+def _swizzle_mxfp8_scale(
+    logical_scale: torch.Tensor,
+    *,
+    rows: int,
+    columns: int,
+) -> torch.Tensor:
+    """Convert TE's logical E8M0 matrix to MOK's tcgen05 scale layout.
+
+    TE stores rowwise scales as ``[E, M, K / 32]``. MOK consumes the
+    tcgen05 1x scale-factor layout ``[E * M / 128, K / 128, 32, 16]``.
+    Only the scale bytes are copied; the much larger FP8 payload stays in
+    native TE storage.
+    """
+    if rows % 128 != 0 or columns % 128 != 0:
+        raise RuntimeError("MOK MXFP8 scale dimensions must be divisible by 128")
+    if logical_scale.dtype != torch.uint8 or logical_scale.ndim != 3:
+        raise RuntimeError("MOK requires logical uint8 MXFP8 scales shaped [E, M, K/32]")
+    num_experts = logical_scale.shape[0]
+    expected_shape = (num_experts, rows, columns // 32)
+    if tuple(logical_scale.shape) != expected_shape:
+        raise RuntimeError(
+            f"MOK logical scale shape mismatch: got {tuple(logical_scale.shape)}, "
+            f"expected {expected_shape}"
+        )
+    return (
+        logical_scale.reshape(
+            num_experts, rows // 128, 128, columns // 128, 4
+        )
+        .permute(0, 1, 3, 2, 4)
+        .reshape(num_experts, rows // 128, columns // 128, 4, 32, 4)
+        .transpose(-3, -2)
+        .reshape(num_experts * rows // 128, columns // 128, 32, 16)
+        .contiguous()
+    )
+
+
+def _native_single_grouped_weight_views(
+    fc1: nn.Parameter,
+    fc2: nn.Parameter,
+    *,
+    num_experts: int,
+    intermediate_size: int,
+    hidden_size: int,
+    use_mxfp8: bool,
+):
+    """Build MOK gate/up/down views directly over native TE grouped parameters."""
+    e, i, h = num_experts, intermediate_size, hidden_size
+    if tuple(fc1.shape) != (e, 2 * i, h) or tuple(fc2.shape) != (e, h, i):
+        raise RuntimeError(
+            "MOK requires native single-grouped FC1/FC2 shapes "
+            f"{(e, 2 * i, h)} and {(e, h, i)}, got "
+            f"{tuple(fc1.shape)} and {tuple(fc2.shape)}"
+        )
+
+    if not use_mxfp8:
+        if fc1.dtype != torch.bfloat16 or fc2.dtype != torch.bfloat16:
+            raise RuntimeError("MOK BF16 requires native BF16 grouped parameters")
+        if not fc1.is_contiguous() or not fc2.is_contiguous():
+            raise RuntimeError("MOK BF16 requires contiguous grouped parameters")
+        # A high-precision TE GroupedTensor keeps its authoritative payload in
+        # rowwise_data. Passing the wrapper itself through a custom op makes TE
+        # materialize each argument independently with torch.stack(), which
+        # both copies the weights and loses the gate/up pointer alias MOK uses
+        # to recognize a combined [E, 2I, H] FC1 tensor. Expose the backing
+        # storage directly so gate and up remain zero-copy aliases.
+        fc1_storage = getattr(fc1, "rowwise_data", None)
+        fc2_storage = getattr(fc2, "rowwise_data", None)
+        if fc1_storage is not None or fc2_storage is not None:
+            if fc1_storage is None or fc2_storage is None:
+                raise RuntimeError(
+                    "MOK BF16 requires both grouped parameters to expose rowwise_data"
+                )
+            fc1_view = _storage_view(
+                fc1_storage, (e, 2 * i, h), dtype=torch.bfloat16, name="FC1 BF16 rowwise"
+            )
+            fc2_view = _storage_view(
+                fc2_storage, (e, h, i), dtype=torch.bfloat16, name="FC2 BF16 rowwise"
+            )
+            return fc1_view, fc1_view, fc2_view
+        return fc1, fc1, fc2
+
+    from megatron.core.fp8_utils import is_grouped_mxfp8tensor
+
+    if not is_grouped_mxfp8tensor(fc1) or not is_grouped_mxfp8tensor(fc2):
+        raise RuntimeError("MOK MXFP8 requires native TE grouped MXFP8 parameters")
+
+    fc1_row = _storage_view(
+        fc1.rowwise_data, (e, 2 * i, h), dtype=torch.float8_e4m3fn, name="FC1 rowwise"
+    )
+    fc1_col = _storage_view(
+        fc1.columnwise_data,
+        (e, 2 * i, h),
+        dtype=torch.float8_e4m3fn,
+        name="FC1 columnwise",
+    )
+    fc2_row = _storage_view(
+        fc2.rowwise_data, (e, h, i), dtype=torch.float8_e4m3fn, name="FC2 rowwise"
+    )
+    fc2_col = _storage_view(
+        fc2.columnwise_data,
+        (e, h, i),
+        dtype=torch.float8_e4m3fn,
+        name="FC2 columnwise",
+    )
+    # TE keeps E8M0 scales in logical order. Rowwise member storage is
+    # [M, K/32]; columnwise member storage is [M/32, K] for the original
+    # matrix, so transpose the latter into logical order for the transposed
+    # FP8 payload. These are all zero-copy views.
+    fc1_row_sc = _grouped_mxfp8_scale_view(
+        fc1, "_rowwise_scale_inv", (e, 2 * i, h // 32), name="FC1 rowwise"
+    )
+    fc1_col_sc = _grouped_mxfp8_scale_view(
+        fc1,
+        "_columnwise_scale_inv",
+        (e, 2 * i // 32, h),
+        name="FC1 columnwise",
+    ).transpose(-2, -1)
+    fc2_row_sc = _grouped_mxfp8_scale_view(
+        fc2, "_rowwise_scale_inv", (e, h, i // 32), name="FC2 rowwise"
+    )
+    fc2_col_sc = _grouped_mxfp8_scale_view(
+        fc2,
+        "_columnwise_scale_inv",
+        (e, h // 32, i),
+        name="FC2 columnwise",
+    ).transpose(-2, -1)
+    # The final flag tells MOK that ``columnwise_data`` is TE's native
+    # columnwise-quantized storage in the original [E, M, K] tensor shape.
+    # MOK can then consume it directly for dgrad instead of materializing an
+    # explicit [E, K, M] transpose on every backward.
+    fc1_views = (fc1_row, fc1_row_sc, fc1_col, fc1_col_sc, True)
+    fc2_views = (fc2_row, fc2_row_sc, fc2_col, fc2_col_sc, True)
+    return fc1_views, fc1_views, fc2_views
 
 
 @torch.no_grad()
@@ -113,6 +366,24 @@ def _accumulate_weight_gradient(param: nn.Parameter, grad: torch.Tensor) -> torc
     main_grad.add_(grad)
     return _finish_weight_gradient(param)
 
+
+def _mok_mxfp8_backward_weight_views(
+    native_weight: tuple[torch.Tensor, ...],
+    *,
+    rows: int,
+    columns: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Prepare zero-copy payloads and compact scale layouts for forward/backward."""
+    row_data, row_scale, column_data, column_scale, native_columnwise = native_weight
+    if native_columnwise is not True:
+        raise RuntimeError("MOK MCore integration requires native TE columnwise weights")
+    return (
+        row_data,
+        _swizzle_mxfp8_scale(row_scale, rows=rows, columns=columns),
+        column_data,
+        _swizzle_mxfp8_scale(column_scale, rows=columns, columns=rows),
+        True,
+    )
 
 class _MoKAutograd(torch.autograd.Function):
     """Autograd bridge from MCore parameters to MoK's functional API."""
@@ -142,15 +413,17 @@ class _MoKAutograd(torch.autograd.Function):
             topk=top_experts.shape[1],
         )
         schedule = functional.build_schedule(
-            workspace,
-            module.mok_config,
-            top_experts,
-            num_local_experts=module.num_local_experts,
+            workspace, module.mok_config, top_experts, num_local_experts=module.num_local_experts
         )
-        gate_q, up_q, down_q = module.quantized_routed_weights()
-        gate_forward = gate_q[:2] if isinstance(gate_q, tuple) else gate_q
-        up_forward = up_q[:2] if isinstance(up_q, tuple) else up_q
-        down_forward = down_q[:2] if isinstance(down_q, tuple) else down_q
+        prepared_gate, prepared_up, prepared_down = module.quantized_routed_weights()
+        if module.use_mxfp8_weights:
+            gate_forward = prepared_gate[:2]
+            up_forward = prepared_up[:2]
+            down_forward = prepared_down[:2]
+        else:
+            gate_forward = prepared_gate
+            up_forward = prepared_up
+            down_forward = prepared_down
         output, forward_context = functional.forward(
             module.mok_config,
             workspace,
@@ -170,7 +443,7 @@ class _MoKAutograd(torch.autograd.Function):
         ctx.workspace = workspace
         ctx.schedule = schedule
         ctx.forward_context = forward_context
-        ctx.quantized_weights = (gate_q, up_q, down_q)
+        ctx.quantized_weights = (prepared_gate, prepared_up, prepared_down)
         ctx.save_for_backward(
             x,
             router_weights,
@@ -197,18 +470,23 @@ class _MoKAutograd(torch.autograd.Function):
             shared_up,
             shared_down,
         ) = ctx.saved_tensors
-        gate_q, up_q, down_q = ctx.quantized_weights
-        backward_gate = gate_q
-        backward_up = up_q
-        backward_down = down_q[2:] if isinstance(down_q, tuple) else down_q
+        prepared_gate, prepared_up, prepared_down = ctx.quantized_weights
+        if ctx.module.use_mxfp8_weights:
+            backward_gate = prepared_gate
+            backward_up = prepared_up
+            backward_down = prepared_down[2:]
+        else:
+            backward_gate = prepared_gate
+            backward_up = prepared_up
+            backward_down = prepared_down
         direct_wgrad_accumulation = ctx.module.fuse_wgrad_accumulation
         main_grads = None
         if direct_wgrad_accumulation:
             main_grads = (
                 _main_grad_buffer(ctx.module.shared_gate_weight),
-                _main_grad_buffer(ctx.module.routed_gate_weight),
+                _main_grad_buffer(ctx.module.routed_gate_parameter),
                 _main_grad_buffer(ctx.module.shared_up_weight),
-                _main_grad_buffer(ctx.module.routed_up_weight),
+                _main_grad_buffer(ctx.module.routed_up_parameter),
                 _main_grad_buffer(ctx.module.shared_down_weight),
                 _main_grad_buffer(ctx.module.routed_down_weight),
             )
@@ -240,8 +518,13 @@ class _MoKAutograd(torch.autograd.Function):
         )
 
         if ctx.module.fuse_wgrad_accumulation:
-            d_routed_gate = _finish_weight_gradient(ctx.module.routed_gate_weight)
-            d_routed_up = _finish_weight_gradient(ctx.module.routed_up_weight)
+            d_routed_gate = _finish_weight_gradient(ctx.module.routed_gate_parameter)
+            if ctx.module.native_single_grouped_weights:
+                # Gate and up are logical views of one FC1 parameter. MOK has
+                # accumulated both halves into the same main_grad already.
+                d_routed_up = None
+            else:
+                d_routed_up = _finish_weight_gradient(ctx.module.routed_up_parameter)
             d_routed_down = _finish_weight_gradient(ctx.module.routed_down_weight)
             d_shared_gate = _finish_weight_gradient(ctx.module.shared_gate_weight)
             d_shared_up = _finish_weight_gradient(ctx.module.shared_up_weight)
@@ -286,6 +569,10 @@ class MoKMegakernel(nn.Module):
                 "on PYTHONPATH"
             ) from exc
 
+        if config.moe_single_grouped_weight and not config.gradient_accumulation_fusion:
+            raise ValueError(
+                "MOK native grouped weights require gradient_accumulation_fusion=True"
+            )
         if config.moe_mlp_glu_interleave_size is not None:
             raise ValueError("MoK weight import requires non-interleaved MCore routed FC1 weights")
         if config.moe_shared_expert_glu_interleave_size is not None:
@@ -302,6 +589,7 @@ class MoKMegakernel(nn.Module):
         self.swiglu_limit = config.activation_func_clamp_value
         self.use_mxfp8_weights = config.mok_use_mxfp8_weights
         self.fuse_wgrad_accumulation = config.gradient_accumulation_fusion
+        self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
         self.mok_config = MoKConfig(
             fwd_num_comm_sms=config.mok_fwd_num_comm_sms,
             bwd_num_comm_sms=config.mok_bwd_num_comm_sms,
@@ -312,14 +600,52 @@ class MoKMegakernel(nn.Module):
             scale_router_before_fc2=config.mok_scale_router_before_fc2,
         )
 
-        self._import_routed_weights(routed_experts)
+        fc1 = routed_experts.linear_fc1
+        fc2 = routed_experts.linear_fc2
+        actual_single_grouped = bool(getattr(fc1, "single_grouped_weight", False))
+        if actual_single_grouped != bool(getattr(fc2, "single_grouped_weight", False)):
+            raise ValueError("MOK requires routed FC1 and FC2 to use the same weight layout")
+        if actual_single_grouped != self.native_single_grouped_weights:
+            raise ValueError(
+                "MOK routed weight layout does not match config.moe_single_grouped_weight"
+            )
+
+        if self.native_single_grouped_weights:
+            # Register aliases of the same Parameter objects so DDP's MOK forward
+            # pre-hook waits for their overlap-param-gather buckets. named_parameters
+            # deduplicates them; no additional payload storage is allocated.
+            self.register_parameter("routed_fc1_weight", fc1.weight)
+            self.register_parameter("routed_down_weight", fc2.weight)
+        else:
+            # Per-expert MCore parameters are separate allocations and cannot be
+            # viewed as the dense expert-major tensors consumed by MOK. Import
+            # once into MOK-owned contiguous BF16 gate/up/down parameters. The
+            # caller unregisters the source experts, so these become the only
+            # routed optimizer/DDP parameters rather than duplicate weights.
+            self._import_routed_weights(routed_experts)
+            if self.use_mxfp8_weights:
+                _warn_mxfp8_compatibility_fallback()
+
         self._import_shared_weights(shared_experts)
 
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
         self.is_first_microbatch = True
+        self._prepared_routed_weight_cache = None
         self._quantized_cache: tuple[Any, Any, Any] | None = None
         self._quantized_versions: tuple[int, int, int] | None = None
+
+    @property
+    def routed_gate_parameter(self) -> nn.Parameter:
+        if self.native_single_grouped_weights:
+            return self.routed_fc1_weight
+        return self.routed_gate_weight
+
+    @property
+    def routed_up_parameter(self) -> nn.Parameter:
+        if self.native_single_grouped_weights:
+            return self.routed_fc1_weight
+        return self.routed_up_weight
 
     @torch.no_grad()
     def _import_routed_weights(self, experts: nn.Module) -> None:
@@ -333,16 +659,53 @@ class MoKMegakernel(nn.Module):
         self.routed_up_weight = _new_bf16_parameter((e, i, h), fc1_ref, allreduce=False)
         self.routed_down_weight = _new_bf16_parameter((e, h, i), fc2_ref, allreduce=False)
 
+        routed_gate_init = None
+        routed_up_init = None
+        routed_down_init = None
+        fc1_has_preserved_init = None
+        fc2_has_preserved_init = None
+
         for expert_idx in range(e):
-            source_fc1 = _dequantize_bf16(
+            source_fc1, current_fc1_has_preserved_init = _materialize_parameter_init(
                 _indexed_grouped_weight(fc1, expert_idx, self.num_local_experts)
-            ).reshape(2 * i, h)
-            source_fc2 = _dequantize_bf16(
+            )
+            source_fc2, current_fc2_has_preserved_init = _materialize_parameter_init(
                 _indexed_grouped_weight(fc2, expert_idx, self.num_local_experts)
-            ).reshape(h, i)
-            self.routed_gate_weight[expert_idx].copy_(source_fc1[:i])
-            self.routed_up_weight[expert_idx].copy_(source_fc1[i:])
-            self.routed_down_weight[expert_idx].copy_(source_fc2)
+            )
+            source_fc1 = source_fc1.reshape(2 * i, h)
+            source_fc2 = source_fc2.reshape(h, i)
+
+            if fc1_has_preserved_init is None:
+                fc1_has_preserved_init = current_fc1_has_preserved_init
+                if fc1_has_preserved_init:
+                    routed_gate_init = torch.empty(
+                        (e, i, h), dtype=source_fc1.dtype, device=source_fc1.device
+                    )
+                    routed_up_init = torch.empty_like(routed_gate_init)
+            elif fc1_has_preserved_init != current_fc1_has_preserved_init:
+                raise RuntimeError("MOK routed FC1 weights have inconsistent initialization state")
+
+            if fc2_has_preserved_init is None:
+                fc2_has_preserved_init = current_fc2_has_preserved_init
+                if fc2_has_preserved_init:
+                    routed_down_init = torch.empty(
+                        (e, h, i), dtype=source_fc2.dtype, device=source_fc2.device
+                    )
+            elif fc2_has_preserved_init != current_fc2_has_preserved_init:
+                raise RuntimeError("MOK routed FC2 weights have inconsistent initialization state")
+
+            self.routed_gate_weight[expert_idx].copy_(source_fc1[:i].to(torch.bfloat16))
+            self.routed_up_weight[expert_idx].copy_(source_fc1[i:].to(torch.bfloat16))
+            self.routed_down_weight[expert_idx].copy_(source_fc2.to(torch.bfloat16))
+            if routed_gate_init is not None:
+                routed_gate_init[expert_idx].copy_(source_fc1[:i])
+                routed_up_init[expert_idx].copy_(source_fc1[i:])
+            if routed_down_init is not None:
+                routed_down_init[expert_idx].copy_(source_fc2)
+
+        _attach_high_precision_init(self.routed_gate_weight, routed_gate_init)
+        _attach_high_precision_init(self.routed_up_weight, routed_up_init)
+        _attach_high_precision_init(self.routed_down_weight, routed_down_init)
 
     @torch.no_grad()
     def _import_shared_weights(self, shared: nn.Module) -> None:
@@ -365,48 +728,110 @@ class MoKMegakernel(nn.Module):
         self.shared_down_weight = _new_bf16_parameter(
             (h, routed_i), fc2_ref, allreduce=True, zero=True
         )
-        source_fc1 = _dequantize_bf16(fc1_ref).reshape(2 * shared_i, h)
-        source_fc2 = _dequantize_bf16(fc2_ref).reshape(h, shared_i)
-        self.shared_gate_weight[:shared_i].copy_(source_fc1[:shared_i])
-        self.shared_up_weight[:shared_i].copy_(source_fc1[shared_i:])
-        self.shared_down_weight[:, :shared_i].copy_(source_fc2)
+        source_fc1, fc1_has_preserved_init = _materialize_parameter_init(fc1_ref)
+        source_fc2, fc2_has_preserved_init = _materialize_parameter_init(fc2_ref)
+        source_fc1 = source_fc1.reshape(2 * shared_i, h)
+        source_fc2 = source_fc2.reshape(h, shared_i)
+        self.shared_gate_weight[:shared_i].copy_(source_fc1[:shared_i].to(torch.bfloat16))
+        self.shared_up_weight[:shared_i].copy_(source_fc1[shared_i:].to(torch.bfloat16))
+        self.shared_down_weight[:, :shared_i].copy_(source_fc2.to(torch.bfloat16))
+
+        shared_gate_init = None
+        shared_up_init = None
+        shared_down_init = None
+        if fc1_has_preserved_init:
+            shared_gate_init = torch.zeros(
+                (routed_i, h), dtype=source_fc1.dtype, device=source_fc1.device
+            )
+            shared_up_init = torch.zeros_like(shared_gate_init)
+            shared_gate_init[:shared_i].copy_(source_fc1[:shared_i])
+            shared_up_init[:shared_i].copy_(source_fc1[shared_i:])
+        if fc2_has_preserved_init:
+            shared_down_init = torch.zeros(
+                (h, routed_i), dtype=source_fc2.dtype, device=source_fc2.device
+            )
+            shared_down_init[:, :shared_i].copy_(source_fc2)
+
+        _attach_high_precision_init(self.shared_gate_weight, shared_gate_init)
+        _attach_high_precision_init(self.shared_up_weight, shared_up_init)
+        _attach_high_precision_init(self.shared_down_weight, shared_down_init)
 
     @torch.no_grad()
     def quantized_routed_weights(self):
-        """Refresh normal+transposed MXFP8 copies once per optimizer iteration."""
-        if not self.use_mxfp8_weights:
-            return (
-                self.routed_gate_weight,
-                self.routed_up_weight,
-                self.routed_down_weight,
-            )
+        """Prepare routed weights for native or compatibility storage layouts."""
+        if not self.native_single_grouped_weights:
+            if not self.use_mxfp8_weights:
+                self.is_first_microbatch = False
+                return (
+                    self.routed_gate_weight,
+                    self.routed_up_weight,
+                    self.routed_down_weight,
+                )
 
-        from mok.ops import mxfp8_quantize
+            from mok.ops import mxfp8_quantize
 
-        versions = (
-            self.routed_gate_weight._version,
-            self.routed_up_weight._version,
-            self.routed_down_weight._version,
-        )
-        if (
-            self._quantized_cache is None
-            or self.is_first_microbatch
-            or versions != self._quantized_versions
-        ):
-            self._quantized_cache = (
-                mxfp8_quantize(self.routed_gate_weight, True, True),
-                mxfp8_quantize(self.routed_up_weight, True, True),
-                mxfp8_quantize(self.routed_down_weight, True, True),
+            versions = (
+                self.routed_gate_weight._version,
+                self.routed_up_weight._version,
+                self.routed_down_weight._version,
             )
-            self._quantized_versions = versions
+            if (
+                self._quantized_cache is None
+                or self.is_first_microbatch
+                or versions != self._quantized_versions
+            ):
+                self._quantized_cache = (
+                    mxfp8_quantize(self.routed_gate_weight, True, True),
+                    mxfp8_quantize(self.routed_up_weight, True, True),
+                    mxfp8_quantize(self.routed_down_weight, True, True),
+                )
+                self._quantized_versions = versions
             self.is_first_microbatch = False
-        return self._quantized_cache
+            return self._quantized_cache
+
+        if not self.use_mxfp8_weights:
+            self.is_first_microbatch = False
+            return _native_single_grouped_weight_views(
+                self.routed_fc1_weight,
+                self.routed_down_weight,
+                num_experts=self.num_local_experts,
+                intermediate_size=self.intermediate_size,
+                hidden_size=self.hidden_size,
+                use_mxfp8=False,
+            )
+
+        if self._prepared_routed_weight_cache is None or self.is_first_microbatch:
+            native_gate, _, native_down = _native_single_grouped_weight_views(
+                self.routed_fc1_weight,
+                self.routed_down_weight,
+                num_experts=self.num_local_experts,
+                intermediate_size=self.intermediate_size,
+                hidden_size=self.hidden_size,
+                use_mxfp8=True,
+            )
+            prepared_gate = _mok_mxfp8_backward_weight_views(
+                native_gate,
+                rows=2 * self.intermediate_size,
+                columns=self.hidden_size,
+            )
+            prepared_down = _mok_mxfp8_backward_weight_views(
+                native_down,
+                rows=self.hidden_size,
+                columns=self.intermediate_size,
+            )
+            # Only the compact scale layouts allocate storage. FP8 row/column
+            # payloads remain zero-copy views of the current TE gather buffer.
+            self._prepared_routed_weight_cache = (
+                prepared_gate,
+                prepared_gate,
+                prepared_down,
+            )
+
+        self.is_first_microbatch = False
+        return self._prepared_routed_weight_cache
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        probs: torch.Tensor,
-        routing_map: torch.Tensor,
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ) -> torch.Tensor:
         del routing_map  # Router side effects/losses are already attached to probs.
         original_shape = hidden_states.shape
@@ -422,8 +847,8 @@ class MoKMegakernel(nn.Module):
             x,
             router_weights,
             top_experts,
-            self.routed_gate_weight,
-            self.routed_up_weight,
+            self.routed_gate_parameter,
+            self.routed_up_parameter,
             self.routed_down_weight,
             self.shared_gate_weight,
             self.shared_up_weight,

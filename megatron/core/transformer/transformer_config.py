@@ -775,7 +775,7 @@ class TransformerConfig(ModelParallelConfig):
     """Experimental: replace MoE dispatch, routed/shared expert MLPs, and combine with
     the external Mixture-of-Kittens megakernel. MCore still owns routing and trainable
     parameters. This path currently requires TP=1 and a shared expert. Routed weights may
-    use BF16 or MXFP8; fused gradient accumulation is currently BF16-only."""
+    use BF16 or MXFP8; fused gradient accumulation supports FP32 and BF16 main gradients."""
 
     mok_fwd_num_comm_sms: int = 40
     """Number of communication SMs used by the MoK forward megakernel."""
@@ -2007,12 +2007,14 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_single_grouped_weight is currently supported with high-precision "
                     "primary weights, fp8_recipe='mxfp8', or fp4_recipe='nvfp4'."
                 )
-            if not self.use_transformer_engine_op_fuser:
+            if not self.use_transformer_engine_op_fuser and not self.use_mok_megakernel:
                 raise ValueError(
                     "moe_single_grouped_weight requires "
                     "use_transformer_engine_op_fuser=True. The non-op-fuser TE GroupedLinear "
                     "path splits the grouped parameter into per-expert tensors and does not "
-                    "support single-grouped-weight training."
+                    "support single-grouped-weight training. The MOK integration is the only "
+                    "exception because it consumes the grouped parameter directly and never "
+                    "calls the TE GroupedLinear forward path."
                 )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
@@ -2081,6 +2083,11 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.use_mok_megakernel:
+            if self.moe_single_grouped_weight and not self.gradient_accumulation_fusion:
+                raise ValueError(
+                    "use_mok_megakernel with native grouped weights requires "
+                    "gradient_accumulation_fusion=True"
+                )
             if self.mok_use_mxfp8_weights and (
                 not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8
             ):
