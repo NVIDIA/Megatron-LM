@@ -2231,6 +2231,15 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if (
+                "gdn_norm_out" in self.recompute_modules
+                and self.experimental_attention_variant not in ["gdn", "kda"]
+            ):
+                raise ValueError(
+                    "gdn_norm_out in recompute_modules is only supported with "
+                    f"GDN-family layers, but got {self.experimental_attention_variant=}."
+                )
+
+            if (
                 "gdn" in self.recompute_modules
                 and self.experimental_attention_variant != "gated_delta_net"
             ):

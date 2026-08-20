@@ -529,6 +529,7 @@ class MultiLatentAttention(Attention):
         return self._apply_mla_output_gate(core_attn_out, gate)
 
     @staticmethod
+    @jit_fuser
     def _apply_mla_output_gate(core_attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Apply one native-dtype sigmoid gate per local MLA attention head."""
         output_shape = core_attn_out.shape
@@ -536,7 +537,7 @@ class MultiLatentAttention(Attention):
         # Preserve the Tiny/native BF16 autograd contract.  Casting to FP32 before
         # sigmoid can produce the same BF16 forward values while changing the
         # gate-input and gate-weight VJP.
-        gate = torch.sigmoid(gate)
+        gate = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
         core_attn_out = core_attn_out * gate.unsqueeze(-1)
         return core_attn_out.reshape(output_shape)
 
