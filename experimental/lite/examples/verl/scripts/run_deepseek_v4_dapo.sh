@@ -9,7 +9,7 @@
 #   Transformer Engine: >= 2.15.0
 #   nvidia-cudnn-frontend: >= 1.27.0, with DSA q_causal_offsets
 #   FlashInfer: 0.6.16.post3
-#   nvidia-cutlass-dsl: 4.5.2
+#   nvidia-cutlass-dsl: 4.6.2
 #   TileLang: 0.1.12
 #
 # validate_deepseek_v4_dapo.py enforces this contract before a real run.

@@ -67,12 +67,10 @@ export VERL_LOCAL_TASK_RUNNER=1
 export VERL_ENGINE_LAZY_IMPORTS=1
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 
-# The generic DAPO validator currently describes the older torch-2.12/dev631
-# runtime. This four-layer release gate instead targets the published clean
-# image whose torch-2.13/dev682 dependency closure is validated by the image
-# build and whose numerical result is checked below. Keep the generic validator
-# available to callers that explicitly opt in after updating its profile.
-export VALIDATE_DS4_ENVIRONMENT="${VALIDATE_DS4_ENVIRONMENT:-0}"
+# Dockerfile.1 provides the validated torch-2.12/dev631 runtime. Keep the
+# dependency check enabled so a direct invocation cannot silently use another
+# vLLM, CUTLASS, or CUDA closure.
+export VALIDATE_DS4_ENVIRONMENT="${VALIDATE_DS4_ENVIRONMENT:-1}"
 
 # This is an NVIDIA-only recipe. Some Slurm/Pyxis versions export the ROCm
 # visibility aliases alongside CUDA_VISIBLE_DEVICES; VERL correctly rejects

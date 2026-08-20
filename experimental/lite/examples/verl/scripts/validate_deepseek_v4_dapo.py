@@ -22,7 +22,7 @@ from packaging.version import Version
 EXACT_DEPENDENCIES = {
     "vllm": "0.26.1rc1.dev631+g5426311d9",
     "flashinfer-python": "0.6.16.post3",
-    "nvidia-cutlass-dsl": "4.5.2",
+    "nvidia-cutlass-dsl": "4.6.2",
     "tilelang": "0.1.12",
 }
 MINIMUM_DEPENDENCIES = {
