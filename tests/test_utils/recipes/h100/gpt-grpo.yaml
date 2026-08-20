@@ -10,7 +10,6 @@ spec:
   gpus: 1
   n_repeat: 1
   platforms: dgx_a100
-  inference_shards: ""
   script_setup: |
     set -euo pipefail
     unset https_proxy
@@ -44,7 +43,6 @@ spec:
     set -euo pipefail
     ls
     cd /opt/megatron-lm
-    export INFERENCE_SHARDS='{inference_shards}'
 
     ARGUMENTS=(
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
@@ -69,13 +67,6 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
-  - test_case: [gpt_grpo_disagg_nccl]
-    products:
-      - inference_shards: ["tp=2,pp=2,role=prefill+tp=1,pp=2,dp=2,role=decode"]
-        environment: [dev]
-        scope: [mr-github]
-        platforms: [dgx_h100]
-        gpus: [8]
   - test_case: [gpt_grpo_tp4_pp1_dp2_8b_throughput]
     products:
       - environment: [dev]

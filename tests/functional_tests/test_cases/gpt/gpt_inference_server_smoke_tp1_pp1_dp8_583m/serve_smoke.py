@@ -35,6 +35,7 @@ def build_server_cmd(
     tokenizer_model: str,
     server_log_dir: str = None,
     inference_shards: str = "",
+    num_gpus: int = 8,
 ) -> list[str]:
     """Build the ``launch_inference_server.py`` command for Mistral 0.5B.
 
@@ -65,7 +66,7 @@ def build_server_cmd(
         "-m",
         "torch.distributed.run",
         *log_args,
-        "--nproc-per-node=8",
+        f"--nproc-per-node={num_gpus}",
         "-m",
         "examples.inference.launch_inference_server",
         "--tiktoken-pattern",
@@ -178,10 +179,15 @@ def main() -> int:
         "dir so per-rank logs land where the harness expects them.",
     )
     parser.add_argument("--inference-shards", default="")
+    parser.add_argument("--num-gpus", type=int, default=8)
     args = parser.parse_args()
 
     cmd = build_server_cmd(
-        args.checkpoint_dir, args.tokenizer_model, args.server_log_dir, args.inference_shards
+        args.checkpoint_dir,
+        args.tokenizer_model,
+        args.server_log_dir,
+        args.inference_shards,
+        args.num_gpus,
     )
     print(f"[smoke] spawning server: {' '.join(cmd)}", flush=True)
 

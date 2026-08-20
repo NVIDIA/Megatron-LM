@@ -8,7 +8,7 @@ TEST_TYPE: frozen-start
 MODE: rl
 MODEL_ARGS:
   --tensor-model-parallel-size: 2
-  --pipeline-model-parallel-size: 4
+  --pipeline-model-parallel-size: 2
   --inference-shards: ${INFERENCE_SHARDS}
   --disagg-kv-transport-backend: nccl
   --inference-dynamic-batching-prefix-caching: true
