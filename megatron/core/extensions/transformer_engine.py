@@ -19,6 +19,7 @@ from torch import Tensor
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core.activations import situlu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -483,6 +484,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     layer_type = te.pytorch.ops.GEGLU
                 elif config.activation_func == F.silu:
                     layer_type = te.pytorch.ops.ReGLU
+                elif config.activation_func is situlu:
+                    layer_type = getattr(te.pytorch.ops, "SiTUGLU", None)
+                    if layer_type is None:
+                        raise RuntimeError(
+                            "SiTU-GLU requires Transformer Engine with "
+                            "pytorch.ops.SiTUGLU support."
+                        )
             else:
                 if config.activation_func == F.gelu:
                     layer_type = te.pytorch.ops.GELU
@@ -490,10 +498,14 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     layer_type = te.pytorch.ops.ReLU
             if layer_type is None:
                 raise Exception(
-                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
+                    'Only SwiGLU, SiTU-GLU, GEGLU, ReGLU, GELU, ReLU are supported by '
                     'transformer engine. Please set use_te_activation_func=False'
                 )
             activation_func_kwargs = {}
+            if config.activation_func is situlu:
+                activation_func_kwargs.update(
+                    beta1=config.situ_glu_beta1, beta2=config.situ_glu_beta2
+                )
             if config.activation_func_fp8_input_store:
                 activation_func_kwargs["cache_quantized_input"] = True
             layer = layer_type(**activation_func_kwargs)
@@ -2729,6 +2741,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 op_type = te.pytorch.ops.ReLU
             elif (activation_func, gated_linear_unit) == (F.relu, True):
                 op_type = te.pytorch.ops.ReGLU
+            elif (activation_func, gated_linear_unit) == (situlu, True):
+                op_type = getattr(te.pytorch.ops, "SiTUGLU", None)
+                if op_type is None:
+                    raise RuntimeError(
+                        "SiTU-GLU requires Transformer Engine with "
+                        "pytorch.ops.SiTUGLU support."
+                    )
 
             # Could not find corresponding activation op
             if op_type is None:
@@ -2740,6 +2759,10 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             # Construct op
             kwargs = {}
+            if activation_func is situlu:
+                kwargs.update(
+                    beta1=self.config.situ_glu_beta1, beta2=self.config.situ_glu_beta2
+                )
             if is_te_min_version("2.3"):
                 kwargs["cache_quantized_input"] = cache_quantized_input
             return op_type(**kwargs)
@@ -2908,14 +2931,23 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     f"{self.__class__.__name__} does not support add_bias_linear=True; "
                     "the CuTeGEMM fused kernel requires bias-free linear layers."
                 )
-            if self.config.activation_func != F.silu or not self.config.gated_linear_unit:
+            if not self.config.gated_linear_unit or self.config.activation_func not in (
+                F.silu,
+                situlu,
+            ):
                 raise ValueError(
-                    f"{self.__class__.__name__} requires SwiGLU activation "
-                    "(activation_func=F.silu, gated_linear_unit=True) "
+                    f"{self.__class__.__name__} requires SwiGLU or SiTU-GLU activation "
+                    "with gated_linear_unit=True "
                     "for the CuTeGEMM fused kernel, but got "
                     f"activation_func={self.config.activation_func}, "
                     f"gated_linear_unit={self.config.gated_linear_unit}."
                 )
+            if self.config.activation_func is situlu:
+                if not hasattr(te.pytorch.ops, "ScaledSiTUGLU"):
+                    raise RuntimeError(
+                        "SiTU-GLU requires Transformer Engine with "
+                        "pytorch.ops.ScaledSiTUGLU support."
+                    )
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
@@ -2992,9 +3024,19 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             op._glu_interleave_size = _GLU_INTERLEAVE_SIZE  # signals fuser_forward to interleave
             fused_impl.append(op)
 
-            # ScaledSwiGLU with glu_interleave_size=32
-            # Required by ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8
-            fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=32))
+            if self.config.activation_func is situlu:
+                # ScaledSiTUGLU with glu_interleave_size=32.
+                fused_impl.append(
+                    te.pytorch.ops.ScaledSiTUGLU(
+                        glu_interleave_size=32,
+                        beta1=self.config.situ_glu_beta1,
+                        beta2=self.config.situ_glu_beta2,
+                    )
+                )
+            else:
+                # ScaledSwiGLU with glu_interleave_size=32
+                # Required by ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8
+                fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=32))
 
             # FC2: GroupedLinear(num_groups=1) instead of BasicLinear
             weight = self.linear_fc2.weight
