@@ -5,12 +5,6 @@
 import argparse
 import time
 
-import numpy as np
-import multiprocessing
-from multiprocessing import Pool
-
-import orjson
-from itertools import islice
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
@@ -76,9 +70,6 @@ def main():
     args = get_args()
     level = "document"
 
-    #ctx = multiprocessing.get_context('spawn')
-    #with ctx.Pool(processes=len(args.json_keys)) as pool:
-    #    pool.starmap(process_key, [(args, key, level) for key in args.json_keys])
     for key in args.json_keys:
         process_key(args, key, level)
 
