@@ -1831,7 +1831,6 @@ def pretrain(
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
-        assert has_rl_utils, "--perform-rl-step requires the megatron.rl package"
         # RL inference doesn't support CP; when training uses CP>1, always build a
         # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
         force_cp1_inference_model = args.context_parallel_size > 1
