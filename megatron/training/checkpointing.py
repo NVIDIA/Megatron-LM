@@ -67,8 +67,11 @@ try:
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
         handle_experts_in_state_dict,
         handle_fp8_extra_state_case,
+        handle_mla_down_proj_in_state_dict,
+        handle_mtp_in_state_dict,
         handle_swiglu_in_state_dict,
         print_diff_in_state_dicts,
+        validate_fsdp_dtensor_model_load,
     )
 
     HAVE_MEGATRON_FSDP = True
@@ -1697,18 +1700,26 @@ def _localize_redundant_extra_states(state_dict):
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict['model'])
-    if args.swiglu:
+
+    def apply(handler):
+        """Run a state dict handler over the model and, when present, the optimizer state."""
+        model_state_dict, optimizer_state_dict = handler(
+            model, state_dict['model'], state_dict.get('optimizer')
+        )
+        state_dict['model'] = model_state_dict
         if 'optimizer' in state_dict:
-            model_state_dict, optimizer_state_dict = handle_swiglu_in_state_dict(
-                model, state_dict['model'], state_dict['optimizer']
-            )
-            state_dict['model'] = model_state_dict
             state_dict['optimizer'] = optimizer_state_dict
-        else:
-            model_state_dict, _ = handle_swiglu_in_state_dict(model, state_dict['model'], None)
-            state_dict['model'] = model_state_dict
+
+    if args.swiglu:
+        apply(handle_swiglu_in_state_dict)
+    # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
+    # layout used on disk. No-op for unfused models.
+    apply(handle_mla_down_proj_in_state_dict)
     if args.num_experts:
         state_dict['model'] = handle_experts_in_state_dict(state_dict['model'], args.num_experts)
+    # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
+    # above resolve keys against live module paths, which still use the new name.
+    apply(handle_mtp_in_state_dict)
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
@@ -2128,6 +2139,16 @@ def _load_base_checkpoint(
 
             _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
             print_diff_in_state_dicts(state_dict_metadata, state_dict)
+            # A partial load silently skips model weights the checkpoint does not have,
+            # leaving them at their initialized values. Report that, unless this is a
+            # fine-tune where loading only part of the model is the intent.
+            if not getattr(args, 'finetune', False):
+                validate_fsdp_dtensor_model_load(
+                    state_dict_metadata,
+                    state_dict,
+                    checkpoint_name,
+                    strict=args.dist_ckpt_strictness,
+                )
 
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
         torch.distributed.checkpoint.load_state_dict(

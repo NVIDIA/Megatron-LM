@@ -35,6 +35,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_maps_from_layer_type_list,
 )
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -417,12 +418,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
+        self.gdp_num_householder = 0
         if self.is_hybrid_model:
             self.mamba_conv_states_shape = mamba_inference_state_config.conv_states_shape
             self.mamba_ssm_states_shape = mamba_inference_state_config.ssm_states_shape
             self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
             self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
             self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
+            self.gdp_num_householder = mamba_inference_state_config.gdp_num_householder
 
             if self.batch_invariant_mode:
                 assert not self.enable_prefix_caching, (
@@ -968,23 +971,31 @@ class DynamicInferenceContext(BaseInferenceContext):
                 mamba_chunk_size=self.mamba_chunk_size,
                 d_conv=self.mamba_conv_states_shape[-1],
                 decode_indices_dtype=self._mamba_decode_indices_dtype,
+                gdp_num_householder=self.gdp_num_householder,
             )
             # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
             # fields ride along with the single coalesced H2D in
             # transfer_bookkeeping_to_gpu().
-            self.mamba_metadata.bind_cpu_buffers(
-                {
-                    "batch_indices_decode": self._cpu_mamba_batch_indices_decode,
-                    "batch_indices_prefill": self._cpu_mamba_batch_indices_prefill,
-                    "seq_idx": self._cpu_mamba_seq_idx,
-                    "cu_seqlens": self._cpu_mamba_cu_seqlens,
-                    "cu_chunk_seqlens": self._cpu_mamba_cu_chunk_seqlens,
-                    "last_chunk_indices": self._cpu_mamba_last_chunk_indices,
-                    "seq_idx_for_varlen": self._cpu_mamba_seq_idx_for_varlen,
-                    "conv_seq_idx": self._cpu_mamba_conv_seq_idx,
-                    "conv_seq_start": self._cpu_mamba_conv_seq_start,
-                }
-            )
+            _mamba_cpu_bufs = {
+                "batch_indices_decode": self._cpu_mamba_batch_indices_decode,
+                "batch_indices_prefill": self._cpu_mamba_batch_indices_prefill,
+                "seq_idx": self._cpu_mamba_seq_idx,
+                "cu_seqlens": self._cpu_mamba_cu_seqlens,
+                "cu_chunk_seqlens": self._cpu_mamba_cu_chunk_seqlens,
+                "last_chunk_indices": self._cpu_mamba_last_chunk_indices,
+                "seq_idx_for_varlen": self._cpu_mamba_seq_idx_for_varlen,
+                "conv_seq_idx": self._cpu_mamba_conv_seq_idx,
+                "conv_seq_start": self._cpu_mamba_conv_seq_start,
+            }
+            if self.gdp_num_householder > 0:
+                _mamba_cpu_bufs.update(
+                    {
+                        "gdp_chunk_indices": self._cpu_gdp_chunk_indices,
+                        "gdp_chunk_indices_dp": self._cpu_gdp_chunk_indices_dp,
+                        "gdp_chunk_offsets": self._cpu_gdp_chunk_offsets,
+                    }
+                )
+            self.mamba_metadata.bind_cpu_buffers(_mamba_cpu_bufs)
             self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
             self.mamba_conv_states = torch.empty(
                 (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
@@ -1217,6 +1228,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             + _mamba_conv_seq_idx_bytes
             + _mamba_conv_seq_start_bytes
         )
+        # GDP chunk descriptor section, only present for GDP models. All int32,
+        # so no alignment padding is needed after the Mamba section.
+        #   gdp_chunk_indices     int32 (max_gdp_chunks, 2)
+        #   gdp_chunk_indices_dp  int32 (max_gdp_chunks_dp, 2)
+        #   gdp_chunk_offsets     int32 (max_requests + 1,)
+        if self.gdp_num_householder > 0:
+            self._max_gdp_chunks, self._max_gdp_chunks_dp = max_gdp_chunk_counts(
+                self.max_tokens, self.max_requests, self.gdp_num_householder
+            )
+            _gdp_chunk_indices_bytes = self._max_gdp_chunks * 2 * 4
+            _gdp_chunk_indices_dp_bytes = self._max_gdp_chunks_dp * 2 * 4
+            _gdp_chunk_offsets_bytes = (self.max_requests + 1) * 4
+        else:
+            self._max_gdp_chunks = 0
+            self._max_gdp_chunks_dp = 0
+            _gdp_chunk_indices_bytes = 0
+            _gdp_chunk_indices_dp_bytes = 0
+            _gdp_chunk_offsets_bytes = 0
+        _total_bytes += (
+            _gdp_chunk_indices_bytes + _gdp_chunk_indices_dp_bytes + _gdp_chunk_offsets_bytes
+        )
         self._cpu_bookkeeping_buf = torch.empty(
             _total_bytes, dtype=torch.uint8, device='cpu', pin_memory=True
         )
@@ -1384,6 +1416,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             ].view(torch.int32)
             _off += _mamba_conv_seq_start_bytes
 
+        if self.gdp_num_householder > 0:
+            self._cpu_gdp_chunk_indices = (
+                self._cpu_bookkeeping_buf[_off : _off + _gdp_chunk_indices_bytes]
+                .view(torch.int32)
+                .view(self._max_gdp_chunks, 2)
+            )
+            _off += _gdp_chunk_indices_bytes
+            self._cpu_gdp_chunk_indices_dp = (
+                self._cpu_bookkeeping_buf[_off : _off + _gdp_chunk_indices_dp_bytes]
+                .view(torch.int32)
+                .view(self._max_gdp_chunks_dp, 2)
+            )
+            _off += _gdp_chunk_indices_dp_bytes
+            self._cpu_gdp_chunk_offsets = self._cpu_bookkeeping_buf[
+                _off : _off + _gdp_chunk_offsets_bytes
+            ].view(torch.int32)
+            _off += _gdp_chunk_offsets_bytes
+
         assert _off == _total_bytes, f"layout bug: wrote {_off} of {_total_bytes} bytes"
 
         # GPU view: the single interface for GPU code to read context state.
@@ -1394,6 +1444,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_kv_blocks=self.max_kv_block_count,
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
+            max_gdp_chunks=self._max_gdp_chunks,
+            max_gdp_chunks_dp=self._max_gdp_chunks_dp,
+            # Same presence predicate as the CPU-side GDP section above; the two
+            # layouts must byte-match, so they gate on the same flag.
+            has_gdp=self.gdp_num_householder > 0,
             mamba_decode_indices_dtype=(
                 self._mamba_decode_indices_dtype if self.is_hybrid_model else torch.int64
             ),

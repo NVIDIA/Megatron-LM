@@ -39,13 +39,13 @@ def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
     """Whether a parameter is managed by :class:`LayerWiseDistributedOptimizer`.
 
     Returns True for the 2D matrix-like weight parameters that Muon orthogonalizes
-    via Newton-Schulz, and False for embeddings, biases, LayerNorm weights, and
-    any other non-matrix parameter (which are handled by Adam through a separate
-    :class:`DistributedOptimizer`).
+    via Newton-Schulz, and False for parameters routed to Muon's scalar fallback:
+    explicit ``use_muon=False`` exclusions, embeddings, and non-matrix parameters.
 
-    Mirrors the routing rule applied by ``_get_param_groups`` /
-    ``default_param_overrides`` for Muon.
+    This DDP-buffer ownership rule must match Muon's parameter-group routing.
     """
+    if not getattr(param, 'use_muon', True):
+        return False
     if not param.dim() == 2:
         return False
     if getattr(param, 'is_embedding_or_output_parameter', False):

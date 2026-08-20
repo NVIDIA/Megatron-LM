@@ -97,7 +97,57 @@ except:
 
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
+_CUDA_GRAPH_STREAM_POOL_SIZE = 3
+_CUDA_GRAPH_STREAM_POOLS = None
+_CUDA_GRAPH_STREAM_NEXT_SLOT = 0
 logger = logging.getLogger(__name__)
+
+
+def _get_cuda_graph_stream() -> torch.cuda.Stream:
+    """Assign local CUDA-graph runners across a bounded set of distinct streams.
+
+    PyTorch obtains streams from a bounded pool, so repeatedly constructing
+    ``torch.cuda.Stream`` objects can eventually return the same underlying CUDA stream.
+    Assigning capture and replay streams explicitly makes that sharing intentional.
+
+    ``CUDA_DEVICE_MAX_CONNECTIONS`` controls how CUDA maps logical streams to hardware work
+    queues. It does not make PyTorch stream handles unique and cannot prevent stream aliasing.
+    """
+    global _CUDA_GRAPH_STREAM_POOLS, _CUDA_GRAPH_STREAM_NEXT_SLOT
+
+    pool = _CUDA_GRAPH_STREAM_POOLS
+    if pool is None:
+        # CUDA recommends at least as many connections as independently active streams. GTP can
+        # concurrently use graph, GTP/EGTP AG and RS, EP, DDP, and activation-offload streams, so
+        # CUDA's default of eight connections can introduce false dependencies between them.
+        max_connections = os.getenv("CUDA_DEVICE_MAX_CONNECTIONS")
+        warning_reason = None
+        if max_connections is None:
+            warning_reason = "is unset (CUDA defaults to 8)"
+        else:
+            try:
+                max_connections_value = int(max_connections)
+            except ValueError:
+                warning_reason = f"must be an integer from 1 to 32, but is {max_connections!r}"
+            else:
+                if max_connections_value < 16:
+                    warning_reason = f"is {max_connections_value}"
+
+        if warning_reason is not None and GTP_CONFIG.is_active():
+            logger.warning(
+                "CUDA_DEVICE_MAX_CONNECTIONS %s. For GTP workloads, consider setting it to "
+                "16 or 32 before process startup to avoid implicit stream aliasing.",
+                warning_reason,
+            )
+
+        pool = tuple(torch.cuda.Stream() for _ in range(_CUDA_GRAPH_STREAM_POOL_SIZE))
+        if len({stream.cuda_stream for stream in pool}) != len(pool):
+            raise RuntimeError("CUDA graph stream pool contains aliased streams")
+        _CUDA_GRAPH_STREAM_POOLS = pool
+
+    slot = _CUDA_GRAPH_STREAM_NEXT_SLOT
+    _CUDA_GRAPH_STREAM_NEXT_SLOT = (slot + 1) % len(pool)
+    return pool[slot]
 
 
 def _get_tensor_alias_chain(tensor):
@@ -981,7 +1031,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.num_warmup_steps = max(self.num_warmup_steps, 2)
 
                 self.use_stream = True
-                self.stream = torch.cuda.Stream()
+                self.stream = _get_cuda_graph_stream()
                 self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
                 self.bwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
                 # Register (chain, group) side streams before the first forward.
