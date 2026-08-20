@@ -3,7 +3,7 @@
 import logging
 import warnings
 from argparse import ArgumentParser, Namespace
-from typing import Literal, Optional
+from typing import Literal, Optional, Type
 
 import torch
 
@@ -80,7 +80,7 @@ def get_model_for_inference(
     pg_collection: Optional[ProcessGroupCollection] = None,
     checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> MegatronModule:
-    """Initialize a model and load its inference checkpoint.
+    """Initialize model and load checkpoint for inference.
 
     Args:
         pg_collection: Process groups used to build and load the model. When
@@ -382,10 +382,10 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
 
 def get_dynamic_inference_engine(
     model: Optional[MegatronModule] = None,
-    engine_class: type[DynamicInferenceEngine] = DynamicInferenceEngine,
+    engine_class: Type[DynamicInferenceEngine] = DynamicInferenceEngine,
     reserve_recurrent_state_dummy_slot: bool = False,
 ) -> DynamicInferenceEngine:
-    """Build a dynamic inference engine of the requested class."""
+    """Builds a `DynamicInferenceEngine`."""
     args = get_args()
     if model is None:
         model = get_model_for_inference()

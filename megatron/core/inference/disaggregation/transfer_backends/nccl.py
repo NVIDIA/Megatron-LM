@@ -73,8 +73,8 @@ class NcclTransferHandle:
 
     def wait(self) -> None:
         """Block until the transfer completes, then scatter."""
-        for work in self._works:
-            work.wait()
+        for w in self._works:
+            w.wait()
         self._finish()
 
     def _finish(self) -> None:

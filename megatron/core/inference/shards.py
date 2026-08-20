@@ -185,7 +185,7 @@ class InferenceShard:
     spec: InferenceShardSpec
     rank_offset: int
     world_size: int
-    pg_collection: Optional[ProcessGroupCollection] = None
+    pg_collection: Optional[ProcessGroupCollection]
     process_group: Optional[dist.ProcessGroup] = None
 
 

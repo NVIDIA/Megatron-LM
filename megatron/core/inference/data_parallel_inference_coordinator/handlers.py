@@ -1,6 +1,17 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Message handlers for the data parallel inference coordinator."""
+"""Message handlers for the data parallel inference coordinator.
+
+Each handler is a free function decorated with @message_handler, which records
+it in the module-level HANDLERS registry keyed by message header. The
+coordinator builds its dispatch table from this registry, so a new message type
+is supported simply by adding a decorated function here; the coordinator's event
+loop never changes.
+
+Handlers have the signature ``(coordinator, sender_identity, payload) -> bool | None``
+where ``payload`` is the already-deserialized message. Returning a truthy value
+signals the coordinator's event loop to stop.
+"""
 
 import logging
 
@@ -28,7 +39,13 @@ HANDLERS = {}
 
 
 def message_handler(*headers):
-    """Register a function for one or more message headers."""
+    """Register a function as the handler for one or more message headers.
+
+    A new message type is supported by writing a handler function and decorating
+    it with the header(s) it serves; it is added to HANDLERS, which the
+    coordinator turns into its dispatch table. The event loop never needs to
+    change when a header is added.
+    """
 
     def decorator(fn):
         for header in headers:

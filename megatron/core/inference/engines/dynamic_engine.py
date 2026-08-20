@@ -2220,8 +2220,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 # How many tokens we can admit this step.
                 token_budget = self.context.max_tokens - self.context.active_token_count
 
-                # Cached tokens do not consume compute budget, so include the
-                # reusable prefix in the first chunk's span.
+                # Prefix-cache skip: on a request's first chunk, the tokens covered
+                # by a cached prefix are reused rather than recomputed, so they do
+                # NOT consume the compute budget. Extend this chunk's SPAN to cover
+                # the entire skippable prefix plus up to `token_budget` newly computed
+                # tokens. Without this the span is capped at the budget, forcing the
+                # rest of a long cached prefix to be re-prefilled over many chunks
+                # (latency then scales with prompt length instead of the delta).
+                # add_request() only computes `effective = span - skip` tokens.
                 prefix_skip = 0
                 if prefix_caching_enabled and not is_continuing_chunked_prefill:
                     _, _, _, _, prefix_skip, _ = self.context._compute_prefix_match(
@@ -2250,8 +2256,20 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     prefill_chunk_length = prefix_skip + computed_chunk
 
-                # Keep non-final hybrid chunks block-aligned so later recurrent
-                # snapshots land on reusable KV boundaries.
+                # Mamba prefix caching: keep chunk boundaries block-aligned.
+                # compute_and_store_offsets() records a recurrent-state snapshot at a
+                # KV-block boundary only when that boundary lands on a multiple of the
+                # SSM chunk size measured FROM the start of the current prefill chunk
+                # (it filters on `offset % mamba_chunk_size == 0`, where the chunk start
+                # equals `finished_chunk_token_count` on continuation chunks). Block
+                # boundaries are multiples of `block_size_tokens` (itself a multiple of
+                # the SSM chunk size), so the filter only passes when
+                # `finished_chunk_token_count` is block-aligned. If a chunk ends at an
+                # arbitrary token offset, every candidate boundary in the following
+                # chunks becomes unrecordable and the last-block snapshot that lets a
+                # future request skip prefill is silently dropped. Stop a partial
+                # (non-final) chunk short at the nearest lower block boundary so the
+                # running `finished_chunk_token_count` stays block-aligned.
                 if (
                     self.context.is_hybrid_model
                     and self.context.mamba_slot_allocator is not None
@@ -2261,14 +2279,17 @@ class DynamicInferenceEngine(AbstractEngine):
                     chunk_end = req.finished_chunk_token_count + prefill_chunk_length
                     aligned_end = (chunk_end // block_size) * block_size
                     aligned_chunk_length = aligned_end - req.finished_chunk_token_count
-                    # Leave sub-block budgets unchanged so the chunk still makes progress.
+                    # Only snap down when the aligned chunk still computes at least one
+                    # token beyond the skipped prefix (a chunk whose budget is smaller
+                    # than a block cannot be block-aligned; leave it unchanged).
                     if aligned_chunk_length > prefix_skip:
                         prefill_chunk_length = aligned_chunk_length
 
                 # Flash-attn guard: if this chunk would leave exactly 1 token for the
                 # final chunk, reduce by 1 (or defer if we only have 1 computed token).
                 # See https://github.com/Dao-AILab/flash-attention/issues/1537
-                # The selected graph also covers a one-token-smaller batch.
+                # The -1 is safe after CG snapping: is_applicable_for_batch_dim matches on
+                # cg.token_count >= real.token_count, so the snapped CG still covers token_count-1.
                 if not batch_invariant_mamba_prefill and remaining_len - prefill_chunk_length == 1:
                     if computed_chunk > 1:
                         prefill_chunk_length -= 1
@@ -2276,8 +2297,15 @@ class DynamicInferenceEngine(AbstractEngine):
                         can_schedule = False
                         break
 
-                # For a one-token delta, add_request may reduce the cache match to
-                # preserve its minimum compute span. Check that exact cost here.
+                # add_request recomputes the skip for this exact chunk and applies a
+                # ">= 2 computed tokens" clamp. When the chunk would compute fewer than
+                # 2 tokens (tight budget late in a batched step, or a prompt that is
+                # all-but-one cached) that clamp shrinks the skip and grows the computed
+                # count by up to one block, which can exceed the token budget
+                # (TokenOverflowError). Only then re-derive the exact effective length
+                # add_request will use and defer on overflow (a later full-budget step
+                # admits the request). For >= 2 computed tokens add_request computes
+                # exactly this chunk, which already fits the budget.
                 if prefix_skip > 0 and (prefill_chunk_length - prefix_skip) < 2:
                     _, _, _, _, _, actual_effective = self.context._compute_prefix_match(
                         req, prefill_chunk_length
