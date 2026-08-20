@@ -76,6 +76,7 @@ training = [
     "transformers",
     "accelerate",
     "omegaconf",
+    "gigatoken",
 ]
 
 ### 'mlm' group is deprecated. please use 'training' instead ###
