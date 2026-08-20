@@ -44,6 +44,39 @@ def test_runtime_returns_loss_separately_from_microbatch_metrics():
     assert result.model_output.loss is not None
 
 
+def test_post_step_scale_invalidation_requires_a_successful_optimizer_update():
+    calls = []
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    model = nn.Linear(1, 1, bias=False)
+
+    no_optim = ModelHandle(
+        model=model,
+        optimizer=None,
+        _extras={"post_optimizer_step_hook": lambda: calls.append("no_optim")},
+    )
+    assert runtime.optimizer_step(no_optim) == (True, 0.0, 0)
+    assert calls == []
+
+    class Optimizer:
+        def __init__(self):
+            self.success = False
+
+        def step(self):
+            return self.success, torch.tensor(1.5), 0
+
+    optimizer = Optimizer()
+    fsdp2 = ModelHandle(
+        model=model,
+        optimizer=optimizer,
+        _extras={"post_optimizer_step_hook": lambda: calls.append("fsdp2")},
+    )
+    assert runtime.optimizer_step(fsdp2) == (False, 1.5, 0)
+    assert calls == []
+    optimizer.success = True
+    assert runtime.optimizer_step(fsdp2) == (True, 1.5, 0)
+    assert calls == ["fsdp2"]
+
+
 def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
     context = LossContext(source_batch="source")
     seen = []

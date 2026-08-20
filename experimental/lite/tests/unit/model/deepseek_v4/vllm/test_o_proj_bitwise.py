@@ -25,9 +25,19 @@ def test_o_projection_cpu_contract_calls_all_official_boundaries(monkeypatch) ->
 
     def post_process(**kwargs):
         calls.append("post")
+        # The real vLLM helper requantizes qweight in place.  qweight is an
+        # inference tensor produced by the deployment packer, so this is legal
+        # only while the adapter's packing phase remains in inference mode.
+        kwargs["wq"].copy_(kwargs["wq"])
         return kwargs["wq"], kwargs["ws"].to(torch.int32)
 
-    official = Mock(return_value=torch.ones(2, 128, dtype=torch.bfloat16))
+    def official(*args, **kwargs):
+        # The visible result must not inherit inference-tensor ownership: the
+        # functional VJP bridge needs to save it during checkpoint recompute.
+        assert not torch.is_inference_mode_enabled()
+        return torch.ones(2, 128, dtype=torch.bfloat16)
+
+    official_mock = Mock(side_effect=official)
     entries = {
         ("vllm.utils.deep_gemm", "per_block_cast_to_fp8"): cast,
         (
@@ -45,7 +55,7 @@ def test_o_projection_cpu_contract_calls_all_official_boundaries(monkeypatch) ->
         (
             "vllm.models.deepseek_v4.nvidia.ops.o_proj",
             "deep_gemm_fp8_o_proj",
-        ): official,
+        ): official_mock,
         (
             "vllm.models.deepseek_v4.nvidia.ops.o_proj",
             "compute_fp8_einsum_recipe",
@@ -69,9 +79,10 @@ def test_o_projection_cpu_contract_calls_all_official_boundaries(monkeypatch) ->
         rope_dim=64,
         o_lora_rank=128,
     )
-    assert torch.equal(result, official.return_value)
+    assert torch.equal(result, torch.ones_like(result))
+    assert not result.is_inference()
     assert calls == ["cast", "post", "cast", "post"]
-    official.assert_called_once()
+    official_mock.assert_called_once()
 
 
 @pytest.mark.gpus(1)

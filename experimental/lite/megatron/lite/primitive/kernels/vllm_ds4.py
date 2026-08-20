@@ -171,13 +171,12 @@ class OProjectionAdapter(nn.Module):
             "vllm.models.deepseek_v4.nvidia.ops.o_proj", "compute_fp8_einsum_recipe"
         )
 
-        # The deployment kernels do not participate in autograd, but their
-        # output must remain an ordinary tensor so the vLLM-visible/functional
-        # VJP bridge can own it during activation-checkpoint recomputation.
-        # ``inference_mode`` would mark the returned O projection as an
-        # inference tensor; ``no_grad`` preserves the same no-tape execution
-        # without changing tensor ownership.
-        with torch.no_grad():
+        # vLLM's post-process requantizes the freshly packed FP8 weights in
+        # place.  The packer creates inference tensors, so this phase must stay
+        # inside inference mode.  Keep the actual projection outside that
+        # scope: its result must be an ordinary tensor that the functional VJP
+        # bridge can own during activation-checkpoint recomputation.
+        with torch.inference_mode():
             canonical_wa = quantize_block_fp8_weight(wo_a)
             wa_q, wa_s = post_process(
                 wq=canonical_wa.qweight,
@@ -199,6 +198,7 @@ class OProjectionAdapter(nn.Module):
                 use_e8m0=True,
             )
 
+        with torch.no_grad():
             def packed_wb(value: Tensor) -> Tensor:
                 activation_quant = _symbol(
                     "vllm.model_executor.layers.quantization.utils.fp8_utils",

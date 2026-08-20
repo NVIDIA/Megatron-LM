@@ -237,6 +237,11 @@ def test_wrap_fsdp2_requires_distributed_when_mesh_is_not_provided(monkeypatch):
 def test_wrap_fsdp2_wraps_units_then_root_and_preserves_param_attrs(monkeypatch):
     model = ToyModel()
     model.block.proj.weight.tensor_model_parallel = True
+    source_scale = torch.tensor([[0.25]], dtype=torch.float32)
+    model.block.proj.weight._fp8_source_scales = source_scale
+    model.block.proj.weight._fp8_source_scale_version = (
+        model.block.proj.weight._version
+    )
     calls: list[nn.Module] = []
 
     def fake_fully_shard(module, **kwargs):
@@ -258,6 +263,11 @@ def test_wrap_fsdp2_wraps_units_then_root_and_preserves_param_attrs(monkeypatch)
     assert result is model
     assert calls == [model.block, model]
     assert model.block.proj.weight.tensor_model_parallel is True
+    assert torch.equal(model.block.proj.weight._fp8_source_scales, source_scale)
+    assert (
+        model.block.proj.weight._fp8_source_scale_version
+        == model.block.proj.weight._version
+    )
     assert model._fake_fsdp2_kwargs["reshard_after_forward"] is False
     assert model._fake_fsdp2_kwargs["mesh"].name == "mesh"
 
