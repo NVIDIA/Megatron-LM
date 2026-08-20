@@ -55,6 +55,7 @@ from megatron.core.tensor_parallel.gtp_api import (  # noqa: E402
     dequantize_gtp_native_fp8,
     gtp_native_fp8_load_context,
     gtp_remat_shard_dim0,
+    is_gtp_param,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed  # noqa: E402
 from megatron.core.transformer.spec_utils import ModuleSpec  # noqa: E402
@@ -1949,6 +1950,126 @@ def _worker_padded_ep_egtp_offsets(rank, world_size, port):
         update_gtp_config(pad_for_alignment=orig)
 
 
+def _worker_egtp_grouped_fc1_swiglu_checkpoint(rank, world_size, port):
+    """Grouped gated fc1 under EGTP, end-to-end through the real TEGroupedMLP wiring.
+
+    This is the path that used to be refused outright by tag_gtp_params_with_names. The guard
+    was the only thing standing between a misconfigured run and training on scrambled experts,
+    and it was replaced by the gather/split wiring in transformer/moe/experts.py -- which three
+    separate real-workload bugs have already been found in (dict key vs checkpoint key, factory
+    resolved by name instead of identity, writer elected over the wrong DP group).
+
+    Nothing else exercises it: the other EGTP tests hand-build sharded_offsets and never call
+    TEGroupedMLP.sharded_state_dict, so they cannot see gate/up ordering at all -- and L1/L2
+    style checks are permutation-blind, which is exactly how the dense-side interleave hid for
+    a day. Assert element-wise instead.
+
+    EP=2 x EGTP=2 (4 ranks), gated moe_ffn 388 -> 776 rows per expert, alignment 16*2 = 32 ->
+    pad 24, per-EGTP-rank shard 400.
+    """
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,
+        TERowParallelGroupedLinear,
+    )
+    from megatron.core.transformer.mlp import MLPSubmodules
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=2,
+        expert_gtp_remat_size=2,
+    )
+    model_parallel_cuda_manual_seed(42)
+    original_pad = GTP_CONFIG.pad_for_alignment
+    update_gtp_config(pad_for_alignment=16)
+    try:
+        pg = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'cp', 'ep', 'expt_tp', 'expt_dp', 'expt_gtp_remat', 'dp_cp']
+        )
+        num_local_experts = 1
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=8,
+            ffn_hidden_size=776,
+            moe_ffn_hidden_size=388,
+            num_moe_experts=2,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            add_bias_linear=False,
+            normalization='RMSNorm',
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            tensor_model_parallel_size=1,
+            expert_model_parallel_size=2,
+            pipeline_model_parallel_size=1,
+            transformer_impl='transformer_engine',
+            moe_grouped_gemm=True,
+        )
+        mlp = TEGroupedMLP(
+            num_local_experts,
+            config,
+            MLPSubmodules(
+                linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
+            ),
+            pg_collection=pg,
+        ).cuda()
+
+        weight = getattr(mlp.linear_fc1, "weight0")
+        assert is_gtp_param(weight), "expert fc1 weight0 should be EGTP-sharded"
+        egtp_size = dist.get_world_size(pg.expt_gtp_remat)
+        egtp_rank = dist.get_rank(pg.expt_gtp_remat)
+        assert weight.pad_length == 24, f"expected 24 pad rows, got {weight.pad_length}"
+
+        metadata = {'dp_cp_group': pg.dp_cp}
+        sharded_sd = mlp.sharded_state_dict(prefix='mlp.', metadata=metadata)
+        key = next(k for k in sharded_sd if k.endswith('linear_fc1.weight0'))
+        factory = sharded_sd[key]
+        assert isinstance(factory, ShardedTensorFactory), type(factory)
+
+        # The gathered tensor is the ETP-local fused [gate | up] weight with the pad stripped.
+        assert tuple(factory.data.shape) == (776, config.hidden_size), factory.data.shape
+
+        # Save side: the same two entries a non-EGTP run writes -- gate and up halves, keyed
+        # WITHOUT a per-expert suffix (TEGroupedLinear carries the expert index as an offset).
+        parts = factory.build()
+        assert len(parts) == 2, len(parts)
+        half = 776 // 2
+        for part in parts:
+            assert part.key.endswith('linear_fc1.weight'), part.key
+            assert tuple(part.local_shape) == (half, config.hidden_size), part.local_shape
+
+        # Load side: merge cats gate+up, re-pads, and slices back this rank's CONTIGUOUS rows,
+        # element-wise equal to the live shard. Pad rows are re-zeroed, not round-tripped.
+        merged = factory.merge_fn([part.data for part in parts])
+        assert tuple(merged.shape) == tuple(weight.shape), (merged.shape, weight.shape)
+        valid = merged.shape[0] - (weight.pad_length if egtp_rank == egtp_size - 1 else 0)
+        torch.testing.assert_close(merged[:valid], weight[:valid])
+        assert torch.count_nonzero(merged[valid:]) == 0
+
+        # Writer election with a REAL EP group: each logical chunk is described by both EGTP
+        # peers, and exactly one of them is the main replica.
+        local_meta = [(p.key, tuple(p.global_offset), tuple(p.replica_id)) for p in parts]
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, local_meta)
+        if rank == 0:
+            by_chunk = {}
+            for rank_meta in gathered:
+                for k, off, rep in rank_meta:
+                    by_chunk.setdefault((k, off), []).append(rep)
+            for (k, off), reps in by_chunk.items():
+                assert len(reps) == egtp_size, (k, off, reps)
+                assert len(set(reps)) == egtp_size, f"EGTP peers share a replica_id: {reps}"
+                mains = sum(is_main_replica(r) for r in reps)
+                assert mains == 1, f"chunk {(k, off)} has {mains} writers: {reps}"
+    finally:
+        update_gtp_config(pad_for_alignment=original_pad)
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
 # ---------------------------------------------------------------------------
 # Test class wrappers (4-GPU)
 # ---------------------------------------------------------------------------
@@ -2001,6 +2122,10 @@ class TestGtpDcpHelper:
     def test_dual_offsets_cross_axis(self):
         _require_world_size(4)
         _worker_helper_offsets_tp_neq_gtp_axis(dist.get_rank(), 4, None)
+
+    def test_egtp_grouped_fc1_swiglu_checkpoint(self):
+        _require_world_size(4)
+        _worker_egtp_grouped_fc1_swiglu_checkpoint(dist.get_rank(), 4, None)
 
     def test_padded_ep_egtp_offsets(self):
         _require_world_size(4)
