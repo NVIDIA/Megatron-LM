@@ -472,9 +472,4 @@ def main():
         find_optimal_num_workers(performance, args.partitions)
 
 if __name__ == '__main__':
-    start_time = time.perf_counter()
     main()
-    end_time = time.perf_counter()
-
-    elapsed_time = end_time - start_time
-    print(f"Elapsed time: {elapsed_time:.2f} seconds")

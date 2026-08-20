@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import awkward as ak
 import logging
 from typing import List, Optional
 
@@ -19,7 +18,7 @@ try:
     import gigatoken as gt
 
     HAVE_GIGATOKEN = True
-except (ImportError, ModuleNotFoundError):
+except ModuleNotFoundError:
     HAVE_GIGATOKEN = False
 
 logger = logging.getLogger(__name__)
@@ -101,7 +100,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                 'Unable to instantiate HuggingFace AutoTokenizer '
                 f'for {tokenizer_path}. Exception: {e}'
             )
-        
+
         # Store the tokenizer's existing chat template if the user does not provide
         # a custom chat template. Otherwise, override the default chat template with
         # the user-provided template.
@@ -283,9 +282,6 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
 
     def text_to_ids(self, text: str) -> List[int]:
         """Converts text to tokens ids."""
-        # if self.use_gigatoken:
-        #     ids = self.tokenizer.tokenizer.encode(text)
-        #     return ids.tolist()
         if self.include_special_tokens:
             return self.tokenizer(text).input_ids
         tokens = self.text_to_tokens(text)
@@ -297,9 +293,6 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
 
         When remove_special_tokens is None, uses not self.include_special_tokens.
         """
-        # if self.use_gigatoken:
-        #     text = self.tokenizer.tokenizer.decode(ids)
-        #     return str(text, encoding="utf-8")
         if remove_special_tokens is None:
             remove_special_tokens = not self.include_special_tokens
         tokens = self.ids_to_tokens(ids)
@@ -318,7 +311,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             conversation=conversation, chat_template=chat_template, **kwargs
         )
 
-    def encode_files(self, paths: list[str], field: str = "text") -> ak.Array:
+    def encode_files(self, paths: list[str], field: str = "text") -> "ak.Array":
         if self.use_gigatoken:
             return self.tokenizer.tokenizer.encode_files(
                 gt.JsonlFileSource(paths, field="text"),

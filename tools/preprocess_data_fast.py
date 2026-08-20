@@ -3,8 +3,6 @@
 """Processing large data for pretraining using gigatoken."""
 
 import argparse
-import awkward as ak
-import gigatoken as gt
 import time
 
 import numpy as np
@@ -65,17 +63,12 @@ def process_key(args, key, level):
         dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
     )
 
-    # Append EOD token
-    if args.append_eod:
-        print("Appending EOD token...")
-        eod_column = ak.singletons(
-            ak.Array(np.full(len(encoded_docs), tokenizer.eod, dtype=encoded_docs.layout.content.dtype))
-        )
-        encoded_docs = ak.concatenate([encoded_docs, eod_column], axis=1)
-
     # Add encoded documents to the IndexedDataset
     print("Adding encoded documents to IndexedDataset...")
-    builder.add_documents(encoded_docs)
+    kwargs = {}
+    if args.append_eod:
+        kwargs['eod_token'] = tokenizer.eod
+    builder.add_documents(encoded_docs, **kwargs)
     builder.finalize(idx_file)
 
 
