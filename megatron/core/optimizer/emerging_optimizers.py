@@ -312,12 +312,17 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             return gathered_grad[gtp_rank * shard_size : (gtp_rank + 1) * shard_size].contiguous()
 
         # distributed: NS via the small-Gram all-reduce (no redundant full-matrix NS).
-        is_tp_active = (
+        # A momentum with both TP and GTP as sharding axes takes two communication steps: an
+        # all-gather that eliminates one axis, then the Gram all-reduce that distributes NS over
+        # the other. With GTP as the only sharding axis, the Gram all-reduce is the only
+        # communication needed. partition_dim is what says whether TP is a sharding axis here,
+        # the same signal scaled_orthogonalize_fn and newton_schulz_tp key off.
+        needs_two_step_communication = (
             partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1
         )
 
-        if not is_tp_active:
-            # GTP-only: distribute NS over the GTP group on the local dim-0 row shard.
+        if not needs_two_step_communication:
+            # GTP is the only sharding axis: distribute NS over it on the local dim-0 row shard.
             return self.scaled_orthogonalize_fn(grad, gtp_remat_group, partition_dim=0)
 
         # GTP + TP: distributed NS can only operate over one (group, dim) at a
