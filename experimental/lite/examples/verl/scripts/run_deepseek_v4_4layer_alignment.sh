@@ -6,15 +6,27 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -L)"
 
+# The published alignment image installs its coherent runtime in this venv.
+# Prefer it when present so invoking this script directly does not accidentally
+# pick up packages from the base image or the user's site directory.
+if [[ -x /opt/ds4-venv/bin/python3 ]]; then
+  export PATH="/opt/ds4-venv/bin:${PATH}"
+fi
+export PYTHONNOUSERSITE=1
+
 : "${MODEL_PATH:?set MODEL_PATH to the four-layer DeepSeek-V4 checkpoint}"
 : "${TRAIN_FILES:?set TRAIN_FILES to DAPO-format training parquet}"
 : "${VAL_FILES:?set VAL_FILES to DAPO-format validation parquet}"
-: "${VLLM_BATCH_INVARIANT_KERNEL_LIB:?set VLLM_BATCH_INVARIANT_KERNEL_LIB}"
+export VLLM_BATCH_INVARIANT_KERNEL_LIB="${VLLM_BATCH_INVARIANT_KERNEL_LIB:-/opt/batch-invariant-kernel/_vllm_batch_invariant_C.so}"
 test -s "${MODEL_PATH}/config.json"
-test -s "${VLLM_BATCH_INVARIANT_KERNEL_LIB}"
+if [[ ! -s "${VLLM_BATCH_INVARIANT_KERNEL_LIB}" ]]; then
+  echo "required batch-invariant kernel is missing: ${VLLM_BATCH_INVARIANT_KERNEL_LIB}" >&2
+  exit 2
+fi
 
 export OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/ds4_4layer_alignment}"
 export RUN_NAME="${RUN_NAME:-ds4_4layer_ep4_alignment}"
+export LOG_FILE="${LOG_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.log}"
 export VERL_TRAIN_INFER_DIFF_DUMP="${VERL_TRAIN_INFER_DIFF_DUMP:-${OUTPUT_ROOT}/train_infer_tokens.jsonl}"
 
 export NNODES=1
@@ -55,6 +67,13 @@ export VERL_LOCAL_TASK_RUNNER=1
 export VERL_ENGINE_LAZY_IMPORTS=1
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 
+# The generic DAPO validator currently describes the older torch-2.12/dev631
+# runtime. This four-layer release gate instead targets the published clean
+# image whose torch-2.13/dev682 dependency closure is validated by the image
+# build and whose numerical result is checked below. Keep the generic validator
+# available to callers that explicitly opt in after updating its profile.
+export VALIDATE_DS4_ENVIRONMENT="${VALIDATE_DS4_ENVIRONMENT:-0}"
+
 # This is an NVIDIA-only recipe. Some Slurm/Pyxis versions export the ROCm
 # visibility aliases alongside CUDA_VISIBLE_DEVICES; VERL correctly rejects
 # that ambiguous pair. Remove the inapplicable aliases before Ray snapshots
@@ -73,7 +92,8 @@ export VERL_TRAIN_INFER_DIFF_MODE=compact
 export VERL_TRAIN_INFER_TOKEN_SAMPLE_LIMIT="${VERL_TRAIN_INFER_TOKEN_SAMPLE_LIMIT:-8}"
 
 layers='[0,1,2,3]'
-exec bash "${SCRIPT_DIR}/run_deepseek_v4_dapo.sh" \
+set +e
+bash "${SCRIPT_DIR}/run_deepseek_v4_dapo.sh" \
   "data.seed=${SEED:-42}" \
   "actor_rollout_ref.actor.engine.impl=vllm" \
   "+actor_rollout_ref.actor.engine.seed=${SEED:-42}" \
@@ -103,3 +123,35 @@ exec bash "${SCRIPT_DIR}/run_deepseek_v4_dapo.sh" \
   "trainer.use_v1=False" \
   "trainer.logger=[console,file]" \
   "$@"
+run_rc=$?
+set -e
+
+if (( run_rc != 0 )); then
+  exit "${run_rc}"
+fi
+if [[ "${DRY_RUN:-0}" == "1" || "${COMPOSE_ONLY:-0}" == "1" ]]; then
+  exit 0
+fi
+
+# Gate on VERL's production train/infer metrics rather than a separate
+# comparator. Every completed old-log-prob stage must be byte-exact and have
+# zero K3 KL; absence of the metric is also a failure.
+python3 - "${LOG_FILE}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+log_path = Path(sys.argv[1])
+pattern = re.compile(
+    r"RL_STAGE old_log_prob_done .*?bitwise_fraction=([^\s\x1b]+) "
+    r"k3_kl=([^\s\x1b]+)"
+)
+metrics = [(float(a), float(b)) for a, b in pattern.findall(log_path.read_text())]
+if not metrics:
+    raise SystemExit(f"no VERL train/infer alignment metric found in {log_path}")
+bad = [(index + 1, bitwise, k3) for index, (bitwise, k3) in enumerate(metrics)
+       if bitwise != 1.0 or k3 != 0.0]
+if bad:
+    raise SystemExit(f"DS4 train/infer alignment gate failed: {bad}")
+print(f"DS4_4L_ALIGNMENT_EXACT steps={len(metrics)} bitwise_fraction=1.0 k3_kl=0.0")
+PY
