@@ -31,6 +31,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.o_proj import (
     o_projection,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.router import fixed_route_vjp
+from megatron.lite.primitive.recompute import wrap_checkpoint
 
 
 def _grad_like(value: torch.Tensor) -> torch.Tensor:
@@ -84,6 +85,29 @@ def test_forward_only_uses_visible_path_without_autograd_owner() -> None:
     assert output.is_inference()
     assert projected.is_inference()
     torch.testing.assert_close(output, visible(x, weight), rtol=0, atol=0)
+
+
+def test_checkpoint_recompute_owns_no_grad_visible_output() -> None:
+    class Projection(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(5, 4))
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            def visible(x, weight):
+                # Deployment kernels run without an autograd tape, but must
+                # return ordinary tensors for the functional VJP bridge.
+                with torch.no_grad():
+                    return F.linear(x, weight)
+
+            return block_fp8_linear(visible, value, self.weight)
+
+    module = Projection()
+    wrap_checkpoint(module)
+    value = torch.randn(3, 4, requires_grad=True)
+    module(value).sum().backward()
+    assert value.grad is not None
+    assert module.weight.grad is not None
 
 
 def test_linear_backward_rejects_master_mutation_after_forward() -> None:
