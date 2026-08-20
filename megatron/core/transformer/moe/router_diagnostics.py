@@ -98,6 +98,8 @@ def build_router_diagnostics(
     has_boundary = aux_map.any(dim=-1) & (~aux_map).any(dim=-1) & valid_mask
     selected_floor = scores.masked_fill(~aux_map, float("inf")).amin(dim=-1)
     unselected_ceiling = scores.masked_fill(aux_map, float("-inf")).amax(dim=-1)
+    # Rows with no selected/unselected boundary use equal finite sentinels so their
+    # relative margin is zero without introducing infinities or NaNs.
     selected_floor = torch.where(has_boundary, selected_floor, torch.ones_like(selected_floor))
     unselected_ceiling = torch.where(has_boundary, unselected_ceiling, selected_floor)
     boundary_margin = (selected_floor - unselected_ceiling).clamp_min(0)

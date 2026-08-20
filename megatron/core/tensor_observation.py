@@ -83,8 +83,10 @@ def observe_tensor(
 def observe_layer_residuals(layer: object, accumulator: torch.Tensor, output: torch.Tensor) -> None:
     """Observe a layer's incoming residual accumulator and net contribution.
 
-    The contribution is reconstructed as ``output - accumulator`` outside the layer's local CUDA
-    graph. It is computed without autograd only when a contribution metric is active.
+    With per-layer CUDA graphs, the contribution is reconstructed as ``output - accumulator``
+    outside the captured layer. Full-iteration CUDA graphs include this call and do not replay
+    Python observation notifications. The contribution is computed without autograd only when a
+    contribution metric is active.
 
     Args:
         layer: Layer owning the residual sites.

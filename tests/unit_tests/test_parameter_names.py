@@ -47,6 +47,15 @@ class _GroupedExpertModel(torch.nn.Module):
         self.mlp.experts.linear_fc1.register_parameter("bias1", torch.nn.Parameter(torch.zeros(1)))
 
 
+class _SingleGroupedExpertModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = type("Config", (), {"num_moe_experts": 4})()
+        self.mlp = torch.nn.Module()
+        self.mlp.experts = torch.nn.Module()
+        self.mlp.experts.linear_fc1 = torch.nn.Linear(1, 1)
+
+
 class _SequentialExpertModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -117,6 +126,32 @@ def test_canonical_parameter_names_use_global_grouped_expert_numbers():
     names = CanonicalParameterNameMap(model, expert_parallel_rank=1, expert_parallel_size=2)
 
     assert set(names.values()) == {"mlp.experts.linear_fc1.weight2", "mlp.experts.linear_fc1.bias3"}
+
+
+def test_canonical_parameter_names_use_global_single_grouped_expert_ranges():
+    first_model = _SingleGroupedExpertModel()
+    second_model = _SingleGroupedExpertModel()
+
+    first_names = set(
+        CanonicalParameterNameMap(
+            first_model, expert_parallel_rank=0, expert_parallel_size=2
+        ).values()
+    )
+    second_names = set(
+        CanonicalParameterNameMap(
+            second_model, expert_parallel_rank=1, expert_parallel_size=2
+        ).values()
+    )
+
+    assert first_names == {
+        "mlp.experts.linear_fc1.weight[experts=0:2]",
+        "mlp.experts.linear_fc1.bias[experts=0:2]",
+    }
+    assert second_names == {
+        "mlp.experts.linear_fc1.weight[experts=2:4]",
+        "mlp.experts.linear_fc1.bias[experts=2:4]",
+    }
+    assert first_names.isdisjoint(second_names)
 
 
 def test_canonical_parameter_names_use_global_sequential_expert_numbers():
