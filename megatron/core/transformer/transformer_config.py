@@ -2232,7 +2232,8 @@ class TransformerConfig(ModelParallelConfig):
 
             if (
                 "gdn_norm_out" in self.recompute_modules
-                and self.experimental_attention_variant not in ["gdn", "kda"]
+                and not self.is_hybrid_model
+                and self.experimental_attention_variant != "gated_delta_net"
             ):
                 raise ValueError(
                     "gdn_norm_out in recompute_modules is only supported with "
