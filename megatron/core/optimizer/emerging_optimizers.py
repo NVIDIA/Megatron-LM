@@ -126,6 +126,42 @@ class EmergingOptimizerEntry:
 def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg_collection):
     """Instantiate an emerging optimizer and return it with its init_state_fn."""
     entry = _EMERGING_OPTIMIZERS[eopt_name]
+
+    # Hybrid layer-sharding scope: with muon_lsh_scope='expert' the caller keeps the
+    # dense/expert bucket split (see get_megatron_optimizer's grouping) and calls this
+    # once per bucket. The expert bucket runs LayerShardedMuon (its win concentrates on
+    # MoE expert homes); the dense bucket stays on TensorParallelMuon, so muon_tp_mode
+    # (including 'auto') governs dense weights. Both land in layer_wise_base_results —
+    # LayerWiseDistributedOptimizer takes a list of base optimizers, and its NS-home
+    # wiring only touches LayerShardedMuon instances.
+    if (
+        eopt_name == 'muon'
+        and _use_layer_sharding_muon(config)
+        and getattr(config, 'muon_lsh_scope', 'all') == 'expert'
+    ):
+        is_expert_bucket = bool(param_groups) and bool(
+            param_groups[0].get('is_expert_parallel', False)
+        )
+        if is_expert_bucket:
+            from megatron.core.optimizer.layer_sharded_muon import LayerShardedMuon
+
+            eopt_kwargs = _layer_sharded_muon_config_to_kwargs(
+                config, model_chunks, pg_collection
+            )
+            # This instance only ever owns expert groups, so its constructor-default
+            # domain should be the expert one. Per-group wiring
+            # (_wire_layer_sharding_ns_homes) still assigns domains group by group;
+            # this just keeps the fallback consistent if wiring is ever skipped.
+            eopt_kwargs['gtp_group'] = (
+                getattr(pg_collection, 'expt_gtp_remat', None) if pg_collection else None
+            )
+            eopt_kwargs['tp_group'] = (
+                getattr(pg_collection, 'expt_tp', None) if pg_collection else None
+            )
+            return LayerShardedMuon(param_groups, **eopt_kwargs), entry.init_state_fn
+        eopt_kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
+        return TensorParallelMuon(param_groups, **eopt_kwargs), entry.init_state_fn
+
     if entry.config_to_kwargs is not None:
         eopt_kwargs = entry.config_to_kwargs(config, model_chunks, pg_collection)
     else:

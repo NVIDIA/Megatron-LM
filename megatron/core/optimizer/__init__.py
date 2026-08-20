@@ -812,12 +812,24 @@ def _get_megatron_emerging_optimizer(
     config_overrides.update(default_param_overrides)
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
-    # Layer-wise distributed optimizer handles expert params internally so we skip that split.
+    # Layer-wise distributed optimizer handles expert params internally so we skip that
+    # split — EXCEPT under the hybrid layer-sharding scope (muon_lsh_scope='expert'),
+    # where the primary optimizer's dense and expert buckets deliberately stay separate
+    # so _create_emerging_optimizer can build TensorParallelMuon for dense weights and
+    # LayerShardedMuon for expert weights (both feed layer_wise_base_results). The split
+    # is restricted to the primary emerging optimizer: scalar (adam/lion) groups keep
+    # collapsing, since the non-emerging fallback path rejects expert-parallel groups.
+    hybrid_lsh_scope = (
+        use_layer_wise
+        and getattr(config, 'use_layer_sharding_muon', False)
+        and getattr(config, 'muon_lsh_scope', 'all') == 'expert'
+    )
     all_param_groups = _get_param_groups(model_chunks, config, config_overrides)
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
-        is_expert = group['is_expert_parallel'] and not use_layer_wise
+        keep_expert_split = not use_layer_wise or (hybrid_lsh_scope and opt_name == eopt_name)
+        is_expert = group['is_expert_parallel'] and keep_expert_split
         grouped_param_groups[(opt_name, is_expert)].append(group)
 
     # Set up DistOpt process groups + filtered buffers once, only if we'll

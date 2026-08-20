@@ -1717,18 +1717,32 @@ def validate_args(args, defaults={}):
                 "--use-layer-sharding-muon requires the layer-wise distributed "
                 "optimizer path (--optimizer muon with --use-distributed-optimizer)."
             )
-            assert not args.muon_split_qkv, (
-                "--use-layer-sharding-muon does not implement split-QKV Newton-Schulz "
-                "yet; pass --muon-no-split-qkv."
-            )
-            if args.muon_tp_mode != 'blockwise':
-                # The kwargs builder matches constructor parameters reflectively, so
-                # an unmatched muon_tp_mode is dropped silently — surface it instead.
-                warn_rank_0(
-                    f"--muon-tp-mode {args.muon_tp_mode} is ignored under "
-                    "--use-layer-sharding-muon: layer sharding replaces the "
-                    "duplicated/distributed mode selection entirely."
+            if args.muon_lsh_scope == 'expert':
+                # Hybrid scope: only expert weights are layer-sharded; dense weights
+                # stay on TensorParallelMuon, which supports split-QKV and honors
+                # --muon-tp-mode (including 'auto'), so neither restriction below
+                # applies. Layer sharding something requires experts to exist.
+                assert args.num_experts is not None and args.num_experts > 0, (
+                    "--muon-lsh-scope expert layer-shards only expert-parallel weights, "
+                    "but this model has no experts (--num-experts). Use "
+                    "--muon-lsh-scope all for dense-only models."
                 )
+            else:
+                assert not args.muon_split_qkv, (
+                    "--use-layer-sharding-muon does not implement split-QKV Newton-Schulz "
+                    "yet; pass --muon-no-split-qkv (or narrow layer sharding with "
+                    "--muon-lsh-scope expert, whose dense path supports split-QKV)."
+                )
+                if args.muon_tp_mode != 'blockwise':
+                    # The kwargs builder matches constructor parameters reflectively, so
+                    # an unmatched muon_tp_mode is dropped silently — surface it instead.
+                    warn_rank_0(
+                        f"--muon-tp-mode {args.muon_tp_mode} is ignored under "
+                        "--use-layer-sharding-muon with --muon-lsh-scope all: layer "
+                        "sharding replaces the duplicated/distributed mode selection "
+                        "entirely. Use --muon-lsh-scope expert to keep dense weights "
+                        "on the tp-mode path."
+                    )
 
 
     # Make sure all functionality that requires Gloo process groups is disabled.
@@ -2648,6 +2662,14 @@ def _add_regularization_args(parser):
                        'back. Mathematically identical to duplicated-mode NS. Requires '
                        'the layer-wise distributed optimizer path (emerging optimizer + '
                        '--use-distributed-optimizer).')
+    group.add_argument('--muon-lsh-scope', type=str, default='all',
+                       choices=['all', 'expert'],
+                       help='Which weight-shard domains use LayerShardedMuon under '
+                       '--use-layer-sharding-muon. "all" (default): every Muon-managed '
+                       '2D weight. "expert": only expert-parallel weights are '
+                       'layer-sharded; dense weights stay on TensorParallelMuon, so '
+                       '--muon-tp-mode (including "auto") governs the dense domain and '
+                       'split-QKV remains available there.')
     group.add_argument('--muon-ns-batch-size', type=int, default=1,
                        help='Max number of same-shape matrices fused into one batched '
                        'Newton-Schulz on an NS home under --use-layer-sharding-muon. '

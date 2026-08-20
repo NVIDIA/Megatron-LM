@@ -327,8 +327,19 @@ class OptimizerConfig:
     same full-matrix Newton-Schulz as duplicated mode runs there with zero communication and
     zero redundancy, and reverse all_to_all stages scatter the result back to the original
     shards. Requires the layer-wise distributed optimizer path; muon_tp_mode is ignored
-    (layer sharding replaces the duplicated/distributed mode selection entirely).
+    (layer sharding replaces the duplicated/distributed mode selection entirely) unless
+    muon_lsh_scope narrows layer sharding to the expert domain.
     Defaults to False."""
+
+    muon_lsh_scope: str = 'all'
+    """Which weight-shard domains use LayerShardedMuon when use_layer_sharding_muon is set.
+    'all' (default): every Muon-managed 2D weight is layer-sharded — current behavior.
+    'expert': only expert-parallel weights are layer-sharded; dense weights stay on
+    TensorParallelMuon, so muon_tp_mode (including 'auto') governs the dense domain.
+    Motivation: the layer-sharded win concentrates on MoE expert homes (many identically
+    shaped matrices per rank), while the dense step cost is pinned by single large
+    matrices where a per-weight duplicated/distributed choice is faster than a2a
+    round-trips. Only used when use_layer_sharding_muon is set."""
 
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
