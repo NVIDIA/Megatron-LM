@@ -174,6 +174,27 @@ class AsyncScheduleMode(str, Enum):
 
 
 @dataclass
+class ImageProcessingConfig:
+    """Configuration for converting raw images into model input tensors."""
+
+    patch_dim: int
+    dynamic_resolution: bool = False
+    use_tiling: bool = False
+    pixel_shuffle: bool = False
+    spatial_merge_size: int = 1
+    dynamic_resolution_min_patches: int = 1
+    dynamic_resolution_max_patches: int = 128
+    vision_model_type: str = "radio"
+    pixel_mean: Optional[List[float]] = None
+    pixel_std: Optional[List[float]] = None
+    img_h: Optional[int] = None
+    img_w: Optional[int] = None
+    max_num_tiles: int = 1
+    use_thumbnail: bool = False
+    num_img_embeddings_per_tile: int = 0
+
+
+@dataclass
 class InferenceConfig:
     """
     Config for inference.
@@ -306,6 +327,9 @@ class InferenceConfig:
 
     pg_collection: Optional[ProcessGroupCollection] = None
     """A `ProcessGroupCollection` for distributed execution."""
+
+    image_preprocessing_config: Optional[ImageProcessingConfig] = None
+    """Configuration for preprocessing raw image payloads."""
 
     use_flashinfer_fused_rope: Optional[bool] = False
     """
