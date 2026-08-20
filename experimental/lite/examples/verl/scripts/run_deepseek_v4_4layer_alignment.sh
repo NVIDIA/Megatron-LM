@@ -13,6 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -L)"
 test -s "${MODEL_PATH}/config.json"
 test -s "${VLLM_BATCH_INVARIANT_KERNEL_LIB}"
 
+export OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/../outputs/ds4_4layer_alignment}"
+export RUN_NAME="${RUN_NAME:-ds4_4layer_ep4_alignment}"
+export VERL_TRAIN_INFER_DIFF_DUMP="${VERL_TRAIN_INFER_DIFF_DUMP:-${OUTPUT_ROOT}/train_infer_tokens.jsonl}"
+
 export NNODES=1
 export NGPUS_PER_NODE=4
 export ACTOR_PP=1
@@ -52,6 +56,7 @@ export MLITE_VALIDATE_INDICES=0
 export MLITE_WEIGHT_SYNC_FINGERPRINT=0
 export MLITE_WEIGHT_SYNC_PROBE=0
 export VERL_TRAIN_INFER_DIFF_MODE=compact
+export VERL_TRAIN_INFER_TOKEN_SAMPLE_LIMIT="${VERL_TRAIN_INFER_TOKEN_SAMPLE_LIMIT:-8}"
 
 layers='[0,1,2,3]'
 exec bash "${SCRIPT_DIR}/run_deepseek_v4_dapo.sh" \
