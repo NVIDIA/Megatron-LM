@@ -115,6 +115,16 @@ class TestTECheckpointCompatibility:
         assert "attention.softmax_offset" in sharded_state_dict
         assert isinstance(sharded_state_dict["attention._extra_state"], LocalNonpersistentObject)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_tenorm_keeps_runtime_and_checkpoint_hooks(self):
+        config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=2)
+
+        norm = TENorm(config=config, hidden_size=config.hidden_size)
+
+        assert norm.returns_residual is False
+        assert norm._mcore_sharded_state_dict_accepts_tp_group is True
+        assert norm.sharded_state_dict.__self__ is norm
+
 
 class TestTENormTensorParallelCheckpoint:
     def setup_method(self, method):
