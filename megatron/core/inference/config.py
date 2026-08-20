@@ -56,7 +56,7 @@ class MambaInferenceStateConfig:
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
         if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
+            mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )
             if conv_states_dtype is None:

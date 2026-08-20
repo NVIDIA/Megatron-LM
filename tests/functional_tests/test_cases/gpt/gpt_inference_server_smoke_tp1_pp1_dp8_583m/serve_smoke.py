@@ -2,10 +2,9 @@
 
 """Smoke test for ``examples/inference/launch_inference_server.py``.
 
-Spawns the high-level-API server as a subprocess (TP=1, DP=8 on Mistral 0.5B),
-tails its stdout for the readiness banner, sends one OpenAI-compatible
-``/v1/completions`` request, and asserts on a 200 response with a non-empty
-``choices[0].text``. Server is then SIGTERM'd and joined.
+Spawns the high-level-API server as a subprocess, optionally with native
+disaggregation, sends one OpenAI-compatible ``/v1/completions`` request, and
+checks for a non-empty response. The server is then SIGTERM'd and joined.
 
 No golden values: this is a pass/fail HTTP smoke. It validates the daemon-thread
 CUDA-device fix, coordinator startup, frontend replicas, and request/response
@@ -32,17 +31,35 @@ SERVER_PORT = 5000
 
 
 def build_server_cmd(
-    checkpoint_dir: str, tokenizer_model: str, server_log_dir: str = None
+    checkpoint_dir: str,
+    tokenizer_model: str,
+    server_log_dir: str = None,
+    inference_shards: str = "",
 ) -> list[str]:
-    """Build the torchrun command for ``launch_inference_server.py`` (Mistral 0.5B,
-    TP=1 DP=8). Mirrors gpt_dynamic_inference_tp1_pp1_dp8_583m_logitsmatch_zmq's
-    model_config.yaml so the same checkpoint that legacy dp8 inference tests use
-    is reused here.
+    """Build the ``launch_inference_server.py`` command for Mistral 0.5B.
+
+    The base model arguments match the existing DP=8 inference test. An
+    ``inference_shards`` value partitions those ranks into prefill and decode pools.
     """
     # ``--tee "3"`` writes per-rank stdout+stderr files under ``--log-dir`` (which
     # the JET harness expects at ``logs/*/*/attempt_0/*/std*.log``) while still
     # echoing to this driver's captured stdout so the readiness watcher works.
     log_args = ["--log-dir", server_log_dir, "--tee", "3"] if server_log_dir else []
+    disagg_args = []
+    if inference_shards:
+        disagg_args = [
+            "--inference-shards",
+            inference_shards,
+            "--disagg-kv-transport-backend",
+            "nccl",
+            "--inference-dynamic-batching-prefix-caching",
+            "--cuda-graph-impl",
+            "local",
+            "--inference-cuda-graph-scope",
+            "block",
+            "--inference-dynamic-batching-num-cuda-graphs",
+            "1",
+        ]
     return [
         sys.executable,
         "-m",
@@ -100,6 +117,7 @@ def build_server_cmd(
         "--dist-ckpt-strictness",
         "log_unexpected",
         "--inference-ckpt-non-strict",
+        *disagg_args,
         "--port",
         str(SERVER_PORT),
         "--host",
@@ -159,9 +177,12 @@ def main() -> int:
         help="torchrun --log-dir for the spawned server; CI passes the JET assets "
         "dir so per-rank logs land where the harness expects them.",
     )
+    parser.add_argument("--inference-shards", default="")
     args = parser.parse_args()
 
-    cmd = build_server_cmd(args.checkpoint_dir, args.tokenizer_model, args.server_log_dir)
+    cmd = build_server_cmd(
+        args.checkpoint_dir, args.tokenizer_model, args.server_log_dir, args.inference_shards
+    )
     print(f"[smoke] spawning server: {' '.join(cmd)}", flush=True)
 
     proc = subprocess.Popen(
