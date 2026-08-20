@@ -1,8 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import sys
-import types
-
 import pytest
 import torch
 
@@ -122,6 +119,24 @@ def test_swizzle_mxfp8_scale_matches_tcgen05_lane_layout():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_swizzle_mxfp8_scale_refreshes_existing_output_in_place():
+    rows = columns = 128
+    logical = torch.arange(rows * (columns // 32), dtype=torch.int32).to(torch.uint8)
+    logical = logical.reshape(1, rows, columns // 32)
+    expected = mok_megakernel._swizzle_mxfp8_scale(
+        logical, rows=rows, columns=columns
+    )
+    output = torch.empty_like(expected)
+    output_ptr = output.data_ptr()
+
+    actual = mok_megakernel._swizzle_mxfp8_scale(
+        logical, rows=rows, columns=columns, out=output
+    )
+
+    assert actual is output
+    assert actual.data_ptr() == output_ptr
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
 
 def test_mxfp8_backward_views_keep_native_columnwise_payload_zero_copy():
     num_experts, rows, columns = 1, 256, 128
@@ -195,72 +210,228 @@ def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeyp
     assert prepare_calls == [(256, 256), (256, 128)] * 2
 
 
-def _compatibility_module(*, use_mxfp8_weights):
+def _split_module(*, use_mxfp8_weights):
     module = mok_megakernel.MoKMegakernel.__new__(mok_megakernel.MoKMegakernel)
     torch.nn.Module.__init__(module)
     module.native_single_grouped_weights = False
     module.use_mxfp8_weights = use_mxfp8_weights
     module.is_first_microbatch = True
-    module._quantized_cache = None
-    module._quantized_versions = None
-    module.routed_gate_weight = torch.nn.Parameter(
-        torch.randn((2, 4, 8), dtype=torch.bfloat16)
-    )
-    module.routed_up_weight = torch.nn.Parameter(
-        torch.randn((2, 4, 8), dtype=torch.bfloat16)
-    )
-    module.routed_down_weight = torch.nn.Parameter(
-        torch.randn((2, 8, 4), dtype=torch.bfloat16)
-    )
+    module._prepared_routed_weight_cache = None
+    module.intermediate_size = 4
+    module.hidden_size = 8
+    module._routed_fc1_parameter_names = ("routed_fc1_weight0", "routed_fc1_weight1")
+    module._routed_down_parameter_names = ("routed_down_weight0", "routed_down_weight1")
+    for name in module._routed_fc1_parameter_names:
+        module.register_parameter(
+            name, torch.nn.Parameter(torch.randn((8, 8), dtype=torch.bfloat16))
+        )
+    for name in module._routed_down_parameter_names:
+        module.register_parameter(
+            name, torch.nn.Parameter(torch.randn((8, 4), dtype=torch.bfloat16))
+        )
     return module
 
 
-def test_bf16_compatibility_weights_are_zero_copy_and_separate():
-    module = _compatibility_module(use_mxfp8_weights=False)
+def test_parameter_storage_attr_supports_public_and_private_te_fields():
+    class Storage:
+        pass
 
-    gate, up, down = module.quantized_routed_weights()
+    public = Storage()
+    public.rowwise_data = torch.tensor([1])
+    assert (
+        mok_megakernel._parameter_storage_attr(public, "rowwise_data")
+        is public.rowwise_data
+    )
 
-    assert gate is module.routed_gate_weight
-    assert up is module.routed_up_weight
-    assert down is module.routed_down_weight
-    assert gate.data_ptr() != up.data_ptr()
-    assert not module.is_first_microbatch
+    private = Storage()
+    private._rowwise_data = torch.tensor([2])
+    assert (
+        mok_megakernel._parameter_storage_attr(private, "rowwise_data")
+        is private._rowwise_data
+    )
+
+    wrapped = Storage()
+    wrapped.data = private
+    assert (
+        mok_megakernel._parameter_storage_attr(wrapped, "rowwise_data")
+        is private._rowwise_data
+    )
 
 
-def test_mxfp8_compatibility_cache_refreshes_per_optimizer_iteration(monkeypatch):
-    module = _compatibility_module(use_mxfp8_weights=True)
-    quantize_calls = []
+def test_bf16_split_descriptors_are_cached(monkeypatch):
+    module = _split_module(use_mxfp8_weights=False)
+    calls = []
 
-    def fake_quantize(weight, rowwise, columnwise):
-        assert rowwise and columnwise
-        quantize_calls.append(weight)
-        return (weight, object(), object(), object())
+    def fake_split(params, *, rows, columns, use_mxfp8):
+        calls.append((params, rows, columns, use_mxfp8))
+        return object()
 
-    fake_mok = types.ModuleType("mok")
-    fake_mok.__path__ = []
-    fake_ops = types.ModuleType("mok.ops")
-    fake_ops.mxfp8_quantize = fake_quantize
-    monkeypatch.setitem(sys.modules, "mok", fake_mok)
-    monkeypatch.setitem(sys.modules, "mok.ops", fake_ops)
+    monkeypatch.setattr(mok_megakernel, "_native_split_weight_view", fake_split)
 
     first = module.quantized_routed_weights()
     second = module.quantized_routed_weights()
 
     assert second is first
-    assert len(quantize_calls) == 3
+    assert first[0] is first[1]
+    assert [(rows, columns, use_mxfp8) for _, rows, columns, use_mxfp8 in calls] == [
+        (8, 8, False),
+        (8, 4, False),
+    ]
+    assert not module.is_first_microbatch
+
+
+def test_mxfp8_split_scale_and_descriptor_cache_refreshes_per_iteration(monkeypatch):
+    module = _split_module(use_mxfp8_weights=True)
+    build_calls = []
+    refresh_calls = []
+
+    def fake_split(params, *, rows, columns, use_mxfp8):
+        build_calls.append((params, rows, columns, use_mxfp8))
+        return object()
+
+    def fake_refresh(prepared, params, *, rows, columns):
+        refresh_calls.append((prepared, params, rows, columns))
+
+    monkeypatch.setattr(mok_megakernel, "_native_split_weight_view", fake_split)
+    monkeypatch.setattr(
+        mok_megakernel, "_refresh_native_split_weight_scales", fake_refresh
+    )
+
+    first = module.quantized_routed_weights()
+    second = module.quantized_routed_weights()
+
+    assert second is first
+    assert len(build_calls) == 2
+    assert not refresh_calls
 
     module.is_first_microbatch = True
     third = module.quantized_routed_weights()
 
-    assert third is not first
-    assert len(quantize_calls) == 6
+    assert third is first
+    assert third[0] is third[1]
+    assert len(build_calls) == 2
+    assert [
+        (prepared, rows, columns) for prepared, _, rows, columns in refresh_calls
+    ] == [(first[0], 8, 8), (first[2], 8, 4)]
 
-    with torch.no_grad():
-        module.routed_gate_weight.add_(1)
-    fourth = module.quantized_routed_weights()
 
-    assert fourth is not third
-    assert len(quantize_calls) == 9
+def test_mxfp8_split_scales_use_per_expert_descriptor_tables(monkeypatch):
+    from megatron.core import fp8_utils
+    from mok import ops
+
+    rows, columns = 256, 128
+
+    class SplitParam:
+        pass
+
+    params = []
+    for expert in range(2):
+        param = SplitParam()
+        param.rowwise_data = torch.empty(
+            (rows, columns), dtype=torch.float8_e4m3fn
+        )
+        param.columnwise_data = torch.empty_like(param.rowwise_data)
+        param._rowwise_scale_inv = torch.full(
+            (rows, columns // 32), expert + 1, dtype=torch.uint8
+        )
+        param._columnwise_scale_inv = torch.full(
+            (rows // 32, columns), expert + 3, dtype=torch.uint8
+        )
+        params.append(param)
+
+    monkeypatch.setattr(fp8_utils, "is_mxfp8tensor", lambda param: True)
+    monkeypatch.setattr(
+        mok_megakernel,
+        "_storage_view",
+        lambda storage, shape, **kwargs: storage.view(shape),
+    )
+    monkeypatch.setattr(
+        torch,
+        "stack",
+        lambda *args, **kwargs: pytest.fail("split MXFP8 scales must not be stacked"),
+    )
+
+    scale_table_inputs = []
+    monkeypatch.setattr(
+        ops,
+        "make_routed_weight_storage_table_mxfp8",
+        lambda tensors: torch.tensor([len(tensors)], dtype=torch.uint8),
+    )
+
+    def fake_scale_table(tensors):
+        scale_table_inputs.append(tuple(tensors))
+        return torch.tensor([len(tensors)], dtype=torch.uint8)
+
+    monkeypatch.setattr(ops, "make_routed_scale_storage_table", fake_scale_table)
+
+    prepared = mok_megakernel._native_split_weight_view(
+        tuple(params), rows=rows, columns=columns, use_mxfp8=True
+    )
+
+    assert len(scale_table_inputs) == 2
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            prepared.scale_tensors, scale_table_inputs[0], strict=True
+        )
+    )
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            prepared.transposed_scale_tensors, scale_table_inputs[1], strict=True
+        )
+    )
+    assert tuple(prepared.scale.shape) == (rows // 128, columns // 128, 32, 16)
+    assert tuple(prepared.transposed_scale.shape) == (
+        columns // 128,
+        rows // 128,
+        32,
+        16,
+    )
+    assert prepared.scale_tensors[0].data_ptr() != prepared.scale_tensors[1].data_ptr()
+    assert (
+        prepared.transposed_scale_tensors[0].data_ptr()
+        != prepared.transposed_scale_tensors[1].data_ptr()
+    )
+
+    row_ptrs = tuple(tensor.data_ptr() for tensor in prepared.scale_tensors)
+    column_ptrs = tuple(
+        tensor.data_ptr() for tensor in prepared.transposed_scale_tensors
+    )
+    row_table = prepared.scale_storage_table
+    column_table = prepared.transposed_scale_storage_table
+    params[0]._rowwise_scale_inv.fill_(9)
+    params[1]._columnwise_scale_inv.fill_(11)
+
+    mok_megakernel._refresh_native_split_weight_scales(
+        prepared, tuple(params), rows=rows, columns=columns
+    )
+
+    assert tuple(tensor.data_ptr() for tensor in prepared.scale_tensors) == row_ptrs
+    assert (
+        tuple(tensor.data_ptr() for tensor in prepared.transposed_scale_tensors)
+        == column_ptrs
+    )
+    assert prepared.scale_storage_table is row_table
+    assert prepared.transposed_scale_storage_table is column_table
+    for expert, param in enumerate(params):
+        expected_row = mok_megakernel._swizzle_mxfp8_scale(
+            param._rowwise_scale_inv.unsqueeze(0), rows=rows, columns=columns
+        )
+        expected_column = mok_megakernel._swizzle_mxfp8_scale(
+            param._columnwise_scale_inv.transpose(-2, -1).unsqueeze(0),
+            rows=columns,
+            columns=rows,
+        )
+        torch.testing.assert_close(
+            prepared.scale_tensors[expert], expected_row, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            prepared.transposed_scale_tensors[expert],
+            expected_column,
+            rtol=0,
+            atol=0,
+        )
 
 
 def test_native_single_grouped_bf16_views_alias_authoritative_parameters():
@@ -342,8 +513,6 @@ def test_import_weights_preserves_reordered_init_for_optimizer(monkeypatch):
     class Stub:
         pass
 
-    monkeypatch.setattr(mok_megakernel, "_debug_tag", lambda *_: None)
-
     hidden_size = 3
     routed_intermediate = 2
     shared_intermediate = 1
@@ -396,7 +565,6 @@ def test_import_weights_preserves_reordered_init_for_optimizer(monkeypatch):
     module.intermediate_size = routed_intermediate
     module.shared_intermediate_size = shared_intermediate
     module.num_local_experts = num_experts
-    module._debug_module_index = 0
 
     module._import_routed_weights(routed)
     module._import_shared_weights(shared)

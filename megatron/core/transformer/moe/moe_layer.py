@@ -352,10 +352,11 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
-        # Experimental E2E path: native single-grouped routed parameters remain
-        # the authoritative optimizer/DDP/checkpoint owner. In compatibility mode,
-        # MOK imports per-expert parameters into its own contiguous layout and the
-        # source experts are unregistered below to avoid duplicate steady-state weights.
+        # Experimental E2E path: MOK keeps the original routed Parameters as the
+        # authoritative optimizer/DDP owners. Single-grouped weights are used
+        # directly; non-single weights are re-registered as per-expert aliases and
+        # addressed through MOK descriptor tables. The source expert module can
+        # therefore be unregistered without copying any routed-weight payload.
         self.mok_experts = None
         if self.config.use_mok_megakernel:
             from megatron.core.transformer.moe.mok_megakernel import MoKMegakernel
