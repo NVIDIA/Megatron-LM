@@ -19,7 +19,7 @@ from .api import EpisodeResult, GroupedRolloutRequest, GroupRolloutParams, Rollo
 
 if TYPE_CHECKING:
     from ..rollout_bank import RolloutBank
-    from .api import GroupedRolloutGenerator
+    from .api import GroupedRolloutGenerator, Rollout, TokenRollout
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +262,8 @@ class RolloutPipeline:
         self.prepared_count = 0
         self.inferred_count = 0
         self.assembled_count = 0
+        # All drops, any reason; the two counters below attribute them for metrics.
+        self.dropped_count = 0
         self.filtered_count = 0
         self.refilled_placeholder_groups = 0
         self.restored_count = 0
@@ -269,6 +271,8 @@ class RolloutPipeline:
         self.prepared_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.assembled_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.yielded_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
+        self.refill_failure_reasons: dict[str, int] = {}
+        self._lifetime_refilled_groups = 0
 
     async def run(self) -> AsyncIterator[RolloutGroup]:
         """Run the pipeline stages; cancels them when the iterator is closed.
@@ -348,16 +352,18 @@ class RolloutPipeline:
             f"The rollout pipeline has buffered rollouts at iteration boundary: {buffered}. "
             "The generator has run ahead under a stale policy."
         )
-        # Filtered groups consume prepared rollouts without ever being yielded;
+        # Dropped groups consume prepared rollouts without ever being yielded;
         # restored groups are yielded without being freshly prepared.
         fresh_yielded_count = self.yielded_count - self.restored_count
         in_flight = self.prepared_count - (
-            (fresh_yielded_count + self.filtered_count) * self.request.rollouts_per_group
+            (fresh_yielded_count + self.dropped_count) * self.request.rollouts_per_group
         )
         assert in_flight == 0, (
             f"The rollout pipeline prepared {self.prepared_count} rollout(s) but yielded "
-            f"{self.yielded_count} and filtered {self.filtered_count} group(s) of "
-            f"{self.request.rollouts_per_group}; "
+            f"{self.yielded_count} ({self.restored_count} restored) and dropped "
+            f"{self.dropped_count} group(s) of {self.request.rollouts_per_group} "
+            f"({self.filtered_count} same-reward-filtered, "
+            f"{self.refilled_placeholder_groups} placeholder-refilled); "
             f"{in_flight} rollout(s) in flight at iteration boundary."
         )
 
@@ -442,7 +448,7 @@ class RolloutPipeline:
         )
 
     async def stage_assemble(self) -> None:
-        """Build complete rollout groups, and regenerate filtered groups."""
+        """Build complete rollout groups, and regenerate dropped groups."""
         pending = self._assemble_pending
         try:
             while True:
@@ -471,7 +477,10 @@ class RolloutPipeline:
                     index_in_batch=first.item.index_in_batch,
                 )
                 if self._decide_drop(group):
-                    task = asyncio.create_task(self._regenerate_group(group))
+                    self.dropped_count += 1
+                    task = asyncio.create_task(
+                        self._regenerate_group(group.batch_id, group.index_in_batch)
+                    )
                     self._regen_tasks.add(task)
                     task.add_done_callback(self._regen_tasks.discard)
                     continue
@@ -486,43 +495,60 @@ class RolloutPipeline:
         finally:
             self.output_queue.shutdown()
 
+    @staticmethod
+    def _is_refillable_placeholder(rollout: "Rollout | TokenRollout") -> bool:
+        """A failed episode's placeholder, eligible for a refill."""
+        return rollout.is_placeholder and rollout.rollout_status in ('ok', 'placeholder')
+
     def _decide_drop(self, group: RolloutGroup) -> bool:
-        """Decide whether to drop this group"""
-        if all(not rollout.trajectory for rollout in group.rollouts):
-            self.filtered_count += 1
+        """Decide whether to drop this group instead of delivering it."""
+        if all(self._is_refillable_placeholder(rollout) for rollout in group.rollouts):
             self.refilled_placeholder_groups += 1
-            if self.refilled_placeholder_groups == 1 or self.refilled_placeholder_groups % 32 == 0:
+            self._lifetime_refilled_groups += 1
+            reasons: dict[str, int] = {}
+            for rollout in group.rollouts:
+                if rollout.failure_reason:
+                    reasons[rollout.failure_reason] = reasons.get(rollout.failure_reason, 0) + 1
+                    self.refill_failure_reasons[rollout.failure_reason] = (
+                        self.refill_failure_reasons.get(rollout.failure_reason, 0) + 1
+                    )
+            if self._lifetime_refilled_groups == 1 or self._lifetime_refilled_groups % 32 == 0:
                 logger.warning(
-                    "Refilling all-placeholder group (batch %s slot %s): %d refilled so far. "
-                    "Groups whose episodes all failed are regenerated; a climbing count means "
-                    "a likely failure upstream of the pipeline.",
+                    "Refilling all-placeholder group (batch %s slot %s): %d refilled over this "
+                    "pipeline's lifetime%s. Groups whose episodes all failed are regenerated; "
+                    "a climbing count means a likely failure upstream of the pipeline.",
                     group.batch_id,
                     group.index_in_batch,
-                    self.refilled_placeholder_groups,
+                    self._lifetime_refilled_groups,
+                    f" (member failure reasons: {sorted(reasons.items())})" if reasons else "",
                 )
             return True
         if self.request.filter_groups_with_same_reward:
-            if np.std([rollout.reward for rollout in group.rollouts]) <= 1e-6:
+            real_rewards = [
+                rollout.reward for rollout in group.rollouts if not rollout.is_placeholder
+            ]
+            if real_rewards and np.std(real_rewards) <= 1e-6:
                 self.filtered_count += 1
                 return True
         return False
 
     @trace_async_exceptions(verbose=True)
-    async def _regenerate_group(self, dropped: RolloutGroup) -> None:
+    async def _regenerate_group(self, batch_id: int, index_in_batch: int) -> None:
         """Resubmit a replacement group for a dropped group's batch slot."""
         group_id = self._next_regen_group_id
         self._next_regen_group_id -= 1
         try:
             await self._submit_group_to_infer_queue(
-                group_id=group_id,
-                batch_id=dropped.batch_id,
-                index_in_batch=dropped.index_in_batch,
+                group_id=group_id, batch_id=batch_id, index_in_batch=index_in_batch
             )
         except asyncio_QueueShutDown:
             # Intake closed mid-regeneration (teardown or other failure).
             self.gate.release_for("G")
             self._groups_in_flight -= 1
             self._maybe_close_intake()
+        except BaseException:
+            self.infer_queue.shutdown()
+            raise
 
     def _record_output_dwell(self, group: RolloutGroup) -> None:
         """Record how long a group sat in output_queue before being yielded."""

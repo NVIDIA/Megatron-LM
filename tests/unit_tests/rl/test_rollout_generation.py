@@ -121,13 +121,23 @@ class PlaceholderMockGenerator(MockGenerator):
     placeholder_members bounds how many members of each affected group come
     back empty (None => every member). Failed episodes keep the group
     rectangular with empty trajectories, which is how placeholders arrive
-    from the environment side.
+    from the environment side; placeholder_status/placeholder_reason stamp
+    the adapter-side status and failure-cause labels on them.
     """
 
-    def __init__(self, num_placeholder=0, placeholder_members=None, **kwargs):
+    def __init__(
+        self,
+        num_placeholder=0,
+        placeholder_members=None,
+        placeholder_status='ok',
+        placeholder_reason=None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.num_placeholder = num_placeholder
         self.placeholder_members = placeholder_members
+        self.placeholder_status = placeholder_status
+        self.placeholder_reason = placeholder_reason
 
     async def prepare_group_rollout(self, request):
         idx = self._call_count
@@ -143,6 +153,8 @@ class PlaceholderMockGenerator(MockGenerator):
                 self.placeholder_members is None or member < self.placeholder_members
             ):
                 rollout.trajectory = []
+                rollout.rollout_status = self.placeholder_status
+                rollout.failure_reason = self.placeholder_reason
             return rollout
 
         return GroupRolloutParams(run_episode=params.run_episode, build_rollout=build_rollout)
@@ -169,6 +181,14 @@ async def _flush(rounds: int = 50):
     """Let pipeline stage tasks settle (mock inference is zero-delay)."""
     for _ in range(rounds):
         await asyncio.sleep(0)
+
+
+def _assert_batches_arrive_in_submission_order(groups, num_groups):
+    """Batches complete and arrive in submission order despite drops/refills."""
+    assert [g.batch_id for g in groups] == sorted(g.batch_id for g in groups)
+    for batch_start in range(0, len(groups), num_groups):
+        batch = groups[batch_start : batch_start + num_groups]
+        assert sorted(g.index_in_batch for g in batch) == list(range(num_groups))
 
 
 class TestSubmissionGate:
@@ -408,11 +428,7 @@ class TestGroupedRollouts:
         for group in groups:
             assert np.std([rollout.reward for rollout in group]) > 1e-6
         if consumption_granularity == "B":
-            # Batches complete and arrive in submission order despite drops.
-            assert [g.batch_id for g in groups] == sorted(g.batch_id for g in groups)
-            for batch_start in range(0, expected_count, num_groups):
-                batch = groups[batch_start : batch_start + num_groups]
-                assert sorted(g.index_in_batch for g in batch) == list(range(num_groups))
+            _assert_batches_arrive_in_submission_order(groups, num_groups)
         if submission_granularity == "B" and parallel_generation_tasks == 1:
             # Every dropped group cost exactly one extra prepare (no under-delivery).
             assert gen.prepare_group_rollout_calls == expected_count + num_degenerate
@@ -472,25 +488,30 @@ class TestGroupedRollouts:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         (
-            "streaming, submission_granularity, consumption_granularity, "
-            "num_placeholder, placeholder_members"
+            "pull_two_windows, submission_granularity, consumption_granularity, "
+            "num_placeholder, placeholder_members, parallel_generation_tasks"
         ),
         [
-            pytest.param(False, "B", "B", 3, None, id="batch_all_placeholder"),
-            pytest.param(False, "G", "G", 3, None, id="group_all_placeholder"),
-            pytest.param(False, "B", "B", 3, 1, id="partial_group_delivers"),
-            pytest.param(False, "B", "B", 9, None, id="cascading_refill"),
-            pytest.param(True, "B", "B", 3, None, id="streaming_batch_consume"),
-            pytest.param(True, "G", "G", 3, 1, id="streaming_partial_delivers"),
+            pytest.param(False, "B", "B", 3, None, 8, id="batch_all_placeholder"),
+            # Depth-1 gate so the refilled groups deliver inside the observed
+            # window and their contents are actually inspected.
+            pytest.param(False, "G", "G", 3, None, 1, id="group_all_placeholder"),
+            pytest.param(False, "B", "B", 3, 1, 8, id="partial_group_delivers"),
+            # Depth-1 gate so refills draw placeholder indices — i.e. refilled
+            # groups are themselves refilled.
+            pytest.param(False, "B", "B", 9, None, 1, id="cascading_refill"),
+            pytest.param(True, "B", "B", 3, None, 8, id="two_window_batch_consume"),
+            pytest.param(True, "G", "G", 3, 1, 8, id="two_window_partial_delivers"),
         ],
     )
     async def test_all_placeholder_groups_are_refilled(
         self,
-        streaming,
+        pull_two_windows,
         submission_granularity,
         consumption_granularity,
         num_placeholder,
         placeholder_members,
+        parallel_generation_tasks,
     ):
         """Groups whose members are ALL empty-trajectory placeholders are
         dropped and regenerated in place; groups with any real member deliver
@@ -504,26 +525,38 @@ class TestGroupedRollouts:
             num_groups=num_groups,
             rollouts_per_group=2,
             inference_interface=MockInferenceInterface(),
-            streaming=streaming,
             submission_granularity=submission_granularity,
             consumption_granularity=consumption_granularity,
         )
 
-        pipeline = RolloutPipeline(gen, request, parallel_generation_tasks=8)
+        pipeline = RolloutPipeline(
+            gen, request, parallel_generation_tasks=parallel_generation_tasks
+        )
 
         all_placeholder = placeholder_members is None
-        expected_count = 2 * num_groups if streaming else num_groups
-        groups, refilled_counts = [], []
+        expected_count = 2 * num_groups if pull_two_windows else num_groups
+        groups, refilled_at_delivery = [], 0
         async with aclosing(pipeline.run()) as it:
-            async for group in it:
-                groups.append(group)
-                refilled_counts.append(pipeline.refilled_placeholder_groups)
-                # stage_prepare no longer stops itself for non-streaming requests
-                # (persistent-stream redesign); every caller bounds its own pull.
-                if len(groups) >= expected_count:
-                    break
+            # stage_prepare no longer stops itself for non-streaming requests
+            # (persistent-stream redesign); every caller bounds its own pull.
+            while len(groups) < expected_count:
+                # wait_for turns the deadlock failure mode (a refill never
+                # resubmitted) into a test failure instead of a hang.
+                groups.append(await asyncio.wait_for(anext(it), timeout=10))
+                refilled_at_delivery = pipeline.refilled_placeholder_groups
+            if submission_granularity == "B" and parallel_generation_tasks == 1:
+                # lag=0: the boundary is quiescent; this also locks the
+                # prepared == (yielded + filtered + refilled) * R identity
+                # under a refill storm.
+                pipeline.assert_no_inflight_rollouts()
 
         assert len(groups) == expected_count
+        if not pull_two_windows:
+            # Refills land in the dropped groups' own batch slots: the observed
+            # window is exactly batch 0, whole.
+            assert {(g.batch_id, g.index_in_batch) for g in groups} == {
+                (0, index) for index in range(num_groups)
+            }
         if all_placeholder:
             # Refilled: no placeholder member ever reaches the consumer.
             for group in groups:
@@ -534,25 +567,164 @@ class TestGroupedRollouts:
             # and nothing is refilled.
             placeholder_groups = [g for g in groups if any(not r.trajectory for r in g)]
             assert placeholder_groups
-            if not streaming:
+            if not pull_two_windows:
                 assert len(placeholder_groups) == num_placeholder
             for group in placeholder_groups:
                 assert any(r.trajectory for r in group)
-            assert refilled_counts[-1] == 0
         if consumption_granularity == "B":
-            # Batches complete and arrive in submission order despite refills.
-            assert [g.batch_id for g in groups] == sorted(g.batch_id for g in groups)
-            for batch_start in range(0, expected_count, num_groups):
-                batch = groups[batch_start : batch_start + num_groups]
-                assert sorted(g.index_in_batch for g in batch) == list(range(num_groups))
-        if not streaming:
-            expected_refills = num_placeholder if all_placeholder else 0
-            # No under-delivery: exactly the expected refills by the time the
-            # observed window is fully delivered. (stage_prepare no longer stops
-            # at one window's worth, so it also eagerly preps later batches in
-            # the background; gen.prepare_group_rollout_calls counts those too
-            # and is no longer a useful bound here.)
-            assert refilled_counts[-1] == expected_refills
+            _assert_batches_arrive_in_submission_order(groups, num_groups)
+        # No under-delivery: exactly the expected refills by the time the
+        # observed window is fully delivered (placeholders only ever affect
+        # batch 0's prepare indices, so this holds for two-window pulls too).
+        expected_refills = num_placeholder if all_placeholder else 0
+        assert refilled_at_delivery == expected_refills
+        # The accounting total and the attribution counters stay in lockstep.
+        assert pipeline.dropped_count == (
+            pipeline.filtered_count + pipeline.refilled_placeholder_groups
+        )
+        if submission_granularity == "B" and parallel_generation_tasks == 1:
+            # Every refill cost exactly one extra prepare (no under-delivery).
+            assert gen.prepare_group_rollout_calls == num_groups + expected_refills
+
+    @pytest.mark.asyncio
+    async def test_refill_diagnostics_survive_metric_resets(self):
+        """The refill warning's lifetime count and the dropped members' failure
+        reasons are kept independently of the public per-window counter that
+        every metrics collection zeroes."""
+        num_placeholder = 3
+        num_groups = 4
+        rollouts_per_group = 2
+        gen = PlaceholderMockGenerator(
+            num_placeholder=num_placeholder, placeholder_reason="episode timeout"
+        )
+        request = GroupedRolloutRequest(
+            num_groups=num_groups,
+            rollouts_per_group=rollouts_per_group,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity="B",
+            consumption_granularity="B",
+        )
+        pipeline = RolloutPipeline(gen, request, parallel_generation_tasks=1)
+
+        groups = []
+        async with aclosing(pipeline.run()) as it:
+            while len(groups) < num_groups:
+                groups.append(await asyncio.wait_for(anext(it), timeout=10))
+            pipeline.assert_no_inflight_rollouts()
+
+        # The dropped originals' failure reasons are kept for the metrics
+        # export; their real replacements contribute none.
+        assert pipeline.refill_failure_reasons == {
+            "episode timeout": num_placeholder * rollouts_per_group
+        }
+        # The warning throttle counts for the pipeline's lifetime: zeroing the
+        # public counter (as every metrics collection does) must not reset it.
+        pipeline.refilled_placeholder_groups = 0
+        assert pipeline._lifetime_refilled_groups == num_placeholder
+
+    @pytest.mark.asyncio
+    async def test_deliberately_voided_empty_groups_deliver(self):
+        """Empty-trajectory rollouts stamped with a deliberate non-placeholder
+        status ('masked'/'graded') are adapter-voided on purpose: their groups
+        must deliver for status accounting, not be refilled."""
+        num_masked = 2
+        num_groups = 4
+        gen = PlaceholderMockGenerator(num_placeholder=num_masked, placeholder_status='masked')
+        request = GroupedRolloutRequest(
+            num_groups=num_groups,
+            rollouts_per_group=2,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity="B",
+            consumption_granularity="B",
+        )
+        pipeline = RolloutPipeline(gen, request, parallel_generation_tasks=1)
+
+        groups = []
+        async with aclosing(pipeline.run()) as it:
+            while len(groups) < num_groups:
+                groups.append(await asyncio.wait_for(anext(it), timeout=10))
+            pipeline.assert_no_inflight_rollouts()
+
+        voided = [g for g in groups if all(r.is_placeholder for r in g)]
+        assert len(voided) == num_masked
+        for group in voided:
+            assert all(r.rollout_status == 'masked' for r in group)
+        # The refill path never touched them.
+        assert pipeline.refilled_placeholder_groups == 0
+        assert gen.prepare_group_rollout_calls == num_groups
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "placeholder_reward",
+        [
+            # An unrewarded failed episode used to crash np.std with a
+            # TypeError; a numeric sentinel used to manufacture fake variance
+            # that let the zero-signal group through.
+            pytest.param(None, id="unrewarded_placeholder"),
+            pytest.param(0.0, id="sentinel_rewarded_placeholder"),
+        ],
+    )
+    async def test_same_reward_filter_ignores_placeholder_members(self, placeholder_reward):
+        """The same-reward filter judges variance over real members only —
+        the same population the trainer's masked group statistics use."""
+
+        class PartialDegenerateMockGenerator(MockGenerator):
+            """Group 0: member 0 fails, real members share one reward; later
+            groups carry distinct member rewards."""
+
+            async def prepare_group_rollout(self, request):
+                idx = self._call_count
+                params = await super().prepare_group_rollout(request)
+                affected = idx < 1
+                member_counter = itertools.count()
+                base_build = params.build_rollout
+
+                async def build_rollout(episode):
+                    rollout = await base_build(episode)
+                    member = next(member_counter)
+                    if affected and member == 0:
+                        rollout.trajectory = []
+                        rollout.reward = placeholder_reward
+                    elif affected:
+                        rollout.reward = 1.0
+                    else:
+                        rollout.reward = float(member)
+                    return rollout
+
+                return GroupRolloutParams(
+                    run_episode=params.run_episode, build_rollout=build_rollout
+                )
+
+        num_groups = 4
+        gen = PartialDegenerateMockGenerator()
+        request = GroupedRolloutRequest(
+            num_groups=num_groups,
+            rollouts_per_group=2,
+            inference_interface=MockInferenceInterface(),
+            filter_groups_with_same_reward=True,
+            submission_granularity="B",
+            consumption_granularity="B",
+        )
+        pipeline = RolloutPipeline(gen, request, parallel_generation_tasks=1)
+
+        groups = []
+        async with aclosing(pipeline.run()) as it:
+            while len(groups) < num_groups:
+                # Pre-fix, the None-reward case killed stage_assemble with a
+                # TypeError inside np.std and this pull raised RuntimeError.
+                groups.append(await asyncio.wait_for(anext(it), timeout=10))
+            pipeline.assert_no_inflight_rollouts()
+
+        # Group 0's lone real member carries no signal (the trainer would give
+        # it advantage exactly 0), so the group is filtered and regenerated —
+        # not delivered on placeholder-manufactured variance, and not a crash.
+        assert pipeline.dropped_count == 1
+        assert pipeline.filtered_count == 1
+        assert pipeline.refilled_placeholder_groups == 0
+        assert gen.prepare_group_rollout_calls == num_groups + 1
+        for group in groups:
+            real_rewards = [r.reward for r in group if r.trajectory]
+            assert np.std(real_rewards) > 1e-6
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
