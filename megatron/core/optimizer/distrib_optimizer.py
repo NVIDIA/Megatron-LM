@@ -1309,16 +1309,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             dtype_state = {}
             assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
-                buffer_numel = self.buffers[gbuf_idx].numel
                 buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
                 # Create coalesced tensors for all state related to parameters in this buffer.
+                # These are sized to the compact (bucket-end padding stripped) layout, which is
+                # exactly what the loop below fills and what the load paths read back.
                 world_tensors = {}
                 if data_parallel_rank == 0 or return_on_all_ranks:
                     world_tensors = {
-                        key: torch.zeros((buffer_numel,), dtype=torch.float32, device="cpu")
+                        key: torch.zeros(
+                            (buffer_numel_unpadded,), dtype=torch.float32, device="cpu"
+                        )
                         for key in ("param",) + self.optimizer_state_keys
                     }
-                    world_tensors["numel"] = buffer_numel
                     world_tensors["numel_unpadded"] = buffer_numel_unpadded
 
                 if not empty_data:
@@ -1800,15 +1802,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     tensors = {}
                     for state_key in world_tensor_keys:
-                        if (
-                            state_key == 'step'
-                            or state_key == 'numel'
-                            or state_key == 'numel_unpadded'
-                        ):
+                        if state_key == 'step' or state_key == 'numel_unpadded':
                             # The optimizer state of STEP is handled
                             # specifically and is read from param_groups.
-                            # numel and numel_unpadded are not needed.
+                            # Numel unpadded is not needed.
                             continue
+                        assert adjusted_end <= world_tensors[state_key].numel(), (
+                            f"'{sharded_metadata.key}' range [{adjusted_start}, {adjusted_end})"
+                            f" runs past the coalesced buffer"
+                            f" ({world_tensors[state_key].numel()} elements);"
+                            f" bucket-padding adjustment is wrong."
+                        )
                         state_ten = world_tensors[state_key][adjusted_start:adjusted_end]
 
                         assert len(state_ten) == (param_world_end - param_world_start), (
