@@ -1,15 +1,25 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for the Triton varlen causal conv1d kernel.
+"""Unit tests for the varlen causal conv1d ops.
 
-Tests correctness of `causal_conv1d_varlen_fn` against a reference implementation
-that loops over requests calling `causal_conv1d_fn` with `initial_states`.
+`causal_conv1d_varlen_fn` (the Triton kernel) is checked against a reference that
+loops over requests calling `causal_conv1d_fn` with `initial_states`.
+
+`causal_conv1d_varlen_carry_states` (the conv-state update) is checked against a
+reference that concatenates the previous state with the slice. Under chunked
+prefill a request's conv state has to survive being handed a slice at a time:
+deriving it from the slice alone is fine while every slice is at least `d_conv`
+tokens long, and wrong the moment one is not -- which chunked prefill makes
+reachable, since a prompt's final chunk can be as short as two tokens.
 """
 
 import pytest
 import torch
 
-from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
+from megatron.core.ssm.ops.common.causal_conv1d_varlen import (
+    causal_conv1d_varlen_carry_states,
+    causal_conv1d_varlen_fn,
+)
 
 try:
     from causal_conv1d import causal_conv1d_fn
@@ -171,3 +181,172 @@ class TestCausalConv1dVarlen:
         assert not torch.allclose(
             out_nonzero[: d_conv - 1], out_none[: d_conv - 1], atol=1e-5
         ), "Non-zero initial states should produce different outputs for early tokens"
+
+
+def _carry_reference(x, cu_seqlens, previous_states):
+    """Right-align `[previous_tokens..., slice_tokens...]` into a d_conv window."""
+    num_requests, conv_dim, d_conv = previous_states.shape
+    out = torch.empty_like(previous_states)
+    for i in range(num_requests):
+        start, end = int(cu_seqlens[i]), int(cu_seqlens[i + 1])
+        # The previous state already holds the d_conv tokens before the slice.
+        history = torch.cat([previous_states[i], x[start:end].transpose(0, 1)], dim=1)
+        out[i] = history[:, -d_conv:]
+    return out
+
+
+def _run_carry(lengths, d_conv=4, conv_dim=3, seed=0):
+    torch.manual_seed(seed)
+    cu_seqlens = torch.tensor([0] + list(torch.tensor(lengths).cumsum(0)), dtype=torch.int32)
+    x = torch.randn(int(cu_seqlens[-1]), conv_dim)
+    previous_states = torch.randn(len(lengths), conv_dim, d_conv)
+    got = causal_conv1d_varlen_carry_states(x, cu_seqlens, previous_states)
+    return got, _carry_reference(x, cu_seqlens, previous_states)
+
+
+class TestCausalConv1dVarlenCarryStates:
+    """Conv-state update that carries prior history across a chunked-prefill slice."""
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("length", [0, 1, 2, 3, 4, 5, 9])
+    def test_matches_reference_for_every_slice_length(self, length):
+        """Slices shorter, equal to, and longer than d_conv all round-trip."""
+        got, expected = _run_carry([length])
+        torch.testing.assert_close(got, expected)
+
+    @pytest.mark.internal
+    def test_long_slice_ignores_previous_state(self):
+        """A slice of at least d_conv tokens fully determines the new state.
+
+        This is the case the non-carrying `causal_conv1d_varlen_states` also gets
+        right, so it pins the equivalence: nothing of the old state leaks through.
+        """
+        torch.manual_seed(1)
+        cu_seqlens = torch.tensor([0, 7], dtype=torch.int32)
+        x = torch.randn(7, 3)
+        first = causal_conv1d_varlen_carry_states(x, cu_seqlens, torch.randn(1, 3, 4))
+        second = causal_conv1d_varlen_carry_states(x, cu_seqlens, torch.randn(1, 3, 4))
+        torch.testing.assert_close(first, second)
+        torch.testing.assert_close(first[0], x[-4:].transpose(0, 1))
+
+    @pytest.mark.internal
+    def test_short_slice_carries_history(self):
+        """A 2-token slice keeps the two taps that predate it.
+
+        Deriving the state from the slice alone would zero-fill those two columns,
+        which is exactly what corrupts the first decode step after a short final
+        prefill chunk.
+        """
+        torch.manual_seed(2)
+        cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+        x = torch.randn(2, 3)
+        previous = torch.randn(1, 3, 4)
+        got = causal_conv1d_varlen_carry_states(x, cu_seqlens, previous)
+
+        torch.testing.assert_close(got[0, :, :2], previous[0, :, 2:])
+        torch.testing.assert_close(got[0, :, 2:], x.transpose(0, 1))
+        assert not torch.allclose(got[0, :, :2], torch.zeros_like(got[0, :, :2]))
+
+    @pytest.mark.internal
+    def test_mixed_batch_including_padding_requests(self):
+        """Zero-length padding requests keep their state; real ones update."""
+        lengths = [0, 2, 5, 0, 130]
+        got, expected = _run_carry(lengths)
+        torch.testing.assert_close(got, expected)
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "lengths", [[2], [4], [0, 2, 5, 0, 130]], ids=["short", "exact", "mixed"]
+    )
+    def test_precomputed_plan_matches_the_inline_path(self, lengths):
+        """The hoisted gather plan must agree with deriving it in place.
+
+        Dynamic batching builds the plan once per step in `MambaMetadata` and
+        every SSM layer reuses it, so the two code paths have to stay identical.
+        """
+        d_conv, conv_dim = 4, 3
+        torch.manual_seed(7)
+        cu_seqlens = torch.tensor([0] + list(torch.tensor(lengths).cumsum(0)), dtype=torch.int32)
+        x = torch.randn(int(cu_seqlens[-1]), conv_dim)
+        previous_states = torch.randn(len(lengths), conv_dim, d_conv)
+
+        inline = causal_conv1d_varlen_carry_states(x, cu_seqlens, previous_states)
+
+        # Same arithmetic MambaMetadata._update_conv_carry_plan performs.
+        starts = cu_seqlens[:-1].to(torch.int64)
+        offsets = (
+            (cu_seqlens[1:].to(torch.int64) - starts)[:, None]
+            - d_conv
+            + torch.arange(d_conv, dtype=torch.int64)[None, :]
+        )
+        planned = causal_conv1d_varlen_carry_states(
+            x,
+            None,
+            previous_states,
+            token_indices=(starts[:, None] + offsets).clamp(min=0),
+            prev_columns=(offsets + d_conv).clamp(0, d_conv - 1),
+            from_slice=offsets >= 0,
+        )
+
+        torch.testing.assert_close(inline, planned)
+
+    @pytest.mark.internal
+    def test_partial_plan_is_rejected(self):
+        """Passing some but not all of the plan is a caller bug, not a fallback."""
+        cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+        with pytest.raises(AssertionError, match="in full or not at all"):
+            causal_conv1d_varlen_carry_states(
+                torch.randn(4, 3),
+                cu_seqlens,
+                torch.randn(1, 3, 4),
+                token_indices=torch.zeros(1, 4, dtype=torch.int64),
+            )
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("field", ["prev_columns", "from_slice"])
+    def test_plan_shape_mismatch_is_rejected(self, field):
+        """Every plan tensor is checked, not just `token_indices`.
+
+        A wrongly-shaped `prev_columns` or `from_slice` would otherwise fail deep
+        inside `gather`/`where`, or broadcast silently.
+        """
+        plan = {
+            "token_indices": torch.zeros(1, 4, dtype=torch.int64),
+            "prev_columns": torch.zeros(1, 4, dtype=torch.int64),
+            "from_slice": torch.zeros(1, 4, dtype=torch.bool),
+        }
+        plan[field] = plan[field][:, :2]
+        with pytest.raises(AssertionError, match=f"carry plan {field} describes"):
+            causal_conv1d_varlen_carry_states(torch.randn(4, 3), None, torch.randn(1, 3, 4), **plan)
+
+    @pytest.mark.internal
+    def test_out_of_range_discarded_column_does_not_read_a_foreign_token(self):
+        """Columns `from_slice` discards may name a token past the end of `x`.
+
+        Those lanes are rewritten to index 0 rather than clamped to the last
+        token, so a plan/`x` mismatch on a *live* column cannot quietly fold
+        another request's final token into this request's state.
+        """
+        d_conv, conv_dim = 4, 3
+        torch.manual_seed(11)
+        x = torch.randn(4, conv_dim)
+        previous_states = torch.randn(1, conv_dim, d_conv)
+
+        # Every column is discarded, but each names a token well past `x`.
+        got = causal_conv1d_varlen_carry_states(
+            x,
+            None,
+            previous_states,
+            token_indices=torch.full((1, d_conv), 999, dtype=torch.int64),
+            prev_columns=torch.arange(d_conv, dtype=torch.int64)[None, :],
+            from_slice=torch.zeros(1, d_conv, dtype=torch.bool),
+        )
+        torch.testing.assert_close(got, previous_states)
+
+    @pytest.mark.internal
+    def test_zero_length_request_is_a_no_op(self):
+        torch.manual_seed(3)
+        cu_seqlens = torch.tensor([0, 0], dtype=torch.int32)
+        previous = torch.randn(1, 3, 4)
+        got = causal_conv1d_varlen_carry_states(torch.randn(0, 3), cu_seqlens, previous)
+        torch.testing.assert_close(got, previous)

@@ -43,10 +43,29 @@ class MambaInferenceStateConfig:
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
 
+    ssm_chunk_alignment: Optional[int] = None
+    """Token quantum that a prefill chunk boundary must land on for the model's
+    SSM mixers to see a clean chunk boundary. Defaults to `mamba_chunk_size`,
+    which is correct for any Mamba-only model.
+
+    This is the mixers' shared `ssm_inference_chunk_size`, which is not always
+    their `chunk_size`: the forked Gated Delta Product prefill kernels run at a
+    fixed 64 whatever `chunk_size` says. `from_model` asserts every SSM layer
+    agrees rather than reconciling a mixed stack. Only the paths that genuinely
+    require an aligned boundary consult it -- batch-invariant chunked prefill,
+    which replays the partial tail at decode, and recurrent-state extraction for
+    prefix caching, which can only snapshot at a chunk boundary. Ordinary
+    chunked prefill splits anywhere, because each step re-chunks from its own
+    slice start."""
+
     gdp_num_householder: int = 0
     """Number of Householder copies of the Gated Delta Product layers, or 0 if the
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
+
+    def __post_init__(self):
+        if self.ssm_chunk_alignment is None:
+            self.ssm_chunk_alignment = self.mamba_chunk_size
 
     @classmethod
     def from_model(
@@ -77,25 +96,62 @@ class MambaInferenceStateConfig:
                 ssm_states_dtype = torch.float32
             elif ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
-            mamba_chunk_size = 128
-            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
-                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
-                    mamba_chunk_size = layer.mixer.chunk_size
-                    break
-            # Gated Delta Product layers register as Mamba layers but carry a
-            # Householder count, which sizes their (separate) chunk descriptors.
+            # Every SSM variant registers under the MAMBA symbol, so one pass
+            # collects all three chunk-related facts. The SSM stack is assumed
+            # homogeneous -- every layer the same mixer with the same chunking --
+            # so each fact is read once and every later layer must agree.
+            mamba_chunk_size = None
             gdp_num_householder = 0
-            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
-                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
-                    num_householder = getattr(layer.mixer, 'num_householder', None)
-                    if num_householder is not None:
-                        # The descriptors are shared across layers, so one count
-                        # has to cover every GDP layer.
-                        assert gdp_num_householder in (0, num_householder), (
-                            "every GDP layer must use the same num_householder; got "
-                            f"{gdp_num_householder} and {num_householder}"
-                        )
-                        gdp_num_householder = num_householder
+            ssm_chunk_alignment = None
+            first_ssm_layer_idx = None
+            for layer_idx, (layer_type, layer) in enumerate(
+                zip(decoder.layer_type_list, decoder.layers)
+            ):
+                if layer_type != Symbols.MAMBA or not hasattr(layer, 'mixer'):
+                    continue
+                mixer = layer.mixer
+                # The chunk length the inference kernels actually run at, which
+                # is not always `chunk_size`: the forked Gated Delta Product
+                # prefill kernels chunk at a fixed 64. Falls back to chunk_size
+                # for any mixer predating the property.
+                inference_chunk_size = getattr(mixer, 'ssm_inference_chunk_size', mixer.chunk_size)
+                # Gated Delta Product layers register as Mamba layers but carry
+                # a Householder count, which sizes their (separate) chunk
+                # descriptors.
+                num_householder = getattr(mixer, 'num_householder', 0) or 0
+                if mamba_chunk_size is None:
+                    mamba_chunk_size = mixer.chunk_size
+                    ssm_chunk_alignment = inference_chunk_size
+                    gdp_num_householder = num_householder
+                    first_ssm_layer_idx = layer_idx
+                else:
+                    # A mixed stack would need a per-mixer alignment quantum and
+                    # per-mixer chunk descriptors. Nothing downstream models
+                    # that, so reject it here instead of silently applying the
+                    # first layer's answer to every other layer.
+                    assert (
+                        mixer.chunk_size == mamba_chunk_size
+                        and inference_chunk_size == ssm_chunk_alignment
+                        and num_householder == gdp_num_householder
+                    ), (
+                        "every SSM layer must share one chunking; layer "
+                        f"{first_ssm_layer_idx} has (chunk_size={mamba_chunk_size}, "
+                        f"inference_chunk_size={ssm_chunk_alignment}, "
+                        f"num_householder={gdp_num_householder}) but layer "
+                        f"{layer_idx} has (chunk_size={mixer.chunk_size}, "
+                        f"inference_chunk_size={inference_chunk_size}, "
+                        f"num_householder={num_householder})"
+                    )
+            # `decoder.layers` is pipeline-local, so a stage holding no SSM layer
+            # falls back to the Mamba defaults while a stage holding GDP layers
+            # computes 64. Safe today because every consumer of a disagreeing value
+            # is stage-local (bookkeeping-buffer sizing) or gated off for GDP
+            # (batch-invariant chunk lengths, prefix-cache extraction offsets). A
+            # future cross-rank consumer must reconcile these across the PP group.
+            if mamba_chunk_size is None:
+                mamba_chunk_size = 128
+            if ssm_chunk_alignment is None:
+                ssm_chunk_alignment = mamba_chunk_size
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,
@@ -103,6 +159,7 @@ class MambaInferenceStateConfig:
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
                 mamba_chunk_size=mamba_chunk_size,
+                ssm_chunk_alignment=ssm_chunk_alignment,
                 gdp_num_householder=gdp_num_householder,
             )
         return None

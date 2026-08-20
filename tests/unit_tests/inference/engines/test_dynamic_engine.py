@@ -56,9 +56,13 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
+from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
@@ -73,14 +77,31 @@ try:
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
+try:
+    import einops  # noqa: F401
+    import fla  # noqa: F401
+    import mamba_ssm  # noqa: F401
 
-def skip_if_mamba_sequence_packing_not_available(model_provider: str):
-    if model_provider == "hybrid":
+    HAVE_GDP_DEPS = True
+except ImportError:
+    HAVE_GDP_DEPS = False
+
+
+def skip_if_mamba_sequence_packing_not_available(model_provider: str, ssm_mixer: str = "mamba"):
+    if model_provider != "hybrid":
+        return
+    if ssm_mixer == "gdp":
+        if not HAVE_GDP_DEPS:
+            pytest.skip("GDP requires fla + mamba_ssm + einops")
+        sequence_packing_available, reason_for_no_sequence_packing = (
+            check_fla_sequence_packing_support()
+        )
+    else:
         sequence_packing_available, reason_for_no_sequence_packing = (
             _check_mamba_sequence_packing_support()
         )
-        if not sequence_packing_available:
-            pytest.skip(reason_for_no_sequence_packing)
+    if not sequence_packing_available:
+        pytest.skip(reason_for_no_sequence_packing)
 
 
 def set_rounder(value):
@@ -134,6 +155,10 @@ class DynamicEngineTestConfig:
     cuda_graph_all_prefills: bool = False
     fp8: bool = False
     model_provider: str = "gpt"
+    # Which linear-attention mixer a hybrid stack uses ("mamba" or "gdp").
+    # Ignored unless model_provider == "hybrid": both build a HybridModel, and
+    # only the stack spec (and so the mixer) differs.
+    ssm_mixer: str = "mamba"
     return_log_probs: bool = False
     logprobs_mode: str = "raw_logprobs"
     materialize_only_last_token_logits: bool = True
@@ -434,6 +459,7 @@ class DynamicInferenceEngineTestBase:
                 position_embedding_type=test_config.position_embedding_type,
             ).cuda()
         elif test_config.model_provider == "hybrid":
+            is_gdp = test_config.ssm_mixer == "gdp"
             pp_size = test_config.pipeline_model_parallel_size
             # Transformer config.
             transformer_config = TransformerConfig(
@@ -443,7 +469,19 @@ class DynamicInferenceEngineTestBase:
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
                 mtp_num_layers=test_config.num_speculative_tokens,
                 hidden_size=256,  # The Mamba layer places several constraints on this
-                mamba_num_heads=16,
+                # GDP needs its head/group/state dims spelled out, plus the
+                # Householder count that sizes its chunk descriptors.
+                **(
+                    dict(
+                        gdp_num_householder=2,
+                        mamba_num_heads=8,
+                        mamba_head_dim=32,
+                        mamba_num_groups=8,
+                        mamba_state_dim=64,
+                    )
+                    if is_gdp
+                    else dict(mamba_num_heads=16)
+                ),
                 num_attention_heads=16,
                 use_cpu_initialization=True,
                 cuda_graph_impl=effective_cuda_graph_impl,
@@ -492,7 +530,7 @@ class DynamicInferenceEngineTestBase:
                 mamba_pattern = "M*-|M*-" + mtp_suffix
             model = HybridModel(
                 config=transformer_config,
-                hybrid_stack_spec=hybrid_stack_spec,
+                hybrid_stack_spec=(gated_delta_product_stack_spec if is_gdp else hybrid_stack_spec),
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,
@@ -2172,15 +2210,17 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_mamba_chunked_prefill(self):
+    @pytest.mark.parametrize("ssm_mixer", ["mamba", "gdp"])
+    def test_mamba_chunked_prefill(self, ssm_mixer):
         """
-        Test chunked prefill with a Mamba model.
+        Test chunked prefill with an SSM model (Mamba2 or Gated Delta Product).
         """
-        skip_if_mamba_sequence_packing_not_available("hybrid")
+        skip_if_mamba_sequence_packing_not_available("hybrid", ssm_mixer)
 
         # Context max tokens = 50.
         test_config = DynamicEngineTestConfig(
             model_provider="hybrid",
+            ssm_mixer=ssm_mixer,
             num_requests=0,
             num_tokens_to_generate=None,
             num_tokens_total=200,
@@ -5937,8 +5977,12 @@ class TestChunkedPrefillCudaGraphs:
         set_rounder(64)
         Utils.destroy_model_parallel()
 
-    def _create_model(self, model_provider, num_cuda_graphs):
-        """Create a GPT or Mamba model with optional CUDA graph support."""
+    def _create_model(self, model_provider, num_cuda_graphs, ssm_mixer="mamba"):
+        """Create a GPT or hybrid model with optional CUDA graph support.
+
+        `ssm_mixer` selects the hybrid stack's linear-attention mixer ("mamba"
+        or "gdp"); it is ignored for GPT.
+        """
         cuda_graph_impl = "local" if num_cuda_graphs else "none"
 
         if model_provider == "gpt":
@@ -5965,11 +6009,24 @@ class TestChunkedPrefillCudaGraphs:
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
         elif model_provider == "hybrid":
+            is_gdp = ssm_mixer == "gdp"
             config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 num_layers=3,
                 hidden_size=256,
-                mamba_num_heads=16,
+                # GDP needs its head/group/state dims spelled out, plus the
+                # Householder count that sizes its chunk descriptors.
+                **(
+                    dict(
+                        gdp_num_householder=2,
+                        mamba_num_heads=8,
+                        mamba_head_dim=32,
+                        mamba_num_groups=8,
+                        mamba_state_dim=64,
+                    )
+                    if is_gdp
+                    else dict(mamba_num_heads=16)
+                ),
                 num_attention_heads=16,
                 use_cpu_initialization=True,
                 cuda_graph_impl=cuda_graph_impl,
@@ -5982,7 +6039,7 @@ class TestChunkedPrefillCudaGraphs:
             )
             model = HybridModel(
                 config=config,
-                hybrid_stack_spec=hybrid_stack_spec,
+                hybrid_stack_spec=(gated_delta_product_stack_spec if is_gdp else hybrid_stack_spec),
                 vocab_size=CHUNKED_CG_VOCAB_SIZE,
                 max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
                 parallel_output=True,
@@ -6001,7 +6058,14 @@ class TestChunkedPrefillCudaGraphs:
     def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
         """Build an engine with the given chunked prefill / CUDA graph config."""
         set_rounder(4)
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        # FP32 recurrent state. Chunked prefill hands a request's recurrence
+        # through the state cache at every chunk boundary, while the baseline
+        # keeps it in the kernel's FP32 accumulator from start to finish. With a
+        # BF16 cache that round trip rounds the boundary value, and the two runs
+        # genuinely diverge -- the same reason batch-invariant mode forces FP32
+        # (see MambaInferenceStateConfig.from_model). Pinning FP32 here makes the
+        # comparison test the state plumbing rather than cache precision.
+        mamba_config = MambaInferenceStateConfig.from_model(model, ssm_states_dtype=torch.float32)
 
         inference_config_kwargs = dict(
             max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
@@ -6058,13 +6122,21 @@ class TestChunkedPrefillCudaGraphs:
 
         return finished, step_count
 
-    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
+    # Paired rather than crossed: the mixer only means something for a hybrid
+    # stack, so a gpt x gdp cell would just re-run the GPT case.
+    @pytest.mark.parametrize(
+        "model_provider,ssm_mixer",
+        [("gpt", None), ("hybrid", "mamba"), ("hybrid", "gdp")],
+        ids=["gpt", "mamba", "gdp"],
+    )
     @pytest.mark.parametrize("chunked_prefill", [False, True])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
     @torch.inference_mode()
-    def test_chunked_prefill_cuda_graphs(self, model_provider, chunked_prefill, num_cuda_graphs):
+    def test_chunked_prefill_cuda_graphs(
+        self, model_provider, ssm_mixer, chunked_prefill, num_cuda_graphs
+    ):
         """Verify generated tokens match across chunked prefill and CUDA graph configs."""
-        skip_if_mamba_sequence_packing_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider, ssm_mixer or "mamba")
 
         clear_nvte_env_vars()
 
@@ -6075,7 +6147,7 @@ class TestChunkedPrefillCudaGraphs:
         )
 
         # Create model with CUDA graph support so it can be used for both CG and non-CG engines.
-        model = self._create_model(model_provider, num_cuda_graphs=2)
+        model = self._create_model(model_provider, num_cuda_graphs=2, ssm_mixer=ssm_mixer)
 
         # 3 prompts of 512 tokens each, disjoint token ranges (no prefix sharing).
         device = torch.cuda.current_device()
@@ -6122,3 +6194,72 @@ class TestChunkedPrefillCudaGraphs:
                 f"chunked prefill should need more steps than baseline "
                 f"({test_steps} <= {baseline_steps})"
             )
+
+    # d_conv is 4 for both mixers, so a final chunk of 2 or 3 tokens is shorter
+    # than the conv window. Deriving the conv state from that slice alone
+    # zero-fills the taps that predate it, and the first decode step then
+    # convolves against zeros instead of the previous chunk's tail.
+    @pytest.mark.internal
+    @pytest.mark.parametrize("ssm_mixer", ["mamba", "gdp"])
+    @pytest.mark.parametrize("final_chunk_len", [2, 3])
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
+    @torch.inference_mode()
+    def test_short_final_prefill_chunk_carries_conv_state(
+        self, ssm_mixer, final_chunk_len, num_cuda_graphs
+    ):
+        """A final prefill chunk shorter than d_conv must still match the baseline.
+
+        Regression test for the conv-state carry: without
+        `causal_conv1d_varlen_carry_states` the saved state loses its leading
+        taps here and the generated tokens diverge from the unchunked run.
+
+        Run under capture as well as eagerly: the carry op's shape-dependent
+        branches (the `total_tokens == 0` early return, the out-of-range column
+        rewrite) and its precomputed-plan path are exactly what a replayed graph
+        stresses.
+        """
+        skip_if_mamba_sequence_packing_not_available("hybrid", ssm_mixer)
+
+        clear_nvte_env_vars()
+
+        random.seed(123)
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(
+            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+        )
+
+        # Built with CUDA graph support so the same model serves both the eager
+        # baseline and the captured test engine.
+        model = self._create_model("hybrid", num_cuda_graphs=2, ssm_mixer=ssm_mixer)
+
+        # Budget the prompt so the last chunk is exactly `final_chunk_len` tokens.
+        # Prefix caching is off, so no block-alignment snapping shifts the split,
+        # and the engine's flash-attn guard only special-cases a 1-token tail.
+        context_max_tokens = 128
+        prompt_len = 2 * context_max_tokens + final_chunk_len
+        device = torch.cuda.current_device()
+        prompts = [torch.arange(prompt_len, dtype=torch.int64, device=device)]
+        num_tokens_to_generate = 8
+
+        baseline_engine = self._build_engine(
+            model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
+        )
+        baseline_outputs, _ = self._run_to_completion(
+            baseline_engine, prompts, num_tokens_to_generate
+        )
+
+        chunked_engine = self._build_engine(
+            model,
+            enable_chunked_prefill=True,
+            num_cuda_graphs=num_cuda_graphs,
+            context_max_tokens=context_max_tokens,
+        )
+        chunked_outputs, _ = self._run_to_completion(
+            chunked_engine, prompts, num_tokens_to_generate
+        )
+
+        assert baseline_outputs[0] == chunked_outputs[0], (
+            f"{ssm_mixer}: a {final_chunk_len}-token final prefill chunk diverged from "
+            f"the unchunked baseline (num_cuda_graphs={num_cuda_graphs}); baseline "
+            f"{baseline_outputs[0]} != chunked {chunked_outputs[0]}"
+        )

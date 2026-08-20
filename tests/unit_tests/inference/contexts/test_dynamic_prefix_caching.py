@@ -1074,7 +1074,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             == ctx.mamba_chunk_size + 1
         )
 
-        with pytest.raises(AssertionError, match="max_tokens > mamba_chunk_size"):
+        with pytest.raises(AssertionError, match="max_tokens > ssm_chunk_alignment"):
             self._mctx(
                 batch_invariant_mode=True,
                 enable_prefix_caching=False,
@@ -1436,6 +1436,12 @@ def _make_cpu_mamba_slot_allocator(
         max_mamba_intermediate_states_per_step=1,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
         kv_block_allocator=kv_allocator,
+        # A real context always sets these two together (see
+        # DynamicInferenceContext.__init__), and the allocator asserts their
+        # divisibility on construction. Mamba-only values: a model whose SSM
+        # layers all chunk at 128 aligns at 128.
+        mamba_chunk_size=128,
+        ssm_chunk_alignment=128,
     )
     return MambaSlotAllocator(
         context=context,

@@ -276,3 +276,131 @@ def _causal_conv1d_varlen_simple(
 
             result = acc * torch.sigmoid(acc)
             out[start + t] = result.to(out.dtype)
+
+
+def causal_conv1d_varlen_carry_states(
+    x: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    previous_states: torch.Tensor,
+    *,
+    token_indices: torch.Tensor = None,
+    prev_columns: torch.Tensor = None,
+    from_slice: torch.Tensor = None,
+) -> torch.Tensor:
+    """Per-request conv state after appending a slice, carrying prior history.
+
+    A request's conv state holds the last `d_conv` tokens it has seen. It exists
+    so that the next call can convolve across the boundary: the causal
+    convolution at token `t` reads tokens `t - d_conv + 1 .. t`, so continuing a
+    sequence requires the tokens that came before the current input.
+
+    When a prompt is processed one slice at a time, the new state is generally a
+    mix of both sources -- the tail of the slice, and whatever the request was
+    already carrying. With `d_conv = 4`, a request whose incoming state is
+    `[a b c d]` and whose slice this call is `[e f]`:
+
+        incoming state   a b c d
+        slice                    e f
+        new state            c d e f
+
+    Two columns survive from the incoming state, two come from the slice. The
+    same request handed a slice of `[e f g h]` or longer takes all four columns
+    from the slice, and the incoming state does not contribute at all:
+
+        incoming state   a b c d
+        slice                    e f g h
+        new state                e f g h
+
+    So the incoming state matters exactly when a slice is shorter than `d_conv`.
+    That is not an edge case to design around -- a prompt of any length can end
+    in a short slice, since the split points are chosen by a token budget that
+    knows nothing about `d_conv`. Reading only the slice in the first example
+    would produce `[0 0 e f]`, and the next call would convolve `e` and `f`
+    against zeros instead of against `c` and `d`.
+
+    Zero-length (padding) requests take every column from the incoming state and
+    so reproduce it unchanged.
+
+    Every shape here is fixed by the padded request count and `d_conv`, and no
+    value crosses to the host, so this is safe to capture in a CUDA graph.
+
+    Args:
+        x: Packed slice tokens `(total_tokens, conv_dim)`.
+        cu_seqlens: Slice boundaries `(num_requests + 1,)`. Only read when the
+            gather plan below is not supplied.
+        previous_states: Incoming per-request states `(num_requests, conv_dim,
+            d_conv)`, in the same request order as `cu_seqlens`.
+        token_indices: Optional precomputed `(num_requests, d_conv)` token index
+            per state column. The plan depends only on `cu_seqlens` and `d_conv`,
+            so dynamic batching builds it once per step in `MambaMetadata` rather
+            than paying the index arithmetic once per SSM layer. Must be passed
+            together with `prev_columns` and `from_slice`.
+        prev_columns: Optional precomputed `(num_requests, d_conv)` column of
+            `previous_states` per state column.
+        from_slice: Optional precomputed `(num_requests, d_conv)` mask selecting
+            `token_indices` over `prev_columns`.
+
+    Returns:
+        The updated states, `(num_requests, conv_dim, d_conv)`.
+    """
+    num_requests, conv_dim, d_conv = previous_states.shape
+
+    have_plan = token_indices is not None
+    assert (prev_columns is not None) == have_plan and (from_slice is not None) == have_plan, (
+        "the precomputed carry plan must be passed in full or not at all; got "
+        f"token_indices={token_indices is not None}, "
+        f"prev_columns={prev_columns is not None}, from_slice={from_slice is not None}"
+    )
+
+    total_tokens = x.shape[0]
+    if total_tokens == 0:
+        # Nothing to append, so every state is unchanged. Branching on a shape
+        # (not a value) keeps this safe to capture: a graph is captured at a
+        # fixed padded token count.
+        return previous_states.clone()
+
+    if token_indices is None:
+        assert cu_seqlens.shape[0] == num_requests + 1, (
+            f"cu_seqlens describes {cu_seqlens.shape[0] - 1} requests but "
+            f"previous_states has {num_requests}"
+        )
+        starts = cu_seqlens[:-1].to(torch.long)
+        lengths = cu_seqlens[1:].to(torch.long) - starts
+        columns = torch.arange(d_conv, device=x.device, dtype=torch.long)
+
+        # Offset of each state column from the slice start; negative means the
+        # token predates this slice and must come from the previous state.
+        offsets = lengths[:, None] - d_conv + columns[None, :]  # [N, d_conv]
+        from_slice = offsets >= 0
+        # offsets >= -d_conv always, so both clamps only guard the entries that
+        # `from_slice` discards.
+        token_indices = (starts[:, None] + offsets).clamp_(min=0)
+        prev_columns = (offsets + d_conv).clamp_(0, d_conv - 1)
+    else:
+        expected = (num_requests, d_conv)
+        for name, plan in (
+            ("token_indices", token_indices),
+            ("prev_columns", prev_columns),
+            ("from_slice", from_slice),
+        ):
+            assert plan.shape == expected, (
+                f"carry plan {name} describes {tuple(plan.shape)} but previous_states "
+                f"has {expected}"
+            )
+
+    # Columns that `from_slice` discards may name a token outside `x` -- the plan
+    # resolves them to whatever the clamped arithmetic produced, and `torch.where`
+    # below throws the value away. Rewrite those lanes to 0 so the gather stays in
+    # bounds. A live (`from_slice=True`) column that lands out of range is a caller
+    # bug, not something to absorb: sending it to token 0 rather than clamping it
+    # to the last token keeps it from quietly folding another request's final token
+    # into this request's state. The check stays on device, so no host sync.
+    in_range = token_indices < total_tokens
+    token_indices = torch.where(in_range, token_indices, torch.zeros_like(token_indices))
+    slice_taps = x[token_indices].transpose(1, 2)  # [N, conv_dim, d_conv]
+
+    previous_taps = previous_states.gather(
+        2, prev_columns[:, None, :].expand(num_requests, conv_dim, d_conv)
+    )
+
+    return torch.where(from_slice[:, None, :], slice_taps, previous_taps)
