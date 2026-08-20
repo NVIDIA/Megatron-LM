@@ -147,7 +147,8 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
     def tokenize_files(self, paths: str | list[str], field: str = "text") -> "ak.Array":
         """
-        Tokenizes whole jsonl files using gigatoken. Only supported for `huggingface` and `megatron` libraries.
+        Tokenizes whole jsonl files with gigatoken.
+        Only supported for `huggingface` and `megatron` libraries.
 
         Args:
             paths (str | list[str]): path to the jsonl file(s).
