@@ -857,7 +857,8 @@ def save_checkpoint(
                 verify_integrity=args.verify_integrity,
             )
             # [ModelOpt]: save sharded modelopt_state
-            save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
+            if has_nvidia_modelopt:
+                save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
         elif ckpt_type == CheckpointType.GLOBAL and ckpt_format in ['torch_dcp', 'fsdp_dtensor']:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
@@ -911,10 +912,11 @@ def save_checkpoint(
                 )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
-            if ckpt_type == CheckpointType.LOCAL:
-                print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
-            else:
-                save_modelopt_state(model, state_dict)
+            if has_nvidia_modelopt:
+                if ckpt_type == CheckpointType.LOCAL:
+                    print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
+                else:
+                    save_modelopt_state(model, state_dict)
 
             end_ckpt = time()
             logger.debug(
