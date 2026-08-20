@@ -2368,7 +2368,7 @@ requires-dist = [
     { name = "tiktoken", marker = "extra == 'mlm'" },
     { name = "tiktoken", marker = "extra == 'training'" },
     { name = "torch", specifier = ">=2.6.0" },
-    { name = "torch-memory-saver", marker = "extra == 'dev'", git = "https://github.com/fzyzcjy/torch_memory_saver.git" },
+    { name = "torch-memory-saver", marker = "extra == 'dev'", specifier = "==0.0.10b1" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=4329ff84bfbdaa778a33cba02a15fb0807c64689" },
     { name = "transformers", marker = "extra == 'mlm'" },
@@ -5306,7 +5306,12 @@ wheels = [
 [[package]]
 name = "torch-memory-saver"
 version = "0.0.10b1"
-source = { git = "https://github.com/fzyzcjy/torch_memory_saver.git#be4164360e50e297540c0b7c9c28c8b5dd3f90ab" }
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/13/42/a134a0c309fa421c13ea3cb5569db50a7e90423fa045fca0b914a298af55/torch_memory_saver-0.0.10b1.tar.gz", hash = "sha256:9dd25fa1b7d20eb21bc765077518e606f7b07a18da89c790a895aef04cbd26d8", size = 35793, upload-time = "2026-08-16T02:51:25.238Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/69/13/89bb131054f4e94d06df50676358c2e5099c393a5cb5149837147eb81969/torch_memory_saver-0.0.10b1-cp39-abi3-manylinux2014_aarch64.whl", hash = "sha256:9c205ba0ec13d1cbae8381b21bafa2dc96f28a5271da937bf21c8236868b9be0", size = 2520982, upload-time = "2026-08-16T02:51:22.064Z" },
+    { url = "https://files.pythonhosted.org/packages/64/2f/2efbdafb8652c296c876ea3f4ee891806dbfe2ede01d95726c60e821ea76/torch_memory_saver-0.0.10b1-cp39-abi3-manylinux2014_x86_64.whl", hash = "sha256:19c320ecbe7eeae3e5efa88629aa90a695ce444f0d66e873db3257c50a254f66", size = 2600026, upload-time = "2026-08-16T02:51:24.014Z" },
+]
 
 [[package]]
 name = "torchx"
