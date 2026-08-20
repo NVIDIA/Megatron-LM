@@ -41,6 +41,11 @@ from .combined_1f1b import (
 )
 from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
+try:
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
+
 # Types
 Shape = Union[List[int], torch.Size]
 
@@ -394,6 +399,7 @@ def forward_step_calc_loss(
     return output_tensor, num_tokens
 
 
+@_otel_trace_fn('microbatch', 'megatron.microbatch.forward')
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -529,6 +535,7 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
+@_otel_trace_fn('microbatch', 'megatron.microbatch.backward')
 def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     """Backward step through passed-in output tensor.
 
@@ -2248,6 +2255,13 @@ def forward_backward_pipelining_without_interleaving(
 
     disable_grad_sync()
 
+    grad_sync_first_stage = p2p_communicator.is_pp_first_stage
+    if isinstance(p2p_communicator, MultiModulePipelineCommunicator):
+        grad_sync_first_stage = all(
+            p2p_communicator.is_module_pp_first_stage(module_name)
+            for module_name in p2p_communicator.rank_module_map
+        )
+
     # Compute number of warmup microbatches.
     num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - 1
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
@@ -2405,7 +2419,7 @@ def forward_backward_pipelining_without_interleaving(
             # Enable grad sync for the last microbatch in the batch if the full
             # backward pass completes in the 1F1B stage.
             if num_warmup_microbatches == 0 and last_iteration:
-                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
+                if config.grad_sync_func is None or grad_sync_first_stage:
                     enable_grad_sync()
 
             input_tensor_grad = backward_func(
@@ -2432,7 +2446,7 @@ def forward_backward_pipelining_without_interleaving(
             # pipeline stages do grad reduction during pipeline
             # bubble.
             if i == num_warmup_microbatches - 1:
-                if config.grad_sync_func is None or p2p_communicator.is_pp_first_stage:
+                if config.grad_sync_func is None or grad_sync_first_stage:
                     enable_grad_sync()
 
             input_tensor = input_tensors.pop(0)

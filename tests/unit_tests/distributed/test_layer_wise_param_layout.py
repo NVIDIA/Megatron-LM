@@ -13,7 +13,12 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+from megatron.core.optimizer.emerging_optimizers import _is_muon_excluded
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    is_managed_by_layer_wise_optimizer,
+    tag_params_for_buffer_routing,
+)
 from megatron.core.optimizer.param_layout import BufferKey, pad_param_start, pad_to_divisor
 
 # ---------------------------------------------------------------------------
@@ -35,6 +40,38 @@ def _make_ddp_config(pad_for_high_busbw=False, grad_reduce_in_fp32=True):
     cfg.pad_buckets_for_high_nccl_busbw = pad_for_high_busbw
     cfg.grad_reduce_in_fp32 = grad_reduce_in_fp32
     return cfg
+
+
+class TestLayerwiseParameterRouting:
+
+    @pytest.mark.parametrize(
+        ("shape", "attrs"),
+        [
+            pytest.param((16, 8), {}, id="matrix"),
+            pytest.param((16, 8), {"use_muon": False}, id="explicit-exclusion"),
+            pytest.param((16, 8), {"use_muon": True}, id="explicit-opt-in"),
+            pytest.param(
+                (16, 8), {"is_embedding_or_output_parameter": True}, id="embedding-or-output"
+            ),
+            pytest.param((16,), {}, id="vector"),
+            pytest.param((16,), {"use_muon": False}, id="excluded-vector"),
+            pytest.param((4, 4, 4), {}, id="non-matrix"),
+        ],
+    )
+    def test_layer_wise_ownership_matches_muon_routing(self, shape, attrs):
+        param = _make_param(shape, **attrs)
+
+        assert is_managed_by_layer_wise_optimizer(param) == (not _is_muon_excluded(param))
+
+    def test_tags_excluded_matrix_separately_from_muon_matrix(self):
+        model = torch.nn.Module()
+        model.muon_weight = _make_param((16, 8))
+        model.scalar_weight = _make_param((16, 8), use_muon=False)
+
+        tag_params_for_buffer_routing([model])
+
+        assert model.muon_weight.is_managed_by_layer_wise_optimizer
+        assert not model.scalar_weight.is_managed_by_layer_wise_optimizer
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +143,15 @@ def _assert_param_within_shard(layout, param, dp_size):
 
 
 class TestSizeMatchingLayout:
+    """Packing and bucketing rules, exercised with 1-D params.
+
+    Every param here is 1-D, so ``_ns_compute_cost`` falls back to ``nelement()``
+    and Newton-Schulz cost equals numel. That keeps these cases focused on the
+    packing and bucketing rules, but it also means they cannot tell
+    compute-balanced placement apart from numel-balanced placement: both order
+    and assign identically when the two metrics agree. ``TestComputeBalancedLayout``
+    covers that distinction with 2-D GTP-sharded params, where the metrics diverge.
+    """
 
     # -- uniform params: all same size, dp_size divides count --
 
@@ -282,6 +328,68 @@ class TestSizeMatchingLayout:
 
         assert len(layout.bucket_indices) == 4  # 8 params / (dp_size per round) = 4 rounds
 
+    # -- bucket size as a soft minimum --
+
+    def test_bucket_absorbs_param_that_fits_existing_shard_padding(self):
+        """``bucket_size`` is a soft minimum, so a param filling shard padding is absorbed.
+
+        Six equal params over 4 shards with a threshold that lands mid-row. Closing the
+        bucket the moment the threshold is met would emit a 5-param bucket (one shard
+        holding two params, three holding one) followed by a 1-param bucket, and both
+        pad out to the tallest shard. Absorbing the sixth completes the second row
+        instead, so one bucket covers all six.
+        """
+        dp_size = 4
+        numel = 256
+        params = [_make_param((numel,)) for _ in range(6)]
+        cfg = _make_ddp_config()
+
+        layout = _LWO._compute_per_buffer_param_layout(params, 5 * numel, dp_size, cfg)
+
+        assert len(layout.bucket_indices) == 1
+        # Two rows of 256 per shard: 4 * 512 buffer, of which 6 * 256 is real.
+        total_buffer_numel = layout.bucket_indices[-1][1]
+        assert total_buffer_numel == 2048
+        assert total_buffer_numel - 6 * numel == 512
+
+    def test_bucket_has_no_padding_when_params_pack_evenly(self):
+        """Params that fill every shard exactly leave no padding behind."""
+        dp_size = 4
+        numel = 256
+        params = [_make_param((numel,)) for _ in range(8)]
+        cfg = _make_ddp_config()
+
+        layout = _LWO._compute_per_buffer_param_layout(params, 5 * numel, dp_size, cfg)
+
+        total_buffer_numel = layout.bucket_indices[-1][1]
+        assert total_buffer_numel == 8 * numel
+
+    def test_mixed_sizes_can_absorb_into_larger_bucket(self):
+        """Absorbing is not always a win: with mixed sizes it can cost space.
+
+        ``_place`` walks params in backprop order while ``_emit_bucket`` sorts the
+        chunk first, so for mixed sizes the two reach different shard loads.
+        ``_absorbs`` compares against its own lower estimate and admits the two
+        128-element params, after which the sorted packing stacks both onto one
+        shard and the bucket grows. Closing at the threshold instead would have
+        emitted 768 + 512 = 1280 elements; absorbing emits 1024 + 384 = 1408.
+
+        Documented rather than fixed: the target case is equal-sized expert
+        matrices, where sorting is a no-op and the estimate is exact.
+        """
+        dp_size = 2
+        # Backprop order is reversed(params), so this list is written back to front.
+        backprop_order_numels = [192, 192, 256, 128, 128, 192]
+        params = [_make_param((n,)) for n in reversed(backprop_order_numels)]
+        cfg = _make_ddp_config()
+
+        layout = _LWO._compute_per_buffer_param_layout(params, 448, dp_size, cfg)
+
+        for param in params:
+            _assert_param_within_shard(layout, param, dp_size)
+        assert len(layout.bucket_indices) == 2
+        assert layout.bucket_indices[-1][1] == 1408
+
     # -- bucket alignment --
 
     def test_bucket_dp_divisible(self):
@@ -391,3 +499,102 @@ class TestLayerwiseFullParamLayout:
         cfg = _make_ddp_config()
         layout = _LWO.compute_full_param_layout([dense, expert], None, dp_size, cfg)
         assert len(layout.layouts) == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests for compute-balanced LPT (Newton-Schulz cost, not numel)
+# ---------------------------------------------------------------------------
+
+
+class TestComputeBalancedLayout:
+    """Placement keys on Newton-Schulz cost, so GTP-sharded params spread out.
+
+    A GTP-sharded param has the numel of its local shard but Newton-Schulz runs on
+    the full all-gathered matrix, so its cost is far higher than numel suggests.
+    """
+
+    def _ns_cost(self, param):
+        rows, cols = param.data.shape
+        rows *= getattr(param, 'gtp_remat_size', 1)
+        big, small = max(rows, cols), min(rows, cols)
+        return big * small * small
+
+    def _shard_compute_loads(self, layout, params, dp_size):
+        loads = [0] * dp_size
+        for param in params:
+            loads[_get_shard_for_param(layout, param, dp_size)] += self._ns_cost(param)
+        return loads
+
+    def test_gtp_params_balanced_by_compute_not_numel(self):
+        """GTP-sharded params dominate cost while having the smallest numel.
+
+        Sorting by numel puts the three cheap-but-large params first and leaves the
+        expensive GTP ones to fill in, which piles them onto shards that are already
+        loaded. Sorting by compute cost spreads them instead.
+        """
+        dp_size = 4
+        gtp = [
+            _make_param((64, 256), is_gtp_weight_remat=True, gtp_remat_size=64) for _ in range(3)
+        ]
+        dense = [_make_param((128, 1024)), _make_param((256, 256)), _make_param((256, 256))]
+        tail = [_make_param((64, 256))]
+        params = dense + gtp + tail
+        cfg = _make_ddp_config()
+
+        layout = _LWO._compute_per_buffer_param_layout(params, None, dp_size, cfg)
+
+        # Each GTP param costs 268M against 16.8M for the largest dense param, so no
+        # two of the three may share a shard.
+        gtp_shards = [_get_shard_for_param(layout, param, dp_size) for param in gtp]
+        assert len(set(gtp_shards)) == len(gtp), f"GTP params clustered onto {gtp_shards}"
+
+        loads = self._shard_compute_loads(layout, params, dp_size)
+        imbalance = max(loads) / (sum(loads) / dp_size)
+        # Numel-ordered placement gives 3.77x on this input.
+        assert imbalance < 1.5, f"compute imbalance {imbalance:.2f}x too high: {loads}"
+
+    def test_gtp_params_land_on_different_shards_in_each_bucket(self):
+        """Expensive params spread across buckets because compute loads do not reset.
+
+        Four buckets, each holding one GTP-sharded matrix plus three dense params of
+        identical numel. ``shard_cursors`` resets per bucket, so numel gives every
+        bucket the same starting state and would send all four GTP matrices to shard
+        0. ``shard_compute_loads`` carries over, so each bucket sees the previous
+        ones' cost and picks a different shard.
+        """
+        dp_size = 4
+        buckets = 4
+        params = []
+        for _ in range(buckets):
+            params.append(_make_param((64, 256), is_gtp_weight_remat=True, gtp_remat_size=64))
+            params.extend(_make_param((128, 128)) for _ in range(3))
+        gtp_params = [param for param in params if hasattr(param, 'gtp_remat_size')]
+        cfg = _make_ddp_config()
+
+        # Each group of four params is 4 * 16384 elements, so this cuts one bucket per group.
+        layout = _LWO._compute_per_buffer_param_layout(params, 4 * 16384, dp_size, cfg)
+
+        assert len(layout.bucket_indices) == buckets
+        gtp_shards = [_get_shard_for_param(layout, param, dp_size) for param in gtp_params]
+        assert len(set(gtp_shards)) == buckets, f"GTP params clustered onto {gtp_shards}"
+
+    def test_param_larger_than_cap_is_still_placed(self):
+        """A param larger than the per-bucket cap still gets placed.
+
+        The cap is ``total_chunk_numel / dp_size * 1.3``. A param above it disqualifies
+        every shard, so assignment falls back to the previous least-numel rule instead
+        of wedging.
+        """
+        dp_size = 2
+        oversized = _make_param((1024,))
+        small_params = [_make_param((64,)) for _ in range(2)]
+        cfg = _make_ddp_config()
+
+        # cap = (1024 + 64 + 64) / 2 * 1.3 = 748.8, below the oversized param's numel.
+        layout = _LWO._compute_per_buffer_param_layout(
+            small_params + [oversized], None, dp_size, cfg
+        )
+
+        for param in small_params + [oversized]:
+            _assert_param_within_shard(layout, param, dp_size)
+        assert oversized in layout.param_index_map

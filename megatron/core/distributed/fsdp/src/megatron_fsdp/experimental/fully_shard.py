@@ -27,11 +27,16 @@ from ..mixed_precision import MixedPrecisionPolicy
 from .module import FsdpContext, FsdpModule
 from .placement import MeshAxis, Placements
 
-_FSDP_CONTEXT = ContextVar[FsdpContext | None]("megatron_fsdp_context", default=None)
+_FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
 
 
 @contextmanager
-def fully_shard_context(device: torch.device | None = None) -> Iterator[FsdpContext]:
+def fully_shard_context(
+    device: torch.device | None = None,
+    *,
+    use_symmetric_memory: bool = False,
+    unify_communication_stream: bool = False,
+) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
     Independent roots are ordered by their root-level ``fully_shard`` calls.
@@ -40,6 +45,11 @@ def fully_shard_context(device: torch.device | None = None) -> Iterator[FsdpCont
     Args:
         device: CUDA device on which to create communication streams. Defaults to
             the current CUDA device.
+        use_symmetric_memory: Allocate communication staging buffers from PyTorch's
+            NCCL symmetric-memory pool.
+        unify_communication_stream: Whether all-gathers and reduce-scatters share one
+            communication stream to reduce peak transient memory. See
+            https://github.com/NVIDIA/Megatron-LM/issues/6471.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -48,7 +58,11 @@ def fully_shard_context(device: torch.device | None = None) -> Iterator[FsdpCont
     if device.type != "cuda":
         raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
 
-    context = FsdpContext(device=device)
+    context = FsdpContext(
+        device=device,
+        use_symmetric_memory=use_symmetric_memory,
+        unify_communication_stream=unify_communication_stream,
+    )
     token = _FSDP_CONTEXT.set(context)
     try:
         yield context
@@ -65,7 +79,7 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
-    use_symm_mem: bool = False,
+    grad_divisor: int = 1,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -78,8 +92,17 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
-        use_symm_mem: Allocate all-gather and reduce-scatter staging buffers from
-            PyTorch's NCCL symmetric-memory pool.
+        grad_divisor: Additional divisor applied to the reduced gradient, on top of the
+            averaging the mesh already performs. Defaults to 1, which is correct whenever
+            each mesh rank contributes exactly one term to the gradient.
+
+            Expert parallelism is the motivating case. A rank's experts process tokens
+            routed to them from every rank in the expert-parallel group, and the backward
+            pass routes those tokens' gradients back, so a rank's expert gradient already
+            sums over ``ep_size`` ranks' data before any reduction happens. Averaging over
+            the expert-data-parallel mesh alone therefore divides by too little, and
+            ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
+            their own rank's tokens and need no divisor.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -105,7 +128,8 @@ def fully_shard(
             mesh=mesh,
             placements=placements,
             mixed_precision_policy=mixed_precision_policy,
-            use_symm_mem=use_symm_mem,
+            grad_divisor=grad_divisor,
+            use_symmetric_memory=context.use_symmetric_memory,
         )
     except Exception:
         module.__class__ = original_cls

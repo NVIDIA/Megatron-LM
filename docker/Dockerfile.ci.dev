@@ -6,10 +6,11 @@ FROM ${FROM_IMAGE_NAME} AS main
 ENV PIP_CONSTRAINT=""
 ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
+ARG TARGETARCH
 ARG YQ_VERSION=4.44.1
 # TE 2.18's NCCL EP build requires NCCL 2.30.7+; the 26.06 base uses CUDA 13.3.
 ARG NCCL_VERSION=2.30.7-1+cuda13.3
-ENV PATH="/root/.local/bin:$PATH"
+ENV PATH="/usr/local/bin:$PATH"
 ARG UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
 ENV VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
@@ -30,7 +31,19 @@ RUN bash -ex <<"EOF"
     esac 
     wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/local/bin/yq
     chmod a+x /usr/local/bin/yq
-    curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+    case "${TARGETARCH}" in \
+      "amd64") UV_ARCH=x86_64; UV_SHA256=cfaab1b5166a6439ff66f020333d3a12bbdf622deee3b510718283e8f06c9de7 ;; \
+      "arm64") UV_ARCH=aarch64; UV_SHA256=2872fdf4785666575d129ba90590c44e6508e22584735f3e7e8a30d773dfc3db ;; \
+      *) echo "Unsupported TARGETARCH for uv: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac
+    UV_ARCHIVE="uv-${UV_ARCH}-unknown-linux-gnu.tar.gz"
+    curl -fLSs -o "/tmp/${UV_ARCHIVE}" \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ARCHIVE}"
+    echo "${UV_SHA256}  /tmp/${UV_ARCHIVE}" | sha256sum -c -
+    tar -xzf "/tmp/${UV_ARCHIVE}" -C /tmp
+    install -m 0755 "/tmp/uv-${UV_ARCH}-unknown-linux-gnu/uv" /usr/local/bin/uv
+    install -m 0755 "/tmp/uv-${UV_ARCH}-unknown-linux-gnu/uvx" /usr/local/bin/uvx
+    rm -rf "/tmp/${UV_ARCHIVE}" "/tmp/uv-${UV_ARCH}-unknown-linux-gnu"
 EOF
 
 RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_nccl.sh \
@@ -126,6 +139,64 @@ EOF
 COPY assets/ /opt/data/
 ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
+ARG RUNTIME_UID=65532
+ARG RUNTIME_GID=65532
+RUN if ! getent group "${RUNTIME_GID}" >/dev/null; then \
+        groupadd --gid "${RUNTIME_GID}" nemo-runtime; \
+    fi && \
+    if ! getent passwd "${RUNTIME_UID}" >/dev/null; then \
+        useradd --no-log-init --uid "${RUNTIME_UID}" --gid "${RUNTIME_GID}" \
+            --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime; \
+    fi && \
+    install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" \
+        /home/nemo-runtime \
+        /home/gitlab-runner/data/gpt3_data \
+        /opt/megatron-lm \
+        /tmp/regent-cache \
+        /tmp/regent-cache/pip \
+        /tmp/regent-cache/uv \
+        /tmp/regent-cache/xdg \
+        /workspace/data/cache && \
+    venv_site_packages="$("${UV_PROJECT_ENVIRONMENT}/bin/python" -c \
+        'import site; print(site.getsitepackages()[0])')" && \
+    touch "${venv_site_packages}/.nonroot-uninstall-probe" && \
+    find "${UV_PROJECT_ENVIRONMENT}" -type d \
+        -exec chown "${RUNTIME_UID}:${RUNTIME_GID}" {} +
+
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+
+# The CI harness materializes an immutable test commit here rather than over
+# the dependency-build checkout in /workspace. Runtime callers select this UID
+# and set HOME/cache variables explicitly; the published image remains root by
+# default. Prove that the non-root contract works before restoring that default.
+# The cache root is probed for directory creation, not just file writes: a
+# caller pointing XDG_CACHE_HOME or HF_HOME below it materializes new
+# subdirectories, which a root-owned parent rejects even when every pre-created
+# leaf is writable.
+RUN export HOME=/home/nemo-runtime \
+        PIP_CACHE_DIR=/tmp/regent-cache/pip \
+        XDG_CACHE_HOME=/tmp/regent-cache/xdg \
+        UV_CACHE_DIR=/tmp/regent-cache/uv && \
+    test "$(id -u)" = "${RUNTIME_UID}" && \
+    test -w "${HOME}" && \
+    test -w "${PIP_CACHE_DIR}" && \
+    test -w "${XDG_CACHE_HOME}" && \
+    test -w "${UV_CACHE_DIR}" && \
+    test -x /usr/local/bin/uv && \
+    test -x /opt/venv/bin/python && \
+    venv_site_packages="$(python -c 'import site; print(site.getsitepackages()[0])')" && \
+    rm "${venv_site_packages}/.nonroot-uninstall-probe" && \
+    touch "${venv_site_packages}/.nonroot-write-probe" && \
+    rm "${venv_site_packages}/.nonroot-write-probe" && \
+    touch /workspace/data/cache/.nonroot-write-probe && \
+    rm /workspace/data/cache/.nonroot-write-probe && \
+    touch /opt/megatron-lm/.nonroot-write-probe && \
+    rm /opt/megatron-lm/.nonroot-write-probe && \
+    mkdir /tmp/regent-cache/.nonroot-mkdir-probe && \
+    rmdir /tmp/regent-cache/.nonroot-mkdir-probe
+
+USER root
+
 ##### For NVIDIANS only #####
 FROM main AS jet
 ARG JET_API_VERSION
@@ -145,4 +216,6 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     uv pip install --no-cache-dir --upgrade "setuptools>=80"
     uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=4.0" 
 EOF
+
+USER root
 ###

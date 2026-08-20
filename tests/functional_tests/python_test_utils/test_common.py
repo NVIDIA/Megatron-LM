@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 
+from tests.functional_tests.python_test_utils import common
 from tests.functional_tests.python_test_utils.common import (
     ApproximateTest,
     DeterministicTest,
@@ -11,7 +14,9 @@ from tests.functional_tests.python_test_utils.common import (
     NotDeterminsticError,
     TypeOfTestResult,
     _filter_checks,
+    _remove_leading_nan_iteration_times,
     pipeline,
+    read_tb_logs_as_list,
 )
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -31,6 +36,41 @@ def run(golden, actual, checks, compare_approximate=False):
         actual_values=actual,
         checks=checks,
     )
+
+
+# ── read_tb_logs_as_list ─────────────────────────────────────────────────────
+
+
+class FakeEventAccumulator:
+    def Tags(self):
+        return {"scalars": ["iteration-time", "lm loss"]}
+
+    def Scalars(self, metric):
+        values = {"iteration-time": [(2, 0.25)], "lm loss": [(2, 1.0)]}
+        return [SimpleNamespace(step=step, value=value) for step, value in values[metric]]
+
+
+def test_read_tb_logs_removes_only_leading_iteration_time_nan(monkeypatch, tmp_path):
+    (tmp_path / "events.out.tfevents.test").touch()
+    monkeypatch.setattr(
+        common, "_load_event_accumulators_with_scalars", lambda _: [FakeEventAccumulator()]
+    )
+
+    result = read_tb_logs_as_list(str(tmp_path), train_iters=3, start_idx=1, step_size=1)
+
+    assert result["iteration-time"].start_step == 2
+    assert result["iteration-time"].values == {2: 0.25, 3: "nan"}
+    assert result["lm loss"].start_step == 1
+    assert result["lm loss"].values == {1: "nan", 2: 1.0, 3: "nan"}
+
+
+def test_remove_leading_iteration_time_nan_preserves_all_nan_metric():
+    iteration_time = make_metric({1: "nan", 5: "nan"}, step_interval=5)
+
+    result = _remove_leading_nan_iteration_times({"iteration-time": iteration_time})
+
+    assert result["iteration-time"] == iteration_time
+    assert result["iteration-time"].start_step == 1
 
 
 # ── ApproximateTest ───────────────────────────────────────────────────────────

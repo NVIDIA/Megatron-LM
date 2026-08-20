@@ -6,6 +6,11 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+try:
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
+
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.utils import nvtx_decorator
@@ -420,6 +425,7 @@ class P2PCommunicator:
 
         return tensor_recv_prev, tensor_recv_next, reqs
 
+    @_otel_trace_fn('communication', 'megatron.p2p.recv_forward')
     @nvtx_decorator()
     def recv_forward(
         self, tensor_shapes, is_first_stage: bool
@@ -451,6 +457,7 @@ class P2PCommunicator:
             return input_tensors[0]
         return input_tensors
 
+    @_otel_trace_fn('communication', 'megatron.p2p.recv_backward')
     @nvtx_decorator()
     def recv_backward(
         self, tensor_shapes, is_last_stage: bool
@@ -482,6 +489,7 @@ class P2PCommunicator:
             return output_tensor_grads[0]
         return output_tensor_grads
 
+    @_otel_trace_fn('communication', 'megatron.p2p.send_forward')
     @nvtx_decorator()
     def send_forward(self, output_tensors, is_last_stage: bool) -> None:
         """Send tensor to next rank in pipeline (forward send)."""
@@ -503,6 +511,7 @@ class P2PCommunicator:
                 if config.timers is not None:
                     config.timers('forward-send').stop()
 
+    @_otel_trace_fn('communication', 'megatron.p2p.send_backward')
     @nvtx_decorator()
     def send_backward(self, input_tensor_grads, is_first_stage: bool) -> None:
         """Send tensor to previous rank in pipeline (backward send)."""
