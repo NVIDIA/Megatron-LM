@@ -206,7 +206,6 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                     "Please, install gigatoken to use fast tokenizers: `pip install gigatoken`."
                 )
 
-
     def add_special_tokens(self, special_tokens_dict: dict) -> int:
         """
         Adds a dictionary of special tokens (eos, pad, cls...).
@@ -315,8 +314,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
     def encode_files(self, paths: list[str], field: str = "text") -> "ak.Array":
         if self.use_gigatoken:
             return self.tokenizer.tokenizer.encode_files(
-                gt.JsonlFileSource(paths, field="text"),
-                parallel=True,
+                gt.JsonlFileSource(paths, field="text"), parallel=True
             )
         else:
             raise NotImplementedError(

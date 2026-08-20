@@ -1015,13 +1015,13 @@ class IndexedDatasetBuilder(object):
 
         n_docs = len(documents)
         for start in range(0, n_docs, chunk_size):
-            chunk = documents[start:start + chunk_size]  # cheap view, no copy
+            chunk = documents[start : start + chunk_size]  # cheap view, no copy
 
             flat = numpy.asarray(ak.flatten(chunk), dtype=self.dtype)
             doc_lengths = numpy.asarray(ak.num(chunk, axis=1))
 
             if eod_token is not None:
-                insert_at = numpy.cumsum(doc_lengths)          # one insertion point per doc boundary
+                insert_at = numpy.cumsum(doc_lengths)  # one insertion point per doc boundary
                 flat = numpy.insert(flat, insert_at, eod_token).astype(self.dtype, copy=False)
                 doc_lengths = doc_lengths + 1
 
@@ -1033,7 +1033,11 @@ class IndexedDatasetBuilder(object):
             self.document_indices.extend((offset + numpy.arange(1, len(doc_lengths) + 1)).tolist())
 
             if self.multimodal:
-                chunk_modes = modes[start:start + chunk_size] if modes is not None else [0] * len(doc_lengths)
+                chunk_modes = (
+                    modes[start : start + chunk_size]
+                    if modes is not None
+                    else [0] * len(doc_lengths)
+                )
                 self.sequence_modes.extend(chunk_modes)
 
     def end_document(self) -> None:

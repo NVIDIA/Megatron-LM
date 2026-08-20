@@ -1,10 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import hashlib
-import numpy as np
 import runpy
 import sys
 import tempfile
+
+import numpy as np
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 

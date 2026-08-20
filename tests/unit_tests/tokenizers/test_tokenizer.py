@@ -600,7 +600,7 @@ class TestBuildTokenizer:
         assert tokenizer.library == "huggingface"
         assert tokenizer.chat_template == chat_template
         assert tokenizer._tokenizer.include_special_tokens == True
-    
+
     def test_build_hf_tokenizer_fast(self):
         tokenizer_model = "/opt/data/tokenizers/huggingface"
         tokenizer_type = "HuggingFaceTokenizer"
@@ -634,8 +634,15 @@ class TestBuildTokenizer:
         text = "Hi how are you? How was your day? :)"
         ids = [128000, 13347, 1268, 527, 499, 30, 2650, 574, 701, 1938, 30, 27046]
         assert tokenizer.tokenize(text) == tokenizer_default.tokenize(text)
-        assert tokenizer.detokenize(ids) == tokenizer_default.detokenize(ids) == f"<|begin_of_text|>{text}"
-        assert tokenizer.additional_special_tokens_ids == tokenizer_default.additional_special_tokens_ids
+        assert (
+            tokenizer.detokenize(ids)
+            == tokenizer_default.detokenize(ids)
+            == f"<|begin_of_text|>{text}"
+        )
+        assert (
+            tokenizer.additional_special_tokens_ids
+            == tokenizer_default.additional_special_tokens_ids
+        )
         assert tokenizer.eod == tokenizer.eod
         assert tokenizer.sep_id == tokenizer.sep_id
         assert tokenizer.vocab_size == tokenizer_default.vocab_size
@@ -658,7 +665,7 @@ class TestBuildTokenizer:
 
         assert tokenizer.library == "megatron"
         assert tokenizer.chat_template == None
-    
+
     def test_build_megatron_tokenizer_fast(self):
         special_tokens = [f'<extra_id_{i}>' for i in range(100)]
         vocab_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
@@ -694,7 +701,10 @@ class TestBuildTokenizer:
         ids = [17250, 703, 389, 345, 30, 1374, 373, 534, 1110, 30, 14373]
         assert tokenizer.tokenize(text) == tokenizer_default.tokenize(text)
         assert tokenizer.detokenize(ids) == tokenizer_default.detokenize(ids) == f"{text}"
-        assert tokenizer.additional_special_tokens_ids == tokenizer_default.additional_special_tokens_ids
+        assert (
+            tokenizer.additional_special_tokens_ids
+            == tokenizer_default.additional_special_tokens_ids
+        )
         assert tokenizer.eod == tokenizer.eod
         assert tokenizer.sep_id == tokenizer.sep_id
         assert tokenizer.vocab_size == tokenizer_default.vocab_size
