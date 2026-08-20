@@ -146,6 +146,7 @@ class MimoModel(MegatronModule):
         modality_embeddings: Dict[str, torch.Tensor],  # [num_embeddings, hidden_dim]
         input_ids: torch.Tensor,  # [bs, seq_len]
         special_token_ids: Dict[str, int],
+        modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Align embeddings from different modalities based on special token positions in input_ids.
 
@@ -158,6 +159,7 @@ class MimoModel(MegatronModule):
                 The number of special tokens for each modality should exactly match the number
                 of embeddings for that modality.
             special_token_ids: Dictionary mapping modality names to their special token IDs
+            modality_token_indices: Optional mapping from modality names to flat token indices.
 
         Returns:
             Combined embeddings tensor. Shape: (S, B, H)
@@ -184,9 +186,20 @@ class MimoModel(MegatronModule):
         combined_embeddings = torch.zeros(
             (batch_size, seq_length, hidden_dim), dtype=dtype, device=device
         )
+        flat_combined_embeddings = combined_embeddings.view(-1, hidden_dim)
 
         # Process each modality in modality_embeddings
         for modality_name, modality_emb in modality_embeddings.items():
+            token_indices = (modality_token_indices or {}).get(modality_name)
+            if token_indices is not None:
+                if token_indices.ndim != 1 or token_indices.numel() != modality_emb.size(0):
+                    raise ValueError(
+                        f"Number of {modality_name} token indices ({token_indices.numel()}) "
+                        f"does not match number of embeddings ({modality_emb.size(0)})"
+                    )
+                flat_combined_embeddings.index_copy_(0, token_indices, modality_emb)
+                continue
+
             if modality_name == "text":
                 mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
                 for token_id in special_token_ids.values():
@@ -344,7 +357,11 @@ class MimoModel(MegatronModule):
             module.zero_grad_buffer()
 
     def get_text_embeddings(
-        self, input_ids: torch.Tensor, position_ids: torch.Tensor, special_token_ids: Dict[str, int]
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        special_token_ids: Dict[str, int],
+        text_token_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Get embeddings for text tokens in the input.
         Args:
@@ -354,26 +371,36 @@ class MimoModel(MegatronModule):
                 Shape: (B, S)
             special_token_ids: Dictionary mapping modality names to their special token IDs.
                 Used to identify non-text tokens in the input_ids.
+            text_token_indices: Optional flat indices of text tokens in ``input_ids``.
 
         Returns:
             torch.Tensor: Embeddings for text tokens.
             Shape: (N, H), where N is the number of text tokens.
         """
-        text_mask = torch.ones_like(input_ids, dtype=torch.bool)  # [b, s]
-        for special_token_id in special_token_ids.values():
-            text_mask &= input_ids != special_token_id
+        if text_token_indices is None:
+            text_mask = torch.ones_like(input_ids, dtype=torch.bool)  # [b, s]
+            for special_token_id in special_token_ids.values():
+                text_mask &= input_ids != special_token_id
 
-        batch_idx, seq_idx = text_mask.nonzero(as_tuple=True)
-        input_ids_text = input_ids[batch_idx, seq_idx].unsqueeze(0)
+            batch_idx, seq_idx = text_mask.nonzero(as_tuple=True)
+            text_token_indices = batch_idx * input_ids.size(1) + seq_idx
+        elif text_token_indices.ndim != 1:
+            raise ValueError("Text token indices must be a flat one-dimensional tensor")
+
+        input_ids_text = input_ids.reshape(-1).index_select(0, text_token_indices).unsqueeze(0)
 
         if position_ids is None:
             position_ids_text = None
         elif position_ids.dim() == 3:
             # Multimodal RoPE can carry [rope_dim, batch, seq] ids. Text
             # embedding lookup only needs a single absolute position channel.
-            position_ids_text = position_ids[0, batch_idx, seq_idx].unsqueeze(0)
+            position_ids_text = (
+                position_ids[0].reshape(-1).index_select(0, text_token_indices).unsqueeze(0)
+            )
         else:
-            position_ids_text = position_ids[batch_idx, seq_idx].unsqueeze(0)
+            position_ids_text = (
+                position_ids.reshape(-1).index_select(0, text_token_indices).unsqueeze(0)
+            )
 
         embedding_layer = unwrap_model(self.language_model).embedding
         # Combined embeddings are SP-scattered later in PartitionAdapter; a second scatter
@@ -405,6 +432,7 @@ class MimoModel(MegatronModule):
         labels: Optional[torch.Tensor] = None,
         modality_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
         packing_kwargs: Optional[dict] = None,
+        modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Forward pass through the multimodal model.
 
@@ -438,6 +466,7 @@ class MimoModel(MegatronModule):
                                         max(seqlens_padded), dtype=torch.int32
                                     ),
                                 }
+            modality_token_indices: Optional mapping from modality names to flat token indices.
 
         Returns:
             tuple: (output, loss_mask) where output semantics depend on role:
@@ -457,6 +486,7 @@ class MimoModel(MegatronModule):
                 labels,
                 modality_inputs,
                 packing_kwargs,
+                modality_token_indices,
             )
 
         if self.role.mode == ModuleLayout.NON_COLOCATED:
@@ -472,6 +502,7 @@ class MimoModel(MegatronModule):
                     labels,
                     input_tensors,
                     packing_kwargs,
+                    modality_token_indices,
                 )
 
             raise RuntimeError(f"Rank has no modules assigned in role: {self.role}")
@@ -631,6 +662,7 @@ class MimoModel(MegatronModule):
         labels: Optional[torch.Tensor],
         input_tensors: Optional[Dict[str, torch.Tensor]],
         packing_kwargs: Optional[dict] = None,
+        modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Tuple[Any, Optional[torch.Tensor]]:
         """Forward pass for language module on this rank.
 
@@ -644,6 +676,7 @@ class MimoModel(MegatronModule):
             labels: Labels for loss computation
             input_tensors: Hidden states or embeddings from previous stage
             packing_kwargs: Optional kwargs to construct packed (THD) sequence params.
+            modality_token_indices: Optional mapping from modality names to flat token indices.
 
         Returns:
             Tuple of (language model output, possibly CP-sharded loss mask). The
@@ -675,7 +708,10 @@ class MimoModel(MegatronModule):
 
             # Get text embeddings
             text_embeddings = self.get_text_embeddings(
-                input_ids, position_ids, self.special_token_ids
+                input_ids,
+                position_ids,
+                self.special_token_ids,
+                text_token_indices=(modality_token_indices or {}).get("text"),
             )
             modality_embeddings["text"] = text_embeddings
 
@@ -684,6 +720,7 @@ class MimoModel(MegatronModule):
                 modality_embeddings=modality_embeddings,
                 input_ids=input_ids,
                 special_token_ids=self.special_token_ids,
+                modality_token_indices=modality_token_indices,
             )
 
             # Apply CP/SP sharding; combined_embeddings returns in [S/(cp*tp), B, H].
@@ -793,6 +830,7 @@ class MimoModel(MegatronModule):
         labels: Optional[torch.Tensor],
         modality_inputs: Optional[Dict[str, Dict[str, Any]]],
         packing_kwargs: Optional[dict] = None,
+        modality_token_indices: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """Forward pass when all modules are on all ranks (no multi-module PP).
 
@@ -822,7 +860,12 @@ class MimoModel(MegatronModule):
             modality_embeddings = self._apply_colocated_comms(modality_embeddings)
 
         # Get text embeddings
-        text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
+        text_embeddings = self.get_text_embeddings(
+            input_ids,
+            position_ids,
+            self.special_token_ids,
+            text_token_indices=(modality_token_indices or {}).get("text"),
+        )
         logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
 
         modality_embeddings["text"] = text_embeddings
@@ -833,6 +876,7 @@ class MimoModel(MegatronModule):
             modality_embeddings=modality_embeddings,
             input_ids=input_ids,
             special_token_ids=self.special_token_ids,
+            modality_token_indices=modality_token_indices,
         )
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
