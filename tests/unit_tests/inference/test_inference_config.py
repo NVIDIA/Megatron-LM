@@ -14,6 +14,8 @@ from megatron.core.inference.config import (
     InferenceConfig,
     MambaInferenceStateConfig,
 )
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -51,6 +53,23 @@ class TestInferenceConfig:
         if Utils.rank != 0:
             return
         subprocess.run([sys.executable, "-c", imports], check=True)
+
+    @pytest.mark.parametrize(
+        ("grouped_gemm_backend", "expected_backend"),
+        [
+            ("torch", "triton"),
+            (InferenceGroupedGemmBackend.TORCH, "triton"),
+            ("flashinfer", "flashinfer"),
+            (InferenceGroupedGemmBackend.FLASHINFER, "flashinfer"),
+        ],
+    )
+    def test_resolve_mxfp8_backend(self, grouped_gemm_backend, expected_backend):
+        assert resolve_mxfp8_backend(grouped_gemm_backend) == expected_backend
+
+    @pytest.mark.parametrize("grouped_gemm_backend", ["vllm", InferenceGroupedGemmBackend.VLLM])
+    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self, grouped_gemm_backend):
+        with pytest.raises(ValueError, match="does not support inference_grouped_gemm_backend"):
+            resolve_mxfp8_backend(grouped_gemm_backend)
 
     def test_mutual_exclusivity_with_transformer_config(self):
         """
