@@ -13,11 +13,16 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from megatron.lite.runtime.contracts.loss import get_loss_context, split_loss_context, use_loss_context
+from megatron.lite.runtime.contracts.loss import (
+    get_loss_context,
+    split_loss_context,
+    use_loss_context,
+)
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
@@ -61,12 +66,16 @@ def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
         "fused": ("0", "1", "0"),
         "unfused": ("0", "0", "1"),
         "local": ("0", "0", "0"),
+        # Magi owns core attention and ignores these TE selectors. Keep TE's
+        # auto-selection available so a built model can hot-swap back to TE.
+        "magi": ("1", "1", "1"),
     }
     try:
         flash, fused, unfused = env_overrides[backend]
     except KeyError as exc:
         raise ValueError(
-            "attention_backend_override must be one of {'auto', 'flash', 'fused', 'unfused', 'local'}"
+            "attention_backend_override must be one of "
+            "{'auto', 'flash', 'fused', 'unfused', 'local', 'magi'}"
         ) from exc
 
     os.environ["NVTE_FLASH_ATTN"] = flash

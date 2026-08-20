@@ -128,6 +128,7 @@ bash experimental/lite/examples/bench/scripts/run_qwen35_correctness_pair.sh
 
 - [Architecture](docs/architecture.md)
 - [Runtime](docs/runtime.md)
+- [MagiAttention](docs/magi_attention.md)
 - [Models](docs/models.md)
 - [Porting Notes](docs/porting.md)
 - [Skills](skills/README.md)
