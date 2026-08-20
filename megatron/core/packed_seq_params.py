@@ -83,16 +83,24 @@ class PackedSeqParams:
 
 
 def resolve_cp_group(
-    static_cp_group: Optional[dist.ProcessGroup], packed_seq_params: PackedSeqParams = None
+    static_cp_group: Optional[dist.ProcessGroup],
+    packed_seq_params: Optional[PackedSeqParams] = None,
 ) -> Optional[dist.ProcessGroup]:
-    """Resolve and validate the context-parallel group for this microbatch."""
-    if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-        assert (
-            packed_seq_params.cp_group is not None
-        ), "packed_seq_params.cp_group must be set when local_cp_size is provided"
-        assert packed_seq_params.cp_group.size() == packed_seq_params.local_cp_size, (
-            "packed_seq_params.cp_group size must match local_cp_size: "
-            f"{packed_seq_params.cp_group.size()} != {packed_seq_params.local_cp_size}"
-        )
-        return packed_seq_params.cp_group
+    """Prefer an explicit runtime CP group and validate a declared runtime size.
+
+    A runtime group can also be supplied without ``local_cp_size``. When the
+    size is declared, it must match the group, including singleton groups for
+    microbatches with CP disabled.
+    """
+    if packed_seq_params is not None:
+        if packed_seq_params.local_cp_size is not None:
+            assert (
+                packed_seq_params.cp_group is not None
+            ), "packed_seq_params.cp_group must be set when local_cp_size is provided"
+            assert packed_seq_params.cp_group.size() == packed_seq_params.local_cp_size, (
+                "packed_seq_params.cp_group size must match local_cp_size: "
+                f"{packed_seq_params.cp_group.size()} != {packed_seq_params.local_cp_size}"
+            )
+        if packed_seq_params.cp_group is not None:
+            return packed_seq_params.cp_group
     return static_cp_group
