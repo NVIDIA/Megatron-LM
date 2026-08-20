@@ -79,7 +79,7 @@ swap_model_weights(None, None, "nccl",
 | Backend | Transport | Best for | Notes |
 |---------|-----------|----------|-------|
 | `nccl` | GPU P2P via `batch_isend_irecv` | Intra-node / single cluster | Lowest latency; default choice |
-| `nccl_m2n` | NCCL M2N hierarchical ring + NCCL windows | Large non-collocated source/destination groups | Requires `libnccl_m2n.so`; source ranks must precede destination ranks |
+| `nccl_m2n` | NCCL M2N copy/staging reshard | Large non-collocated source/destination groups | Requires the official `nccl-extensions` Python package and NCCL 2.30.5+; source ranks must precede destination ranks |
 | `gloo` | CPU-staged via Gloo PG | Cross-cluster / multi-node | Higher latency; works where NCCL cross-cluster doesn't |
 | `nvshmem` | Pipelined NVSHMEM puts | High-throughput intra-node | Requires NVSHMEM; uses double-buffered kernel pipeline |
 | `nixl` | GPU RDMA via NIXL (UCX), sender-initiated WRITE | Cross-cluster / non-collocated | Requires NIXL; transfers GPU memory directly (no host staging) |
@@ -91,30 +91,39 @@ destination meshes must be disjoint.
 
 ### NCCL M2N backend
 
-Build and install the experimental `contrib/nccl_m2n` library from the
-[NVIDIA NCCL repository](https://github.com/NVIDIA/nccl/tree/master/contrib/nccl_m2n),
-then make the shared library discoverable:
+Build the current M2N library from
+[NVIDIA/nccl-extensions](https://github.com/NVIDIA/nccl-extensions), then install
+its Python package together with NCCL4Py. M2N v0.2 requires NCCL 2.30.5 or
+newer. For a source checkout, follow the upstream native build instructions,
+then install the bindings from outside the `python/` directory:
 
 ```bash
-export NCCL_M2N_LIBRARY=/path/to/nccl_m2n/build/lib/libnccl_m2n.so
+CUDA_HOME=/usr/local/cuda pip install -e /path/to/nccl-extensions/python
+```
+
+The package imports as `nccl.m2n` and uses `nccl.core` from NCCL4Py. A wheel
+may bundle `libnccl_m2n.so`; otherwise set the loader override explicitly:
+
+```bash
+export NCCL_M2N_LIBRARY=/path/to/libnccl_m2n.so
 ```
 
 Select it with `refit_method="nccl_m2n"` or `--refit-method nccl_m2n`.
 The backend preserves the existing ReFIT planner and packs its operations into
 one logical `[source, destination, bytes]` tensor. Source ranks shard dimension
-0, destination ranks shard dimension 1, and one cross-dimension M2N reshard
-moves the entire batch through the hierarchical ring.
+0, destination ranks shard dimension 1, and one cross-dimension
+`nccl.m2n.reshard` call moves the entire batch through M2N's managed
+copy/staging transport.
 
-NCCL M2N v0.1 only supports non-collocated layouts. The communication group
-must contain a contiguous source interval starting at group rank 0, immediately
-followed by a contiguous destination interval, with no overlapping or idle
-ranks. Use a process group scoped to exactly one source/destination pool when
-the application has extra ranks. Tensor data is staged through a reusable
-NCCL symmetric-memory window; model parameter storage itself is not replaced.
-The v0.1 build caps RING meshes at 16 source and 64 destination ranks, and
-DIRECT meshes at 32 source and 64 destination ranks. A custom build with
-larger bounds can be used by constructing `NCCLM2NCopyService` with
-`enforce_mesh_limits=False`.
+This backend supports only non-collocated multi-rank layouts. The communication
+group must contain a contiguous source interval starting at group rank 0,
+immediately followed by a contiguous destination interval, with no overlapping
+or idle ranks. Use a process group scoped to exactly one source/destination pool
+when the application has extra ranks. Tensor data is packed into an ordinary,
+reusable CUDA tensor; model parameter storage itself is not replaced. The stock
+v0.2 copy/staging path caps meshes at 16 source and 64 destination ranks. A
+custom build with larger bounds can be used by constructing
+`NCCLM2NCopyService` with `enforce_mesh_limits=False`.
 
 ## How the Reshard Plan Works
 
