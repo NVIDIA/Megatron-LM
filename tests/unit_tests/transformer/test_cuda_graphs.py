@@ -36,7 +36,11 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
+    _CudagraphReplayNode,
+    _CudaGraphRunner,
     _layer_is_graphable,
+    create_cudagraphs,
+    delete_cuda_graphs,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -403,6 +407,32 @@ class TestCudaGraphConfigAndArguments:
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.none
         assert cfg.cuda_graph_modules == []
         assert cfg.cuda_graph_scope is None
+
+
+class TestCudaGraphReplay:
+    def test_gtp_forward_ensures_captured_params_ready_before_replay(self, monkeypatch):
+        calls = []
+        first = object()
+        second = object()
+        runner = object.__new__(_CudaGraphRunner)
+        runner._gtp_fwd_params_to_ensure_ready = (first, second)
+        runner.grad_enabled = False
+        runner.fwd_graph_outputs = (object(),)
+        runner.get_mismatch_errors = lambda args, kwargs: []
+        runner.get_tensors = lambda args, kwargs, check_types: []
+        runner.to_list = lambda value: list(value) if isinstance(value, tuple) else [value]
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            "ensure_params_ready",
+            lambda params: calls.append(("ready", tuple(params))),
+        )
+        monkeypatch.setattr(
+            _CudagraphReplayNode, "apply", lambda *args: calls.append("replay") or (object(),)
+        )
+
+        runner.replay_graph_capture(False, (), {})
+
+        assert calls == [("ready", (first, second)), "replay"]
 
 
 class TestParallelTransformerBlockCudagraphs:
