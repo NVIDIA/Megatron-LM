@@ -20,16 +20,16 @@ from packaging.version import Version
 
 
 EXACT_DEPENDENCIES = {
-    "vllm": "0.25.1",
-    "flashinfer-python": "0.6.13",
+    "vllm": "0.26.1rc1.dev631+g5426311d9",
+    "flashinfer-python": "0.6.16.post3",
     "nvidia-cutlass-dsl": "4.5.2",
-    "tilelang": "0.1.9",
+    "tilelang": "0.1.12",
 }
 MINIMUM_DEPENDENCIES = {
     "transformer-engine": "2.15.0",
     "nvidia-cudnn-frontend": "1.27.0",
 }
-EXPECTED_VERL_COMMIT = "b9c513c4"
+EXPECTED_VERL_COMMIT = "36cbb408"
 
 
 def installed(name: str) -> str:

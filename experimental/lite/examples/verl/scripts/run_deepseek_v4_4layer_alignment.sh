@@ -46,6 +46,9 @@ export VLLM_DS4_DECODE_KERNEL=sparse
 export VERL_FULL_DETERMINISM=1
 export VERL_DETERMINISM_SEED="${SEED:-42}"
 export PYTHONHASHSEED="${SEED:-42}"
+export VERL_LOCAL_TASK_RUNNER=1
+export VERL_ENGINE_LAZY_IMPORTS=1
+export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 
 # Keep this release gate free of tensor dumps, forced synchronization, and
 # validation probes so its timings remain representative.

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # DeepSeek-V4 DAPO launcher.
 #
-# Validated hero dependency contract (CW H100, 2026-07-17):
-#   VERL: 6a937b63
+# Validated DS4 alignment dependency contract (CW H100, 2026-08-20):
+#   VERL: 36cbb408
 #   Python: 3.12
 #   PyTorch: 2.12.0a0 nv26.05, CUDA 13.2
-#   vLLM: 0.25.1
+#   vLLM: 0.26.1rc1.dev631+g5426311d9
 #   Transformer Engine: >= 2.15.0
 #   nvidia-cudnn-frontend: >= 1.27.0, with DSA q_causal_offsets
-#   FlashInfer: 0.6.13
+#   FlashInfer: 0.6.16.post3
 #   nvidia-cutlass-dsl: 4.5.2
-#   TileLang: 0.1.9
+#   TileLang: 0.1.12
 #
 # validate_deepseek_v4_dapo.py enforces this contract before a real run.
 set -euo pipefail
