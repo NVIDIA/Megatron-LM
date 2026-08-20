@@ -331,6 +331,27 @@ def mcore_to_pyt_state_dict(
     return pyt_state_dict
 
 
+def _gtp_restore_padded(sh_ten) -> torch.Tensor:
+    """Give back the full padded GTP shard once its logical rows have been loaded.
+
+    A GTP shard whose alignment-pad tail is excluded from the checkpoint is described to DCP as
+    a trimmed view of the buffer behind it (see utils._make_gtp_logical_sharded_tensor). Loading
+    fills that view, and because the view shares storage with that buffer the buffer is already
+    correct -- but the state dict must hand back the full-length tensor, or ``load_state_dict``
+    sees the shorter one and reports a size mismatch. The pad rows keep whatever the model
+    initialized them with, which is what a fresh GTP shard holds anyway.
+
+    Use ``gtp_pad_buffer`` (what the shard was sliced FROM), not ``gtp_pad_src`` (the live param,
+    kept for identity matching). For a native-FP8 param those differ: the entry's data is a
+    dequantized BF16 copy, and the FP8 param shares no storage with the rows just loaded, so
+    returning it would silently discard them on exactly the trimmed rank.
+    """
+    src = getattr(sh_ten, "gtp_pad_buffer", None)
+    if src is None:
+        src = getattr(sh_ten, "gtp_pad_src", None)
+    return sh_ten.data if src is None else src
+
+
 def _unwrap_pyt_sharded_tensor(
     sh_ten: Union[TorchShardedTensor, CheckpointableShardedTensor, LocalShardsContainer, Any]
 ) -> Union[List[torch.Tensor], Any]:
@@ -340,9 +361,9 @@ def _unwrap_pyt_sharded_tensor(
     then the tensor has additional singleton dimensions which should be squeezed.
     """
     if isinstance(sh_ten, CheckpointableShardedTensor):
-        return [sh_ten._sh_ten.data]
+        return [_gtp_restore_padded(sh_ten._sh_ten)]
     if isinstance(sh_ten, LocalShardsContainer):
-        return [local_shard._sh_ten.data for local_shard in sh_ten._local_shards]
+        return [_gtp_restore_padded(local_shard._sh_ten) for local_shard in sh_ten._local_shards]
     if not isinstance(sh_ten, TorchShardedTensor):
         return sh_ten
     mcore_sh_ten = sh_ten.mcore_sh_ten
