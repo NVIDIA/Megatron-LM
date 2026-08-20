@@ -773,10 +773,11 @@ class TestMLAOutputGate:
             reference_output, (reference_gate, reference_core), output_gradient
         )
 
-        # Allow one BF16 quantization step from the compiled sigmoid/cast path.
-        torch.testing.assert_close(actual_output, reference_output, atol=1e-2, rtol=1e-2)
+        # Allow exactly one BF16 quantization step from the compiled sigmoid/cast path.
+        bf16_eps = torch.finfo(torch.bfloat16).eps
+        torch.testing.assert_close(actual_output, reference_output, atol=bf16_eps, rtol=0.0)
         for actual, reference in zip(actual_gradients, reference_gradients):
-            torch.testing.assert_close(actual, reference, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(actual, reference, atol=bf16_eps, rtol=0.0)
 
     def test_missing_gate_spec_raises(self):
         submodules = get_mla_self_attn_submodules()
