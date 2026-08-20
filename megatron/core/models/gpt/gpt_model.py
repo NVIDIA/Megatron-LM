@@ -27,6 +27,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
@@ -771,6 +772,18 @@ class GPTModel(LanguageModule):
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
+        gather_output = (
+            self.output_layer.gather_output
+            if runtime_gather_output is None
+            else runtime_gather_output
+        )
+        observe_tensor(
+            self.output_layer,
+            "output_logits",
+            "output_logits",
+            logits,
+            tp_shard_dim=None if gather_output else -1,
+        )
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
