@@ -538,7 +538,8 @@ class TEGroupedMLP(MegatronModule):
         # grouped view at the op boundary.
         # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
         # TODO: remove after TE support the grouped tensor path
-        op.ep_mxfp8_carrier_input = self.config.moe_dispatch_fwd_dtype == 'mxfp8'
+        if getattr(self.config, 'moe_dispatch_fwd_dtype', 'bf16') == 'mxfp8':
+            op.ep_mxfp8_carrier_input = True
         ops.append(op)
 
         # Activation and post-multiply probs (SwiGLU, clamped GLU, or SReLU).
@@ -645,7 +646,8 @@ class TEGroupedMLP(MegatronModule):
         # view at the op boundary.
         # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
         # TODO: remove after TE support the grouped tensor path
-        op.ep_mxfp8_carrier_grad = self.config.moe_combine_bwd_dtype == 'mxfp8'
+        if getattr(self.config, 'moe_combine_bwd_dtype', 'bf16') == 'mxfp8':
+            op.ep_mxfp8_carrier_grad = True
         ops.append(op)
 
         # Emulate submodule pre-forward hooks
