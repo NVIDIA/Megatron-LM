@@ -372,6 +372,10 @@ class RolloutPipeline:
                     allocation = self.allocations[env_index]
                     restored = self.agent.take_restored_group(allocation.env_id)
                     if restored is not None:
+                        assert all(rollout.env_id == allocation.env_id for rollout in restored), (
+                            f"Restored rollout group routed to env {allocation.env_id!r} contains "
+                            f"members for {[rollout.env_id for rollout in restored]}"
+                        )
                         restored.batch_id = batch_id
                         restored.index_in_batch = index_in_batch
                         self._output_enqueued_at[(batch_id, index_in_batch)] = time.monotonic()

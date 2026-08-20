@@ -2699,8 +2699,8 @@ def _add_rl_args(parser):
                             '<save>/rollout_bank so the bank stays coupled to the checkpoint.')
     group.add_argument('--rl-rollout-bank-max-bytes', type=int, default=0,
                        help='Soft cap (bytes) on the rollout bank size; 0 = unbounded. On '
-                            'exceed, a warning is logged and compaction is nudged at the next '
-                            'checkpoint. Never blocks generation.')
+                            'exceed, a warning is logged. Compaction occurs at the next checkpoint '
+                            'regardless of the cap and never blocks generation.')
     group.add_argument('--grpo-iterations', type=int, default=2,
                        help="Number of iterations per a GRPO implementation.")
     # As in DAPO, we keep upper/lower eps different.

@@ -258,6 +258,20 @@ class TestRLUtils:
         )
         assert rl_utils.single_turn_termination_ok(rollout, traj, seq_len, eod) is ok
 
+    def test_single_turn_termination_without_generation_cap(self):
+        """Production rollouts that do not stamp a cap retain strict EOD validation."""
+        rollout = TokenRollout(
+            trajectory=[[1, 2, 3]],
+            generation_mask=[[False, True, True]],
+            reward=0.0,
+            env_id="uncapped-test",
+        )
+
+        assert rollout.generation_cap is None
+        assert not rl_utils.single_turn_termination_ok(
+            rollout, rollout.trajectory[-1], seq_len=16, eod=99
+        )
+
     def test_rl_granularity_defaults(self):
         args = self.create_test_args(perform_rl_step=True, grpo_prompts_per_step=8)
 

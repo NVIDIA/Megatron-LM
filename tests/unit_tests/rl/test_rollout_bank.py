@@ -2,6 +2,7 @@
 
 """Parameterized coverage for durable rollout-bank persistence and replay."""
 
+import asyncio
 import json
 from collections import Counter
 from contextlib import aclosing
@@ -75,6 +76,10 @@ def _active_generation(bank_dir):
     return bank_dir / _GENERATIONS / manifest["active_generation"]
 
 
+def _segment_dir(bank_dir, iteration=3):
+    return _active_generation(bank_dir) / _segment_name(iteration)
+
+
 def _assert_group_matches(actual, expected):
     assert actual.batch_id == expected.batch_id
     assert len(actual.rollouts) == len(expected.rollouts)
@@ -131,6 +136,58 @@ def test_rollout_bank_round_trip(tmp_path, group_factory):
         assert record["kind"] == "token"
         assert record["tok"]["bytes"] == 0
         assert not (generation / _segment_name(3) / _TOKENS_BIN).exists()
+
+
+def test_restore_drops_torn_final_ledger_record(tmp_path):
+    """A partial final JSONL append is truncated and does not hide durable records."""
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(3)
+    durable_uid = bank.append(_token_group())
+    bank.append(_token_group())
+    bank.close()
+
+    ledger = _segment_dir(tmp_path) / _LEDGER
+    lines = ledger.read_bytes().splitlines(keepends=True)
+    ledger.write_bytes(lines[0] + lines[1][: len(lines[1]) // 2])
+
+    restarted = RolloutBank(str(tmp_path))
+    restarted.set_collection(3)
+    assert ledger.read_bytes() == lines[0]
+    assert [group.uid for group in restarted.restore(trained_through=0)] == [durable_uid]
+
+
+def test_restore_drops_record_with_bad_checksum(tmp_path):
+    """Checksum corruption drops only the affected record during recovery."""
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(3)
+    durable_uid = bank.append(_token_group())
+    bank.append(_token_group())
+    bank.close()
+
+    ledger = _segment_dir(tmp_path) / _LEDGER
+    records = [json.loads(line) for line in ledger.read_text().splitlines()]
+    records[-1]["checksum"] = "0" * 32
+    ledger.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    assert [group.uid for group in RolloutBank(str(tmp_path)).restore(trained_through=0)] == [
+        durable_uid
+    ]
+
+
+def test_restore_drops_record_with_truncated_sidecar(tmp_path):
+    """A short sidecar slice drops its ledger record instead of failing resume."""
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(3)
+    durable_uid = bank.append(_token_group())
+    bank.append(_token_group())
+    bank.close()
+
+    tokens = _segment_dir(tmp_path) / _TOKENS_BIN
+    tokens.write_bytes(tokens.read_bytes()[:-1])
+
+    assert [group.uid for group in RolloutBank(str(tmp_path)).restore(trained_through=0)] == [
+        durable_uid
+    ]
 
 
 @pytest.mark.parametrize(
