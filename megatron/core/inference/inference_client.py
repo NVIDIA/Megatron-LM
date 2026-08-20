@@ -6,12 +6,22 @@ import logging
 import time
 from typing import List, Optional, Union
 
+import torch
+
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 from .headers import Headers
+from .messages import (
+    CLIENT_REPLY,
+    CLIENT_REPLY_PARTIAL,
+    SUBMIT_REQUEST,
+    SUBMIT_REQUEST_WITH_KV,
+    header_of,
+    pack_signal,
+)
 
 try:
     import zmq
@@ -111,8 +121,30 @@ class InferenceClient:
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
-        return self._submit_request(payload, request_id)
+        # The prompt travels in its own frame so the coordinator can route the
+        # request without decoding it -- at long prompts that decode dominates its
+        # per-request cost, and it is one serial loop shared by every rank.
+        frames = SUBMIT_REQUEST.pack(
+            request_id=request_id,
+            sampling_params=sampling_params.serialize(),
+            prompt=self._pack_prompt(prompt),
+        )
+        return self._submit_request(frames, request_id)
+
+    @staticmethod
+    def _pack_prompt(prompt):
+        """Pack a prompt into its own frame.
+
+        Coercion happens here rather than at the coordinator: the coordinator no
+        longer decodes the prompt, and clients are many against its one serial
+        loop, so this is both the only place that still sees the object and the
+        cheaper place to normalize it.
+        """
+        if isinstance(prompt, torch.Tensor):
+            prompt = prompt.tolist()
+        elif not isinstance(prompt, (str, list)):
+            raise TypeError(f"unsupported prompt type {type(prompt).__name__}")
+        return msgpack.packb(prompt, use_bin_type=True)
 
     def _make_kv_handoff_request(
         self,
@@ -121,18 +153,27 @@ class InferenceClient:
         kv_meta: dict,
         src_block_ids: List[int],
     ) -> tuple[int, list]:
-        """Allocate an ID and build a decode request carrying remote KV metadata."""
+        """Allocate an ID and build a decode request carrying remote KV metadata.
+
+        Framed as [metadata, prompt, src_block_ids].
+
+        Nothing whose size follows the sequence length belongs in the metadata
+        frame, since that frame is the only one the coordinator decodes.
+        ``src_block_ids`` names one block per block_size_tokens of prompt, so it
+        grows with the prompt and travels as its own body. ``kv_meta`` stays in
+        the metadata: it is the peer's NIXL agent/layout export, bounded by TP
+        size and num_speculative_tokens, not by prompt length.
+        """
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [
-            Headers.SUBMIT_REQUEST_WITH_KV.value,
-            request_id,
-            prompt,
-            sampling_params.serialize(),
-            kv_meta,
-            list(src_block_ids),
-        ]
-        return request_id, payload
+        frames = SUBMIT_REQUEST_WITH_KV.pack(
+            request_id=request_id,
+            sampling_params=sampling_params.serialize(),
+            kv_meta=kv_meta,
+            prompt=self._pack_prompt(prompt),
+            src_block_ids=msgpack.packb(list(src_block_ids), use_bin_type=True),
+        )
+        return request_id, frames
 
     def add_request_with_kv_handoff(
         self,
@@ -155,10 +196,10 @@ class InferenceClient:
         Returns:
             asyncio.Future: A future that resolves to the completed request.
         """
-        request_id, payload = self._make_kv_handoff_request(
+        request_id, frames = self._make_kv_handoff_request(
             prompt, sampling_params, kv_meta, src_block_ids
         )
-        return self._submit_request(payload, request_id)
+        return self._submit_request(frames, request_id)
 
     def add_request_with_kv_handoff_streaming(
         self,
@@ -182,10 +223,10 @@ class InferenceClient:
             AsyncStream[dict]: Per-step partial and final reply frames.
         """
         sampling_params.streaming = True
-        request_id, payload = self._make_kv_handoff_request(
+        request_id, frames = self._make_kv_handoff_request(
             prompt, sampling_params, kv_meta, src_block_ids
         )
-        return self._submit_stream(payload, request_id)
+        return self._submit_stream(frames, request_id)
 
     def release_handoff(self, request_id: int) -> None:
         """Tell the coordinator to release the KV blocks pinned for `request_id`.
@@ -193,8 +234,7 @@ class InferenceClient:
         Fire-and-forget. The coordinator broadcasts RELEASE_KV to every engine;
         engines without that request_id ignore the message.
         """
-        payload = [Headers.RELEASE_KV.value, int(request_id)]
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self.socket.send_multipart(pack_signal(Headers.RELEASE_KV, int(request_id)))
 
     def abort_request(self, request_id: int) -> None:
         """Cancel an in-flight request and close its local response stream."""
@@ -207,8 +247,7 @@ class InferenceClient:
         if future is not None and not future.done():
             future.cancel()
         self.request_submission_times.pop(request_id, None)
-        payload = [Headers.ABORT_REQUEST.value, request_id]
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self.socket.send_multipart(pack_signal(Headers.ABORT_REQUEST, request_id))
 
     def add_request_streaming(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
@@ -238,21 +277,28 @@ class InferenceClient:
         sampling_params.streaming = True
         request_id = self.next_request_id
         self.next_request_id += 1
-        payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
-        return self._submit_stream(payload, request_id)
+        # The prompt travels in its own frame so the coordinator can route the
+        # request without decoding it -- at long prompts that decode dominates its
+        # per-request cost, and it is one serial loop shared by every rank.
+        frames = SUBMIT_REQUEST.pack(
+            request_id=request_id,
+            sampling_params=sampling_params.serialize(),
+            prompt=self._pack_prompt(prompt),
+        )
+        return self._submit_stream(frames, request_id)
 
-    def _submit_request(self, payload: list, request_id: int) -> asyncio.Future:
+    def _submit_request(self, frames: list, request_id: int) -> asyncio.Future:
         """Send a prepared request and register its completion future."""
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self.socket.send_multipart(frames)
         assert request_id not in self.completion_futures
         future = asyncio.get_running_loop().create_future()
         self.completion_futures[request_id] = future
         self.request_submission_times[request_id] = time.perf_counter()
         return future
 
-    def _submit_stream(self, payload: list, request_id: int) -> AsyncStream[dict]:
+    def _submit_stream(self, frames: list, request_id: int) -> AsyncStream[dict]:
         """Send a prepared streaming request and register its response stream."""
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self.socket.send_multipart(frames)
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop
         )
@@ -275,13 +321,17 @@ class InferenceClient:
         """
         while True:
             try:
-                data = msgpack.unpackb(self.socket.recv(flags=zmq.NOBLOCK), raw=False)
-                header = Headers(data[0])
+                # frames[0] is metadata; a reply body, when present, follows it.
+                frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
+                metadata = msgpack.unpackb(frames[0], raw=False)
+                header = header_of(metadata)
                 if header == Headers.ENGINE_REPLY:
-                    request_id, reply = data[1:]
+                    delivery = CLIENT_REPLY.parse(metadata, frames[1:])
+                    request_id = delivery.request_id
                     if request_id in self.aborted_request_ids:
                         self.aborted_request_ids.discard(request_id)
                         continue
+                    reply = msgpack.unpackb(delivery.reply, raw=False)
                     submitted = self.request_submission_times.pop(request_id, None)
                     if submitted is not None:
                         reply['latency'] = time.perf_counter() - submitted
@@ -305,10 +355,10 @@ class InferenceClient:
                     )
                     completion_future.set_result(completed_request)
                 elif header == Headers.ENGINE_REPLY_PARTIAL:
-                    request_id, partial = data[1:]
-                    stream = self.streams.get(request_id)
+                    delivery = CLIENT_REPLY_PARTIAL.parse(metadata, frames[1:])
+                    stream = self.streams.get(delivery.request_id)
                     if stream is not None:
-                        stream.put({"partial": partial})
+                        stream.put({"partial": msgpack.unpackb(delivery.partial, raw=False)})
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -322,14 +372,13 @@ class InferenceClient:
         Sends a CONNECT signal and waits for a CONNECT_ACK reply to ensure the
         connection is established and acknowledged by the coordinator.
         """
-        payload = [Headers.CONNECT.value]
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        self.socket.send_multipart(pack_signal(Headers.CONNECT))
         if timeout_seconds is not None and not self.socket.poll(
             timeout=max(0, int(timeout_seconds * 1000))
         ):
             raise TimeoutError("Timed out connecting to the Megatron inference coordinator")
-        reply = msgpack.unpackb(self.socket.recv(), raw=False)
-        assert Headers(reply[0]) == Headers.CONNECT_ACK
+        reply = msgpack.unpackb(self.socket.recv_multipart()[0], raw=False)
+        assert header_of(reply) == Headers.CONNECT_ACK
 
     def start(
         self,
@@ -356,9 +405,7 @@ class InferenceClient:
             signal: The signal to send, typically a value from the `Headers` enum.
             *args: Optional extra values to include in the payload.
         """
-        payload = [signal.value, *args]
-        payload_serialized = msgpack.packb(payload, use_bin_type=True)
-        self.socket.send(payload_serialized)
+        self.socket.send_multipart(pack_signal(signal, *args))
 
     def pause_engines(self):
         """Sends PAUSE to all engines via coordinator.

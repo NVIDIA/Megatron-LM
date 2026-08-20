@@ -30,28 +30,26 @@ async def test_add_request_streaming_emits_partials_then_final():
     """Two ENGINE_REPLY_PARTIAL frames followed by an ENGINE_REPLY terminate the iterator."""
     client, fake_socket = _make_client()
 
+    # Partials and finals both arrive as [metadata, body] frames.
     recv_queue = [
-        msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True),
-        msgpack.packb(
-            [
-                Headers.ENGINE_REPLY_PARTIAL.value,
-                0,
+        [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)],
+        [
+            msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, 0], use_bin_type=True),
+            msgpack.packb(
                 {"request_id": 0, "new_tokens": [1, 2], "new_log_probs": [-0.1, -0.2]},
-            ],
-            use_bin_type=True,
-        ),
-        msgpack.packb(
-            [
-                Headers.ENGINE_REPLY_PARTIAL.value,
-                0,
-                {"request_id": 0, "new_tokens": [3], "new_log_probs": [-0.3]},
-            ],
-            use_bin_type=True,
-        ),
-        msgpack.packb(
-            [Headers.ENGINE_REPLY.value, 0, {"request_id": 0, "generated_tokens": [1, 2, 3]}],
-            use_bin_type=True,
-        ),
+                use_bin_type=True,
+            ),
+        ],
+        [
+            msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, 0], use_bin_type=True),
+            msgpack.packb(
+                {"request_id": 0, "new_tokens": [3], "new_log_probs": [-0.3]}, use_bin_type=True
+            ),
+        ],
+        [
+            msgpack.packb([Headers.ENGINE_REPLY.value, 0], use_bin_type=True),
+            msgpack.packb({"request_id": 0, "generated_tokens": [1, 2, 3]}, use_bin_type=True),
+        ],
     ]
 
     def fake_recv(*args, **kwargs):
@@ -59,7 +57,7 @@ async def test_add_request_streaming_emits_partials_then_final():
             return recv_queue.pop(0)
         raise zmq.Again()
 
-    fake_socket.recv.side_effect = fake_recv
+    fake_socket.recv_multipart.side_effect = fake_recv
     client.start()
 
     params = SamplingParams(temperature=0.7, return_log_probs=True)
@@ -70,9 +68,10 @@ async def test_add_request_streaming_emits_partials_then_final():
     assert isinstance(iterator, AsyncStream)
     assert params.streaming is True
     assert 0 in client.streams
-    submit_payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    submit_meta, _ = fake_socket.send_multipart.call_args.args[0]
+    submit_payload = msgpack.unpackb(submit_meta, raw=False)
     assert submit_payload[0] == Headers.SUBMIT_REQUEST.value
-    assert submit_payload[3]["streaming"] is True
+    assert submit_payload[2]["streaming"] is True
 
     items = []
     async for item in iterator:
@@ -97,11 +96,11 @@ async def test_streaming_partial_for_unknown_request_is_dropped():
     client, fake_socket = _make_client()
 
     recv_queue = [
-        msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True),
-        msgpack.packb(
-            [Headers.ENGINE_REPLY_PARTIAL.value, 42, {"request_id": 42, "new_tokens": [9]}],
-            use_bin_type=True,
-        ),
+        [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)],
+        [
+            msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, 42], use_bin_type=True),
+            msgpack.packb({"request_id": 42, "new_tokens": [9]}, use_bin_type=True),
+        ],
     ]
 
     def fake_recv(*args, **kwargs):
@@ -109,7 +108,7 @@ async def test_streaming_partial_for_unknown_request_is_dropped():
             return recv_queue.pop(0)
         raise zmq.Again()
 
-    fake_socket.recv.side_effect = fake_recv
+    fake_socket.recv_multipart.side_effect = fake_recv
     client.start()
 
     await asyncio.sleep(0.02)
@@ -122,14 +121,14 @@ async def test_client_stop_terminates_open_streams():
     """stop() finishes open streams so awaiters can exit."""
     client, fake_socket = _make_client()
 
-    recv_queue = [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
+    recv_queue = [[msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]]
 
     def fake_recv(*args, **kwargs):
         if recv_queue:
             return recv_queue.pop(0)
         raise zmq.Again()
 
-    fake_socket.recv.side_effect = fake_recv
+    fake_socket.recv_multipart.side_effect = fake_recv
     client.start()
 
     iterator = client.add_request_streaming("hi", SamplingParams())
